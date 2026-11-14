@@ -33,7 +33,7 @@ from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+from nemo_automodel.shared.import_utils import is_te_min_version, safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -252,6 +252,42 @@ def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
         return type(module).forward(module, *args, **kwargs)
 
 
+_MXFP8_FORWARD_ATTR = "_te_mxfp8_forward"
+"""Instance attribute holding the forward a module had before :meth:`TENvfp4Config.route_mxfp8_modules` wrapped it."""
+
+
+def _forward_in_mxfp8(module: nn.Module, *args, **kwargs):
+    """Run ``module``'s forward under Transformer Engine's MXFP8 recipe.
+
+    Bound per instance by :meth:`TENvfp4Config.route_mxfp8_modules`; the forward the module had before is looked
+    up like in :func:`_forward_outside_fp8`.
+    """
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+    installed = vars(module).get(_MXFP8_FORWARD_ATTR)
+    with te_autocast(enabled=True, recipe=MXFP8BlockScaling()):
+        if installed is not None:
+            return installed(*args, **kwargs)
+        return type(module).forward(module, *args, **kwargs)
+
+
+def _bind_forward(module: nn.Module, wrapper: types.FunctionType, saved_attr: str) -> None:
+    """Make ``wrapper`` the instance forward of ``module`` and keep the instance forward it replaces.
+
+    Args:
+        module: Module whose calls go through ``wrapper`` afterwards.
+        wrapper: Function called as ``wrapper(module, *args, **kwargs)``.
+        saved_attr: Instance attribute that receives the instance forward ``module`` had, if it had one.
+    """
+    installed = vars(module).get("forward")
+    if isinstance(installed, types.MethodType) and installed.__func__ is wrapper:
+        return
+    if installed is not None:
+        setattr(module, saved_attr, installed)
+    module.forward = types.MethodType(wrapper, module)
+
+
 @dataclass(kw_only=True)
 class TEQuantizationConfig(ABC):
     """Base class of :class:`TEFp8Config` and :class:`TENvfp4Config`."""
@@ -304,11 +340,7 @@ class TEQuantizationConfig(ABC):
         for name, module in model.named_modules():
             if not name or not self.module_excluded(name):
                 continue
-            installed = vars(module).get("forward")
-            if not (isinstance(installed, types.MethodType) and installed.__func__ is _forward_outside_fp8):
-                if installed is not None:
-                    setattr(module, _EXCLUDED_FORWARD_ATTR, installed)
-                module.forward = types.MethodType(_forward_outside_fp8, module)
+            _bind_forward(module, _forward_outside_fp8, _EXCLUDED_FORWARD_ATTR)
             excluded.append(name)
         if excluded:
             logger.info(
@@ -318,6 +350,14 @@ class TEQuantizationConfig(ABC):
                 ", ".join(excluded),
             )
         return excluded
+
+    def prepare_modules(self, model: nn.Module) -> None:
+        """Apply the per-module settings of this config to ``model``; idempotent.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+        """
+        self.exclude_modules(model)
 
     @abstractmethod
     def build_recipe(self) -> "Recipe | None":
@@ -395,17 +435,21 @@ class TENvfp4Config(TEQuantizationConfig):
     random_hadamard_transform: bool = True
     """Rotate the operands of the weight-gradient GEMM with a 16x16 Hadamard matrix before quantizing."""
     stochastic_rounding: bool = True
-    """Round gradients stochastically instead of to nearest."""
+    """Round gradients stochastically instead of to nearest. With ``backward="mxfp8"`` this applies to the
+    MXFP8 copies of the forward operands instead; the gradient is rounded to nearest."""
     weight_blocks_2d: bool = True
     """Share one block scale per 16x16 weight block instead of per 16 values of a row."""
     row_scaled_activation: bool = False
     """Scale forward activations per row (one FP32 scale per token) instead of per tensor."""
     four_over_six: Literal["none", "weights", "activations", "all"] = "none"
     """Tensors whose blocks map their maximum to 4 or to 6, whichever quantizes the block with less error."""
-    backward: Literal["quantized", "high_precision", "dequantized"] = "quantized"
-    """Operands of the backward GEMMs: quantized to NVFP4, the original floating-point operands, or the
-    dequantized forward operands. With ``"quantized"``, ``row_scaled_activation`` and ``four_over_six`` on
-    activations only work with frozen weights."""
+    backward: Literal["quantized", "high_precision", "dequantized", "mxfp8"] = "quantized"
+    """Operands of the backward GEMMs: quantized to NVFP4, the original floating-point operands, the
+    dequantized forward operands, or (``"mxfp8"``) the dequantized forward operands quantized again to MXFP8
+    and multiplied with an MXFP8 gradient. With ``"quantized"``, ``row_scaled_activation`` and ``four_over_six``
+    on activations only work with frozen weights."""
+    mxfp8_fqns: tuple[str, ...] = ()
+    """Module names that run Transformer Engine's MXFP8 recipe instead of NVFP4, matched like ``exclude_fqns``."""
     resident_weights: bool = False
     """Hold the expert weights as NVFP4 tensors: an NVFP4 checkpoint fills them unchanged and they are saved
     in the same form. Training them needs Transformer Engine ``FusedAdam`` with ``master_weights=True``."""
@@ -418,10 +462,23 @@ class TENvfp4Config(TEQuantizationConfig):
                 "te_nvfp4.four_over_six must be one of 'none', 'weights', 'activations' or 'all', "
                 f"got {self.four_over_six!r}"
             )
-        if self.backward not in ("quantized", "high_precision", "dequantized"):
+        if self.backward not in ("quantized", "high_precision", "dequantized", "mxfp8"):
             raise ValueError(
-                f"te_nvfp4.backward must be one of quantized, high_precision or dequantized, got {self.backward!r}"
+                "te_nvfp4.backward must be one of quantized, high_precision, dequantized or mxfp8, "
+                f"got {self.backward!r}"
             )
+        if isinstance(self.mxfp8_fqns, str):
+            self.mxfp8_fqns = (self.mxfp8_fqns,)
+        self.mxfp8_fqns = tuple(self.mxfp8_fqns)
+        if any(not isinstance(fqn, str) or not fqn for fqn in self.mxfp8_fqns):
+            raise ValueError(f"te_nvfp4.mxfp8_fqns must be non-empty module-name strings, got {self.mxfp8_fqns!r}")
+        if self.backward == "mxfp8" and self.random_hadamard_transform:
+            raise ValueError(
+                "te_nvfp4.backward='mxfp8' requires te_nvfp4.random_hadamard_transform=False: "
+                "the transform rotates NVFP4 backward operands"
+            )
+        if self.backward == "mxfp8" and self.resident_weights:
+            raise ValueError("te_nvfp4.backward='mxfp8' does not support te_nvfp4.resident_weights")
         if self.random_hadamard_transform and (
             self.row_scaled_activation or self.four_over_six in ("activations", "all")
         ):
@@ -458,7 +515,61 @@ class TENvfp4Config(TEQuantizationConfig):
                 "te_nvfp4 requires transformer_engine.common.recipe.NVFP4BlockScaling "
                 "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
             ) from e
+        if self.backward == "mxfp8":
+            if not is_te_min_version("2.19.0"):
+                raise ImportError("te_nvfp4.backward='mxfp8' requires Transformer Engine 2.19.0 or newer.")
+            from transformer_engine.common.recipe import CustomRecipe
+
+            from nemo_automodel.components.quantization.te_nvfp4 import NVFP4ForwardMXFP8BackwardFactory
+
+            return CustomRecipe(
+                qfactory=NVFP4ForwardMXFP8BackwardFactory(
+                    weight_blocks_2d=self.weight_blocks_2d,
+                    row_scaled_activation=self.row_scaled_activation,
+                    four_over_six=self.four_over_six,
+                    stochastic_rounding=self.stochastic_rounding,
+                )
+            )
         return NVFP4BlockScaling(**self.recipe_kwargs())
+
+    def route_mxfp8_modules(self, model: nn.Module) -> list[str]:
+        """Run the modules matching :attr:`mxfp8_fqns` under Transformer Engine's MXFP8 recipe.
+
+        The outermost matching modules get an instance ``forward`` that runs the forward they had so far under
+        ``te_autocast(recipe=MXFP8BlockScaling())``; the modules inside them inherit it. Parameters, state-dict
+        keys and FSDP/pipeline wrapping are untouched; idempotent.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+
+        Returns:
+            Qualified names of the wrapped modules, in ``named_modules`` order; empty without Transformer Engine
+            or without ``mxfp8_fqns``.
+        """
+        if not HAVE_TE or not self.mxfp8_fqns:
+            return []
+        routed: list[str] = []
+        for name, module in model.named_modules():
+            if not name or not any(fqn in name for fqn in self.mxfp8_fqns):
+                continue
+            if self.module_excluded(name):
+                raise ValueError(f"Module {name!r} matches both te_nvfp4.exclude_fqns and te_nvfp4.mxfp8_fqns")
+            if any(name.startswith(f"{parent}.") for parent in routed):
+                continue
+            _bind_forward(module, _forward_in_mxfp8, _MXFP8_FORWARD_ATTR)
+            routed.append(name)
+        if routed:
+            logger.info("te_nvfp4: %d module(s) run the MXFP8 recipe: %s", len(routed), ", ".join(routed))
+        return routed
+
+    def prepare_modules(self, model: nn.Module) -> None:
+        """Apply ``exclude_fqns`` and ``mxfp8_fqns`` to ``model``; idempotent.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+        """
+        super().prepare_modules(model)
+        self.route_mxfp8_modules(model)
 
 
 @dataclass(kw_only=True)
