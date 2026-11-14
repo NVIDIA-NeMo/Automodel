@@ -2204,6 +2204,23 @@ _GEMMA4_MODEL_TURN = "<|turn>model\n"
 _GEMMA4_THINKING_PREFIX = "<|channel>thought\n<channel|>"
 
 
+def _nonoverlapping_marker_ends(seq: torch.Tensor, marker: torch.Tensor) -> list[int]:
+    """Ends of left-to-right marker matches that do not overlap an earlier match."""
+    marker_len = int(marker.numel())
+    length = int(seq.numel())
+    if marker_len == 0 or length < marker_len:
+        return []
+    hits = (seq.unfold(0, marker_len, 1) == marker).all(dim=-1)
+    ends: list[int] = []
+    next_start = 0
+    for start in torch.nonzero(hits, as_tuple=False).flatten().tolist():
+        if start < next_start:
+            continue
+        ends.append(start + marker_len)
+        next_start = start + marker_len
+    return ends
+
+
 def _inject_thinking_prefix_tokens(
     batch: Dict[str, torch.Tensor],
     tokenizer,
@@ -2221,7 +2238,6 @@ def _inject_thinking_prefix_tokens(
     if not prefix_ids or not marker_ids:
         return batch
 
-    marker_len = len(marker_ids)
     prefix_len = len(prefix_ids)
     marker_t = torch.tensor(marker_ids, dtype=batch["input_ids"].dtype)
     prefix_t = torch.tensor(prefix_ids, dtype=batch["input_ids"].dtype)
@@ -2249,14 +2265,7 @@ def _inject_thinking_prefix_tokens(
         seq = batch["input_ids"][b]
         dev = seq.device
 
-        insert_after: List[int] = []
-        i = 0
-        while i <= len(seq) - marker_len:
-            if torch.all(seq[i : i + marker_len] == marker_t.to(dev)):
-                insert_after.append(i + marker_len)
-                i += marker_len
-            else:
-                i += 1
+        insert_after = _nonoverlapping_marker_ends(seq, marker_t.to(dev))
 
         if not insert_after:
             for k in seq_keys:
