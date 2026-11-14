@@ -38,7 +38,8 @@ New format (nanogpt_data_processor.py)::
 Optionally, a corresponding .bos.idx file can exist alongside each .bin file::
 
     int32[n_bos_tokens] bos_positions
-        # Array of absolute byte positions where BOS tokens occur in the .bin file
+        # Token positions of the BOS tokens, i.e. indices into the token array
+        # that follows the header (not byte offsets into the .bin file)
 
 The dataset streams one contiguous *seq_len* token slice at a time and
 returns the pair ``(inputs, labels)`` where ``labels`` is shifted by one
@@ -56,6 +57,7 @@ runtime dependency on the NanoGPT codebase.
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import random
 from dataclasses import dataclass
@@ -67,6 +69,8 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 __all__ = ["NanogptDataset", "load_bin_shard"]
+
+logger = logging.getLogger(__name__)
 
 # Support both legacy fineweb.py format and new nanogpt_data_processor.py format
 MAGIC = 2788_95051  # New format magic number
@@ -115,6 +119,27 @@ def _load_bos_index(path: str | os.PathLike) -> np.ndarray | None:
     except Exception:
         # If there's any error loading the index file, return None to fall back to linear search
         return None
+
+
+def _bos_index_matches(bos_positions: np.ndarray, tokens: torch.Tensor, bos_token: int) -> bool:
+    """
+    Check that a loaded BOS index holds token positions of BOS tokens.
+
+    Index files written before the index stored token positions hold byte offsets
+    instead; checking the first and last entries is enough to tell them apart.
+
+    Args:
+        bos_positions: int32 array of shape [n_bos] with BOS token positions.
+        tokens: Tensor of shape [tokens] with the shard's token ids.
+        bos_token: BOS token id.
+
+    Returns:
+        True when the first and last entries are in range and point at ``bos_token``.
+    """
+    if len(bos_positions) == 0:
+        return True
+    ends = (int(bos_positions[0]), int(bos_positions[-1]))
+    return all(0 <= pos < len(tokens) and tokens[pos].item() == bos_token for pos in ends)
 
 
 def _find_next_bos_with_index(bos_positions: np.ndarray, start_pos: int, max_pos: int) -> int:
@@ -399,6 +424,13 @@ class NanogptDataset(IterableDataset):
         bos_positions = None
         if self.align_to_bos:
             bos_positions = _load_bos_index(file)
+            if bos_positions is not None and not _bos_index_matches(bos_positions, tokens, self.bos_token):
+                logger.warning(
+                    "%s does not point at BOS tokens (written before the index stored token positions); "
+                    "falling back to linear BOS search. Regenerate it with tools/nanogpt_data_processor.py.",
+                    Path(file).with_suffix(".bos.idx"),
+                )
+                bos_positions = None
 
         # Set start and end positions based on whether we're splitting a single file
         if split_single_file:
