@@ -532,6 +532,8 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
+        # forward returns compute_lm_head_logits(...).logits uncast.
+        supports_fp32_logits: bool = True
 
     def __init__(
         self,

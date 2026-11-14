@@ -59,6 +59,8 @@ class ModelCapabilities:
         supports_mtp_cp_pp: MTP training with context and pipeline parallelism.
         supports_cp_vision_frame_sharding: Frame-level vision-tower sharding over
             context-parallel ranks.
+        supports_fp32_logits: The forward returns its LM head's logits uncast, so
+            ``logits_dtype=float32`` yields FP32 logits from the BF16/FP16 head GEMM.
     """
 
     supports_tp: bool = False
@@ -69,6 +71,7 @@ class ModelCapabilities:
     supports_mtp_cp: bool = False
     supports_mtp_cp_pp: bool = False
     supports_cp_vision_frame_sharding: bool = False
+    supports_fp32_logits: bool = False
 
 
 def _to_canonical(caps_obj) -> ModelCapabilities:
@@ -89,6 +92,7 @@ def _to_canonical(caps_obj) -> ModelCapabilities:
         supports_mtp_cp=bool(getattr(caps_obj, "supports_mtp_cp", False)),
         supports_mtp_cp_pp=bool(getattr(caps_obj, "supports_mtp_cp_pp", False)),
         supports_cp_vision_frame_sharding=bool(getattr(caps_obj, "supports_cp_vision_frame_sharding", False)),
+        supports_fp32_logits=bool(getattr(caps_obj, "supports_fp32_logits", False)),
     )
 
 

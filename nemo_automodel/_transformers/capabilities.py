@@ -197,6 +197,7 @@ class ModelSupports:
             "mtp_cp",
             "mtp_cp_pp",
             "cp_vision_frame_sharding",
+            "fp32_logits",
             "gradient_checkpointing",
             "generate",
         )
@@ -346,6 +347,15 @@ class ModelSupports:
         except AttributeError:
             return False
         return capabilities.supports_cp_vision_frame_sharding
+
+    @property
+    def supports_fp32_logits(self) -> bool:
+        """Model returns its LM head's logits uncast, so an FP32-output head yields FP32 logits."""
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_fp32_logits
 
     @property
     def supports_generate(self) -> bool:
