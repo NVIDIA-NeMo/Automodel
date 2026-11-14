@@ -14,34 +14,11 @@
 
 
 import torch
-import torch.distributed.nn.functional as dist_nn_func
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
-try:
-    from torch.distributed.tensor import DTensor, Shard
-
-    _HAVE_DTENSOR = True
-except Exception:
-    DTensor = None  # type: ignore[assignment, misc]
-    Shard = None  # type: ignore[assignment, misc]
-    _HAVE_DTENSOR = False
-
-
-def _infer_tp_group_from_dtensor(logits: torch.Tensor) -> torch.distributed.ProcessGroup | None:
-    """If *logits* is a DTensor sharded on the vocab (last) dimension, return its TP process group.
-
-    Iterates over the DTensor placements to find the mesh dimension that holds a vocab-dim
-    ``Shard`` and returns the corresponding process group.  Returns ``None`` for plain tensors
-    or DTensors that are not vocab-sharded.
-    """
-    if not _HAVE_DTENSOR or not isinstance(logits, DTensor):
-        return None
-    vocab_dim = logits.ndim - 1
-    for mesh_dim, placement in enumerate(logits.placements):
-        if isinstance(placement, Shard) and (placement.dim == -1 or placement.dim == vocab_dim):
-            return logits.device_mesh.get_group(mesh_dim)
-    return None
+from nemo_automodel.components.loss import vocab_parallel
 
 
 def _forward_kl_from_log_probs(
@@ -66,40 +43,10 @@ def _forward_kl_from_log_probs(
     return (teacher_prob * log_ratio).sum(dim=-1)
 
 
-class _AllReduceForwardPassThroughBackward(torch.autograd.Function):
-    """All-reduce a tensor in forward while preserving its local gradient."""
-
-    @staticmethod
-    def forward(ctx, input_tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
-        """Reduce a clone of the input tensor without mutating its autograd value.
-
-        Args:
-            ctx: Autograd context, unused by this operation.
-            input_tensor: Tensor of shape ``[...]`` containing local per-token KL values.
-            group: Process group over which to sum the local values.
-
-        Returns:
-            Tensor of shape ``[...]`` containing the forward all-reduced values.
-        """
-        output = input_tensor.clone()
-        torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=group)
-        return output
-
-    @staticmethod
-    def backward(ctx, *grad_outputs: torch.Tensor | None) -> tuple[torch.Tensor | None, None]:
-        """Pass the output gradient through without a second distributed reduction.
-
-        Args:
-            ctx: Autograd context, unused by this operation.
-            grad_outputs: One-element tuple containing a tensor of shape ``[...]``
-                with the gradient of the all-reduced output, or ``None`` when the
-                output is unused.
-
-        Returns:
-            Tuple containing the local input gradient (or ``None`` when the output
-            is unused) and ``None`` for the process group.
-        """
-        return grad_outputs[0], None
+def _vocab_layout(shard: vocab_parallel.VocabShard) -> tuple[tuple[int, ...] | None, int, int]:
+    """Return the ranks, first id, and size of a vocabulary slice, comparable across meshes."""
+    ranks = None if shard.group is None else tuple(torch.distributed.get_process_group_ranks(shard.group))
+    return ranks, shard.start, shard.local.shape[-1]
 
 
 def _kl_forward_tp(
@@ -117,35 +64,15 @@ def _kl_forward_tp(
         tp_group: Process group spanning the tensor-parallel ranks.
 
     Returns:
-        Tensor of shape ``[tokens]`` containing per-token forward KL. The local
-        vocabulary axis is a ``Shard(-1)`` across ``tp_group`` and is reduced
-        without gathering the full vocabulary.
+        Tensor of shape ``[tokens]`` containing per-token forward KL, the same on
+        every rank. The local vocabulary axis is a ``Shard(-1)`` across
+        ``tp_group`` and is reduced without gathering the full vocabulary. Both
+        inputs receive their exact gradients (``vocab_parallel`` convention).
     """
-    # --- Stable global softmax for teacher: P ---
-    teacher_max, _ = torch.max(t_logits, dim=-1, keepdim=True)
-    torch.distributed.all_reduce(teacher_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
-    output_teacher = t_logits - teacher_max
-    denom_teacher = torch.sum(torch.exp(output_teacher), dim=-1, keepdim=True)
-    torch.distributed.all_reduce(denom_teacher, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-    teacher_log_prob = output_teacher - torch.log(denom_teacher.clamp(min=1e-12))
-
-    # --- Stable global log-softmax for student: log Q ---
-    student_max, _ = torch.max(s_logits, dim=-1, keepdim=True)
-    student_max = student_max.detach()
-    torch.distributed.all_reduce(student_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
-    output_student = s_logits - student_max
-    denom_student = torch.sum(torch.exp(output_student), dim=-1, keepdim=True)
-    denom_student = dist_nn_func.all_reduce(denom_student, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-    student_log_prob = output_student - torch.log(denom_student.clamp(min=1e-12))
-
-    # --- Per-token KL: local vocabulary contribution then global reduce ---
+    teacher_log_prob = t_logits - vocab_parallel.logsumexp(t_logits, tp_group).unsqueeze(-1)
+    student_log_prob = s_logits - vocab_parallel.logsumexp(s_logits, tp_group).unsqueeze(-1)
     kl_local = _forward_kl_from_log_probs(teacher_log_prob, student_log_prob)
-    # Every rank computes the same global KL value, so its backward pass must
-    # retain the local vocabulary gradient instead of reducing that gradient a
-    # second time through the autograd-aware collective.
-    kl_local = _AllReduceForwardPassThroughBackward.apply(kl_local, tp_group)
-
-    return kl_local
+    return vocab_parallel.replicated(vocab_parallel.sum_over_group(kl_local, tp_group), tp_group)
 
 
 def _kl_forward_chunked(
@@ -227,9 +154,10 @@ class KDLoss(nn.Module):
             magnitudes remain independent of the chosen temperature (Hinton et al., 2015).
         fp32_upcast: Cast logits to float32 before computing softmax / log-softmax for numerical
             stability (default ``True``).
-        tp_group: Explicit TP process group.  When ``None`` (default) the group is inferred from
-            the DTensor placement of ``student_logits``, or the non-TP path is used for plain
-            tensors.
+        tp_group: Explicit TP process group, in which case the logits must already be local
+            vocabulary shards.  When ``None`` (default) the group is read from vocabulary-sharded
+            ``DTensor`` logits; student and teacher logits must then share one vocabulary layout,
+            and plain tensors use the non-TP path.  No path gathers the full vocabulary.
         chunk_size: When positive, valid tokens are processed in chunks of this size to avoid
             materializing the full ``[num_valid_tokens, vocab_size]`` probability matrix in fp32.
             With a Python scalar temperature, multi-chunk logits up to 32 bits use chunk-local
@@ -277,40 +205,45 @@ class KDLoss(nn.Module):
         Returns:
             Scalar tensor containing zero-based forward KL.
         """
+        if isinstance(labels, DTensor):
+            labels = labels.full_tensor()
+
+        # Keep each rank's vocabulary slice. An explicit tp_group means the inputs
+        # already hold local shards; otherwise vocabulary-sharded DTensor logits
+        # supply the group, and both logits must share one vocabulary layout.
+        tp_group = self.tp_group
+        if tp_group is None:
+            student = vocab_parallel.vocab_shard(student_logits)
+            teacher = vocab_parallel.vocab_shard(teacher_logits)
+            if _vocab_layout(student) != _vocab_layout(teacher):
+                raise ValueError(
+                    "KDLoss needs student and teacher logits with one vocabulary layout: both sharded on the "
+                    "vocabulary axis over the same group, or both holding the whole vocabulary. Got student ids "
+                    f"[{student.start}, {student.start + student.local.shape[-1]}) and teacher ids "
+                    f"[{teacher.start}, {teacher.start + teacher.local.shape[-1]}). Slice whole teacher logits to "
+                    "the student's shard first (KDMeshBridge.match_student_vocab_shard)."
+                )
+            tp_group = student.group
+            student_logits, teacher_logits = student.local, teacher.local
+        else:
+            if isinstance(student_logits, DTensor):
+                student_logits = student_logits.to_local()
+            if isinstance(teacher_logits, DTensor):
+                teacher_logits = teacher_logits.to_local()
+
         # Exclude padding / ignored tokens from the loss.
         valid_mask = (labels != self.ignore_index).view(-1)
         if valid_mask.sum() == 0:
             # Keep a zero student gradient without reducing the ignored logits.
-            if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
-                student_logits = student_logits.to_local()
             return student_logits[..., :0].sum()
 
+        # flatten, unlike reshape(-1, local_vocab), also handles an empty vocabulary shard.
         if student_logits.ndim > 2:
-            student_logits = student_logits.view(-1, student_logits.shape[-1])
+            student_logits = student_logits.flatten(0, -2)
         if teacher_logits.ndim > 2:
-            teacher_logits = teacher_logits.view(-1, teacher_logits.shape[-1])
+            teacher_logits = teacher_logits.flatten(0, -2)
         if labels.ndim > 1:
             labels = labels.view(-1)
-
-        # Determine TP group: prefer explicit argument, then auto-detect from DTensor.
-        tp_group = self.tp_group
-        if tp_group is None and _HAVE_DTENSOR and isinstance(student_logits, DTensor):
-            tp_group = _infer_tp_group_from_dtensor(student_logits)
-
-        if tp_group is not None:
-            # TP path: keep local shards to avoid gathering the full vocabulary.
-            if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
-                student_logits = student_logits.to_local()
-            if _HAVE_DTENSOR and isinstance(teacher_logits, DTensor):
-                teacher_logits = teacher_logits.to_local()
-        else:
-            # Non-TP path: materialise full tensors.
-            if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
-                student_logits = student_logits.full_tensor()
-            if _HAVE_DTENSOR and isinstance(teacher_logits, DTensor):
-                teacher_logits = teacher_logits.full_tensor()
-            if _HAVE_DTENSOR and isinstance(labels, DTensor):
-                labels = labels.full_tensor()
 
         t_logits = teacher_logits[valid_mask]
         s_logits = student_logits[valid_mask]

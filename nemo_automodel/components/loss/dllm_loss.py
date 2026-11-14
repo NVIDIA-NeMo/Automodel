@@ -24,10 +24,11 @@ from dataclasses import dataclass
 from typing import NamedTuple, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.loss import vocab_parallel
 from nemo_automodel.components.loss.chunked_ce import _validate_chunk_len
 from nemo_automodel.components.loss.kd_loss import KDLoss
 
@@ -43,16 +44,19 @@ def _compute_per_token_nll(
     logits: torch.Tensor,
     target_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute per-token negative log-likelihood, shape ``[B, L]``."""
-    if isinstance(logits, DTensor):
-        logits = logits.full_tensor()
+    """Compute per-token negative log-likelihood without gathering the vocabulary.
 
-    V = logits.size(-1)
-    return F.cross_entropy(
-        logits.reshape(-1, V),
-        target_ids.reshape(-1).to(logits.device),
-        reduction="none",
-    ).reshape(target_ids.shape)
+    Args:
+        logits: Tensor of global shape ``[..., vocab]``; a tensor-parallel
+            DTensor sharded on the vocabulary axis is reduced shard by shard.
+        target_ids: Integer tensor of shape ``[...]`` with vocabulary ids.
+
+    Returns:
+        Tensor of shape ``[...]`` in the logits dtype, the same on every
+        tensor-parallel rank.
+    """
+    shard = vocab_parallel.vocab_shard(logits)
+    return vocab_parallel.cross_entropy(shard, target_ids.to(shard.local.device), ignore_index=-100)
 
 
 def encoder_ar_loss(
@@ -372,6 +376,8 @@ class SCDDLoss(nn.Module):
         log_base_s_chunk: torch.Tensor,
         log_rho_s_chunk: torch.Tensor,
         mask_token_id: int,
+        vocab_start: int,
+        vocab_group: dist.ProcessGroup | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce one position chunk over the vocabulary axis.
 
@@ -382,7 +388,8 @@ class SCDDLoss(nn.Module):
         position is independent, so chunking is exact.
 
         Args:
-            logits_chunk: Model logits, shape ``[chunk, vocab]``.
+            logits_chunk: Model logits, shape ``[chunk, vocab]``, or this rank's
+                ``[chunk, local_vocab]`` slice of tensor-parallel logits.
             x_0_chunk: Clean token IDs, shape ``[chunk]``.
             z_t_chunk: Corrupted token IDs seen by the model, shape ``[chunk]``.
             log_base_s_chunk: ``log`` of the uniform base mass at ``s``, shape
@@ -390,10 +397,13 @@ class SCDDLoss(nn.Module):
             log_rho_s_chunk: ``log`` of the retained-mass ratio at ``s``, shape
                 ``[chunk]``.
             mask_token_id: Token ID of the absorbing ``[MASK]`` state.
+            vocab_start: First vocabulary id in ``logits_chunk``.
+            vocab_group: Vocabulary-sharding group, or None when
+                ``logits_chunk`` holds the whole vocabulary.
 
         Returns:
             Tuple of ``(sum_log, log_at_x0, log_at_zt, log_p_zt)``, each of
-            shape ``[chunk]``:
+            shape ``[chunk]`` and the same on every tensor-parallel rank:
 
             * ``sum_log`` — the posterior numerator summed over the non-``[MASK]``
               domain.
@@ -404,9 +414,12 @@ class SCDDLoss(nn.Module):
         # Driving the [MASK] logit to -inf removes the absorbing state from the
         # denoiser's domain. The fill is done in the logits' own dtype so only
         # the float() cast below pays vocabulary-sized fp32.
-        mask_col = torch.tensor([mask_token_id], device=logits_chunk.device)
-        logits_chunk = logits_chunk.index_fill(-1, mask_col, float("-inf")).float()  # [chunk, vocab]
-        log_denom = torch.logsumexp(logits_chunk, dim=-1)  # [chunk]
+        mask_col = mask_token_id - vocab_start
+        if 0 <= mask_col < logits_chunk.shape[-1]:
+            mask_index = torch.tensor([mask_col], device=logits_chunk.device)
+            logits_chunk = logits_chunk.index_fill(-1, mask_index, float("-inf"))
+        logits_chunk = logits_chunk.float()  # [chunk, vocab]
+        log_denom = vocab_parallel.logsumexp(logits_chunk, vocab_group)  # [chunk]
 
         # log p_theta(v) = logits(v) - logsumexp(logits), so the log-softmax
         # never has to be materialised: its per-position normaliser folds into a
@@ -420,10 +433,10 @@ class SCDDLoss(nn.Module):
         # At the [MASK] column the logit is -inf, so the term collapses to
         # log(base_s): excluding that column from the vocabulary sum is a scalar
         # subtraction, not a gather.
-        sum_log = log_term.sum(dim=-1) - log_base_s_chunk
-        log_at_x0 = log_term.gather(-1, x_0_chunk[:, None]).squeeze(-1)
-        log_at_zt = log_term.gather(-1, z_t_chunk[:, None]).squeeze(-1)
-        log_p_zt = logits_chunk.gather(-1, z_t_chunk[:, None]).squeeze(-1) - log_denom
+        sum_log = vocab_parallel.vocab_sum(log_term, vocab_group) - log_base_s_chunk
+        log_at_x0 = vocab_parallel.gather(log_term, x_0_chunk, start=vocab_start, group=vocab_group)
+        log_at_zt = vocab_parallel.gather(log_term, z_t_chunk, start=vocab_start, group=vocab_group)
+        log_p_zt = vocab_parallel.gather(logits_chunk, z_t_chunk, start=vocab_start, group=vocab_group) - log_denom
         return sum_log, log_at_x0, log_at_zt, log_p_zt
 
     def forward(
@@ -442,7 +455,9 @@ class SCDDLoss(nn.Module):
         """Compute the SCDD discrete-time NELBO.
 
         Args:
-            logits: Model output logits, shape ``[batch, sequence, vocab]``.
+            logits: Model output logits, shape ``[batch, sequence, vocab]``. A
+                tensor-parallel DTensor sharded on the vocabulary axis is reduced
+                shard by shard, without gathering the vocabulary.
             target_ids: Clean token IDs ``x_0``, shape ``[batch, sequence]``.
             noise_mask: Boolean mask of corrupted positions, shape
                 ``[batch, sequence]``. Ignored — the SCDD ELBO is supported on
@@ -477,12 +492,11 @@ class SCDDLoss(nn.Module):
         if noisy_input_ids is None:
             raise ValueError("SCDDLoss requires noisy_input_ids (the corrupted tokens z_t seen by the model).")
 
-        if isinstance(logits, DTensor):
-            logits = logits.full_tensor()
-        z_t = noisy_input_ids.to(logits.device)
-        x_0 = target_ids.to(logits.device)
+        shard = vocab_parallel.vocab_shard(logits)
+        z_t = noisy_input_ids.to(shard.local.device)
+        x_0 = target_ids.to(shard.local.device)
 
-        vocab = logits.size(-1)
+        vocab = shard.vocab
         # Domain of the denoiser: every token except the absorbing state.
         num_states = vocab - 1
 
@@ -509,7 +523,7 @@ class SCDDLoss(nn.Module):
         # the batch boundary.
         log_base_s = base_s.clamp(min=_SCDD_TINY).log().repeat_interleave(seq_len)  # [batch * sequence]
         log_rho_s = rho_s.clamp(min=_SCDD_TINY).log().repeat_interleave(seq_len)  # [batch * sequence]
-        flat_logits = logits.reshape(-1, vocab)
+        flat_logits = shard.local.flatten(0, -2)
         flat_x0 = x_0.reshape(-1)
         flat_zt = z_t.reshape(-1)
         del logits
@@ -526,6 +540,8 @@ class SCDDLoss(nn.Module):
                 log_base_s[start:end],
                 log_rho_s[start:end],
                 self.mask_token_id,
+                shard.start,
+                shard.group,
             )
             if self.chunk_size is None:
                 parts.append(self._vocab_terms(*args))
@@ -560,7 +576,7 @@ class SCDDLoss(nn.Module):
         mask = loss_mask.bool().to(per_token.dtype)
         loss = (per_token * mask).sum()
         denom = num_diffusion_tokens if num_diffusion_tokens is not None else int(mask.sum().item())
-        loss = loss / max(denom, 1)
+        loss = vocab_parallel.replicated(loss / max(denom, 1), shard.group)
 
         return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
 
@@ -699,22 +715,12 @@ class HybridDiffusionLLMLoss(nn.Module):
         """
         input_ids_len = target_ids.shape[1]
 
-        # Legacy path: split concatenated logits when causal_logits not passed
-        # separately. Must happen before _compute_per_token_nll consumes the
-        # DTensor. For DTensor input we all-gather first (unavoidable for the
-        # legacy concat layout).
-        if causal_logits is None:
-            if isinstance(logits, DTensor):
-                logits_full = logits.full_tensor()
-                if logits_full.shape[1] > input_ids_len:
-                    causal_logits = logits_full[:, input_ids_len:]
-                    logits = logits_full[:, :input_ids_len]
-                else:
-                    logits = logits_full
-                del logits_full
-            elif logits.shape[1] > input_ids_len:
-                causal_logits = logits[:, input_ids_len:]
-                logits = logits[:, :input_ids_len]
+        # Legacy path: split concatenated logits when causal_logits is not passed
+        # separately. Slicing the sequence axis keeps a vocabulary-sharded DTensor
+        # sharded, so neither half is gathered.
+        if causal_logits is None and logits.shape[1] > input_ids_len:
+            causal_logits = logits[:, input_ids_len:]
+            logits = logits[:, :input_ids_len]
 
         # --- Diffusion loss ---
         token_nll = _compute_per_token_nll(logits, target_ids)  # [B, L]
@@ -1192,7 +1198,7 @@ class DFlashDecayLoss(nn.Module):
         )
 
         token_nll = _compute_per_token_nll(logits, target_ids)  # [batch, blocks, k]
-        pred_ids = logits.argmax(dim=-1)  # [batch, blocks, k]
+        pred_ids = vocab_parallel.argmax(vocab_parallel.vocab_shard(logits))  # [batch, blocks, k]
         del logits
         c_per_pos, n_per_pos = self._draft_acc_per_pos(pred_ids == target_ids, block_mask, report_per_pos)
         output, denominator = self._reduce(
@@ -1395,8 +1401,8 @@ class IDLMLoss(nn.Module):
         clean_logits = logits[:, seq_len : 2 * seq_len, :]
 
         # Logit shift: logits[:, i] predicts target[:, i+1]. Both copies supervise
-        # the response tokens. _compute_per_token_nll materialises a vocab-sharded
-        # DTensor via full_tensor() if needed.
+        # the response tokens. _compute_per_token_nll reduces a vocab-sharded
+        # DTensor shard by shard.
         #
         # Support note (deliberate, differs from the reference by one position):
         # gating on ``answer_mask[:, 1:]`` supervises every position whose NEXT
@@ -1429,19 +1435,26 @@ class IDLMLoss(nn.Module):
         return DLLMLossOutput(total_loss=loss, dllm_loss=ce_noisy.detach().clone())
 
 
-def _total_variation_rows(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
+def _total_variation_rows(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    vocab_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
     """Per-row L1 distance between the student and teacher softmax distributions.
 
     Args:
-        student_logits: Tensor of shape [rows, vocab].
-        teacher_logits: Tensor of shape [rows, vocab], detached.
+        student_logits: Tensor of shape [rows, vocab], or this rank's
+            [rows, local_vocab] slice of tensor-parallel logits.
+        teacher_logits: Tensor shaped like ``student_logits``, detached.
+        vocab_group: Vocabulary-sharding group, or None for whole-vocabulary rows.
 
     Returns:
-        Tensor of shape [rows] with ``sum_v |softmax(student) - softmax(teacher)|`` in float32.
+        Tensor of shape [rows] with ``sum_v |softmax(student) - softmax(teacher)|`` in float32,
+        the same on every tensor-parallel rank.
     """
-    student_probs = F.softmax(student_logits, dim=-1, dtype=torch.float32)
-    teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
-    return (student_probs - teacher_probs).abs().sum(dim=-1)
+    student_probs = vocab_parallel.softmax(student_logits, vocab_group)
+    teacher_probs = vocab_parallel.softmax(teacher_logits, vocab_group)
+    return vocab_parallel.vocab_sum((student_probs - teacher_probs).abs(), vocab_group)
 
 
 class UnoDistillLoss(nn.Module):
@@ -1492,7 +1505,8 @@ class UnoDistillLoss(nn.Module):
 
         Args:
             logits: Concatenated forward logits, Tensor of shape [batch, 2 * sequence, vocab] ordered
-                ``[x_t | x_0]``; the ``x_0`` half is the LoRA-off teacher and is detached here.
+                ``[x_t | x_0]``; the ``x_0`` half is the LoRA-off teacher and is detached here. A
+                tensor-parallel DTensor sharded on the vocabulary axis is reduced shard by shard.
             answer_mask: Bool Tensor of shape [batch, sequence] marking supervised (response)
                 positions, unshifted: position ``i`` compares the next-token distributions predicted
                 at ``i`` by the two halves.
@@ -1507,13 +1521,13 @@ class UnoDistillLoss(nn.Module):
             detached TV term. This is the paper's ``L_TV``, the full L1 distance, i.e.
             ``2 * (1 - acceptance)`` rather than the half-L1 total-variation distance.
         """
-        if isinstance(logits, DTensor):
-            logits = logits.full_tensor()
+        shard = vocab_parallel.vocab_shard(logits)
+        logits = shard.local  # [batch, 2 * sequence, local_vocab]
         supervise = answer_mask.bool() & valid_mask.bool()
-        student_logits = logits[:, :seq_len, :][supervise]  # [tokens, vocab]
+        student_logits = logits[:, :seq_len, :][supervise]  # [tokens, local_vocab]
         # x_0 queries attend only x_0 keys and that half runs with the adapter gated off, so it
         # already carries no adapter gradient; the detach just keeps the teacher explicit.
-        teacher_logits = logits[:, seq_len : 2 * seq_len, :][supervise].detach()  # [tokens, vocab]
+        teacher_logits = logits[:, seq_len : 2 * seq_len, :][supervise].detach()  # [tokens, local_vocab]
         denom = max(int(num_diffusion_tokens), 1) if num_diffusion_tokens is not None else max(int(supervise.sum()), 1)
 
         num_tokens = student_logits.size(0)
@@ -1525,16 +1539,22 @@ class UnoDistillLoss(nn.Module):
         chunk = num_tokens if self.chunk_size is None else self.chunk_size
         parts = []
         for start in range(0, num_tokens, chunk):
-            args = (student_logits[start : start + chunk], teacher_logits[start : start + chunk])
+            args = (student_logits[start : start + chunk], teacher_logits[start : start + chunk], shard.group)
             if self.chunk_size is None:
                 parts.append(_total_variation_rows(*args))
             else:
                 parts.append(torch.utils.checkpoint.checkpoint(_total_variation_rows, *args, use_reentrant=False))
-        tv = torch.cat(parts).sum() / denom
+        tv = vocab_parallel.replicated(torch.cat(parts).sum() / denom, shard.group)
 
         loss = self.tv_weight * tv
         if self.kl_weight > 0:
             labels = torch.zeros(num_tokens, dtype=torch.long, device=student_logits.device)
-            kl = self.reverse_kl(teacher_logits, student_logits, labels, num_batch_labels=denom)
+            # Vocabulary slices need the group; KDLoss then keeps them sharded.
+            reverse_kl = (
+                self.reverse_kl
+                if shard.group is None
+                else KDLoss(chunk_size=self.reverse_kl.chunk_size, tp_group=shard.group)
+            )
+            kl = reverse_kl(teacher_logits, student_logits, labels, num_batch_labels=denom)
             loss = loss + self.kl_weight * kl
         return DLLMLossOutput(total_loss=loss, dllm_loss=tv.detach().clone())

@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.loss import vocab_parallel
 from nemo_automodel.components.loss.utils import _normalize_loss_labels
 
 
@@ -53,7 +54,9 @@ class MaskedCrossEntropy(nn.Module):
         and then averaged. If no mask is provided, the standard cross-entropy loss is used.
 
         Args:
-            logits (torch.Tensor): The predicted logits with shape [batch_size, seq_len, vocab_size] where C is the number of classes.
+            logits (torch.Tensor): The predicted logits with global shape [batch_size, seq_len, vocab_size].
+                A tensor-parallel DTensor sharded on the vocabulary axis (``Shard(-1)``) is reduced
+                shard by shard, without gathering the vocabulary.
             labels (torch.Tensor): The ground truth class indices with shape [batch_size, seq_len].
             mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
                 1 will be used to calculate loss, otherwise ignored. Must be broadcastable to the shape
@@ -80,8 +83,9 @@ class MaskedCrossEntropy(nn.Module):
                     f"and {tuple(labels_shape)}"
                 )
             loss_weights = loss_weights.reshape(-1).to(device=logits.device, dtype=torch.float32)
-        # reshape to (N, C) and (N,) respectively
-        logits = logits.view(-1, logits.size(-1))
+        # reshape to (N, C) and (N,) respectively; a vocabulary-sharded DTensor keeps its local slice
+        shard = vocab_parallel.vocab_shard(logits)
+        logits = shard.local.flatten(0, -2)
         labels = labels.view(-1)
         if mask is not None:
             with torch.no_grad():
@@ -92,14 +96,20 @@ class MaskedCrossEntropy(nn.Module):
         if self.fp32_upcast:
             logits = logits.float()
 
-        if isinstance(logits, DTensor):
-            logits = logits.full_tensor()
-
         if isinstance(labels, DTensor):
             labels = labels.full_tensor()
 
         reduction = "none" if loss_weights is not None else self.reduction
-        loss = F.cross_entropy(logits, labels, ignore_index=self.ignore_index, reduction=reduction)
+        if shard.group is None:
+            loss = F.cross_entropy(logits, labels, ignore_index=self.ignore_index, reduction=reduction)
+        else:
+            loss = vocab_parallel.cross_entropy(shard.with_local(logits), labels, ignore_index=self.ignore_index)
+            if reduction == "sum":
+                loss = loss.sum()
+            elif reduction == "mean":
+                loss = loss.sum() / (labels != self.ignore_index).sum()
+            elif reduction != "none":
+                raise ValueError(f"Unsupported reduction: {reduction!r}")
         if loss_weights is not None:
             loss = (loss * loss_weights).sum()
         if num_label_tokens is not None:

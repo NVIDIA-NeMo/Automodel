@@ -611,6 +611,45 @@ def unshard_context_parallel_tensor(
     return unsharded
 
 
+def gather_context_parallel_tensor(
+    cp_mesh: DeviceMesh,
+    tensor: torch.Tensor,
+    *,
+    seq_dim: int,
+) -> torch.Tensor | None:
+    """Restore a load-balanced context-parallel tensor on the first CP rank only.
+
+    Unlike :func:`unshard_context_parallel_tensor`, the other ranks only send
+    their chunk; they never hold the full sequence. Every rank of ``cp_mesh``
+    must call this.
+
+    Args:
+        cp_mesh: One-dimensional context-parallel mesh of size ``C``.
+        tensor: Tensor of shape ``[..., local_sequence, ...]`` whose sequence
+            axis is selected by ``seq_dim`` and uses PyTorch's load-balanced CP
+            layout. Every rank holds the same shape.
+        seq_dim: Axis containing the local sequence extent.
+
+    Returns:
+        On CP rank 0, a tensor of shape ``[..., sequence, ...]`` equal to what
+        :func:`unshard_context_parallel_tensor` returns; None on other ranks.
+    """
+    if cp_mesh.size() <= 1:
+        return tensor
+    group = cp_mesh.get_group()
+    rank = cp_mesh.get_local_rank()
+    local_len = tensor.shape[seq_dim]
+    # Unsharding each element's (rank, local index) code through the same load
+    # balancer gives the source of every global position, without reimplementing it.
+    codes = rank * local_len + torch.arange(local_len, device=tensor.device)
+    order = unshard_context_parallel_tensor(cp_mesh, codes.unsqueeze(0), seq_dim=1)[0]
+    chunks = [torch.empty_like(tensor) for _ in range(cp_mesh.size())] if rank == 0 else None
+    torch.distributed.gather(tensor.contiguous(), chunks, dst=torch.distributed.get_global_rank(group, 0), group=group)
+    if chunks is None:
+        return None
+    return torch.cat(chunks, dim=seq_dim).index_select(seq_dim, order)
+
+
 def _make_cp_batch_and_ctx(
     device_mesh,
     batch,

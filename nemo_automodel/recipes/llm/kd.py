@@ -551,7 +551,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         Returns:
             Detached tensor of shape ``[batch, sequence, vocab]`` on the teacher
-            output rank, otherwise ``None`` for PP ranks without the final stage.
+            replica's transport rank, otherwise ``None`` (PP ranks without the
+            final stage and the other TP/CP ranks, which only send their shards).
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
@@ -588,17 +589,17 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     capture[0] = None
                 logits = None
                 if captured_logits:
-                    logits = torch.cat(
-                        [
-                            materialize_teacher_logits(
-                                microbatch_logits,
-                                device_mesh=self.device_mesh,
-                                sequence_length=sequence_length,
-                            )
-                            for microbatch_logits in captured_logits
-                        ],
-                        dim=0,
-                    )
+                    microbatches = [
+                        materialize_teacher_logits(
+                            microbatch_logits,
+                            device_mesh=self.device_mesh,
+                            sequence_length=sequence_length,
+                        )
+                        for microbatch_logits in captured_logits
+                    ]
+                    # Only the transport rank assembles full logits; the others return None.
+                    if microbatches[0] is not None:
+                        logits = torch.cat(microbatches, dim=0)
             else:
                 teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
                 output = self.teacher_model(**teacher_batch)

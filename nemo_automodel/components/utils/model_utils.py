@@ -32,7 +32,6 @@ import math
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
@@ -183,26 +182,6 @@ def get_lm_head_module(model: nn.Module) -> nn.Module | None:
         if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
             return module
     return None
-
-
-def _full_tensor(weight: torch.Tensor | nn.Module) -> torch.Tensor:
-    """Return ``weight`` as a regular tensor, gathering a DTensor; a module attribute is rejected."""
-    if isinstance(weight, DTensor):
-        return weight.full_tensor()
-    if isinstance(weight, torch.Tensor):
-        return weight
-    raise TypeError(f"LM-head weight must be a tensor, got {type(weight).__name__}")
-
-
-def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
-    """Return the model's LM-head weight, materializing DTensor weights when needed."""
-    lm_head = get_lm_head_module(model)
-    if lm_head is not None:
-        return _full_tensor(lm_head.weight)
-    for name, param in model.named_parameters(remove_duplicate=False):
-        if "lm_head" in name and name.endswith(".weight"):
-            return _full_tensor(param)
-    raise ValueError("lm_head.weight not found in model")
 
 
 def _get_logical_numel(param: torch.Tensor) -> int:

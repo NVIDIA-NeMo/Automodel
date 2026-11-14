@@ -228,7 +228,7 @@ def main() -> None:
     loss_hidden = torch.randn(2, 5, 16, device=device, requires_grad=True)
     loss_labels = torch.randint(0, 32, (2, 5), device=device)
 
-    materialized_tp_weight = Gemma4TensorParallelFusedLinearCrossEntropy.materialize_lm_weight(tp_loss_weight)
+    materialized_tp_weight = Gemma4TensorParallelFusedLinearCrossEntropy.resolve_lm_weight(tp_loss_weight)
     F.cross_entropy(F.linear(loss_hidden, materialized_tp_weight).flatten(0, 1), loss_labels.flatten()).backward()
     F.cross_entropy(F.linear(loss_hidden.detach(), full_loss_weight).flatten(0, 1), loss_labels.flatten()).backward()
 
