@@ -21,7 +21,8 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
-from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _build_packed_vlm_sample, _shift_sample
+from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _shift_sample
+from nemo_automodel.components.datasets.vlm.preprocessing import merge_vlm_documents
 from nemo_automodel.components.models.deepseek_v41 import attention
 from nemo_automodel.components.models.deepseek_v41.cp import shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
@@ -103,7 +104,7 @@ def _batch(samples: list[dict[str, torch.Tensor]], *, length: int | None = None,
     Returns:
         A collated native VLM batch with token axes [1, sequence].
     """
-    pack = _build_packed_vlm_sample([_shift_sample(s) for s in samples], 4096, 0, sequence_alignment=alignment)
+    pack = merge_vlm_documents([_shift_sample(s) for s in samples], padding_idx=0, sequence_alignment=alignment)
     return packed_sequence_thd_vlm_collater([pack], max_length=length)
 
 
@@ -305,7 +306,7 @@ def test_batch_rows_keep_distinct_image_and_document_order() -> None:
         [_sample(((1, 1), (3, 5))), _sample(())],
         [_sample(()), _sample(((5, 3),), prefix=2)],
     ]
-    packs = [_build_packed_vlm_sample([_shift_sample(s) for s in row], 256, 0, sequence_alignment=4) for row in rows]
+    packs = [merge_vlm_documents([_shift_sample(s) for s in row], padding_idx=0, sequence_alignment=4) for row in rows]
     batch = packed_sequence_thd_vlm_collater(packs, max_length=128)
     _, batch, _ = shard_cp_batch(None, None, batch, packed_alignment=2)
     batch.pop("labels")

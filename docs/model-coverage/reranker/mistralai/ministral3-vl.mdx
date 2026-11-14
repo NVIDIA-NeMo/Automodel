@@ -1,0 +1,31 @@
+---
+title: "Ministral-3-3B-Instruct-2512-BF16"
+description: "Use the existing NeMo AutoModel cross-encoder recipe for Ministral-3-3B-Instruct-2512-BF16 with bidirectional image-text ranking."
+slug: model-coverage/reranking-models/mistralai/Ministral-3-3B-Instruct-2512-BF16
+---
+
+The [Ministral 3 BF16 checkpoint](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-BF16)
+can initialize AutoModel's image-text cross-encoder. The existing retrieval
+recipe adds a scalar ranking head and uses bidirectional text attention.
+
+## Train the Cross-Encoder
+
+Follow the [installation guide](/get-started/installation) and prepare the
+corpus-ID JSON inputs described in the [retrieval dataset guide](/datasets/retrieval-dataset).
+Set the data paths in the
+[recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml),
+then run from the repository root:
+
+```bash
+uv run automodel examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml --nproc-per-node 8
+```
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text Reranking |
+| Architecture | `Mistral3VLBidirectionalForSequenceClassification` |
+| Checkpoint | [`mistralai/Ministral-3-3B-Instruct-2512-BF16`](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-BF16) |

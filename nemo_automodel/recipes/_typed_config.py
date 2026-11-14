@@ -423,12 +423,20 @@ class RecipeConfig:
         """
         from torchdata.stateful_dataloader import StatefulDataLoader
 
-        from nemo_automodel.components.datasets.loader import make_dataset_config
+        from nemo_automodel.components.datasets.loader import StreamDatasetConfig, make_dataset_config
         from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
         from nemo_automodel.components.datasets.vlm.loader import VlmCollatorConfig, VlmDataloaderConfig
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        # Native preprocessing keys are consumed below. Preserve their presence
+        # so stream configs cannot silently ignore them, even when set to false.
+        native_preprocessing_fields = dataset_kwargs.keys() & {
+            "packing",
+            "pretokenize",
+            "truncate",
+            "inject_fake_images",
+        }
         # `tokenizer`/`processor` are runtime build args, not declarative dataset fields.
         # Drop them here as the LLM path (`_resolve_dataloader`) does, so a `dataset.tokenizer`
         # block (valid on the LLM path) does not reach the dataset config, which rejects unknown fields.
@@ -440,6 +448,14 @@ class RecipeConfig:
         truncate = dataset_kwargs.pop("truncate", dataset_max_length is not None)
         inject_fake_images = dataset_kwargs.pop("inject_fake_images", True)
         dataset_config = make_dataset_config(target, dataset_kwargs)
+        if isinstance(dataset_config, StreamDatasetConfig):
+            if native_preprocessing_fields:
+                raise TypeError(
+                    "Stream dataset configurations do not accept native VLM preprocessing fields: "
+                    f"{', '.join(sorted(native_preprocessing_fields))}; configure the selected stream backend instead"
+                )
+            if packed_sequence_node is not None:
+                raise ValueError("Stream datasets own packing; remove native packed_sequence configuration")
 
         packed = _as_dict(packed_sequence_node)
         if packed_sequence_node is not None:
@@ -504,8 +520,11 @@ class RecipeConfig:
 
         loader_kwargs = _as_dict(dataloader_node)
         loader_target = loader_kwargs.pop("_target_", None)
-        if loader_target not in (None, "torchdata.stateful_dataloader.StatefulDataLoader", StatefulDataLoader):
-            raise ValueError(f"Unsupported VLM dataloader _target_ {loader_target!r}; expected StatefulDataLoader")
+        config_class = (
+            VlmDataloaderConfig
+            if loader_target in ("torchdata.stateful_dataloader.StatefulDataLoader", StatefulDataLoader)
+            else _loader_config_class(loader_target, VlmDataloaderConfig, dataset_config=dataset_config)
+        )
         collate_node = loader_kwargs.pop("collate_fn", None)
         collator = None
         if collate_node is not None:
@@ -526,7 +545,7 @@ class RecipeConfig:
         if unknown:
             raise TypeError(f"Unexpected VLM dataloader config field(s): {', '.join(unknown)}")
 
-        return VlmDataloaderConfig(
+        return config_class(
             dataset_config=dataset_config,
             processor_config=cls._resolve_vlm_processor(processor_node),
             pretokenization=pretokenization,

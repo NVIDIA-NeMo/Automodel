@@ -21,7 +21,6 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Union
 
-from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
 
 if TYPE_CHECKING:
@@ -120,6 +119,9 @@ def _load_dataset(
     Returns:
         datasets.Dataset: The loaded dataset.
     """
+    # Formatting helpers are also used without the native HF dataset reader.
+    from datasets import VerificationMode, load_dataset
+
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
             path_or_dataset_id,
@@ -151,6 +153,23 @@ def _check_all_values_equal_length(sample: Dict[str, List[int]]) -> bool:
             all_equal = False
             break
     return all_equal
+
+
+def instruction_messages(sample: dict[str, str]) -> list[dict[str, str]]:
+    """Normalize mapped context/question/answer fields into the native chat order."""
+    return [
+        {"role": "system", "content": sample.get("context") or ""},
+        {"role": "user", "content": sample.get("question") or ""},
+        {"role": "assistant", "content": sample["answer"]},
+    ]
+
+
+def instruction_prompt_completion(sample: dict[str, str]) -> tuple[str, str]:
+    """Normalize mapped instruction fields using the native prompt whitespace."""
+    prompt = " ".join(value for value in (sample.get("context"), sample.get("question"), "") if value is not None)
+    if len(prompt) <= 1:
+        raise ValueError("Expected prompt to be non-empty")
+    return prompt, sample["answer"]
 
 
 @dataclass
@@ -341,19 +360,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
         """
         assert isinstance(sample, dict), "Expected sample to be a dictionary"
         assert len(sample) >= 2, "Expected at least two columns"
-        context = sample.get(ColumnTypes.Context.value, None)
-        question = sample.get(ColumnTypes.Question.value, None)
-        answer = sample[ColumnTypes.Answer.value]
 
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
         if self.use_hf_chat_template and _has_chat_template(self.tokenizer):
-            formatted_text = [
-                {"role": "system", "content": context or ""},
-                {"role": "user", "content": question or ""},
-                {"role": "assistant", "content": answer},
-            ]
+            formatted_text = instruction_messages(sample)
             return format_chat_template(
                 self.tokenizer,
                 formatted_text,
@@ -365,8 +377,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 answer_only_loss_mask=self.answer_only_loss_mask,
             )
         else:
-            prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))
-            assert len(prompt) > 1, "Expected prompt to be non-empty"
+            prompt, answer = instruction_prompt_completion(sample)
             return format_prompt_completion(
                 self.tokenizer,
                 prompt,

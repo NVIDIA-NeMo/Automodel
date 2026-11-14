@@ -20,7 +20,7 @@ import torch
 from PIL import Image as PILImage
 from transformers.processing_utils import ProcessorMixin
 
-from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX, resolve_chat_template_string
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
@@ -65,6 +65,7 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
     inject_fake_image_into_conversation,
     mask_fake_vision_tokens_batch,
 )
+from nemo_automodel.components.datasets.vlm.preprocessing import collate_position_ids, merge_media_values
 from nemo_automodel.components.datasets.vlm.samplers import _smart_resize_image
 from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
 
@@ -309,7 +310,7 @@ _IMSTART_TEMPLATE_PROCESSORS = frozenset(
 )
 
 
-def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
+def _derive_turn_markers(tokenizer, *, chat_template: str | None = None) -> tuple[list[int], int]:
     """Derive the assistant-turn start marker and end-of-turn token id from the
     tokenizer's own chat template.
 
@@ -329,6 +330,11 @@ def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
         ``isinstance(result, dict)`` is ``False``.  We access ``result["input_ids"]``
         directly, which works for both ``BatchEncoding`` and plain ``dict`` / ``list``.
 
+    Args:
+        tokenizer: Tokenizer that renders and encodes assistant-turn markers.
+        chat_template: Resolved processor template, when it differs from the
+            tokenizer's default. None retains the tokenizer's own selection.
+
     Returns
     -------
     tuple[list[int], int]
@@ -347,12 +353,14 @@ def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
         except (KeyError, TypeError):
             return list(result)
 
+    template_kwargs = {"chat_template": chat_template} if chat_template is not None else {}
     sentinel = "XSENTINELMARKERX"
     all_ids = _extract_ids(
         tokenizer.apply_chat_template(
             [{"role": "user", "content": "u"}, {"role": "assistant", "content": sentinel}],
             tokenize=True,
             add_generation_prompt=False,
+            **template_kwargs,
         )
     )
     user_ids = _extract_ids(
@@ -360,6 +368,7 @@ def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
             [{"role": "user", "content": "u"}],
             tokenize=True,
             add_generation_prompt=False,
+            **template_kwargs,
         )
     )
     sentinel_ids = tokenizer.encode(sentinel, add_special_tokens=False)
@@ -507,7 +516,9 @@ def build_labels_from_template(
     # ------------------------------------------------------------------
     if hasattr(tokenizer, "apply_chat_template"):
         try:
-            assistant_marker, stop_id = _derive_turn_markers(tokenizer)
+            template = getattr(processor, "chat_template", None)
+            selected_template = resolve_chat_template_string(template) if isinstance(template, dict) else None
+            assistant_marker, stop_id = _derive_turn_markers(tokenizer, chat_template=selected_template)
             return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
         except Exception as exc:
             logger.warning(
@@ -1437,25 +1448,6 @@ def default_collate_fn(
     return batch
 
 
-def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
-    """Merge fixed-shape patch tensors or preserve variable-resolution media lists."""
-    if not values:
-        raise ValueError("Media merge requires at least one value.")
-    if all(isinstance(value, torch.Tensor) for value in values):
-        return torch.cat(values, dim=0).to(torch.bfloat16)
-    # At least one pack carries variable-resolution media as a list: flatten
-    # every pack to one tensor per image (a stacked [N, ...] tensor splits along dim 0).
-    flat = []
-    for value in values:
-        if isinstance(value, torch.Tensor):
-            flat.extend(value.to(torch.bfloat16))
-        elif isinstance(value, (list, tuple)):
-            flat.extend(item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for item in value)
-        else:
-            raise TypeError(f"VLM media values must be tensors or lists, got {type(value).__name__}.")
-    return flat
-
-
 def pad_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -1543,7 +1535,7 @@ def pad_collate_fn(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
-            batch[key] = _merge_media_values(tensors)
+            batch[key] = merge_media_values(tensors, dtype=torch.bfloat16)
 
     # Per-sample image counts from image_grid_thw shapes (before concat)
     image_grid_per_sample = [
@@ -1684,21 +1676,7 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
-    pos_sample = torch.as_tensor(batch[0]["position_ids"])
-    if pos_sample.ndim == 2:
-        # mRoPE: [3, seq_len] → pad to [3, max_len], stack to [3, B, max_len]
-        def _pad_mrope(pos, target_len):
-            t = torch.as_tensor(pos)  # [3, seq_len]
-            pad_len = target_len - t.shape[1]
-            if pad_len > 0:
-                return torch.cat([t, torch.zeros(3, pad_len, dtype=t.dtype)], dim=1)
-            return t
-
-        position_ids = torch.stack([_pad_mrope(x["position_ids"], max_len) for x in batch], dim=1)
-    else:
-        # Standard 1D: [seq_len] → pad to [max_len], stack to [B, max_len]
-        position_ids = torch.stack([_pad_1d(x["position_ids"], 0, max_len) for x in batch])
+    position_ids = collate_position_ids([torch.as_tensor(x["position_ids"]) for x in batch], sequence_length=max_len)
 
     result: Dict[str, Any] = {
         "input_ids": input_ids,
@@ -1745,7 +1723,7 @@ def neat_packed_vlm_collater(
             ):
                 result[key] = pad_image_tensors(tensors).to(torch.bfloat16)
             else:
-                result[key] = _merge_media_values(tensors)
+                result[key] = merge_media_values(tensors, dtype=torch.bfloat16)
 
     for key in (
         "image_grid_thw",
@@ -1884,12 +1862,7 @@ def packed_sequence_thd_vlm_collater(
     seq_lens = torch.LongTensor(pad_within_micro(seq_lens_list, seq_lens_padding_value))
     seq_lens_padded = torch.LongTensor(pad_within_micro(seq_lens_padded_list, seq_lens_padding_value))
 
-    pos_sample = torch.as_tensor(batch[0]["position_ids"])
-    if pos_sample.ndim == 2:
-        # mRoPE [n_rope, seq]: pad along the seq axis, then stack on a new batch axis.
-        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len, seq_dim=1) for x in batch], dim=1)
-    else:
-        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len) for x in batch])
+    position_ids = collate_position_ids([torch.as_tensor(x["position_ids"]) for x in batch], sequence_length=max_len)
 
     result: Dict[str, Any] = {
         "input_ids": input_ids,
@@ -1910,7 +1883,7 @@ def packed_sequence_thd_vlm_collater(
             ):
                 result[key] = pad_image_tensors(tensors).to(torch.bfloat16)
             else:
-                result[key] = _merge_media_values(tensors)
+                result[key] = merge_media_values(tensors, dtype=torch.bfloat16)
 
     for key in (
         "image_grid_thw",

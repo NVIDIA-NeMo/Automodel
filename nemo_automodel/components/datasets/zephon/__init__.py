@@ -12,5 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Zephon data backend for AutoModel recipes."""
 
-"""Shared Zephon source construction, batch adaptation and loader runtime."""
+import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonDataloaderConfig,
+        ZephonInstructionDatasetConfig,
+        ZephonPretokenizedTextDatasetConfig,
+        ZephonTextDatasetConfig,
+    )
+    from nemo_automodel.components.datasets.zephon.vlm_config import (
+        ZephonVlmDatasetConfig,
+        ZephonVlmOptions,
+        ZephonVlmSource,
+    )
+    from nemo_automodel.components.datasets.zephon.vlm_input import VlmInputOptions
+
+__all__ = [
+    "ZephonDataloaderConfig",
+    "ZephonInstructionDatasetConfig",
+    "ZephonPretokenizedTextDatasetConfig",
+    "ZephonTextDatasetConfig",
+    "ZephonVlmDatasetConfig",
+    "ZephonVlmOptions",
+    "ZephonVlmSource",
+    "VlmInputOptions",
+]
+
+
+def __getattr__(name: str) -> type:
+    """Load configuration only when requested, keeping worker helpers lightweight."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name = (
+        ".vlm_config"
+        if name in ("ZephonVlmDatasetConfig", "ZephonVlmOptions", "ZephonVlmSource", "VlmInputOptions")
+        else ".config"
+    )
+    module = importlib.import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose the public configuration classes before loading them."""
+    return sorted(__all__)
