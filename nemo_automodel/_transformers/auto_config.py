@@ -14,15 +14,21 @@
 
 """Hugging Face config loading through Transformers' native revision resolution."""
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from huggingface_hub import ResolvedRevision, hf_hub_download
+from huggingface_hub.errors import StrictDataclassClassValidationError
 from transformers import AutoConfig, PretrainedConfig
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.utils import CONFIG_NAME
 from transformers.utils.hub import extract_commit_hash, resolve_revision
+
+logger = logging.getLogger(__name__)
 
 
 class NeMoAutoConfig(AutoConfig):
@@ -124,7 +130,57 @@ class NeMoAutoConfig(AutoConfig):
             The config, or the config and unused options when requested.
         """
         kwargs = cls._pin_revision(pretrained_model_name_or_path, kwargs)
-        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        try:
+            return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        except (ValueError, StrictDataclassClassValidationError) as exc:
+            message = str(exc)
+            if "num_hidden_layers" not in message or not ("layer_types" in message or "layer types" in message):
+                raise
+            return cls._load_config_with_layer_types_fix(pretrained_model_name_or_path, **kwargs)
+
+    @classmethod
+    def _load_config_with_layer_types_fix(
+        cls, pretrained_model_name_or_path: str | os.PathLike, **kwargs: Any
+    ) -> PretrainedConfig | tuple[PretrainedConfig, dict[str, Any]]:
+        """Retry config construction after removing layer types beyond the decoder."""
+        kwargs = kwargs.copy()
+        trust_remote_code = kwargs.pop("trust_remote_code", False)
+        code_revision = kwargs.pop("code_revision", None)
+        kwargs["_from_auto"] = True
+        kwargs["name_or_path"] = os.fspath(pretrained_model_name_or_path)
+        config_dict, unused_kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
+        n = config_dict.get("num_hidden_layers")
+        layer_types = config_dict.get("layer_types")
+        # These values come from external checkpoint JSON, before HF validates it.
+        if isinstance(n, int) and isinstance(layer_types, list) and len(layer_types) > n:
+            logger.warning(
+                "Truncating layer_types (len=%d) to num_hidden_layers=%d for %s",
+                len(layer_types),
+                n,
+                pretrained_model_name_or_path,
+            )
+            config_dict["layer_types"] = layer_types[:n]
+
+        model_type = config_dict.get("model_type")
+        config_cls = CONFIG_MAPPING[model_type] if model_type in CONFIG_MAPPING else None
+        # HF gives explicitly registered local classes precedence over remote code.
+        explicit_local_code = config_cls is not None and not config_cls.__module__.startswith("transformers.")
+        auto_map = config_dict.get("auto_map") or {}
+        if trust_remote_code and "AutoConfig" in auto_map and not explicit_local_code:
+            code_kwargs = {
+                key: kwargs[key]
+                for key in ("revision", "cache_dir", "token", "local_files_only", "force_download", "subfolder")
+                if key in kwargs
+            }
+            config_cls = get_class_from_dynamic_module(
+                auto_map["AutoConfig"], pretrained_model_name_or_path, code_revision=code_revision, **code_kwargs
+            )
+        if config_cls is None:
+            raise ValueError(
+                f"Could not resolve config class for {pretrained_model_name_or_path} "
+                f"(model_type={config_dict.get('model_type')!r})"
+            )
+        return config_cls.from_dict(config_dict, **unused_kwargs)
 
     @classmethod
     def get_config_dict(
