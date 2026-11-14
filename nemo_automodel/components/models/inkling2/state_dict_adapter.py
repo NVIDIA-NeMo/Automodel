@@ -227,13 +227,18 @@ class Inkling2StateDictAdapter(StateDictAdapter):
     projections and singleton residual queries instead get staging tensors from
     ``to_hf(for_checkpoint_load=True)``; ``from_hf`` decodes or copies them into the
     original storage and reports those keys through ``view_loaded_native_keys``.
+
+    Transformer Engine experts keep one parameter per expert, and their state dict stacks
+    copies. With ``experts_alias_state_dict=False`` the decoded experts are therefore returned
+    by ``from_hf`` like every other tensor, for ``load_state_dict`` to assign.
     """
 
     # Direct aliases plus per-tensor staging avoid a full model copy.
     _supports_low_memory_dcp_load = True
 
-    def __init__(self, config: Inkling2TextConfig | Inkling2Config) -> None:
+    def __init__(self, config: Inkling2TextConfig | Inkling2Config, *, experts_alias_state_dict: bool = True) -> None:
         self.multimodal = isinstance(config, Inkling2Config)
+        self.experts_alias_state_dict = experts_alias_state_dict
         config = config.text_config if isinstance(config, Inkling2Config) else config
         self.config = config
         self.source_quantized = config.quantization_config is not None
@@ -242,6 +247,8 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         )
         # Staging allocated by to_hf(for_checkpoint_load=True) and completed by the following from_hf.
         self._pending: list[tuple[frozenset[str], _QuantizedProjection | _FloatingLayout]] = []
+        # Decoded expert destinations that from_hf returns: (staging keys, native key, destination).
+        self._decoded_experts: list[tuple[frozenset[str], str, torch.Tensor]] = []
         self._view_loaded_native_keys: set[str] = set()
 
     def _split_sizes(self, layer: int) -> tuple[int, ...]:
@@ -413,7 +420,7 @@ class Inkling2StateDictAdapter(StateDictAdapter):
                 "Quantization targets are for checkpoint loading only; export trained weights without quantization"
             )
         if for_checkpoint_load:
-            self._pending, self._view_loaded_native_keys = [], set()
+            self._pending, self._decoded_experts, self._view_loaded_native_keys = [], [], set()
         output: dict[str, torch.Tensor] = {}
         for key, tensor in state_dict.items():
             if exclude_key_regex is not None and re.search(exclude_key_regex, key) is not None:
@@ -466,7 +473,10 @@ class Inkling2StateDictAdapter(StateDictAdapter):
             denominator = torch.empty(1, dtype=torch.float32, device=_local(destination).device)
             targets.update({key + "_amax": amax, key + "_outer_scale_denominator": denominator})
         self._pending.append((frozenset(targets), _QuantizedProjection(destination, packed, scale, amax, denominator)))
-        self._view_loaded_native_keys.add(name)
+        if self.experts_alias_state_dict:
+            self._view_loaded_native_keys.add(name)
+        else:
+            self._decoded_experts.append((frozenset(targets), name, tensor))
         return targets
 
     @property
@@ -515,6 +525,10 @@ class Inkling2StateDictAdapter(StateDictAdapter):
                 staged |= keys
         self._pending = []
         output, fused, consumed = {}, {}, set(staged)
+        for keys, name, tensor in self._decoded_experts:
+            if keys <= staged:
+                output[name] = tensor
+        self._decoded_experts = []
         roots = {
             "embed.weight": "embed_tokens.weight",
             "embed_norm.weight": "embed_norm.weight",

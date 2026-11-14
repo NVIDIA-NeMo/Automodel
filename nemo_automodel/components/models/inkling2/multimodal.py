@@ -68,7 +68,9 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
             config.vision_config, config.text_config.hidden_size, dtype=self.embed_tokens.weight.dtype
         )
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Inkling2StateDictAdapter(config)
+            self.state_dict_adapter = Inkling2StateDictAdapter(
+                config, experts_alias_state_dict=self.backend.experts != "te"
+            )
 
     @classmethod
     def from_config(

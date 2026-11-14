@@ -200,6 +200,26 @@ def test_safetensors_load_targets_decode_into_existing_storage(tmp_path: Path, d
         adapter.to_hf(native, quantization=True)
 
 
+def test_decoded_experts_are_returned_when_the_state_dict_does_not_alias_them(tmp_path: Path) -> None:
+    """Transformer Engine experts stack copies in state_dict(): from_hf must hand the decoded experts back."""
+    model, checkpoint, expected = mixed_fixture()
+    write_checkpoint(checkpoint, tmp_path)
+    adapter = Inkling2StateDictAdapter(model.config, experts_alias_state_dict=False)
+    # Copies, as a state dict that does not share storage with the experts would give.
+    native = {k: torch.full_like(v, float("nan")) for k, v in expected.items()}
+    expert_keys = {k for k in native if ".mlp.experts." in k}
+    assert expert_keys
+    targets = adapter.to_hf(native, quantization=True, for_checkpoint_load=True)
+    dcp.load(targets, storage_reader=_HuggingFaceStorageReader(str(tmp_path), key_mapping=None), no_dist=True)
+    restored = adapter.from_hf(targets)
+    assert adapter.view_loaded_native_keys == set()
+    assert set(restored) == set(native)
+    for key in expert_keys:
+        torch.testing.assert_close(restored[key], expected[key], rtol=0, atol=0, msg=key)
+    # A second conversion without a new load has nothing staged to return.
+    assert not expert_keys & set(adapter.from_hf({k: v for k, v in targets.items() if ".mlp.experts." not in k}))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_public_checkpointer_load_forward_backward_and_float_reload(tmp_path: Path, dtype: torch.dtype) -> None:
     model, checkpoint, expected = mixed_fixture()
