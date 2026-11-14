@@ -14,10 +14,13 @@
 
 """Reference parity for the dense Qwen3 implementation."""
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 from transformers import Qwen3Config
 from transformers.cache_utils import DynamicCache
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -116,3 +119,44 @@ def test_qwen3_bshd_bf16_fp32_rope_forward_backward_and_cache(attn_implementatio
     assert cache.get_seq_length() == hidden_states.shape[1]
     assert cache.layers[0].keys.dtype == cache.layers[0].values.dtype == torch.bfloat16
     torch.testing.assert_close(decoded, output)
+
+
+@pytest.mark.cpu_only
+def test_qwen3_autocast_attention_dtype_and_hf_parity() -> None:
+    """FP32 master norms must not promote Q/K or cached keys out of the compute dtype."""
+    torch.manual_seed(1234)
+    config = _tiny_config()
+    reference = HFQwen3ForCausalLM(config).train()
+    with torch.no_grad():
+        for layer in reference.model.layers:
+            layer.self_attn.q_norm.weight.normal_(mean=1.0, std=0.25)
+            layer.self_attn.k_norm.weight.normal_(mean=1.0, std=0.25)
+    model = Qwen3ForCausalLM(config, backend=BackendConfig(attn="sdpa", rope_fusion=False)).train()
+    model.load_state_dict(reference.state_dict())
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    cache = DynamicCache(config=config)
+    attention = Mock(wraps=ALL_ATTENTION_FUNCTIONS["sdpa"])
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        expected = reference(input_ids, position_ids=position_ids, use_cache=False).logits
+        with patch.object(ALL_ATTENTION_FUNCTIONS, "get_interface", return_value=attention):
+            actual = model(input_ids, position_ids=position_ids, past_key_values=cache, use_cache=True).logits
+
+    assert len(attention.call_args_list) == config.num_hidden_layers
+    for call in attention.call_args_list:
+        query, key, value = call.args[1:4]
+        assert query.dtype == key.dtype == value.dtype == torch.bfloat16
+    for layer in cache.layers:
+        assert layer.keys.dtype == layer.values.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    for (name, parameter), (reference_name, reference_parameter) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        assert name == reference_name
+        assert parameter.dtype == torch.float32
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=0, atol=0, msg=name)
