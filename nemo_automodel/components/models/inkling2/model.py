@@ -304,7 +304,9 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             config.hidden_size, config.vocab_size, bias=False, dtype=dtype
         )
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Inkling2StateDictAdapter(config)
+            self.state_dict_adapter = Inkling2StateDictAdapter(
+                config, experts_alias_state_dict=self.backend.experts != "te"
+            )
         Inkling2ForCausalLM.initialize_weights(self)
 
     def prepare_model_inputs_for_cp(self, batch: CPBatch, *, num_chunks: int = 1) -> dict[str, ContextParallelSharder]:
