@@ -55,6 +55,7 @@ from torch.distributed.tensor import DTensor, Shard
 from nemo_automodel.components.optim.dion import build_dion_optimizer, get_dion_mesh, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.optim.weight_rounding import WeightRounding, attach_bf16_weight_rounding
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -75,7 +76,7 @@ _DTYPE_FIELDS = ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
 
 # Config fields that are not optimizer-constructor kwargs and must be stripped
 # from ``asdict(self)`` before splatting into the underlying optimizer.
-_NON_CONSTRUCTOR_FIELDS = frozenset({"param_group_overrides"})
+_NON_CONSTRUCTOR_FIELDS = frozenset({"param_group_overrides", "weight_rounding", "rounding_seed"})
 
 
 @dataclass
@@ -196,9 +197,10 @@ class OptimizerConfig:
     via ``shard_optimizers_for_megatron_fsdp(...)``.
     """
 
-    # Whether this optimizer can be sharded for Megatron-FSDP. The recipe layer
-    # reads this to decide whether to shard the built optimizers.
-    supports_megatron_fsdp_sharding: ClassVar[bool] = True
+    @property
+    def supports_megatron_fsdp_sharding(self) -> bool:
+        """Whether the recipe may apply Megatron-FSDP optimizer sharding."""
+        return True
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
@@ -283,7 +285,19 @@ class AdamConfig(OptimizerConfig):
 
 @dataclass
 class AdamWConfig(OptimizerConfig):
-    """``torch.optim.AdamW``."""
+    """Native AdamW with optional BF16 working-weight rounding.
+
+    weight_rounding=None preserves the standard optimizer behavior. Setting
+    it to "nearest" or "stochastic" keeps full-precision master weights in
+    optimizer state and writes BF16-representable working weights into existing
+    FP32 parameters after each step. Use FP32 model storage and BF16 FSDP2
+    compute; enabling rounding does not change AdamW update arithmetic.
+
+    rounding_seed controls private per-parameter SR streams. Caller-defined
+    parameter groups may set quantize=False to retain ordinary FP32 weights.
+    Rounded mode requires unfused, non-foreach AdamW and supports DTensors with
+    Shard/Replicate placements. Megatron-FSDP optimizer sharding is unsupported.
+    """
 
     lr: float = 1e-4
     weight_decay: float = 0.01
@@ -291,16 +305,31 @@ class AdamWConfig(OptimizerConfig):
     eps: float = 1e-8
     amsgrad: bool = False
     fused: bool = False
+    weight_rounding: WeightRounding | None = None
+    rounding_seed: int = 42
+
+    @property
+    def supports_megatron_fsdp_sharding(self) -> bool:
+        """Keep the existing backend support when working-weight rounding is off."""
+        return self.weight_rounding is None
 
     def _build_optimizer(
         self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
     ) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
+        if self.weight_rounding is not None and params and isinstance(params[0], dict):
+            # Native flattened DCP needs a parameter FQN for each group. Keep
+            # zero-sized local shards; omit only globally empty parameter groups.
+            params = [group for group in params if isinstance(group, dict) and group["params"]]
+        optimizer = torch.optim.AdamW(
             params,
             **self._constructor_kwargs(),
-            # foreach and fused are mutually exclusive; only pass foreach when not fused.
-            foreach=foreach and not self.fused,
+            # Rounded mode uses native single-tensor AdamW, matching the reference.
+            # Otherwise preserve the existing foreach/fused selection.
+            foreach=False if self.weight_rounding is not None else foreach and not self.fused,
         )
+        if self.weight_rounding is not None:
+            attach_bf16_weight_rounding(optimizer, rounding=self.weight_rounding, rounding_seed=self.rounding_seed)
+        return optimizer
 
 
 @dataclass
@@ -373,7 +402,11 @@ class _DionConfigBase(OptimizerConfig):
     """
 
     # Dion optimizers are incompatible with Megatron-FSDP optimizer sharding.
-    supports_megatron_fsdp_sharding: ClassVar[bool] = False
+    @property
+    def supports_megatron_fsdp_sharding(self) -> bool:
+        """Dion-family optimizers do not support Megatron-FSDP sharding."""
+        return False
+
     use_matrix_layout: ClassVar[bool] = False
 
     @property

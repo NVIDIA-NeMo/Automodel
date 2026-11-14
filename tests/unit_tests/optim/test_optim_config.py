@@ -15,6 +15,7 @@
 """Tests for nemo_automodel.components.optim.optimizer — typed configs + builders."""
 
 import math
+from dataclasses import asdict
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +37,7 @@ from nemo_automodel.components.optim.optimizer import (
     build_optimizer_config,
 )
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.optim.weight_rounding import WeightRounding
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 
@@ -104,9 +106,113 @@ class TestAdamWConfig:
 
     def test_build_fused_skips_foreach(self):
         # fused and foreach are mutually exclusive; foreach is disabled when fused.
-        opt = AdamWConfig(fused=True)._build_optimizer(_params(), foreach=False)
+        opt = AdamWConfig(fused=True)._build_optimizer(_params(), foreach=True)
         assert opt.param_groups[0]["fused"] is True
         assert not opt.param_groups[0]["foreach"]
+
+    @pytest.mark.parametrize("foreach", [None, False, True])
+    def test_default_preserves_native_state_groups_and_updates(self, foreach: bool | None) -> None:
+        param = nn.Parameter(torch.tensor([1.0, -0.5], dtype=torch.float32))
+        reference_param = nn.Parameter(param.detach().clone())
+        config = AdamWConfig(lr=1e-3, rounding_seed=99)
+        optimizer = config._build_optimizer([param], foreach=foreach)
+        reference = torch.optim.AdamW(
+            [reference_param],
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            amsgrad=False,
+            fused=False,
+            foreach=foreach,
+        )
+
+        assert type(optimizer) is torch.optim.AdamW
+        assert config.weight_rounding is None
+        assert optimizer.state == reference.state == {}
+        assert optimizer.state_dict()["param_groups"] == reference.state_dict()["param_groups"]
+        for gradient in ([0.25, -0.5], [-0.75, 0.125]):
+            param.grad = torch.tensor(gradient)
+            reference_param.grad = param.grad.clone()
+            optimizer.step()
+            reference.step()
+            assert torch.equal(param, reference_param)
+            actual = optimizer.state[param]
+            expected = reference.state[reference_param]
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                assert torch.equal(actual[key], expected[key])
+
+    @pytest.mark.parametrize("rounding", ["nearest", "stochastic"])
+    def test_rounding_keeps_native_adamw_master_update(self, rounding: WeightRounding) -> None:
+        param = nn.Parameter(torch.tensor([1.0, -0.5], dtype=torch.float32))
+        reference_param = nn.Parameter(param.detach().clone())
+        config = AdamWConfig(lr=1e-3, weight_rounding=rounding, rounding_seed=123)
+        optimizer = config._build_optimizer([param], foreach=True)
+        reference = torch.optim.AdamW(
+            [reference_param], lr=1e-3, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8, foreach=False
+        )
+
+        assert type(optimizer) is torch.optim.AdamW
+        assert optimizer.state == {}
+        assert optimizer.param_groups[0]["foreach"] is False
+        assert optimizer.param_groups[0]["rounding"] == rounding
+        assert optimizer.param_groups[0]["rounding_seed"] == 123
+        for gradient in ([0.25, -0.5], [-0.75, 0.125]):
+            param.grad = torch.tensor(gradient)
+            reference_param.grad = param.grad.clone()
+            optimizer.step()
+            reference.step()
+            assert torch.equal(optimizer.state[param]["master"], reference_param)
+            assert param.dtype == torch.float32
+            assert torch.equal(param, param.to(torch.bfloat16).float())
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                assert torch.equal(optimizer.state[param][key], reference.state[reference_param][key])
+        assert optimizer.param_groups[0]["quantization_step"] == 2
+
+    @pytest.mark.parametrize("rounding", ["nearest", "stochastic"])
+    def test_caller_group_can_protect_fp32_weights(self, rounding: WeightRounding) -> None:
+        rounded = nn.Parameter(torch.tensor([1.0, -0.5]))
+        protected = nn.Parameter(torch.tensor([1.234567, -0.876543]))
+        reference_param = nn.Parameter(protected.detach().clone())
+        config = AdamWConfig(lr=1e-3, weight_rounding=rounding)
+        optimizer = config.build_from_param_groups([{"params": [rounded]}, {"params": [protected], "quantize": False}])
+        reference = torch.optim.AdamW(
+            [reference_param], lr=1e-3, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8, foreach=False
+        )
+        rounded.grad = torch.tensor([0.2, -0.1])
+        protected.grad = torch.tensor([0.3, -0.4])
+        reference_param.grad = protected.grad.clone()
+        optimizer.step()
+        reference.step()
+
+        assert optimizer.param_groups[1]["quantize"] is False
+        assert "master" not in optimizer.state[protected]
+        assert torch.equal(protected, reference_param)
+        assert not torch.equal(protected, protected.to(torch.bfloat16).float())
+        assert torch.equal(rounded, rounded.to(torch.bfloat16).float())
+
+    def test_rounding_fields_are_not_adamw_constructor_arguments(self) -> None:
+        config = AdamWConfig(weight_rounding="nearest", rounding_seed=7)
+        assert "weight_rounding" not in config._constructor_kwargs()
+        assert "rounding_seed" not in config._constructor_kwargs()
+        assert "supports_megatron_fsdp_sharding" not in asdict(config)
+        assert type(config._build_optimizer(_params())) is torch.optim.AdamW
+
+    @pytest.mark.parametrize("rounding", ["nearest", "stochastic"])
+    def test_rounding_rejects_fused(self, rounding: WeightRounding) -> None:
+        with pytest.raises(ValueError, match="non-fused"):
+            AdamWConfig(weight_rounding=rounding, fused=True)._build_optimizer(_params())
+
+    def test_rounding_rejects_invalid_mode(self) -> None:
+        config = build_optimizer_config("adamw", {"weight_rounding": "invalid"})
+        with pytest.raises(ValueError, match="Unsupported rounding"):
+            config._build_optimizer(_params())
+
+    def test_rounding_rejects_bf16_parameter_storage(self) -> None:
+        param = nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+        with pytest.raises(TypeError, match="FP32 parameter storage"):
+            AdamWConfig(weight_rounding="nearest")._build_optimizer([param])
 
 
 class TestOptimizerConfigBase:
