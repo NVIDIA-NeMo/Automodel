@@ -87,4 +87,5 @@ freeze_config:
   freeze_language_model: false
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100

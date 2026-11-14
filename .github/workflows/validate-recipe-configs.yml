@@ -21,7 +21,7 @@ on:
       - 'examples/**/*.yaml'
       - 'examples/**/*.yml'
       - '.github/workflows/validate-recipe-configs.yml'
-      - 'tests/ci_tests/utils/validate_nightly_recipes.py'
+      - 'tests/ci_tests/utils/validate_recipe_lists.py'
       - 'tests/ci_tests/utils/validate_generate_ci.py'
       - 'tests/ci_tests/utils/validate_new_recipe_ci.py'
       - 'tests/ci_tests/utils/generate_ci_tests.py'

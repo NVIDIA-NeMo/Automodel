@@ -77,4 +77,5 @@ optimizer:
   weight_decay: 0.01  # Crucial for stable training on small datasets
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

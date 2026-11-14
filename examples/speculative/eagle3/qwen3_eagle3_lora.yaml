@@ -58,4 +58,5 @@ checkpoint:
   model_save_format: safetensors
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

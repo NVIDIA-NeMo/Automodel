@@ -123,6 +123,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   recipe_owner: akoumpa
   time: "00:15:00"
@@ -138,3 +139,5 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+  perf_testing:
+    schedule: nightly

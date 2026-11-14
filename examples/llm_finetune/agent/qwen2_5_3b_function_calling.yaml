@@ -146,4 +146,5 @@ lr_scheduler:
 nvtx: false
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100

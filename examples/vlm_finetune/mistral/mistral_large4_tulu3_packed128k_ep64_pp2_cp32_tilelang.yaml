@@ -160,6 +160,7 @@ wandb:
   - expert-shard1
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: snowmanwwg
   cluster_tag: gb200
   nodes: 32

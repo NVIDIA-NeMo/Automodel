@@ -79,7 +79,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -98,6 +98,7 @@ lr_scheduler:
   min_lr: 2.0e-6
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: yuhez
   nodes: 1
@@ -109,7 +110,7 @@ ci:
     step_scheduler.val_every_steps: 10
     step_scheduler.global_batch_size: 8
     step_scheduler.local_batch_size: 1
-    validation_dataset.num_samples_limit: 32
+    validation_dataset.limit_dataset_samples: 32
   checkpoint_robustness:
     tokenizer_name: inclusionAI/Ling-mini-2.0
     trust_remote_code: true
@@ -122,5 +123,5 @@ ci:
       hf_reload: relaxed
     step_scheduler.global_batch_size: 8
     step_scheduler.local_batch_size: 1
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 32
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 32

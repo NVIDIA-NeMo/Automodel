@@ -113,6 +113,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: akoumpa
   time: "00:30:00"
   nproc_per_node: 1

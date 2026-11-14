@@ -1690,6 +1690,9 @@ class Checkpointer:
                 is_init_step=True,
                 key_mapping=key_mapping,
             )
+            # DoRA magnitudes are derived from the base weight, which only now holds checkpoint values.
+            # An adapter checkpoint restored later still overwrites them.
+            _init_dora_magnitudes(model)
 
         _reinit_non_persistent_buffers(model, device, model_type=model_type)
 
@@ -2606,6 +2609,18 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 module.init_lora_weights(peft_init_method)
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _init_dora_magnitudes(model: nn.Module) -> None:
+    """
+    Set every DoRA magnitude vector to the row-wise L2 norm of its module's current base weight.
+
+    Args:
+        model: Model whose DoRA modules (``use_dora=True`` with an ``init_dora_magnitude`` method) are updated.
+    """
+    for module in model.modules():
+        if getattr(module, "use_dora", False) and hasattr(module, "init_dora_magnitude"):
+            module.init_dora_magnitude()
 
 
 _MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(

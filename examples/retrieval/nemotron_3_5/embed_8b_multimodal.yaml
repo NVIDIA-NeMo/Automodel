@@ -93,4 +93,5 @@ checkpoint:
   max_recent_checkpoints: 2
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

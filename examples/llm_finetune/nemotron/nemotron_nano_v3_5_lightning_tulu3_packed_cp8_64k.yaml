@@ -127,6 +127,7 @@ wandb:
 
 # Release CI runs a short smoke test on one 8-GPU node.
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:30:00"

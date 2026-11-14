@@ -105,4 +105,5 @@ optimizer:
   exp_avg_sq_dtype: torch.float32
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

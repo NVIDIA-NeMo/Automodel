@@ -1,27 +1,17 @@
-# Custom Qwen2.5-72B with combined projections for benchmarking
-# Based on Qwen2_72B_peft_benchmark.yaml but using custom model implementation
-# Similar to custom_llama3_3_70b_instruct_peft_benchmark.yaml
+# Qwen2.5-32B LoRA finetuning on SQuAD with performance coverage in ci.perf_testing.
 
 # To run this recipe:
 #   automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
+#PR4637: removed benchmark: {nsys_end: -1, nsys_ranks: [], nsys_start: -1, num_nodes: 1, peak_tflops: 989, warmup_steps: 5}
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 42
 
-# Benchmark section
-benchmark:
-  warmup_steps: 5
-  peak_tflops: 989  # H100: 989, A100: 312
-  nsys_start: -1    # Set to step number to profile (e.g., 10)
-  nsys_end: -1      # Set to end step (e.g., 15)
-  nsys_ranks: []    # e.g., [0] to profile rank 0
-  num_nodes: 1
-
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 8
+  local_batch_size: 2  #PR4637: 8
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
@@ -36,17 +26,17 @@ rng:
   ranked: true
 
 model:
+  #PR4637: removed model.force_hf: true
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
   torch_dtype: bf16
-  force_hf: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: '*_proj'
   dim: 16
   alpha: 32
-  use_triton: True
+  use_triton: true
 
 checkpoint:
   enabled: false
@@ -55,38 +45,41 @@ checkpoint:
   save_consolidated: false
 
 distributed:
+  #PR4637: removed distributed.pipeline: {dtype: bf16, layers_per_stage: 2, pp_microbatch_size: 1, pp_schedule: interleaved1f1b, round_virtual_stages_to_pp_multiple: up, scale_grads_in_schedule: false}
   strategy: fsdp2
-  dp_size: none
-  tp_size: 1
+  dp_size:  #PR4637: none
+  tp_size: 2  #PR4637: 1
   cp_size: 1
-  pp_size: 4
-
+  pp_size: 1  #PR4637: 4
   sequence_parallel: false
   activation_checkpointing: true
-
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
-    layers_per_stage: 2
-    scale_grads_in_schedule: false
-    round_virtual_stages_to_pp_multiple: up
-    dtype: bf16
-
+  enable_async_tensor_parallel: false
+  enable_fsdp2_prefetch: true
+  enable_compile: true
+  patch_is_packed_sequence: true
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
-# Use MockIterableDataset for benchmarking (faster, no I/O)
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  vocab_size: 100
-  seq_len: 4096
-  num_samples: 1000000
+  #PR4637: removed dataset.vocab_size: 100
+  #PR4637: removed dataset.seq_len: 4096
+  #PR4637: removed dataset.num_samples: 1000000
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  dataset_name: rajpurkar/squad
+  split: train
 
+  padding: false
+packed_sequence:
+  packed_sequence_size: 4096
+
+  packing_strategy: neat
 dataloader:
-  _target_: torch.utils.data.DataLoader
-  batch_size: null  # Dataset already yields batches
-  # Note: model_config will be auto-injected by train_ft.py for PP models
+  #PR4637: removed dataloader.batch_size: null
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader  #PR4637: torch.utils.data.DataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  shuffle: false
 
+  drop_last: true
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -99,6 +92,10 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: ZhiyuLi-Nvidia
-  time: "00:30:00"
+  time: "00:40:00"  #PR4637: "00:30:00"
+  perf_testing:
+    schedule: nightly
+  nodes: 1

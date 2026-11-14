@@ -109,6 +109,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   time: "00:25:00"
   checkpoint_robustness:
@@ -119,3 +120,5 @@ ci:
     check_fused_qkv_keys: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+  perf_testing:
+    schedule: nightly

@@ -80,6 +80,7 @@ lr_scheduler:
   min_lr: 2.0e-6
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: Butterfingrz
   time: "01:00:00"
   nodes: 32

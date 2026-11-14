@@ -23,10 +23,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   num_epochs: 1
-  global_batch_size: 256
-  local_batch_size: 8
+  global_batch_size: 512  #PR4637: 256
+  local_batch_size: 2  #PR4637: 8
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -43,12 +44,23 @@ model:
   mtp_loss_scaling_factor: 0.1
 
 # torch.compile configuration
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 compile:
   enabled: false
   mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
   fullgraph: false
   dynamic: true  # Set to false for better performance with fixed shapes
-  backend: null  # Use default backend (inductor)
+  backend:       # Use default backend (inductor)
 
 checkpoint:
   enabled: true
@@ -57,44 +69,57 @@ checkpoint:
   save_consolidated: final
 
 peft:
+  #PR4637: removed peft.use_triton: True
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
-  dim: 8
+  # Mamba kernels use out_proj.weight directly and cannot apply its LoRA adapter.
+  exclude_modules: ['*.out_proj']
+  dim: 32  #PR4637: 8
   alpha: 32
-  use_triton: True
+  dropout: 0.0
+  moe_rank_scaling: true
 
 distributed:
+  #PR4637: removed distributed.dp_size: none
   strategy: fsdp2
-  dp_size: none
   tp_size: 1
   cp_size: 1
-  ep_size: 8
-
+  pp_size: 1
+  ep_size: 64  #PR4637: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    ignore_router_for_ac: false
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
+  padding: false
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 4096  #PR4637: 0
 
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: True
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
 
+  drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.Adam
@@ -108,6 +133,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   vllm_deploy: true
   vllm_smoke_test: true
@@ -115,8 +141,12 @@ ci:
   vllm_deploy_time: "00:30:00"
   vllm_enable_expert_parallel: false  # vLLM 0.19 does not support expert parallelism with runtime LoRA
   recipe_owner: adil-a
-  time: "00:30:00"
+  time: "00:40:00"  #PR4637: "00:30:00"
   checkpoint_robustness:
+    # DP64 x local batch 2: retain five complete global batches after packing.
+    step_scheduler.global_batch_size: 128  #PR4637: 32
+    step_scheduler.local_batch_size: 2
+    packed_sequence.max_packs: 640
     experts_implementation: grouped_mm
     trust_remote_code: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
@@ -128,11 +158,16 @@ ci:
     # Vanilla Transformers intentionally omits the training-only MTP modules.
     # Exact-match every adapter tensor it can instantiate and allow only MTP keys.
     hf_adapter_ignored_key_prefix: "base_model.model.mtp."
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    # Bound packed sequences rather than source examples, which shrink during packing.
+    dataset.limit_dataset_samples: null  #PR4637: 500
+    validation_dataset.limit_dataset_samples: 500
 
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+  perf_testing:
+    fake_balanced_gate: true
+    schedule: nightly
+  nodes: 8

@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Models deprecated for 26.10 removal — skipped in release (auto-discover) scope.
+# Models deprecated for 26.10 removal — skipped in every CI scope.
 exempt_models:
   - gemma3
   - kimi
   - cohere_micro_vision
 
 exempt_configs:
+  inkling2_medpix_lora_ep32:
+    reason: "Requires the Inkling-2-Small model implementation, which is not yet on main"
+  inkling2_medpix_sft_ep64_pp4:
+    reason: "Requires the Inkling-2-Small model implementation, which is not yet on main"
 
 known_issue:
