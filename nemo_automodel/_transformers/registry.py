@@ -411,6 +411,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
         ),
         (
+            "Inkling2ForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling2.model", "Inkling2ForConditionalGeneration"),
+        ),
+        (
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
@@ -439,6 +443,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
+    "inkling2": ("nemo_automodel.components.models.inkling2.configuration", "Inkling2Config"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),

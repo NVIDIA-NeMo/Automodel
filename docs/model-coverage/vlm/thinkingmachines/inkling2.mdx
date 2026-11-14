@@ -1,6 +1,6 @@
 ---
 title: "Inkling-2-Small"
-description: "Fine-tune Inkling-2-Small with NeMo AutoModel using 128K packed Tulu 3 text SFT, MedPix LoRA, and MedPix full SFT recipes on GB200 with expert parallelism."
+description: "Fine-tune Inkling-2-Small with NeMo AutoModel using MedPix LoRA and full SFT recipes on H100 or GB200 and 128K packed Tulu 3 text SFT on GB200, with expert parallelism."
 slug: model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small
 ---
 
@@ -11,8 +11,9 @@ NeMo AutoModel provides a text recipe (`Inkling2ForCausalLM`) and two image-text
 (`Inkling2ForConditionalGeneration`) for the released checkpoint.
 
 <Note>
-The recipes require the native Inkling-2-Small implementation, which is not yet part of NeMo
-AutoModel. They run once the implementation is merged.
+The three GB200 recipes use flex attention, `Inkling2FusedLinearCrossEntropy`, `Inkling2ForCausalLM`,
+and pipeline and context parallelism, which the native implementation does not provide yet. The two
+H100 recipes run with it.
 </Note>
 
 ## Fine-Tune Inkling-2-Small
@@ -37,6 +38,9 @@ Run the text recipe with `examples/llm_finetune/finetune.py`.
 | 128K packed text SFT on Tulu 3 | [inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml) |
 | Image-text LoRA on MedPix | [inkling2_medpix_lora_ep32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml) |
 | Full image-text SFT on MedPix | [inkling2_medpix_sft_ep64_pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_sft_ep64_pp4.yaml) |
+| Full image-text SFT on MedPix, H100 | [inkling2_small_medpix_sft_ep128.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_small_medpix_sft_ep128.yaml) |
+| Image-text LoRA on MedPix, H100 | [inkling2_small_medpix_lora_ep32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_small_medpix_lora_ep32.yaml) |
+| Train the released drafter layout with DSpark | [inkling2_small_dspark.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/inkling2_small_dspark.yaml), see the [DSpark guide](/recipes-e2e-examples/dspark-speculative-decoding) |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ### Configuration
@@ -65,6 +69,23 @@ The text recipe builds `Inkling2ForCausalLM` from the image-text checkpoint thro
 `dataset.dataset_path`. Both MedPix recipes freeze the vision tower.
 
 W&B is opt-in: set `wandb.enable: true` and configure your entity and project when launching.
+
+### H100 Recipes
+
+| Setting | MedPix SFT, H100 | MedPix LoRA, H100 |
+| --- | --- | --- |
+| GPUs | 128 H100, 16 nodes | 32 H100, 4 nodes |
+| Parallelism | EP128, TP1; FSDP2 | EP32, TP1; FSDP2 |
+| Expert dispatch | HybridEP, `torch_mm` experts | HybridEP, `torch_mm` experts |
+| Sequence | Nonpacked, up to 1024 tokens | Nonpacked, up to 1024 tokens |
+| Trained weights | Language model; vision tower frozen | LoRA rank 8 on attention projections and routed experts |
+| Weights and optimizer | BF16 weights; TE FusedAdam with FP32 master weights and BF16 moments | Frozen BF16 base; Adam on the adapters |
+
+Launch them with `-m nemo_automodel.cli.app` and the recipe path, one `torchrun` per node with eight
+GPUs. Both load the NVFP4 checkpoint with `checkpoint.dequantize_base_checkpoint: true` and use SDPA
+attention. Their layouts are sized from parameter and optimizer-state arithmetic: about 4.6B
+parameters per GPU for SFT and about 37 GB of frozen weights per GPU for LoRA. Full-model runs at
+this scale have not been validated yet.
 
 ## Model Reference
 

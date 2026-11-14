@@ -298,6 +298,10 @@ def _load_registered_custom_config(pretrained_model_name_or_path, attn_implement
     config_cls = resolve_custom_config_cls(model_type)
     if config_cls is None:
         return None
+    if config_cls.get_config_dict.__func__ is not PretrainedConfig.get_config_dict.__func__:
+        # The class reads files beside config.json (such as a quantization manifest); let it read
+        # them with the same revision and subfolder.
+        config_dict, unused_kwargs = config_cls.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
 
     unused_kwargs.setdefault("attn_implementation", attn_implementation)
     return config_cls.from_dict(config_dict, **unused_kwargs)

@@ -78,6 +78,7 @@ from nemo_automodel.components.speculative.dspark.config import (
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import (
     ModelOwnedDSparkProvider,
+    ModelOwnedDSparkTargetProvider,
     resolve_dspark_draft_spec,
 )
 from nemo_automodel.components.speculative.dspark.remote import DSparkTargetInfo, RemoteDSparkTargetModel
@@ -836,7 +837,21 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             architectures = getattr(target_config, "architectures", []) or []
             is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
 
-            if load_target:
+            if load_target and isinstance(target_config, ModelOwnedDSparkTargetProvider):
+                # A target config that owns its frozen-target construction (an expert-parallel
+                # MoE target) loads on the mesh of the recipe's distributed: block.
+                self.distributed_setup = create_distributed_setup_from_config(
+                    self.cfg, world_size=self.dist_env.world_size
+                )
+                self.target_model = target_config.build_dspark_target(
+                    target_path=target_path,
+                    trust_remote_code=trust_remote_code,
+                    device=self.device,
+                    compute_dtype=self.compute_dtype,
+                    distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
+                )
+            elif load_target:
                 target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
                 target_kwargs = {}
                 if target_attn_implementation is not None:
@@ -872,12 +887,12 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
         # width) so the two never disagree.
-        # Gemma4 and MiniMax M3 VL nest their text fields (layer count, vocab)
-        # under text_config.
+        # Gemma4, MiniMax M3 VL and other composite configs nest their text fields
+        # (layer count, vocab) under text_config.
         target_text_config = (
             target_config.text_config
             if (is_deepseek_v41_target or is_gemma4_target or is_minimax_m3_target)
-            else target_config
+            else target_config.get_text_config()
         )
         num_target_layers = int(target_text_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
