@@ -68,15 +68,10 @@ def get_text_module(model: nn.Module) -> nn.Module:
 def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_position, position_ids):
     """Build a stage's ``causal_mask_mapping``, caching it per stage when safe.
 
-    Under pipeline parallelism the mask precomputed in the data pipeline only reaches
-    the first stage; non-first stages arrive with ``causal_mask_mapping=None`` and used
-    to recompute it on every microbatch (slow, and a torch.compile graph-break). When
-    no explicit ``attention_mask`` is provided -- the common fixed-length / packed
-    training case, and exactly what non-first stages receive -- the causal mask depends
-    only on ``(seq_len, dtype, device)`` and is constant across microbatches and steps,
-    so it is built once per stage and reused. With an explicit ``attention_mask`` (which
-    may encode per-batch padding) it is rebuilt each call. Behavior is identical to the
-    previous recompute; only the redundant recomputation is removed.
+    Each stage builds masks from its model config and current microbatch. Without
+    an explicit ``attention_mask``, the fixed-length causal mask is reused for the
+    same sequence length, dtype and device. Explicit padding/document masks are
+    recomputed for each microbatch, while supplied mask mappings pass through.
     """
     # An ``attention_mask`` that is already a mask-mapping dict is used as-is.
     if isinstance(attention_mask, dict):
@@ -129,6 +124,28 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: dict | None = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        """Run this stage's layers with model-owned attention masks.
+
+        Args:
+            self: Text model or pipeline stage retaining a subset of decoder layers.
+            input_ids: Token IDs [batch, sequence], or hidden states
+                [batch, sequence, hidden] on a non-first stage.
+            attention_mask: Optional padding mask [batch, sequence], complete mask
+                [batch, 1, sequence, sequence], or mapping of complete masks.
+            position_ids: Optional rotary positions [batch, sequence].
+            past_key_values: Optional model-owned KV cache.
+            inputs_embeds: Optional hidden states [batch, sequence, hidden].
+            use_cache: Whether to update the KV cache.
+            cache_position: Optional sequence offsets [sequence].
+            causal_mask_mapping: Optional full/sliding masks, each shaped
+                [batch, 1, sequence, sequence] or None for implicit causality.
+            **kwargs: Auxiliary inputs, including Flash cumulative lengths
+                [segments + 1] and integer maximum lengths for this microbatch.
+
+        Returns:
+            Hidden states [batch, sequence, hidden], directly for a pipeline stage
+            or inside BaseModelOutputWithPast. Input tensors remain unmodified.
+        """
         # For VLM models the text components (embed_tokens, layers, norm) live on a
         # nested text module (e.g. model.language_model) rather than directly on self.
         # get_text_module returns self when no nesting exists (e.g. LlamaModel).
@@ -164,12 +181,8 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # Attention mask handling (compilation-friendly):
-        # causal_mask_mapping is precomputed in the data pipeline (default_collater +
-        # add_causal_masks_to_batch) and passed to the first stage. The PP schedule
-        # cannot forward this dict to non-first stages, which therefore arrive with
-        # causal_mask_mapping=None. Build it once per stage and cache it (see
-        # _build_or_reuse_pp_causal_mask) instead of recomputing every microbatch.
+        # Each stage owns its attention masks, including the first stage. Reuse
+        # fixed-length causal masks and honor explicit padding/document masks.
         if causal_mask_mapping is None:
             causal_mask_mapping = _build_or_reuse_pp_causal_mask(
                 self, inputs_embeds, attention_mask, cache_position, position_ids
@@ -186,14 +199,23 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if hasattr(text_module, "layers") and text_module.layers is not None:
             # Preserve the public FlashAttention metadata for this microbatch.
             flash_kwargs = {key: kwargs[key] for key in _FLASH_VARLEN_KWARGS if key in kwargs}
-            # Works for dict-like or list-like containers
-            layer_iter = text_module.layers.values() if hasattr(text_module.layers, "values") else text_module.layers
-            for decoder_layer in layer_iter:
-                layer_attention_mask = causal_mask_mapping.get("full_attention")
-                if hasattr(decoder_layer, "attention_type"):
-                    layer_attention_mask = causal_mask_mapping.get(
-                        getattr(decoder_layer, "attention_type"), causal_mask_mapping.get("full_attention")
-                    )
+            # HF configs declare layer types, but not all HF layer classes expose
+            # attention_type. PP's ModuleDict retains global layer indices.
+            layer_types = getattr(self.config, "layer_types", None)
+            layer_iter = (
+                text_module.layers.items()
+                if isinstance(text_module.layers, nn.ModuleDict)
+                else enumerate(text_module.layers)
+            )
+            for layer_index, decoder_layer in layer_iter:
+                attention_type = (
+                    layer_types[int(layer_index)]
+                    if layer_types is not None
+                    else getattr(decoder_layer, "attention_type", "full_attention")
+                )
+                layer_attention_mask = causal_mask_mapping.get(
+                    attention_type, causal_mask_mapping.get("full_attention")
+                )
 
                 layer_outputs = decoder_layer(
                     hidden_states,

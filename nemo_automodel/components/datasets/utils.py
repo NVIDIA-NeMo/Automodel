@@ -13,13 +13,9 @@
 # limitations under the License.
 
 import math
-from collections.abc import Callable, MutableMapping
-from typing import TypeVar
 
 import numpy as np
 import torch
-from transformers import PretrainedConfig
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
@@ -160,140 +156,6 @@ def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) ->
         ans = ans + [0] * (len(ids) - len(ans))
     assert len(ans) == len(ids)
     return ans
-
-
-def create_causal_mask_mapping(
-    model_config,
-    batch_size,
-    seq_len,
-    position_ids=None,
-    attention_mask=None,
-    device=None,
-):
-    """
-    Create causal mask mapping for pipeline parallelism.
-
-    This is the core mask creation logic that can be reused by different collate functions.
-    Extracts common mask creation logic to avoid duplication between collate functions.
-
-    Args:
-        model_config: HuggingFace model config
-        batch_size: Batch size
-        seq_len: Sequence length
-        position_ids: Optional position IDs tensor [batch_size, seq_len]
-        attention_mask: Optional 2D attention mask tensor [batch_size, seq_len] for padding
-        device: Device to create tensors on (defaults to cpu)
-
-    Returns:
-        dict: Mapping of mask types to 4D mask tensors
-            - "full_attention": [batch_size, 1, seq_len, seq_len]
-            - "sliding_attention": [batch_size, 1, seq_len, seq_len] (if model uses sliding window)
-    """
-    if device is None:
-        device = torch.device("cpu")
-
-    # Create position_ids if not provided
-    if position_ids is None:
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-
-    # Prepare mask creation kwargs
-    mask_kwargs = {
-        "config": model_config,
-        "inputs_embeds": torch.empty((batch_size, seq_len), device=device),
-        "attention_mask": attention_mask,
-        "past_key_values": None,  # Training only
-        "position_ids": position_ids,
-    }
-
-    # Create causal masks
-    causal_mask_mapping = {
-        "full_attention": create_causal_mask(**mask_kwargs),
-    }
-
-    # Add sliding window mask if model uses it
-    if hasattr(model_config, "sliding_window") and model_config.sliding_window is not None:
-        causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-
-    return causal_mask_mapping
-
-
-def add_causal_masks_to_batch(batch_dict, model_config):
-    """
-    Add precomputed causal masks to an already-batched data dict.
-
-    This function is designed for datasets that yield complete batches (like MockIterableDataset),
-    where we want to add mask precomputation as a separate processing step.
-
-    Args:
-        batch: A dict or list containing a single batched dict with tensors:
-            - input_ids: [batch_size, seq_length]
-            - position_ids: [batch_size, seq_length] (optional)
-            - labels: [batch_size, seq_length]
-            - _packed_seq_ids: [batch_size, seq_length] document IDs (optional).
-              Retained while flat Flash offsets are removed for PP microbatching.
-        model_config: HuggingFace model config for creating causal masks
-
-    Returns:
-        dict: Same batch with added causal_mask_mapping field
-    """
-    if "_packed_seq_ids" in batch_dict:
-        # Flat Flash offsets span the whole local batch and cannot be split
-        # along its batch axis. Model-entry hooks rebuild them from the
-        # preserved document IDs after pipeline microbatching.
-        for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
-            batch_dict.pop(key, None)
-
-    # Extract info from batch
-    batch_size = batch_dict["input_ids"].shape[0]
-    seq_len = batch_dict["input_ids"].shape[1]
-    position_ids = batch_dict.get("position_ids")
-    attention_mask = batch_dict.get("attention_mask")  # May have padding info
-
-    # Create causal masks using the shared helper function
-    causal_mask_mapping = create_causal_mask_mapping(
-        model_config=model_config,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        position_ids=position_ids,
-        attention_mask=attention_mask,
-        device=batch_dict["input_ids"].device,
-    )
-
-    batch_dict["causal_mask_mapping"] = causal_mask_mapping
-    return batch_dict
-
-
-_RawBatch = TypeVar("_RawBatch")
-_CollatedBatch = TypeVar(
-    "_CollatedBatch", bound=MutableMapping[str, torch.Tensor | int | float | dict[str, torch.Tensor | None]]
-)
-
-
-def collate_with_causal_masks(
-    batch: _RawBatch,
-    *,
-    base_fn: Callable[[_RawBatch], _CollatedBatch],
-    config: PretrainedConfig,
-) -> _CollatedBatch:
-    """Collate examples and attach pipeline-parallel masks in a spawn-picklable callable.
-
-    Args:
-        batch: Raw examples accepted by ``base_fn``. Standard token-list fields
-            have per-example shape ``[sequence]``; pre-batched tensor fields
-            have shape ``[batch, ...]`` with arbitrary trailing dimensions.
-        base_fn: Collator returning a mutable batch mapping. It must be picklable
-            when DataLoader multiprocessing uses spawn.
-        config: HuggingFace model config used to construct attention masks.
-
-    Returns:
-        The base collator's mapping, updated in place with ``causal_mask_mapping``.
-        Standard token tensors retain shape ``[batch, sequence]``. The added
-        ``full_attention`` and optional ``sliding_attention`` masks have shape
-        ``[batch, 1, sequence, sequence]``, or are ``None`` when the attention
-        backend does not need an explicit mask. Other fields retain their base
-        layout.
-    """
-    return add_causal_masks_to_batch(base_fn(batch), model_config=config)
 
 
 def default_collater(

@@ -14,9 +14,7 @@
 from __future__ import annotations
 
 import math
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -418,20 +416,6 @@ def test_get_pad_token_from_key(val, expected):
 )
 def test_make_attention_mask_from_labels(ids, expected):
     assert sftp.make_attention_mask_from_labels(ids) == expected
-
-
-def test_create_causal_mask_mapping_uses_inputs_embeds_keyword() -> None:
-    """Mask creation must use the Transformers 5.3+ inputs_embeds keyword."""
-    with patch.object(sftp, "create_causal_mask", return_value="full_attention") as mock_create_causal:
-        mapping = sftp.create_causal_mask_mapping(
-            model_config=SimpleNamespace(),
-            batch_size=2,
-            seq_len=4,
-        )
-
-    assert mapping == {"full_attention": "full_attention"}
-    assert "inputs_embeds" in mock_create_causal.call_args.kwargs
-    assert "input_embeds" not in mock_create_causal.call_args.kwargs
 
 
 class TestPackedSequenceTHDCollater:
@@ -967,31 +951,3 @@ def test_default_collater_leaves_reused_examples_intact_across_epochs() -> None:
     second = sftp.default_collater(samples)
     assert torch.equal(first["input_ids"], second["input_ids"])
     assert tuple(second["input_ids"].shape) == (2, 3)
-
-
-@pytest.mark.parametrize("packed", [False, True])
-def test_add_causal_masks_preserves_document_ids_and_drops_flat_offsets_only_for_packing(packed):
-    """PP microbatches retain document maps, never whole-batch Flash offsets."""
-    input_ids = torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]])
-    doc_ids = torch.tensor([[1, 1, 2, 2], [1, 1, 1, 0]])
-    offsets = {
-        "cu_seq_lens_q": torch.tensor([0, 2, 4, 7, 8], dtype=torch.int32),
-        "cu_seq_lens_k": torch.tensor([0, 2, 4, 7, 8], dtype=torch.int32),
-        "max_length_q": 3,
-        "max_length_k": 3,
-    }
-    batch = {"input_ids": input_ids, **offsets}
-    if packed:
-        batch["_packed_seq_ids"] = doc_ids
-    mapping = {"full_attention": torch.ones(2, 1, 4, 4, dtype=torch.bool)}
-    with patch.object(sftp, "create_causal_mask_mapping", return_value=mapping):
-        result = sftp.add_causal_masks_to_batch(batch, model_config=SimpleNamespace())
-    assert result is batch
-    assert result["input_ids"] is input_ids
-    assert result["causal_mask_mapping"] is mapping
-    if packed:
-        assert result["_packed_seq_ids"] is doc_ids
-        assert not offsets.keys() & result.keys()
-    else:
-        for key, value in offsets.items():
-            assert result[key] is value

@@ -32,7 +32,6 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.components.training.batch import move_batch_to_device
@@ -50,7 +49,6 @@ _HAS_WANDB, wandb = safe_import(
 )
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoConfig
 
 from nemo_automodel._transformers import (
     NeMoAutoModelForCausalLM,
@@ -173,12 +171,6 @@ def _should_pack_validation(
         or bool(getattr(model, "_te_attention_injected", False))
         or model_requires_packing
     )
-
-
-def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
-    """Return whether the recipe should attach PP causal-mask precomputation."""
-    # TODO: Replace model-type exceptions with a shared mask-ownership capability.
-    return getattr(model_config, "model_type", None) not in ("deepseek_v4", "glm_moe_dsa")
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -433,41 +425,6 @@ def _build_tokenizer(cfg_model, cfg_ds):
             # If we can't get the signature, skip adding tokenizer
             pass
     return kwargs, tokenizer
-
-
-def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
-    """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
-
-    ``None`` when PP is disabled, the model config can't be loaded, or the model
-    computes masks internally (e.g. ``deepseek_v4`` or ``glm_moe_dsa``).  Passed to
-    :meth:`DataloaderConfig.build` as ``collate_wrapper``.
-    """
-    if not pp_enabled:
-        return None
-    try:
-        hf_model_config = AutoConfig.from_pretrained(
-            _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
-        )
-    except Exception:
-        logger.warning(
-            "Failed to load model config for causal mask precomputation. "
-            "Pipeline parallel mask precomputation will be skipped."
-        )
-        return None
-    if not _should_precompute_pp_causal_masks(hf_model_config):
-        logger.info(
-            "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
-            getattr(hf_model_config, "model_type", None),
-        )
-        return None
-
-    from nemo_automodel.components.datasets.utils import collate_with_causal_masks
-
-    def wrapper(base_collate_fn):
-        # Workers receive this partial, not the recipe-local wrapper factory.
-        return partial(collate_with_causal_masks, base_fn=base_collate_fn, config=hf_model_config)
-
-    return wrapper
 
 
 def _build_partial_cuda_graph_manager(
@@ -852,7 +809,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             validate_thd_packing_support(self.model_parts)
         elif dataloader_config.is_packed:
             configure_packing_for_models(self.model_parts)
-        collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config: DataloaderConfig, *, is_training: bool = True):
             process_group = getattr(self.mesh_context, "process_group", None)
@@ -878,7 +834,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     else self.cfg.get("distributed.cp_size", 1)
                 ),
                 packing_contract=packing_contract,
-                collate_wrapper=collate_wrapper,
                 ignore_index=_get_loss_ignore_index(self.loss_fn),
                 training_schedule=DatasetBuildSchedule(
                     local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
@@ -1271,6 +1226,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
         """
+        if self.pp_enabled and "_packed_seq_ids" in batch:
+            # Flat Flash offsets span the whole local batch and cannot be split
+            # into PP microbatches. Each model stage rebuilds them from its rows'
+            # document IDs after splitting; keep THD-only metadata unchanged.
+            batch = {
+                key: value
+                for key, value in batch.items()
+                if key not in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+            }
         batch = move_batch_to_device(batch, self.dist_env.device)
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))

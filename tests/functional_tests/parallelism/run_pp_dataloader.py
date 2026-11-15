@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 import multiprocessing
-from functools import partial
 from pathlib import Path
 
 import torch
@@ -39,7 +38,7 @@ def main() -> None:
 
     from nemo_automodel.components.config.loader import load_yaml_config
     from nemo_automodel.components.datasets.loader import close_dataloader
-    from nemo_automodel.components.datasets.utils import collate_with_causal_masks
+    from nemo_automodel.components.datasets.utils import default_collater
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
     cfg = load_yaml_config(Path(__file__).with_name("pp_dataloader_tiny.yaml"))
@@ -54,7 +53,7 @@ def main() -> None:
         assert recipe.pp_enabled and recipe.mesh_context.pp_size == 2
         assert recipe.dataloader.num_workers == 2
         assert multiprocessing.get_start_method() == "spawn"
-        collate_fn = recipe.dataloader.collate_fn
+        assert recipe.dataloader.collate_fn is default_collater
 
         parameter_count = torch.tensor(
             sum(parameter.numel() for part in recipe.model_parts for parameter in part.parameters()),
@@ -64,10 +63,6 @@ def main() -> None:
         dist.all_reduce(parameter_count)
         assert 0 < parameter_count.item() <= 1_000_000
         recipe.run_train_validation_loop()
-        # Check after iteration so the original nested closure fails in worker
-        # startup, while silently skipping mask precomputation cannot pass either.
-        assert isinstance(collate_fn, partial)
-        assert collate_fn.func is collate_with_causal_masks
         assert recipe.step_scheduler.step == 3
         dist.barrier()
         if dist.get_rank() == 0:

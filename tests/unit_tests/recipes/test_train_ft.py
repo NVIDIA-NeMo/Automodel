@@ -47,7 +47,6 @@ from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    _build_pp_collate_wrapper,
     _get_domain_mixture_blend,
     _should_pack_validation,
     _supports_loss_weights,
@@ -106,7 +105,6 @@ def _build_loader(
         pp_enabled=pp_enabled,
         supports_seq_lens=model is None or "seq_lens" in inspect.signature(model.forward).parameters,
         cp_size=cp_size,
-        collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
     )
     return loader, None
 
@@ -2027,155 +2025,40 @@ def test_build_model_and_optimizer_return_values():
 # Tests for _get_model_name helper
 # =============================================================================
 
-# =============================================================================
-# Tests for PP mask precomputation guard in the loader build
-# =============================================================================
-
-
-def _pp_loader(cfg_model, cfg_dl, **patches):
-    """Build a PP-enabled iterable loader and return its resolved ``collate_fn``."""
-    cfg_ds = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
-            "tokenizer": None,
-            "num_shards": 4,
-        }
-    )
-    loader, _ = _build_loader(
-        cfg_ds=cfg_ds,
-        cfg_dl=cfg_dl,
-        cfg_model=cfg_model,
-        cfg_ps=ConfigNode({}),
-        seed=123,
-        local_batch_size=2,
-        global_batch_size=4,
-        max_steps=None,
-        val_check_interval=None,
-        dp_rank=0,
-        dp_world_size=1,
-        pp_enabled=True,
-    )
-    return loader.collate_fn
-
-
-def test_pp_autoconfig_failure_skips_masks(caplog):
-    """When AutoConfig.from_pretrained raises, the collate is left unwrapped (warning logged)."""
-    calls = []
-    cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
-    with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
-        caplog.at_level(logging.WARNING),
-    ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
-
-    assert "Failed to load model config for causal mask precomputation" in caplog.text
-    collate_fn(["dummy"])
-    assert calls == ["base"]
-    add_masks.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "model_type",
-    ["deepseek_v4", "glm_moe_dsa"],
-)
-def test_pp_custom_sparse_model_skips_masks(caplog, model_type):
-    """Custom sparse models compute masks internally, so PP precomputation is skipped."""
-    calls = []
-    cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    model_name = "zai-org/GLM-5.2" if model_type == "glm_moe_dsa" else "deepseek-ai/DeepSeek-V4-Pro"
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": model_name})
-    with (
-        patch(
-            "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
-            return_value=MagicMock(model_type=model_type),
-        ),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
-        caplog.at_level(logging.INFO),
-    ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
-
-    collate_fn(["dummy"])
-    assert calls == ["base"]
-    add_masks.assert_not_called()
-    assert f"Skipping pipeline parallel causal mask precomputation for model_type={model_type}" in caplog.text
-
-
-def test_pp_autoconfig_success_chains_masks():
-    """When AutoConfig succeeds, the resolved collate is wrapped with mask precomputation (base -> masks)."""
-    call_order = []
-    cfg_dl = ConfigNode({"collate_fn": lambda b: call_order.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
-
-    def mock_add_masks(batch, model_config=None):
-        call_order.append("masks")
-        return batch
-
-    with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=MagicMock()),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
-    ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
-        collate_fn(["dummy_batch"])
-
-    assert call_order == ["base", "masks"]
-
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("num_workers", [0, 1])
-def test_pp_collate_spawn_workers_preserve_batches_and_masks(num_workers: int) -> None:
-    """PP collation must work in spawned workers and preserve causal/padding masks."""
-    from torchdata.stateful_dataloader import StatefulDataLoader
-    from transformers import LlamaConfig
-
+def test_pp_spawn_dataloader_only_collates_data(num_workers: int) -> None:
+    """Spawned PP loaders preserve data without loading configs or building model masks."""
+    from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDatasetConfig
     from nemo_automodel.components.datasets.utils import default_collater
 
-    config = LlamaConfig(hidden_size=8, num_attention_heads=2, num_hidden_layers=1)
-    config._attn_implementation = "eager"
-    samples = [
-        {"input_ids": [1, 2, 3, 0], "labels": [2, 3, 4, -100], "attention_mask": [1, 1, 1, 0]},
-        {"input_ids": [5, 6, 0, 0], "labels": [6, 7, -100, -100], "attention_mask": [1, 1, 0, 0]},
-    ]
-    with patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=config):
-        wrapper = _build_pp_collate_wrapper(ConfigNode({"pretrained_model_name_or_path": "test"}), True)
-    collate_fn = wrapper(default_collater)
-    loader_kwargs = {"multiprocessing_context": "spawn", "timeout": 45} if num_workers else {}
-    loader = StatefulDataLoader(samples, batch_size=2, collate_fn=collate_fn, num_workers=num_workers, **loader_kwargs)
+    config = DataloaderConfig(
+        dataset_config=MockIterableDatasetConfig(vocab_size=16, seq_len=4, num_samples=2),
+        batch_size=2,
+        num_workers=num_workers,
+        collate_fn=default_collater,
+    )
+    loader = config.build(dp_rank=0, dp_world_size=1, pp_enabled=True)
+    assert loader.collate_fn is default_collater
     iterator = iter(loader)
     try:
         batches = list(iterator)
     finally:
         if num_workers:
-            # torchdata can terminate a worker after its bounded shutdown join;
-            # reap it before the test's child-process leak check runs.
+            # torchdata's bounded shutdown can terminate before reaping a worker.
+            # Reap it before the test's child-process leak check runs.
             iterator._shutdown_workers()
             for worker in iterator._workers:
                 worker.join(timeout=10)
                 assert not worker.is_alive()
     assert len(batches) == 1
     batch = batches[0]
-    assert batch["input_ids"].tolist() == [[1, 2, 3, 0], [5, 6, 0, 0]]
-    assert batch["labels"].tolist() == [[2, 3, 4, -100], [6, 7, -100, -100]]
-    assert batch["padding_mask"].tolist() == [[False, False, False, True], [False, False, True, True]]
-    mask = batch["causal_mask_mapping"]["full_attention"]
-    assert mask.shape == (2, 1, 4, 4)
-    blocked = torch.finfo(mask.dtype).min
-    expected = torch.tensor(
-        [
-            [[[0, blocked, blocked, blocked], [0, 0, blocked, blocked], [0, 0, 0, blocked], [0, 0, 0, blocked]]],
-            [
-                [
-                    [0, blocked, blocked, blocked],
-                    [0, 0, blocked, blocked],
-                    [0, 0, blocked, blocked],
-                    [0, 0, blocked, blocked],
-                ]
-            ],
-        ],
-        dtype=mask.dtype,
-    )
-    torch.testing.assert_close(mask, expected)
+    assert batch["input_ids"].shape == (2, 4)
+    torch.testing.assert_close(batch["labels"][:, :-1], batch["input_ids"][:, 1:])
+    assert (batch["labels"][:, -1] == -100).all()
+    torch.testing.assert_close(batch["padding_mask"], batch["input_ids"] == 0)
+    assert "causal_mask_mapping" not in batch
 
 
 @pytest.mark.parametrize(
@@ -4584,11 +4467,9 @@ def test_setup_always_passes_return_contract_and_only_configures_packed_batched_
 def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[list[int]]) -> None:
     """Real PP splitting must deliver rebased offsets covering each microbatch."""
     from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
-    from transformers import LlamaConfig
 
     from nemo_automodel.components.datasets.utils import neat_packed_collater
     from nemo_automodel.components.models.common.packing import PackingCapabilities, configure_packing
-    from nemo_automodel.recipes.llm.train_ft import _build_pp_collate_wrapper
 
     class Capture(torch.nn.Module):
         def forward(self, input_ids: torch.Tensor, **kwargs):
@@ -4599,21 +4480,59 @@ def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[l
         {"input_ids": [1] * 5, "labels": [1] * 5, "position_ids": [0] * 5, "attention_mask": ids}
         for ids in document_ids
     ]
-    config = LlamaConfig()
-    config._attn_implementation = "flash_attention_2"
-    with patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=config):
-        wrapper = _build_pp_collate_wrapper(ConfigNode({"pretrained_model_name_or_path": "test"}), True)
-    batch = wrapper(lambda rows: neat_packed_collater(rows, packing=packing))(samples)
-    _, chunks = split_args_kwargs_into_chunks((), batch, chunks=2)
+    batch = neat_packed_collater(samples, packing=packing)
     model = Capture()
     configure_packing("flash_attention_2", model=model)
-    for sample, chunk in zip(samples, chunks):
-        tokens, prepared = model(**chunk)
-        expected = neat_packed_collater([sample], packing=packing)
-        offsets = prepared["cu_seq_lens_q"]
-        assert tokens.shape == (1, 5)
-        assert offsets[0].item() == 0
-        assert offsets[-1].item() == tokens.numel()
-        torch.testing.assert_close(offsets, expected["cu_seq_lens_q"])
-        torch.testing.assert_close(prepared["cu_seq_lens_k"], expected["cu_seq_lens_k"])
-        assert prepared["max_length_q"] == expected["max_length_q"]
+    seen = []
+
+    def run_schedule(
+        input_ids: torch.Tensor,
+        *,
+        target: torch.Tensor | None,
+        losses: list[torch.Tensor] | None,
+        **kwargs: torch.Tensor | int | str | None,
+    ) -> None:
+        """Validate PP chunks from token IDs [batch, sequence] and batch-major metadata.
+
+        Args:
+            input_ids: Token IDs [batch, sequence].
+            target: Optional label IDs [batch, sequence]; unused on this non-final stage.
+            losses: Optional scalar loss tensors; unused on this non-final stage.
+            **kwargs: Packing metadata with document IDs [batch, sequence].
+
+        Returns:
+            None; validates both model-prepared microbatches.
+        """
+        assert not {"cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"} & kwargs.keys()
+        _, chunks = split_args_kwargs_into_chunks((), {"input_ids": input_ids, **kwargs}, chunks=2)
+        for sample, chunk in zip(samples, chunks):
+            tokens, prepared = model(**chunk)
+            expected = neat_packed_collater([sample], packing=packing)
+            offsets = prepared["cu_seq_lens_q"]
+            assert tokens.shape == (1, 5)
+            assert offsets[0].item() == 0
+            assert offsets[-1].item() == tokens.numel()
+            torch.testing.assert_close(offsets, expected["cu_seq_lens_q"])
+            torch.testing.assert_close(prepared["cu_seq_lens_k"], expected["cu_seq_lens_k"])
+            assert prepared["max_length_q"] == expected["max_length_q"]
+            seen.append(True)
+
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.device_mesh = None
+    recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(
+        pp_batch_size=2,
+        pp_microbatch_size=1,
+        update_seq_len=lambda length: None,
+        info=SimpleNamespace(has_first_stage=True, has_last_stage=False, schedule=SimpleNamespace(step=run_schedule)),
+    )
+    recipe.tokenizer = None
+    recipe.te_fp8 = None
+    recipe.domain_mixture = None
+    recipe.model_parts = [model]
+    recipe.loss_fn = MaskedCrossEntropy()
+    original_keys = set(batch)
+    recipe._forward_backward_step(0, batch, loss_buffer=[], num_label_tokens=8, num_batches=1)
+    assert len(seen) == 2
+    assert set(batch) == original_keys
