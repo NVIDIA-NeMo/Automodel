@@ -2141,9 +2141,18 @@ def test_pp_collate_spawn_workers_preserve_batches_and_masks(num_workers: int) -
         wrapper = _build_pp_collate_wrapper(ConfigNode({"pretrained_model_name_or_path": "test"}), True)
     collate_fn = wrapper(default_collater)
     loader_kwargs = {"multiprocessing_context": "spawn", "timeout": 45} if num_workers else {}
-    batches = list(
-        StatefulDataLoader(samples, batch_size=2, collate_fn=collate_fn, num_workers=num_workers, **loader_kwargs)
-    )
+    loader = StatefulDataLoader(samples, batch_size=2, collate_fn=collate_fn, num_workers=num_workers, **loader_kwargs)
+    iterator = iter(loader)
+    try:
+        batches = list(iterator)
+    finally:
+        if num_workers:
+            # torchdata can terminate a worker after its bounded shutdown join;
+            # reap it before the test's child-process leak check runs.
+            iterator._shutdown_workers()
+            for worker in iterator._workers:
+                worker.join(timeout=10)
+                assert not worker.is_alive()
     assert len(batches) == 1
     batch = batches[0]
     assert batch["input_ids"].tolist() == [[1, 2, 3, 0], [5, 6, 0, 0]]
