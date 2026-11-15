@@ -28,6 +28,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import MoE
 
+from . import capped_swiglu_triton
 from .config import Inkling2TextConfig
 from .context_parallel import convolution_history
 
@@ -92,6 +93,8 @@ def capped_swiglu(
 ) -> torch.Tensor:
     """Apply the interleaved capped activation, with routing before the down GEMM.
 
+    Contiguous 2-D CUDA inputs run the fused kernels of ``capped_swiglu_triton``.
+
     Args:
         gate_up: Tensor of shape [tokens, 2 * intermediate], interleaved gate/up.
         weights: Tensor of shape [tokens, 1], containing selected expert weights.
@@ -101,6 +104,8 @@ def capped_swiglu(
     Returns:
         Tensor of shape [tokens, intermediate], in gate_up's dtype.
     """
+    if capped_swiglu_triton.uses_triton_kernel(gate_up, weights):
+        return capped_swiglu_triton.capped_swiglu_triton(gate_up, weights, gate_softcap, up_softcap)
     gate = gate_up[..., 0::2].float()
     up = gate_up[..., 1::2].float()
     result = gate_softcap * torch.tanh(gate / gate_softcap) * torch.sigmoid(gate)
