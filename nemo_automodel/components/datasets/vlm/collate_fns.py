@@ -1232,6 +1232,11 @@ def _estimate_media_tokens(conversation, processor):
     if image_cfg is None:
         return 0
 
+    ip = getattr(processor, "image_processor", None)
+    get_patches = getattr(ip, "get_number_of_image_patches", None)
+    if get_patches is None:
+        get_patches = getattr(processor, "get_number_of_image_patches", None)
+
     extra = 0
     for message in conversation:
         content = message.get("content")
@@ -1253,17 +1258,26 @@ def _estimate_media_tokens(conversation, processor):
             except Exception:
                 continue
 
-            resized_h, resized_w = _smart_resize_image(
-                height,
-                width,
-                factor=image_cfg["factor"],
-                min_pixels=image_cfg["min_pixels"],
-                max_pixels=image_cfg["max_pixels"],
-            )
             merge_length = image_cfg["merge_size"] ** 2
-            image_seq_len = (
-                (resized_h // image_cfg["patch_size"]) * (resized_w // image_cfg["patch_size"]) // merge_length
-            )
+            image_seq_len = None
+            if get_patches is not None:
+                try:
+                    n_patches = get_patches(height, width)
+                    image_seq_len = n_patches // merge_length
+                except Exception:
+                    pass
+
+            if image_seq_len is None:
+                resized_h, resized_w = _smart_resize_image(
+                    height,
+                    width,
+                    factor=image_cfg["factor"],
+                    min_pixels=image_cfg["min_pixels"],
+                    max_pixels=image_cfg["max_pixels"],
+                )
+                image_seq_len = (
+                    (resized_h // image_cfg["patch_size"]) * (resized_w // image_cfg["patch_size"]) // merge_length
+                )
             extra += image_seq_len - 1  # -1: placeholder already counted in base tokenization
 
     return extra

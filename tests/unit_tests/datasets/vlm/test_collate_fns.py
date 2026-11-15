@@ -3000,6 +3000,82 @@ def test_estimate_media_tokens_no_image_processor(collate_mod):
     assert collate_mod._estimate_media_tokens(conversation, ProcNoIP()) == 0
 
 
+def test_estimate_media_tokens_with_patch_counter(collate_mod):
+    """When image_processor implements get_number_of_image_patches, it is used."""
+    img = PILImage.new("RGB", (192, 16))
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": "What is this?"},
+            ],
+        },
+    ]
+
+    class MockMimoIP:
+        patch_size = 16
+        merge_size = 2
+        min_pixels = 8192
+        max_pixels = 8388608
+        size = {"min_pixels": 8192, "max_pixels": 8388608}
+
+        def get_number_of_image_patches(self, height, width, images_kwargs=None):
+            # 16x192 at factor=32 upscales short side to factor -> 32x384
+            # (32 // 16) * (384 // 16) = 2 * 24 = 48 patches
+            return 48
+
+    class ProcWithPatchCounter:
+        image_processor = MockMimoIP()
+
+    extra = collate_mod._estimate_media_tokens(conversation, ProcWithPatchCounter())
+    # 48 patches // (2*2) = 12 image tokens
+    # extra = 12 - 1 = 11 tokens (fallback _smart_resize_image would give 10 - 1 = 9)
+    assert extra == 11
+
+
+def test_drop_overlong_samples_uses_image_patches(collate_mod):
+    """_drop_overlong_samples drops sample when image patch count exceeds max_length."""
+    img = PILImage.new("RGB", (192, 16))
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": "x"},
+            ],
+        },
+    ]
+
+    class MockMimoIP:
+        patch_size = 16
+        merge_size = 2
+        min_pixels = 8192
+        max_pixels = 8388608
+        size = {"min_pixels": 8192, "max_pixels": 8388608}
+
+        def get_number_of_image_patches(self, height, width, images_kwargs=None):
+            return 48
+
+    class MockProcessor(_DropTestProcessor):
+        def __init__(self):
+            super().__init__()
+            self.image_processor = MockMimoIP()
+
+    proc = MockProcessor()
+    # 1 text token ("x") + 11 extra image tokens = 12 tokens total.
+    # At max_length=10, the sample must be dropped (all dropped raises ValueError).
+    import pytest
+
+    with pytest.raises(ValueError, match="exceed max_length=10"):
+        collate_mod._drop_overlong_samples([conversation], proc, max_length=10)
+
+    # At max_length=12, the sample is kept.
+    kept, indices = collate_mod._drop_overlong_samples([conversation], proc, max_length=12)
+    assert len(kept) == 1
+    assert indices == [0]
+
+
 # ---------------------------------------------------------------------------
 # _count_media_per_sample tests
 # ---------------------------------------------------------------------------
