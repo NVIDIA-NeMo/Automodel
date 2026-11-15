@@ -14,6 +14,7 @@
 
 import inspect
 from dataclasses import dataclass, fields
+from pathlib import Path
 
 import pytest
 import torch
@@ -791,3 +792,35 @@ def test_recipe_rejects_a_loader_target_that_is_not_a_config_subclass():
     )
     with pytest.raises(ValueError, match="DataloaderConfig subclass"):
         RecipeConfig(raw).dataloader
+
+
+_SYNTHETIC_PRETRAIN_CONFIGS = sorted(
+    path
+    for path in (Path(__file__).resolve().parents[3] / "examples/llm_pretrain").rglob("*.yaml")
+    if "# Synthetic pretraining counterpart of" in path.read_text()
+)
+
+
+@pytest.mark.parametrize("config_path", _SYNTHETIC_PRETRAIN_CONFIGS, ids=lambda path: path.stem)
+def test_synthetic_pretraining_uses_recipe_batch_size(config_path: Path) -> None:
+    """Real migrated loaders honor local batch overrides without an extra axis."""
+    import yaml
+
+    raw = yaml.safe_load(config_path.read_text())
+    # Keep model vocabulary/exclusions, but make the CPU smoke workload tiny.
+    raw["dataset"]["seq_len"] = 16
+    raw["step_scheduler"]["local_batch_size"] = 3
+    raw["dataloader"].update(num_workers=0, pin_memory=False)
+    data_config = {key: raw[key] for key in ("dataset", "dataloader", "step_scheduler")}
+    config = RecipeConfig(ConfigNode(data_config)).dataloader
+    batch = next(iter(config.build(tokenizer=None, dp_rank=0, dp_world_size=1)))
+    assert batch["input_ids"].shape == (3, 16)
+    assert batch["labels"].shape == (3, 16)
+    torch.testing.assert_close(batch["labels"][:, :-1], batch["input_ids"][:, 1:])
+    assert batch["labels"][:, -1].eq(-100).all()
+    assert not batch["padding_mask"].any()
+    assert "position_ids" not in batch
+    assert batch["input_ids"].min() >= 0
+    assert batch["input_ids"].max() < raw["dataset"]["vocab_size"]
+    for token_id in raw["dataset"]["exclude_token_ids"]:
+        assert batch["input_ids"].ne(token_id).all()

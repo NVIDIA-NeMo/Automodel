@@ -236,3 +236,10 @@ class TestModuleMatcherMatch:
         matcher = ModuleMatcher(exclude_modules=["*.layers.1.*"])
         excluded = [i for i in range(24) if not matcher.match(nn.Linear(10, 10), name=f"model.layers.{i}.mlp.up_proj")]
         assert excluded == [1]
+
+    def test_exclude_modules_leading_wildcard_matches_top_level_module(self):
+        # Documented usage: exclude_modules=["*.lm_head"] also excludes a root-level lm_head.
+        matcher = ModuleMatcher(exclude_modules=["*.lm_head"])
+        assert not matcher.match(nn.Linear(10, 10), name="lm_head")
+        assert not matcher.match(nn.Linear(10, 10), name="model.lm_head")
+        assert matcher.match(nn.Linear(10, 10), name="model.layers.0.q_proj")
