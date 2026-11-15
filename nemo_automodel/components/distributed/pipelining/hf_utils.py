@@ -70,8 +70,30 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
 
     Each stage builds masks from its model config and current microbatch. Without
     an explicit ``attention_mask``, the fixed-length causal mask is reused for the
-    same sequence length, dtype and device. Explicit padding/document masks are
+    same sequence length, dtype and device, only for internally generated positions.
+    Supplied positions may encode changing document boundaries and disable caching.
+    Explicit padding/document masks are
     recomputed for each microbatch, while supplied mask mappings pass through.
+
+    Args:
+        module: Pipeline stage owning its model config and mask cache.
+        inputs_embeds: Local microbatch tensor [batch, sequence, hidden]; only
+            its shape, dtype and device are read.
+        attention_mask: Optional token keep-mask [batch, sequence], complete
+            mask [batch, 1, sequence, sequence], or full/sliding mask mapping.
+            Token masks use nonzero for valid tokens; complete boolean masks
+            use True for allowed attention and floating masks are additive.
+        cache_position: Offset tensor [sequence], currently unused.
+        position_ids: Supplied positions [1, sequence] or [batch, sequence].
+            None means the caller generated ordinary contiguous positions.
+            Supplied positions may encode packing and always bypass the cache.
+
+    Returns:
+        Full/sliding masks: backend-dependent complete masks
+        [batch, 1, sequence, sequence], token masks [batch, sequence] for Flash,
+        or None for implicit attention. Supplied mappings pass through by
+        identity; generated mappings may alias the stage cache. Input tensors
+        are not mutated.
     """
     # An ``attention_mask`` that is already a mask-mapping dict is used as-is.
     if isinstance(attention_mask, dict):
@@ -79,7 +101,7 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
 
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-    cacheable = attention_mask is None
+    cacheable = attention_mask is None and position_ids is None
     cache_key = (inputs_embeds.shape[1], inputs_embeds.dtype, inputs_embeds.device)
     cache = getattr(module, "_pp_causal_mask_cache", None)
     if cache is not None and not isinstance(cache, MutableMapping):
@@ -182,6 +204,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
+        mask_position_ids = position_ids
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
@@ -189,7 +212,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         # fixed-length causal masks and honor explicit padding/document masks.
         if causal_mask_mapping is None:
             causal_mask_mapping = _build_or_reuse_pp_causal_mask(
-                self, inputs_embeds, attention_mask, cache_position, position_ids
+                self, inputs_embeds, attention_mask, cache_position, mask_position_ids
             )
 
         hidden_states = inputs_embeds
