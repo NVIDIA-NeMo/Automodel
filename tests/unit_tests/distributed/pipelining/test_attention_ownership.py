@@ -13,11 +13,12 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import create_pip
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
 @pytest.mark.parametrize("architecture", ["llama", "qwen2"])
 @pytest.mark.parametrize("first_stage", [False, True])
 @pytest.mark.parametrize("mask_kind", ["causal", "padding", "packed"])
 def test_stage_owned_masks_match_model_outputs_and_gradients(
-    architecture: str, first_stage: bool, mask_kind: str
+    architecture: str, first_stage: bool, mask_kind: str, backend: str
 ) -> None:
     """Compare full/sliding attention, padding, and document isolation without a collate wrapper."""
     if architecture == "llama":
@@ -45,7 +46,7 @@ def test_stage_owned_masks_match_model_outputs_and_gradients(
         use_cache=False,
         **extra,
     )
-    config._attn_implementation = "eager"
+    config._attn_implementation = backend
     torch.manual_seed(42)
     reference = model_cls(config).eval()
     stage = deepcopy(reference)
@@ -95,3 +96,29 @@ def test_stage_owned_masks_match_model_outputs_and_gradients(
                 torch.testing.assert_close(parameter.grad, expected, rtol=1e-4, atol=1e-5)
         stage.zero_grad(set_to_none=True)
         reference.zero_grad(set_to_none=True)
+
+
+def test_explicit_padding_mask_has_no_scalar_reads() -> None:
+    """Mask materialization must not read tensor values back to the host."""
+    from types import SimpleNamespace
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from transformers import LlamaConfig
+
+    from nemo_automodel.components.distributed.pipelining.hf_utils import _build_or_reuse_pp_causal_mask
+
+    class RejectScalarReads(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert func != torch.ops.aten._local_scalar_dense.default, "Mask creation reads a tensor scalar"
+            return func(*args, **(kwargs or {}))
+
+    config = LlamaConfig()
+    config._attn_implementation = "sdpa"
+    module = SimpleNamespace(config=config, has_sliding_layers=False)
+    padding = torch.tensor([[1, 1, 0, 0], [0, 1, 1, 1]])
+    with RejectScalarReads():
+        result = _build_or_reuse_pp_causal_mask(
+            module, torch.zeros(2, 4, 8), padding, torch.arange(4), torch.arange(4)[None]
+        )["full_attention"]
+    expected = torch.ones(4, 4, dtype=torch.bool).tril()[None, None] & padding[:, None, None, :].bool()
+    torch.testing.assert_close(result, expected)

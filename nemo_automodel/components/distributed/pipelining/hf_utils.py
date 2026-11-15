@@ -94,6 +94,10 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
         "attention_mask": attention_mask,
         "past_key_values": None,  # Training-only: no KV cache
         "position_ids": position_ids,
+        # HF's SDPA skip heuristic reads GPU reductions back to Python twice
+        # for a padded microbatch. An explicit mask must preserve its exclusions;
+        # materialize it directly without synchronizing the training process.
+        "allow_is_causal_skip": attention_mask is None,
     }
     causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
     if getattr(module, "has_sliding_layers", False) is True:
