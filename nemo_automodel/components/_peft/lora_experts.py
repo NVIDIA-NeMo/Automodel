@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 import torch.distributed.nn.functional as dist_nn_f
@@ -33,9 +33,6 @@ from nemo_automodel.components.moe.experts import (
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.shared.utils import dtype_from_str
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
 
 LoraAInitMethod = Literal["xavier", "kaiming"]
 
@@ -592,7 +589,6 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     n_routed_experts: int
     ep_size: int
     ep_rank: int
-    token_dispatcher: MoEFlexTokenDispatcher | None
     use_mxfp8: bool
     expert_activation: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
     gate_and_up_projs: nn.Parameter | DTensor
