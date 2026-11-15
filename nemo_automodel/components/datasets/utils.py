@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import math
+from collections.abc import Callable, MutableMapping
+from typing import TypeVar
 
 import numpy as np
 import torch
+from transformers import PretrainedConfig
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from nemo_automodel.components.datasets.packing import (
@@ -258,6 +261,39 @@ def add_causal_masks_to_batch(batch_dict, model_config):
 
     batch_dict["causal_mask_mapping"] = causal_mask_mapping
     return batch_dict
+
+
+_RawBatch = TypeVar("_RawBatch")
+_CollatedBatch = TypeVar(
+    "_CollatedBatch", bound=MutableMapping[str, torch.Tensor | int | float | dict[str, torch.Tensor | None]]
+)
+
+
+def collate_with_causal_masks(
+    batch: _RawBatch,
+    *,
+    base_fn: Callable[[_RawBatch], _CollatedBatch],
+    config: PretrainedConfig,
+) -> _CollatedBatch:
+    """Collate examples and attach pipeline-parallel masks in a spawn-picklable callable.
+
+    Args:
+        batch: Raw examples accepted by ``base_fn``. Standard token-list fields
+            have per-example shape ``[sequence]``; pre-batched tensor fields
+            have shape ``[batch, ...]`` with arbitrary trailing dimensions.
+        base_fn: Collator returning a mutable batch mapping. It must be picklable
+            when DataLoader multiprocessing uses spawn.
+        config: HuggingFace model config used to construct attention masks.
+
+    Returns:
+        The base collator's mapping, updated in place with ``causal_mask_mapping``.
+        Standard token tensors retain shape ``[batch, sequence]``. The added
+        ``full_attention`` and optional ``sliding_attention`` masks have shape
+        ``[batch, 1, sequence, sequence]``, or are ``None`` when the attention
+        backend does not need an explicit mask. Other fields retain their base
+        layout.
+    """
+    return add_causal_masks_to_batch(base_fn(batch), model_config=config)
 
 
 def default_collater(

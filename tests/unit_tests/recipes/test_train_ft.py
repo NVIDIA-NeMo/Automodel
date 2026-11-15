@@ -2117,9 +2117,56 @@ def test_pp_autoconfig_success_chains_masks():
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
     ):
         collate_fn = _pp_loader(cfg_model, cfg_dl)
+        collate_fn(["dummy_batch"])
 
-    collate_fn(["dummy_batch"])
     assert call_order == ["base", "masks"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_workers", [0, 1])
+def test_pp_collate_spawn_workers_preserve_batches_and_masks(num_workers: int) -> None:
+    """PP collation must work in spawned workers and preserve causal/padding masks."""
+    from torchdata.stateful_dataloader import StatefulDataLoader
+    from transformers import LlamaConfig
+
+    from nemo_automodel.components.datasets.utils import default_collater
+
+    config = LlamaConfig(hidden_size=8, num_attention_heads=2, num_hidden_layers=1)
+    config._attn_implementation = "eager"
+    samples = [
+        {"input_ids": [1, 2, 3, 0], "labels": [2, 3, 4, -100], "attention_mask": [1, 1, 1, 0]},
+        {"input_ids": [5, 6, 0, 0], "labels": [6, 7, -100, -100], "attention_mask": [1, 1, 0, 0]},
+    ]
+    with patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=config):
+        wrapper = _build_pp_collate_wrapper(ConfigNode({"pretrained_model_name_or_path": "test"}), True)
+    collate_fn = wrapper(default_collater)
+    loader_kwargs = {"multiprocessing_context": "spawn", "timeout": 45} if num_workers else {}
+    batches = list(
+        StatefulDataLoader(samples, batch_size=2, collate_fn=collate_fn, num_workers=num_workers, **loader_kwargs)
+    )
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["input_ids"].tolist() == [[1, 2, 3, 0], [5, 6, 0, 0]]
+    assert batch["labels"].tolist() == [[2, 3, 4, -100], [6, 7, -100, -100]]
+    assert batch["padding_mask"].tolist() == [[False, False, False, True], [False, False, True, True]]
+    mask = batch["causal_mask_mapping"]["full_attention"]
+    assert mask.shape == (2, 1, 4, 4)
+    blocked = torch.finfo(mask.dtype).min
+    expected = torch.tensor(
+        [
+            [[[0, blocked, blocked, blocked], [0, 0, blocked, blocked], [0, 0, 0, blocked], [0, 0, 0, blocked]]],
+            [
+                [
+                    [0, blocked, blocked, blocked],
+                    [0, 0, blocked, blocked],
+                    [0, 0, blocked, blocked],
+                    [0, 0, blocked, blocked],
+                ]
+            ],
+        ],
+        dtype=mask.dtype,
+    )
+    torch.testing.assert_close(mask, expected)
 
 
 @pytest.mark.parametrize(

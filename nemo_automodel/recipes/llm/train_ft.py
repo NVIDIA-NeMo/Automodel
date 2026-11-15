@@ -32,6 +32,7 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.components.training.batch import move_batch_to_device
@@ -460,25 +461,11 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
         )
         return None
 
-    from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
+    from nemo_automodel.components.datasets.utils import collate_with_causal_masks
 
     def wrapper(base_collate_fn):
-        def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
-            """Collate examples and attach pipeline-parallel causal masks.
-
-            Args:
-                batch: Raw examples accepted by ``base_fn``. Standard token-list fields have per-example shape
-                    ``[S_i]`` and pre-batched tensor fields have shape ``[B_i, ...]``, where ``S_i`` is an
-                    example sequence length and ``B_i`` is a source batch size.
-
-            Returns:
-                Collated mapping whose standard token tensors have shape ``[B, S]``, where ``B`` is local batch
-                size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
-                same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
-            """
-            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
-
-        return chained_collate_fn
+        # Workers receive this partial, not the recipe-local wrapper factory.
+        return partial(collate_with_causal_masks, base_fn=base_collate_fn, config=hf_model_config)
 
     return wrapper
 
