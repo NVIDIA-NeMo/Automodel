@@ -263,6 +263,8 @@ def add_causal_masks_to_batch(batch_dict, model_config):
 def default_collater(
     batch: list[dict[str, list[int] | torch.Tensor]],
     pad_seq_len_divisible: int | None = None,
+    *,
+    omit_empty_padding_mask: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Default batch collator that handles padding and batching.
@@ -278,11 +280,15 @@ def default_collater(
             ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place. Apart from
             that removal, the input examples and their tensors are left unmodified.
         pad_seq_len_divisible: If set, round padded ``S`` up to a multiple of this value.
+        omit_empty_padding_mask: Omit ``padding_mask`` when it excludes no tokens. This opt-in check
+            runs during collation, normally on CPU, so models can use their implicit unpadded-input
+            path without a device synchronization in every forward. Masks containing padding remain.
 
     Returns:
         Mapping of fields to tensors. List-valued inputs become ``torch.int64`` tensors shaped ``[B, S]``;
         tensor-valued inputs preserve dtype/device and trailing layout. When ``attention_mask`` or
-        ``input_ids`` is present with shape ``[B, S]``, ``padding_mask`` is a boolean ``[B, S]`` tensor.
+        ``input_ids`` is present with shape ``[B, S]``, ``padding_mask`` is a boolean ``[B, S]`` tensor,
+        unless ``omit_empty_padding_mask`` is enabled and the mask is entirely false.
     """
     pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
     # ans contains a dict with:
@@ -327,6 +333,10 @@ def default_collater(
     elif "input_ids" in result:
         input_ids_pad_token = get_pad_token_from_key("input_ids", pad_token_ids) or 0
         result["padding_mask"] = (result["input_ids"] == input_ids_pad_token).bool()
+
+    padding_mask = result.get("padding_mask")
+    if omit_empty_padding_mask and padding_mask is not None and not padding_mask.any():
+        del result["padding_mask"]
 
     return result
 

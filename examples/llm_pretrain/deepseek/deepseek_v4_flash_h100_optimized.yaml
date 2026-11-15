@@ -9,7 +9,10 @@ checkpoint:
   enabled: false
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    # Grouped compressors require implicit unpadded inputs; retain masks for real padding.
+    omit_empty_padding_mask: true
   num_workers: 4
   pin_memory: true
 dataset:
