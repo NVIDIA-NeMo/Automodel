@@ -639,15 +639,17 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
     assert "2 output shard(s)" in caplog.text
 
 
-def _run_consolidated_index_pp_worker(rank: int, init_file: str, checkpoint_dir: str) -> None:
-    """Every stage must derive the expected global mapping using only its local tensors."""
+def _run_consolidated_index_pp_worker(
+    rank: int, init_file: str, checkpoint_dir: str, with_pp_group: bool = True
+) -> None:
+    """Every rank must derive the expected global mapping using only its local tensors."""
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     torch.distributed.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
     )
     try:
         checkpointer = CheckpointingConfig(checkpoint_dir=checkpoint_dir, save_consolidated=False).build(
-            dp_rank=0, tp_rank=0, pp_rank=rank, pp_group=torch.distributed.group.WORLD
+            dp_rank=0, tp_rank=0, pp_rank=rank, pp_group=torch.distributed.group.WORLD if with_pp_group else None
         )
         keys = [f"layers.{index}.weight" for index in range(4)]
         # For size fallback, each 4-GiB logical tensor needs its own shard; meta avoids allocating the payload.
@@ -689,6 +691,87 @@ def test_consolidated_index_agrees_across_pp_ranks(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.cpu_only
+def test_consolidated_index_agrees_across_ranks_without_pp_group(tmp_path):
+    """Ranks that hold different keys without pipeline parallelism, as expert-parallel ranks do, derive one mapping."""
+    torch.multiprocessing.spawn(
+        _run_consolidated_index_pp_worker,
+        args=(str(tmp_path / "dist_init"), str(tmp_path), False),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _run_rank_local_expert_export_worker(rank: int, init_file: str, checkpoint_dir: str) -> None:
+    """Export through a save group of ranks 0 and 1 in a world of three ranks.
+
+    Each saving rank holds the shared weight and its own two of four expert weights. Rank 2 is outside the save
+    group and takes no part in the save.
+    """
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=3, timeout=timedelta(seconds=30)
+    )
+    try:
+        save_group = torch.distributed.new_group(ranks=[0, 1], backend="gloo")
+        if rank < 2:
+            model = torch.nn.Module()
+            model.shared = torch.nn.Linear(4, 4, bias=False)
+            model.experts = torch.nn.ModuleDict(
+                {str(index): torch.nn.Linear(4, 4, bias=False) for index in range(2 * rank, 2 * rank + 2)}
+            )
+            with torch.no_grad():
+                model.shared.weight.fill_(-1.0)
+                for index, expert in model.experts.items():
+                    expert.weight.fill_(float(index))
+            # The complete key list, computed before sharding and stamped on every rank.
+            model._pre_shard_hf_state_dict_keys = ["shared.weight", *(f"experts.{index}.weight" for index in range(4))]
+            checkpointer = CheckpointingConfig(
+                checkpoint_dir=checkpoint_dir,
+                model_cache_dir=os.path.join(checkpoint_dir, "empty_cache"),
+                model_repo_id="test/no-cached-snapshot",
+                save_consolidated=True,
+            ).build(dp_rank=rank, tp_rank=0, pp_rank=0, process_group=save_group)
+            try:
+                # Two FP32 [4, 4] weights fill a 128-byte shard, so the five tensors need three shards.
+                with patch(
+                    "nemo_automodel.components.checkpoint.checkpointing._DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES", 128
+                ):
+                    checkpointer.save_model(model, os.path.join(checkpoint_dir, "checkpoint"))
+            finally:
+                checkpointer.close()
+        # Rank 2 never enters the save group's collectives; the world is still usable by all three ranks.
+        check = torch.ones(1)
+        torch.distributed.all_reduce(check)
+        assert check.item() == 3
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.cpu_only
+def test_export_from_ranks_with_different_expert_keys_reloads_every_tensor(tmp_path):
+    """Every tensor is in the output shard the published index names, with the saved values."""
+    torch.multiprocessing.spawn(
+        _run_rank_local_expert_export_worker,
+        args=(str(tmp_path / "dist_init"), str(tmp_path)),
+        nprocs=3,
+        join=True,
+    )
+
+    output = tmp_path / "checkpoint" / "model" / "consolidated"
+    weight_map = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    expected = {"shared.weight": -1.0, **{f"experts.{index}.weight": float(index) for index in range(4)}}
+    assert set(weight_map) == set(expected)
+    restored = {}
+    for filename in set(weight_map.values()):
+        tensors = load_file(str(output / filename))
+        assert set(tensors) == {key for key, mapped_file in weight_map.items() if mapped_file == filename}
+        restored.update(tensors)
+    for key, value in expected.items():
+        torch.testing.assert_close(restored[key], torch.full((4, 4), value), rtol=0, atol=0)
+    assert len(set(weight_map.values())) == 3
 
 
 def test_fully_pruned_original_index_does_not_readd_excluded_tied_lm_head(tmp_path):
@@ -777,7 +860,7 @@ def test_collect_global_tensor_sizes_rejects_missing_rank_metadata():
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=2),
         patch("torch.distributed.all_gather_object", side_effect=omit_remote_mapping),
-        pytest.raises(RuntimeError, match="Pipeline rank 1 did not provide tensor sizes for consolidated export"),
+        pytest.raises(RuntimeError, match="Rank 1 did not provide tensor sizes for consolidated export"),
     ):
         _collect_global_tensor_sizes({"weight": torch.empty(2)}, group)
 
@@ -821,7 +904,7 @@ def _run_logical_tensor_sizes_worker(rank: int, world_size: int, init_file: str)
             torch.empty(3 if rank else 2, dtype=torch.float32),
             torch.empty(2, dtype=torch.float64 if rank else torch.float32),
         ):
-            with pytest.raises(ValueError, match="Conflicting logical sizes for 'weight' across pipeline ranks"):
+            with pytest.raises(ValueError, match="Conflicting logical sizes for 'weight' across ranks"):
                 _collect_global_tensor_sizes({"weight": conflicting_tensor}, group)
     finally:
         torch.distributed.destroy_process_group()
