@@ -37,7 +37,7 @@ from nemo_automodel.components.speculative.dspark import Qwen3DSparkModel, build
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
-from nemo_automodel.recipes.llm.train_dspark import TrainDSparkRecipe
+from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention backward requires a GPU")
 

@@ -446,6 +446,8 @@ def dsv4_sparse_attention(
     *,
     backend: Dsv4SparseAttentionBackend,
     reference_rounding: bool = False,
+    backward_impl: str = "atomic",
+    backward_workspace_bytes: int = 2 * 1024**3,
     all_rows_nonempty: bool = False,
     plan: SparseIndexPlan | None = None,
 ) -> torch.Tensor:
@@ -459,6 +461,8 @@ def dsv4_sparse_attention(
             with ``plan``, which then carries the prepared indices.
         sm_scale: Query/key score multiplier.
         backend: Sparse execution backend.
+        backward_impl: Atomic or fixed-order deterministic backward (TileLang only).
+        backward_workspace_bytes: Partial-KV workspace cap; auxiliary buffers are extra.
         reference_rounding: Scale logits before max reduction and use the
             original inference exponent arithmetic. Requires TileLang.
         all_rows_nonempty: Whether every query has at least one valid slot (``"cudnn"``).
@@ -468,6 +472,10 @@ def dsv4_sparse_attention(
     Returns:
         Attention output [batch, sequence, heads, head_dim], with q's dtype.
     """
+    if backward_impl not in ("atomic", "deterministic") or backward_workspace_bytes <= 0:
+        raise ValueError("invalid sparse attention backward implementation or workspace")
+    if backward_impl == "deterministic" and backend != "tilelang":
+        raise ValueError("deterministic sparse attention backward requires TileLang")
     if topk_idxs is None and plan is None:
         raise ValueError("dsv4_sparse_attention needs topk_idxs or a prepared plan")
     if plan is not None and (plan.backend != backend or plan.kv_sequence != kv.shape[1]):
@@ -510,14 +518,31 @@ def dsv4_sparse_attention(
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            kwargs = {"reference_rounding": True} if reference_rounding else {}
             output = _miles_sparse_attn_tilelang_head_chunked(
-                q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale, **kwargs
+                q,
+                kv,
+                sinks,
+                topk_idxs,
+                max_heads_per_kernel,
+                sm_scale,
+                reference_rounding=reference_rounding,
+                backward_impl=backward_impl,
+                backward_workspace_bytes=backward_workspace_bytes,
             )
         else:
-            kwargs = {"reference_rounding": True} if reference_rounding else {}
-            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale, **kwargs)
+            output = _miles_sparse_attn_tilelang(
+                q,
+                kv,
+                sinks,
+                topk_idxs,
+                sm_scale,
+                reference_rounding=reference_rounding,
+                backward_impl=backward_impl,
+                backward_workspace_bytes=backward_workspace_bytes,
+            )
         return output[:, :, :original_heads, :]
+    if backward_impl == "deterministic":
+        raise ValueError("deterministic sparse attention backward requires CUDA BF16 TileLang execution")
     if reference_rounding:
         raise ValueError("Original-inference sparse attention rounding requires the TileLang backend")
     if plan is not None:

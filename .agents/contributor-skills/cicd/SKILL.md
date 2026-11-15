@@ -1,6 +1,6 @@
 ---
 name: cicd
-description: CI/CD reference for NeMo AutoModel — pipeline structure, commit and PR workflow, CI failure investigation, and common failure patterns. Use when investigating a CI failure, understanding the pipeline structure, writing a commit or PR, triggering CI, 'CI is red', 'how do I trigger CI', 'PR workflow', 'where are the logs', 'CI did not run', '/ok to test'.
+description: "NeMo AutoModel CI: pipeline structure, commits and PRs, triggering CI with /ok to test, and investigating failures. Use when CI is red or didn't run, or when writing a commit or PR."
 ---
 
 # CI/CD

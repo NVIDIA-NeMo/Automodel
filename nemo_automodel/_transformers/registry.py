@@ -19,6 +19,7 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
+from types import ModuleType
 from typing import Dict, Tuple, Type, Union
 
 import torch.nn as nn
@@ -143,6 +144,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "KimiK3ForCausalLM",
             ("nemo_automodel.components.models.kimi_k3.model", "KimiK3ForCausalLM"),
+        ),
+        (
+            "KimiK31ForConditionalGeneration",
+            ("nemo_automodel.components.models.kimi_k3.multimodal", "KimiK31ForConditionalGeneration"),
         ),
         (
             "KimiVLForConditionalGeneration",
@@ -406,9 +411,18 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
         ),
         (
+            "Inkling2ForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling2.multimodal", "Inkling2ForConditionalGeneration"),
+        ),
+        (
+            "Inkling2ForCausalLM",
+            ("nemo_automodel.components.models.inkling2.model", "Inkling2ForCausalLM"),
+        ),
+        (
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
+        ("PraxisPolicy", ("nemo_automodel.components.models.praxis.model", "PraxisPolicy")),
     ]
 )
 
@@ -433,9 +447,13 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
+    "inkling2": ("nemo_automodel.components.models.inkling2.config", "Inkling2Config"),
+    "inkling2_mm_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2LegacyConfig"),
+    "inkling2_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2TextConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
+    "kimi_k31": ("nemo_automodel.components.models.kimi_k3.config", "KimiK31Config"),
     "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
     "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
@@ -485,6 +503,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 # Checkpoint model_type to local image/text processor implementation.
 _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
+    "kimi_k31": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
 }
 
@@ -576,7 +595,7 @@ class _LazyArchMapping:
                 self._tags[key] = value[2]
         self._loaded: Dict[str, Type[nn.Module]] = {}
         self._extra: Dict[str, Type[nn.Module]] = {}
-        self._modules: Dict[str, object] = {}
+        self._modules: Dict[str, ModuleType] = {}
 
     def _load(self, key: str) -> Type[nn.Module]:
         if key in self._loaded:

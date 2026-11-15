@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest import mock
 
 import pytest
@@ -26,7 +27,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata
+from nemo_automodel.components.models.common.packing import PackingCapabilities, flatten_packed_sequence_metadata
 
 
 def _reference_varlen_sdpa(
@@ -434,6 +435,43 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert torch.equal(attn_kwargs["attn_mask"], expected_mask)
         assert attn_kwargs["is_causal"] is False
 
+    @pytest.mark.parametrize("window_size", [(-1, 0), (3, 0)])
+    def test_sdpa_compiled_padding_mask_forward_backward(self, window_size):
+        """Fullgraph attention must honor changing padding values without scalar extraction."""
+
+        def attend(q, k, v, padding_mask):
+            q, k, v, kwargs = preprocess_args_and_kwargs_for_attn(
+                q, k, v, attention_mask=padding_mask, attn_impl="sdpa", window_size=window_size
+            )
+            return F.scaled_dot_product_attention(q, k, v, **kwargs)
+
+        compiled = torch.compile(attend, backend="aot_eager", fullgraph=True)
+        torch.manual_seed(23)
+        values = [torch.randn(2, 5, 2, 8) for _ in range(3)]
+        # Reuse one compiled function as the same-shaped mask changes from all
+        # valid to padded, catching accidental specialization to tensor values.
+        for padding_mask in (
+            torch.ones(2, 5, dtype=torch.bool),
+            torch.tensor([[True, True, False, False, False], [True, True, True, False, True]]),
+        ):
+            inputs = [value.clone().requires_grad_() for value in values]
+            references = [value.clone().requires_grad_() for value in values]
+            actual = compiled(*inputs, padding_mask)
+            positions = torch.arange(5)
+            allowed = positions[:, None] >= positions[None, :]
+            if window_size[0] >= 0:
+                allowed &= positions[None, :] > positions[:, None] - window_size[0]
+            mask = allowed[None, None] & padding_mask[:, None, None, :]
+            expected = F.scaled_dot_product_attention(
+                *(value.transpose(1, 2).contiguous() for value in references), attn_mask=mask
+            )
+            torch.testing.assert_close(actual, expected)
+            gradient = torch.randn_like(expected)
+            actual.backward(gradient)
+            expected.backward(gradient)
+            for value, reference in zip(inputs, references):
+                torch.testing.assert_close(value.grad, reference.grad)
+
     def test_sdpa_preprocessing_with_explicit_attention_bias(self):
         """Test SDPA preserves a prebuilt additive attention mask."""
         q = torch.randn(2, 4, 3, 8)
@@ -753,9 +791,9 @@ class TestFA4Backend:
                     "n_videos": 0,
                 },
             ],
-            packing=SimpleNamespace(
+            packing=PackingCapabilities(
                 packed_mask_type="document_ids",
-                requires_packed_sequence_metadata=True,
+                return_packed_sequence_metadata=True,
             ),
         )
         attention_mask = collated["attention_mask"]

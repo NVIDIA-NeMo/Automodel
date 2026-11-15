@@ -32,10 +32,12 @@ import yaml
 # Only allow importing from these module prefixes by default
 ALLOWED_IMPORT_PREFIXES = ("nemo_automodel", "torch", "transformers", "torchdata", "torchao", "liger_kernel")
 
-# Define a safe base dir for loading modules from files (default: repo root)
+# Python files inside the installed nemo_automodel package can be loaded by path without the
+# opt-in below, because they are already part of the trusted installation.
 SAFE_BASE_DIR = Path(__file__).resolve().parents[2]
 
-# Opt-in flag that allows loading user-defined code. Default: disabled
+# Opt-in flag that allows loading user-defined code: Python files outside SAFE_BASE_DIR and
+# private attributes of dotted targets. Default: disabled
 ENABLE_USER_MODULES = os.environ.get("NEMO_ENABLE_USER_MODULES", "").lower() in ("1", "true", "yes")
 
 SENSITIVE_KEY_SUBSTRINGS = (
@@ -59,16 +61,8 @@ def set_enable_user_modules(allow: bool) -> None:
 
 
 def _is_safe_path(p: Path) -> bool:
-    rp = p.resolve()
-    try:
-        # Python 3.9+
-        return rp.is_relative_to(SAFE_BASE_DIR)
-    except AttributeError:
-        # Fallback for older versions
-        try:
-            return os.path.commonpath([str(rp), str(SAFE_BASE_DIR.resolve())]) == str(SAFE_BASE_DIR.resolve())
-        except ValueError:
-            return False
+    """Return True if ``p`` resolves, after following symlinks, to a path inside SAFE_BASE_DIR."""
+    return p.resolve().is_relative_to(SAFE_BASE_DIR)
 
 
 def _is_allowed_module(module_name: str) -> bool:
@@ -200,13 +194,15 @@ def resolve_yaml_env_vars(obj: Any) -> Any:
             if var_name in os.environ:
                 return os.environ[var_name]
             if default is not None:
-                return default
+                # A default is part of the config text, so it may itself reference an env var.
+                return _resolve_in_str(default)
             raise KeyError(f"Environment variable '{var_name}' is not set (required by '{token}').")
 
-        # Handle braced patterns first: ${...}
-        braced_pattern = re.compile(r"\$\{([^}]+)\}")
-
-        def _braced_repl(match: re.Match[str]) -> str:
+        # One pass over `${...}` and `$VAR` / `$var.dot.var` (dot-separated segments; do not allow trailing dot),
+        # so the text substituted for one reference is not rescanned for another.
+        def _repl(match: re.Match[str]) -> str:
+            if match.group(1) is None:
+                return _get_env(match.group(2), None, match.group(0))
             expr = match.group(1).strip()
             # Back-compat: ${oc.env:VAR}
             if expr.startswith("oc.env:"):
@@ -221,17 +217,7 @@ def resolve_yaml_env_vars(obj: Any) -> Any:
 
             return _get_env(var_name, default, match.group(0))
 
-        value = braced_pattern.sub(_braced_repl, value)
-
-        # Then handle $VAR patterns (allow dots in name).
-        # `$VAR` and `$var.dot.var` (dot-separated segments; do not allow trailing dot).
-        dollar_pattern = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)")
-
-        def _dollar_repl(match: re.Match[str]) -> str:
-            var_name = match.group(1)
-            return _get_env(var_name, None, match.group(0))
-
-        return dollar_pattern.sub(_dollar_repl, value)
+        return re.sub(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)", _repl, value)
 
     if isinstance(obj, dict):
         return {k: resolve_yaml_env_vars(v) for k, v in obj.items()}
@@ -243,18 +229,36 @@ def resolve_yaml_env_vars(obj: Any) -> Any:
 
 
 def load_module_from_file(file_path: str | Path) -> types.ModuleType:
-    """Dynamically imports a module from a given file path.
+    """Execute a Python file and return it as a module.
 
-    Intentionally permissive to support test/temporary modules. Caller is
-    responsible for any higher-level policy checks.
+    Executing the file runs its top-level code, so a file outside the installed
+    ``nemo_automodel`` package (``SAFE_BASE_DIR``) is refused unless user modules
+    are enabled with ``NEMO_ENABLE_USER_MODULES=1`` or ``set_enable_user_modules(True)``.
+
+    Args:
+        file_path: Path to a ``.py`` file. Symlinks are resolved before the check.
+
+    Returns:
+        The executed module, registered in ``sys.modules`` under a generated name.
+
+    Raises:
+        ImportError: If the file is not a ``.py`` file, is outside the package
+            while user modules are disabled, or cannot be loaded.
     """
     p = Path(file_path)
     if p.suffix != ".py":
         raise ImportError(f"Refusing to load non-Python file as module: {p}")
+    resolved = p.resolve()
+    if not ENABLE_USER_MODULES and not _is_safe_path(resolved):
+        raise ImportError(
+            f"Refusing to execute {resolved}: loading a Python file from outside the nemo_automodel package "
+            "runs its code and is disabled by default. If you trust this file, set NEMO_ENABLE_USER_MODULES=1 "
+            "or call set_enable_user_modules(True)."
+        )
 
-    unique_part = str(abs(hash(str(p.resolve()))) % (10**8))
+    unique_part = str(abs(hash(str(resolved))) % (10**8))
     name = f"cfgmod_{unique_part}_{p.stem}"
-    spec = importlib.util.spec_from_file_location(name, str(p.resolve()))
+    spec = importlib.util.spec_from_file_location(name, str(resolved))
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot create module spec for {p}")
 
@@ -275,11 +279,14 @@ def load_module_from_file(file_path: str | Path) -> types.ModuleType:
 
 def _resolve_target(dotted_path: str) -> Any:
     """
-    Resolve a dotted path to a Python object with safety checks.
+    Resolve a target string to a Python object.
 
     Supports two forms:
-      - "path/to/file.py:attr" (file import): allowed if under SAFE_BASE_DIR unless opt-in is enabled.
-      - "pkg.mod.attr" (dotted import): allowed only for allowlisted prefixes unless opt-in is enabled.
+      - "path/to/file.py:attr" (file import): executes the file. A file outside the installed
+        nemo_automodel package needs the NEMO_ENABLE_USER_MODULES opt-in (see `load_module_from_file`).
+        A private or dunder `attr` is rejected before the file runs.
+      - "pkg.mod.attr" (dotted import): imports the longest module prefix that `_is_allowed_module`
+        accepts, then resolves the rest as attributes. Private attributes need the opt-in.
     """
     if not isinstance(dotted_path, str):
         return dotted_path
@@ -292,12 +299,9 @@ def _resolve_target(dotted_path: str) -> Any:
             raise AssertionError("Left side of ':' must be a .py file")
         if not p.exists():
             raise AssertionError(f"Python script does not exist: {file_part}")
-        module = load_module_from_file(str(p.resolve()))
         if not _is_safe_attr(attr):
-            raise ImportError(
-                "Access to private or dunder attributes is disabled by default. "
-                "To allow out-of-tree code, set NEMO_ENABLE_USER_MODULES=1 or call set_enable_user_modules(True)."
-            )
+            raise ImportError(f"Refusing private or dunder attribute '{attr}' in file target '{dotted_path}'.")
+        module = load_module_from_file(p)
         return getattr(module, attr)
 
     parts = dotted_path.split(".")
@@ -312,7 +316,12 @@ def _resolve_target(dotted_path: str) -> Any:
 
         try:
             module = importlib.import_module(module_name)
-        except ModuleNotFoundError:
+        except ModuleNotFoundError as e:
+            # Only a missing candidate (or one of its parents) means "try a shorter prefix".
+            # A dependency missing inside an existing module is the real error; falling back
+            # would report it as an unresolvable attribute instead.
+            if e.name is not None and not (module_name == e.name or module_name.startswith(e.name + ".")):
+                raise
             continue
 
         obj = module
@@ -600,7 +609,7 @@ class ConfigNode:
         Convert configuration to a YAML-ready dictionary:
         - Preserves typed scalars (ints, floats, bools)
         - Converts callables/classes/methods (e.g., _target_, *_fn) to dotted path strings
-        - Recurses through nested ConfigNodes and lists
+        - Recurses through nested ConfigNodes and lists, emitting tuples as lists
 
         Args:
             resolve_env: If True, resolve `${oc.env:VAR}` interpolations in the returned dict.
@@ -745,16 +754,44 @@ class ConfigNode:
         Set (or append) a value in the config using a dotted key.
 
         e.g. set_by_dotted("foo.bar.abc", 1) will ensure self.foo.bar.abc == 1
+
+        A numeric part indexes into an existing list, as in ``get``:
+        set_by_dotted("optimizer.betas.1", 0.98) replaces only that element.
         """
         parts = dotted_key.split(".")
         node = self
+        owner = self  # nearest ConfigNode, used to wrap values stored in lists
         # walk / create intermediate ConfigNodes
         for p in parts[:-1]:
-            if p not in node.__dict__ or not isinstance(node.__dict__[p], ConfigNode):
-                node.__dict__[p] = ConfigNode({})
-            node = node.__dict__[p]
+            if isinstance(node, list):
+                node = node[self._list_index(node, p, dotted_key)]
+            else:
+                if p not in node.__dict__ or not isinstance(node.__dict__[p], (ConfigNode, list)):
+                    node.__dict__[p] = ConfigNode({})
+                node = node.__dict__[p]
+            if isinstance(node, ConfigNode):
+                owner = node
+            elif not isinstance(node, list):
+                raise TypeError(
+                    f"Cannot set '{dotted_key}': '{p}' is a {type(node).__name__}, not a config node or list"
+                )
         # wrap the final leaf value
-        node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
+        if isinstance(node, list):
+            node[self._list_index(node, parts[-1], dotted_key)] = owner._wrap("", value)
+        else:
+            node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
+
+    @staticmethod
+    def _list_index(items: list[Any], part: str, dotted_key: str) -> int:
+        """Return the list position named by one dotted-key part, or raise."""
+        try:
+            idx = int(part)
+            items[idx]
+        except (ValueError, IndexError):
+            raise IndexError(
+                f"Cannot set '{dotted_key}': '{part}' is not a valid index into a list of length {len(items)}"
+            ) from None
+        return idx
 
     def _format(self, level: int = 0, *, use_orig_values: bool = True) -> str:
         """Return a string representation of the configuration node with indentation.

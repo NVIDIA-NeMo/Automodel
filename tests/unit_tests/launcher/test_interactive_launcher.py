@@ -139,12 +139,13 @@ def _make_torch_distributed_mock(world_size=1, run_return=0):
     return mock_module, mock_args
 
 
-def test_interactive_launcher_single_device(tmp_path):
+@pytest.mark.parametrize("loop_result, expected", [(None, 0), (0, 0), (7, 7)])
+def test_interactive_launcher_single_device(tmp_path, loop_result, expected):
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("recipe:\n  _target_: some.Recipe\n")
 
     mock_recipe_instance = mock.MagicMock()
-    mock_recipe_instance.run_train_validation_loop.return_value = 0
+    mock_recipe_instance.run_train_validation_loop.return_value = loop_result
     mock_recipe_cls = mock.MagicMock(return_value=mock_recipe_instance)
     mock_dist, _ = _make_torch_distributed_mock(world_size=1)
 
@@ -166,7 +167,7 @@ def test_interactive_launcher_single_device(tmp_path):
             recipe_target="some.module.Recipe",
             launcher_config=None,
         )
-    assert rc == 0
+    assert rc == expected
     mock_recipe_cls.assert_called_once_with({"key": "val"})
     mock_recipe_instance.setup.assert_called_once()
     mock_recipe_instance.run_train_validation_loop.assert_called_once()

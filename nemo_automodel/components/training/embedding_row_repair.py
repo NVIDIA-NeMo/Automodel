@@ -23,7 +23,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Partial, Placement, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from nemo_automodel.shared.tied_weights import (
@@ -94,8 +95,8 @@ class _WeightView:
     global_shape: tuple[int, ...]
     local_shape: tuple[int, ...]
     global_offset: tuple[int, ...]
-    mesh: object | None
-    placements: tuple[object, ...]
+    mesh: DeviceMesh | None
+    placements: tuple[Placement, ...]
 
 
 def _weight_view(weight: torch.Tensor, name: str) -> _WeightView:

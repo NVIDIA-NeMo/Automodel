@@ -131,6 +131,7 @@ wandb:
   dir: wandb
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 8

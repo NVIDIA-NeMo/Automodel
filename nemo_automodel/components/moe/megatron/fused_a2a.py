@@ -560,11 +560,11 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
-_hybrid_ep_runtime_signature: tuple[object, ...] | None = None
+_hybrid_ep_runtime_signature: tuple[int | torch.dtype | torch.device | None, ...] | None = None
 _hybrid_ep_initialized_capacity = 0
 
 
-def get_hybrid_ep_initialized_capacity(signature: tuple[object, ...]) -> int:
+def get_hybrid_ep_initialized_capacity(signature: tuple[int | torch.dtype | torch.device | None, ...]) -> int:
     """Return process-global initialized capacity after validating the resource signature.
 
     Args:
@@ -581,7 +581,9 @@ def get_hybrid_ep_initialized_capacity(signature: tuple[object, ...]) -> int:
     return _hybrid_ep_initialized_capacity
 
 
-def publish_hybrid_ep_initialized_capacity(signature: tuple[object, ...], capacity: int) -> None:
+def publish_hybrid_ep_initialized_capacity(
+    signature: tuple[int | torch.dtype | torch.device | None, ...], capacity: int
+) -> None:
     """Publish a successfully initialized process-global HybridEP capacity.
 
     Args:
@@ -761,6 +763,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_preprocessing_api: int | None = None,
         num_blocks_permute: int | None = None,
         num_blocks_unpermute: int | None = None,
+        max_tokens_per_rank: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
         """Dispatch hidden states using compact indices or a dense routing map.
 
@@ -784,6 +787,9 @@ class HybridEPDispatch(torch.autograd.Function):
             num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
             num_blocks_permute: Optional dispatch permutation block count.
             num_blocks_unpermute: Optional combine unpermutation block count.
+            max_tokens_per_rank: Optional per-rank token capacity for the process-global buffer
+                allocated on the first dispatch (``max(tokens, max_tokens_per_rank)``); later
+                dispatches up to that size then never reallocate the buffer.
 
         Returns:
             Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
@@ -795,6 +801,10 @@ class HybridEPDispatch(torch.autograd.Function):
         if first_call:
             t_first = time.perf_counter()
             seq_len, hidden_dim = x.shape[-2:]
+            if max_tokens_per_rank is not None:
+                # Size the buffer for the largest micro-batch up front: HybridEP's runtime
+                # reallocation for a larger batch re-creates the inter-node queue pairs.
+                seq_len = max(int(seq_len), int(max_tokens_per_rank))
             fp8_dispatch = False
             init_hybrid_ep_buffer(
                 group,
@@ -914,10 +924,13 @@ class HybridEPDispatch(torch.autograd.Function):
             # The backward combine is the last HybridEP kernel variant compiled in a training step.
             _jit_stored = True
             store_hybrid_ep_jit_cache()
+        # One entry per forward input (16, ``max_tokens_per_rank`` included): autograd rejects a
+        # shorter tuple whenever the wrapper passes every argument.
         return (
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -1032,6 +1045,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api: int | None = None,
         num_blocks_permute: int | None = None,
         num_blocks_unpermute: int | None = None,
+        max_tokens_per_rank: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
         """Dispatch tokens through HybridEP while retaining dense probability layout.
 
@@ -1051,6 +1065,9 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
             num_blocks_permute: Optional dispatch permutation block count.
             num_blocks_unpermute: Optional combine unpermutation block count.
+            max_tokens_per_rank: Optional per-rank token capacity for the process-global buffer
+                allocated on the first dispatch (``max(tokens, max_tokens_per_rank)``); later
+                dispatches up to that size then never reallocate the buffer.
 
         Returns:
             Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
@@ -1074,6 +1091,7 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api,
             num_blocks_permute,
             num_blocks_unpermute,
+            max_tokens_per_rank,
         )
 
     def hybrid_ep_combine(

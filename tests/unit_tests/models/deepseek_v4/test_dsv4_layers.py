@@ -713,8 +713,261 @@ class TestDeepseekV4AttentionMask:
         for actual, expected in zip(records[1][2], records[0][2], strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    @pytest.mark.parametrize(
+        ("ratio", "segments", "expected"),
+        [
+            # Segment: (document id or 0 for padding, length, first position or None for a constant
+            # position 0). Expected: (document, window, first source row) of every pooled window.
+            (128, [(1, 128, 0), (2, 128, 0)], [(1, 0, 0), (2, 0, 128)]),
+            (128, [(1, 256, 0), (2, 384, 0)], [(1, 0, 0), (1, 1, 128), (2, 0, 256), (2, 1, 384), (2, 2, 512)]),
+            # Document 2 starts at row 100: its windows are rows 100..227 and 228..355.
+            (128, [(1, 100, 0), (2, 300, 0)], [(2, 0, 100), (2, 1, 228)]),
+            (128, [(1, 100, 0), (0, 28, 0), (2, 300, 0), (0, 84, 0)], [(2, 0, 128), (2, 1, 256)]),
+            (128, [(1, 127, 0), (2, 127, 0)], []),
+            # Positions that run over the row keep the row-aligned windows that lie inside one document.
+            (128, [(1, 100, 0), (2, 300, 100)], [(2, 1, 128), (2, 2, 256)]),
+            # Padding that is its own document with one repeated position never forms a window.
+            (128, [(1, 100, 0), (2, 28, None), (3, 300, 0), (4, 128, None)], [(3, 0, 128), (3, 1, 256)]),
+            # Ratio 4: document 1 keeps window 0; document 2 starts at row 6 and has three windows.
+            (4, [(1, 6, 0), (2, 14, 0)], [(1, 0, 0), (2, 0, 6), (2, 1, 10), (2, 2, 14)]),
+            # Positions 1..10: only window 1 (positions 4..7, rows 3..6) is complete.
+            (4, [(1, 10, 1)], [(1, 1, 3)]),
+        ],
+    )
+    def test_align_packed_compressor_windows_selects_complete_document_windows(
+        self, ratio: int, segments: list[tuple[int, int, int | None]], expected: list[tuple[int, int, int]]
+    ):
+        seq_ids = torch.cat([torch.full((length,), doc) for doc, length, _ in segments]).unsqueeze(0)
+        position_ids = torch.cat(
+            [
+                torch.zeros(length, dtype=torch.long) if first is None else torch.arange(first, first + length)
+                for _, length, first in segments
+            ]
+        ).unsqueeze(0)
+        # Feature 0 of token ``row`` is ``row``, so a window's source rows can be read back.
+        kv = torch.arange(seq_ids.shape[1], dtype=torch.float32).view(1, -1, 1).repeat(1, 1, 2)
+
+        aligned_kv, aligned_gate, aligned_seq_ids, aligned_positions = dsv4_layers._align_packed_compressor_windows(
+            kv, -kv, seq_ids, position_ids, ratio
+        )
+        window_seq_ids, window_positions = dsv4_layers._compressed_window_metadata(
+            seq_ids=aligned_seq_ids, position_ids=aligned_positions, ready_len=aligned_kv.shape[1], ratio=ratio
+        )
+
+        usable = (seq_ids.shape[1] // ratio) * ratio
+        assert aligned_kv.shape[1] == usable
+        torch.testing.assert_close(aligned_gate, -aligned_kv)
+        if [row for _, _, row in expected] == list(range(0, usable, ratio)):
+            # Every row chunk already is a complete window: nothing moves.
+            assert torch.equal(aligned_kv, kv[:, :usable])
+        windows = []
+        for slot in range(0 if window_seq_ids is None else window_seq_ids.shape[1]):
+            if window_seq_ids[0, slot] > 0:
+                rows = aligned_kv[0, slot * ratio : (slot + 1) * ratio, 0].long()
+                torch.testing.assert_close(rows, torch.arange(int(rows[0]), int(rows[0]) + ratio))
+                # A window never moves behind the row chunk that holds its last token, so kernels that
+                # bound compressed keys by the query's row offset still reach it.
+                assert slot <= int(rows[-1]) // ratio
+                windows.append((int(window_seq_ids[0, slot]), int(window_positions[0, slot]), int(rows[0])))
+        assert windows == expected
+        # Slots without a window are padding: they must not keep a document id.
+        assert not aligned_seq_ids[0, len(expected) * ratio :].any()
+
+    def test_align_packed_compressor_windows_handles_each_batch_row_on_its_own(self):
+        ratio = 4
+        layouts = ([6, 14], [9, 11])
+        seq_ids = torch.stack(
+            [torch.cat([torch.full((n,), i + 1) for i, n in enumerate(lengths)]) for lengths in layouts]
+        )
+        position_ids = torch.stack([torch.cat([torch.arange(n) for n in lengths]) for lengths in layouts])
+        kv = torch.randn(2, 20, 3)
+        gate = torch.randn(2, 20, 3)
+
+        batched = dsv4_layers._align_packed_compressor_windows(kv, gate, seq_ids, position_ids, ratio)
+
+        for row in range(2):
+            single = dsv4_layers._align_packed_compressor_windows(
+                kv[row : row + 1], gate[row : row + 1], seq_ids[row], position_ids[row], ratio
+            )
+            for batched_tensor, single_tensor in zip(batched, single, strict=True):
+                assert torch.equal(batched_tensor[row : row + 1], single_tensor)
+        # Row 0 pools windows of rows 0..3, 6..9, 10..13, 14..17; row 1 pools 0..3, 4..7, 9..12, 13..16.
+        assert batched[2][:, ::ratio].tolist() == [[1, 2, 2, 2, 0], [1, 1, 2, 2, 0]]
+
+    def test_packed_hca_pools_each_document_from_its_own_start(self):
+        """A packed document that starts off a 128-token boundary pools the same keys as when it runs alone."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        lengths = [100, 300]
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+        hidden_states = torch.randn(1, sum(lengths), cfg.hidden_size)
+        position_ids, packed_seq_ids, position_embeddings_compress, rotary_compress, _ = self._packed_inputs(
+            cfg, hidden_states, lengths
+        )
+        second = hidden_states[:, lengths[0] :]
+        _, single_embeddings_compress, single_rotary_compress, _ = self._hca_inputs(cfg, lengths[1])[1:]
+
+        with torch.no_grad():
+            packed_pool, _, pooled_seq_ids, pooled_positions = attention.compressor(
+                hidden_states,
+                q_residual=None,
+                rotary=rotary_compress,
+                position_embeddings=position_embeddings_compress,
+                cache=dsv4_layers.DeepseekV4TrainCache(),
+                layer_idx=0,
+                start_pos=0,
+                position_ids=position_ids,
+                packed_seq_ids=packed_seq_ids,
+            )
+            single_pool, _, _, _ = attention.compressor(
+                second,
+                q_residual=None,
+                rotary=single_rotary_compress,
+                position_embeddings=single_embeddings_compress,
+                cache=dsv4_layers.DeepseekV4TrainCache(),
+                layer_idx=0,
+                start_pos=0,
+            )
+
+        # Document 1 has no complete window; document 2 has windows 0 and 1.
+        valid = pooled_seq_ids[0] > 0
+        assert pooled_seq_ids[0, valid].tolist() == [2, 2]
+        assert pooled_positions[0, valid].tolist() == [0, 1]
+        torch.testing.assert_close(packed_pool[0, 0, valid], single_pool[0, 0], rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        ("compress_ratio", "sliding_window", "lengths", "causal_positions", "reach_position", "reach_tokens", "index"),
+        [
+            # HCA: compressed window 0 of document 2 becomes visible at its position 127. Position 200
+            # reaches tokens 0..72 of the document only through that window.
+            (128, 128, [100, 300], (126, 127, 130, 149, 200, 298), 200, 73, {}),
+            # CSA with the indexer selecting every key: position 20 of document 2 reaches its tokens
+            # 0..11 only through compressed keys.
+            (4, 8, [6, 26], tuple(range(25)), 20, 12, {}),
+            # CSA with the indexer choosing two keys per query, so its scores decide the result: they
+            # must come from the same per-document windows as the compressor pool they index.
+            (4, 8, [6, 26], tuple(range(25)), None, 0, {"index_topk": 2, "index_n_heads": 16}),
+        ],
+    )
+    def test_packed_unaligned_document_stays_causal_and_matches_separate_run(
+        self,
+        compress_ratio: int,
+        sliding_window: int,
+        lengths: list[int],
+        causal_positions: tuple[int, ...],
+        reach_position: int | None,
+        reach_tokens: int,
+        index: dict[str, int],
+    ):
+        """Document 2 starts off a compressor-window boundary; it must behave as when it runs alone."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config(compress_ratio=compress_ratio, sliding_window=sliding_window, **index)
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+        hidden_states = torch.randn(1, sum(lengths), cfg.hidden_size, requires_grad=True)
+        position_ids, packed_seq_ids, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._packed_inputs(cfg, hidden_states, lengths)
+        )
+        compressor_parameters = [attention.compressor.wkv.weight, attention.compressor.wgate.weight]
+        # A fixed random upstream gradient, so the parameter gradients below are not a plain count.
+        upstream = torch.randn(1, sum(lengths), cfg.hidden_size)
+
+        packed_output, _ = attention(
+            hidden_states,
+            position_embeddings=position_embeddings_compress,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+            position_ids=position_ids,
+            packed_seq_ids=packed_seq_ids,
+        )
+
+        # No position of document 2 may depend on a later token of the row.
+        start = lengths[0]
+        for position in causal_positions:
+            row = start + position
+            (dependence,) = torch.autograd.grad(packed_output[0, row].sum(), hidden_states, retain_graph=True)
+            assert dependence[0, row + 1 :].abs().max().item() == 0.0, f"position {position} depends on a later token"
+        if reach_position is not None:
+            # Tokens outside the sliding window are reached through compressed keys, so those are in use.
+            (dependence,) = torch.autograd.grad(
+                packed_output[0, start + reach_position].sum(), hidden_states, retain_graph=True
+            )
+            assert (dependence[0, start : start + reach_tokens].abs().amax(dim=-1) > 0).all()
+        packed_gradients = torch.autograd.grad((packed_output * upstream).sum(), compressor_parameters)
+
+        separate_outputs = []
+        separate_gradients = [torch.zeros_like(parameter) for parameter in compressor_parameters]
+        offset = 0
+        for length in lengths:
+            document = hidden_states[:, offset : offset + length].detach()
+            _, _, single_embeddings_compress, single_rotary_compress, single_mask = self._hca_inputs(cfg, length)
+            output, _ = attention(
+                document,
+                position_embeddings=single_embeddings_compress,
+                attention_mask=single_mask,
+                position_embeddings_compress=single_embeddings_compress,
+                rotary_compress=single_rotary_compress,
+            )
+            separate_outputs.append(output.detach())
+            gradients = torch.autograd.grad(
+                (output * upstream[:, offset : offset + length]).sum(), compressor_parameters, allow_unused=True
+            )
+            for total, gradient in zip(separate_gradients, gradients, strict=True):
+                if gradient is not None:  # a document shorter than one window does not use the compressor
+                    total += gradient
+            offset += length
+        # Packed and separate runs do the same arithmetic on differently shaped tensors, so they agree
+        # to float32 rounding; the misplaced windows this guards against change outputs by 1e-2 or more.
+        torch.testing.assert_close(packed_output.detach(), torch.cat(separate_outputs, dim=1), rtol=1e-5, atol=1e-6)
+        for packed_gradient, separate_gradient in zip(packed_gradients, separate_gradients, strict=True):
+            torch.testing.assert_close(packed_gradient, separate_gradient, rtol=1e-4, atol=1e-6)
+
     @staticmethod
-    def _tiny_hca_config() -> DeepseekV4Config:
+    def _packed_inputs(
+        cfg: DeepseekV4Config,
+        hidden_states: torch.Tensor,
+        lengths: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], nn.Module, torch.Tensor]:
+        """Build the attention inputs of one packed row whose documents are directly concatenated.
+
+        Args:
+            cfg: Model config; supplies the rotary settings and the sliding window.
+            hidden_states: Tensor of shape [1, sequence, hidden] with sequence equal to ``sum(lengths)``.
+            lengths: Document lengths in row order.
+
+        Returns:
+            Positions of shape [1, sequence] that restart at zero for each document, document ids of shape
+            [1, sequence] starting at one, the compress-rope cosine and sine of shape
+            [1, sequence, rotary_channels], the compress-rope module, and the additive block-causal
+            sliding-window mask of shape [1, 1, sequence, sequence].
+        """
+        position_ids = torch.cat([torch.arange(length) for length in lengths]).unsqueeze(0)
+        packed_seq_ids = torch.cat(
+            [torch.full((length,), index + 1) for index, length in enumerate(lengths)]
+        ).unsqueeze(0)
+        rotary_compress = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.compress_rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=float(cfg.qk_rope_head_dim) / float(cfg.head_dim),
+        )
+        position_embeddings_compress = rotary_compress(hidden_states, position_ids)
+        attention_mask = build_packed_causal_padding_mask(
+            torch.tensor([lengths]),
+            seq_len=sum(lengths),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            sliding_window=cfg.sliding_window,
+        )
+        return position_ids, packed_seq_ids, position_embeddings_compress, rotary_compress, attention_mask
+
+    @staticmethod
+    def _tiny_hca_config(
+        compress_ratio: int = 128, sliding_window: int = 128, index_topk: int = 512, index_n_heads: int = 64
+    ) -> DeepseekV4Config:
         return DeepseekV4Config(
             vocab_size=32,
             hidden_size=16,
@@ -731,8 +984,10 @@ class TestDeepseekV4AttentionMask:
             n_shared_experts=0,
             num_experts_per_tok=1,
             max_position_embeddings=256,
-            compress_ratios=[128],
-            sliding_window=128,
+            compress_ratios=[compress_ratio],
+            sliding_window=sliding_window,
+            index_topk=index_topk,
+            index_n_heads=index_n_heads,
             attention_dropout=0.0,
             num_hash_layers=0,
             hc_mult=1,

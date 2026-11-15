@@ -292,6 +292,8 @@ navigation:
                 path: ../../model-coverage/llm/moonshotai/kimi-k2-base.mdx
               - page: "Kimi-K3"
                 path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
+              - page: "Kimi-K3.1-Pro"
+                path: ../../model-coverage/llm/moonshotai/kimi-k31-pro.mdx
               - page: "Kimi-Linear-48B-A3B-Instruct"
                 path: ../../model-coverage/llm/moonshotai/kimi-linear-48b-a3b-instruct.mdx
               - page: "Moonlight-16B-A3B"
@@ -623,6 +625,8 @@ navigation:
                 path: ../../model-coverage/vlm/moonshotai/kimi-k2-5.mdx
               - page: "Kimi-K3"
                 path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
+              - page: "Kimi-K3.1-Pro"
+                path: ../../model-coverage/vlm/moonshotai/kimi-k31-pro.mdx
               - page: "Kimi-VL-A3B-Instruct"
                 path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - section: "NVIDIA"
@@ -693,6 +697,8 @@ navigation:
             contents:
               - page: "Inkling"
                 path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
+              - page: "Inkling-2-Small"
+                path: ../../model-coverage/vlm/thinkingmachines/inkling2.mdx
               - page: "Inkling-Small"
                 path: ../../model-coverage/vlm/thinkingmachines/inkling-small.mdx
           - section: "Z.ai"
@@ -755,6 +761,19 @@ navigation:
                 path: ../../model-coverage/omni/qwen/qwen2-5-omni-7b.mdx
               - page: "Qwen3-Omni-30B-A3B-Instruct"
                 path: ../../model-coverage/omni/qwen/qwen3-omni.mdx
+      - section: "World Action Models"
+        slug: wam
+        contents:
+          - page: "Overview"
+            path: ../../model-coverage/wam/index.mdx
+            slug: overview
+          - section: "Runway"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRiQBAABXRUJQVlA4IBgBAABQBwCdASoUABQAPjEWiUOiISEUBAAgAwS0gGJvTj/R3JBNJOYQOiCzs/Lvoh/5j8o+MADs5eAwkDXAus7SZA1yip7QAP7/aukTzGO9xUiRLf37hT589lVrdjIey+P3d0r+myG1v/7eSA0bf65+O//SDI/bwp9VKcjQHKfV/jss067/9Wdyk6/UCCRFMZmFTwn0g/T3aayqMdQnYJy/By/oWns66Ku1yLdHC1JcTKfOHt/P+tJdP8qt+zVj3lzQth/+Neb6XZPlzRjCTMRp+EL2X/7rFca1Poaj9f7egsQZu/8QAKYJZBZOKPhV5OEiO64Iabr5RHspdQpeHb/wh/zv1eMoTNZdw4X275OxGZW0UKlq1mjRQAAA"/></svg>'
+            slug: runwayml
+            path: ../../model-coverage/wam/runwayml/index.mdx
+            contents:
+              - page: "praxis-1-droid"
+                path: ../../model-coverage/wam/runwayml/praxis-1.mdx
       - section: "Diffusion Language Models"
         slug: dllm
         contents:

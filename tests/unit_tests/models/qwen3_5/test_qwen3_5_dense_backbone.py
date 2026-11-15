@@ -270,6 +270,22 @@ class TestDenseTextBackbone:
         assert metadata.document_ids is attention_mask
         assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
 
+    def test_single_document_metadata_preserves_padding(self):
+        selected_ids = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 0, 0, 0]])
+        packed_metadata = build_packed_sequence_metadata(selected_ids)
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            None,
+            selected_ids,
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids is selected_ids
+        assert metadata.indices.tolist() == [0, 1, 2, 3, 5, 6]
+        assert metadata.cu_seqlens.tolist() == [0, 4, 6]
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 4, 6]
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_packed_metadata_uses_host_mirror_without_cuda_readback(self, monkeypatch):
         host_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
@@ -342,6 +358,40 @@ class TestDenseTextBackbone:
         # an fp32 SSMGate holder; the full-attention block does not.
         assert hasattr(backbone.layers["1"], "linear_attn")
         assert hasattr(backbone.layers["1"].linear_attn, "_fp32_params")
+
+    def test_init_weights_initializes_every_parameter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        cfg = _tiny_config(
+            layer_types=("full_attention", "linear_attention"),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        with torch.no_grad():
+            for p in backbone.parameters():
+                p.fill_(float("nan"))
+        backbone.init_weights(torch.device("cpu"))
+        uninitialized = [n for n, p in backbone.named_parameters() if not torch.isfinite(p).all()]
+        assert not uninitialized, uninitialized
+        conv_std = backbone.layers["1"].linear_attn.conv1d.weight.std().item()
+        assert 0.01 < conv_std < 0.04, conv_std  # HF-style normal(0, 0.02), not torch's kaiming default
+
+        # The first forward/backward through the real convolution and recurrence is finite.
+        linear_attn = backbone.layers["1"].linear_attn
+        monkeypatch.setattr(cp_linear_attn, "causal_conv1d_fn", inspect.unwrap(hf_modeling.causal_conv1d_fn))
+        linear_attn.causal_conv1d_fn = None
+        linear_attn.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        output = backbone(input_ids=torch.tensor([[1, 2, 3, 4]])).last_hidden_state
+        assert torch.isfinite(output).all()
+        output.backward(torch.randn_like(output))
+        for name, parameter in backbone.named_parameters():
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
 
     def test_forward_shape_full_attention(self):
         cfg = _tiny_config(layer_types=("full_attention",))

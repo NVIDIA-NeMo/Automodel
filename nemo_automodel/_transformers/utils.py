@@ -16,11 +16,15 @@ import inspect
 import logging
 from collections import deque
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, PretrainedConfig
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+    from nemo_automodel.shared.peft_config import PeftConfig
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +97,13 @@ def resolve_get_rope_index(model: nn.Module) -> Callable | None:
 
 def _should_load_before_shard(
     *,
-    autopipeline: object | None,
+    autopipeline: "AutoPipeline | None",
     tp_size: int,
     ep_size: int,
     dp_shard_size: int = 1,
     pretrained_model_name_or_path: str,
     load_base_model: bool,
-    peft_config: object | None,
+    peft_config: "PeftConfig | None",
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 

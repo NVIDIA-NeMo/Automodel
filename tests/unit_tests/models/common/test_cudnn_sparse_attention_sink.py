@@ -28,6 +28,11 @@ def _accept_cpu_tensors(operation: str, *tensors: torch.Tensor) -> tuple[int, in
     return 10, 0
 
 
+def _pretend_device(monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+
 class _FakeDsa:
     """cuDNN >= 1.29 namespace: forward and backward wrappers with the real tensor contract."""
 
@@ -70,6 +75,7 @@ def fake_dsa(monkeypatch: pytest.MonkeyPatch) -> _FakeDsa:
     monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", False)  # no FlashMLA: the cuDNN forward must carry the run
     monkeypatch.setattr(shared_cudnn, "_CUDNN_DSA", dsa)
     monkeypatch.setattr(shared_cudnn, "_require_cuda_tensors", _accept_cpu_tensors)
+    _pretend_device(monkeypatch, (10, 0))
     return dsa
 
 
@@ -78,6 +84,14 @@ def test_availability_accepts_the_cudnn_forward_without_flash_mla(
 ) -> None:
     assert shared_cudnn.is_cudnn_sparse_attention_available()
     monkeypatch.setattr(shared_cudnn, "_CUDNN_DSA", object())  # an older frontend without the forward wrapper
+    assert not shared_cudnn.is_cudnn_sparse_attention_available()
+    monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", True)
+    assert shared_cudnn.is_cudnn_sparse_attention_available()
+
+
+def test_cudnn_forward_requires_an_sm100_family_gpu(fake_dsa: _FakeDsa, monkeypatch: pytest.MonkeyPatch) -> None:
+    """cuDNN's sparse forward rejects SM90, so there the backend is available only with FlashMLA."""
+    _pretend_device(monkeypatch, (9, 0))
     assert not shared_cudnn.is_cudnn_sparse_attention_available()
     monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", True)
     assert shared_cudnn.is_cudnn_sparse_attention_available()

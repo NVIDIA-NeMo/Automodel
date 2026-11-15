@@ -37,3 +37,4 @@ the contributor-facing skills.
 | `linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
 | `parity-testing` | Verify numerical correctness against references |
 | `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
+| `train-inference-consistency` | Build and verify an inference-aligned (bitwise) training forward against the rollout engine's kernels; not HF parity |

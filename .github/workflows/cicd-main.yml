@@ -190,28 +190,16 @@ jobs:
 
           uv sync --link-mode copy --locked --group linting
 
-      - name: Run ty
+      - name: Test annotation policy
+        run: |
+          source ./venv/bin/activate
+          uv run --active python -m unittest discover -s tests/unit_tests/tools -p test_annotation_policy.py
+
+      - name: Run annotation policy, signature completeness, and ty
         run: |
           source ./venv/bin/activate
           uv run --active ty --version
-
-          uv pip install -q tomli
-          TY_DIRS=$(python3 -c "
-          try:
-              import tomllib
-          except ModuleNotFoundError:
-              import tomli as tomllib
-          from pathlib import Path
-          data = tomllib.loads(Path('pyproject.toml').read_text())
-          dirs = set()
-          for override in data.get('tool', {}).get('ty', {}).get('overrides', []):
-              for pattern in override.get('include', []):
-                  dirs.add(pattern.replace('/**', ''))
-          print(' '.join(sorted(dirs)))
-          ")
-
-          echo "ty check targets: $TY_DIRS"
-          uv run --active ty check --verbose $TY_DIRS
+          uv run --active python tools/check_types.py
 
   Nemo_Linting_Test:
     needs: [pre-flight, linting, import_linting, type_checking]
@@ -580,9 +568,10 @@ jobs:
           # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
           # over the measured merged runtime while bounding timeout retries.
           # Kimi Linear FA4 parity is also collected here; its kernel compilation
-          # is not included in the historical timings above.
+          # is not included in the historical timings above. tests/integration holds
+          # CPU-only end-to-end checks that no other job collects; they run here once.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4,models/kimi_linear
+            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4,models/kimi_linear,integration
             timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -615,12 +604,14 @@ jobs:
           # moe + parallelism merged (2.8 + 5.8 = 8.6 min median) to fit `max-parallel: 10`.
           # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
           # 2-rank parallel), so the budget is roughly double a single smoke test.
-          # The merged pytest run takes about 30 minutes, so a 45-minute timeout
-          # leaves room for slow runners without letting a hung test retry for long.
-          # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage.
+          # The merged pytest run took 32-33 minutes before `distributed` was added, and
+          # that folder adds a few minutes, so a 50-minute timeout leaves room for slow
+          # runners without letting a hung test retry for long.
+          # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage, plus
+          # every test under tests/functional_tests/distributed.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism,optim,decision_models/clef
-            timeout: 45
+            test-folder: moe,parallelism,optim,decision_models/clef,distributed
+            timeout: 50
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
@@ -703,9 +694,10 @@ jobs:
             test-folder: retrieval
             timeout: 20
           # moe + parallelism merged, mirroring cicd-e2e-tests (about 30 minutes of pytest).
-          # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage.
+          # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage, plus
+          # every test under tests/functional_tests/distributed.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism,optim,decision_models/clef
+            test-folder: moe,parallelism,optim,decision_models/clef,distributed
             timeout: 45
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
