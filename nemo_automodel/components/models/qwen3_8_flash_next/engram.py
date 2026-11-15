@@ -16,13 +16,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import math
+import os
+import shutil
+import struct
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from safetensors import safe_open
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
@@ -77,6 +87,11 @@ QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS = (
     300001275,
 )
 QWEN3_8_FLASH_NEXT_NGRAM_PADDED_ROWS = 320001536
+# ``text_config.ple_embedding_dtype`` value of checkpoints whose PLE table is
+# stored as FP8 shards plus one global BF16 ``weight_scale``.
+QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE = "float8_e4m3fn"
+
+logger = logging.getLogger(__name__)
 
 
 _CAPACITY_MARGIN = 1.25  # capacity mode: padded rows per peer = ceil(calibrated max count x margin), aligned
@@ -1007,6 +1022,315 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         return returned_values[unsort_indices].reshape(*original_shape, self.embedding_dim)
 
 
+class Qwen3_8_FlashNextHostNGramTable:
+    """Frozen FP8 PLE table held once per node in host memory.
+
+    The table is deliberately not an ``nn.Module``: it stays out of
+    ``parameters()``, ``state_dict()``, FSDP, the optimizer, ``Module.to()``,
+    checkpoint saves, and weight refits. It is never trained.
+
+    The rows keep the checkpoint bytes (``uint8`` storage of ``float8_e4m3fn``
+    values). A lookup returns ``bf16(fp8_row) * weight_scale`` with the BF16
+    scale of shape ``[1]``, which is the inference engine's order of operations.
+    Every FP8 E4M3 value is exact in BF16, and the product of two BF16 values is
+    rounded once to BF16 on CPU and CUDA alike, so the values are bitwise equal
+    to the engine's.
+
+    Args:
+        num_embeddings: Number of global table rows. The checkpoint holds them
+            in equal shards: shard ``k`` holds rows
+            ``[k * rows_per_shard, (k + 1) * rows_per_shard)``.
+        embedding_dim: Number of FP8 values in each row.
+        host_dir: Directory for the node-shared table file, chosen by the job
+            (for example a node-local ``/tmp``). Every process on a node that
+            uses the same directory maps one copy of the table. ``None`` is
+            allowed for construction only; :meth:`load` then raises. The table
+            file stays after the job; the job removes it after its last reader
+            ends.
+    """
+
+    # Rows per shard whose bytes the cache manifest records and checks.
+    _SAMPLE_ROWS_PER_SHARD = 16
+    _MANIFEST_VERSION = 1
+
+    def __init__(self, *, num_embeddings: int, embedding_dim: int, host_dir: str | os.PathLike[str] | None) -> None:
+        if num_embeddings <= 0:
+            raise ValueError(f"num_embeddings must be positive, got {num_embeddings}")
+        if embedding_dim <= 0:
+            raise ValueError(f"embedding_dim must be positive, got {embedding_dim}")
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.host_dir = None if host_dir is None else Path(host_dir)
+        self.rows: torch.Tensor | None = None
+        self.scale: torch.Tensor | None = None
+        self.source: Path | None = None
+        self._device_scales: dict[torch.device, torch.Tensor] = {}
+
+    @property
+    def nbytes(self) -> int:
+        """Return the size of the FP8 table in bytes."""
+        return self.num_embeddings * self.embedding_dim
+
+    def load(
+        self,
+        checkpoint_dir: str | os.PathLike[str],
+        *,
+        weight_map: Mapping[str, str],
+        shard_keys: Sequence[str],
+        scale_key: str,
+    ) -> None:
+        """Map the node-shared table file, writing it from the checkpoint first if needed.
+
+        The first process on a node that takes the file lock writes the shards,
+        in ``shard_keys`` order, into one file in ``host_dir``. Every process
+        then maps that file read-shared. The file name hashes the identity of
+        the shard files (device, inode, size, modification and change times),
+        not their paths, so a replaced shard selects a new file, and another
+        directory of symlinks or another mount path to the same files selects
+        the same file. Its completion marker holds a
+        manifest: a digest of each shard's safetensors header and of a sample
+        of its row bytes. Before a process maps a complete file, it checks the
+        manifest and the file's sampled rows against the source shards and
+        writes the file again on a mismatch. Rows outside the sample are not
+        compared. Loading the same checkpoint again is a no-op.
+
+        Args:
+            checkpoint_dir: Local safetensors checkpoint directory.
+            weight_map: Checkpoint key to file name (relative to ``checkpoint_dir``).
+            shard_keys: Keys of the FP8 row shards, each a tensor of shape
+                ``[num_embeddings / len(shard_keys), embedding_dim]``, in global
+                row order.
+            scale_key: Key of the BF16 scale tensor of shape ``[1]``.
+
+        Raises:
+            RuntimeError: If no host directory was given, if the scale or a
+                shard does not match the table contract, or if ``host_dir``
+                lacks room for the table.
+        """
+        if self.host_dir is None:
+            raise RuntimeError(
+                "The FP8 Qwen3.8-Flash-Next PLE table needs an explicit host directory for its node-shared "
+                "47.7 GiB file: pass engram_host_dir to the model"
+            )
+        if not shard_keys or self.num_embeddings % len(shard_keys):
+            raise RuntimeError(
+                f"The PLE table's {self.num_embeddings} rows do not split into {len(shard_keys)} equal shards"
+            )
+        checkpoint_dir = Path(checkpoint_dir)
+        scale = _read_safetensors_tensor(checkpoint_dir / weight_map[scale_key], scale_key)
+        if scale.dtype != torch.bfloat16 or tuple(scale.shape) != (1,):
+            raise RuntimeError(
+                f"PLE {scale_key} must be a bfloat16 tensor of shape [1]; got {scale.dtype} {tuple(scale.shape)}"
+            )
+        if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
+            raise RuntimeError(f"PLE {scale_key} must be finite and positive; got {scale.tolist()}")
+
+        shard_paths = [(key, checkpoint_dir / weight_map[key]) for key in shard_keys]
+        table_path = self._table_path(shard_paths)
+        if self.source == table_path and self.scale is not None and torch.equal(self.scale, scale):
+            return
+        self._write_table_file_once(table_path, shard_paths)
+        flat_rows = torch.from_file(str(table_path), shared=True, size=self.nbytes, dtype=torch.uint8)
+        self.rows = flat_rows.view(self.num_embeddings, self.embedding_dim)
+        self.scale = scale
+        self.source = table_path
+        self._device_scales = {}
+        logger.info(
+            "Qwen3.8-Flash-Next PLE table: %.1f GiB FP8 mapped from %s, weight_scale=%s",
+            self.nbytes / 2**30,
+            table_path,
+            scale.item(),
+        )
+
+    def _table_path(self, shard_paths: Sequence[tuple[str, Path]]) -> Path:
+        """Return the host file name, keyed by the identity of the shard files, not by their paths.
+
+        Device and inode name a file whatever path, symlink or mount point
+        reaches it; size, modification and change times change when it is
+        rewritten.
+        """
+        fingerprint = hashlib.sha1(f"{self.nbytes}|{self.embedding_dim}".encode())
+        for key, path in shard_paths:
+            stat = path.stat()
+            fingerprint.update(
+                f"|{key}|{stat.st_dev}|{stat.st_ino}|{stat.st_size}|{stat.st_mtime_ns}|{stat.st_ctime_ns}".encode()
+            )
+        return self.host_dir / f"qwen3_8_flash_next_ple_{fingerprint.hexdigest()[:16]}.bin"
+
+    def _sample_rows(self, rows_per_shard: int) -> list[int]:
+        """Return the shard-local row indices whose bytes the manifest records."""
+        count = min(self._SAMPLE_ROWS_PER_SHARD, rows_per_shard)
+        return sorted({(index * (rows_per_shard - 1)) // max(count - 1, 1) for index in range(count)})
+
+    def _source_manifest(self, shard_paths: Sequence[tuple[str, Path]]) -> dict[str, Any]:
+        """Return the header digest and sampled-row digest of every source shard."""
+        rows_per_shard = self.num_embeddings // len(shard_paths)
+        sample_rows = self._sample_rows(rows_per_shard)
+        shards = []
+        for key, path in shard_paths:
+            with open(path, "rb") as checkpoint_file:
+                (header_size,) = struct.unpack("<Q", checkpoint_file.read(8))
+                header_digest = hashlib.sha256(checkpoint_file.read(header_size)).hexdigest()
+            with safe_open(str(path), framework="pt", device="cpu") as checkpoint_file:
+                shard_slice = checkpoint_file.get_slice(key)
+                sample = b"".join(
+                    shard_slice[row : row + 1].contiguous().view(torch.uint8).numpy().tobytes() for row in sample_rows
+                )
+            shards.append(
+                {"key": key, "header_sha256": header_digest, "rows_sha256": hashlib.sha256(sample).hexdigest()}
+            )
+        return {
+            "version": self._MANIFEST_VERSION,
+            "num_embeddings": self.num_embeddings,
+            "embedding_dim": self.embedding_dim,
+            "rows_per_shard": rows_per_shard,
+            "sample_rows": sample_rows,
+            "shards": shards,
+        }
+
+    def _file_matches(self, table_path: Path, ok_path: Path, manifest: dict[str, Any]) -> bool:
+        """Check a complete table file's manifest and sampled rows against ``manifest``."""
+        if not table_path.is_file() or table_path.stat().st_size != self.nbytes or not ok_path.is_file():
+            return False
+        try:
+            if json.loads(ok_path.read_text()) != manifest:
+                return False
+        except json.JSONDecodeError:
+            return False
+        rows_per_shard = manifest["rows_per_shard"]
+        row_bytes = self.embedding_dim
+        with open(table_path, "rb") as table_file:
+            for shard_idx, shard in enumerate(manifest["shards"]):
+                sample = b""
+                for row in manifest["sample_rows"]:
+                    table_file.seek((shard_idx * rows_per_shard + row) * row_bytes)
+                    sample += table_file.read(row_bytes)
+                if hashlib.sha256(sample).hexdigest() != shard["rows_sha256"]:
+                    return False
+        return True
+
+    def _write_table_file_once(self, table_path: Path, shard_paths: Sequence[tuple[str, Path]]) -> None:
+        """Write the table file under an exclusive per-file lock unless a verified file exists."""
+        import fcntl
+
+        if not self.host_dir.is_dir():
+            raise RuntimeError(f"PLE host table directory {self.host_dir} does not exist")
+        manifest = self._source_manifest(shard_paths)
+        ok_path = table_path.with_name(f"{table_path.name}.ok")
+        with open(table_path.with_name(f"{table_path.name}.lock"), "a") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if self._file_matches(table_path, ok_path, manifest):
+                    return
+                if ok_path.is_file():
+                    logger.warning(
+                        "Qwen3.8-Flash-Next PLE table %s does not match its source shards; writing it again",
+                        table_path,
+                    )
+                # Holding the lock means no other writer of this file is alive;
+                # remove what a killed writer or a stale cache left.
+                ok_path.unlink(missing_ok=True)
+                table_path.unlink(missing_ok=True)
+                for stale_path in table_path.parent.glob(f"{table_path.name}.tmp*"):
+                    stale_path.unlink(missing_ok=True)
+                for stale_path in table_path.parent.glob(f"{ok_path.name}.tmp*"):
+                    stale_path.unlink(missing_ok=True)
+                # Keep a 5% margin for the other users of the directory.
+                free_bytes = shutil.disk_usage(self.host_dir).free
+                if free_bytes < self.nbytes * 1.05:
+                    raise RuntimeError(
+                        f"PLE host table needs {self.nbytes * 1.05 / 2**30:.1f} GiB (table plus 5%) in "
+                        f"{self.host_dir}, which has {free_bytes / 2**30:.1f} GiB free"
+                    )
+                start = time.monotonic()
+                tmp_path = table_path.with_name(f"{table_path.name}.tmp{os.getpid()}")
+                try:
+                    self._write_rows(tmp_path, shard_paths)
+                    os.replace(tmp_path, table_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+                ok_tmp_path = ok_path.with_name(f"{ok_path.name}.tmp{os.getpid()}")
+                ok_tmp_path.write_text(json.dumps(manifest))
+                os.replace(ok_tmp_path, ok_path)
+                if not self._file_matches(table_path, ok_path, manifest):
+                    raise RuntimeError(f"PLE table {table_path} does not match its source shards after the write")
+                logger.info(
+                    "Qwen3.8-Flash-Next PLE table: wrote %.1f GiB to %s in %.0f s",
+                    self.nbytes / 2**30,
+                    table_path,
+                    time.monotonic() - start,
+                )
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _write_rows(self, path: Path, shard_paths: Sequence[tuple[str, Path]]) -> None:
+        """Concatenate the raw FP8 bytes of every equal-shaped shard into ``path``."""
+        expected_shape = (self.num_embeddings // len(shard_paths), self.embedding_dim)
+        with open(path, "wb") as table_file:
+            for key, shard_path in shard_paths:
+                shard = _read_safetensors_tensor(shard_path, key)
+                if shard.dtype != torch.float8_e4m3fn or tuple(shard.shape) != expected_shape:
+                    raise RuntimeError(
+                        f"PLE shard {key} must be float8_e4m3fn of shape {list(expected_shape)}; "
+                        f"got {shard.dtype} {list(shard.shape)}"
+                    )
+                table_file.write(shard.contiguous().view(torch.uint8).numpy())
+
+    def _scale_on(self, device: torch.device) -> torch.Tensor:
+        """Return the BF16 scale of shape ``[1]`` on ``device``."""
+        scale = self._device_scales.get(device)
+        if scale is None:
+            scale = self.scale.to(device)
+            self._device_scales[device] = scale
+        return scale
+
+    def __call__(self, global_ids: torch.Tensor) -> torch.Tensor:
+        """Look up scaled BF16 rows for global table row IDs.
+
+        Args:
+            global_ids: Integer tensor of shape ``[...]`` (any rank, any device)
+                holding global table row IDs in ``[0, num_embeddings)``.
+
+        Returns:
+            BF16 tensor of shape ``[..., embedding_dim]`` on
+            ``global_ids.device``. Each row is ``bf16(fp8_row) * weight_scale``.
+            The tensor requires no gradient.
+        """
+        if self.rows is None or self.scale is None:
+            raise RuntimeError(
+                "The FP8 PLE table is not loaded; it is read from the checkpoint by the state-dict adapter"
+            )
+        if global_ids.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
+            raise ValueError(f"PLE row IDs must use an integer dtype, got {global_ids.dtype}")
+        flat_ids = global_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+        if flat_ids.numel() > 0 and (int(flat_ids.min()) < 0 or int(flat_ids.max()) >= self.num_embeddings):
+            raise ValueError(f"PLE row IDs must lie in [0, {self.num_embeddings})")
+        rows = self.rows.index_select(0, flat_ids)
+        device = global_ids.device
+        if device.type == "cuda":
+            # The caching host allocator keeps the pinned block until the copy is done.
+            rows = rows.pin_memory().to(device, non_blocking=True)
+        else:
+            rows = rows.to(device)
+        # Inference order: gather -> bf16 -> multiply by the bf16 scale.
+        values = rows.view(torch.float8_e4m3fn).to(torch.bfloat16) * self._scale_on(device)
+        return values.reshape(*global_ids.shape, self.embedding_dim)
+
+
+def _read_safetensors_tensor(path: Path, key: str) -> torch.Tensor:
+    """Read one tensor from a safetensors file on the CPU.
+
+    Args:
+        path: Safetensors file that holds ``key``.
+        key: Tensor name in the file.
+
+    Returns:
+        The stored tensor, in its stored dtype and shape.
+    """
+    with safe_open(str(path), framework="pt", device="cpu") as checkpoint_file:
+        return checkpoint_file.get_tensor(key)
+
+
 class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
     """Hash raw token IDs into the packed Qwen3.8-Flash-Next PLE table.
 
@@ -1019,7 +1343,9 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
     Args:
         ngram_embedding: Lookup module accepting global row IDs of shape
             ``[batch, sequence, ngram_heads]`` and returning values of shape
-            ``[batch, sequence, ngram_heads, head_dim]``.
+            ``[batch, sequence, ngram_heads, head_dim]``. The frozen FP8 table
+            (:class:`Qwen3_8_FlashNextHostNGramTable`) is a plain callable, not a
+            submodule, so it stays outside the module tree.
         ngram_size: Largest n-gram order, including the current token.
         heads_per_ngram: Number of hash heads for every order from two through
             ``ngram_size``.
@@ -1033,7 +1359,7 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
 
     def __init__(
         self,
-        ngram_embedding: nn.Module,
+        ngram_embedding: nn.Module | Qwen3_8_FlashNextHostNGramTable,
         *,
         ngram_size: int = 3,
         heads_per_ngram: int = 8,
