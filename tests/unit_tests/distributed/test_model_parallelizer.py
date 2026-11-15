@@ -123,6 +123,37 @@ def test_fsdp2_dispatch_receives_model_parallelizer(monkeypatch):
     call.assert_called_once_with(model, context, parallelizer=parallelizer)
 
 
+@pytest.mark.parametrize("ep_size", [1, 2])
+@pytest.mark.parametrize("reject", [False, True])
+def test_model_preparation_precedes_strategy_dispatch(monkeypatch, ep_size, reject):
+    """Validation must fail before either executor can mutate parameter ownership."""
+    class PreparedSidecar(ModelParallelizer):
+        def _prepare_model(self, model, mesh_context):
+            assert mesh_context is context
+            if reject:
+                raise ValueError("unsupported topology")
+            model.prepared = True
+
+    model = nn.Linear(2, 2)
+    context = SimpleNamespace(cp_size=1, ep_size=ep_size, strategy_config=FSDP2Config())
+
+    def execute(model, context, *, parallelizer):
+        assert model.prepared
+        return model
+
+    executor = Mock(side_effect=execute)
+    target = "_parallelize_moe" if ep_size > 1 else "_parallelize_fsdp2"
+    monkeypatch.setattr(f"nemo_automodel.components.distributed.model_parallelizer.{target}", executor)
+    parallelizer = PreparedSidecar()
+    if reject:
+        with pytest.raises(ValueError, match="unsupported topology"):
+            parallelizer.parallelize(model, context)
+        executor.assert_not_called()
+    else:
+        assert parallelizer.parallelize(model, context) is model
+        executor.assert_called_once_with(model, context, parallelizer=parallelizer)
+
+
 def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch):
     parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)

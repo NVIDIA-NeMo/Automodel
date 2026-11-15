@@ -29,7 +29,7 @@ model:
     linear: torch
     rms_norm: torch
     experts: torch_mm
-    dispatcher: torch
+    dispatcher: hybridep
     gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -69,12 +69,24 @@ loss_fn:
   reduction: sum
   logit_softcapping: 30.0
 dataset:
-  _target_: datasets.load_from_disk
-  dataset_path: data/inkling2_tulu3_packed128k/train
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 1234
+  seq_length: 131072
+  truncation: true
+  padding: false
+  chat_template: examples/llm_finetune/inkling2/inkling2_chat_template.jinja
+  tokenizer:
+    pretrained_model_name_or_path: thinkingmachines/Inkling-2-Small
+    pad_token: "<|content_model_end_sampling|>"
+    eos_token: "<|content_model_end_sampling|>"
 packed_sequence:
   packed_sequence_size: 131072
   packing_strategy: thd
-  prepacked: true
+  # 50 optimizer steps x 8 packs, plus a small margin, without tokenizing the
+  # whole mixture up front.
+  max_packs: 416
   pad_to_multiple_of: 64
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
