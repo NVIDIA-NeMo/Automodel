@@ -15,7 +15,8 @@
 """Unit tests for nemo_automodel/components/attention/ffpa_attention.py."""
 
 import logging
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -38,8 +39,10 @@ def _reset_module_state():
     ffpa_mod._FLEX_FN = None
     ffpa_mod._FFPA_HIGH_LEVEL = None
     ffpa_mod._FFPA_LOW_LEVEL_READY = None
+    ffpa_mod._ffpa_sm80_split_d_backward.cache_clear()
     yield
     ffpa_mod._FALLBACK_WARNED.clear()
+    ffpa_mod._ffpa_sm80_split_d_backward.cache_clear()
 
 
 def _module(head_dim, training=False):
@@ -333,3 +336,150 @@ def test_block_mask_requires_flex_no_sdpa_fallback():
     ):
         ffpa_attention_forward(_module(256), q, k, v, attention_mask=object(), scaling=0.0625)
     mock_sdpa.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Backward dK/dV storage on the generic SM80 Split-D path                      #
+# --------------------------------------------------------------------------- #
+def _fake_ffpa_cute(**attrs):
+    """Stand-in ``ffpa_attn.cute`` module for the function-local imports."""
+    cute = ModuleType("ffpa_attn.cute")
+    vars(cute).update(attrs)
+    pkg = ModuleType("ffpa_attn")
+    pkg.cute = cute
+    return mock.patch.dict(sys.modules, {"ffpa_attn": pkg, "ffpa_attn.cute": cute})
+
+
+def _packed(T, Hq=4, Hkv=2, D=8):
+    """(grad_out, q, k, v, out, lse) in packed THD layout for T tokens."""
+    return (
+        torch.randn(T, Hq, D),
+        torch.randn(T, Hq, D),
+        torch.randn(T, Hkv, D),
+        torch.randn(T, Hkv, D),
+        torch.randn(T, Hq, D),
+        torch.randn(Hq, T),
+    )
+
+
+def test_sm80_split_d_backward_follows_ffpa_dispatch():
+    sm80, sm90 = object(), object()
+    device = torch.device("cpu")
+    with _fake_ffpa_cute(_backward_impl_for_device=lambda *_: sm80, _ffpa_attn_backward_sm80=sm80):
+        assert ffpa_mod._ffpa_sm80_split_d_backward(device, 512, 512)
+    ffpa_mod._ffpa_sm80_split_d_backward.cache_clear()
+    with _fake_ffpa_cute(_backward_impl_for_device=lambda *_: sm90, _ffpa_attn_backward_sm80=sm80):
+        assert not ffpa_mod._ffpa_sm80_split_d_backward(device, 512, 512)
+
+
+def test_sm80_split_d_backward_is_cached_per_device_and_head_dims():
+    sm80 = object()
+    dispatch = mock.Mock(return_value=sm80)
+    with _fake_ffpa_cute(_backward_impl_for_device=dispatch, _ffpa_attn_backward_sm80=sm80):
+        for _ in range(3):
+            assert ffpa_mod._ffpa_sm80_split_d_backward(torch.device("cpu"), 512, 512)
+        assert ffpa_mod._ffpa_sm80_split_d_backward(torch.device("cpu"), 256, 256)
+    assert dispatch.call_count == 2
+
+
+@pytest.mark.parametrize("sm80", [True, False])
+def test_dense_bwd_requests_fp32_kv_storage_only_on_sm80(sm80):
+    q, k, v = _qkv(1, 8, 4, 16, 512)
+    grad_out, out, lse = torch.randn_like(q), torch.randn_like(q), torch.randn(1, 8, 16)
+    fake_bwd = mock.Mock(return_value=("dq", "dk", "dv"))
+    with (
+        _fake_ffpa_cute(_ffpa_attn_backward_cute=fake_bwd),
+        mock.patch.object(ffpa_mod, "_ffpa_sm80_split_d_backward", return_value=sm80) as dispatch,
+    ):
+        assert ffpa_mod._ffpa_dense_bwd(grad_out, q, k, v, out, lse, scale=0.0625, causal=True) == ("dq", "dk", "dv")
+    dispatch.assert_called_once_with(q.device, 512, 512)
+    storage = {"grad_kv_storage_dtype": torch.float32} if sm80 else {}
+    fake_bwd.assert_called_once_with(grad_out, q, k, v, out, lse, 0.0625, True, **storage)
+
+
+def test_sm80_split_d_backward_keeps_defaults_when_dispatch_is_unimportable(caplog):
+    caplog.set_level(logging.WARNING, logger=ffpa_mod.__name__)
+    with _fake_ffpa_cute():  # no private dispatch names exported
+        assert ffpa_mod._ffpa_sm80_split_d_backward(torch.device("cpu"), 512, 512) is False
+        ffpa_mod._ffpa_sm80_split_d_backward.cache_clear()
+        assert ffpa_mod._ffpa_sm80_split_d_backward(torch.device("cpu"), 256, 256) is False
+    assert len(_warns(caplog, "cannot inspect the ffpa-attn backward dispatch")) == 1
+
+
+def test_varlen_bwd_sm80_runs_dense_backward_per_document():
+    Hq, Hkv, D = 4, 2, 8
+    grad_out, q_pack, k_pack, v_pack, out, lse = _packed(10, Hq, Hkv, D)
+    calls = []
+
+    def fake_dense_bwd(dout, q, k, v, o, lse_seg, *, scale, causal):
+        calls.append((tuple(q.shape), tuple(k.shape), tuple(lse_seg.shape), scale, causal))
+        assert dout.shape == o.shape == q.shape
+        return q * 2, k * 3, v * 4  # SDPA layout, marked per input
+
+    with mock.patch.object(ffpa_mod, "_ffpa_dense_bwd", fake_dense_bwd):
+        dq, dk, dv = ffpa_mod._ffpa_varlen_bwd_sm80(
+            grad_out, q_pack, k_pack, v_pack, out, lse, [0, 6, 10], [0, 6, 10], scale=0.0625, causal=True
+        )
+    assert calls == [
+        ((1, Hq, 6, D), (1, Hkv, 6, D), (1, Hq, 6), 0.0625, True),
+        ((1, Hq, 4, D), (1, Hkv, 4, D), (1, Hq, 4), 0.0625, True),
+    ]
+    assert torch.equal(dq, q_pack * 2)
+    assert torch.equal(dk, k_pack * 3)
+    assert torch.equal(dv, v_pack * 4)
+
+
+def test_varlen_bwd_sm80_skips_empty_segments():
+    grad_out, q_pack, k_pack, v_pack, out, lse = _packed(5)
+    fake_dense_bwd = mock.Mock(side_effect=AssertionError("no segment should run"))
+    with mock.patch.object(ffpa_mod, "_ffpa_dense_bwd", fake_dense_bwd):
+        # doc 1 has no queries, doc 2 has no keys
+        dq, dk, dv = ffpa_mod._ffpa_varlen_bwd_sm80(
+            grad_out, q_pack, k_pack, v_pack, out, lse, [0, 0, 5], [0, 3, 3], scale=0.0625, causal=False
+        )
+    fake_dense_bwd.assert_not_called()
+    assert not dq.any() and not dk.any() and not dv.any()
+
+
+@pytest.mark.parametrize("host_bounds", [True, False])
+def test_varlen_bwd_on_sm80_uses_segment_loop_with_host_bounds(host_bounds):
+    T = 6
+    grad_out, q_pack, k_pack, v_pack, out, lse = _packed(T)
+    cu_q, cu_k = mock.Mock(name="cu_q"), mock.Mock(name="cu_k")  # only .tolist() is reachable on this path
+    cu_q.tolist.return_value = cu_k.tolist.return_value = [0, T]
+    fake_op = mock.Mock()
+    fake_loop = mock.Mock(return_value=("ldq", "ldk", "ldv"))
+    host = {"cu_q_host": [0, T], "cu_k_host": [0, T]} if host_bounds else {}
+    with (
+        mock.patch.object(ffpa_mod, "_ffpa_sm80_split_d_backward", return_value=True),
+        mock.patch.object(ffpa_mod, "_ffpa_varlen_bwd_sm80", fake_loop),
+        mock.patch.object(torch.ops, "ffpa_attn", SimpleNamespace(_varlen_bwd_cute=fake_op), create=True),
+    ):
+        result = ffpa_mod._ffpa_varlen_bwd(
+            grad_out, q_pack, k_pack, v_pack, out, lse, cu_q, cu_k, T, T, scale=0.0625, causal=False, **host
+        )
+    assert result == ("ldq", "ldk", "ldv")
+    fake_op.assert_not_called()
+    fake_loop.assert_called_once_with(
+        grad_out, q_pack, k_pack, v_pack, out, lse, [0, T], [0, T], scale=0.0625, causal=False
+    )
+    assert cu_q.tolist.call_count == cu_k.tolist.call_count == (0 if host_bounds else 1)
+
+
+def test_varlen_bwd_off_sm80_keeps_the_varlen_op():
+    T = 6
+    grad_out, q_pack, k_pack, v_pack, out, lse = _packed(T)
+    cu = torch.tensor([0, T], dtype=torch.int32)
+    fake_op = mock.Mock(return_value=("dq", "dk", "dv"))
+    fake_loop = mock.Mock()
+    with (
+        mock.patch.object(ffpa_mod, "_ffpa_sm80_split_d_backward", return_value=False),
+        mock.patch.object(ffpa_mod, "_ffpa_varlen_bwd_sm80", fake_loop),
+        mock.patch.object(torch.ops, "ffpa_attn", SimpleNamespace(_varlen_bwd_cute=fake_op), create=True),
+    ):
+        result = ffpa_mod._ffpa_varlen_bwd(
+            grad_out, q_pack, k_pack, v_pack, out, lse, cu, cu, T, T, scale=0.0625, causal=False
+        )
+    assert result == ("dq", "dk", "dv")
+    fake_loop.assert_not_called()
+    fake_op.assert_called_once()

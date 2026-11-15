@@ -50,6 +50,7 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
@@ -93,6 +94,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
+from nemo_automodel.shared.import_utils import get_torch_version
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -1688,6 +1690,9 @@ class Checkpointer:
                 is_init_step=True,
                 key_mapping=key_mapping,
             )
+            # DoRA magnitudes are derived from the base weight, which only now holds checkpoint values.
+            # An adapter checkpoint restored later still overwrites them.
+            _init_dora_magnitudes(model)
 
         _reinit_non_persistent_buffers(model, device, model_type=model_type)
 
@@ -2045,8 +2050,12 @@ set -euo pipefail
 # Slurm example:
 #   sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/consolidate.sh'
 # Optional: set CAST_DTYPE=bf16 to request a floating-point dtype cast during export.
+# TIMEOUT_MINUTES caps the distributed barrier wait (default 30). With imbalanced
+# shard sizes ranks finish minutes apart; keep it comfortably above the slowest
+# rank's runtime or fast ranks time out and the run tears down.
 NPROC_PER_NODE="${{NPROC_PER_NODE:-1}}"
 NUM_THREADS="${{NUM_THREADS:-5}}"
+TIMEOUT_MINUTES="${{TIMEOUT_MINUTES:-30}}"
 CAST_DTYPE="${{CAST_DTYPE:-}}"
 PYTHON="${{PYTHON:-python3}}"
 TORCHRUN="${{TORCHRUN:-torchrun}}"
@@ -2065,6 +2074,7 @@ if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
   "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
+    --timeout-minutes "${{TIMEOUT_MINUTES}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
     --output-dir "{output_dir}"{diffusers_arg} \\
@@ -2073,6 +2083,7 @@ else
   "${{PYTHON}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
+    --timeout-minutes "${{TIMEOUT_MINUTES}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
     --output-dir "{output_dir}"{diffusers_arg} \\
@@ -2300,8 +2311,9 @@ fi
         Prefers the upstream ``torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader``
         when no ``key_mapping`` is needed, since it uses safetensors' native ``get_slice()`` for
         efficient partial reads (only the bytes for the local DTensor shard are read from disk).
-        Falls back to the backported reader when ``key_mapping`` is required or when the upstream
-        reader is not available.
+        Falls back to the backported reader when ``key_mapping`` is required, and for base-model
+        loads the upstream reader cannot serve: remote paths, torch before 2.9, integrated GPUs, and
+        checkpoints with dtypes the safetensors package does not decode.
 
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
@@ -2321,23 +2333,21 @@ fi
             is_safetensors = _is_safetensors_checkpoint(model_path)
         if not is_init_step and not is_safetensors:
             return None
-        # The upstream HuggingFaceStorageReader delegates dtype decoding to
-        # safetensors.torch._TYPES, which does not yet recognize the FP8
-        # scale dtypes emitted by some quantized HF checkpoints (e.g.
-        # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
-        # read_metadata → DCP ends up with metadata=None on every rank).
-        # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
-        # so prefer it for base-model HF loads. Mid-training DCP loads may
-        # still use the faster upstream reader.
         if key_mapping is None and not is_init_step:
+            return _CachedMetadataHFReader(path=model_path)
+        # Base-model loads use the upstream reader too: each read is a safetensors slice copy, several times faster
+        # than the backport's mmap page-fault path on network filesystems. The upstream reader decodes dtypes with the
+        # safetensors package, which does not know some quantized-checkpoint scale dtypes (DeepSeek V4's F8_E8M0):
+        # reading the metadata then raises KeyError, and those checkpoints stay on the backport, whose DTYPE_MAP
+        # covers them. The metadata read here is cached for the dcp.load calls that follow.
+        if key_mapping is None and is_safetensors and _can_use_upstream_hf_reader(model_path):
+            reader = _CachedMetadataHFReader(path=model_path)
             try:
-                from torch.distributed.checkpoint.hf_storage import (
-                    HuggingFaceStorageReader as _UpstreamHFReader,
-                )
-
-                return _UpstreamHFReader(path=model_path)
-            except ImportError:
-                pass
+                reader.read_metadata()
+            except KeyError as error:
+                logger.info("Loading %s with the in-tree reader: safetensors cannot decode dtype %s", model_path, error)
+            else:
+                return reader
         return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
@@ -2364,6 +2374,58 @@ fi
         # fall back to the standard HF hub cache root.
         cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
         return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
+
+
+class _CachedMetadataHFReader(HuggingFaceStorageReader):
+    """The upstream safetensors reader, parsing the checkpoint metadata once per checkpoint path.
+
+    ``dcp.load`` calls ``read_metadata`` on every load, and the upstream reader rescans every shard header each time.
+    The part-by-part base load issues one ``dcp.load`` per part with one reader, so it relies on this cache, as on the
+    backport reader's.
+    """
+
+    def __init__(self, path: str) -> None:
+        """Bind the reader to one checkpoint directory.
+
+        Args:
+            path: Local checkpoint directory.
+        """
+        super().__init__(path=path)
+        self._metadata_cache: Metadata | None = None
+
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        """Reset reader state and discard the cached metadata only when the checkpoint changes."""
+        previous_path = str(self.path)
+        super().reset(checkpoint_id)
+        if checkpoint_id is not None and str(self.path) != previous_path:
+            self._metadata_cache = None
+
+    def read_metadata(self) -> Metadata:
+        """Return the checkpoint metadata, parsing the safetensors headers on the first call only."""
+        if self._metadata_cache is None:
+            self._metadata_cache = super().read_metadata()
+        elif self._metadata_cache.storage_meta is not None:
+            self._metadata_cache.storage_meta.load_id = self.load_id
+        return self._metadata_cache
+
+
+def _can_use_upstream_hf_reader(model_path: str) -> bool:
+    """Whether a base-model load from ``model_path`` may use the upstream safetensors reader.
+
+    Before torch 2.9 the upstream reader reads whole shard files and decodes dtypes with a table that has no FP8. It
+    reads local directories only, and on integrated GPUs the backport stages reads through host memory instead.
+
+    Args:
+        model_path: Checkpoint directory or remote path.
+
+    Returns:
+        True for a local directory on torch 2.9 or later without an integrated CUDA device.
+    """
+    if get_torch_version().release < (2, 9) or not os.path.isdir(model_path):
+        return False
+    if not torch.cuda.is_available():
+        return True
+    return not _is_integrated_cuda_device(torch.device("cuda", torch.cuda.current_device()))
 
 
 def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
@@ -2547,6 +2609,18 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 module.init_lora_weights(peft_init_method)
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _init_dora_magnitudes(model: nn.Module) -> None:
+    """
+    Set every DoRA magnitude vector to the row-wise L2 norm of its module's current base weight.
+
+    Args:
+        model: Model whose DoRA modules (``use_dora=True`` with an ``init_dora_magnitude`` method) are updated.
+    """
+    for module in model.modules():
+        if getattr(module, "use_dora", False) and hasattr(module, "init_dora_magnitude"):
+            module.init_dora_magnitude()
 
 
 _MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(

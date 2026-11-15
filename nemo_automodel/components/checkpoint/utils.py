@@ -38,8 +38,13 @@ from nemo_automodel.shared.tied_weights import (
     has_local_tied_lm_head as has_local_tied_lm_head,
 )
 
+# Values consumed by the checkpoint resolver: scalar download options, proxy maps,
+# and an optional in-memory tensor state dictionary.
+_CheckpointLoadValue = str | bool | os.PathLike[str] | Mapping[str, str] | Mapping[str, torch.Tensor] | None
+
+
 logger = logging.getLogger(__name__)
-_AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_\d+_step_(\d+)$")
+_AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_(\d+)_step_(\d+)$")
 _CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
 _INCOMPLETE_CHECKPOINT_MARKER = ".incomplete"
 
@@ -112,12 +117,19 @@ def _checkpoint_step_num(path: Path) -> int:
     return int(match.group(1)) if match else -1
 
 
+def _checkpoint_sort_key(path: Path) -> tuple[int, int]:
+    """Order optimizer steps first, then the completed epoch frontier at a tie."""
+    canonical = _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)
+    epoch = int(canonical.group(1)) if canonical is not None else -1
+    return _checkpoint_step_num(path), epoch
+
+
 def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
     """Return existing checkpoint directories whose names end in ``step_<N>``."""
     if not ckpt_root.exists():
         return []
     checkpoints = [path for path in ckpt_root.glob("*step_*") if path.is_dir() and not path.is_symlink()]
-    return sorted((path for path in checkpoints if _checkpoint_step_num(path) >= 0), key=_checkpoint_step_num)
+    return sorted((path for path in checkpoints if _checkpoint_step_num(path) >= 0), key=_checkpoint_sort_key)
 
 
 def list_automodel_checkpoints(ckpt_root: Path) -> list[Path]:
@@ -349,7 +361,8 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
 
     Preference order:
       1) Valid LATEST symlink or txt file under checkpoint_dir
-      2) Highest step directory under checkpoint_dir whose name ends in ``step_<N>``
+      2) Highest step directory under checkpoint_dir whose name ends in ``step_<N>``,
+         preferring the later epoch frontier when canonical checkpoint steps tie
 
     Directories left behind by an interrupted save are skipped at both steps.
     The LATEST target needs the same filter as the step scan: re-saving a step
@@ -378,7 +391,7 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
     if not checkpoint_files:
         return
 
-    latest = max(checkpoint_files, key=_checkpoint_step_num)
+    latest = max(checkpoint_files, key=_checkpoint_sort_key)
     if _checkpoint_step_num(latest) == -1:
         return
 
@@ -502,7 +515,7 @@ def materialize_missing_tied_lm_head(
 def _get_checkpoint_tensor_dtypes(
     pretrained_model_name_or_path: str,
     hf_config: Any,
-    load_kwargs: Mapping[str, object] | None = None,
+    load_kwargs: Mapping[str, _CheckpointLoadValue] | None = None,
 ) -> dict[str, torch.dtype]:
     """Inspect checkpoint tensors and return their exact dtypes by key.
 

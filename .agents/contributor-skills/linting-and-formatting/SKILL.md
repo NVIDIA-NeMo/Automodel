@@ -1,6 +1,6 @@
 ---
 name: linting-and-formatting
-description: Code style and quality rules for NeMo AutoModel — ruff configuration, naming conventions, type hints, docstrings, copyright headers, and the code review checklist. Use when writing or reviewing code for style compliance, fixing ruff errors, understanding type hint or docstring conventions, copyright header questions, or pre-commit failures.
+description: "NeMo AutoModel code style: ruff config, naming, type hints, docstrings, copyright headers, and the review checklist. Use for style questions, ruff errors, or pre-commit failures."
 ---
 
 # Linting and Formatting
@@ -102,17 +102,11 @@ modify it. Use the current year (2026).
 # limitations under the License.
 ```
 
-## Additional Style Conventions
+## Repository-wide conventions
 
-- **Explicit over implicit.** Inline logic where possible; avoid hiding behavior
-  behind unnecessary layers of indirection.
-- **No speculative abstractions.** Do not add features, parameters, or
-  generalization beyond what is explicitly asked for.
-- **Optional dependencies** must be guarded with `safe_import()` from
-  `nemo_automodel.shared.import_utils`. Never let an optional import crash
-  module loading.
-- **Components must not import each other** — enforced by `import-linter`
-  (see `pyproject.toml`).
+Explicit over implicit, no speculative abstractions, `safe_import()` for optional
+dependencies, and no cross-component imports (`import-linter`) are
+repository-wide rules in `AGENTS.md`.
 
 ## Code Review Checklist
 

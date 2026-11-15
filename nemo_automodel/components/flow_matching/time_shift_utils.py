@@ -27,20 +27,20 @@ def time_shift(
     base_shift: float = 0.5,
     max_shift: float = 1.15,
     constant: float = 3.0,
-):
-    """
-    Convert timesteps to sigmas with sequence-length-aware shifting.
+) -> torch.Tensor:
+    """Convert timesteps to sigmas with sequence-length-aware shifting.
 
     Args:
-        t: timesteps in range [0, 1]
+        t: Tensor of arbitrary shape containing timesteps in the range [0, 1].
         image_seq_len: number of tokens (frames * height * width / patch_size^2)
-        shift_type: "linear", "sqrt", or "constant"
+        shift_type: "linear", "sqrt", or "constant". Any other value returns ``t`` unchanged.
         base_shift: base shift for linear mode
         max_shift: max shift for linear mode
         constant: shift value for constant mode (default 3.0 matches Pika)
 
     Returns:
-        sigma values for noise scheduling
+        Tensor with the same shape as ``t`` containing sigma values. Shifted floating-point results preserve the
+        dtype and device of ``t`` and use a new tensor; an unrecognized ``shift_type`` returns ``t`` itself.
     """
     if shift_type == "linear":
         # Linear interpolation based on sequence length
@@ -68,19 +68,21 @@ def compute_density_for_timestep_sampling(
     logit_mean: float = 0.0,
     logit_std: float = 1.0,
     mode_scale: float = 1.29,
-):
-    """
-    Sample timesteps from different distributions for better training coverage.
+) -> torch.Tensor:
+    """Sample timesteps from different distributions for better training coverage.
 
     Args:
-        weighting_scheme: "uniform", "logit_normal", or "mode"
+        weighting_scheme: "logit_normal" or "mode" for the corresponding transform. "uniform" and any other value
+            use uniform sampling.
         batch_size: number of samples to generate
         logit_mean: mean for logit-normal distribution
         logit_std: std for logit-normal distribution
         mode_scale: scale for mode-based sampling
 
     Returns:
-        Tensor of shape (batch_size,) with values in [0, 1]
+        Tensor of shape [batch_size] on the CPU, using PyTorch's default floating-point dtype. Logit-normal samples
+        are in [0, 1], uniform samples are in [0, 1), and mode-transformed samples are not guaranteed to remain in
+        that range for arbitrary ``mode_scale`` values.
     """
     if weighting_scheme == "logit_normal":
         # SD3-style logit-normal sampling
@@ -99,18 +101,18 @@ def compute_density_for_timestep_sampling(
     return u
 
 
-def get_flow_match_loss_weight(sigma: torch.Tensor, shift: float = 3.0):
-    """
-    Compute loss weights for flow matching based on sigma values.
+def get_flow_match_loss_weight(sigma: torch.Tensor, shift: float = 3.0) -> torch.Tensor:
+    """Compute loss weights for flow matching based on sigma values.
 
     Higher sigma (more noise) typically gets higher weight.
 
     Args:
-        sigma: sigma values in range [0, 1]
+        sigma: Floating-point tensor of arbitrary shape containing sigma values in the range [0, 1].
         shift: weight scaling factor
 
     Returns:
-        Loss weights with same shape as sigma
+        New tensor of loss weights with the same shape, dtype, and device as ``sigma``. The result does not alias
+        ``sigma``.
     """
     # Flow matching weight: weight = 1 + shift * sigma
     # This gives more weight to noisier timesteps

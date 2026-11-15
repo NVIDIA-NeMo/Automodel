@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import math
 import os
+import types
 import warnings
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
@@ -226,6 +227,27 @@ def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
         return True
 
 
+_EXCLUDED_FORWARD_ATTR = "_te_fp8_excluded_forward"
+"""Instance attribute holding the forward a module had before :meth:`TEFp8Config.exclude_modules` wrapped it."""
+
+
+def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
+    """Run ``module``'s forward with the Transformer Engine FP8 autocast disabled.
+
+    Bound per instance by :meth:`TEFp8Config.exclude_modules`. The forward the module had before the
+    exclusion (an instance-level one installed earlier by a tensor-parallel style, a pipeline wrapper or
+    CUDA-graph capture, else the class ``forward``) is looked up on the instance at call time, so the
+    binding stays valid after ``copy.deepcopy``.
+    """
+    from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+    installed = vars(module).get(_EXCLUDED_FORWARD_ATTR)
+    with te_autocast(enabled=False):
+        if installed is not None:
+            return installed(*args, **kwargs)
+        return type(module).forward(module, *args, **kwargs)
+
+
 @dataclass(kw_only=True)
 class TEFp8Config:
     """Configuration for Transformer Engine FP8 quantization.
@@ -241,6 +263,59 @@ class TEFp8Config:
     """
 
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    exclude_fqns: tuple[str, ...] = ("lm_head",)
+    """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
+
+    Same matching as the torchao ``fp8.filter_fqns`` block: a module is excluded when any entry is a
+    substring of its qualified name, so ``"lm_head"`` covers ``lm_head`` and
+    ``model.language_model.lm_head``. The default keeps the output head in high precision, as the
+    FP8 checkpoints' ``modules_to_not_convert`` lists do. The train recipe applies the exclusions to
+    every model part once the parts exist (:meth:`exclude_modules`).
+    """
+
+    def __post_init__(self) -> None:
+        """Normalize ``exclude_fqns`` from YAML lists or a single string into a tuple of names."""
+        if isinstance(self.exclude_fqns, str):
+            self.exclude_fqns = (self.exclude_fqns,)
+        self.exclude_fqns = tuple(self.exclude_fqns)
+        if any(not isinstance(fqn, str) or not fqn for fqn in self.exclude_fqns):
+            raise ValueError(f"te_fp8.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}")
+
+    def module_excluded(self, name: str) -> bool:
+        """Whether the module with qualified name ``name`` stays out of the FP8 autocast."""
+        return any(fqn in name for fqn in self.exclude_fqns)
+
+    def exclude_modules(self, model: nn.Module) -> list[str]:
+        """Keep the modules matching :attr:`exclude_fqns` out of the FP8 autocast.
+
+        Each matching module gets an instance ``forward`` that runs the forward it had so far (an
+        instance-level forward installed earlier, e.g. by a tensor-parallel style, else the class
+        ``forward``) under ``te_autocast(enabled=False)``. Parameters, state-dict keys and FSDP/pipeline
+        wrapping are untouched; idempotent; the binding follows the instance through ``copy.deepcopy``.
+        Logs the excluded names.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+
+        Returns:
+            Qualified names of the modules now kept out of FP8, in ``named_modules`` order; empty
+            without Transformer Engine or without exclusions.
+        """
+        if not HAVE_TE or not self.exclude_fqns:
+            return []
+        excluded: list[str] = []
+        for name, module in model.named_modules():
+            if not name or not self.module_excluded(name):
+                continue
+            installed = vars(module).get("forward")
+            if not (isinstance(installed, types.MethodType) and installed.__func__ is _forward_outside_fp8):
+                if installed is not None:
+                    setattr(module, _EXCLUDED_FORWARD_ATTR, installed)
+                module.forward = types.MethodType(_forward_outside_fp8, module)
+            excluded.append(name)
+        if excluded:
+            logger.info("te_fp8: %d module(s) kept out of the FP8 autocast: %s", len(excluded), ", ".join(excluded))
+        return excluded
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -430,7 +505,12 @@ class BackendConfig:
             For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
-            CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+            CUDA BF16, "fa4" selects FlashAttention 4 sparse GQA (SM90 BF16), and "cudnn"
+            selects cuDNN Frontend indexed QSA on SM100/SM103 with compression ratio four
+            and CP=1, preserving the existing indexer. CPU execution retains the PyTorch
+            numerical oracle. For Kimi K3, "fa4" runs MLA through FlashAttention 4 (varlen,
+            with and without context parallelism). "fa4" requires the optional
+            flash_attn.cute package; models without an FA4 path reject it.
         sparse_attn: Sparse-attention backend. "generic" preserves each model's
             existing sparse mask plus ``attn`` path; "msa" selects the optional
             SM100 MSA kernels a model provides for its sparse layers only.
@@ -469,6 +549,13 @@ class BackendConfig:
             blocks. ``None`` preserves HybridEP's default.
         dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
             unpermutation blocks. ``None`` preserves HybridEP's default.
+        dispatcher_hybridep_max_tokens_per_rank: HybridEP only. Allocate the process-global
+            HybridEP buffer for this many tokens per rank on the first dispatch instead of the
+            first micro-batch's token count. HybridEP grows the buffer when a later micro-batch
+            is larger; in multi-node mode that reallocation re-creates the RDMA queue pairs, is
+            slow and has been seen to abort (``Failed to create ... QP``). Set it to the largest
+            micro-batch token count (e.g. the dynamic-batching token cap). The buffer is resident
+            GPU memory for the whole run, so do not pad it. ``None`` keeps the lazy behaviour.
         dispatcher_capacity_factor: HybridEP only, dynamic routing. Run HybridEP dispatch in its
             non-blocking mode with output buffers sized to the first microbatch's permuted row
             count times this factor (EP-group max, 4-token aligned) instead of letting every
@@ -587,6 +674,7 @@ class BackendConfig:
     dispatcher_hybridep_num_sms_preprocessing: int | None = None
     dispatcher_hybridep_num_blocks_permute: int | None = None
     dispatcher_hybridep_num_blocks_unpermute: int | None = None
+    dispatcher_hybridep_max_tokens_per_rank: int | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -1527,7 +1615,12 @@ def compute_lm_head_logits(
     return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
 
 
-def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
+def prepare_frozen_parameters_for_sharding(
+    model: nn.Module,
+    compute_dtype: torch.dtype | None,
+    *,
+    keep_storage: set[nn.Parameter] | None = None,
+) -> None:
     """Drop FP32 master storage for frozen parameters before distributed wrapping.
 
     Trainable parameters retain their configured storage. Model-declared FP32
@@ -1539,28 +1632,32 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
         model: Unsharded model after its final trainability policy is applied;
             parameters may be on the meta device. Call before optimizer creation.
         compute_dtype: Reduced compute dtype, or None to retain existing storage.
+        keep_storage: Frozen parameters whose storage dtype is part of their format, such as
+            packed expert codes and scales. They are never cast and their dtypes are always recorded.
     """
+    kept_ids = {id(parameter) for parameter in keep_storage or ()}
     has_frozen_parameters = any(not parameter.requires_grad for parameter in model.parameters())
     has_trainable_parameters = any(parameter.requires_grad for parameter in model.parameters())
 
     def preserve_trainable_storage() -> None:
-        """Retain adapter dtypes when a mixed-trainability model is not reduced."""
+        """Retain adapter and kept-storage dtypes when a mixed-trainability model is not reduced."""
         if not (has_frozen_parameters and has_trainable_parameters):
             return
         for module in model.modules():
-            trainable_dtypes = {
+            retained_dtypes = {
                 name: parameter.dtype
                 for name, parameter in module.named_parameters(recurse=False)
-                if parameter.requires_grad
+                if parameter.requires_grad or id(parameter) in kept_ids
             }
-            if trainable_dtypes:
-                module._preserve_parameter_dtypes = trainable_dtypes
+            if retained_dtypes:
+                module._preserve_parameter_dtypes = retained_dtypes
 
     if compute_dtype not in (torch.bfloat16, torch.float16):
         # A model-wide storage reduction may be unsafe when submodules use
         # different compute policies. Still retain configured trainable storage
-        # (for example FP32 LoRA adapters) across later model-wide initializer
-        # casts. Frozen parameters remain unrecorded and follow those casts.
+        # (for example FP32 LoRA adapters) and ``keep_storage`` across later
+        # model-wide initializer casts. Other frozen parameters remain unrecorded
+        # and follow those casts.
         preserve_trainable_storage()
         return
     fp32_keywords = _get_fp32_module_keywords(model)
@@ -1574,6 +1671,8 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
         if parameter.requires_grad or parameter.dtype not in (torch.float32, compute_dtype):
             continue
         if id(parameter) in pinned_ids or getattr(parameter, "_hf_compute_dtype", None) == torch.float32:
+            continue
+        if id(parameter) in kept_ids:
             continue
         # Initialization-only storage change: no autograd graph, optimizer, or
         # distributed wrapper owns these plain parameters yet. Preserve identity.
@@ -1590,7 +1689,12 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
         preserve_trainable_storage()
 
 
-def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
+def cast_frozen_modules_to_compute_dtype(
+    model: nn.Module,
+    compute_dtype: torch.dtype | None,
+    *,
+    keep_storage: set[nn.Parameter] | None = None,
+) -> None:
     """Cast frozen floating-point tensors to ``compute_dtype``.
 
     When parameters are stored in fp32 (the fp32-master-weights pattern) while compute runs
@@ -1618,6 +1722,8 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     Args:
         model: The model, already materialized, checkpoint-loaded, and sharded.
         compute_dtype: The compute dtype (``mp_policy.param_dtype``); None disables the cast.
+        keep_storage: Frozen parameters whose storage dtype is part of their format, such as
+            packed expert codes and scales; never cast.
     """
     if compute_dtype is None:
         return
@@ -1628,6 +1734,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
         DTensor = ()
 
     fp32_keywords = _get_fp32_module_keywords(model)
+    kept_ids = {id(parameter) for parameter in keep_storage or ()}
 
     def _is_fp32_pinned(name: str) -> bool:
         return any(kw in name for kw in fp32_keywords)
@@ -1655,7 +1762,12 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
                 if not subtree:
                     break
                 subtree, _, _ = subtree.rpartition(".")
-        elif param.is_floating_point() and not _is_fp32_pinned(name) and not (DTensor and isinstance(param, DTensor)):
+        elif (
+            param.is_floating_point()
+            and not _is_fp32_pinned(name)
+            and id(param) not in kept_ids
+            and not (DTensor and isinstance(param, DTensor))
+        ):
             frozen_param_owners.add(owner_name)
 
     mixed_subtrees = frozen_param_owners & trainable_subtrees
@@ -1674,7 +1786,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     for name, param in named_params:
         if (param.requires_grad and not _is_in_subtrees(name, mixed_subtrees)) or _is_fp32_pinned(name):
             continue
-        if DTensor and isinstance(param, DTensor):
+        if id(param) in kept_ids or (DTensor and isinstance(param, DTensor)):
             continue
         if param.is_floating_point() and param.dtype != compute_dtype:
             param.data = param.data.to(compute_dtype)

@@ -729,6 +729,24 @@ def test_synthesize_single_document_seq_ids_noop_when_present():
     assert torch.equal(batch["_packed_seq_ids"], existing)
 
 
+def test_synthesize_single_document_seq_ids_from_thd_seq_lens_padded():
+    # THD collates carry document boundaries only in `seq_lens_padded` (-1000 sentinels pad rows);
+    # each document must get its own id so the ring never attends across a boundary.
+    batch = {
+        "input_ids": torch.zeros(2, 6, dtype=torch.long),
+        "seq_lens": torch.tensor([[2, 3, 1], [5, -1000, -1000]]),
+        "seq_lens_padded": torch.tensor([[2, 3, 1], [6, -1000, -1000]]),
+    }
+    _cm._synthesize_single_document_seq_ids(batch, 6)
+    assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[1, 1, 2, 2, 2, 3], [1, 1, 1, 1, 1, 1]]))
+
+
+def test_synthesize_single_document_seq_ids_rejects_thd_lengths_not_covering_sequence():
+    batch = {"input_ids": torch.zeros(1, 6, dtype=torch.long), "seq_lens_padded": torch.tensor([[2, 3]])}
+    with pytest.raises(ValueError, match="must cover exactly"):
+        _cm._synthesize_single_document_seq_ids(batch, 6)
+
+
 def test_sharder_constructor_derives_magi_and_thd_without_sharding(monkeypatch):
     """An enabled magi occupies the same _make_cp_batch_and_ctx rung as the TE
     path: (nullcontext, prepped batch), never the torch-native CP context."""

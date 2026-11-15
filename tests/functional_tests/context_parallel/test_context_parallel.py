@@ -34,6 +34,7 @@ CP_DENSE_PACKED_TEST_FILENAME = "L2_CP_Dense_Packed_Test.sh"
 TP_DENSE_PACKED_TEST_FILENAME = "L2_TP_Dense_Packed_Test.sh"
 TP_CP_DENSE_PACKED_TEST_FILENAME = "L2_TP_CP_Dense_Packed_Test.sh"
 CP_QWEN3_8_FLASH_NEXT_PACKED_TEST_FILENAME = "L2_CP_Qwen3_8_FlashNext_Packed_Test.sh"
+CP_QWEN3_5_DENSE_PACKED_TEST_FILENAME = "L2_CP_Qwen3_5_Dense_Packed_Test.sh"
 CP_STEP5_TEST_FILENAME = "L2_CP_Step5_Test.sh"
 TP_CP_DENSE_PACKED_REQUIRED_GPUS = 4
 
@@ -76,6 +77,10 @@ class TestContextParallelAttention:
     def test_cp_qwen3_8_flash_next_packed(self):
         """Test Qwen3.8-Flash-Next QSA packed THD parity on the flex path with CP=1 vs CP=2."""
         run_test_script(TEST_FOLDER, CP_QWEN3_8_FLASH_NEXT_PACKED_TEST_FILENAME)
+
+    def test_cp_qwen3_5_dense_packed(self):
+        """Test packed dense Qwen3.5 parity at CP=2 versus CP=1."""
+        run_test_script(TEST_FOLDER, CP_QWEN3_5_DENSE_PACKED_TEST_FILENAME)
 
     def test_tp_dense_packed(self):
         """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=1."""

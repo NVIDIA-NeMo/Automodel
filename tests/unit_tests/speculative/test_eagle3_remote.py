@@ -249,7 +249,7 @@ class _RecordingBackend:
 
 
 def test_prefetched_batches_preserves_order_and_prefetches_ahead():
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.target_wrapper = _RecordingBackend()
@@ -292,7 +292,7 @@ def test_prefetched_batches_never_exceeds_depth_in_flight():
     """The prefetcher must hold at most ``depth`` requests in flight. With depth
     capped to the server count, one extra request means some server runs two
     concurrent /generate forwards, which corrupts the hook-captured supervision."""
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.target_wrapper = _InflightBackend()

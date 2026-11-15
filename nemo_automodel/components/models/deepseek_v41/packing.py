@@ -45,6 +45,11 @@ class PackedSequenceLayout:
         Returns:
             Independent tensor [batch, padded_sequence, ...], preserving gradients of real tokens.
         """
+        if values.shape[1] == 0:
+            # A one-token document becomes empty after the SFT shift. Its
+            # padding slots have no valid source index to gather.
+            result = values.new_full((*self.source_indices.shape, *values.shape[2:]), fill)
+            return result + values.sum() * 0 if values.requires_grad else result
         rows = torch.arange(values.shape[0], device=values.device).unsqueeze(1)
         result = values[rows, self.source_indices.clamp_min(0)]
         valid = self.source_indices >= 0
@@ -79,7 +84,7 @@ def packed_layout(
 
     Args:
         seq_lens: Integer real document lengths [batch, documents] or [documents] for batch one.
-            Zero and -1000 entries denote absent documents.
+            Zero denotes an empty document whose span may contain padding; -1000 is absent metadata.
         seq_lens_padded: Optional integer physical span lengths with the same shape. These include
             existing per-document padding; omitted means documents are directly concatenated.
         input_shape: Original [batch, sequence] dimensions.
@@ -108,8 +113,13 @@ def packed_layout(
         old_start = new_start = 0
         for document, (length, span) in enumerate(zip(real_row, span_row, strict=True), start=1):
             if length in (0, -1000):
-                if span not in (0, -1000):
+                # The native VLM collator assigns tail padding to the final
+                # span, which can be a zero-token document after the SFT shift.
+                if span not in (0, -1000) and (length < 0 or span < 0):
                     raise ValueError("An absent packed document cannot have a physical span")
+                old_start += max(span, 0)
+                if old_start > input_shape[1]:
+                    raise ValueError("Packed padding spans exceed the input row")
                 continue
             if length < 0 or span < length or old_start + span > input_shape[1]:
                 raise ValueError("Packed document lengths exceed their physical spans or input row")

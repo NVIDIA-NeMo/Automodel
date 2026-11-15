@@ -1,10 +1,10 @@
 ---
 title: "Qwen-Image-Edit-2511"
-description: "Use NeMo AutoModel to fine-tune Qwen-Image-Edit-2511 for Diffusion workflows with checked-in image to image recipes and documented distributed settings."
+description: "Use NeMo AutoModel to fine-tune Qwen-Image-Edit-2511 for diffusion workflows with checked-in image-to-image recipes and documented distributed settings."
 slug: model-coverage/diffusion/qwen/Qwen-Image-Edit-2511
 ---
 
-[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) has a checked-in NeMo AutoModel recipe for image to image.
+[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) has checked-in NeMo AutoModel recipes for full-parameter and single-GPU LoRA image-edit training.
 
 ## Fine-Tune Qwen-Image-Edit-2511
 
@@ -23,6 +23,7 @@ uv run torchrun --nproc-per-node=8 \
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml). |
+| Train LoRA adapters on one GPU | Use the [LoRA workflow](#single-gpu-lora) below. |
 
 ### Configuration
 
@@ -36,7 +37,67 @@ uv run torchrun --nproc-per-node=8 \
 
 ### More Recipes for This Model
 
-- [`generate_qwen_image_edit.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml)
+To try another checked-in recipe for this model, use the [`generate_qwen_image_edit.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml) recipe.
+
+## Single-GPU LoRA
+
+The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml) uses BF16, rank 8, batch size 1, activation checkpointing, and single-rank Distributed Data Parallel (DDP) without FSDP. The 256p setup was validated on a GPU with 48 GiB of memory; 24 GiB GPUs and editing quality have not been validated.
+
+### Prepare the Cache
+
+Set `MODEL_DIR` to the complete base-model directory. Cache 16 MagicBrush samples at the recipe's 256x256 image resolution:
+
+```bash
+export MODEL_DIR=/data/model/Qwen-Image-Edit-2511
+export CACHE_DIR=/data/cache/magicbrush-qie2511-256p
+export RUN_DIR=/data/checkpoints/qie2511-lora-run-01
+
+CUDA_VISIBLE_DEVICES=0 uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
+  --dataset_name osunlp/MagicBrush --dataset_split train --dataset_streaming \
+  --dataset_media_mapping target=target_img \
+  --dataset_media_mapping context=source_img \
+  --dataset_media_mapping condition=source_img \
+  --dataset_caption_column instruction \
+  --max_items 16 --resolution_preset 256p --max_sequence_length 512 \
+  --processor qwen_image_edit --model_name "${MODEL_DIR}" \
+  --num_gpus 1 --verify --output_dir "${CACHE_DIR}"
+```
+
+### Train and Resume
+
+Use a new `RUN_DIR` for a fresh run: an existing checkpoint there can trigger automatic restore. Run a 20-step execution check:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run torchrun --standalone --nproc-per-node=1 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml \
+  --model.pretrained_model_name_or_path "${MODEL_DIR}" \
+  --data.dataloader.cache_dir "${CACHE_DIR}" \
+  --checkpoint.checkpoint_dir "${RUN_DIR}" \
+  --step_scheduler.max_steps 20 --step_scheduler.ckpt_every_steps 10
+```
+
+The recipe defaults to 1,000 steps with checkpoints every 100 steps. To resume a stopped run, repeat its original command with `--checkpoint.restore_from LATEST`; keep the same data, seed, and total step count. `LATEST` starts fresh if no checkpoint exists, so check the restore path in the log. A specific restore path must name the full `epoch_*_step_*` directory.
+
+### Generate with the Adapter
+
+Set `STEP_DIR` to a saved checkpoint and `SOURCE_IMAGE` to the image to edit. The example checkpoint name is for the 16-sample, 20-step run above:
+
+```bash
+export STEP_DIR="${RUN_DIR}/epoch_1_step_19"
+export SOURCE_IMAGE=/data/source.png
+
+CUDA_VISIBLE_DEVICES=0 uv run python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_qwen_image_edit.yaml \
+  --model.pretrained_model_name_or_path "${MODEL_DIR}" \
+  --model.lora_weights "${STEP_DIR}/model" \
+  --inference.input_images "[\"${SOURCE_IMAGE}\"]" \
+  --inference.prompts '["Add mountains in the background"]' \
+  --inference.height 512 --inference.width 512 \
+  --output.output_dir /data/outputs/qie2511-lora-run-01
+```
+
+The `model/` directory contains `adapter_model.safetensors` and `adapter_config.json` for inference. Use `model.lora_weights` for the adapter; `model.checkpoint` is for a full-model checkpoint.
 
 ## Model Reference
 
@@ -44,7 +105,7 @@ uv run torchrun --nproc-per-node=8 \
 
 | Property | Value |
 | --- | --- |
-| Task | Image to image |
+| Task | Image-to-Image |
 | Architecture | - |
 
 ### Available Models
@@ -53,4 +114,4 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Related Resources
 
-- [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)
+- [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)

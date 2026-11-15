@@ -171,6 +171,7 @@ clip_grad_norm:
 #   dir: logs/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps/wandb
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   nodes: 32
   nproc_per_node: 4

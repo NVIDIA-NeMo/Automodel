@@ -91,6 +91,17 @@ def test_base_mask_sliding_window_limits_lookback():
             assert bool(allowed[qi, ki]) == expected
 
 
+def test_base_mask_window_cuts_the_block_overlay():
+    module = SimpleNamespace(sliding_window=2)
+    ctx = SimpleNamespace(seq_global_start=0, is_causal=True)
+    q, kv = _idx_grid(4, 4)
+    block = torch.ones(4, 4, dtype=torch.bool)  # one vision block longer than the window
+    allowed = cpa._base_gemma4_cp_mask(module, ctx, q, kv, block_overlay=block)
+    # AND(window, OR(causal, block)): every future key, past keys only inside the window
+    expected = (q - kv) < 2
+    assert torch.equal(allowed, expected)
+
+
 def test_base_mask_global_offset_shifts_causal_window():
     module = SimpleNamespace(sliding_window=None)
     ctx = SimpleNamespace(seq_global_start=4, is_causal=True)  # local q starts at global 4
@@ -173,6 +184,17 @@ def test_zero_if_none_returns_zeros_when_none():
 # ---------------------------------------------------------------------------
 # attach_gemma4_cp_ring_attention
 # ---------------------------------------------------------------------------
+def test_flex_compile_settings_scope_recompile_room_and_duck_shape():
+    from torch.fx.experimental import _config as fx_config
+
+    limit, duck = torch._dynamo.config.recompile_limit, fx_config.use_duck_shape
+    with cpa._flex_compile_settings():
+        assert torch._dynamo.config.recompile_limit >= cpa._FLEX_RECOMPILE_LIMIT
+        assert fx_config.use_duck_shape is False
+    assert torch._dynamo.config.recompile_limit == limit
+    assert fx_config.use_duck_shape == duck
+
+
 def test_attach_sets_metadata_keys_and_method():
     module = torch.nn.Linear(2, 2)
     cpa.attach_gemma4_cp_ring_attention(module)
@@ -513,6 +535,28 @@ def test_flex_chunk_packed_seq_ids_branch():
         kv_global_start=0,
     )
     assert out.shape == ctx.query.shape
+
+
+def test_flex_chunk_vision_block_longer_than_the_window_matches_hf_composition():
+    window = 2
+    module = _flex_module(sliding_window=window, use_bidirectional_attention="vision")
+    mm = torch.tensor([[0, 1, 1, 1, 1, 1, 1, 0]])  # a 6-token vision block, window 2
+    ctx = _make_ctx(module, seq=8, head_dim=8, metadata={"mm_token_type_ids": mm})
+    out, _, _, _ = cpa._run_gemma4_flex_chunk(
+        module,
+        ctx,
+        key_chunk=ctx.key,
+        value_chunk=ctx.value,
+        metadata_chunk={"mm_token_type_ids": mm},
+        kv_global_start=0,
+    )
+    pos = torch.arange(8)
+    groups = cpa.gemma4_vision_group_ids(mm)[0]
+    same_block = (groups[:, None] == groups[None, :]) & (groups[:, None] >= 0)
+    # Hugging Face's Gemma4 sliding mask: AND(window, OR(causal, vision block))
+    allowed = ((pos[None, :] <= pos[:, None]) | same_block) & ((pos[:, None] - pos[None, :]) < window)
+    ref = torch.nn.functional.scaled_dot_product_attention(ctx.query, ctx.key, ctx.value, attn_mask=allowed)
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
 
 
 def test_flex_chunk_vision_bidirectional_branch():

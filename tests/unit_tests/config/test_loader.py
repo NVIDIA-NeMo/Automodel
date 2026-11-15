@@ -28,6 +28,7 @@ from nemo_automodel.components.config.loader import (
     _resolve_target,
     load_module_from_file,
     load_yaml_config,
+    resolve_yaml_env_vars,
     translate_value,
 )
 
@@ -108,6 +109,17 @@ def test_resolve_target_error():
         _resolve_target("surely.does.not.exist")
 
 
+def test_resolve_target_reports_missing_dependency_of_existing_module(tmp_path: Path, monkeypatch):
+    """A dependency missing inside an existing module surfaces as itself, not as a missing attribute."""
+    (tmp_path / "needs_missing_dep.py").write_text(
+        "import nemo_automodel_missing_dependency_for_test  # noqa: F401\n\nclass Target:\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(ModuleNotFoundError, match="nemo_automodel_missing_dependency_for_test"):
+        _resolve_target("needs_missing_dep.Target")
+
+
 def test_confignode_wrap_and_fn_resolution(tmp_module):
     """
     * Scalar values must be translated.
@@ -143,6 +155,35 @@ def test_dotted_get_set_contains():
     cfg.set_by_dotted("arr.values", ["a", "b", "c"])
     assert cfg.get("arr.values.1") == "b"
     assert cfg.get("non.existent", default="sentinel") == "sentinel"
+
+
+def test_set_by_dotted_indexes_into_lists():
+    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.95]}, "ds": [{"path": "a"}, {"path": "b"}]})
+
+    cfg.set_by_dotted("optimizer.betas.1", "0.98")
+    cfg.set_by_dotted("ds.1.path", "z")
+    cfg.set_by_dotted("ds.0", {"path": "y", "split": "train"})
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
+    assert isinstance(cfg.ds, list) and len(cfg.ds) == 2
+    assert cfg.get("ds.1.path") == "z"
+    assert isinstance(cfg.ds[0], ConfigNode) and cfg.ds[0].to_dict() == {"path": "y", "split": "train"}
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("ds.2.path", "w")
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("optimizer.betas.x", 0.5)
+    assert cfg.optimizer.betas == [0.9, 0.98]
+
+
+def test_cli_override_of_list_element_keeps_the_list(tmp_path: Path):
+    from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("optimizer:\n  lr: 1.0e-5\n  betas: [0.9, 0.95]\n")
+
+    cfg = parse_args_and_load_config(argv=["--config", str(cfg_path), "--optimizer.betas.1", "0.98"])
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
 
 
 def test_instantiate_simple(tmp_module):
@@ -324,14 +365,18 @@ def test_to_yaml_dict_uses_live_callable_when_original_target_cannot_resolve():
 
 
 def test_to_yaml_dict_emits_tuples_as_safe_loadable_lists():
-    """A tuple CLI value must not dump as `!!python/tuple`, which yaml.safe_load rejects."""
-    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.999]}})
+    """CLI tuple literals must serialize as plain YAML sequences, not `!!python/tuple`."""
+    cfg = ConfigNode({"optimizer": {"lr": 1e-4}})
     cfg.set_by_dotted("optimizer.betas", translate_value("(0.9, 0.95)"))
+    cfg.set_by_dotted("shapes", translate_value("[(1, 2), (3, 4)]"))
 
     out = cfg.to_yaml_dict(use_orig_values=True)
 
     assert out["optimizer"]["betas"] == [0.9, 0.95]
+    assert out["shapes"] == [[1, 2], [3, 4]]
     assert yaml.safe_load(yaml.dump(out)) == out
+    # The live config keeps the tuple for the components that consume it.
+    assert cfg.optimizer.betas == (0.9, 0.95)
 
 
 def test_load_yaml_config(tmp_path):
@@ -426,6 +471,32 @@ def test_load_yaml_config_resolves_dotted_env_var_name(monkeypatch, tmp_path: Pa
     assert "qux/qux" not in s
 
 
+def test_resolved_env_var_value_is_not_expanded_again(monkeypatch, tmp_path: Path):
+    # A resolved value is data: a `$` inside it must not be read as another reference.
+    monkeypatch.setenv("DB_PASSWORD", "pa$word")
+    monkeypatch.setenv("word", "should-not-be-used")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text(
+        """
+        braced: ${DB_PASSWORD}
+        bare: $DB_PASSWORD
+        embedded: user:${DB_PASSWORD}@host
+        """
+    )
+    cfg = load_yaml_config(str(yml))
+    assert cfg.braced == "pa$word"
+    assert cfg.bare == "pa$word"
+    assert cfg.embedded == "user:pa$word@host"
+
+
+def test_env_var_default_may_reference_another_env_var(monkeypatch):
+    monkeypatch.delenv("PRIMARY_DIR", raising=False)
+    monkeypatch.setenv("FALLBACK_DIR", "/data")
+    assert resolve_yaml_env_vars("${PRIMARY_DIR,$FALLBACK_DIR}/x") == "/data/x"
+    monkeypatch.setenv("PRIMARY_DIR", "/fast")
+    assert resolve_yaml_env_vars("${PRIMARY_DIR,$FALLBACK_DIR}/x") == "/fast/x"
+
+
 def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("SECRET_ENV", "super_secret_value")
     yml = tmp_path / "cfg.yaml"
@@ -444,8 +515,9 @@ def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path)
     assert copied_value._orig_value == "${oc.env:SECRET_ENV}"
 
 
-def test_load_module_from_file(tmp_path):
-    """Module is imported, its globals are accessible, and it gets a unique name."""
+def test_load_module_from_file(tmp_path, monkeypatch):
+    """With user modules enabled, the file is imported, its globals are accessible, and it gets a unique name."""
+    monkeypatch.setattr("nemo_automodel.components.config.loader.ENABLE_USER_MODULES", True)
     py_file = tmp_path / "plugin.py"
     py_file.write_text(
         textwrap.dedent(
@@ -470,8 +542,9 @@ def test_resolve_target_non_string_passthrough():
     assert _resolve_target(42) == 42
 
 
-def test_resolve_target_file_colon(tmp_path):
-    """`path/to/file.py:object_name` is resolved correctly."""
+def test_resolve_target_file_colon(tmp_path, monkeypatch):
+    """With user modules enabled, `path/to/file.py:object_name` is resolved correctly."""
+    monkeypatch.setattr("nemo_automodel.components.config.loader.ENABLE_USER_MODULES", True)
     script = tmp_path / "tools.py"
     script.write_text(
         textwrap.dedent(

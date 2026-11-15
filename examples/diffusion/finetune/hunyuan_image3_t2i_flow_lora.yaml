@@ -4,7 +4,7 @@
 #
 # 1. Preprocess images and captions (latents from the release VAE, prompt tokens from the release tokenizer,
 #    images snapped to the release's 33 resolutions around 1024x1024):
-#      uv run python tools/diffusion/preprocessing_multiprocess.py image \
+#      uv run python -m tools.diffusion.preprocessing_multiprocess image \
 #        --image_dir PATH_TO_IMAGES --output_dir PATH_TO_YOUR_DATA \
 #        --processor hunyuan_image3 --model_name tencent/HunyuanImage-3.0 --resolution_preset 1024p
 # 2. Train:
@@ -121,6 +121,7 @@ checkpoint:
   restore_from: null
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: khazic
   time: "01:00:00"

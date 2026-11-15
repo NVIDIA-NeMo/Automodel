@@ -329,6 +329,19 @@ def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expec
     assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
 
 
+@pytest.mark.parametrize(
+    "device_name, expected_tflops",
+    [
+        ("NVIDIA B200", 2250.0),
+        ("NVIDIA B300 SXM6 AC", 2250.0),
+        ("NVIDIA GB200", 2500.0),
+        ("NVIDIA GB300", 2500.0),
+    ],
+)
+def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expected_tflops):
+    assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
+
+
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):
     monkeypatch.setattr(mfu_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(mfu_module.torch.cuda, "current_device", lambda: 3)
@@ -395,3 +408,36 @@ def test_mfu_config_builds_calculator(monkeypatch):
 
     assert calculator.config is model_config
     assert calculator.reference_mfu == 1979.0
+
+
+def test_optional_field_set_to_none_uses_its_default():
+    """An explicit ``None`` in an optional field behaves like the field being absent."""
+    with_none = _llama2_cfg()
+    with_none.num_key_value_heads = None
+    without = _llama2_cfg()
+    del without.num_key_value_heads
+
+    assert flops_utils.llama2_flops(with_none, gbs=1, seq_len=1024) == flops_utils.llama2_flops(
+        without, gbs=1, seq_len=1024
+    )
+
+
+def test_optional_field_with_wrong_type_raises():
+    cfg = _llama2_cfg()
+    cfg.num_key_value_heads = "8"
+
+    with pytest.raises(TypeError, match="num_key_value_heads must be an int"):
+        flops_utils.llama2_flops(cfg, gbs=1, seq_len=1024)
+
+
+def test_mla_moe_flops_accepts_alternate_ffn_field_names():
+    """Configs that name their FFN widths ``ffn_hidden_size`` / ``expert_ffn_hidden_size`` need no
+    ``intermediate_size``; these names are only read as fallbacks."""
+    cfg = _moonlight_16b_config()
+    standard = flops_utils.mla_moe_flops(cfg, gbs=1, seq_len=1024)
+    alternate = SimpleNamespace(**vars(cfg))
+    alternate.ffn_hidden_size = alternate.intermediate_size
+    alternate.expert_ffn_hidden_size = alternate.moe_intermediate_size
+    del alternate.intermediate_size, alternate.moe_intermediate_size
+
+    assert flops_utils.mla_moe_flops(alternate, gbs=1, seq_len=1024) == standard

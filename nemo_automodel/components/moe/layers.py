@@ -1027,6 +1027,10 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             if module.gate_proj is not None:
                 to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
         elif isinstance(module, MoE):
+            if module.shared_expert_gate is not None:
+                to_local(module.shared_expert_gate.weight).normal_(mean=0.0, std=init_std)
+                if module.shared_expert_gate.bias is not None:
+                    to_local(module.shared_expert_gate.bias).zero_()
             if module.fc1_latent_proj is not None:
                 to_local(module.fc1_latent_proj.weight).normal_(mean=0.0, std=init_std)
                 if module.fc1_latent_proj.bias is not None:

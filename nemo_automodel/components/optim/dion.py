@@ -19,6 +19,7 @@ import math
 from typing import Any, ClassVar, Protocol
 
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
@@ -32,7 +33,10 @@ class _DionFamilyConfig(Protocol):
     scalar_opt: str
     scalar_betas: tuple[float, float]
     scalar_eps: float
-    supports_batched_matrices: ClassVar[bool]
+
+    @property
+    def supports_batched_matrices(self) -> bool: ...
+
     use_matrix_layout: ClassVar[bool]
 
 
@@ -161,7 +165,19 @@ def _separate_param_groups(
     return param_groups
 
 
-def _get_dion_mesh(device_mesh: Any) -> Any:
+def get_dion_mesh(device_mesh: DeviceMesh | None) -> DeviceMesh | None:
+    """Resolve the data-parallel mesh a Dion-family optimizer communicates over.
+
+    Dion gathers sharded matrix axes only over its data-parallel group, so a multi-dimensional training mesh is
+    reduced to its FSDP data-parallel sub-mesh. ``None`` and 1-D meshes are returned unchanged, as is a mesh whose
+    data-parallel axes cannot be resolved.
+
+    Args:
+        device_mesh: Root training mesh, or ``None`` for a single-process run.
+
+    Returns:
+        The mesh to pass as the optimizer's ``distributed_mesh``, or ``None``.
+    """
     if device_mesh is None:
         return None
     if not hasattr(device_mesh, "ndim") or device_mesh.ndim == 1:
@@ -242,7 +258,7 @@ def build_dion_optimizer(
         use_matrix_layout=config.use_matrix_layout,
     )
 
-    dion_mesh = _get_dion_mesh(device_mesh)
+    dion_mesh = get_dion_mesh(device_mesh)
     mesh_kwargs: dict[str, Any] = {}
     if mesh_kwarg is not None and dion_mesh is not None:
         mesh_kwargs[mesh_kwarg] = dion_mesh

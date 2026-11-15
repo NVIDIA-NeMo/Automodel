@@ -96,7 +96,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  num_samples_limit: 6144
+  limit_dataset_samples: 6144
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.5-Pro
@@ -116,7 +116,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 576
+  limit_dataset_samples: 576
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.5-Pro
@@ -145,6 +145,7 @@ wandb:
   mode: online
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: Simar-malhotra09
   # pp_size(18) * ep_size(8) = 144 GPUs => 18 nodes (8 H100/node).

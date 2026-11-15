@@ -28,6 +28,9 @@ from torch.distributed.fsdp import (
 )
 
 from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_restore_unused_param_grads as _patch_fsdp_restore_unused_param_grads,
+)
+from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
 from nemo_automodel.components.distributed.fsdp_patches import (
@@ -42,6 +45,7 @@ UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, 
 
 __all__ = [
     "fully_shard_by_dtype",
+    "get_internal_fsdp_mp_policy",
     "reject_unsupported_mtp_cp",
     "reject_unsupported_mtp_cp_pp",
 ]
@@ -84,7 +88,9 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     collective and discard peer contributions. PyTorch's public API fills the
     missing local contribution with zero, analogous to DDP unused-parameter
     handling. AutoModel keeps a compatibility fallback for supported PyTorch
-    versions that predate that public API.
+    versions that predate that public API. A parameter that no rank of its
+    reduction used keeps ``grad is None`` instead of the reduced zero, so the
+    optimizer skips it as it would without context parallelism.
 
     Args:
         module: Root module containing the FSDP units to configure.
@@ -105,6 +111,8 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
             fsdp_module.set_reduce_scatter_unused_params(True, recurse=False)
     else:
         _patch_fsdp_unused_param_reduction()
+    # Installed after the fill so its post-backward probe sees gradients before the zero fill.
+    _patch_fsdp_restore_unused_param_grads()
     return len(fsdp_modules)
 
 
