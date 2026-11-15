@@ -3108,6 +3108,29 @@ def test_estimate_media_tokens_real_mimo_and_muse_spark(collate_mod):
     assert collate_mod._estimate_media_tokens(conv_112_112, muse_proc) == 15
 
 
+def test_estimate_media_tokens_incompatible_counter_fallbacks(collate_mod):
+    """Counters returning non-scalars (e.g. Idefics3 tuples) or crop counts (e.g. Aria)
+    must fall back to _smart_resize_image instead of corrupting extra token counts.
+    """
+    from transformers import AriaImageProcessor, Idefics3ImageProcessor
+
+    img = PILImage.new("RGB", (112, 112))
+    conv = [{"role": "user", "content": [{"type": "image", "image": img}]}]
+
+    class WrapperProc:
+        def __init__(self, ip):
+            self.image_processor = ip
+
+    idefics_proc = WrapperProc(Idefics3ImageProcessor())
+    aria_proc = WrapperProc(AriaImageProcessor())
+
+    # Idefics3 returns (17, 4, 4); non-scalar return must be skipped and fall back to _smart_resize_image
+    assert collate_mod._estimate_media_tokens(conv, idefics_proc) == 0
+
+    # Aria returns crop count 1; without merge_size, must fall back to _smart_resize_image
+    assert collate_mod._estimate_media_tokens(conv, aria_proc) == 15
+
+
 # ---------------------------------------------------------------------------
 # _count_media_per_sample tests
 # ---------------------------------------------------------------------------

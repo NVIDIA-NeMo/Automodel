@@ -1263,16 +1263,21 @@ def _estimate_media_tokens(conversation, processor):
             if get_patches is not None:
                 try:
                     n_patches = get_patches(height, width)
-                    # Only divide when merge_size is explicitly declared on the processor
-                    # (e.g. MiMo, Qwen2VL) where get_number_of_image_patches returns unmerged patches.
-                    # Processors like Muse Spark return post-downsampling visual tokens directly.
-                    explicit_merge = getattr(ip, "merge_size", None)
-                    if explicit_merge is None and ip is None:
-                        explicit_merge = getattr(processor, "merge_size", None)
-                    if explicit_merge is not None:
-                        image_seq_len = n_patches // (explicit_merge**2)
-                    else:
-                        image_seq_len = n_patches
+                    # Only consume counters whose return type and units match this calculation.
+                    # Non-scalar counters (e.g. Idefics3 returning (num_patches, rows, cols))
+                    # or crop counters (e.g. Aria) must fall back to _smart_resize_image.
+                    if isinstance(n_patches, int) and not isinstance(n_patches, bool):
+                        explicit_merge = getattr(ip, "merge_size", None)
+                        if explicit_merge is None and ip is None:
+                            explicit_merge = getattr(processor, "merge_size", None)
+                        if explicit_merge is not None:
+                            image_seq_len = n_patches // (explicit_merge**2)
+                        elif (
+                            getattr(ip, "token_patch_size", None) is not None
+                            or (ip is not None and type(ip).__name__.startswith("MuseSpark"))
+                            or (processor is not None and type(processor).__name__.startswith("MuseSpark"))
+                        ):
+                            image_seq_len = n_patches
                 except Exception:
                     pass
 
