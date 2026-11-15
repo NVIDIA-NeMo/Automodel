@@ -366,7 +366,7 @@ constraint-dependencies = [
     "filelock>=4.2.1",
     "graphql-core>=3.2.12",
     "oauthlib>=4.0.1",
-    "opentelemetry-api>=1.45.1",
+    "opentelemetry-api>=1.45.2",
 ]
 override-dependencies = [
     # Override Trackio's Pillow<13 cap to enforce the security update.
