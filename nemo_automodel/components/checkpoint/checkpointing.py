@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -2120,8 +2121,8 @@ fi
         """
         Build FQN to shard index mapping for consolidated HF export.
 
-        Uses the base checkpoint index (if present), removes non-persistent keys,
-        and assigns new keys to the last shard by default.
+        Uses the base checkpoint index when every rank that saves the model loaded the same one and a size-based
+        plan otherwise, removes non-persistent keys, and assigns new keys to the last shard by default.
 
         Args:
             model_state: Wrapper exposing the primary model part.
@@ -2146,11 +2147,17 @@ fi
             self.config.model_cache_dir,
             self.config.model_repo_id,
         )
+        fqn_to_file_index_mapping: dict[str, int] | None = None
         if reference_path:
             # HF VLM models may contain a special checkpoint mapping attribute
             fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                 reference_path, getattr(model, "_checkpoint_conversion_mapping", None)
             )
+        # Each rank reads the reference from its own Hugging Face cache, and node-local caches can differ. The size
+        # collectives below depend on the reference, so the ranks of the save group first agree on it: the reference
+        # layout is used only when every rank loaded the same mapping, otherwise every rank plans by size.
+        reference_digests = _gather_reference_mapping_digests(fqn_to_file_index_mapping, save_group)
+        if fqn_to_file_index_mapping is not None and len(set(reference_digests)) == 1:
             model_part = model_state.model[0]
             config = getattr(model_part, "config", None)
             model_type = getattr(config, "model_type", None)
@@ -2217,7 +2224,18 @@ fi
                 key_size_mapping=global_key_sizes,
             )
             num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
-            if is_rank_0():
+            if is_rank_0() and len(set(reference_digests)) > 1:
+                logger.warning(
+                    "The %d ranks that save %s loaded %d different original HF shard mappings (a missing mapping and "
+                    "an empty one each count as one); every rank uses the size-based consolidated shard mapping "
+                    "with target shard size %s and %d output shard(s).",
+                    len(reference_digests),
+                    self.config.model_repo_id,
+                    len(set(reference_digests)),
+                    format_bytes(_DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES),
+                    num_shards,
+                )
+            elif is_rank_0():
                 logger.info(
                     "No original HF safetensors reference path found for %s; using size-based consolidated shard "
                     "mapping with target shard size %s and %d output shard(s).",
@@ -3168,6 +3186,42 @@ def _divide_keys_by_size(
         current_shard_bytes += tensor_bytes
 
     return fqn_to_index_mapping
+
+
+def _gather_reference_mapping_digests(
+    reference_mapping: dict[str, int] | None,
+    process_group: torch.distributed.ProcessGroup | None,
+) -> list[str]:
+    """Collect a digest of the reference shard mapping from every rank that saves a model.
+
+    Each rank reads the reference from its own Hugging Face cache, so the ranks compare digests instead of assuming
+    that they loaded the same mapping. Every rank of a multi-rank group must call this at the same point of the
+    save.
+
+    Args:
+        reference_mapping: Mapping from tensor names to one-based shard indices as this rank loaded it from the base
+            checkpoint, before any rank-local exclusion, or ``None`` when this rank has no cached snapshot.
+        process_group: Process group whose ranks save the model, or ``None`` for a local-only result.
+
+    Returns:
+        One entry per rank of ``process_group`` in rank order, or a single entry without a multi-rank group: the
+        SHA-256 hex digest of the rank's mapping, which does not depend on the order of its entries, or an empty
+        string for a rank without a cached snapshot.
+    """
+    local_digest = ""
+    if reference_mapping is not None:
+        local_digest = hashlib.sha256(json.dumps(sorted(reference_mapping.items())).encode()).hexdigest()
+    if (
+        process_group is None
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size(group=process_group) == 1
+    ):
+        return [local_digest]
+
+    digests = [""] * torch.distributed.get_world_size(group=process_group)
+    torch.distributed.all_gather_object(digests, local_digest, group=process_group)
+    return digests
 
 
 def _collect_global_tensor_sizes(

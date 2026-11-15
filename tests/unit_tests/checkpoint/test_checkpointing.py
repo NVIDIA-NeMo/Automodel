@@ -20,6 +20,7 @@ import pickle
 import random
 from contextlib import ExitStack
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -57,6 +58,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _ensure_dirs,
     _ensure_shared_dirs,
     _equally_divide_layers,
+    _gather_reference_mapping_digests,
     _is_custom_model,
     _load_hf_bin_checkpoint,
     _load_hf_safetensors_checkpoint,
@@ -772,6 +774,210 @@ def test_export_from_ranks_with_different_expert_keys_reloads_every_tensor(tmp_p
     for key, value in expected.items():
         torch.testing.assert_close(restored[key], torch.full((4, 4), value), rtol=0, atol=0)
     assert len(set(weight_map.values())) == 3
+
+
+def test_reference_mapping_digests_separate_missing_empty_and_different_mappings():
+    """Ranks agree on a reference only when they loaded the same entries, in any order."""
+    mapping = {"a.weight": 1, "b.weight": 2}
+    [digest] = _gather_reference_mapping_digests(mapping, None)
+    assert _gather_reference_mapping_digests(dict(reversed(mapping.items())), None) == [digest]
+    assert _gather_reference_mapping_digests(None, None) == [""]
+    different = [{}, {"a.weight": 1}, {"a.weight": 2, "b.weight": 1}]
+    digests = {digest, "", *(_gather_reference_mapping_digests(other, None)[0] for other in different)}
+    assert len(digests) == 5
+
+
+def test_differing_reference_mappings_plan_by_size_and_warn(tmp_path, caplog):
+    """A rank whose peer reports another reference mapping plans by size, and the log says how many mappings differ."""
+    checkpointer = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path), model_repo_id="test/model", save_consolidated=False
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+    state_dict = {"a.weight": torch.empty(4, 4), "b.weight": torch.empty(4, 4)}
+    model_state = SimpleNamespace(model=[SimpleNamespace(_pre_shard_hf_state_dict_keys=list(state_dict))])
+    caplog.set_level(logging.WARNING)
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            return_value={"a.weight": 2, "b.weight": 1},
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._gather_reference_mapping_digests",
+            return_value=["digest of this rank", ""],
+        ),
+    ):
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+    assert mapping == {"a.weight": 1, "b.weight": 1}
+    assert "loaded 2 different original HF shard mappings" in caplog.text
+
+
+def _run_rank_local_reference_cache_worker(
+    rank: int,
+    init_file: str,
+    root: str,
+    weight_names: list[str],
+    expected_mappings: dict[str, dict[str, int]],
+    single_rank_consolidation: bool,
+    shard_bytes: int | None,
+) -> None:
+    """Save one model once per case from two ranks whose Hugging Face caches differ.
+
+    A rank's cache for a case is ``root/<case>/cache_rank<rank>``. ``expected_mappings`` gives, per case, the shard
+    mapping that both ranks must derive.
+    """
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    # A rank that enters a collective without its peer fails after this timeout instead of hanging.
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2, timeout=timedelta(seconds=15)
+    )
+    try:
+        model = torch.nn.ModuleDict({name: torch.nn.Linear(4, 4, bias=False) for name in weight_names})
+        with torch.no_grad():
+            for index, name in enumerate(weight_names):
+                model[name].weight.fill_(float(index))
+        # The complete key list, the same on both ranks.
+        model._pre_shard_hf_state_dict_keys = [f"{name}.weight" for name in weight_names]
+        with ExitStack() as stack:
+            if shard_bytes is not None:
+                stack.enter_context(
+                    patch(
+                        "nemo_automodel.components.checkpoint.checkpointing._DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES",
+                        shard_bytes,
+                    )
+                )
+            for case, expected_mapping in expected_mappings.items():
+                checkpointer = CheckpointingConfig(
+                    checkpoint_dir=os.path.join(root, case),
+                    model_cache_dir=os.path.join(root, case, f"cache_rank{rank}"),
+                    model_repo_id="test/rank-local-cache",
+                    save_consolidated=True,
+                    single_rank_consolidation=single_rank_consolidation,
+                ).build(dp_rank=rank, tp_rank=0, pp_rank=0)
+                try:
+                    checkpointer.save_model(model, os.path.join(root, case, "checkpoint"))
+                    mapping = checkpointer._maybe_build_consolidated_index(
+                        SimpleNamespace(model=[model]), model.state_dict()
+                    )
+                    # Spawn propagates assertion failures from either rank, including the failing case name.
+                    assert mapping == expected_mapping, case
+                finally:
+                    checkpointer.close()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _save_from_ranks_with_different_reference_caches(
+    root: Path,
+    reference_shards: list[list[str]],
+    other_reference_shards: list[list[str]],
+    size_based_shards: list[list[str]],
+    single_rank_consolidation: bool,
+    shard_bytes: int | None,
+) -> None:
+    """Save from two ranks under five cache states and check the shard plan and the export of each.
+
+    A rank's cache holds the base checkpoint with its index, a snapshot with only ``config.json``, no snapshot at
+    all, or another checkpoint with another index. Ranks that share the base index must export the base layout; in
+    every other case both ranks must export the size-based plan.
+
+    Args:
+        root: Empty directory for the caches, the process-group rendezvous file and the checkpoints.
+        reference_shards: Module names per shard of the base checkpoint.
+        other_reference_shards: Module names per shard of the checkpoint with another index.
+        size_based_shards: Module names per shard of the size-based plan, in model order.
+        single_rank_consolidation: Whether rank 0 alone writes the consolidated export.
+        shard_bytes: Shard-size target in bytes, or ``None`` for the unmodified 5 GiB default.
+    """
+    weight_names = [name for shard in size_based_shards for name in shard]
+    values = {f"{name}.weight": torch.full((4, 4), float(index)) for index, name in enumerate(weight_names)}
+    snapshot_shards = {"index": reference_shards, "other_index": other_reference_shards, "config_only": []}
+    # What the caches of rank 0 and of rank 1 hold in each case.
+    cases = {
+        "cached_on_rank_0": ("index", "config_only"),
+        "cached_on_rank_1": ("config_only", "index"),
+        "cached_on_both_ranks": ("index", "index"),
+        "no_snapshot_on_rank_1": ("index", "no_snapshot"),
+        "other_index_on_rank_1": ("index", "other_index"),
+    }
+    expected_mappings = {}
+    for case, cache_states in cases.items():
+        for rank, cache_state in enumerate(cache_states):
+            if cache_state == "no_snapshot":
+                continue
+            snapshot = root / case / f"cache_rank{rank}" / "models--test--rank-local-cache" / "snapshots" / "main"
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text("{}")
+            shards = snapshot_shards[cache_state]
+            weight_map = {}
+            for index, shard in enumerate(shards, start=1):
+                filename = f"model-{index:05d}-of-{len(shards):05d}.safetensors"
+                tensors = {f"{name}.weight": values.get(f"{name}.weight", torch.zeros(4, 4)) for name in shard}
+                save_file(tensors, str(snapshot / filename))
+                weight_map.update(dict.fromkeys(tensors, filename))
+            if shards:
+                (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+        shards = reference_shards if cache_states == ("index", "index") else size_based_shards
+        expected_mappings[case] = {
+            f"{name}.weight": index for index, shard in enumerate(shards, start=1) for name in shard
+        }
+
+    torch.multiprocessing.spawn(
+        _run_rank_local_reference_cache_worker,
+        args=(
+            str(root / "dist_init"),
+            str(root),
+            weight_names,
+            expected_mappings,
+            single_rank_consolidation,
+            shard_bytes,
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+    for case, expected_mapping in expected_mappings.items():
+        output = root / case / "checkpoint" / "model" / "consolidated"
+        weight_map = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+        shard_count = max(expected_mapping.values())
+        assert weight_map == {
+            key: f"model-{index:05d}-of-{shard_count:05d}.safetensors" for key, index in expected_mapping.items()
+        }, case
+        for filename in set(weight_map.values()):
+            tensors = load_file(str(output / filename))
+            assert set(tensors) == {key for key, mapped_file in weight_map.items() if mapped_file == filename}, case
+            for key, tensor in tensors.items():
+                torch.testing.assert_close(tensor, values[key], rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+def test_save_with_base_checkpoint_cached_on_one_rank_and_single_rank_consolidation(tmp_path):
+    """One FP32 [4, 4] weight and the default shard target: every save completes and the weight reads back."""
+    _save_from_ranks_with_different_reference_caches(
+        tmp_path,
+        reference_shards=[["shared"]],
+        other_reference_shards=[["shared", "unused"]],
+        size_based_shards=[["shared"]],
+        single_rank_consolidation=True,
+        shard_bytes=None,
+    )
+
+
+@pytest.mark.cpu_only
+def test_save_with_base_checkpoint_cached_on_one_rank_and_every_rank_consolidation(tmp_path):
+    """Both ranks write output shards from their own plan, so they must derive the same one."""
+    # Two FP32 [4, 4] weights fill a 128-byte shard; both checkpoints group the weights differently.
+    _save_from_ranks_with_different_reference_caches(
+        tmp_path,
+        reference_shards=[["first", "third"], ["second", "fourth"]],
+        other_reference_shards=[["first", "fourth"], ["second", "third"]],
+        size_based_shards=[["first", "second"], ["third", "fourth"]],
+        single_rank_consolidation=False,
+        shard_bytes=128,
+    )
 
 
 def test_fully_pruned_original_index_does_not_readd_excluded_tied_lm_head(tmp_path):
