@@ -17,6 +17,7 @@
 import logging
 import os
 import types
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1520,6 +1521,13 @@ class TestLayerTypesFix:
 @pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigLayerTypesRetry:
     """get_hf_config should retry via the layer_types fix helper when AutoConfig raises."""
+
+    @pytest.fixture(autouse=True)
+    def skip_registered_config(self) -> Iterator[None]:
+        # These tests exercise the fallback for unregistered configs. Step-3.5
+        # now has a local config and otherwise bypasses this retry path entirely.
+        with patch("nemo_automodel._transformers.model_init._load_registered_custom_config", return_value=None):
+            yield
 
     @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
     @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=True)

@@ -496,6 +496,8 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
         "nemo_automodel.components.models.qwen3_8_flash_next.config",
         "Qwen3_8_FlashNextLegacyTextConfig",
     ),
+    # Step-3.5 and Step-3.7 share this text backbone config, including MTP metadata.
+    "step3p5": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7TextConfig"),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
