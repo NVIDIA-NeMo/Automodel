@@ -3076,6 +3076,38 @@ def test_drop_overlong_samples_uses_image_patches(collate_mod):
     assert indices == [0]
 
 
+def test_estimate_media_tokens_real_mimo_and_muse_spark(collate_mod):
+    """Real MimoV2ImageProcessor divides unmerged patches by merge_size**2;
+    MuseSparkImageProcessor returns final visual tokens directly without re-division.
+    """
+    from nemo_automodel.components.models.mimo_v2_flash.processing import MimoV2ImageProcessor
+    from nemo_automodel.components.models.muse_spark.image_processing import MuseSparkImageProcessor
+
+    class WrapperProc:
+        def __init__(self, ip):
+            self.image_processor = ip
+
+    mimo_proc = WrapperProc(MimoV2ImageProcessor())
+    muse_proc = WrapperProc(MuseSparkImageProcessor())
+
+    # MiMo: 16x192 and 192x16 produce 48 patches -> 12 visual tokens (extra=11)
+    conv_16_192 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (192, 16))}]}]
+    conv_192_16 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (16, 192))}]}]
+    assert collate_mod._estimate_media_tokens(conv_16_192, mimo_proc) == 11
+    assert collate_mod._estimate_media_tokens(conv_192_16, mimo_proc) == 11
+
+    # MiMo controls: 96x64 produces 48 patches -> 12 visual tokens (extra=11)
+    conv_96_64 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (64, 96))}]}]
+    assert collate_mod._estimate_media_tokens(conv_96_64, mimo_proc) == 11
+
+    # MiMo controls: 112x112 produces 64 patches -> 16 visual tokens (extra=15)
+    conv_112_112 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (112, 112))}]}]
+    assert collate_mod._estimate_media_tokens(conv_112_112, mimo_proc) == 15
+
+    # Muse Spark: 112x112 produces 16 visual tokens -> extra=15 (must NOT divide by 4)
+    assert collate_mod._estimate_media_tokens(conv_112_112, muse_proc) == 15
+
+
 # ---------------------------------------------------------------------------
 # _count_media_per_sample tests
 # ---------------------------------------------------------------------------

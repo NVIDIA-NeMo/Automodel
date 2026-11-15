@@ -1263,7 +1263,16 @@ def _estimate_media_tokens(conversation, processor):
             if get_patches is not None:
                 try:
                     n_patches = get_patches(height, width)
-                    image_seq_len = n_patches // merge_length
+                    # Only divide when merge_size is explicitly declared on the processor
+                    # (e.g. MiMo, Qwen2VL) where get_number_of_image_patches returns unmerged patches.
+                    # Processors like Muse Spark return post-downsampling visual tokens directly.
+                    explicit_merge = getattr(ip, "merge_size", None)
+                    if explicit_merge is None and ip is None:
+                        explicit_merge = getattr(processor, "merge_size", None)
+                    if explicit_merge is not None:
+                        image_seq_len = n_patches // (explicit_merge**2)
+                    else:
+                        image_seq_len = n_patches
                 except Exception:
                     pass
 
