@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig, CudaGraphConfig
+from nemo_automodel.components.models.common.utils import HAVE_TE
 from nemo_automodel.components.moe.config import MoEConfig
 
 
@@ -399,26 +400,25 @@ class TestBackendConfigCompileAttn:
             BackendConfig(compile_mla=True)
 
 
-class TestBackendConfigRopeFusionDisabled:
-    """TE fused RoPE is temporarily force-disabled globally in __post_init__ (see #3027)."""
+class TestBackendConfigRopeFusion:
+    """TE fusion honors its default and explicit choices, with non-TE precedence."""
 
-    def test_rope_fusion_default_forced_false(self):
-        """The default resolves to False regardless of TE/CUDA availability."""
-        assert BackendConfig().rope_fusion is False
+    def test_rope_fusion_default(self) -> None:
+        """The default enables fusion when both TE and CUDA are available."""
+        assert BackendConfig().rope_fusion is bool(HAVE_TE and torch.cuda.is_available())
 
-    def test_rope_fusion_explicit_true_is_overridden(self, caplog):
-        """An explicit rope_fusion=True is forced back to False and warns once."""
+    @pytest.mark.parametrize("fusion", [False, True])
+    def test_rope_fusion_explicit_choice(self, fusion: bool, caplog: pytest.LogCaptureFixture) -> None:
+        """Explicit requests survive configuration normalization without an override."""
         with caplog.at_level(logging.WARNING):
-            config = BackendConfig(rope_fusion=True)
-        assert config.rope_fusion is False
-        assert "rope_fusion is temporarily force-disabled globally" in caplog.text
-
-    def test_rope_fusion_explicit_false_no_warning(self, caplog):
-        """An explicit rope_fusion=False stays False and logs no override warning."""
-        with caplog.at_level(logging.WARNING):
-            config = BackendConfig(rope_fusion=False)
-        assert config.rope_fusion is False
+            config = BackendConfig(rope_fusion=fusion)
+        assert config.rope_fusion is fusion
         assert "force-disabled" not in caplog.text
+
+    @pytest.mark.parametrize("rope", ["quack", "triton"])
+    def test_non_te_backend_takes_precedence(self, rope: Literal["quack", "triton"]) -> None:
+        """A selected non-TE backend disables the incompatible TE fusion path."""
+        assert BackendConfig(rope=rope, rope_fusion=True).rope_fusion is False
 
 
 class TestBackendConfigPartialCudaGraphs:
@@ -486,9 +486,9 @@ class TestBackendConfigPartialCudaGraphs:
                 cuda_graph=CudaGraphConfig(modules=["attn"]),
             )
 
-    def test_whole_attention_uses_resolved_rope_fusion_value(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            config = BackendConfig(
+    def test_whole_attention_rejects_enabled_rope_fusion(self) -> None:
+        with pytest.raises(ValueError, match="requires rope_fusion=False"):
+            BackendConfig(
                 attn="te",
                 linear="torch",
                 rms_norm="torch",
@@ -496,6 +496,13 @@ class TestBackendConfigPartialCudaGraphs:
                 cuda_graph=CudaGraphConfig(modules=["attn"]),
             )
 
+        config = BackendConfig(
+            attn="te",
+            linear="torch",
+            rms_norm="torch",
+            rope_fusion=False,
+            cuda_graph=CudaGraphConfig(modules=["attn"]),
+        )
         assert config.rope_fusion is False
         assert config.cuda_graph.modules == ["attn"]
 
