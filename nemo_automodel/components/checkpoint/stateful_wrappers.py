@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 from functools import partial
 from typing import Any
@@ -136,6 +137,39 @@ def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
                 state["exp_avg_sq"] = _zeros_like_optimizer_param(param)
             if group.get("amsgrad", False) and "max_exp_avg_sq" not in state:
                 state["max_exp_avg_sq"] = _zeros_like_optimizer_param(param)
+
+
+def _stores_low_precision_adam_state(optimizer: torch.optim.Optimizer) -> bool:
+    """Whether optimizer is a TE FusedAdam that keeps its moments in a dtype below FP32."""
+    if type(optimizer).__name__ != "FusedAdam":
+        return False
+    dtypes = getattr(optimizer, "name_to_dtype_map", None)
+    if not isinstance(dtypes, dict):
+        return False
+    return any(dtypes.get(name, torch.float32) != torch.float32 for name in ("exp_avg", "exp_avg_sq"))
+
+
+@contextlib.contextmanager
+def _optimizer_state_as_stored(optimizers):
+    """Serialize TE FusedAdam state in the dtypes it is stored in.
+
+    FusedAdam.state_dict() widens every BF16 moment to a new FP32 tensor on the GPU (+8 bytes per
+    parameter), which exhausts GPU memory when a large model with BF16 moments is saved. While this
+    context is active the optimizer's state_dict is PyTorch's base implementation, which returns
+    the stored tensors (BF16 moments, INT16 master-weight remainders) without copies. Loading needs
+    no counterpart: FusedAdam.load_state_dict accepts the stored dtypes and converts per tensor.
+    The save and the load skeleton must both use this context so their dtypes agree.
+    """
+    patched = []
+    try:
+        for optimizer in optimizers:
+            if _stores_low_precision_adam_state(optimizer) and "state_dict" not in vars(optimizer):
+                optimizer.state_dict = partial(torch.optim.Optimizer.state_dict, optimizer)
+                patched.append(optimizer)
+        yield
+    finally:
+        for optimizer in patched:
+            del optimizer.state_dict
 
 
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
@@ -648,6 +682,10 @@ class OptimizerState:
         # update: the materialized step and moment tensors are all zero.
         for optimizer in self.optimizer:
             _materialize_missing_adam_state(optimizer)
+        with _optimizer_state_as_stored(self.optimizer):
+            return self._state_dict_impl()
+
+    def _state_dict_impl(self) -> dict[str, Any]:
         if self._use_native_optimizer_state:
             if self.optimizer_part_ids is None:
                 if len(self.optimizer) != 1:
@@ -687,6 +725,10 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
+        with _optimizer_state_as_stored(self.optimizer):
+            self._load_state_dict_impl(state_dict)
+
+    def _load_state_dict_impl(self, state_dict: dict[str, Any]) -> None:
         # Mirror state_dict(): PEFT with quantized parameters or EP topology uses native optimizer state.
         if self._use_native_optimizer_state:
             optimizer_state_dict = state_dict["optim"]
