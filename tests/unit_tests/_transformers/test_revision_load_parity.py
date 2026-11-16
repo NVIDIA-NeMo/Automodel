@@ -221,6 +221,30 @@ def test_fallback_config_snapshot_reaches_checkpoint_loader(
     assert Path(_get_hf_safetensors_reference_path(str(root), source)) == cache / "snapshots" / B
 
 
+def test_partially_downloaded_snapshot_reaches_checkpoint_loader(hf_config_hub, checkpoint_source_capture):
+    """A snapshot holding the loaded files, but not every file of the repo, still pins the weights.
+
+    transformers fetches only the files it loads through ``snapshot_download(allow_patterns=...)``,
+    which caches the listing of the whole repo; README.md here is listed but never downloaded.
+    """
+    from huggingface_hub._tree_cache import TreeCacheEntry, write_tree_cache
+
+    from nemo_automodel._transformers import auto_model
+
+    root, cache, _, _ = hf_config_hub
+    snapshot = cache / "snapshots" / B
+    (snapshot / "model.safetensors.index.json").write_text("{}")
+    listing = ("config.json", "model.safetensors.index.json", "README.md")
+    write_tree_cache(str(cache), B, {name: TreeCacheEntry(size=1, blob_id=name) for name in listing})
+
+    auto_model.NeMoAutoModelForCausalLM.from_pretrained(
+        REPO, cache_dir=str(root), use_liger_kernel=False, use_sdpa_patching=False, attn_implementation="eager"
+    )
+
+    source = checkpoint_source_capture["pretrained_model_name_or_path"]
+    assert Path(_get_hf_safetensors_reference_path(str(root), source)) == snapshot
+
+
 def test_v41_target_config_and_weights_share_revision(hf_config_hub, checkpoint_source_capture, monkeypatch):
     """Moving the Hub branch after V4.1 config loading must not change the weight source."""
     import httpx

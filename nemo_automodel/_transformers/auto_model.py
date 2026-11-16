@@ -39,6 +39,7 @@ from nemo_automodel.shared.torch_patches import apply_torch_patches
 apply_torch_patches()
 from huggingface_hub import ResolvedRevision, snapshot_download
 from huggingface_hub import constants as hf_constants  # noqa: E402
+from huggingface_hub.errors import IncompleteSnapshotError
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -631,12 +632,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         ):
             # Give the checkpointer the selected snapshot, not a repo id whose
             # cache may also contain an unrelated (or newer) weight index.
-            pretrained_path = snapshot_download(
-                pretrained_path,
-                revision=revision,
-                cache_dir=cache_dir,
-                local_files_only=True,
-            )
+            try:
+                pretrained_path = snapshot_download(
+                    pretrained_path,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    local_files_only=True,
+                )
+            except IncompleteSnapshotError as error:
+                # transformers downloads only the files it loads, with a filtered snapshot_download
+                # that caches the whole repo listing; the selected snapshot then lacks files such as
+                # README.md that loading never needs.
+                pretrained_path = error.snapshot_path
             pretrained_path = os.path.join(pretrained_path, kwargs.get("subfolder", ""))
 
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
