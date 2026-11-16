@@ -1,6 +1,6 @@
 ---
 title: "Train a DFlash Drafter for Speculative Decoding"
-description: "Train a DFlash block-parallel speculative-decoding drafter with NeMo AutoModel, from data through multi-GPU training, including the DFlash 2, Domino, and JetSpec variants."
+description: "Train a DFlash block-parallel speculative-decoding drafter with NeMo AutoModel, from data through multi-GPU training, including the DFlash 2, DSpine, Domino, and JetSpec variants."
 ---
 
 **A guide for training a DFlash speculative-decoding drafter to accelerate LLM
@@ -8,7 +8,7 @@ inference with [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel).**
 
 ---
 
-## What is DFlash?
+## What Is DFlash?
 
 DFlash is a *block-parallel* drafter. Where an autoregressive drafter proposes
 one token at a time, DFlash proposes an entire block of `block_size` tokens in a
@@ -24,14 +24,15 @@ checkpointing.
 
 ## Variants
 
-All four share the DFlash backbone, anchor sampling, and block attention mask;
-only the head and the objective differ.
+All five share the DFlash backbone, anchor sampling, and block attention mask.
+Only the head and the objective differ:
 
-| Variant | What it adds | Recipe | Example config |
+| Variant | What It Adds | Recipe | Example Config |
 |---------|--------------|--------|----------------|
 | DFlash | the block-parallel baseline | `TrainDFlashRecipe` | `qwen3_dflash.yaml` |
 | DFlash 2 | a two-tap in-block convolution around every sublayer, plus a pairwise path selector that walks one coherent path through each position's top-k candidates | `TrainDFlash2Recipe` | `qwen3_dflash2.yaml` |
-| Domino | a serial GRU correction head that refines each block position on the previous ones | `TrainDominoRecipe` | `qwen3_domino.yaml` |
+| DSpine | causal in-block attention plus an adjacent causal injection after every draft layer: each position receives a gated message built from its predecessor's code, and decoding rescores each position's top-k candidates with the exact previously chosen token | `TrainDSpineRecipe` | `qwen3_dspine.yaml`, `qwen3_8_27b_dspine.yaml` |
+| Domino | a serial gated recurrent unit (GRU) correction head that refines each block position on the previous ones | `TrainDominoRecipe` | `qwen3_domino.yaml` |
 | JetSpec | causal in-block attention plus forward-KL distillation against the target distribution | `TrainJetSpecRecipe` | `jetspec/` |
 
 DFlash 2 keeps drafting in one pass. The convolution and the selector add
@@ -39,17 +40,29 @@ parameters inside the stack rather than an autoregressive correction, so it has
 its own draft class whose checkpoint layout matches the published DFlash 2
 drafters.
 
+DSpine ([Tencent/DSpine](https://github.com/Tencent/DSpine), "Draft in
+Parallel, Condition Through Depth: Adjacent Causal Injection for Speculative
+Decoding") also drafts in one pass. Because in-block attention is causal, a
+message injected at layer `l` reaches the next position at layer `l + 1`, so the
+left-to-right dependency unfolds over the draft's depth. Its checkpoint layout
+(`architectures: ["DSpineDraftModel"]`, `selected_prefix_*` config keys, and
+`selected_prefix_bridge.*` tensors) matches the released
+`tencent/Qwen3-8B-DSpine-b16` and `tencent/Qwen3.8-27B-DSpine-b16` drafters, so a
+trained draft loads directly into
+SGLang with `--speculative-algorithm DSPINE`. DSpine has no in-repo
+`spec_generate`.
+
 ## Objective
 
 Only block positions `1..block_size-1` are supervised (position 0 is the clean
-anchor). Their cross-entropy is weighted by a position decay
+anchor). Their cross-entropy (CE) is weighted by a position decay
 `w_k = exp(-(k-1)/loss_decay_gamma)`, so early positions (the ones a verifier
 reaches first) dominate the loss.
 
 Paper `loss_decay_gamma` values track the block size: 7 for `block_size` 16, 5
 for 10, and 4 for 8.
 
-Set `loss_type: variable_prefix` to train the D2SD VP-Drafter objective
+Set `loss_type: variable_prefix` to train the Dual Diffusion Speculative Decoding (D2SD) VP-Drafter objective
 ([arXiv:2606.04446](https://arxiv.org/abs/2606.04446)) instead: each block draws
 a visible-prefix length from a truncated geometric prior
 (`prefix_weight_base`, default 0.9), only the masked suffix is supervised, and
@@ -62,12 +75,39 @@ scored against the ground-truth predecessor. Positions whose true token missed
 the candidate list carry no selector signal and are reported as
 `candidate_recall`.
 
+DSpine replaces the plain CE with the objective of the DSpine authors (the
+corrected SpecForge objective). Each block is supervised only up to its first
+unsupervised token, with the same position decay, and the loss sums three
+parts:
+
+- A backbone term that mixes the CE with the full-vocabulary L1 distance to the
+  target's next-token distribution, weighted by `distribution_ce_weight` (default
+  0.1, the rest going to the L1).
+- A refinement term, with the same CE and L1 mix, over each position's
+  `refine_top_k` candidates rescored with the true previous token. The CE counts
+  only where the label is a candidate; the L1 only where the target puts more
+  than `candidate_mass_threshold` of its mass on the candidates.
+- An alignment term that pulls every layer's code toward the fixed codebook code
+  of the token that position predicts. It is scaled by the detached backbone CE
+  and an `alignment_weight` that warms up over `alignment_warmup_steps` (the LR
+  warmup when unset).
+
+The sum is divided by the number of sequences (documents, under sequence packing). A curriculum teacher-forces the
+predecessor codes of the first `teacher_forcing_layers` layers on a random subset
+of blocks, with a probability that is held and then decays to zero over
+training. The recipe reports the refined path as `accuracy` and `accept_len`
+(what decoding emits) and the backbone's own picks as `base_accuracy` and
+`base_accept_len`. One difference from SpecForge: the detached CE that scales the
+alignment term is each micro-batch's own, not one all-reduced over ranks and the
+accumulation window.
+
 ## Data
 
 Use a chat dataset of OpenAI-format `messages` rows. As with the other
 speculative recipes, use Open-PerfectBlend prompts with the **responses
-regenerated by the target model** (training is teacher-forced; regenerate before
-training to avoid a training and inference distribution mismatch). Point
+regenerated by the target model**. Training is teacher-forced, so regenerate
+the responses before training to avoid a mismatch between the training and
+inference distributions. Point
 `recipe_args.train_data_path` at the regenerated JSONL or a Hugging Face dataset
 id.
 
@@ -92,25 +132,28 @@ torchrun --standalone --nproc_per_node=2 \
 Swap the module and config to train a variant. For example,
 `-m nemo_automodel.recipes.speculative_decoding.train_dflash2 -c examples/speculative/dflash/qwen3_dflash2.yaml`.
 
-Multi-GPU wraps the draft in DDP and replicates the frozen target. Set
+Multi-GPU wraps the draft in Distributed Data Parallel (DDP) and replicates
+the frozen target. Set
 `distributed.tp_size` to shard a large target across ranks
-(`qwen3_dflash_tp.yaml`); `distributed.cp_size` enables context parallelism,
-which cannot be combined with sequence packing or with `tp_size > 1`.
+(`qwen3_dflash_tp.yaml`). `distributed.cp_size` enables context parallelism
+that cannot be combined with sequence packing or with `tp_size > 1`.
 
 The published drafters diverge from their target in two ways the recipe
 reproduces: a sliding window over the context (`draft_sliding_window`, which also
 keeps the flex `BlockMask` sparse on long sequences) and a different attention
-shape (`draft_num_attention_heads` and the related head-size fields). See `qwen3_8_27b_dflash2.yaml`.
+shape (`draft_num_attention_heads` and the related attention settings). Refer to
+`qwen3_8_27b_dflash2.yaml`.
 
 Training logs `train/loss`, `train/accuracy`, and `train/accept_len`. Setting
 `recipe_args.val_data_path` adds globally reduced `val_loss`, `val_accuracy`,
-and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
+and `val_accept_len`. Adding a top-level `wandb:` block uploads all of them.
 
 ## Key Config Fields
 
+The following table describes the key config fields:
 | Field | Meaning |
 |-------|---------|
-| `target_model_name_or_path` | frozen target (e.g., `Qwen/Qwen3-8B`) |
+| `target_model_name_or_path` | frozen target (for example, `Qwen/Qwen3-8B`) |
 | `draft_num_hidden_layers` | draft stack depth (paper: 5) |
 | `block_size` | tokens drafted in parallel per block (paper: 16) |
 | `num_anchors` | blocks sampled per sequence per step |
@@ -126,6 +169,10 @@ and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
 | `input_embedding_scale` | scales the embedded draft block; identity unless set |
 | `conv_kernel_size` / `conv_group_size` | DFlash 2 convolution taps and channels per dynamic correction |
 | `selector_rank` / `selector_top_k` / `selector_loss_weight` | DFlash 2 path-selector width, candidates scored per position, and objective weight |
+| `code_size` / `message_size` / `refine_top_k` | DSpine codebook width, injected-message width, and candidates rescored per position (a power of two up to 64) |
+| `distribution_ce_weight` / `candidate_mass_threshold` | DSpine CE weight against the L1-to-target term, and the refinement L1's minimum target mass on the candidates |
+| `alignment_weight` / `alignment_warmup_steps` | DSpine alignment weight and its warmup (the LR warmup when unset) |
+| `teacher_forcing_layers` / `teacher_forcing_probability` / `teacher_forcing_hold_fraction` / `teacher_forcing_zero_fraction` | DSpine curriculum: teacher-forced early layers, starting per-block probability, and the training fractions where it starts decaying and reaches zero |
 
 `spec_generate` accepts `temperature`, `top_p`, and `top_k`. The truncation
 applies to the *target's* distribution (the one rejection sampling verifies
@@ -135,4 +182,5 @@ lengths at temperature 1.0, top-p 0.95, top-k 20.
 
 Supported targets: Qwen3 and Qwen3.5, dense and Mixture-of-Experts (MoE), including the multimodal
 `*ForConditionalGeneration` variants such as `Qwen/Qwen3.8-27B`. DFlash and
-JetSpec drafts serve on vLLM through its `dflash` method.
+JetSpec drafts serve on vLLM through its `dflash` method. DSpine drafts serve on
+SGLang's `DSPINE` speculative algorithm.

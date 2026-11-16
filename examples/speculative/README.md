@@ -23,7 +23,8 @@ inference engine (SGLang or vLLM). The training code lives in
 | **P-EAGLE** | Parallel-drafting EAGLE-3: predicts all `num_depths` tokens in one forward over a COD-subsampled sequence instead of the TTT unroll. Serves on vLLM only. | `TrainEagle3Recipe` (`parallel_drafting: true`) | `p-eagle/` |
 | **DFlash** | Block-parallel drafting: drafts a whole block of `block_size` tokens in one non-causal "denoising" forward over `[anchor, MASK, MASK, ...]`. | `TrainDFlashRecipe` (LLM) / `DiffusionLMSFTRecipe` (DLLM SFT) | `dflash/`, `../dllm_sft/*dflash*` |
 | **DFlash 2** | DFlash backbone plus a two-tap dynamic convolution around every draft sublayer (removes suffix decay) and a pairwise path selector that walks one coherent path through each position's top-k candidates. | `TrainDFlash2Recipe` | `dflash/qwen3_dflash2.yaml`, `dflash/qwen3_8_27b_dflash2.yaml` |
-| **Domino** | DFlash backbone plus a serial GRU correction head (`prefix_gru` / `embed_proj`) that refines each block position on the previous ones. | `TrainDominoRecipe` | `dflash/qwen3_domino.yaml` |
+| **DSpine** | DFlash backbone with causal in-block attention plus an adjacent causal injection after every draft layer (each position receives a gated message from its predecessor's code), and an exact-sender refinement that rescores each position's top-k candidates with the previously chosen token. | `TrainDSpineRecipe` | `dflash/qwen3_dspine.yaml`, `dflash/qwen3_8_27b_dspine.yaml` |
+| **Domino** | DFlash backbone plus a serial gated recurrent unit (GRU) correction head (`prefix_gru` / `embed_proj`) that refines each block position on the previous ones. | `TrainDominoRecipe` | `dflash/qwen3_domino.yaml` |
 | **JetSpec** | DFlash backbone trained as a *causal* parallel tree drafter: causal in-block attention plus forward-KL distillation against the target distribution. | `TrainJetSpecRecipe` | `jetspec/` |
 | **DSpark** | Semi-autoregressive parallel drafting: a parallel backbone drafts the block, a lightweight serial Markov head adds intra-block dependency, and a confidence head predicts per-position acceptance. | `TrainDSparkRecipe` | `dspark/` |
 
@@ -35,7 +36,8 @@ draft class and checkpoint format. Only their training wrappers (and, for
 Domino, the extra head weights) differ. DFlash 2 keeps the same block-drafting
 contract but adds parameters inside the stack, so it has its own draft class
 (`Qwen3DFlash2DraftModel`) whose checkpoint layout matches the published DFlash 2
-drafters.
+drafters. DSpine likewise has its own draft class (`Qwen3DSpineDraftModel`), saved
+in the released `tencent/Qwen3-8B-DSpine-b16` layout.
 
 **Not yet runnable: MSD (multimodal speculative decoding).** `eagle/msd.py`,
 `msd_target.py`, `msd_curriculum.py`, and `msd_decode.py` implement the MSD
@@ -52,9 +54,9 @@ is nothing to launch. The recipe and data pipeline are a follow-up change.
 A target's `config.architectures` string selects the draft architecture through a
 registry (`eagle/registry.py`, `dflash/registry.py`, `dspark/registry.py`).
 Capability is per registry, not per (method, target) pair: the EAGLE-3.1
-(`fc_norm` and `norm_output`) and P-EAGLE (`parallel_drafting`) toggles ride on the
+(`fc_norm` and `norm_output`) and P-EAGLE (`parallel_drafting`) toggles use the
 same EAGLE-3 dense draft, so they apply to any target the EAGLE-3 registry maps.
-The shipped example configs only cover a subset.
+The shipped example configs only cover a subset. The following list shows the supported targets for each method:
 
 - **EAGLE-1, EAGLE-2, and EAGLE-3 (and the EAGLE-3.1 and P-EAGLE toggles on top of EAGLE-3)**:
   `LlamaForCausalLM`, `Phi3ForCausalLM`, `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
@@ -72,7 +74,7 @@ The shipped example configs only cover a subset.
   using a dedicated no-positional-embedding (NoPE) MLA draft class (eager attention, no context or
   tensor parallelism and no sequence packing, see
   `eagle3/README-kimi-k3.md`).
-- **DFlash, DFlash 2, Domino, and JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
+- **DFlash, DFlash 2, DSpine, Domino, and JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`,
   `Qwen3_5MoeForConditionalGeneration` (the Qwen3.5 family, which `Qwen/Qwen3.8-27B`
   belongs to; its decoder config is read from the nested `text_config`). All
@@ -95,7 +97,7 @@ Qwen3-MoE is handled exactly like a dense target: the draft only consumes
 post-block hidden states, never per-expert routing. gpt-oss uses a dedicated
 draft class that reuses the target's YaRN rotary embedding but keeps the on-disk
 `architectures` string as the Llama EAGLE-3 draft so inference engines load it
-unchanged. The large mixture-of-experts (MoE) DSpark targets (DeepSeek-V4, GLM-5.2, MiniMax M3) load
+unchanged. The large Mixture-of-Experts (MoE) DSpark targets (DeepSeek-V4, GLM-5.2, MiniMax M3) load
 frozen through the same expert-parallel and FSDP paths their fine-tuning recipes use.
 Per-target notes are in `dspark/README-*.md`.
 
@@ -122,7 +124,7 @@ SFT entry script:
 torchrun --nproc-per-node 8 examples/dllm_sft/finetune.py -c examples/dllm_sft/qwen3_4b_dflash.yaml
 ```
 
-Each config family ships an `*_mvp.yaml` (tiny single-GPU smoke with placeholder
+Each config family ships an `*_mvp.yaml` (tiny single-GPU basic verification run with placeholder
 data paths) and a `*_perfectblend.yaml` (real run on
 `frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`).
 
@@ -138,7 +140,7 @@ Select them in the config. All degrade gracefully when a dependency is missing.
 | EAGLE-3 / 3.1 | `eager`, `flash_attention_2` | `recipe_args.draft_attn_implementation` (default `eager`) |
 | EAGLE-1/2 | `eager` only | n/a |
 | P-EAGLE | `flex_attention` (compiled when CUDA + head_dim ≥ 16, else eager flex) | automatic |
-| DFlash / DFlash 2 / Domino / JetSpec | `flex_attention`, `sdpa` | `recipe_args.attention_backend` (default `flex_attention`) |
+| DFlash / DFlash 2 / DSpine / Domino / JetSpec | `flex_attention`, `sdpa` | `recipe_args.attention_backend` (default `flex_attention`) |
 | DSpark | `flex_attention` (Qwen3 / Gemma4 / MiniMax M3 drafts), `sdpa` (V4 / GLM MLA drafts, fixed) | `recipe_args.attention_backend` |
 
 For EAGLE-3, FlashAttention-2 is real FA2 over the TTT attention pattern: FA2
@@ -173,8 +175,8 @@ unset when the draft vocab is uncompressed.
 All spec-decode recipes (EAGLE-1/2, EAGLE-3, P-EAGLE, DFlash, Domino,
 JetSpec, and DSpark) accept the same top-level `fp8:` block as the SFT recipes (see
 `components/quantization/fp8.py`). When enabled, the draft's `nn.Linear` layers
-are swapped to torchao `Float8Linear` before the DDP or FSDP2 wrap, so the
-draft's forward and backward GEMMs run in FP8. Requires SM89+ (H100 or newer);
+are swapped to torchao `Float8Linear` before the Distributed Data Parallel (DDP) or FSDP2 wrap, so the
+draft's forward and backward GEMMs run in FP8. FP8 training requires SM89+ (H100 or newer).
 `emulate: true` runs the FP8 numerics on older GPUs for testing. The frozen
 target model is never converted (it already supports FP8-quantized checkpoints
 through dequant-on-load in the DSpark V4 and GLM paths). Linears with a weight dim not
@@ -354,7 +356,7 @@ Use it when you want a drafter for a specific target but your only conversationa
 data came from a different model, or when you have a curated prompts dataset
 (ShareGPT, UltraChat, an internal corpus) and want its answer distribution
 aligned with the target. If a regenerated set already exists on the Hub (for
-example `frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`), skip this
+example, `frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`), skip this
 and point `recipe_args.train_data_path` straight at it.
 
 ### Two-Step Flow
@@ -409,13 +411,14 @@ recipe_args:
 | `--max-new-tokens` | 1024 | Cap per-answer length. |
 | `--temperature` | 0.0 | Greedy by default; drafters are typically trained against argmax answers. |
 | `--top-p` | 1.0 | Only relevant with `temperature > 0`. |
-| `--timeout-s` | 600 | Per-request timeout; bump for very long generations. |
+| `--timeout-s` | 600 | Per-request timeout; increase for very long generations. |
 | `--max-retries` | 3 | Retries on 5xx, 429, and transport errors with exponential backoff. |
-| `--split` | `train` | Supports HF slice syntax, e.g., `train[:10000]`. |
+| `--split` | `train` | Supports HF slice syntax, for example, `train[:10000]`. |
 | `--shuffle-seed` | unset | Optional shuffle before slicing. |
 
 ### Regeneration Pitfalls
 
+The following issues can cause regeneration to fail or produce misaligned training data:
 - **Wrong model name.** `--model` is the name sent in the OpenAI payload. It must
   match what the server serves. SGLang uses `--model-path` as the served name by
   default, so mirror `--served-model-name` here if you set it.
@@ -436,8 +439,9 @@ training. The draft's attention runs as a differentiable ring
 (`eagle/ring_attention.py`, with a load-balanced zig-zag layout in
 `zigzag_ring_attention.py`). `target_cp.py` prepares the target-side inputs.
 
-The constraints are enforced, not advisory: every combination below raises at
-setup rather than training something subtly wrong.
+The following constraints are enforced during setup. If a listed combination is
+present, setup raises an error instead of allowing a training run with invalid
+results:
 
 | Constraint | Applies To |
 |---|---|
@@ -588,6 +592,7 @@ such caveat.
 | P-EAGLE | no (tracked upstream) | yes (parallel-drafting runtime, >= 0.16) |
 | DFlash, JetSpec | no | yes (`dflash` method, >= 0.20) |
 | DFlash 2 | not yet wired here (`--speculative-algorithm DFLASH` upstream) | not yet wired here (`dflash` method upstream) |
+| DSpine | yes, through the `--speculative-algorithm DSPINE` plugin ([Tencent/DSpine](https://github.com/Tencent/DSpine)); not wired into `serve_sglang.py` | no (runtime in development upstream, unreleased) |
 | Domino | no | no (the GRU correction head has no engine runtime) |
 | DSpark | no | not yet (runtime in development upstream, unreleased) |
 
@@ -618,14 +623,19 @@ blocks) instead.
 
 ### DFlash-Family Validation Metrics
 
-When `recipe_args.val_data_path` is set, DFlash, DFlash 2, Domino, and JetSpec
+When `recipe_args.val_data_path` is set, DFlash, DFlash 2, DSpine, Domino, and JetSpec
 report globally reduced `val_loss`, token-weighted `val_accuracy`, and
 block-weighted `val_accept_len`. Domino also reports final-head and base-head
 loss, base accuracy, and base acceptance length. DFlash 2 reports its two loss
 terms (`val_base_loss`, `val_selector_loss`), the backbone's own top-1 accuracy
 and acceptance length (`val_base_accuracy`, `val_base_accept_len`), and
 `val_candidate_recall` (how often the true token is in the top-k candidate
-list, the ceiling the selector can reach). The reductions sum raw token and block
+list, the ceiling the selector can reach). DSpine reports the refined path as
+`val_accuracy` and `val_accept_len`, its loss terms (`val_backbone_ce`,
+`val_backbone_l1`, `val_refine_ce`, `val_refine_l1`, `val_alignment`), the
+backbone's own top-1 accuracy and acceptance length, and
+`val_candidate_coverage` (how often the true token is among the rescored
+candidates). The reductions sum raw token and block
 statistics across ranks before division, so uneven valid-token counts do not
 bias the result.
 
@@ -661,6 +671,7 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `parallel_drafting`, `num_depths`, `num_draft_layers`, `down_sample_ratio`, `down_sample_ratio_min`, `mask_token_id`, `sequence_partitions` | P-EAGLE | `mask_token_id` is required (no default). `sequence_partitions > 1` splits each sequence by dependency lineage to bound long-context memory. |
 | `block_size`, `num_anchors`, `loss_decay_gamma`, `mask_token_id`, `target_layer_ids`, `attention_backend` | DFlash (LLM recipe) | Block drafting knobs. |
 | `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `selector_loss_weight` | DFlash 2 | Convolution and path-selector knobs on top of the DFlash set. |
+| `code_size`, `message_size`, `refine_top_k`, `distribution_ce_weight`, `candidate_mass_threshold`, `alignment_weight`, `alignment_warmup_steps`, `teacher_forcing_layers`, `teacher_forcing_probability`, `teacher_forcing_hold_fraction`, `teacher_forcing_zero_fraction`, `objective_chunk_blocks` | DSpine | Injection, refinement, objective, and curriculum knobs on top of the DFlash set; defaults reproduce the released drafter. |
 | `draft_sliding_window` | DFlash family | Bounds how far back a block reads the target context; unset attends over the whole prefix. |
 | `draft_num_attention_heads`, `draft_num_key_value_heads`, `draft_head_dim` | DFlash family | Size the draft's attention independently of the target's; default to the target's shape. |
 | `output_multiplier`, `final_logit_softcapping`, `input_embedding_scale` | DFlash family | The target's logit/embedding transforms, applied in both training and decoding. Identity unless set; the published Muse Glimmer drafter ships a multiplier and a softcap. |
@@ -676,7 +687,8 @@ The following tree shows the configs in this folder:
 examples/speculative/
   eagle1/    eagle2/    eagle3/    eagle3_1/    eagle4/    p-eagle/
   dflash/                     # DFlash + DFlash 2 (qwen3_dflash2.yaml,
-                              #   qwen3_8_27b_dflash2.yaml)
+                              #   qwen3_8_27b_dflash2.yaml) + DSpine (qwen3_dspine.yaml,
+                              #   qwen3_8_27b_dspine.yaml)
                               #   + Domino (qwen3_domino.yaml) configs
   jetspec/   dspark/
   bench_sweep/                # --datasets-config example for bench_sweep.py
@@ -694,8 +706,8 @@ nemo_automodel/components/speculative/
                 msd*                        # MSD core (no recipe yet)
                 ring_attention, zigzag_ring_attention   # draft-side CP
                 {sglang,vllm}_target, *_runner          # engine-backed targets
-  dflash/       core, dflash2_core, domino_core, jetspec_core, draft_qwen3,
-                draft_qwen3_dflash2, registry, target
+  dflash/       core, dflash2_core, dspine_core, domino_core, jetspec_core,
+                draft_qwen3, draft_qwen3_dflash2, draft_qwen3_dspine, registry, target
   dspark/       core, draft_qwen3, draft_deepseek_v4, draft_glm_5_2,
                 draft_gemma4, markov_head, registry, target,
                 remote                      # remote target server logic + client

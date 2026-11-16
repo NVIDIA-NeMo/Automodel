@@ -48,6 +48,16 @@ from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import (
     GroupedDynamicCausalConv,
     Qwen3DFlash2DraftModel,
 )
+from nemo_automodel.components.speculative.dflash.draft_qwen3_dspine import (
+    DSpineCodeBridge,
+    DSpineDraftOutput,
+    Qwen3DSpineDraftModel,
+)
+from nemo_automodel.components.speculative.dflash.dspine_core import (
+    DSpineSchedule,
+    DSpineStepMetrics,
+    DSpineTrainerModule,
+)
 from nemo_automodel.components.speculative.dflash.registry import (
     DFLASH_DRAFT_REGISTRY,
     DFlashDraftSpec,
@@ -65,6 +75,9 @@ __all__ = [
     "DominoStepMetrics",
     "DFlash2TrainerModule",
     "DFlash2StepMetrics",
+    "DSpineTrainerModule",
+    "DSpineStepMetrics",
+    "DSpineSchedule",
     "compute_accept_len",
     "get_lambda_base",
     "Qwen3DFlashDraftModel",
@@ -72,6 +85,9 @@ __all__ = [
     "Qwen3DFlash2DraftModel",
     "CandidateSelector",
     "GroupedDynamicCausalConv",
+    "Qwen3DSpineDraftModel",
+    "DSpineCodeBridge",
+    "DSpineDraftOutput",
     "build_target_layer_ids",
     "extract_context_feature",
     "HFDFlashTargetModel",
