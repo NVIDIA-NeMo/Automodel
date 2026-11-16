@@ -114,8 +114,18 @@ def test_relabelled_config_survives_a_save_and_reload(tmp_path):
             "no entry for the \\['full_attention'\\]",
         ),
         ({**PUBLISHED_ROPE, "sliding_attention": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 2.0}}, "yarn"),
+        (
+            {**PUBLISHED_ROPE, "full_attention": {**PUBLISHED_ROPE["full_attention"], "factor": 2.0}},
+            "frequency scaling, got `factor` \\{'full_attention': 2.0\\}",
+        ),
     ],
 )
 def test_unusable_rope_parameters_are_rejected(rope_parameters, message):
     with pytest.raises(ValueError, match=message):
         Lfm3Config(rope_parameters=rope_parameters)
+
+
+def test_unit_rope_factor_is_accepted():
+    rope = {**PUBLISHED_ROPE, "full_attention": {**PUBLISHED_ROPE["full_attention"], "factor": 1.0}}
+
+    assert Lfm3Config(rope_parameters=rope).rope_parameters["full_attention"]["factor"] == 1.0

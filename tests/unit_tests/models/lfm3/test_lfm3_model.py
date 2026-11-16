@@ -26,7 +26,7 @@ from safetensors.torch import load_file, save_file
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.lfm3.config import Lfm3Config, Lfm3VlConfig
-from nemo_automodel.components.models.lfm3.model import Lfm3ForCausalLM, rotary_factors
+from nemo_automodel.components.models.lfm3.model import Lfm3ForCausalLM, Lfm3ShortConv, rotary_factors
 from nemo_automodel.components.models.lfm3.vl_model import Lfm3VlForConditionalGeneration
 
 REFERENCE = Path(__file__).with_name("fixtures") / "reference.npz"
@@ -134,6 +134,19 @@ def test_partial_rotation_leaves_the_tail_of_each_head_unrotated():
     torch.testing.assert_close(cosine[..., :2], expected.cos())
     torch.testing.assert_close(sine[..., 4:6], expected.sin())
     assert torch.all(cosine[..., [2, 3, 6, 7]] == 1) and torch.all(sine[..., [2, 3, 6, 7]] == 0)
+
+
+def test_biased_short_conv_keeps_left_padding_out_of_real_tokens():
+    torch.manual_seed(0)
+    config = Lfm3Config(hidden_size=16, intermediate_size=24, num_hidden_layers=1, conv_bias=True)
+    with torch.device("cpu"):
+        conv = Lfm3ShortConv(config, layer_idx=0).eval()
+    real = torch.randn(2, 6, 16)
+    padded = torch.cat([torch.randn(2, 3, 16), real], dim=1)
+    mask = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1, 1]]).expand(2, -1)
+
+    with torch.no_grad():
+        torch.testing.assert_close(conv(padded, attention_mask=mask)[:, 3:], conv(real))
 
 
 def test_model_wide_bfloat16_cast_keeps_full_precision_rotary_frequencies(reference):

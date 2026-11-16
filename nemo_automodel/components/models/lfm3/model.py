@@ -170,6 +170,9 @@ class Lfm3ShortConv(Lfm2ShortConv):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         input_gate, output_gate, values = self.in_proj(hidden_states).transpose(-1, -2).chunk(3, dim=-2)
         gated = input_gate * values
+        if attention_mask is not None:
+            # A biased `in_proj` makes padded positions nonzero again; keep them out of the convolution and the cache.
+            gated = gated * attention_mask[:, None, :].to(gated.dtype)
         if past_key_values is not None:
             gated = past_key_values.update_conv_state(gated, self.layer_idx, conv_kernel_size=self.conv_kernel_size)
         # `self.conv` pads both ends: the leading outputs are causal, the trailing ones look ahead.

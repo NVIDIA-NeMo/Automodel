@@ -110,6 +110,12 @@ class Lfm3Config(PreTrainedConfig):
             if self.rope_parameters[layer_type]["rope_type"] not in ("default", "proportional")
         }:
             raise ValueError(f"LFM3 supports `default` and `proportional` RoPE only, got {unsupported}.")
+        if scaled := {
+            layer_type: self.rope_parameters[layer_type]["factor"]
+            for layer_type in attention_types
+            if self.rope_parameters[layer_type].get("factor", 1.0) != 1.0
+        }:
+            raise ValueError(f"LFM3 does not support RoPE frequency scaling, got `factor` {scaled}.")
 
 
 @strict
