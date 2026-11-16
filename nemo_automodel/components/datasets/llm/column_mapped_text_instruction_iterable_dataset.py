@@ -17,6 +17,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Union
 
+from datasets import IterableDataset as HFIterableDataset
+from datasets.distributed import split_dataset_by_node
 from torch.utils.data import IterableDataset
 
 if TYPE_CHECKING:
@@ -307,7 +309,12 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
             self.dataset.set_epoch(epoch)
 
     def shard(self, num_shards: int, index: int):
-        if self.dataset is not None and callable(getattr(self.dataset, "shard", None)):
+        if isinstance(self.dataset, HFIterableDataset):
+            # HF ``IterableDataset.shard`` splits by source file, so a stream with fewer files
+            # than ranks gives every example to rank 0 and fails on the others. Split by node
+            # instead, which falls back to per-example assignment in that case.
+            self.dataset = split_dataset_by_node(self.dataset, rank=index, world_size=num_shards)
+        elif self.dataset is not None and callable(getattr(self.dataset, "shard", None)):
             self.dataset = self.dataset.shard(num_shards, index)
         return self
 

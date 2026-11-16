@@ -54,6 +54,7 @@ def _write_jsonl(path: Path, rows):
         for row in rows:
             fp.write(json.dumps(row) + "\n")
 
+
 def test_iterable_dataset_shard_and_shuffle_smoke(monkeypatch, tmp_path: Path):
     class _StubHFIterable:
         def __init__(self, rows):
@@ -93,16 +94,44 @@ def test_iterable_dataset_shard_and_shuffle_smoke(monkeypatch, tmp_path: Path):
         _fake_load_dataset,
     )
 
-    ds = ColumnMappedTextInstructionIterableDataset(
-        path_or_dataset_id="ignored.jsonl",
-        column_mapping={"question": "q", "answer": "a"},
-        tokenizer=_DummyTokenizer(),
-        answer_only_loss_mask=False,
-        repeat_on_exhaustion=True,
-    ).shard(2, 1).shuffle(buffer_size=2, seed=0)
+    ds = (
+        ColumnMappedTextInstructionIterableDataset(
+            path_or_dataset_id="ignored.jsonl",
+            column_mapping={"question": "q", "answer": "a"},
+            tokenizer=_DummyTokenizer(),
+            answer_only_loss_mask=False,
+            repeat_on_exhaustion=True,
+        )
+        .shard(2, 1)
+        .shuffle(buffer_size=2, seed=0)
+    )
 
     first = next(iter(ds))
     assert {"input_ids", "attention_mask", "labels"}.issubset(first.keys())
+
+
+@pytest.mark.parametrize("world_size", [2, 3])
+def test_iterable_dataset_shard_splits_single_file_stream_by_example(tmp_path: Path, world_size: int):
+    # Regression: a streamed JSONL file is one HF shard, and HF ``IterableDataset.shard``
+    # splits by file, so rank 0 used to get every row and every other rank raised IndexError.
+    rows = [{"q": f"Q{i}?", "a": f"A{i}"} for i in range(6)]
+    jsonl_path = tmp_path / "single_file.jsonl"
+    _write_jsonl(jsonl_path, rows)
+
+    seen = []
+    for rank in range(world_size):
+        ds = ColumnMappedTextInstructionIterableDataset(
+            path_or_dataset_id=str(jsonl_path),
+            column_mapping={"question": "q", "answer": "a"},
+            tokenizer=_DummyTokenizer(),
+            answer_only_loss_mask=False,
+            repeat_on_exhaustion=True,
+        ).shard(world_size, rank)
+        # Read one pass of the underlying stream; the wrapper itself repeats forever.
+        seen.append([row["q"] for row in ds.dataset])
+
+    assert all(len(rank_rows) == len(rows) // world_size for rank_rows in seen)
+    assert sorted(q for rank_rows in seen for q in rank_rows) == sorted(row["q"] for row in rows)
 
 
 def test_iterable_dataset_pad_token_fallback_with_eos(tmp_path: Path):
