@@ -39,7 +39,7 @@ def single_thread() -> Iterator[None]:
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_fused_loss_materializes_usable_bf16_head_rows(dtype: str) -> None:
+def test_fused_loss_resolves_usable_bf16_head_rows(dtype: str) -> None:
     """The shared recipe hook hands the kernel the usable rows in BF16; gradients reach the full head."""
     torch.manual_seed(107)
     model = Inkling2ForCausalLM(tiny_config(dtype=dtype))
@@ -71,7 +71,7 @@ def test_output_selection_and_loss_boundary_errors() -> None:
     with pytest.raises(ValueError, match="logit_softcapping must be positive"):
         Inkling2FusedLinearCrossEntropy(37, logit_softcapping=0)
     with pytest.raises(ValueError, match="fewer than unpadded_vocab_size"):
-        Inkling2FusedLinearCrossEntropy(41).materialize_lm_weight(model.lm_head.weight)
+        Inkling2FusedLinearCrossEntropy(41).resolve_lm_weight(model.lm_head.weight)
     backend = BackendConfig(attn="flex", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
     with pytest.raises(ValueError, match="requires CUDA"):
         Inkling2ForCausalLM(tiny_config(), backend=backend)(ids)

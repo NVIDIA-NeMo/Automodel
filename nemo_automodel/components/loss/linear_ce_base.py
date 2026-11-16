@@ -106,20 +106,27 @@ class ShardedLMHeadWeight:
     reduction group has the mesh's size).
 
     Attributes:
-        weight: DTensor of global shape [vocab, hidden], sharded on the
+        weight: DTensor of global shape [padded_vocab, hidden], sharded on the
             vocabulary axis (``Shard(0)``) over exactly one mesh dimension and
             replicated over any others (an FSDP or HSDP layout).
         dtype: Projection dtype. Each shard chunk is cast to it before the
             all-gather; the weight gradient keeps ``weight.dtype``.
+        vocab_size: Usable vocabulary prefix, excluding padded rows from the
+            loss without changing the physical shard boundaries. None uses all rows.
     """
 
     weight: DTensor
     dtype: torch.dtype
+    vocab_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.vocab_size is not None and not 0 < self.vocab_size <= self.weight.shape[0]:
+            raise ValueError("vocab_size must be positive and no larger than the LM-head row count")
 
     @property
     def shape(self) -> torch.Size:
-        """Global ``[vocab, hidden]`` shape of the weight."""
-        return self.weight.shape
+        """Effective global ``[vocab, hidden]`` shape, excluding padding rows."""
+        return torch.Size((self.vocab_size, self.weight.shape[1])) if self.vocab_size is not None else self.weight.shape
 
 
 class _PendingChunk:
@@ -191,11 +198,13 @@ class _VocabShardLayout:
     """Chunking and collectives for an LM head sharded on its vocabulary axis.
 
     Shards follow ``torch.chunk`` semantics, as in FSDP2 and DTensor: rank ``r``
-    holds rows ``[r * rows_per_rank, min((r + 1) * rows_per_rank, vocab))``, so
+    holds rows ``[r * rows_per_rank, min((r + 1) * rows_per_rank, padded_vocab))``, so
     trailing ranks may hold fewer rows, or none. Chunk ``k`` takes local rows
     ``[k * chunk_rows, (k + 1) * chunk_rows)`` from every rank. Its gathered rows
     are ordered by rank, and the rows that exist form a prefix of the gathered
-    buffer because only trailing ranks are short.
+    buffer because only trailing ranks are short. The usable vocabulary may
+    exclude a suffix of the physical head; trimming gathered rows leaves these
+    physical shard boundaries unchanged.
     """
 
     def __init__(self, lm_weight: ShardedLMHeadWeight):
@@ -231,10 +240,11 @@ class _VocabShardLayout:
         self.world_size = mesh.size(shard_dim)
         self.reduce_world_size = mesh.size()
         self.dtype = lm_weight.dtype
-        self.vocab, self.hidden = weight.shape
-        self.rows_per_rank = -(-self.vocab // self.world_size)
+        self.padded_vocab, self.hidden = weight.shape
+        self.vocab = lm_weight.shape[0]
+        self.rows_per_rank = -(-self.padded_vocab // self.world_size)
         rank = mesh.get_local_rank(shard_dim)
-        expected_local_rows = max(0, min(self.rows_per_rank, self.vocab - rank * self.rows_per_rank))
+        expected_local_rows = max(0, min(self.rows_per_rank, self.padded_vocab - rank * self.rows_per_rank))
         with torch.no_grad():
             local_shape = tuple(weight.to_local().shape)
         if local_shape != (expected_local_rows, self.hidden):
@@ -244,7 +254,7 @@ class _VocabShardLayout:
             )
         row_bytes = self.world_size * self.hidden * torch.empty((), dtype=self.dtype).element_size()
         self.chunk_rows = min(self.rows_per_rank, max(1, _STREAM_CHUNK_BYTES // row_bytes))
-        self.num_chunks = -(-self.rows_per_rank // self.chunk_rows)
+        self.num_chunks = -(-min(self.rows_per_rank, self.vocab) // self.chunk_rows)
 
     def chunk_size(self, chunk: int) -> int:
         """Return the number of rows each rank contributes to ``chunk``."""
@@ -412,7 +422,10 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
         need_hidden, need_weight = ctx.needs_input_grad[:2]
         grad_loss = grad_loss.float().contiguous()
         grad_hidden = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device) if need_hidden else None
-        grad_shard = torch.empty_like(shard) if need_weight else None
+        grad_shard = None
+        if need_weight:
+            # Chunks consisting entirely of vocabulary padding are not visited.
+            grad_shard = torch.zeros_like(shard) if layout.vocab < layout.padded_vocab else torch.empty_like(shard)
         pending = None
         for chunk, weight in layout.stream(shard):
             chunk_grad_hidden, chunk_grad_weight = None, None

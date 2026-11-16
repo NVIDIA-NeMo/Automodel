@@ -50,6 +50,7 @@ _SCENARIOS = (
     "unsupported_placement_raises",
     "mtp_depths_share_one_resolution",
     "autocast_recompute",
+    "padded_vocab_adapter",
 )
 
 
@@ -339,6 +340,65 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         torch.testing.assert_close(sharded.grad.full_tensor(), dense_weight.grad, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(local_hidden.grad / _WORLD_SIZE, dense_hidden.grad[rank], rtol=2e-2, atol=2e-2)
 
+    def padded_vocab_adapter() -> None:
+        """Exclude padded rows without changing physical FSDP/HSDP shard boundaries."""
+        from nemo_automodel.components.loss.utils import prepare_lm_weight
+        from nemo_automodel.components.models.inkling2.loss import Inkling2FusedLinearCrossEntropy
+
+        for dtype in (torch.float32, torch.bfloat16):
+            for mesh, placements, vocab in (
+                (flat, [Shard(0)], 37),
+                (flat, [Shard(0)], 7),
+                (flat, [Shard(0)], 1),
+                (hsdp, [Replicate(), Shard(0)], 37),
+            ):
+                weight, hidden, labels = _data(43)
+                weight = (weight * 0.1).to(dtype)
+                hidden = hidden.bfloat16()
+                labels = torch.where(labels == -100, labels, labels % vocab)
+                normalizer = int((labels != -100).sum())
+                dense_weight = weight.clone().requires_grad_()
+                dense_hidden = hidden.clone().requires_grad_()
+                logits = F.linear(dense_hidden, dense_weight[:vocab].bfloat16())
+                logits = (logits / 30).tanh() * 30
+                reference = F.cross_entropy(logits.float().flatten(0, 2), labels.flatten(), reduction="sum")
+                reference = reference / normalizer
+                reference.backward()
+
+                model = torch.nn.Module()
+                model.lm_head = torch.nn.Linear(_HIDDEN, 43, bias=False)
+                model.lm_head.weight = torch.nn.Parameter(distribute_tensor(weight, mesh, placements))
+                local_hidden = hidden[rank].clone().requires_grad_()
+                loss_fn = Inkling2FusedLinearCrossEntropy(vocab)
+                # Exercise streamed adapter semantics with the existing eager CPU
+                # chunk kernel; CCE's CUDA kernel is covered by the GPU suite.
+                loss_fn.impl = "torch_compile"
+
+                def train() -> torch.Tensor:
+                    operand = prepare_lm_weight(loss_fn, model, grad_reduce_group=world)
+                    assert isinstance(operand, ShardedLMHeadWeight)
+                    assert operand.weight is model.lm_head.weight
+                    assert operand.dtype == torch.bfloat16 and operand.shape == (vocab, _HIDDEN)
+                    loss = loss_fn(
+                        local_hidden, labels[rank], operand, num_label_tokens=normalizer, grad_reduce_group=world
+                    )
+                    (loss * _WORLD_SIZE).backward()
+                    return loss.detach()
+
+                loss = _forbid_gather_and_full_saves(43, train)
+                dist.all_reduce(loss)
+                torch.testing.assert_close(loss, reference, rtol=1e-5, atol=1e-6)
+                grad = model.lm_head.weight.grad.full_tensor()
+                assert torch.count_nonzero(grad[vocab:]) == 0
+                torch.testing.assert_close(grad, dense_weight.grad, rtol=2e-2, atol=1e-3)
+                torch.testing.assert_close(
+                    local_hidden.grad / _WORLD_SIZE, dense_hidden.grad[rank], rtol=2e-2, atol=1e-3
+                )
+                torch.optim.SGD(model.parameters(), lr=0.1).step()
+                torch.testing.assert_close(
+                    model.lm_head.weight.full_tensor(), weight - 0.1 * dense_weight.grad, rtol=2e-2, atol=1e-3
+                )
+
     checks = {
         # 37 rows over 4 ranks: shards of 10, 10, 10 and 7 rows, streamed in chunks of 3.
         "fsdp_uneven_vocab_chunked_ce": lambda: _check_training_parity(
@@ -358,6 +418,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "unsupported_placement_raises": unsupported_placement_raises,
         "mtp_depths_share_one_resolution": mtp_depths_share_one_resolution,
         "autocast_recompute": autocast_recompute,
+        "padded_vocab_adapter": padded_vocab_adapter,
     }
     assert tuple(checks) == _SCENARIOS
     outcomes = {}
