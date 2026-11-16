@@ -22,10 +22,62 @@ that already depend on torch (training / distributed / dataloading).
 from __future__ import annotations
 
 import logging
+import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 _logger = logging.getLogger(__name__)
 
 _TORCH_PATCHES_APPLIED = False
+
+
+def disable_unsupported_cutedsl_overrides(device: torch.device | int) -> list[str]:
+    """Restore aten kernels for ops PyTorch routes to CuTe-DSL kernels the installed DSL cannot compile.
+
+    PyTorch's ``torch._native`` registry (2.15) overrides ops such as ``aten::_fused_rms_norm`` with
+    CuTe-DSL (QuACK) kernels on SM 9.x, 10.x and 12.x GPUs whenever a known-good
+    ``nvidia-cutlass-dsl`` is installed, without checking that the DSL can compile for the GPU.
+    nvidia-cutlass-dsl 4.6.2 has no SM 10.7 (VR200) target, so the first RMSNorm on VR200 raises
+    ``KeyError: 'sm_107a'``. Deregistering the CuTe-DSL overrides restores the aten kernels.
+
+    Call after the process has selected its CUDA device.
+
+    Args:
+        device: CUDA device, or its index, that this process computes on.
+
+    Returns:
+        Names of the ops whose CuTe-DSL overrides were deregistered; empty when nothing changed.
+    """
+    import torch
+
+    from nemo_automodel.shared.import_utils import safe_import_from
+
+    has_registry, registry = safe_import_from("torch._native", "registry")
+    if not has_registry:
+        return []
+    cutedsl_ops = registry.get_dsl_operations("cutedsl")
+    if not cutedsl_ops:
+        return []
+
+    # The DSL compiles for CUTE_DSL_ARCH when set, otherwise for the detected sm_<major><minor>,
+    # with an "a" suffix on SM 9.0 and newer (cutlass.base_dsl.env_manager.detect_gpu_arch).
+    major, minor = torch.cuda.get_device_capability(device)
+    target = os.environ.get("CUTE_DSL_ARCH") or f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+    has_arch, arch = safe_import_from("cutlass.base_dsl.arch", "Arch")
+    if not has_arch or target in arch.__members__:
+        return []
+
+    _, cutedsl_utils = safe_import_from("torch._native", "cutedsl_utils")
+    cutedsl_utils.deregister_op_overrides()
+    _logger.warning(
+        "The installed nvidia-cutlass-dsl cannot compile for %s; using aten kernels instead of "
+        "PyTorch's CuTe-DSL overrides for %s.",
+        target,
+        ", ".join(cutedsl_ops),
+    )
+    return cutedsl_ops
 
 
 def apply_torch_patches() -> None:
