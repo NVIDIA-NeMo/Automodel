@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LM-head projection that keeps BF16/FP16 operands and writes FP32 logits.
+"""The FP32 LM-head logits path shared by every model.
+
+A model returns FP32 logits exactly when its LM head is a :class:`Float32LogitsLinear`:
+
+- ``logits_dtype: float32`` swaps any model's head for one (:meth:`Float32LogitsLinear.from_head`),
+  keeping the head's parameters;
+- models whose head is FP32 by design (FP32 head weights or an FP32 output stream)
+  build a :class:`Float32LogitsLinear` themselves;
+- linear losses reproduce the head's projection with :func:`linear_with_fp32_logits`
+  when the model's head is a :class:`Float32LogitsLinear`.
 
 Upcasting already-rounded BF16 logits does not recover their precision, and
-projecting with an FP32 copy of the head weight costs a transient weight-sized
-allocation and an FP32 GEMM. Instead the head GEMM reads the low-precision
-hidden states and weight, accumulates in FP32 and stores FP32 logits, as vLLM's
-``head_dtype=float32`` path and Megatron-LM's ``logit_dtype`` do.
+projecting with an FP32 copy of a BF16 head weight costs a transient weight-sized
+allocation and an FP32 GEMM. Instead the head GEMM reads its operands in the head
+weight's compute dtype, accumulates in FP32 and stores FP32 logits, as vLLM's
+``head_dtype=float32`` path and Megatron-LM's ``logit_dtype`` do. A head whose
+weight computes in FP32 (FP32 storage, or an FP32 FSDP policy) runs an FP32 GEMM.
 
 ``torch.mm(..., out_dtype=torch.float32)`` has no autograd formula, so training
 goes through :class:`_Float32LogitsMatmul`. Its backward follows Megatron-LM's
@@ -26,17 +36,19 @@ goes through :class:`_Float32LogitsMatmul`. Its backward follows Megatron-LM's
 and the input and weight gradients use the same GEMMs as a BF16-output head.
 
 Parameter storage, optimizer master weights and gradient reduction stay with the
-model and its FSDP policy. The GEMM operands are the head's compute-dtype weight
-(for example the FSDP-gathered BF16 weight) and the hidden states cast to it.
+model and its FSDP policy.
 """
 
+import abc
 import math
+import sys
 
 import torch
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
-__all__ = ["Float32LogitsLinear", "linear_with_fp32_logits"]
+__all__ = ["Float32LogitsConvertible", "Float32LogitsLinear", "head_compute_dtype", "linear_with_fp32_logits"]
 
 
 def _fp32_output_mm(input_2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -139,12 +151,14 @@ def _vocab_parallel_fp32_logits(input: torch.Tensor, weight: DTensor) -> DTensor
     )
 
 
-def linear_with_fp32_logits(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Project hidden states through a bias-free LM-head weight into FP32 logits.
+def linear_with_fp32_logits(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Project hidden states through an LM-head weight into FP32 logits.
 
     The GEMM reads ``input`` cast to ``weight.dtype`` and ``weight`` unchanged,
-    accumulates in FP32 and stores FP32 logits. Autocast is disabled inside so it
-    cannot lower the output precision.
+    accumulates in FP32 and stores FP32 logits; a bias is added in FP32. Autocast
+    is disabled inside so it cannot lower the output precision.
 
     Args:
         input: Tensor of shape [..., hidden], with arbitrary leading dimensions, of
@@ -153,24 +167,68 @@ def linear_with_fp32_logits(input: torch.Tensor, weight: torch.Tensor) -> torch.
         weight: Tensor of shape [vocab, hidden] in BF16, FP16 or FP32. A DTensor must
             have global shape [vocab, hidden] and placements ``(Shard(0),)`` on a 1-D
             tensor-parallel mesh.
+        bias: Optional tensor of shape [vocab] in any floating dtype; not supported
+            with a DTensor ``weight``.
 
     Returns:
         New FP32 tensor of shape [..., vocab]. For a DTensor ``weight`` it is a
-        DTensor of that global shape with placement ``Shard(-1)``. Neither input is
+        DTensor of that global shape with placement ``Shard(-1)``. No input is
         mutated.
     """
     with torch.autocast(device_type=input.device.type, enabled=False):
         if isinstance(weight, DTensor):
+            if bias is not None:
+                raise NotImplementedError("FP32 logits with tensor parallelism need a bias-free LM head.")
             return _vocab_parallel_fp32_logits(input, weight)
-        return _Float32LogitsMatmul.apply(input.to(weight.dtype), weight)
+        logits = _Float32LogitsMatmul.apply(input.to(weight.dtype), weight)
+        return logits if bias is None else logits + bias.to(torch.float32)
+
+
+def _linear_backend_classes() -> tuple[type[nn.Module], ...]:
+    """Return the linear classes that ``initialize_linear_module`` builds.
+
+    Each projects with its ``weight`` and ``bias`` exactly as ``nn.Linear`` does, so a
+    head of one of these classes can hand its parameters to a :class:`Float32LogitsLinear`.
+    A head of a kernel backend's class implies that its module is already imported,
+    so these imports never load a backend that the model does not use.
+
+    Returns:
+        ``nn.Linear`` and the imported Transformer Engine and quack ``Linear`` classes.
+    """
+    classes: list[type[nn.Module]] = [nn.Linear]
+    if "transformer_engine.pytorch.module.linear" in sys.modules:
+        from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
+
+        classes.append(TransformerEngineLinear)
+    if "quack.linear" in sys.modules:
+        from quack.linear import Linear as QuackLinear
+
+        classes.append(QuackLinear)
+    return tuple(classes)
+
+
+class Float32LogitsConvertible(abc.ABC):
+    """Mixin for a model-owned LM head whose projection is not a plain linear map.
+
+    :meth:`Float32LogitsLinear.from_head` asks such a head for its FP32-logits
+    variant instead of rejecting it, so the model package keeps owning the projection.
+    """
+
+    @abc.abstractmethod
+    def to_fp32_logits(self) -> "Float32LogitsLinear":
+        """Return a head that owns this head's parameters and whose projection writes FP32 logits.
+
+        Returns:
+            A :class:`Float32LogitsLinear` subclass instance sharing this head's Parameters.
+        """
 
 
 class Float32LogitsLinear(nn.Linear):
-    """Bias-free LM head whose GEMM writes FP32 logits from its compute-dtype operands.
+    """LM head whose GEMM writes FP32 logits from operands in its weight's compute dtype.
 
-    It owns the replaced head's ``weight`` Parameter, so parameter names, storage,
-    tied embeddings, optimizer state, checkpoints and rollout weight sync are
-    unchanged. Only the projection's output dtype differs from ``nn.Linear``.
+    Models whose head is FP32 by design construct it directly; :meth:`from_head`
+    wraps another head's parameters for ``logits_dtype: float32``. Only the
+    projection's output dtype differs from ``nn.Linear``.
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -183,31 +241,65 @@ class Float32LogitsLinear(nn.Linear):
             FP32 tensor of shape [..., vocab] (see :func:`linear_with_fp32_logits`
             for the tensor-parallel DTensor layout).
         """
-        return linear_with_fp32_logits(input, self.weight)
+        return linear_with_fp32_logits(input, self.weight, self.bias)
 
     @classmethod
-    def from_linear(cls, head: nn.Linear) -> "Float32LogitsLinear":
-        """Build a head that owns ``head.weight`` itself (no copy, identity preserved).
+    def from_head(cls, head: nn.Module) -> "Float32LogitsLinear":
+        """Return an FP32-logits head that owns ``head``'s parameters (no copy, identity preserved).
+
+        An FP32-logits head is returned unchanged; a :class:`Float32LogitsConvertible`
+        head converts itself; a head of a linear kernel backend (``nn.Linear``,
+        Transformer Engine or quack ``Linear``) becomes a :class:`Float32LogitsLinear`
+        owning the same ``weight`` and ``bias`` Parameters, so parameter names, tied
+        embeddings, optimizer state, checkpoints and rollout weight sync are
+        unchanged. A Transformer Engine head under FP8 autocast then projects in its
+        compute dtype instead.
 
         Args:
-            head: Plain bias-free ``nn.Linear`` LM head whose weight has shape [vocab, hidden].
+            head: LM head whose weight has shape [vocab, hidden] and optional bias shape [vocab].
 
         Returns:
-            A new module whose ``weight`` is the same Parameter object as ``head.weight``.
+            A head whose projection writes FP32 logits.
 
         Raises:
-            ValueError: If ``head`` has a bias or is not exactly ``nn.Linear``.
+            ValueError: If ``head`` owns a projection that cannot write FP32 logits,
+                such as LoRA, QAT or quantized linears.
         """
-        # Linear subclasses (LoRA, FP8, QAT, bitsandbytes) own their projection,
-        # so its output precision cannot be changed from outside.
-        if type(head) is not nn.Linear:
+        if isinstance(head, Float32LogitsLinear):
+            return head
+        if isinstance(head, Float32LogitsConvertible):
+            return head.to_fp32_logits()
+        if type(head) not in _linear_backend_classes():
             raise ValueError(
-                f"FP32 logits require a plain nn.Linear LM head; got {type(head).__name__}. "
-                "Keep LoRA, quantization and FP8 off the LM head."
+                "FP32 logits require an LM head built from a linear kernel backend (torch, te or quack) or one "
+                f"that converts itself (Float32LogitsConvertible); got {type(head).__name__}. LoRA, QAT and "
+                "quantized linears own their projection; keep them off the LM head."
             )
-        if head.bias is not None:
-            raise ValueError("FP32 logits require a bias-free LM head.")
         fp32_head = cls(head.in_features, head.out_features, bias=False, device="meta")
         fp32_head.weight = head.weight
+        # Transformer Engine keeps an empty, unregistered tensor for a disabled bias.
+        if isinstance(head.bias, nn.Parameter):
+            fp32_head.bias = head.bias
         fp32_head.train(head.training)
         return fp32_head
+
+
+def head_compute_dtype(head: nn.Module) -> torch.dtype | None:
+    """Return the dtype in which ``head``'s GEMM reads its weight.
+
+    A head that is its own FSDP unit computes in its mixed-precision policy's
+    ``param_dtype``; its sharded weight may still expose the storage dtype before
+    the pre-forward hook runs. Any other head computes in its weight's dtype.
+
+    Args:
+        head: LM-head module.
+
+    Returns:
+        The compute dtype, or None when the head has no weight tensor.
+    """
+    if isinstance(head, FSDPModule):
+        param_dtype = head._get_fsdp_state()._mp_policy.param_dtype
+        if param_dtype is not None:
+            return param_dtype
+    weight = getattr(head, "weight", None)
+    return weight.dtype if isinstance(weight, torch.Tensor) else None

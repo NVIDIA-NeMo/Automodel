@@ -148,23 +148,6 @@ class Inkling2MoE(MoE):
             cast(GroupedExperts, self.experts).expert_activation_grouped = activation
 
 
-class Inkling2LMHead(nn.Linear):
-    """Bias-free output projection with FP32 arithmetic and ordinary FSDP hooks."""
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Project through the module boundary so FSDP gathers its weight.
-
-        Args:
-            input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
-
-        Returns:
-            FP32 tensor of shape [..., vocab]. Weight storage may be FP32 or BF16.
-            The caller applies softcapping and unused-vocabulary masking.
-        """
-        with torch.autocast(device_type=input.device.type, enabled=False):
-            return F.linear(input.float(), self.weight.float(), self.bias.float() if self.bias is not None else None)
-
-
 class ShortConvolution(nn.Module):
     """Causal width-W convolution with static or token-generated per-head taps."""
 

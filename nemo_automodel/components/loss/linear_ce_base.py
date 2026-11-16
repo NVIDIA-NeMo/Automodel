@@ -15,10 +15,27 @@
 import torch
 import torch.distributed as dist
 from torch import nn
+from transformers import PretrainedConfig
 
 
 class LinearCrossEntropy(nn.Module):
     """Losses consuming final hidden states and an LM-head weight instead of logits."""
+
+    def validate_lm_head(
+        self, lm_head: nn.Module | None, *, model_config: PretrainedConfig | None = None
+    ) -> nn.Module | None:
+        """Check, once at setup, that this loss can reproduce the model's head projection.
+
+        Args:
+            lm_head: The model's LM head with weight of global shape [vocab, hidden],
+                or None on a pipeline stage that does not own it.
+            model_config: Owning model's configuration, when available.
+
+        Returns:
+            ``lm_head``, unchanged. Subclasses raise ``ValueError`` for heads they
+            cannot reproduce.
+        """
+        return lm_head
 
     @staticmethod
     def materialize_lm_weight(

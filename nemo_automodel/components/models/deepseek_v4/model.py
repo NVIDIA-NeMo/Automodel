@@ -55,9 +55,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -1261,13 +1261,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=torch.float32,
-        )
+        # DeepSeek-V4 keeps an FP32 head and returns its FP32 logits.
+        self.lm_head = Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,
@@ -1367,7 +1362,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
+            # The Float32LogitsLinear head writes FP32 logits.
+            output_meta = torch.empty(
+                microbatch_size, seq_len, self.config.vocab_size, device="meta", dtype=torch.float32
+            )
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)
         else:
@@ -1535,17 +1533,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # path can recompute logits over every position.
         final_hidden_states = hidden_states
 
-        # deepseek runs the lm_head in fp32: project in fp32 and cast the logits
-        # back to the hidden dtype via the shared helper.
         # Linear CE owns the final projection in PP, avoiding a full logits
         # allocation for every in-flight microbatch. MTP still carries its
         # per-depth hidden states through the existing tuple contract.
         if self._pp_return_hidden_states:
             logits = hidden_states
         else:
-            logits = compute_lm_head_logits(
-                self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True
-            ).logits
+            logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode).logits
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

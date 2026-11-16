@@ -317,6 +317,9 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.lm_head = new_embeddings
+
     def forward(
         self,
         input_ids: torch.Tensor,

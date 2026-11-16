@@ -30,6 +30,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_round_robin
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -197,8 +198,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         )
         self.cp_mesh: DeviceMesh | None = None
         self.model = FlintModel(config, self.backend)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
-        self.lm_head._flint_fp32_output_head = True
+        self.lm_head = Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
         # Seeded from the model config like PreTrainedModel does for generating
         # models, so bos/eos/pad are set; the loader then restores the checkpoint's
         # generation_config.json and the consolidated export writes it back out.
@@ -382,11 +382,11 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             )
         self.model.embed_tokens = value
 
-    def get_output_embeddings(self) -> nn.Linear:
+    def get_output_embeddings(self) -> Float32LogitsLinear:
         """Return the separate FP32 vocabulary projection module.
 
         Returns:
-            Bias-free linear module with weight [vocab, hidden].
+            Bias-free FP32-logits head with weight [vocab, hidden].
         """
         return self.lm_head
 
@@ -394,7 +394,8 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         """Replace the output module under the protected-FP32 contract.
 
         Args:
-            value: Bias-free linear module with FP32 weight [vocab, hidden].
+            value: Bias-free linear module with FP32 weight [vocab, hidden]; it is
+                installed as a ``Float32LogitsLinear`` owning the same weight.
         """
         if (
             value.weight.shape != (self.config.vocab_size, self.config.hidden_size)
@@ -412,8 +413,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             raise ValueError(
                 "Flint output embeddings require an untied, bias-free FP32 linear module with fixed vocabulary"
             )
-        value._flint_fp32_output_head = True
-        self.lm_head = value
+        self.lm_head = Float32LogitsLinear.from_head(value)
 
     def resize_token_embeddings(
         self,
@@ -572,8 +572,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden_states)
         selected = hidden_states[:, -logits_to_keep:] if logits_to_keep else hidden_states
-        with torch.autocast(device_type=selected.device.type, enabled=False):
-            logits = self.lm_head(selected.float())
+        logits = self.lm_head(selected)
         loss = None
         if labels is not None:
             if labels.shape != hidden_states.shape[:2]:

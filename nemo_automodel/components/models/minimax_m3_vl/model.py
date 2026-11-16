@@ -545,6 +545,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     def get_output_embeddings(self):
         return self.lm_head
 
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.lm_head = new_embeddings
+
     def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
         """Return modules whose inputs are the DSpark target features of ``layer_ids``.
 

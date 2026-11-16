@@ -48,6 +48,11 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
+from nemo_automodel.components.models.common.fp32_logits import (
+    Float32LogitsConvertible,
+    Float32LogitsLinear,
+    linear_with_fp32_logits,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -256,7 +261,28 @@ class DecoderLayer(nn.Module):
         return outputs
 
 
-class NormHead(nn.Module):
+def _normalized_weight(head: NormHead | Float32LogitsNormHead) -> torch.Tensor:
+    """Return the head weight with unit-norm rows, as Baichuan's head projects with.
+
+    Training normalizes on every call; evaluation normalizes the stored weight once,
+    in place, and then reuses it.
+
+    Args:
+        head: Baichuan head whose ``weight`` has shape [vocab, hidden].
+
+    Returns:
+        Tensor of shape [vocab, hidden] with unit-norm rows.
+    """
+    if head.training:
+        head.first_flag = True
+        return F.normalize(head.weight)
+    if head.first_flag:
+        head.first_flag = False
+        head.weight.data = F.normalize(head.weight)
+    return head.weight
+
+
+class NormHead(nn.Module, Float32LogitsConvertible):
     def __init__(self, hidden_size, vocab_size, bias=False):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((vocab_size, hidden_size)))
@@ -264,16 +290,32 @@ class NormHead(nn.Module):
         self.first_flag = True
 
     def forward(self, hidden_states):
-        if self.training:
-            norm_weight = F.normalize(self.weight)
-            self.first_flag = True
-        elif self.first_flag:
-            self.first_flag = False
-            self.weight.data = F.normalize(self.weight)
-            norm_weight = self.weight
-        else:
-            norm_weight = self.weight
-        return F.linear(hidden_states, norm_weight)
+        return F.linear(hidden_states, _normalized_weight(self))
+
+    def to_fp32_logits(self) -> Float32LogitsNormHead:
+        """Return the FP32-logits head that owns this head's weight."""
+        head = Float32LogitsNormHead(self.weight.shape[1], self.weight.shape[0], bias=False, device="meta")
+        head.weight = self.weight
+        head.first_flag = self.first_flag
+        head.train(self.training)
+        return head
+
+
+class Float32LogitsNormHead(Float32LogitsLinear):
+    """``NormHead`` whose GEMM writes FP32 logits."""
+
+    first_flag: bool
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Project hidden states with the row-normalized weight into FP32 logits.
+
+        Args:
+            input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            FP32 tensor of shape [..., vocab].
+        """
+        return linear_with_fp32_logits(input, _normalized_weight(self))
 
 
 # ---------------------------------------------------------------------------

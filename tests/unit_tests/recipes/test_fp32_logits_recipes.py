@@ -125,7 +125,6 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        lm_head_projection_dtype=torch.float32,
         te_fp8=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
@@ -196,8 +195,6 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
     recipe.kd_ratio = 0.5
     recipe._offload_teacher_model = False
     recipe.separate_meshes = False
-    # setup() resolves this from model.logits_dtype for the student.
-    recipe.lm_head_projection_dtype = torch.float32
     input_ids, labels, num_label_tokens = _batch()
 
     _, _, ce_loss = recipe._forward_backward_step(
@@ -215,13 +212,15 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
     ("loss_fn", "error"),
     [
         pytest.param(ChunkedCrossEntropy(compile=False), None, id="chunked"),
-        pytest.param(FusedLinearCrossEntropy(impl="torch_compile"), "rounds logits to BF16", id="fused-torch-compile"),
+        pytest.param(
+            FusedLinearCrossEntropy(impl="torch_compile"), "rounds logits to torch.bfloat16", id="fused-torch-compile"
+        ),
     ],
 )
-def test_setup_checks_linear_losses_against_model_logits_dtype(monkeypatch, loss_fn, error):
+def test_setup_checks_linear_losses_against_the_fp32_logits_head(monkeypatch, loss_fn, error):
     cfg = ConfigNode(
         {
-            "model": {"logits_dtype": "float32"},
+            "model": {},
             "dataloader": {},
             "dataset": {},
             "validation_dataloader": {},
@@ -242,7 +241,5 @@ def test_setup_checks_linear_losses_against_model_logits_dtype(monkeypatch, loss
         with pytest.raises(ValueError, match=error):
             trainer.setup()
         return
-    # A Float32LogitsLinear head passes ChunkedCrossEntropy's check only with an FP32 projection.
     trainer.setup()
     assert trainer.loss_fn is loss_fn
-    assert trainer.lm_head_projection_dtype is torch.float32

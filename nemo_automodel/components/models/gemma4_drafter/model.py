@@ -25,7 +25,9 @@ registry.
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -63,6 +65,10 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
         head.
         """
 
+        # Set by ``Gemma4DrafterForCausalLM.set_output_embeddings``: project like a
+        # ``Float32LogitsLinear`` head, whose weight the HF forward passes in.
+        fp32_logits: bool = False
+
         def forward(self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor) -> torch.Tensor:
             """Score every vocabulary token.
 
@@ -71,8 +77,11 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
                 lm_head_weight: Tied output embedding of shape ``[vocab_size, hidden_size]``.
 
             Returns:
-                Logits of shape ``[batch, seq_len, vocab_size]``, ``hidden_states @ lm_head_weight.T``.
+                Logits of shape ``[batch, seq_len, vocab_size]``, ``hidden_states @ lm_head_weight.T``,
+                in FP32 when ``fp32_logits`` is set.
             """
+            if self.fp32_logits:
+                return linear_with_fp32_logits(hidden_states, lm_head_weight)
             return torch.nn.functional.linear(hidden_states, lm_head_weight)
 
     class Gemma4DrafterForCausalLM(HFCheckpointingMixin, HFGemma4AssistantForCausalLM):
@@ -105,6 +114,12 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
         def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
             """Tie ``lm_head`` to the drafter token embedding."""
             self.lm_head.weight = self.model.embed_tokens.weight
+
+        def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+            """Replace the tied head; the full-vocabulary embedder projects like it."""
+            self.lm_head = new_embeddings
+            if isinstance(self.masked_embedding, Gemma4DrafterFullVocabEmbedder):
+                self.masked_embedding.fp32_logits = isinstance(new_embeddings, Float32LogitsLinear)
 
         @dataclass(frozen=True)
         class ModelCapabilities:

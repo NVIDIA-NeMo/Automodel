@@ -18,13 +18,13 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch import nn
 from torch.nn.attention import SDPBackend
-from transformers import LlamaConfig, PretrainedConfig, Qwen2Config, Qwen3Config
+from transformers import Gemma2Config, LlamaConfig, MistralConfig, PhiConfig, PretrainedConfig, Qwen2Config, Qwen3Config
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.infrastructure import _use_fp32_logits
-from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 
 _VOCAB = 128
@@ -119,12 +119,109 @@ def test_logits_dtype_survives_the_build_retry():
     assert model(input_ids=input_ids).logits.dtype == torch.float32
 
 
-def test_models_without_the_capability_are_rejected():
-    # The Hugging Face implementation declares no ModelCapabilities.
-    with pytest.raises(NotImplementedError, match="supports_fp32_logits"):
-        NeMoAutoModelForCausalLM.from_config(
-            _config(LlamaConfig, tied=False), force_hf=True, torch_dtype=torch.bfloat16, logits_dtype="float32"
-        )
+def _hf_config(config_cls: type[PretrainedConfig], **overrides) -> PretrainedConfig:
+    return config_cls(
+        architectures=[config_cls.__name__.removesuffix("Config") + "ForCausalLM"],
+        vocab_size=_VOCAB,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(_hf_config(LlamaConfig, head_dim=8), id="llama-force-hf"),
+        pytest.param(_hf_config(MistralConfig, head_dim=8), id="mistral"),
+        # Phi's head has a bias, added in fp32.
+        pytest.param(_hf_config(PhiConfig), id="phi-biased-head"),
+        # Gemma 2 ties its head and softcaps the logits after it.
+        pytest.param(_hf_config(Gemma2Config, head_dim=8, final_logit_softcapping=30.0), id="gemma2-tied-softcap"),
+    ],
+)
+def test_hugging_face_implementations_install_an_fp32_logits_head(config):
+    torch.manual_seed(0)
+    model = NeMoAutoModelForCausalLM.from_config(
+        config, force_hf=True, torch_dtype=torch.bfloat16, logits_dtype="float32"
+    )
+
+    head = model.get_output_embeddings()
+    assert isinstance(head, Float32LogitsLinear)
+    input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
+    output = model(input_ids=input_ids, output_hidden_states=True)
+    reference = output.hidden_states[-1].double() @ head.weight.double().t()
+    if head.bias is not None:
+        reference = reference + head.bias.double()
+    if cap := getattr(config, "final_logit_softcapping", None):
+        reference = torch.tanh(reference / cap) * cap
+    assert output.logits.dtype == torch.float32
+    torch.testing.assert_close(output.logits.double(), reference, rtol=0, atol=1e-5)
+
+
+class _TiedLM(nn.Module):
+    """Minimal model exposing the Hugging Face output-embedding accessors, with a tied head."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(320, 96)
+        self.lm_head = nn.Linear(96, 320, bias=False)
+        self.lm_head.weight = self.embed.weight
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.lm_head = new_embeddings
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Project embedded ids through the head.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+
+        Returns:
+            Logits of shape [batch, sequence, vocab].
+        """
+        return self.lm_head(self.embed(input_ids).bfloat16())
+
+
+def test_use_fp32_logits_installs_the_head_and_keeps_the_tie():
+    model = _TiedLM()
+
+    _use_fp32_logits(model, "float32", pipelined=False)
+    installed = model.lm_head
+
+    assert isinstance(installed, Float32LogitsLinear)
+    assert model.lm_head.weight is model.embed.weight
+    assert model(torch.tensor([[1, 2, 3]])).dtype == torch.float32
+    _use_fp32_logits(model, "float32", pipelined=False)
+    assert model.lm_head is installed
+
+
+def test_use_fp32_logits_rejects_models_without_a_head():
+    with pytest.raises(ValueError, match="needs an LM head"):
+        _use_fp32_logits(nn.Linear(4, 4), torch.float32, pipelined=False)
+
+    class _NoHead(_TiedLM):
+        def get_output_embeddings(self) -> None:
+            return None
+
+    with pytest.raises(ValueError, match="needs an LM head"):
+        _use_fp32_logits(_NoHead(), torch.float32, pipelined=False)
+
+
+def test_use_fp32_logits_rejects_a_setter_that_does_not_install_the_head():
+    class _IgnoringSetter(_TiedLM):
+        def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+            pass
+
+    with pytest.raises(RuntimeError, match="did not install"):
+        _use_fp32_logits(_IgnoringSetter(), torch.float32, pipelined=False)
 
 
 def test_only_float32_logits_are_accepted():
@@ -136,5 +233,5 @@ def test_pipeline_parallelism_is_rejected():
     model = _build(_config(Qwen3Config, tied=False))
 
     with pytest.raises(NotImplementedError, match="pipeline parallelism"):
-        _use_fp32_logits(model, torch.float32, mesh=MeshContext(), pipelined=True)
+        _use_fp32_logits(model, torch.float32, pipelined=True)
     assert type(model.lm_head) is torch.nn.Linear

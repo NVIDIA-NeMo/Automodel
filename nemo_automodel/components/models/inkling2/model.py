@@ -30,6 +30,7 @@ from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import (
     HFCheckpointingMixin,
 )
@@ -43,7 +44,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 from .attention import AttentionSources, Inkling2Attention
 from .config import Inkling2Config, Inkling2TextConfig, resolve_quantization_config
 from .context_parallel import CPBatch, prepare_cp_inputs, unpack_row_layout, validate_document_positions
-from .layers import Inkling2LMHead, Inkling2MoE, ResidualQuery, ResidualState, ShortConvolution
+from .layers import Inkling2MoE, ResidualQuery, ResidualState, ShortConvolution
 from .parallelization import FP32_MODULES, Inkling2Parallelizer
 from .state_dict_adapter import Inkling2StateDictAdapter
 
@@ -245,7 +246,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.norm: nn.Module | None = initialize_rms_norm_module(
             "torch", config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.lm_head: Inkling2LMHead | None = Inkling2LMHead(
+        self.lm_head: Float32LogitsLinear | None = Float32LogitsLinear(
             config.hidden_size, config.vocab_size, bias=False, dtype=dtype
         )
         if self.backend.enable_hf_state_dict_adapter:
@@ -285,9 +286,13 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Return the untied token lookup; embed_norm is applied in forward."""
         return self.embed_tokens
 
-    def get_output_embeddings(self) -> Inkling2LMHead | None:
+    def get_output_embeddings(self) -> Float32LogitsLinear | None:
         """Return the callable untied head for shared FSDP and output-loss setup."""
         return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        """Replace the untied head, keeping its FP32 logits."""
+        self.lm_head = Float32LogitsLinear.from_head(new_embeddings)
 
     def _pipeline_layer_ids(self) -> list[int]:
         """Validate contiguous global layer IDs and exclusive parameter ownership."""

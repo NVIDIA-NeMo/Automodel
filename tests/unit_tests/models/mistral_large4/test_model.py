@@ -252,7 +252,7 @@ def test_existing_loss_guard_and_padding_mask() -> None:
 
     model = make_model()
     with pytest.raises(ValueError, match="softcapping"):
-        ChunkedCrossEntropy.validate_lm_head(model.lm_head, model_config=model.config)
+        ChunkedCrossEntropy().validate_lm_head(model.lm_head, model_config=model.config)
     ids = torch.tensor([[0, 1, 3, 8, 0]])
     padding = torch.tensor([[True, False, False, False, True]])
     expected = model(ids, attention_mask=(~padding).long()).logits

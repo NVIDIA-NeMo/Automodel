@@ -430,28 +430,24 @@ class TestComputeLmHeadLogits:
         assert out.logits.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.logits, hidden.unsqueeze(0))
 
-    def test_fp32_lm_head_projects_in_fp32_and_restores_dtype(self):
-        """fp32_lm_head upcasts to fp32 for the matmul, then casts logits back to input dtype."""
+    def test_fp32_weight_head_returns_fp32_logits(self):
+        """An fp32 head weight projects the upcast bf16 input in fp32 and keeps fp32 logits."""
         lm_head = self._lm_head()  # nn.Linear with an fp32 weight
         hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, fp32_lm_head=True)
-        assert out.logits.dtype == torch.bfloat16
-        torch.testing.assert_close(out.logits, lm_head(hidden.float()).to(torch.bfloat16))
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0)
+        assert out.logits.dtype == torch.float32
+        torch.testing.assert_close(out.logits, lm_head(hidden.float()), rtol=0, atol=0)
 
-    def test_fp32_lm_head_with_slicing(self):
-        """fp32_lm_head composes with logits_to_keep slicing (2D THD input)."""
-        lm_head = self._lm_head()
+    def test_fp32_logits_head_composes_with_slicing(self):
+        """A bf16 Float32LogitsLinear head writes fp32 logits for the kept positions (2D THD input)."""
+        from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
+
+        lm_head = Float32LogitsLinear.from_head(self._lm_head().to(torch.bfloat16))
         hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3, fp32_lm_head=True)
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3)
         assert out.logits.shape == (3, self.VOCAB)
-        assert out.logits.dtype == torch.bfloat16
-        torch.testing.assert_close(out.logits, lm_head(hidden[-3:, :].float()).to(torch.bfloat16))
-
-    def test_fp32_lm_head_ignored_when_lm_head_none(self):
-        """fp32_lm_head is a no-op on the lm_head=None passthrough."""
-        hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(None, hidden, fp32_lm_head=True)
-        assert out.logits is hidden
+        assert out.logits.dtype == torch.float32
+        torch.testing.assert_close(out.logits, linear_with_fp32_logits(hidden[-3:, :], lm_head.weight), rtol=0, atol=0)
 
     def test_lm_head_dtype_casts_after_slicing(self):
         lm_head = self._lm_head().to(torch.bfloat16)
@@ -484,7 +480,7 @@ class TestComputeLmHeadLogits:
         lm_head = FakeFSDPHead()
         hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
 
-        with patch("nemo_automodel.components.models.common.utils.FSDPModule", FakeFSDPHead):
+        with patch("nemo_automodel.components.models.common.fp32_logits.FSDPModule", FakeFSDPHead):
             out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
 
         assert lm_head.weight.dtype == torch.float32

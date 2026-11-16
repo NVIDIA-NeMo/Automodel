@@ -77,7 +77,7 @@ def _head(fp32_logits: bool, weight: torch.Tensor) -> nn.Linear:
     head = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype)
     with torch.no_grad():
         head.weight.copy_(weight)
-    return Float32LogitsLinear.from_linear(head) if fp32_logits else head
+    return Float32LogitsLinear.from_head(head) if fp32_logits else head
 
 
 def _check_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
@@ -167,6 +167,12 @@ def _check_vocab_parallel_contract(hidden: torch.Tensor, weight: torch.Tensor, u
             assert "vocabulary-sharded" in str(error), (name, error)
         else:
             raise AssertionError(f"FP32 logits accepted a {name} weight")
+    try:
+        linear_with_fp32_logits(hidden, distribute_tensor(weight, mesh, [Shard(0)]), torch.zeros(weight.shape[0]))
+    except NotImplementedError as error:
+        assert "bias-free" in str(error), error
+    else:
+        raise AssertionError("FP32 logits accepted a biased column-parallel head")
 
 
 class _TinyLM(nn.Module):

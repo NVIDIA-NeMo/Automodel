@@ -23,6 +23,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -342,8 +343,13 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             if config.use_audio_perception
             else None
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype
+        # ``use_fp32_for_output`` returns FP32 logits (see get_pipeline_stage_metas).
+        self.lm_head = (
+            Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+            if config.use_fp32_for_output
+            else initialize_linear_module(
+                self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype
+            )
         )
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
@@ -1020,13 +1026,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 loss_hidden_states = loss_hidden_states.unsqueeze(0)
             return loss_hidden_states
 
-        projected = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-            fp32_lm_head=self.config.use_fp32_for_output,
-        )
+        projected = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd)
         if self.lm_head is None:
             # No output scaling or soft cap may touch the residual stream
             # passed between non-final PP stages.

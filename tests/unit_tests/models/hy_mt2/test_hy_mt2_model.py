@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.hy_mt2.config import HyMT2Config
 from nemo_automodel.components.models.hy_mt2.model import (
     Block,
@@ -219,7 +220,7 @@ class TestHyMT2ForCausalLM:
         assert hasattr(model, "model")
         assert hasattr(model, "lm_head")
         assert model.config is config
-        assert model._enable_lm_head_fp32 is True
+        assert isinstance(model.lm_head, Float32LogitsLinear)
 
     def test_enable_lm_head_fp32_default_false_without_config_flag(self, backend_config):
         # When the config does not declare the flag, default to False.
@@ -252,13 +253,11 @@ class TestHyMT2ForCausalLM:
             moe_router_use_sigmoid = True
 
         model = HyMT2ForCausalLM(_Cfg(), backend=backend_config)
-        assert model._enable_lm_head_fp32 is False
+        assert not isinstance(model.lm_head, Float32LogitsLinear)
 
-    def test_lm_head_fp32_upcast_when_weight_promoted(self, config, backend_config, device):
-        """When the parallelizer has promoted lm_head.weight to fp32 (the
-        ``distributed.moe.lm_head_precision: float32`` path), the in-model
-        fallback feeds the bf16 hidden state up to fp32, runs lm_head, and
-        casts logits back to bf16."""
+    def test_promoted_fp32_head_weight_projects_in_fp32(self, config, backend_config, device):
+        """An fp32 head weight (the ``distributed.moe.lm_head_precision: float32``
+        path) runs an fp32 GEMM on the upcast hidden state and keeps fp32 logits."""
         model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
         # Simulate the parallelizer's promotion of lm_head.weight to fp32.
         model.lm_head = model.lm_head.to(torch.float32)
@@ -266,24 +265,20 @@ class TestHyMT2ForCausalLM:
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
             logits = model(input_ids).logits
-        # Output dtype must be the input dtype (bf16), not fp32.
-        assert logits.dtype == torch.bfloat16
+        assert logits.dtype == torch.float32
+        torch.testing.assert_close(logits, bf16_hidden.float() @ model.lm_head.weight.t())
 
-    def test_lm_head_no_upcast_when_weight_is_bf16(self, config, backend_config, device):
-        """If the parallelizer did NOT promote lm_head.weight, the model must
-        fall through to ``self.lm_head(hidden)`` without trying to upcast,
-        to avoid the dtype mismatch (fp32 input vs bf16 weight) and the
-        ``F.linear`` DTensor mixing crash that the prior implementation hit."""
+    def test_bf16_head_weight_writes_fp32_logits(self, config, backend_config, device):
+        """``enable_lm_head_fp32`` keeps the bf16 head weight and writes fp32 logits
+        from bf16 operands, so no logit is rounded to bf16."""
         model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
-        # lm_head.weight is bf16 (no promotion). Even though enable_lm_head_fp32
-        # is True on the config, the in-model path must NOT activate.
         assert model.lm_head.weight.dtype == torch.bfloat16
-        assert model._enable_lm_head_fp32 is True
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
             logits = model(input_ids).logits
-        assert logits.dtype == torch.bfloat16
+        assert logits.dtype == torch.float32
+        torch.testing.assert_close(logits, bf16_hidden.float() @ model.lm_head.weight.float().t())
 
     def test_lm_head_no_upcast_when_disabled(self, config, backend_config, device):
         config.enable_lm_head_fp32 = False

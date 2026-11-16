@@ -58,7 +58,8 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -636,9 +637,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         self.model = DeepseekV41Model(
             config, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32
-        )
+        # DeepSeek-V4.1 keeps an FP32 head and returns its FP32 logits.
+        self.lm_head = Float32LogitsLinear(text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32)
         self.moe_config = moe_config
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepseekV41StateDictAdapter(config, moe_config, self.backend, dtype=dtype)

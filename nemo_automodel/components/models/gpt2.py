@@ -167,6 +167,12 @@ class GPT2LMHeadModel(nn.Module):
     def initialize_weights(self):
         self._init_weights()
 
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.lm_head = new_embeddings
+
     def forward(self, input_ids: torch.LongTensor, **kwargs) -> torch.Tensor:  # (B, T) → (B, T, V)
         batch_size, seq_len = input_ids.shape
 

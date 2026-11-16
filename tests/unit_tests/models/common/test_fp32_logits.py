@@ -14,12 +14,20 @@
 
 """FP32-output LM head: logits precision against FP64, backward contract and module surgery."""
 
+import sys
+import types
+
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
+from nemo_automodel.components.models.common.fp32_logits import (
+    Float32LogitsConvertible,
+    Float32LogitsLinear,
+    head_compute_dtype,
+    linear_with_fp32_logits,
+)
 
 _DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"))]
 
@@ -95,30 +103,103 @@ def test_autocast_does_not_lower_logits():
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
-def test_from_linear_owns_the_same_weight():
-    head = nn.Linear(96, 320, bias=False).eval()
+@pytest.mark.parametrize("bias", [False, True])
+def test_from_head_owns_the_same_parameters(bias):
+    head = nn.Linear(96, 320, bias=bias).eval()
 
-    fp32_head = Float32LogitsLinear.from_linear(head)
+    fp32_head = Float32LogitsLinear.from_head(head)
 
     assert fp32_head.weight is head.weight
+    assert fp32_head.bias is head.bias
     assert not fp32_head.training
-    assert list(fp32_head.state_dict()) == ["weight"]
+    assert list(fp32_head.state_dict()) == list(head.state_dict())
     hidden = torch.randn(3, 96, dtype=torch.bfloat16)
-    torch.testing.assert_close(fp32_head(hidden), linear_with_fp32_logits(hidden, head.weight), rtol=0, atol=0)
+    torch.testing.assert_close(
+        fp32_head(hidden), linear_with_fp32_logits(hidden, head.weight, head.bias), rtol=0, atol=0
+    )
+
+
+def test_bias_is_added_in_fp32_and_receives_its_gradient():
+    hidden, weight, upstream = _operands("cpu")
+    bias = (torch.randn(320) * 0.1).to(torch.bfloat16).requires_grad_()
+
+    logits = linear_with_fp32_logits(hidden, weight, bias)
+    logits.backward(upstream.float())
+
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, linear_with_fp32_logits(hidden, weight) + bias.detach().float(), rtol=0, atol=0)
+    assert bias.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(bias.grad, upstream.float().sum((0, 1)).bfloat16(), rtol=0, atol=0)
+
+
+def test_fp32_logits_heads_are_returned_unchanged():
+    head = Float32LogitsLinear(96, 320, bias=False)
+
+    assert Float32LogitsLinear.from_head(head) is head
+
+
+class _BackendLinear(nn.Module):
+    """Mimics Transformer Engine's Linear: same weight layout, an empty unregistered tensor for no bias."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__()
+        self.in_features, self.out_features = in_features, out_features
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = torch.Tensor()
+
+
+class _QuackLinear(nn.Linear):
+    """Mimics quack's Linear: an nn.Linear subclass with its own kernel."""
+
+
+def test_linear_kernel_backend_heads_convert(monkeypatch):
+    te_linear = types.ModuleType("transformer_engine.pytorch.module.linear")
+    te_linear.Linear = _BackendLinear
+    quack_linear = types.ModuleType("quack.linear")
+    quack_linear.Linear = _QuackLinear
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.linear", te_linear)
+    monkeypatch.setitem(sys.modules, "quack.linear", quack_linear)
+
+    for head in (_BackendLinear(96, 320), _QuackLinear(96, 320, bias=True)):
+        fp32_head = Float32LogitsLinear.from_head(head)
+        assert type(fp32_head) is Float32LogitsLinear
+        assert fp32_head.weight is head.weight
+        assert fp32_head.bias is (head.bias if isinstance(head.bias, nn.Parameter) else None)
+
+
+class _NormalizedHead(nn.Module, Float32LogitsConvertible):
+    """A model-owned head with its own projection, like Baichuan's NormHead."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(320, 96))
+
+    def to_fp32_logits(self) -> Float32LogitsLinear:
+        head = Float32LogitsLinear(96, 320, bias=False, device="meta")
+        head.weight = self.weight
+        return head
+
+
+def test_convertible_heads_convert_themselves():
+    head = _NormalizedHead()
+
+    fp32_head = Float32LogitsLinear.from_head(head)
+
+    assert isinstance(fp32_head, Float32LogitsLinear) and fp32_head.weight is head.weight
 
 
 class _LinearSubclass(nn.Linear):
-    """Stands in for LoRA, FP8 and quantized heads, which subclass nn.Linear."""
+    """Stands in for LoRA, FP8 and quantized heads, which subclass nn.Linear and own their projection."""
 
 
-@pytest.mark.parametrize(
-    ("head", "message"),
-    [
-        (nn.Linear(4, 8, bias=True), "bias-free"),
-        (_LinearSubclass(4, 8, bias=False), "plain nn.Linear"),
-        (nn.Embedding(8, 4), "plain nn.Linear"),
-    ],
-)
-def test_from_linear_rejects_heads_with_their_own_projection(head, message):
-    with pytest.raises(ValueError, match=message):
-        Float32LogitsLinear.from_linear(head)
+@pytest.mark.parametrize("head", [_LinearSubclass(4, 8, bias=False), nn.Embedding(8, 4)])
+def test_from_head_rejects_heads_with_their_own_projection(head):
+    with pytest.raises(ValueError, match="linear kernel backend"):
+        Float32LogitsLinear.from_head(head)
+
+
+def test_head_compute_dtype_follows_the_weight():
+    fp32_logits_head = Float32LogitsLinear.from_head(nn.Linear(4, 8, bias=False, dtype=torch.bfloat16))
+
+    assert head_compute_dtype(fp32_logits_head) is torch.bfloat16
+    assert head_compute_dtype(nn.Identity()) is None

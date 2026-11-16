@@ -388,6 +388,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     def get_output_embeddings(self) -> nn.Module:
         return self.model.language_model.get_output_embeddings()
 
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.model.language_model.set_output_embeddings(new_embeddings)
+
     # ------------------------------------------------------------------
     # Forward (understanding + optional generation).
     # ------------------------------------------------------------------

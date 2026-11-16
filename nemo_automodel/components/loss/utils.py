@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 
 _DATASET_IGNORE_INDEX = -100
 
@@ -142,7 +143,6 @@ def prepare_lm_weight(
     model: nn.Module,
     *,
     grad_reduce_group: torch.distributed.ProcessGroup | None = None,
-    projection_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Prepare one shared projection weight for main and auxiliary losses.
 
@@ -151,9 +151,6 @@ def prepare_lm_weight(
         model: Model or DDP wrapper whose wrapped module owns the config and
             output head of global shape [vocab, hidden].
         grad_reduce_group: Group contributing independent token losses.
-        projection_dtype: Chunked CE's head projection dtype: ``torch.float32``
-            for a model built with ``logits_dtype=float32``, else None. Fused
-            linear CE does not use it.
 
     Returns:
         Dense [vocab, hidden] weight under ``materialize_lm_weight``'s layout
@@ -168,7 +165,6 @@ def prepare_lm_weight(
             _get_lm_head_module(model),
             model_config=getattr(model, "config", None),
             grad_reduce_group=grad_reduce_group,
-            projection_dtype=projection_dtype,
         )
     return loss_fn.materialize_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
 
@@ -184,9 +180,8 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             shape ``[batch, sequence, vocab]`` and labels.
         **kwargs: Loss inputs. Rank-local tensors keep their existing layout;
             ``grad_reduce_group`` describes the ranks contributing independent
-            linear-loss shards, and ``projection_dtype`` is chunked CE's head
-            projection dtype (see ``prepare_lm_weight``). The caller's mapping
-            and tensors are not mutated.
+            linear-loss shards. Chunked CE projects like the model's head. The
+            caller's mapping and tensors are not mutated.
 
     Returns:
         Scalar loss tensor that does not alias an input.
@@ -198,7 +193,6 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         loss_fn_kwargs["loss_weights"] = loss_weights
     if isinstance(loss_fn, LinearCrossEntropy):
         model = kwargs.pop("model")
-        projection_dtype = kwargs.pop("projection_dtype", None)
         # Reuse a caller-materialized LM head when provided so a single
         # full_tensor() all-gather is shared across the main loss and every MTP
         # depth (see calculate_mtp_loss). Re-gathering the (vocab x hidden) head
@@ -206,18 +200,16 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         # on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab).
         lm_head = kwargs.pop("lm_weight", None)
         if lm_head is None:
-            lm_head = prepare_lm_weight(
-                loss_fn,
-                model,
-                grad_reduce_group=kwargs.get("grad_reduce_group"),
-                projection_dtype=projection_dtype,
-            )
+            lm_head = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
         if isinstance(loss_fn, ChunkedCrossEntropy):
             logits = kwargs.get("logits")
             loss_fn_kwargs["logits_dtype"] = kwargs.pop(
                 "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
             )
-            loss_fn_kwargs["projection_dtype"] = projection_dtype
+            # Project like the model's head: a Float32LogitsLinear head writes FP32 logits.
+            unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+            fp32_head = isinstance(_get_lm_head_module(unwrapped), Float32LogitsLinear)
+            loss_fn_kwargs["projection_dtype"] = torch.float32 if fp32_head else None
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),
