@@ -385,17 +385,13 @@ override-dependencies = [
 ]
 prerelease = "allow"
 
-[tool.uv.extra-build-variables.deep-ep]
-CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
-
-[tool.uv.extra-build-variables.mixture-of-kittens]
-CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
-LIBRARY_PATH = "/usr/local/cuda/lib64/stubs"
-
-[tool.uv.extra-build-variables.transformer-engine-torch]
-CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl"
-NVTE_BUILD_USE_NVIDIA_WHEELS = "1"
-NVTE_WITH_NCCL_EP = "0"
+# Keep each package's variables on one line. NeMo-CI's Rubin build profile (STRIP_TE)
+# deletes every line of this file that names the TE package; a multi-line sub-table
+# would leave its keys behind in the preceding table and fail to parse.
+[tool.uv.extra-build-variables]
+deep-ep = { CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl" }
+mixture-of-kittens = { CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl", LIBRARY_PATH = "/usr/local/cuda/lib64/stubs" }
+transformer-engine-torch = { CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl", NVTE_BUILD_USE_NVIDIA_WHEELS = "1", NVTE_WITH_NCCL_EP = "0" }
 
 [tool.uv.sources]
 mamba-ssm = { git = "https://github.com/akoumpa/cute-mamba.git", rev = "a8b8882fa03668613f7b06831950d504a03b647a" }
