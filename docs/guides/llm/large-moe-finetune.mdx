@@ -138,6 +138,10 @@ The following advanced settings apply only when `dispatcher: hybridep`:
 
 Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. A value that improves performance on one GPU architecture or topology might reduce performance on another.
 
+NeMo AutoModel also supports additional token dispatchers. See
+[MoE Backends and Dispatchers](/development/moe-backends) for the available
+options, their requirements, and configuration details.
+
 ## Launch Training
 
 NeMo AutoModel supports direct Slurm submission, local interactive runs through the NeMo AutoModel CLI, and external `torchrun`. For full details on Slurm batch jobs, multi-node configuration, environment variables, and other launch options, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
