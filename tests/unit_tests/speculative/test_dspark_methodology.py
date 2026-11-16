@@ -268,6 +268,37 @@ def test_chunked_probability_distance_matches_reference_and_gradient():
     torch.testing.assert_close(draft.grad, chunked_grad)
 
 
+def test_chunked_probability_distance_backward_writes_full_gradient_once():
+    """The chunked backward produces the full-vocab gradient once, not once per chunk."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    rows, vocab = 12, 7
+
+    class CountFullSizeResults(TorchDispatchMode):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ops = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            if not func.is_view and isinstance(out, torch.Tensor) and out.numel() == rows * vocab:
+                self.ops.append(str(func))
+            return out
+
+    torch.manual_seed(5)
+    draft = torch.randn(rows, vocab, requires_grad=True)
+    target = torch.randn(rows, vocab)
+    distance = loss_module._compute_l1_dist_per_token(draft_logits=draft, aligned_target_logits=target, chunk_size=2)
+    upstream = torch.randn_like(distance)
+    with CountFullSizeResults() as mode:
+        distance.backward(upstream)
+
+    assert len(mode.ops) == 1, mode.ops
+    expected = (draft.softmax(dim=-1) - target.softmax(dim=-1)).abs().sum(dim=-1)
+    (expected_grad,) = torch.autograd.grad(expected, draft, upstream)
+    torch.testing.assert_close(draft.grad, expected_grad)
+
+
 def test_anchor_candidates_require_two_consecutive_supervised_tokens():
     """A position is a valid anchor only if it and its first draft target are supervised."""
     loss_mask = torch.tensor([[1, 1, 0, 1, 1, 1]], dtype=torch.uint8)
