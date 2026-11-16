@@ -27,13 +27,16 @@ A checkpoint whose config sets ``ple_embedding_dtype: float8_e4m3fn`` stores
 the table as FP8 shards plus one global BF16 ``weight_scale``.  That table is a
 frozen host table outside the model's state dict: :meth:`from_hf` checks the
 checkpoint format and loads the table and its scale directly from the
-checkpoint directory, and the shards never pass through the DCP read.
+checkpoint directory, and the shards never pass through the DCP read.  That
+directory is the one the checkpointer reads the base weights from
+(:meth:`Qwen3_8_FlashNextStateDictAdapter.set_base_checkpoint_dir`).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import struct
 from collections.abc import Iterable
@@ -41,7 +44,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from huggingface_hub import snapshot_download
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
@@ -91,7 +93,12 @@ def _local_safetensors_weight_map(checkpoint_dir: Path) -> dict[str, str] | None
 
 
 def _local_checkpoint_dir(name_or_path: str | None) -> Path | None:
-    """Return the local folder of a named checkpoint: the path itself or its Hugging Face cache snapshot.
+    """Return the folder of a model's named local checkpoint.
+
+    A Hub ID is not resolved here: a second resolution could select another
+    revision than the one the base weights load from. The checkpointer names
+    the resolved snapshot through
+    :meth:`Qwen3_8_FlashNextStateDictAdapter.set_base_checkpoint_dir` instead.
 
     Args:
         name_or_path: The model's ``name_or_path``; empty for a model built
@@ -101,20 +108,17 @@ def _local_checkpoint_dir(name_or_path: str | None) -> Path | None:
         The folder, or ``None`` for a model without a named checkpoint.
 
     Raises:
-        RuntimeError: If a named checkpoint has no local copy.
+        RuntimeError: If a named checkpoint is not a local directory.
     """
     if not name_or_path:
         return None
     path = Path(name_or_path)
     if path.is_dir():
         return path
-    try:
-        return Path(snapshot_download(str(name_or_path), local_files_only=True))
-    except (OSError, ValueError) as error:
-        raise RuntimeError(
-            f"Checkpoint {name_or_path!r} has no local copy, so the Qwen3.8-Flash-Next PLE table format cannot be "
-            "checked"
-        ) from error
+    raise RuntimeError(
+        f"Checkpoint {name_or_path!r} is not a local directory, and the checkpointer named no base checkpoint "
+        "directory: the Qwen3.8-Flash-Next PLE table is read only from the snapshot that the base weights load from"
+    )
 
 
 def _safetensors_layouts(
@@ -143,8 +147,10 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
             embedding, or the frozen FP8 host table when
             ``config.ple_embedding_dtype`` is ``"float8_e4m3fn"``.
         dtype: Native parameter dtype.
-        pretrained_model_name_or_path: Checkpoint directory. The FP8 table is
-            read from it directly, so FP8 checkpoints must be local.
+        pretrained_model_name_or_path: The model's checkpoint name or local
+            directory. The table is read from the directory that the
+            checkpointer names through :meth:`set_base_checkpoint_dir`; this
+            path is used only when no directory was named and it is local.
     """
 
     _supports_low_memory_dcp_load = True
@@ -178,6 +184,7 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         ]
         self._table_scale_key = f"{self._table_hf_prefix}.weight_scale"
         self._view_loaded_native_keys: set[str] = set()
+        self._base_checkpoint_dir: Path | None = None
 
         self._fp8_table = config.ple_embedding_dtype == QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE
         if self._fp8_table != isinstance(engram_table, Qwen3_8_FlashNextHostNGramTable):
@@ -203,6 +210,20 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
     def view_loaded_native_keys(self) -> set[str]:
         """Return native parameters already populated through checkpoint views."""
         return set(self._view_loaded_native_keys)
+
+    def set_base_checkpoint_dir(self, checkpoint_dir: str | os.PathLike[str]) -> None:
+        """Record the directory that the checkpointer reads the base weights from.
+
+        The checkpointer calls this before a base-checkpoint load with the
+        snapshot it resolved (a Hub ID and revision, cache directory and
+        subfolder included). :meth:`from_hf` then reads the PLE table format,
+        and an FP8 table with its scale, from this directory, so the table and
+        every other weight come from one snapshot.
+
+        Args:
+            checkpoint_dir: Local directory of the base checkpoint.
+        """
+        self._base_checkpoint_dir = Path(checkpoint_dir)
 
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
         """Return the rank-independent global HF key set without gathering PLE.
@@ -344,10 +365,11 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
                     unchecked_views.append(key)
         if unchecked_views and not format_checked:
             # The checkpoint reader casts into these BF16 destinations, so their stored dtype is not visible here.
-            if self.pretrained_model_name_or_path:
+            if self._base_checkpoint_dir is not None or self.pretrained_model_name_or_path:
                 raise RuntimeError(
                     f"Cannot check the stored format of {len(unchecked_views)} PLE table shards: checkpoint "
-                    f"{self.pretrained_model_name_or_path!r} has no local safetensors files"
+                    f"{str(self._base_checkpoint_dir or self.pretrained_model_name_or_path)!r} has no local "
+                    "safetensors files"
                 )
             # A model built from a config has no base checkpoint; it loads tables that it saved itself.
             logger.warning(
@@ -370,16 +392,18 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
             the supplied tensors.
 
         Raises:
-            RuntimeError: On a format mismatch, for a named checkpoint without
-                a local copy, or for an FP8 table without a local safetensors
+            RuntimeError: On a format mismatch, for a named checkpoint that is
+                not a local directory when the checkpointer named no base
+                directory, or for an FP8 table without a local safetensors
                 checkpoint.
         """
-        checkpoint_dir = _local_checkpoint_dir(self.pretrained_model_name_or_path)
+        checkpoint_dir = self._base_checkpoint_dir or _local_checkpoint_dir(self.pretrained_model_name_or_path)
         weight_map = None if checkpoint_dir is None else _local_safetensors_weight_map(checkpoint_dir)
         if weight_map is None:
             if self._fp8_table:
                 raise RuntimeError(
                     "The FP8 Qwen3.8-Flash-Next PLE table is read from a local safetensors checkpoint; got "
+                    f"checkpoint directory {checkpoint_dir} and "
                     f"pretrained_model_name_or_path={self.pretrained_model_name_or_path!r}"
                 )
             return False

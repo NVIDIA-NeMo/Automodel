@@ -549,7 +549,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     ) -> Qwen3_8_FlashNextForConditionalGeneration:
         """Construct architecture from a local/HF config before checkpoint load."""
         config = Qwen3_8_FlashNextConfig.from_pretrained(pretrained_model_name_or_path)
-        # The state-dict adapter reads the FP8 PLE table from this directory.
+        # The state-dict adapter reads the FP8 PLE table from the directory that the checkpointer
+        # loads the base weights from; it uses this path only when no such directory was named.
         config.name_or_path = pretrained_model_name_or_path
         config.language_model_only = True
         model = cls.from_config(config, *model_args, **kwargs)

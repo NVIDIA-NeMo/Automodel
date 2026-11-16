@@ -25,13 +25,15 @@ from typing import NamedTuple
 import pytest
 import torch
 import torch.multiprocessing as mp
+from huggingface_hub import constants as huggingface_constants
 from safetensors.torch import save_file
 from torch import nn
 
 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen3_8_flash_next import engram as engram_module
-from nemo_automodel.components.models.qwen3_8_flash_next import state_dict_adapter as adapter_module
 from nemo_automodel.components.models.qwen3_8_flash_next.config import (
     Qwen3_8_FlashNextConfig,
     Qwen3_8_FlashNextTextConfig,
@@ -83,6 +85,7 @@ def _write_checkpoint(
     scale: torch.Tensor | None,
     drop_shards: tuple[int, ...] = (),
     prefix: str = _PREFIX,
+    extra_tensors: dict[str, torch.Tensor] | None = None,
 ) -> Path:
     """Write a two-file sharded PLE table, an optional scale file, and an index.
 
@@ -92,6 +95,7 @@ def _write_checkpoint(
         scale: Optional tensor of shape ``[1]`` stored under the scale key.
         drop_shards: Shard indices to leave out of the checkpoint.
         prefix: Checkpoint name prefix of the PLE table.
+        extra_tensors: Other tensors of the checkpoint; ``lm_head.weight`` when omitted.
     """
     path.mkdir(parents=True)
     weight_map: dict[str, str] = {}
@@ -106,8 +110,10 @@ def _write_checkpoint(
     if scale is not None:
         files["model-ple-scale.safetensors"] = {f"{prefix}.weight_scale": scale}
         weight_map[f"{prefix}.weight_scale"] = "model-ple-scale.safetensors"
-    files["model-embed.safetensors"] = {"lm_head.weight": torch.zeros(2, 3, dtype=torch.bfloat16)}
-    weight_map["lm_head.weight"] = "model-embed.safetensors"
+    if extra_tensors is None:
+        extra_tensors = {"lm_head.weight": torch.zeros(2, 3, dtype=torch.bfloat16)}
+    files["model-embed.safetensors"] = dict(extra_tensors)
+    weight_map.update(dict.fromkeys(extra_tensors, "model-embed.safetensors"))
     for file_name, tensors in files.items():
         save_file(tensors, str(path / file_name))
     (path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
@@ -568,27 +574,18 @@ def test_fp8_needs_a_local_checkpoint(tmp_path: Path) -> None:
 
 def test_named_checkpoint_without_local_copy_is_an_error(tmp_path: Path) -> None:
     table = Qwen3_8_FlashNextEngramTableConfig(num_embeddings=16, embedding_dim=_DIM).build(process_group=None)
-    with pytest.raises(RuntimeError, match="has no local copy"):
+    with pytest.raises(RuntimeError, match="is not a local directory"):
         _adapter(tmp_path / "missing-checkpoint", table, None).from_hf({})
 
 
-def test_hub_id_is_checked_through_its_cached_snapshot(
-    fp8_checkpoint: _Checkpoint, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    requested = []
-
-    def _cached_snapshot(repo_id: str, *, local_files_only: bool) -> str:
-        requested.append((repo_id, local_files_only))
-        return str(fp8_checkpoint.path)
-
-    monkeypatch.setattr(adapter_module, "snapshot_download", _cached_snapshot)
+def test_hub_id_is_read_from_the_directory_the_checkpointer_names(fp8_checkpoint: _Checkpoint, tmp_path: Path) -> None:
     table = _host_table(tmp_path / "shm")
     adapter = Qwen3_8_FlashNextStateDictAdapter(
         _text_config(_FP8), _moe_config(), _backend(), table, pretrained_model_name_or_path="org/model"
     )
+    adapter.set_base_checkpoint_dir(fp8_checkpoint.path)
     adapter.from_hf({})
-    assert requested == [("org/model", True)]
-    assert table.rows is not None
+    assert torch.equal(table.rows, fp8_checkpoint.table.view(torch.uint8))
 
 
 def test_bf16_views_of_named_checkpoint_without_safetensors_are_an_error(tmp_path: Path) -> None:
@@ -753,3 +750,87 @@ def test_fp8_cuda_lookup_matches_cpu_bitwise(fp8_checkpoint: _Checkpoint, tmp_pa
     cuda_values = table(ids.cuda())
     assert cuda_values.device.type == "cuda"
     assert torch.equal(_bits(cuda_values.cpu()), _bits(table(ids)))
+
+
+class _TinyFP8CheckpointModel(HFCheckpointingMixin, nn.Module):
+    """Minimal model with the production PLE hierarchy, an FP8 host table, and one trainable parameter."""
+
+    def __init__(self, name_or_path: str, host_dir: Path) -> None:
+        super().__init__()
+        self.config = _text_config(_FP8)
+        self.ordinary = nn.Parameter(torch.zeros(3))
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+        ple = nn.Module()
+        ple.ple_embedding = nn.Module()
+        # A plain attribute, as in the model: the host table is not a submodule.
+        ple.ple_embedding.ngram_embedding = _host_table(host_dir)
+        self.model.language_model.layers[1].ple = ple
+        self.state_dict_adapter = Qwen3_8_FlashNextStateDictAdapter(
+            _text_config(_FP8),
+            _moe_config(),
+            _backend(),
+            ple.ple_embedding.ngram_embedding,
+            dtype=torch.float32,
+            pretrained_model_name_or_path=name_or_path,
+        )
+        # ``apply_model_infrastructure`` records this key list before sharding in production.
+        self._pre_shard_hf_state_dict_keys = self.state_dict_adapter.get_hf_state_dict_keys(self.state_dict())
+
+    @property
+    def table(self) -> Qwen3_8_FlashNextHostNGramTable:
+        return self.model.language_model.layers[1].ple.ple_embedding.ngram_embedding
+
+
+def _write_model_checkpoint(path: Path, table: torch.Tensor, scale: torch.Tensor, ordinary: torch.Tensor) -> Path:
+    """Write an FP8-table checkpoint that also holds the tiny model's trainable parameter."""
+    _write_checkpoint(path, table=table, scale=scale, extra_tensors={"ordinary": ordinary})
+    return path
+
+
+def _checkpointer(checkpoint_dir: Path, *, repo_id: str | None = None):
+    return CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(checkpoint_dir),
+        model_save_format="safetensors",
+        model_repo_id=repo_id,
+        save_consolidated=True,
+        is_peft=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+
+
+def test_base_load_reads_the_table_from_the_snapshot_the_checkpointer_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two cached snapshots of one Hub repository: ``main`` points at A, the run requests B.
+    repo = tmp_path / "hub" / "models--org--tiny"
+    sha_a, sha_b = "a" * 40, "b" * 40
+    table_a = _finite_fp8_table(_ROWS, _DIM, seed=11)
+    table_b = (-table_a.to(torch.float32)).to(torch.float8_e4m3fn)
+    scale_b = torch.tensor([_CHECKPOINT_SCALE], dtype=torch.bfloat16)
+    _write_model_checkpoint(repo / "snapshots" / sha_a, table_a, scale_b * 2, torch.full((3,), 1.0))
+    snapshot_b = _write_model_checkpoint(repo / "snapshots" / sha_b, table_b, scale_b, torch.full((3,), 2.0))
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text(sha_a)
+    monkeypatch.setattr(huggingface_constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
+
+    model = _TinyFP8CheckpointModel("org/tiny", tmp_path / "shm")
+    checkpointer = _checkpointer(tmp_path / "out")
+    try:
+        # The native loader resolves revision B to its snapshot and passes that directory.
+        checkpointer.load_base_model(model, torch.device("cpu"), str(tmp_path / "hub"), str(snapshot_b))
+    finally:
+        checkpointer.close()
+
+    assert torch.equal(model.ordinary.detach(), torch.full((3,), 2.0))
+    assert torch.equal(model.table.rows, table_b.view(torch.uint8))
+    assert torch.equal(model.table.scale, scale_b)
+
+
+def test_named_checkpoint_needs_the_checkpointer_snapshot(tmp_path: Path) -> None:
+    # The adapter never resolves a Hub ID by itself; only the checkpointer names the snapshot.
+    adapter = _adapter(None, _host_table(tmp_path / "shm"), _FP8)
+    adapter.pretrained_model_name_or_path = "org/tiny"
+    with pytest.raises(RuntimeError, match="is not a local directory"):
+        adapter.from_hf({})
