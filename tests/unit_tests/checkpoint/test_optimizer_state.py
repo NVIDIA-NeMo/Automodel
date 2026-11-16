@@ -475,3 +475,80 @@ def test_optimizer_checkpoint_restores_group_mults(tmp_path, native):
     assert [g["weight_decay"] for g in resumed_optimizer.param_groups] == pytest.approx([0.1, 0.0, 0.0])
     assert [g["lr"] for g in resumed_optimizer.param_groups] == pytest.approx([1e-3, 1e-3, 5e-3])
     _assert_adam_states_equal(resumed_optimizer, optimizer)
+
+
+def _te_fused_adam_fixture():
+    te_optim = pytest.importorskip("transformer_engine.pytorch.optimizers")
+    torch.manual_seed(0)
+    model = nn.Linear(32, 16, bias=False).cuda().to(torch.bfloat16)
+    optimizer = te_optim.FusedAdam(
+        model.parameters(),
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+        master_weights=True,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+        store_param_remainders=True,
+    )
+    return model, optimizer
+
+
+def _step_te_fused_adam(model, optimizer, steps):
+    for _ in range(steps):
+        loss = model(torch.randn(4, 32, device="cuda", dtype=torch.bfloat16)).float().pow(2).mean()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+
+def _sum_sq_second_moments(optimizer):
+    return sum(
+        float((state["exp_avg_sq"].detach().float() ** 2).sum())
+        for state in optimizer.state.values()
+        if isinstance(state, dict) and state.get("exp_avg_sq") is not None
+    )
+
+
+@pytest.mark.run_only_on("GPU")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_native_te_fused_adam_state_round_trip_restores_moments_and_step(tmp_path):
+    """Native (index-keyed) optimizer checkpoints must restore TE FusedAdam moments and the group step.
+
+    Regression test: a fresh FusedAdam has an empty ``state`` and no group ``step``, so before the fix the DCP load
+    template built from it read nothing from the checkpoint and the resumed optimizer stayed fresh without any error.
+    """
+    model, optimizer = _te_fused_adam_fixture()
+    _step_te_fused_adam(model, optimizer, 3)
+    saved_step = optimizer.param_groups[0]["step"]
+    saved_sq = _sum_sq_second_moments(optimizer)
+    assert saved_step == 3 and saved_sq > 0.0
+
+    checkpointer = _make_peft_ep_checkpointer(tmp_path)
+    checkpointer.save_optimizer(optimizer, model, str(tmp_path))
+
+    model2, optimizer2 = _te_fused_adam_fixture()
+    template = OptimizerState(model2, optimizer2, is_peft=True, has_expert_parallelism=True).state_dict()
+    assert len(template["optim"]["state"]) == 1, "load template must carry the per-parameter state"
+    assert "step" in template["optim"]["param_groups"][0], "load template must carry the group step"
+
+    checkpointer.load_optimizer(optimizer2, model2, str(tmp_path))
+    assert optimizer2.param_groups[0]["step"] == saved_step
+    assert _sum_sq_second_moments(optimizer2) == pytest.approx(saved_sq, rel=1e-6)
+
+
+@pytest.mark.run_only_on("GPU")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_native_optimizer_load_rejects_silent_noop():
+    """A native load that leaves the optimizer fresh must raise instead of continuing with fresh Adam."""
+    from nemo_automodel.components.checkpoint.stateful_wrappers import _verify_native_optimizer_state_restored
+
+    model, optimizer = _te_fused_adam_fixture()
+    _step_te_fused_adam(model, optimizer, 1)
+    loaded = optimizer.state_dict()
+
+    _, fresh = _te_fused_adam_fixture()
+    with pytest.raises(RuntimeError, match="not restored"):
+        _verify_native_optimizer_state_restored(fresh, loaded)
+    _verify_native_optimizer_state_restored(optimizer, loaded)
