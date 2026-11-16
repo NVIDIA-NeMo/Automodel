@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe with 8 H100 nodes (64 GPUs)
-#   torchrun --nproc-per-node 8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml --nproc-per-node 8
+# Run on each of 8 H100 nodes (64 GPUs). Set NODE_RANK, MASTER_ADDR, MASTER_PORT.
+# torchrun --nnodes=8 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+#   --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+#   -m nemo_automodel.cli.app examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml
 
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -22,7 +24,7 @@ seed: 1234
 
 step_scheduler:
   global_batch_size: 512  #PR4637: 256
-  local_batch_size: 16  #PR4637: 8
+  local_batch_size: 2   #PR4637: 8
   ckpt_every_steps: 500
   val_every_steps: 500
   gc_every_steps: 100  #PR4637: 10
@@ -121,15 +123,17 @@ dataset:
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+  padding: false
 
 packed_sequence:
-  packed_sequence_size: 0
+  # local_batch_size counts packed rows, not individual documents.
+  packed_sequence_size: 4096
+  packing_strategy: thd
+  pad_to_multiple_of: 64
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
 validation_dataset:
@@ -139,14 +143,14 @@ validation_dataset:
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+  padding: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: false
   drop_last: true
+  batch_size: 1
 
 optimizer:
   #PR4637: removed optimizer.fused: true
