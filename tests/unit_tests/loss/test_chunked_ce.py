@@ -435,18 +435,17 @@ def test_mtp_depths_project_like_the_fp32_logits_head():
 
 
 @pytest.mark.parametrize("recipe", ["llm.train_ft", "vlm.finetune"])
-def test_recipe_checks_linear_losses_against_the_fp32_logits_head(recipe):
+def test_recipe_setup_accepts_an_fp32_logits_head_for_chunked_ce(recipe):
     import importlib
 
-    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
     from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 
     _maybe_downgrade_loss_fn = importlib.import_module(f"nemo_automodel.recipes.{recipe}")._maybe_downgrade_loss_fn
 
     class Model(torch.nn.Module):
-        def __init__(self, dtype: torch.dtype):
+        def __init__(self):
             super().__init__()
-            self.lm_head = Float32LogitsLinear.from_head(torch.nn.Linear(7, 13, bias=False, dtype=dtype))
+            self.lm_head = Float32LogitsLinear.from_head(torch.nn.Linear(7, 13, bias=False, dtype=torch.bfloat16))
 
         def forward(self, input_ids, logits_to_keep=0):
             """Fail if setup runs the model.
@@ -457,11 +456,5 @@ def test_recipe_checks_linear_losses_against_the_fp32_logits_head(recipe):
             """
             raise AssertionError("setup must not run the model")
 
-    model = Model(torch.bfloat16)
-    for loss_fn in (ChunkedCrossEntropy(compile=False), FusedLinearCrossEntropy(impl="cce")):
-        assert _maybe_downgrade_loss_fn(loss_fn, model, False) is loss_fn
-    compiled_fused = FusedLinearCrossEntropy(impl="torch_compile")
-    with pytest.raises(ValueError, match="rounds logits to torch.bfloat16"):
-        _maybe_downgrade_loss_fn(compiled_fused, model, False)
-    # An fp32 head weight projects in fp32, which the compiled projection keeps.
-    assert _maybe_downgrade_loss_fn(compiled_fused, Model(torch.float32), False) is compiled_fused
+    loss_fn = ChunkedCrossEntropy(compile=False)
+    assert _maybe_downgrade_loss_fn(loss_fn, Model(), False) is loss_fn

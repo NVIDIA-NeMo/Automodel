@@ -224,7 +224,8 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, torch.dtype | None], torch.Tensor
         ] = torch.compile(_linear_cross_entropy, dynamic=True) if compile else _linear_cross_entropy
 
-    def validate_lm_head(self, lm_head: nn.Module | None, *, model_config: PretrainedConfig | None = None) -> nn.Linear:
+    @staticmethod
+    def validate_lm_head(lm_head: nn.Module | None, *, model_config: PretrainedConfig | None = None) -> nn.Linear:
         """Validate the head and the owning model's output-logit configuration.
 
         A linear module alone does not rule out post-projection transformations.

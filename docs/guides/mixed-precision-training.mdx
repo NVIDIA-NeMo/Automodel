@@ -273,7 +273,7 @@ Some models compute fp32 logits by design and return them without `logits_dtype`
 | `MaskedCrossEntropy` and other logits-based losses | Supported; they consume the fp32 logits. |
 | `ChunkedCrossEntropy` | Supported; each chunk reproduces the fp32 projection. |
 | `FusedLinearCrossEntropy` with `impl: cce` | Supported; the kernel computes logits in fp32 internally. |
-| `FusedLinearCrossEntropy` with `impl: torch_compile` | Rejected at setup when the head computes in bf16 or fp16, because it rounds logits to that dtype. |
+| `FusedLinearCrossEntropy` with `impl: torch_compile` | Rounds logits to the head's compute dtype, so the loss does not see fp32 logits; use `impl: cce`. |
 
 The fp32 logits tensor is twice the size of bf16 logits. Losses that upcast logits to fp32 already hold a tensor of that size, so measure end-to-end memory for your workload.
 

@@ -68,11 +68,8 @@ from typing import Literal
 import torch
 import torch.distributed as dist
 from packaging.version import Version
-from torch import nn
-from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear, head_compute_dtype
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
 try:
@@ -161,34 +158,6 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
         self.logit_softcapping = logit_softcapping
         self.reduction = reduction
         self.impl = impl
-
-    def validate_lm_head(
-        self, lm_head: nn.Module | None, *, model_config: PretrainedConfig | None = None
-    ) -> nn.Module | None:
-        """Reject ``torch_compile`` for an FP32-logits head with BF16/FP16 operands.
-
-        ``cce`` accumulates logits in FP32; ``torch_compile`` rounds them to the
-        head's compute dtype.
-
-        Args:
-            lm_head: The model's LM head with weight of global shape [vocab, hidden],
-                or None on a pipeline stage that does not own it.
-            model_config: Owning model's configuration, when available.
-
-        Returns:
-            ``lm_head``, unchanged.
-        """
-        if (
-            self.impl != "cce"
-            and isinstance(lm_head, Float32LogitsLinear)
-            and head_compute_dtype(lm_head) in (torch.bfloat16, torch.float16)
-        ):
-            raise ValueError(
-                f"FusedLinearCrossEntropy(impl={self.impl!r}) rounds logits to "
-                f"{head_compute_dtype(lm_head)} and cannot reproduce the FP32-logits LM head; "
-                "use impl='cce', ChunkedCrossEntropy or MaskedCrossEntropy."
-            )
-        return lm_head
 
     def forward(
         self,

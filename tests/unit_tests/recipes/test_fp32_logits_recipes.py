@@ -33,7 +33,6 @@ from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.kd_loss import KDLoss
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm import kd as llm_kd
@@ -208,16 +207,7 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
     _assert_matches_fp32_logits_ce(ce_loss, reference, input_ids, labels, num_label_tokens)
 
 
-@pytest.mark.parametrize(
-    ("loss_fn", "error"),
-    [
-        pytest.param(ChunkedCrossEntropy(compile=False), None, id="chunked"),
-        pytest.param(
-            FusedLinearCrossEntropy(impl="torch_compile"), "rounds logits to torch.bfloat16", id="fused-torch-compile"
-        ),
-    ],
-)
-def test_setup_checks_linear_losses_against_the_fp32_logits_head(monkeypatch, loss_fn, error):
+def test_setup_accepts_chunked_ce_with_the_fp32_logits_head(monkeypatch):
     cfg = ConfigNode(
         {
             "model": {},
@@ -231,15 +221,12 @@ def test_setup_checks_linear_losses_against_the_fp32_logits_head(monkeypatch, lo
             "distributed": {"cp_size": 1},
         }
     )
+    loss_fn = ChunkedCrossEntropy(compile=False)
     _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
     model = _fp32_logits_llama()
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *args, **kwargs: model)
     monkeypatch.setattr(RecipeConfig, "loss_fn", property(lambda self: SimpleNamespace(build=lambda: loss_fn)))
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
-    if error is not None:
-        with pytest.raises(ValueError, match=error):
-            trainer.setup()
-        return
     trainer.setup()
     assert trainer.loss_fn is loss_fn
