@@ -48,6 +48,7 @@ _DSPARK_RELEASED_ARCHITECTURE = "DSparkMiniMaxDraftModel"
 # Draft fields inherited from the target. The released draft must agree on them, because the
 # config it exports is what inference engines build the draft from.
 _DSPARK_RELEASED_BACKBONE_FIELDS = (
+    "vocab_size",
     "hidden_size",
     "num_attention_heads",
     "num_key_value_heads",

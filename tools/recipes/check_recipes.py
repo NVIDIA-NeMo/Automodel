@@ -89,7 +89,7 @@ def main() -> int:
         added = _added_recipes(repo_root, args.base_ref, args.head_ref)
         for script, paths in (
             ("tools/lint_example_yamls.py", []),
-            ("tests/ci_tests/utils/validate_nightly_recipes.py", []),
+            ("tests/ci_tests/utils/validate_recipe_lists.py", []),
             ("tests/ci_tests/utils/validate_generate_ci.py", []),
             ("tests/ci_tests/utils/validate_new_recipe_ci.py", added),
         ):

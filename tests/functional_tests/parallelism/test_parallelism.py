@@ -42,6 +42,10 @@ MISTRAL3P5_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Mistral3p5_TP2_Parity.sh"
 
 
 class TestParallelismParity:
+    def test_pp_spawn_dataloader(self) -> None:
+        """Train a sub-million-parameter model with PP2 and spawned workers."""
+        run_test_script(TEST_FOLDER, "L2_Parallelism_PP_Dataloader.sh")
+
     def test_gemma4_pp2_parity(self):
         run_test_script(TEST_FOLDER, GEMMA4_PP2_PARITY_FILENAME)
 

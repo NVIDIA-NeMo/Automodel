@@ -142,6 +142,7 @@ wandb:
   tags: [muse-spark-open, medpix, nonpacked4k, ep64, pp4, fp32-residual]
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 32
