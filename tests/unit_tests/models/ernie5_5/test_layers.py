@@ -208,16 +208,27 @@ def _multimax_oracle(x: torch.Tensor, r: torch.Tensor, t: torch.Tensor) -> torch
         Corrected FP64 logits of shape [..., vocab].
     """
     x, r, t = x.double(), r.double(), t.double()
-    below0, above1 = (r[0] - x).clamp_min(0), (x - r[1]).clamp_min(0)
-    below2, above3 = (r[2] - x).clamp_min(0), (x - r[3]).clamp_min(0)
+    # The reference uses ReLU's zero subgradient at a threshold. clamp_min chooses a different
+    # boundary derivative, which matters when BF16 inputs equal the learned thresholds exactly.
+    below0 = torch.where(x < r[0], r[0] - x, torch.zeros_like(x))
+    above1 = torch.where(x > r[1], x - r[1], torch.zeros_like(x))
+    below2 = torch.where(x < r[2], r[2] - x, torch.zeros_like(x))
+    above3 = torch.where(x > r[3], x - r[3], torch.zeros_like(x))
     return x + t[0] * below0 + t[1] * above1 + t[2] * below2**2 + t[3] * above3**2
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_forward_and_backward_against_fp64(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("at_thresholds", [False, True], ids=["random", "thresholds_and_neighbors"])
+def test_forward_and_backward_against_fp64(dtype: torch.dtype, at_thresholds: bool) -> None:
     generator = torch.Generator().manual_seed(55)
-    logits = torch.randn(530, 2, 7, generator=generator, dtype=dtype).requires_grad_()
-    weight = torch.randn(logits.shape, generator=generator, dtype=dtype)
+    if at_thresholds:
+        # Include every threshold and both sides of each, independently of random BF16 rounding.
+        values = [-0.5, 0.75, -1.25, 1.5, -0.625, -0.375, 0.625, 0.875, -1.375, -1.125, 1.375, 1.625, 0.0, 2.0]
+        logits = torch.tensor(values, dtype=dtype).view(1, 2, 7).requires_grad_()
+        weight = (torch.arange(1, 15, dtype=torch.float32).view_as(logits) / 3).to(dtype)
+    else:
+        logits = torch.randn(530, 2, 7, generator=generator, dtype=dtype).requires_grad_()
+        weight = torch.randn(logits.shape, generator=generator, dtype=dtype)
     module = Ernie5_5MultiMax(dtype=dtype)
     with torch.no_grad():
         module.multimax_ranges.copy_(torch.tensor([-0.5, 0.75, -1.25, 1.5]))
@@ -229,6 +240,10 @@ def test_forward_and_backward_against_fp64(dtype: torch.dtype) -> None:
     actual = module(logits)
     expected.backward(weight.double())
     actual.backward(weight)
+    if at_thresholds:
+        # At r0 and r1 the only remaining input derivative is the identity term, exactly one.
+        torch.testing.assert_close(ref_x.grad[0, 0, :2], weight[0, 0, :2].double(), rtol=0, atol=0)
+        torch.testing.assert_close(logits.grad[0, 0, :2], weight[0, 0, :2], rtol=0, atol=0)
     rtol, atol = (0.02, 0.02) if dtype == torch.bfloat16 else (1e-5, 1e-5)
     torch.testing.assert_close(actual.float(), expected.detach().float(), rtol=rtol, atol=atol)
     torch.testing.assert_close(logits.grad.float(), ref_x.grad.float(), rtol=rtol, atol=atol)
