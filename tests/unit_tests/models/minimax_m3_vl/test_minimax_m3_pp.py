@@ -202,13 +202,18 @@ def test_stage0_consumes_pp_media_chunks(vlm_model):
     # Stage 0: keep embed_tokens + all layers, but route through the chunk path
     # with pixel_values omitted from the call, as the PP schedule does.
     m = copy.deepcopy(vlm_model)
-    m._vlm_pixel_values_chunks = [pixel_values]
-    m._vlm_image_grid_hws_chunks = [grid_tensor]
+    m._vlm_pixel_values_chunks = [pixel_values[:0], pixel_values]
+    m._vlm_image_grid_hws_chunks = [grid_tensor[:0], grid_tensor]
     m._vlm_chunk_idx = 0
+    text_ids = torch.full_like(ids, 3)
     with torch.no_grad():
+        direct_text = vlm_model(text_ids)
+        staged_text = m(text_ids)
+        assert m._vlm_chunk_idx == 1
         via_chunks = m(ids)  # no pixel_values in the call -> must come from chunks
 
-    assert m._vlm_chunk_idx == 1, "media chunk cursor did not advance"
+    torch.testing.assert_close(staged_text, direct_text)
+    assert m._vlm_chunk_idx == 2, "media chunk cursor did not advance"
     torch.testing.assert_close(via_chunks, direct, rtol=1e-4, atol=1e-4)
 
     # Guard against the regression: without the chunk plumbing the image positions

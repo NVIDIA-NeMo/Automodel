@@ -25,9 +25,68 @@ Mirrors the canonical sglang reference ``sglang.srt.configs.minimax_vl`` and the
 field set in the checkpoint's ``config.json``; keep them in sync.
 """
 
-from typing import Any, Required, TypedDict, Union
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, Required, TypedDict, Union
 
 from transformers.configuration_utils import PretrainedConfig
+from transformers.utils.hub import cached_file
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
+
+
+logger = logging.getLogger(__name__)
+
+_DSPARK_DRAFT_ATTN_IMPLEMENTATION = "flex_attention"
+_DSPARK_RELEASED_ARCHITECTURE = "DSparkMiniMaxDraftModel"
+# Draft fields inherited from the target. The released draft must agree on them, because the
+# config it exports is what inference engines build the draft from.
+_DSPARK_RELEASED_BACKBONE_FIELDS = (
+    "vocab_size",
+    "hidden_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "rms_norm_eps",
+    "use_gemma_norm",
+    "rope_theta",
+    "rotary_dim",
+    "partial_rotary_factor",
+    "swiglu_alpha",
+    "swiglu_limit",
+)
+_DSPARK_RELEASED_REQUIRED_FIELDS = (
+    *_DSPARK_RELEASED_BACKBONE_FIELDS,
+    "dspark_block_size",
+    "dspark_ffn_hidden_size",
+    "dspark_markov_head_type",
+    "dspark_markov_rank",
+    "dspark_noise_token_id",
+    "dspark_target_layer_ids",
+    "dspark_use_dense_ffn",
+    "layer_types",
+    "sliding_window",
+)
+
+
+class _DSparkDraftOptions(Protocol):
+    """Declarative DSpark settings supplied by the generic training recipe."""
+
+    num_draft_layers: int
+    target_layer_ids: list[int]
+    block_size: int
+    num_anchors: int
+    mask_token_id: int
+    markov_rank: int
+    markov_head_type: str
+    confidence_head_alpha: float
+    confidence_head_with_markov: bool
 
 
 class MiniMaxM3QuantizationConfig(TypedDict, total=False):
@@ -252,3 +311,225 @@ class MiniMaxM3VLConfig(PretrainedConfig):
 
     def to_dict(self):
         return _json_safe_value(super().to_dict())
+
+    def build_dspark_draft(self, options: _DSparkDraftOptions) -> MiniMaxM3DSparkModel:
+        """Build the model-owned DSpark draft.
+
+        A target that ships ``dspark/config.json`` fixes the draft contract, and
+        ``options`` must agree with it.
+
+        Args:
+            options: Declarative draft settings supplied by the DSpark recipe.
+
+        Returns:
+            Newly initialized draft ready for device placement.
+        """
+        return MiniMaxM3DSparkConfig(
+            text_config=self.text_config,
+            num_draft_layers=int(options.num_draft_layers),
+            target_layer_ids=tuple(int(layer_id) for layer_id in options.target_layer_ids),
+            block_size=int(options.block_size),
+            num_anchors=int(options.num_anchors),
+            mask_token_id=int(options.mask_token_id),
+            markov_rank=int(options.markov_rank),
+            markov_head_type=str(options.markov_head_type),
+            confidence_head_alpha=float(options.confidence_head_alpha),
+            confidence_head_with_markov=bool(options.confidence_head_with_markov),
+            released=MiniMaxM3DSparkReleasedConfig.from_target(self.name_or_path),
+        ).build()
+
+
+@dataclass(frozen=True)
+class MiniMaxM3DSparkReleasedConfig:
+    """Draft contract read from a target checkpoint's ``dspark/config.json``.
+
+    Attributes:
+        num_draft_layers: Number of draft decoder layers.
+        target_layer_ids: Target layers whose features the draft consumes.
+        block_size: Number of tokens drafted per anchor.
+        mask_token_id: Vocabulary id of the noise token.
+        markov_rank: Rank of the Markov head.
+        markov_head_type: Markov head variant.
+        ffn_hidden_size: Hidden width of the draft's dense FFN.
+        sliding_window: Context window of every draft layer, in tokens.
+        exported_config: Released config without quantization metadata, written
+            next to the draft weights because the export is not quantized.
+    """
+
+    num_draft_layers: int
+    target_layer_ids: tuple[int, ...]
+    block_size: int
+    mask_token_id: int
+    markov_rank: int
+    markov_head_type: str
+    ffn_hidden_size: int
+    sliding_window: int
+    exported_config: dict[str, Any]
+
+    @classmethod
+    def from_target(cls, target_name_or_path: str) -> MiniMaxM3DSparkReleasedConfig | None:
+        """Read the contract a target checkpoint ships for its DSpark draft.
+
+        Args:
+            target_name_or_path: Hub id or local directory of the target checkpoint.
+
+        Returns:
+            The parsed contract, or None when the target has no ``dspark/config.json``.
+
+        Raises:
+            ValueError: If the file does not describe a dense, sliding-window
+                ``DSparkMiniMaxDraftModel``.
+        """
+        if not target_name_or_path:
+            return None
+        path = cached_file(
+            target_name_or_path,
+            "config.json",
+            subfolder="dspark",
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if path is None:
+            logger.warning(
+                "%s has no dspark/config.json, so the MiniMax M3 DSpark draft takes its FFN width from "
+                "intermediate_size, has no sliding window, and exports native keys.",
+                target_name_or_path,
+            )
+            return None
+        with open(path, encoding="utf-8") as f:
+            released = json.load(f)
+
+        text_config = released["text_config"]
+        missing = sorted(set(_DSPARK_RELEASED_REQUIRED_FIELDS) - set(text_config))
+        if missing:
+            raise ValueError(f"{path} is missing text_config fields {missing}.")
+        layer_types = text_config["layer_types"]
+        if (
+            released["architectures"] != [_DSPARK_RELEASED_ARCHITECTURE]
+            or not text_config["dspark_use_dense_ffn"]
+            or set(layer_types) != {"sliding_attention"}
+        ):
+            raise ValueError(
+                f"{path} must describe a dense, sliding-window {_DSPARK_RELEASED_ARCHITECTURE}, got "
+                f"architectures={released['architectures']}, "
+                f"dspark_use_dense_ffn={text_config['dspark_use_dense_ffn']}, layer_types={layer_types}."
+            )
+
+        exported_config = copy.deepcopy(released)
+        exported_config.pop("quantization_config", None)
+        exported_config["text_config"].pop("quantization_config", None)
+        return cls(
+            num_draft_layers=len(layer_types),
+            target_layer_ids=tuple(text_config["dspark_target_layer_ids"]),
+            block_size=text_config["dspark_block_size"],
+            mask_token_id=text_config["dspark_noise_token_id"],
+            markov_rank=text_config["dspark_markov_rank"],
+            markov_head_type=text_config["dspark_markov_head_type"],
+            ffn_hidden_size=text_config["dspark_ffn_hidden_size"],
+            sliding_window=text_config["sliding_window"],
+            exported_config=exported_config,
+        )
+
+
+@dataclass(frozen=True)
+class MiniMaxM3DSparkConfig:
+    """Validated settings of the MiniMax M3 DSpark draft.
+
+    Attributes:
+        text_config: Text configuration of the target model.
+        num_draft_layers: Number of draft decoder layers.
+        target_layer_ids: Target layers whose features the draft consumes.
+        block_size: Number of tokens drafted per anchor.
+        num_anchors: Number of anchors sampled per training row.
+        mask_token_id: Vocabulary id of the noise token.
+        markov_rank: Rank of the Markov head, zero to disable it.
+        markov_head_type: Markov head variant.
+        confidence_head_alpha: Confidence loss weight, zero to disable the head.
+        confidence_head_with_markov: Whether the confidence head reads Markov embeddings.
+        released: Contract shipped by the target checkpoint, when it has one.
+    """
+
+    text_config: MiniMaxM3VLTextConfig
+    num_draft_layers: int
+    target_layer_ids: tuple[int, ...]
+    block_size: int
+    num_anchors: int
+    mask_token_id: int
+    markov_rank: int
+    markov_head_type: str
+    confidence_head_alpha: float
+    confidence_head_with_markov: bool
+    released: MiniMaxM3DSparkReleasedConfig | None = None
+
+    def _validate_released(self, released: MiniMaxM3DSparkReleasedConfig) -> None:
+        """Reject recipe settings that disagree with the target's released contract."""
+        for name in (
+            "num_draft_layers",
+            "target_layer_ids",
+            "block_size",
+            "mask_token_id",
+            "markov_rank",
+            "markov_head_type",
+        ):
+            expected, actual = getattr(released, name), getattr(self, name)
+            if actual != expected:
+                raise ValueError(f"MiniMax M3 DSpark requires {name}={expected} from the target, got {actual}.")
+        released_text_config = released.exported_config["text_config"]
+        for name in _DSPARK_RELEASED_BACKBONE_FIELDS:
+            expected, actual = released_text_config[name], getattr(self.text_config, name)
+            if actual != expected:
+                raise ValueError(
+                    f"The target's {name}={actual} disagrees with its released MiniMax M3 DSpark draft ({expected})."
+                )
+        if self.confidence_head_alpha <= 0 or not self.confidence_head_with_markov:
+            raise ValueError(
+                "The released MiniMax M3 DSpark draft requires a Markov-conditioned confidence head, got "
+                f"confidence_head_alpha={self.confidence_head_alpha}, "
+                f"confidence_head_with_markov={self.confidence_head_with_markov}."
+            )
+
+    def build(self) -> MiniMaxM3DSparkModel:
+        """Validate the settings and build the draft.
+
+        Returns:
+            Newly initialized draft ready for device placement.
+
+        Raises:
+            ValueError: If a setting is out of range or disagrees with ``released``.
+        """
+        from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
+        from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
+
+        if not math.isfinite(self.confidence_head_alpha) or self.confidence_head_alpha < 0:
+            raise ValueError(f"confidence_head_alpha must be finite and >= 0, got {self.confidence_head_alpha}.")
+        if self.markov_rank < 0:
+            raise ValueError(f"markov_rank must be >= 0, got {self.markov_rank}.")
+        if self.released is not None:
+            self._validate_released(self.released)
+
+        num_target_layers = self.text_config.num_hidden_layers
+        target_layer_ids = validate_target_layer_ids(self.target_layer_ids, num_target_layers)
+        enable_confidence_head = self.confidence_head_alpha > 0.0
+
+        draft_config = copy.deepcopy(self.text_config)
+        draft_config.architectures = ["MiniMaxM3DSparkModel"]
+        draft_config.target_model_type = "minimax_m3_vl"
+        draft_config.num_target_layers = num_target_layers
+        draft_config.num_hidden_layers = self.num_draft_layers
+        # The draft is always dense: no block-sparse indexer, no MoE, no MTP.
+        draft_config.num_mtp_modules = 0
+        draft_config.tie_word_embeddings = False
+        if self.released is not None:
+            draft_config.intermediate_size = self.released.ffn_hidden_size
+        draft_config = type(draft_config).from_dict(draft_config.to_dict())
+        draft_config._attn_implementation = _DSPARK_DRAFT_ATTN_IMPLEMENTATION
+        draft_config.block_size = self.block_size
+        draft_config.mask_token_id = self.mask_token_id
+        draft_config.target_layer_ids = target_layer_ids
+        draft_config.num_anchors = self.num_anchors
+        draft_config.enable_confidence_head = enable_confidence_head
+        if enable_confidence_head:
+            draft_config.confidence_head_with_markov = self.confidence_head_with_markov
+        draft_config.markov_rank = self.markov_rank
+        if self.markov_rank > 0:
+            draft_config.markov_head_type = self.markov_head_type
+        return MiniMaxM3DSparkModel(draft_config, released=self.released)

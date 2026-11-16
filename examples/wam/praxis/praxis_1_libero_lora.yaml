@@ -1,0 +1,100 @@
+# Fine-tune Praxis-1 with LoRA on the converted LIBERO-Spatial demonstrations
+# (tutorials/praxis-1-libero) on one 8-GPU node: the routed experts are expert parallel over the
+# 8 GPUs (HybridEP token dispatch), everything else is FSDP2-sharded, the optimizer state is fp32.
+# Paths are relative to the working directory; the frozen encoders and the window reader come from
+# the reference `praxis` package (PYTHONPATH).
+recipe: TrainWAMFinetuneRecipe
+seed: 3
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.components.models.praxis.PraxisPolicy.from_pretrained
+  pretrained_model_name_or_path: runwayml/praxis-1-droid
+  backend:
+    _target_: nemo_automodel.components.models.praxis.praxis_backend
+    dispatcher: hybridep  # token exchange of the expert-parallel experts (distributed.ep_size)
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  # LoRA adapters on the modules below; everything else, the routers included, stays frozen.
+  target_modules:
+    - "*backbone.*.attn.*"
+    - "*backbone.*.ffn.*"
+    - "*action_expert.*"
+  dim: 64
+  alpha: 128
+  lora_dtype: float32
+  use_memory_efficient_lora: false
+
+encoders:
+  vae:
+    _target_: nemo_automodel.components.models.praxis.hub.load_vae
+    path: Wan-AI/Wan2.2-TI2V-5B  # the repo of the public Wan2.2 VAE (Wan2.2_VAE.pth), or a local .pth file
+  text_encoder:
+    _target_: nemo_automodel.components.models.praxis.hub.load_text_encoder
+    path: Qwen/Qwen3.5-2B  # or a local directory in the Hugging Face layout
+
+objective:
+  _target_: nemo_automodel.components.models.praxis.objective.ObjectiveSettings
+  text_dropout: 0.1
+  proprio_dropout: 0.1
+  video_timestep_shift: 5.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.wam.episode_windows.EpisodeWindowDataset
+  root: data/libero_episodes/libero_spatial
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: null
+  num_workers: 6
+
+step_scheduler:
+  global_batch_size: 48  # windows per optimizer step: 6 micro-steps of one window per GPU on 8 GPUs
+  local_batch_size: 1
+  num_epochs: 1  # the window stream is endless; max_steps ends the run
+  max_steps: 600
+  ckpt_every_steps: 100
+  save_checkpoint_every_epoch: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 50
+  init_lr: 2.0e-6
+  min_lr: 1.0e-5
+clip_grad_norm:
+  max_norm: 1.0
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  ep_size: 8
+  activation_checkpointing: true
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: runs/libero_spatial_lora
+  model_save_format: safetensors
+  save_consolidated: false  # a LoRA save holds the adapters; lora_export merges them into a checkpoint
+  restore_from: null
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100
+  recipe_owner: HuiyingLi
+  time: "02:30:00"
+  nodes: 1

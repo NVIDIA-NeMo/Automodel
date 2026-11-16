@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache
 
 from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
@@ -203,7 +204,7 @@ class Glm5_2DSparkDecoderLayer(nn.Module):
         hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_value: object | None = None,
+        past_key_value: Cache | None = None,
         use_cache: bool | None = False,
         freqs_cis: torch.Tensor | None = None,
         **kwargs,
@@ -434,7 +435,7 @@ class Glm5_2DSparkModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         noise_embedding: torch.Tensor | None = None,
         target_hidden_states: torch.Tensor | None = None,
-        past_key_values: object | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:

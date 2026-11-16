@@ -137,6 +137,7 @@ optimizer:
 #   dir: <your_wandb_save_dir>
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: HuiyingLi
   nodes: 2
   cluster_tag: gb200

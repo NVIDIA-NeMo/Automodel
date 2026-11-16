@@ -46,6 +46,7 @@ model:
     experts: torch_mm
     dispatcher: hybridep
     gate_precision: float32
+    compile_hc: true  # 4096 fixed tokens per rank: each static mHC core variant compiles once, not per step.
     rope_fusion: false
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -148,6 +149,7 @@ wandb:
   dir: ../logs/wandb
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   nodes: 16
   cluster_tag: gb200

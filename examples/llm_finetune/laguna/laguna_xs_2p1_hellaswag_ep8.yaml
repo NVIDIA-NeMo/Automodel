@@ -107,7 +107,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -137,6 +137,7 @@ wandb:
   mode: online
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   # pp_size(1) * ep_size(8) = 8 GPUs => 1 node (8 H100/node).

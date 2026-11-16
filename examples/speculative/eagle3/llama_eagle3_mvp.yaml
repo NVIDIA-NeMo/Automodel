@@ -83,4 +83,5 @@ checkpoint:
 #   name: ""   # empty -> defaults to eagle3_<target-model-name>
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

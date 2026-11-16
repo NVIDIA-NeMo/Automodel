@@ -1,0 +1,43 @@
+---
+title: "Kimi-K3.1-Pro"
+description: "Fine-tune Kimi-K3.1-Pro on nonpacked MedPix image-text examples with NeMo AutoModel, using its native processor and distributed checkpoint loading."
+slug: model-coverage/vision-language-models/moonshotai/Kimi-K3.1-Pro
+---
+
+[Kimi K3.1 Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) extends the native Kimi K3 implementation with a learned indexer in each of its 24 gated multi-head latent attention (MLA) layers. The indexer selects up to 2,048 causal keys per query. The other 69 layers use Kimi Delta Attention (KDA).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| Task | Image-text-to-text |
+| Architecture | `KimiK31ForConditionalGeneration` |
+| Parameters | 2.8T total / 104B activated |
+| Layers | 93: 69 KDA and 24 gated DSA |
+| Checkpoint | `moonshotai/Kimi-K3.1-Pro` |
+| Context length | 1,048,576 tokens advertised by the checkpoint; this length has not been validated for training |
+
+## Implementation Limits
+
+- The `backend.attn: cudnn` path uses the fused cuDNN indexer to produce top-k coordinates, and the shared FlashMLA and cuDNN kernels attend directly to selected latent KV. This requires the optional cuDNN Frontend and FlashMLA dependencies and has been exercised on GB200. The `eager` and `sdpa` paths remain dense-mask references.
+- Indexer projections use BF16 with FP32 score accumulation; this is not the FP8 indexer used by some serving kernels. The indexer still scans all causal keys, and its score buffer remains quadratic. Sparse MLA avoids expanding all per-head K/V and avoids dense attention over unselected keys.
+- The pretrained indexer stays frozen, including after LoRA injection. Hard top-k selection has no language-model-loss gradient into the indexer; indexer distillation training is not implemented.
+- A sequence of at most 2,048 valid tokens keeps every causal key. Sparse-selection validation needs an individual sequence longer than 2,048 tokens. Padding or packing short documents is insufficient.
+
+On GB200, FlashMLA forward pads the 96 query heads to 128, while cuDNN backward runs the native 96 heads. Native-96 backward training is validated with cuDNN Frontend 1.30.0.
+
+The cuDNN path preserves the output gate and supports contiguous documents and padding. Interior masked holes within one document require the `sdpa` path.
+
+## Nonpacked MedPix
+
+Use [k31_medpix_nonpacked.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/k31_medpix_nonpacked.yaml) with `NeMoAutoModelForImageTextToText.from_pretrained`. The native `KimiK3Processor` expands the image tokens, and `default_collate_fn` passes images to that processor. The recipe uses context parallelism (CP1), expert parallelism (EP32), and pipeline parallelism (PP8) on 64 GB200 nodes with four GPUs each. KDA uses FLA. Expert routing uses the pretrained router with HybridEP. The recipe uses `ChunkedCrossEntropy` with 512-token chunks and fused PyTorch AdamW, with BF16 model parameters and optimizer moments. Model compile islands are disabled.
+
+Set `FLA_DISABLE_TENSOR_CACHE=1` before launching PP training, as the recipe launcher environment does. This prevents FLA metadata-cache hits and misses from changing the operation sequence during activation-checkpoint recomputation across microbatches.
+
+Allocate the recipe's resources through the [Slurm launcher](/job-launchers/slurm-cluster). The full 93-layer model completed 100 optimizer steps on nonpacked MedPix. Each step used 4,096-token padded sequences and a global batch size of 256. The run used cuDNN Frontend 1.30.0 and AutoModel's native distributed checkpoint loading. All 256 ranks completed every update with finite gradients before and after clipping. Training loss was 1.7097 at step 0 and 0.5750 at step 99.
+
+This full-model validation covers nonpacked CP1 training. Packed image CP and full-model CP2 training are outside its scope.
+
+See [text-model architecture and validation](/model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro) for text-only coverage.

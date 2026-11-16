@@ -17,9 +17,10 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.kimi_k3.config import KimiK3Config
+from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK31Config
 from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_vlm_cp
 from nemo_automodel.components.models.kimi_k3.model import KimiK3ForCausalLM
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
@@ -355,30 +356,17 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             optional scalar loss and hidden states [batch, expanded_sequence, hidden].
             Intermediate PP stages return activations and residual starts.
         """
-        chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-        if (
-            pixel_values is None
-            and input_ids is not None
-            and not torch.is_floating_point(input_ids)
-            and chunks is not None
-        ):
-            chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-            if chunk_idx < len(chunks):
-                pixel_values = chunks[chunk_idx]
-                image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
-                if image_grid_hws.shape[-1] == 2:
-                    ones = torch.ones(
-                        image_grid_hws.shape[0],
-                        1,
-                        dtype=image_grid_hws.dtype,
-                        device=image_grid_hws.device,
-                    )
-                    grid_thws = torch.cat((ones, image_grid_hws), dim=-1)
-                else:
-                    grid_thws = image_grid_hws
-                self._vlm_chunk_idx = chunk_idx + 1
-                if pixel_values.numel() == 0:
-                    pixel_values = None
+        if pixel_values is None and input_ids is not None and not torch.is_floating_point(input_ids):
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                image_grid_hws = media.image_grid
+                if image_grid_hws is not None:
+                    if image_grid_hws.shape[-1] == 2:
+                        ones = torch.ones_like(image_grid_hws[:, :1])
+                        grid_thws = torch.cat((ones, image_grid_hws), dim=-1)
+                    else:
+                        grid_thws = image_grid_hws
 
         if grid_thws is None and image_grid_thw is not None:
             grid_thws = image_grid_thw
@@ -493,6 +481,28 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                     module.reset_parameters()
                 elif isinstance(module, Rope2DPosEmbRepeated):
                     module.reset_parameters()
+
+
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """Kimi K3.1 vision-language model: Kimi K3 with gated DSA on the full-attention layers.
+
+    The architecture differs from Kimi K3 only through ``text_config.dsa_config``, which
+    :class:`~nemo_automodel.components.models.kimi_k3.model.KimiMLAAttention` reads to attach
+    a sparse-attention indexer to the listed layers.
+    """
+
+    # DSA only changes the attention kernel; parallelism support is the Kimi K3 profile.
+    ModelCapabilities = KimiK3ForConditionalGeneration.ModelCapabilities
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        **kwargs: Any,
+    ) -> "KimiK31ForConditionalGeneration":
+        config = KimiK31Config.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
 
 
 ModelClass = KimiK3ForConditionalGeneration

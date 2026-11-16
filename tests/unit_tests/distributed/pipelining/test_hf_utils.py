@@ -35,6 +35,7 @@ class TestCreatePipelineForwardInner:
 
     def test_public_flash_metadata_reaches_each_decoder_layer(self):
         model = nn.Module()
+        model.config = Mock(layer_types=None)
         model.embed_tokens = nn.Embedding(16, 4)
         model.rotary_emb = None
         model.norm = None
@@ -74,7 +75,7 @@ class TestCreatePipelineForwardInner:
     def test_forward_with_embeddings(self, mock_arange):
         # Create mock model with embeddings
         mock_model = Mock()
-        mock_model.config = Mock(output_attentions=False, output_hidden_states=False, use_cache=True)
+        mock_model.config = Mock(layer_types=None, output_attentions=False, output_hidden_states=False, use_cache=True)
         mock_model.gradient_checkpointing = False
 
         # Mock embed_tokens
@@ -568,7 +569,7 @@ class TestValidateHfModelForPipelineSupport:
 
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
-            tie_word_embeddings = True  # Needed to enable the tied-weights check
+            tie_word_embeddings = True
             is_encoder_decoder = False
 
         class _Inner(nn.Module):
@@ -588,6 +589,26 @@ class TestValidateHfModelForPipelineSupport:
         model = MockModel()
 
         with pytest.raises(ValueError, match="Pipeline parallelism does not support tie_word_embeddings=True"):
+            validate_hf_model_for_pipeline_support(model)
+
+    @pytest.mark.parametrize("tied", [False, True])
+    def test_validate_meta_alias_independent_of_nested_tie_flag(self, tied):
+        model = nn.Module()
+        model.config = SimpleNamespace(
+            model_type="mistral3",
+            tie_word_embeddings=True,
+            text_config=SimpleNamespace(tie_word_embeddings=False),
+        )
+        model.model = nn.Module()
+        model.model.language_model = nn.Module()
+        model.model.language_model.embed_tokens = nn.Embedding(4, 4, device="meta")
+        model.lm_head = nn.Linear(4, 4, bias=False, device="meta")
+        if tied:
+            model.lm_head.weight = model.model.language_model.embed_tokens.weight
+            with pytest.raises(ValueError, match="does not support tie_word_embeddings=True"):
+                validate_hf_model_for_pipeline_support(model)
+        else:
+            # Distinct meta parameters both have a null data pointer, but are not tied.
             validate_hf_model_for_pipeline_support(model)
 
     def test_validate_encoder_decoder_model(self):
@@ -794,7 +815,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_hidden_states_not_collected(self):
         """Hidden states are not collected in the new inner forward."""
         mock_model = Mock()
-        mock_model.config = Mock()
+        mock_model.config = Mock(layer_types=None)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.rotary_emb = None
@@ -817,7 +838,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_attention_type_handling(self):
         """Test attention type handling for layers."""
         mock_model = Mock()
-        mock_model.config = Mock()
+        mock_model.config = Mock(layer_types=None)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.rotary_emb = None
@@ -862,7 +883,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_attentions_not_collected(self):
         """Attentions are not collected in the new inner forward."""
         mock_model = Mock()
-        mock_model.config = Mock()
+        mock_model.config = Mock(layer_types=None)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.rotary_emb = None

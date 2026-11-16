@@ -3466,6 +3466,54 @@ def test_gemma4_inject_thinking_prefix_accepts_processor_or_tokenizer(collate_mo
     assert torch.equal(out_proc["input_ids"], out_tok["input_ids"])
 
 
+class _OverlapMarkerTokenizer:
+    """Marker [7, 7] overlaps itself; prefix is three tokens."""
+
+    pad_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        if text == "<|turn>model\n":
+            return [7, 7]
+        if text == "<|channel>thought\n<channel|>":
+            return [20, 21, 22]
+        return []
+
+
+def test_gemma4_inject_thinking_prefix_keeps_nonoverlapping_matches(collate_mod):
+    """A hit that starts inside an earlier marker is not a second insert."""
+    seq = torch.tensor([[7, 7, 7, 1]])
+    batch = {
+        "input_ids": seq,
+        "attention_mask": torch.ones_like(seq),
+        "assistant_masks": torch.zeros_like(seq),
+    }
+    out = collate_mod.gemma4_inject_thinking_prefix(batch, _OverlapMarkerTokenizer())
+    assert out["input_ids"].tolist() == [[7, 7, 20, 21, 22, 7, 1]]
+    assert out["assistant_masks"].tolist() == [[0, 0, 0, 0, 0, 0, 0]]
+
+    end = torch.tensor([[1, 7, 7]])
+    end_batch = {"input_ids": end, "attention_mask": torch.ones_like(end)}
+    end_out = collate_mod.gemma4_inject_thinking_prefix(end_batch, _OverlapMarkerTokenizer())
+    assert end_out["input_ids"].tolist() == [[1, 7, 7, 20, 21, 22]]
+
+    rows = torch.tensor([[7, 7, 3, 7, 7], [4, 5, 6, 8, 9]])
+    paired = {
+        "input_ids": rows,
+        "attention_mask": torch.ones_like(rows),
+        "mm_token_type_ids": torch.arange(rows.numel()).reshape(rows.shape),
+    }
+    paired_out = collate_mod.gemma4_inject_thinking_prefix(paired, _OverlapMarkerTokenizer())
+    assert paired_out["input_ids"].tolist() == [
+        [7, 7, 20, 21, 22, 3, 7, 7, 20, 21, 22],
+        [4, 5, 6, 8, 9, 0, 0, 0, 0, 0, 0],
+    ]
+    assert paired_out["attention_mask"].tolist()[1] == [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+    assert paired_out["mm_token_type_ids"].tolist() == [
+        [0, 1, 0, 0, 0, 2, 3, 4, 0, 0, 0],
+        [5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0],
+    ]
+
+
 def _thd_vlm_make_sample(doc_lens, n_img_patches=0):
     import torch
 
