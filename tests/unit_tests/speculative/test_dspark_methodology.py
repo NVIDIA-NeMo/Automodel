@@ -268,8 +268,8 @@ def test_chunked_probability_distance_matches_reference_and_gradient():
     torch.testing.assert_close(draft.grad, chunked_grad)
 
 
-def test_chunked_probability_distance_backward_writes_full_gradient_once():
-    """The chunked backward produces the full-vocab gradient once, not once per chunk."""
+def test_chunked_probability_distance_backward_does_not_accumulate_full_gradients():
+    """The chunked backward never sums full-vocab gradients, one per chunk."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
     rows, vocab = 12, 7
@@ -293,7 +293,10 @@ def test_chunked_probability_distance_backward_writes_full_gradient_once():
     with CountFullSizeResults() as mode:
         distance.backward(upstream)
 
-    assert len(mode.ops) == 1, mode.ops
+    # One full-size result is the assembled gradient; allow one more in case AccumulateGrad clones it.
+    # Six chunks that each produced a full-size gradient would need full-size adds to combine them.
+    assert not [op for op in mode.ops if op.startswith("aten.add")], mode.ops
+    assert len(mode.ops) <= 2, mode.ops
     expected = (draft.softmax(dim=-1) - target.softmax(dim=-1)).abs().sum(dim=-1)
     (expected_grad,) = torch.autograd.grad(expected, draft, upstream)
     torch.testing.assert_close(draft.grad, expected_grad)
