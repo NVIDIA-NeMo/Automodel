@@ -78,31 +78,29 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
-  padding: false
 
 packed_sequence:
-  # local_batch_size counts packed rows, not individual documents.
-  packed_sequence_size: 5120
-  packing_strategy: thd
-  pad_to_multiple_of: 160
+  packed_sequence_size: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
   shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
-  padding: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
   shuffle: true
   drop_last: true
-  batch_size: 1
 
 optimizer:
   _target_: torch.optim.Adam

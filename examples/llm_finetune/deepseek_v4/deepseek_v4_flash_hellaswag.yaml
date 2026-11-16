@@ -150,7 +150,8 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: false
   drop_last: true
-  batch_size: 1
+  # Validation reuses the training PP schedule, so it needs local_batch_size rows.
+  batch_size: 2
 
 optimizer:
   #PR4637: removed optimizer.fused: true

@@ -112,7 +112,8 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
-  limit_dataset_samples: 256
+  # One full validation batch for each of the 32 data-parallel ranks.
+  limit_dataset_samples: 512
   padding: false
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
@@ -121,9 +122,10 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  # NEAT validation evaluates individual documents.
+  # NEAT validation evaluates individual documents. Validation reuses the
+  # training PP schedule, so it needs local_batch_size rows.
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 1
+  batch_size: 16
 
 optimizer:
   _target_: torch.optim.AdamW
