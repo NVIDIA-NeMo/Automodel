@@ -24,14 +24,19 @@ import inspect
 from dataclasses import dataclass
 from functools import partial
 from types import MethodType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import MoeModelOutputWithPast
 
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata
 from nemo_automodel.shared.import_utils import safe_import_from
+
+if TYPE_CHECKING:
+    from mamba_ssm.utils.generation import InferenceParams
 
 
 @dataclass(frozen=True)
@@ -98,7 +103,7 @@ def _root_forward(
     input_ids: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
     position_ids: torch.Tensor | None = None,
-    past_key_values: object = None,
+    past_key_values: Cache | list[torch.Tensor] | None = None,
     inputs_embeds: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
     use_cache: bool | None = None,
@@ -106,8 +111,8 @@ def _root_forward(
     output_hidden_states: bool | None = None,
     return_dict: bool | None = None,
     calc_logits_for_entire_prompt: bool = True,
-    fla_past_key_values: object = None,
-    mamba_inference_params: object = None,
+    fla_past_key_values: Cache | None = None,
+    mamba_inference_params: "InferenceParams | None" = None,
     *,
     packed_token_indices: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
@@ -152,7 +157,7 @@ def _root_forward(
 def _backbone_forward(
     self: nn.Module,
     input_ids: torch.Tensor | None = None,
-    attention_mask: object = None,
+    attention_mask: torch.Tensor | _PackedInput | None = None,
     position_ids: torch.Tensor | None = None,
     inputs_embeds: torch.Tensor | None = None,
     **kwargs: Any,
@@ -192,7 +197,12 @@ def _backbone_forward(
     return output if kwargs.get("return_dict", True) is not False else (output.last_hidden_state,)
 
 
-def _mamba_forward(self: nn.Module, hidden_states: torch.Tensor, attention_mask: object = None, **kwargs: Any) -> Any:
+def _mamba_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | _PhysicalDocuments | None = None,
+    **kwargs: Any,
+) -> Any:
     if not isinstance(attention_mask, _PhysicalDocuments):
         return self._nemo_unpacked_forward(hidden_states, attention_mask=attention_mask, **kwargs)
     if self.process_group is not None:
@@ -222,14 +232,24 @@ def _mamba_forward(self: nn.Module, hidden_states: torch.Tensor, attention_mask:
     return self.out_proj(output), kwargs.get("past_key_value")
 
 
-def _delta_forward(self: nn.Module, hidden_states: torch.Tensor, attention_mask: object = None, **kwargs: Any) -> Any:
+def _delta_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | _PhysicalDocuments | None = None,
+    **kwargs: Any,
+) -> Any:
     if isinstance(attention_mask, _PhysicalDocuments):
         kwargs.update(position_ids=attention_mask, cu_seqlens=attention_mask.cu)
         attention_mask = None
     return self._nemo_unpacked_forward(hidden_states, attention_mask=attention_mask, **kwargs)
 
 
-def _short_convolution_forward(self: nn.Module, *args: Any, seq_idx: object = None, **kwargs: Any) -> Any:
+def _short_convolution_forward(
+    self: nn.Module,
+    *args: Any,
+    seq_idx: torch.Tensor | _PhysicalDocuments | None = None,
+    **kwargs: Any,
+) -> Any:
     if isinstance(seq_idx, _PhysicalDocuments):
         if self._nemo_packing_uses_cu:
             kwargs["cu_seqlens"] = seq_idx.cu
@@ -243,7 +263,7 @@ def _attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: object,
+    attention_mask: torch.Tensor | _PhysicalDocuments | None,
     query_length: int,
     **kwargs: Any,
 ) -> torch.Tensor:
@@ -272,7 +292,7 @@ def _validate_backend(self: nn.Module, attn_implementation: str) -> None:
         raise ValueError("Packed Flash-1B currently requires flash_attention_2")
 
 
-def apply_packing_adapters(model: nn.Module, *, mesh: object = None) -> nn.Module:
+def apply_packing_adapters(model: nn.Module, *, mesh: MeshContext | None = None) -> nn.Module:
     """Add document-aware training while preserving released weights and generation.
 
     Args:

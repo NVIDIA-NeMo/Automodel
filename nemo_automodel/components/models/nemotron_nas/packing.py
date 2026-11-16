@@ -26,8 +26,10 @@ from typing import Any
 
 import torch
 from torch import nn
+from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.shared.import_utils import safe_import_from
 
 
@@ -76,7 +78,7 @@ def _root_forward(
     input_ids: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
     position_ids: torch.Tensor | None = None,
-    past_key_values: object = None,
+    past_key_values: Cache | None = None,
     inputs_embeds: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
     use_cache: bool | None = None,
@@ -116,7 +118,12 @@ def _root_forward(
     return self._nemo_unpacked_forward(**kwargs)
 
 
-def _causal_mask(self: nn.Module, attention_mask: object, *args: Any, **kwargs: Any) -> Any:
+def _causal_mask(
+    self: nn.Module,
+    attention_mask: torch.Tensor | _FlashBoundaries | None,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     if isinstance(attention_mask, _FlashBoundaries):
         return attention_mask
     return self._nemo_unpacked_causal_mask(attention_mask, *args, **kwargs)
@@ -151,7 +158,7 @@ def _validate_backend(self: nn.Module, attn_implementation: str) -> None:
         raise ValueError("Packed DeciLM currently requires flash_attention_2")
 
 
-def apply_packing_adapters(model: nn.Module, *, mesh: object = None) -> nn.Module:
+def apply_packing_adapters(model: nn.Module, *, mesh: MeshContext | None = None) -> nn.Module:
     """Add explicit packed boundaries without changing unpacked/generation calls.
 
     Args:
