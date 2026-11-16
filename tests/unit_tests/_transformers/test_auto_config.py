@@ -327,7 +327,7 @@ def test_remote_code_follows_resolved_commit_or_explicit_override(
     assert list(config.layer_types) == ["full_attention"] * 2
 
 
-@pytest.fixture(params=["remote", "qwen3"])
+@pytest.fixture(params=["remote", "qwen3", "mistral"])
 def layer_types_checkpoint(tmp_path, monkeypatch, request):
     monkeypatch.setattr("transformers.dynamic_module_utils.HF_MODULES_CACHE", str(tmp_path / "modules"))
     path = tmp_path / "model"
@@ -339,6 +339,8 @@ def layer_types_checkpoint(tmp_path, monkeypatch, request):
         "num_nextn_predict_layers": 1,
         "hidden_size": 64,
     }
+    if request.param == "mistral":
+        data.update(model_type="mistral", sliding_window=16)
     if request.param == "remote":
         (path / "configuration_mtp.py").write_text(
             "from transformers import PretrainedConfig\n"
@@ -378,6 +380,47 @@ def test_layer_types_fallback_preserves_overrides_and_unused_kwargs(layer_types_
     # The fallback must not relax Transformers' validator globally.
     with pytest.raises(StrictDataclassClassValidationError, match="layer_types"):
         AutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("loader", ["direct", "model_id", "yaml"])
+def test_layer_types_retry_preserves_hf_config_and_model_resolution(tmp_path, loader):
+    from transformers import AutoModelForCausalLM, MinistralConfig, MinistralForCausalLM
+
+    from nemo_automodel._transformers.model_init import get_hf_config
+
+    data = {
+        "model_type": "mistral",
+        "num_hidden_layers": 2,
+        "layer_types": ["full_attention", "sliding_attention", "full_attention"],
+        "sliding_window": 16,
+        "hidden_size": 64,
+    }
+    checkpoint = tmp_path / "malformed.json"
+    checkpoint.write_text(json.dumps(data))
+    reference = tmp_path / "reference.json"
+    reference.write_text(json.dumps({**data, "layer_types": data["layer_types"][:2]}))
+    expected = AutoConfig.from_pretrained(reference)
+    assert type(expected) is MinistralConfig
+
+    if loader == "direct":
+        actual = NeMoAutoConfig.from_pretrained(checkpoint)
+    elif loader == "model_id":
+        actual = get_hf_config(str(checkpoint), "sdpa")
+    else:
+        actual = ConfigNode(
+            {
+                "_target_": "nemo_automodel.NeMoAutoConfig.from_pretrained",
+                "pretrained_model_name_or_path": str(checkpoint),
+            }
+        ).instantiate()
+
+    assert type(actual) is type(expected)
+    assert AutoModelForCausalLM._model_mapping[type(actual)] is MinistralForCausalLM
+    assert actual.model_type == expected.model_type
+    assert actual.layer_types == expected.layer_types
+    assert actual.sliding_window == expected.sliding_window
+    assert actual.name_or_path == str(checkpoint)
 
 
 def test_yaml_config_target_truncates_layer_types(layer_types_checkpoint):
@@ -440,8 +483,12 @@ def test_unrelated_config_errors_propagate(tmp_path, monkeypatch, strict):
 
 
 def test_plain_value_error_also_retries(layer_types_checkpoint, monkeypatch):
+    from_pretrained = AutoConfig.from_pretrained
+
     def fail(cls, *args, **kwargs):
-        raise ValueError("`num_hidden_layers` (2) must be equal to the number of layer types (3)")
+        if Path(args[0]) == layer_types_checkpoint:
+            raise ValueError("`num_hidden_layers` (2) must be equal to the number of layer types (3)")
+        return from_pretrained(*args, **kwargs)
 
     monkeypatch.setattr(AutoConfig, "from_pretrained", classmethod(fail))
     config = NeMoAutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=True)

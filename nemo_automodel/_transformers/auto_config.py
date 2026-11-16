@@ -14,10 +14,12 @@
 
 """Hugging Face config loading through Transformers' native revision resolution."""
 
+import json
 import logging
 import os
 import re
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from huggingface_hub import ResolvedRevision, hf_hub_download
@@ -175,12 +177,18 @@ class NeMoAutoConfig(AutoConfig):
             config_cls = get_class_from_dynamic_module(
                 auto_map["AutoConfig"], pretrained_model_name_or_path, code_revision=code_revision, **code_kwargs
             )
-        if config_cls is None:
-            raise ValueError(
-                f"Could not resolve config class for {pretrained_model_name_or_path} "
-                f"(model_type={config_dict.get('model_type')!r})"
-            )
-        return config_cls.from_dict(config_dict, **unused_kwargs)
+            return config_cls.from_dict(config_dict, **unused_kwargs)
+
+        # AutoConfig applies class-selection rules beyond CONFIG_MAPPING. Feed the
+        # repaired JSON back through its public loader without modifying the source
+        # checkpoint or shared Hub cache. Remote code stays tied to the original repo.
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / CONFIG_NAME
+            config_path.write_text(json.dumps(config_dict))
+            result = super().from_pretrained(config_path, trust_remote_code=False, **unused_kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        config.name_or_path = os.fspath(pretrained_model_name_or_path)
+        return result
 
     @classmethod
     def get_config_dict(
