@@ -1,6 +1,6 @@
 ---
 title: "ERNIE-5.5-Flash-Base-BF16"
-description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: full-parameter SFT of the 43-layer decoder with expert parallelism and FSDP2 on single unpacked documents."
+description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: full-parameter SFT and LoRA of the 43-layer decoder with expert parallelism and FSDP2 on single documents."
 slug: model-coverage/large-language-models/baidu/ERNIE-5.5-Flash-Base-BF16
 ---
 
@@ -17,9 +17,10 @@ and the output projection, and MultiMax corrects the logits. The checkpoint
 also stores one multi-token prediction (MTP) block.
 
 <Note>
-This page covers one configuration: full-parameter supervised fine-tuning (SFT)
-of the 43-layer main decoder with expert parallelism (EP) and FSDP2 on single
-unpacked documents. [Current Scope](#current-scope) lists what is outside it.
+This page covers two configurations of the 43-layer main decoder with expert
+parallelism (EP) and FSDP2 on single unpacked documents: full-parameter
+supervised fine-tuning (SFT) on 16 nodes and [LoRA](#lora) on 2 nodes.
+[Current Scope](#current-scope) lists what is outside them.
 
 </Note>
 
@@ -46,10 +47,10 @@ unpacked documents. [Current Scope](#current-scope) lists what is outside it.
 
 ## Fine-Tune ERNIE-5.5-Flash-Base-BF16
 
-The recipe runs full-parameter SFT of the 43-layer main decoder on 64 GPUs (16
-nodes with 4 GB200 GPUs per node), so it is not a single-node example. Run it
-from the repository root on each of the 16 nodes, with `NODE_RANK` set from 0
-to 15 and `MASTER_ADDR` set to the first node:
+The full fine-tuning recipe runs full-parameter SFT of the 43-layer main
+decoder on 64 GPUs (16 nodes with 4 GB200 GPUs per node), so it is not a
+single-node example. Run it from the repository root on each of the 16 nodes,
+with `NODE_RANK` set from 0 to 15 and `MASTER_ADDR` set to the first node:
 
 ```bash
 uv run torchrun --nnodes=16 --nproc-per-node=4 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
@@ -71,6 +72,7 @@ not loaded or trained.
 | Recipe | Dataset | Description |
 |---|---|---|
 | [ernie5_5_flash_squad_ep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep.yaml) | SQuAD | Full-parameter SFT of the 43-layer decoder with EP and FSDP2; checkpoint saving disabled because of the checkpoint size |
+| [ernie5_5_flash_squad_ep_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml) | SQuAD | LoRA on the 43-layer decoder with EP and FSDP2 on 2 nodes; adapter checkpoints enabled; see [LoRA](#lora) |
 
 The six DSA layers run through the cuDNN sparse-attention path
 (`model.backend.attn: cudnn`). This path requires
@@ -100,13 +102,13 @@ expands the layer output back into the streams in FP32 with autocast disabled.
 The hyper head contracts the streams in FP32.
 
 <Note>
-The recipe sets `checkpoint.enabled: false` because one checkpoint of the full
-model and optimizer is about 3.1 TiB: 523 GiB of weights and 2.5 TiB of
-optimizer state. To save, set `checkpoint.enabled: true` and
-`checkpoint.save_consolidated: false`. The validated save of the full model
-wrote one checkpoint, with `step_scheduler.ckpt_every_steps: 100` and
-`dist_env.timeout_minutes: 180`; the recipe's values of 50 and 30 were not run
-with saving enabled.
+The full fine-tuning recipe sets `checkpoint.enabled: false` because one
+checkpoint of the full model and optimizer is about 3.1 TiB: 523 GiB of
+weights and 2.5 TiB of optimizer state. To save, set
+`checkpoint.enabled: true` and `checkpoint.save_consolidated: false`. The
+validated save of the full model wrote one checkpoint, with
+`step_scheduler.ckpt_every_steps: 100` and `dist_env.timeout_minutes: 180`;
+that recipe's values of 50 and 30 were not run with saving enabled.
 [Validated Configuration](#validated-configuration) lists what was saved and
 restored. The consolidated Hugging Face export has not been validated.
 
@@ -122,6 +124,9 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 [Installation Guide](/get-started/installation) for setup.
 
 ## Validated Configuration
+
+This section covers the full fine-tuning recipe;
+[Validated LoRA Configuration](#validated-lora-configuration) covers LoRA.
 
 | Area | Validated Configuration |
 |---|---|
@@ -150,12 +155,182 @@ once, with the three-layer model on 4 GPUs (`ep_size: 2`): 16 updates on
 documents of 4,096 tokens, with labels only on answer tokens from position
 2,176 on. The top-k step selected 2,048 of up to 3,968 remote keys, and the
 loss and the gradient norms stayed finite. The run was not compared with a
-reference. The 43-layer model has not been trained with documents longer than
-256 tokens.
+reference. With full fine-tuning, the 43-layer model has not been trained with
+documents longer than 256 tokens.
+
+## LoRA
+
+The LoRA recipe trains rank-8 adapters on the 43-layer main decoder on 8 GPUs
+(2 nodes with 4 GB200 GPUs per node). The released weights are loaded and stay
+frozen. Run it from the repository root on each of the 2 nodes, with
+`NODE_RANK` set to 0 and 1 and `MASTER_ADDR` set to the first node:
+
+```bash
+uv run torchrun --nnodes=2 --nproc-per-node=4 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml
+```
+
+The recipe keeps the model, the data, the precision policy, and the optimizer
+of the full fine-tuning recipe. It adds the `peft` section, runs one document
+per rank on 8 ranks (global batch size 8), sets the learning rate to 1.0e-5,
+and enables adapter checkpoints. With `ep_size: 8` on 8 ranks, every rank owns
+one of the 8 expert groups of each MoE layer.
+
+LoRA removes the gradients and the optimizer state of the base weights, which
+is what lets 2 nodes take the place of 16. It does not reduce the weights that
+a GPU holds: every GPU keeps one eighth of the routed experts and its shard of
+the dense weights, 65.8 GiB after loading. A training step still gathers the
+dense weights and keeps the activations of the forward pass for the backward
+pass; in the validated run the allocation rose from 65.8 GiB to a peak of
+102.8 GiB.
+
+### LoRA Targets
+
+LoRA is supported on the plain linear projections that an attention module
+owns directly (not those of its indexer or compressor), on the routed experts,
+and on the projections of the dense FFN and of the shared expert. The recipe
+selects all of them.
+
+| Modules under `model.layers.*` | Layers | LoRA |
+|---|---|---|
+| `attention.wq_a`, `attention.wq_b`, `attention.wkv`, `attention.wo_b` | 37 HCA layers | Supported |
+| `attention.gate_proj` | 43 layers | Supported |
+| `attention.q_a_proj`, `attention.q_b_proj`, `attention.kv_a_proj_with_mqa`, `attention.o_proj` | 6 DSA layers | Supported |
+| `moe.experts` | 42 MoE layers | Supported; 98% of the adapter parameters |
+| `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj` | Layer 0 | Supported |
+| `moe.shared_experts.gate_proj`, `moe.shared_experts.up_proj`, `moe.shared_experts.down_proj` | 42 MoE layers | Supported |
+| `attention.wo_a` | 37 HCA layers | Rejected: a grouped projection with its own forward |
+| `moe.fc1_latent_proj`, `moe.fc2_latent_proj` | 42 MoE layers | Rejected: FP32 projections with their own forward |
+| `attention.indexer.wq_b`, `attention.indexer.wk`, `attention.indexer.weights_proj` | 6 DSA layers | Rejected: the indexers are frozen |
+| `attention.compressor.wkv`, `attention.compressor.wgate` | 37 HCA layers | Rejected: not validated |
+| `attention.k_b_proj`, `attention.v_b_proj`, `moe.gate`, the mHC parameters, the norms | | Cannot be selected: parameters without a linear module of their own |
+
+The output head `model.lm_head` is rejected as not validated. An adapter on a
+rejected module is an error when the model is parallelized, before it is
+sharded and before any weight is read. Without `peft.target_modules`, the
+default pattern of the LoRA configuration, `*_proj`, selects rejected
+projections, so list the targets as the recipe does. DoRA (`peft.use_dora`) is
+rejected on every target when the model is built. An adapter in another dtype
+than the weight it adapts is rejected when the model is parallelized. There
+are two ways to get one: `peft.lora_dtype` set to another dtype, and a model
+loaded in FP32 under a BF16 FSDP compute dtype
+(`distributed.mp_policy.param_dtype`, BF16 when no policy is given), because
+the frozen weights of a LoRA run are then stored in BF16 while the adapters
+stay FP32. The recipe loads the model in BF16 and sets the compute dtype to
+`null`.
+
+### Validated LoRA Configuration
+
+| Area | Validated Configuration |
+|---|---|
+| Hardware | 2 nodes with 4 GB200 GPUs each (8 GPUs) |
+| Parallelism | FSDP2 with `ep_size: 8`: one rank per expert group; TP1 / PP1 / CP1 |
+| Adapters | Adapter rank 8 (`peft.dim`), alpha 32 on the targets of the recipe: 856 BF16 tensors on 386 modules, 1,790,614,528 parameters (0.64% of all parameters) |
+| Workload | SQuAD, single unpacked documents of at most 256 tokens; local batch size 1, global batch size 8; 100 optimizer updates |
+| GPU memory | 65.8 GiB allocated on every GPU after loading; peak 102.8 GiB allocated (`torch.cuda.max_memory_allocated`, largest of the 8 ranks); 110.4 GiB used on the fullest GPU as sampled with `nvidia-smi` |
+| Step time | 20 s for the first update and 9 s for the second; median 5.5 s over the 98 updates from the third on, with single updates of up to 12.3 s |
+| Loss | Validation loss 0.3101 before training, 0.1351 after 50 updates, and 0.1328 after 100, on 367 label tokens. Training loss 0.3114 at the first update and 0.3207 at the last; an update has 11 to 58 label tokens, and the mean training loss is 0.3015 over the first 10 updates and 0.2141 over the last 10 |
+
+The run completed without non-finite losses or gradient norms. It validates the
+training mechanics, not model convergence. Every rank hashed its local part of
+every tensor before and after training: on all 8 ranks the 1,474 frozen
+parameters and the buffers were unchanged, and all 856 adapter tensors had
+changed. In the first two updates only adapter tensors received a gradient.
+
+The same schedule of updates and validation was also run with a learning rate
+of 1.0e-4: the validation loss was 0.0918 after 50 updates and 0.1014 after
+100, lower than with 1.0e-5 at both evaluations but rising between them. The
+recipe keeps 1.0e-5, with which the validation loss did not rise. One run of
+100 updates at each rate, evaluated on 367 label tokens, does not select a
+learning rate.
+
+The numbers of this section and of [LoRA Checkpoints](#lora-checkpoints) come
+from runs on one state of the code: the change that added LoRA for this model,
+plus the library change of pull request
+[#4739](https://github.com/NVIDIA-NeMo/Automodel/pull/4739), which was merged
+after these runs. Two runs used the same code without that library change: the
+resume in the row "Without it" of [LoRA Checkpoints](#lora-checkpoints) and
+the one-node run below. The runs on the 43-layer model started the recipe
+through a wrapper that adds these measurements; the two runs of 100 updates
+also ran a validation pass before training. The `nemo_automodel.cli.app`
+entry of the command above was run on one node with a three-layer model built
+from released layers (4 GPUs, `ep_size: 4`): 8 updates, one validation pass,
+and one adapter checkpoint.
+
+### LoRA Checkpoints
+
+A LoRA checkpoint holds the adapter and the state needed to resume, not the
+base weights:
+
+| Content | Size |
+|---|---|
+| `model/adapter_model.safetensors`: 856 BF16 adapter tensors | 3.34 GiB |
+| `optim/`: optimizer state of the adapter, one file per rank | 16.71 GiB |
+| `model/adapter_config.json`, `model/automodel_peft_config.json`, tokenizer files, `config.yaml`, `losses.json`, and data-loader, random-number, and scheduler state | 15 MiB |
+| Total | 20.06 GiB |
+
+The recipe writes one checkpoint after 50 updates and one after 100, 40 GiB
+in all. The two saves took 10.1 and 8.5 s.
+
+A resume loads the released checkpoint first and then the adapter; it was
+validated with the same number of ranks and the same `ep_size`. It restores
+the adapter exactly. The state of the recipe's optimizer (Transformer Engine
+`FusedAdam`: moments, master weights, and the update counter) is restored only
+with the fix of pull request
+[#4739](https://github.com/NVIDIA-NeMo/Automodel/pull/4739). A version without
+that fix restarts the optimizer silently on the restored adapter: no error is
+raised, the moments start empty, and the update counter starts again.
+
+A run resumes from the checkpoint directory that `checkpoint.restore_from`
+names; the two runs below were started that way. Without
+`checkpoint.restore_from`, a run looks for the latest checkpoint in
+`checkpoint.checkpoint_dir` and resumes from it if the check of its model
+configuration against the run's accepts it; a checkpoint that this check
+reports as incompatible is skipped. A second run of the recipe in the same
+directory is therefore normally a resume. That second way was not run with
+LoRA for this model.
+
+Both cases were run on the 43-layer model from the checkpoint written after 50
+updates, each in a new process that loaded the released checkpoint (142 and
+129 s), restored the adapter (5 and 9 s), and trained 8 more updates
+(`step_scheduler.max_steps: 58`, no save):
+
+| Library | Adapter | Optimizer state | Update counter |
+|---|---|---|---|
+| With the change of #4739 | All 856 tensors hold the saved bytes on every rank | All 2,568 tensors hold the saved bytes on every rank | 50, as saved |
+| Without it | All 856 tensors hold the saved bytes on every rank | Empty on every rank | Absent |
+
+Both processes exited without an error. Training is not bit-reproducible from
+run to run, so a resumed run does not repeat the uninterrupted run bit for
+bit. The loss of the first resumed update is computed before the optimizer
+acts and was the same to four decimal places in both cases. Over the next
+seven updates the loss differed from the uninterrupted run by at most 0.0070
+with the restored optimizer state and by at most 0.0164 without it; in three
+of the seven updates the run without it was the closer one. The validation
+loss after the eight updates was 0.1317 with the restored optimizer state and
+0.1316 without it, on 367 label tokens. One run of eight updates in each case
+does not separate the two cases by their loss.
+
+### Adapter Format
+
+`model/adapter_model.safetensors` stores the adapter tensors under the
+parameter names of NeMo AutoModel with the prefix `base_model.model.`:
+`lora_A.weight` and `lora_B.weight` for every adapted linear projection, and
+`lora_gate_and_up_A`, `lora_gate_and_up_B`, `lora_down_A`, and `lora_down_B`
+for the routed experts of every MoE layer, each with the 512 experts on its
+first axis. `adapter_config.json` lists the 344 adapted linear projections. It
+does not list the 42 expert modules, although their tensors are in the file;
+`automodel_peft_config.json` keeps the target patterns of the recipe. A resume
+installs the adapters from the `peft` section of the run and reads their
+tensors from `adapter_model.safetensors`; it does not use the list in
+`adapter_config.json`. A LoRA run writes no consolidated Hugging Face export,
+whatever `checkpoint.save_consolidated` says. Loading the adapter with Hugging
+Face PEFT and merging it into the base weights with
+`export_merged_peft_checkpoint` have not been tested.
 
 ## Loading and Inputs
 
-The recipe loads revision `68d19ee51c032344fa0a8018e7dc21b2668a55c4` of
+Both recipes load revision `68d19ee51c032344fa0a8018e7dc21b2668a55c4` of
 `baidu/ERNIE-5.5-Flash-Base-BF16`. The released configuration declares the
 `Ernie5_5_MoeForCausalLM` architecture and `model_type: ernie5_5_moe`, which
 NeMo AutoModel resolves through its own registry.
@@ -166,12 +341,12 @@ implementation does not construct that block: a non-zero
 `num_nextn_predict_layers` is rejected when the model is constructed, so the
 released configuration cannot be loaded unchanged. Set
 `model.num_nextn_predict_layers: 0` to load the 43 decoder layers; the MTP keys
-of the checkpoint are then not loaded. The example recipe sets it. A
+of the checkpoint are then not loaded. Both example recipes set it. A
 configuration that does not come from the released file defaults to 0.
 
 Inputs are single unpacked documents. The model's `forward` accepts one
-unpadded document, `input_ids` of shape `[1, sequence]`, which the recipe
-provides with `step_scheduler.local_batch_size: 1`. `forward` rejects a padded
+unpadded document, `input_ids` of shape `[1, sequence]`, which the recipes
+provide with `step_scheduler.local_batch_size: 1`. `forward` rejects a padded
 batch, and THD sequence packing is refused when the data loader is built.
 
 ## Numerical Validation
@@ -221,14 +396,16 @@ was not compared.
 
 ## Current Scope
 
-Supported: full-parameter SFT of the 43-layer main decoder with EP and FSDP2
-on single unpacked documents.
+Supported: full-parameter SFT and LoRA of the 43-layer main decoder with EP and
+FSDP2 on single unpacked documents.
 
 - The MTP block is not loaded or trained. Its 1,582 checkpoint keys under
   `model.layers.43.*` are excluded, and loading requires
   `model.num_nextn_predict_layers: 0`.
 - The parameters of the DSA indexers are frozen, and a `freeze_config` unfreeze
   selector that covers a DSA indexer is an error at the first training step.
+  A LoRA adapter on an indexer projection is rejected when the model is
+  parallelized.
   The router correction bias is a fixed buffer, not a parameter. No indexer
   loss is computed; the reference training recipe trains the indexers with a KL
   term against the attention distribution, which this implementation does not.
@@ -245,24 +422,41 @@ on single unpacked documents.
   rejected when the model is parallelized.
 - A KV cache is not supported: `forward` raises an error when `use_cache` is
   true.
-- LoRA has not been validated.
+- LoRA is validated with the targets, adapter rank 8 (`peft.dim`), and alpha
+  32 of the LoRA recipe, with one rank per expert group, and with documents of
+  at most 256 tokens. The modules that [LoRA Targets](#lora-targets) lists as
+  rejected raise an error when the model is parallelized. DoRA
+  (`peft.use_dora`) is rejected on every target when the model is built, and
+  an adapter in another dtype than the weight it adapts when the model is
+  parallelized (see [LoRA Targets](#lora-targets)). `peft.dropout` is not
+  applied to the adapters of the routed experts, which hold 98% of the adapter
+  parameters, and dropout on the linear projections was not validated. Not
+  validated: `peft.moe_rank_scaling`, the full model with more ranks than
+  `ep_size`, merging an adapter into the base weights with
+  `export_merged_peft_checkpoint`, and loading an adapter with Hugging Face
+  PEFT. A resume restores the optimizer state only with the change of pull
+  request #4739; see [LoRA Checkpoints](#lora-checkpoints).
 - Documents longer than 512 tokens require the cuDNN sparse-attention path of
   the DSA layers, which requires `nvidia-cudnn-frontend[cutedsl]` and FlashMLA
   and is validated on SM100-class GPUs (GB200) only. Multi-GPU training of the
   released model has been validated with that path only, and with documents of
-  at most 256 tokens. With longer documents only the forward pass of the
-  released model was run. From position 2,176 of a document on, two forward
-  passes of the same document can give different losses; in a three-layer
-  model this was traced to the top-k step, which does not choose the same key
-  among keys with equal index scores every time.
-- The example recipe sets `checkpoint.enabled: false` because of the
+  at most 256 tokens. With longer documents, full fine-tuning of the released
+  model was not run, only its forward pass. With LoRA, an earlier state of the
+  code ran three updates each at 384, 512, 768, and 1,024 tokens to measure
+  memory (113 to 161 GiB allocated at the peak); this is not a validation.
+  From position 2,176 of a document on, two forward passes of the same
+  document can give different losses; in a three-layer model this was traced
+  to the top-k step, which does not choose the same key among keys with equal
+  index scores every time.
+- The full fine-tuning recipe sets `checkpoint.enabled: false` because of the
   checkpoint size (about 3.1 TiB with optimizer state). Saving and resuming
-  were run once on the full model and on a three-layer model with 16 and with
-  2 GPUs, each time with the same number of ranks before and after and with
-  `checkpoint.save_consolidated: false`. A resume loads the released
-  checkpoint before the saved one. The consolidated Hugging Face export
-  and a resume on a different number of ranks have not been validated. A
-  saved checkpoint contains the 43 decoder layers and declares no MTP block.
+  full fine-tuning were run once on the full model and on a three-layer model
+  with 16 and with 2 GPUs, each time with the same number of ranks before and
+  after and with `checkpoint.save_consolidated: false`. A resume loads the
+  released checkpoint before the saved one. The consolidated Hugging Face
+  export and a resume on a different number of ranks have not been validated.
+  A saved checkpoint of full fine-tuning contains the 43 decoder layers and
+  declares no MTP block.
 
 ## Related Resources
 

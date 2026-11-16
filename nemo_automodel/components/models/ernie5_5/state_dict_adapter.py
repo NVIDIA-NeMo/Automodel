@@ -18,16 +18,25 @@
 conversions of ``checkpoint_layout``, whose released tensors are views of the native ones, and a sharded model
 with the destinations and export views of ``checkpoint_io``.
 
-A checkpoint load is a session of two calls: ``to_hf(..., for_checkpoint_load=True)`` returns the destinations
-that the reader fills, and ``from_hf`` receives the same mapping back, installs what could not be read in place
-and returns the native state. The adapter keeps one session at a time and fails closed: after a session that was
-abandoned, replaced or failed, every later load or save raises, because the model may be partially overwritten.
+A base checkpoint load is a session of two calls: ``to_hf(..., for_checkpoint_load=True)`` returns destinations
+that the reader fills; ``from_hf`` receives that same mapping, installs the temporary values and returns the native
+state. A LoRA load instead records the model-provided adapter keys, shapes and dtypes; its reader can return a new
+mapping, which ``from_hf`` validates before returning it for installation. The adapter keeps one session at a time.
+If validation of a session fails, or a base session is abandoned or replaced, later work on the adapter is refused.
+An exception during the later framework installation is outside the adapter's view: after any load failure discard
+both model and adapter, because model storage may already have changed.
 
 Limitations:
     * Decoder-only: the configuration must have ``num_nextn_predict_layers == 0`` and untied embedding and
       output-head weights. MTP weights are neither loaded nor exported.
-    * No quantized checkpoints, no ``v4_compatible`` metadata export, no PEFT adapters and no streaming export
-      of single tensors.
+    * No quantized checkpoints, no ``v4_compatible`` metadata export and no streaming export of single tensors.
+      LoRA supports only the native linear and grouped-expert tensor names used by the tested ERNIE configuration;
+      DoRA is rejected, and interoperability with external PEFT implementations is not established.
+    * A LoRA restore requires the receiving model's exact adapter key set, tensor shapes and dtypes. Cross-layout
+      restores were exercised through the checkpointer on a small CPU model; full-model restore was validated with
+      the same rank count and expert-parallel size.
+    * If a LoRA reader fails after opening a session, the session remains open: framework save, load and key
+      planning refuse further work. Discard the model and adapter after any load failure.
     * A sharded load or save needs the layouts listed in ``checkpoint_io``. All ranks must make the same calls
       in the same order.
     * A load is not transactional: after a failure the model and the adapter must be discarded. Concurrent
@@ -42,6 +51,7 @@ Limitations:
 
 import copy
 import functools
+import re
 import weakref
 from collections.abc import Callable, Mapping
 from typing import Any, Self
@@ -65,6 +75,20 @@ from nemo_automodel.components.models.ernie5_5.config import Ernie5_5Config, Ern
 
 # The registered model holds every parameter and buffer under its ``model`` attribute.
 _MODEL_PREFIX = "model."
+
+
+# Accept the native ERNIE names and the prefix added by the PEFT checkpointer.
+# This recognizes the tensor formats we support, not the existence of a module:
+# at load time the expected keys come from the actual receiving model.
+_LORA_KEY = re.compile(
+    r"^(?:base_model\.model\.)?model(?:\.[A-Za-z_][A-Za-z_0-9]*|\.[0-9]+)+\."
+    r"(?:lora_[AB]\.weight|experts\.lora_(?:gate_and_up|down)_[AB])$"
+)
+
+
+def _is_lora_key(name: str) -> bool:
+    """Recognize supported native linear and grouped-expert LoRA tensor names."""
+    return _LORA_KEY.fullmatch(name) is not None
 
 
 class _SessionToken:
@@ -100,6 +124,9 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
     Native names carry the ``model.`` prefix of the registered class. For a sharded and for an unsharded state,
     ``to_hf`` returns destinations or export views that alias model storage, so that a checkpoint read writes
     the model in place and a distributed read or save moves each rank's shard only.
+
+    LoRA saves retain native adapter names; a LoRA load validates the receiving model's keys, shapes and dtypes
+    before returning tensors for installation. It accepts a reader-created mapping, not only the original one.
 
     Key planning (``get_hf_state_dict_keys``) is supported for the unsharded state only, which is how the
     framework uses it: once, before the model is sharded. It converts a shape-only copy of the state with
@@ -138,6 +165,7 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
         self._active: weakref.ReferenceType[_LoadDestinations] | None = None
         self._token: _SessionToken | None = None
         self._poisoned = False
+        self._lora_expected: dict[str, tuple[torch.Size, torch.dtype]] | None = None
         # Tensors that the adapter created as destinations of sessions that have ended.
         self._ended: list[weakref.ReferenceType[torch.Tensor]] = []
 
@@ -159,6 +187,7 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
         duplicate.config = copy.deepcopy(self.config, memo)
         duplicate._active = None
         duplicate._token = None
+        duplicate._lora_expected = None
         duplicate._poisoned = self._poisoned or self._token is not None
         duplicate._ended = list(self._ended)
         return duplicate
@@ -349,13 +378,13 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
         cannot stand in for the plan of the whole model.
 
         Args:
-            state_dict: Exactly the native tensors of the unsharded model under their ``model.`` names, in the
-                shapes of the model's parameters and buffers; plain tensors on any device. Only shapes and
-                dtypes are read.
+            state_dict: Native tensors of the unsharded model under their ``model.`` names, including any
+                installed LoRA tensors, in the shapes of the model's parameters and buffers; plain tensors on
+                any device. Only shapes and dtypes are read.
 
         Returns:
-            The released Hugging Face names, in the order in which ``to_hf`` returns them for an unsharded
-            state.
+            Released Hugging Face base names followed by native LoRA names when adapters are installed, in the
+            order in which ``to_hf`` returns them for an unsharded state.
 
         Raises:
             ValueError: If a tensor of the state is a DTensor, or the unsharded conversion rejects the state.
@@ -379,14 +408,17 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
     ) -> dict[str, torch.Tensor]:
         """Return the released layout of the native state, as load destinations or as tensors to save.
 
-        The state is treated as sharded when its tensors are DTensors. With ``for_checkpoint_load`` the result
-        opens a load session that ``from_hf`` must close; without it the result is what a save writes.
+        The base state is treated as sharded when its tensors are DTensors. With ``for_checkpoint_load`` the
+        result opens a load session that ``from_hf`` must close; without it the result is what a save writes.
+        Supported LoRA tensors keep their native names and are passed through for save or mixed key planning.
 
         Args:
             state_dict: Exactly the native tensors of the model under their ``model.`` names, in the shapes of
                 the model's parameters and buffers. Either all plain tensors, or all DTensors in the layouts
                 required by ``model_hf_dcp_load_destinations`` (load) and ``model_hf_distributed_export``
-                (save): for a DTensor the shapes are global and each rank holds its shard.
+                (save): for a DTensor the shapes are global and each rank holds its shard. A LoRA-only PEFT
+                state instead contains supported native names, optionally under the PEFT outer prefix; the
+                checkpointer supplies plain tensors in the global shapes of the model's adapter parameters.
             quantization: Must be false; quantized checkpoints are not supported.
             for_checkpoint_load: Return destinations for a checkpoint read instead of tensors to save.
             v4_compatible: Must be false; the legacy metadata export is not supported.
@@ -394,9 +426,11 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
                 ``legacy_paramwrapper_layout``). They do not apply to this model and are not read.
 
         Returns:
-            Released Hugging Face names mapped to tensors in the released layouts.
+            Base tensors under released Hugging Face names; supported LoRA tensors retain their native names,
+            optionally prefixed by ``base_model.model.``. A LoRA-only load records the supplied keys, shapes
+            and dtypes and returns a shallow copy; its reader may replace the mapping before ``from_hf``.
 
-            For a load, the mapping must be passed to ``from_hf`` unchanged after the read. The destinations
+            For a base load, the mapping must be passed to ``from_hf`` unchanged after the read. The destinations
             alias model storage, so the read overwrites the model in place before ``from_hf`` runs. The
             exceptions are temporaries that ``from_hf`` installs: the fused K/V projection of each DSA layer
             and, for a sharded state, the mHC alphas. Sharded: the destinations of
@@ -413,13 +447,39 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
             RuntimeError: If a load session is active, or an earlier session was abandoned, replaced or
                 failed.
             ValueError: If the state is empty (save), mixes plain tensors and DTensors (save), has a name
-                without the ``model.`` prefix, or a conversion rejects its tensors.
+                without the ``model.`` prefix, contains an unsupported LoRA key or a non-tensor LoRA value,
+                or a conversion rejects its tensors.
             TypeError: If a sharded state holds a plain tensor where a DTensor is required.
         """
         if quantization or v4_compatible:
             raise NotImplementedError("Quantization and v4 metadata export are unsupported")
         if self.config.num_nextn_predict_layers != 0 or self.config.tie_word_embeddings:
             raise NotImplementedError("Only untied decoder-only export is supported")
+        # LoRA tensors retain native names and storage. A PEFT load records the model-provided key, shape,
+        # and dtype contract, because its reader may return a new mapping instead of these destinations.
+        # The model key plan can mix base and adapter tensors; base checkpoint loads must remain base-only.
+        unsupported = [name for name in state_dict if ".lora_" in name and not _is_lora_key(name)]
+        if unsupported:
+            first = unsupported[0]
+            if first.rsplit(".", 1)[-1] in {"lora_magnitude", "lora_magnitude_vector"}:
+                raise ValueError(f"Unsupported LoRA state key: {first}. DoRA is unsupported; disable peft.use_dora")
+            raise ValueError(f"Unsupported LoRA state key: {first}")
+        adapter_state = {name: value for name, value in state_dict.items() if _is_lora_key(name)}
+        if adapter_state:
+            if self._poisoned or self._token is not None:
+                raise RuntimeError("Abandoned or active load: discard this model and adapter")
+            if len(adapter_state) == len(state_dict):
+                if not all(isinstance(value, torch.Tensor) for value in adapter_state.values()):
+                    raise ValueError("LoRA state must contain only tensors")
+                if for_checkpoint_load:
+                    self._lora_expected = {key: (value.shape, value.dtype) for key, value in adapter_state.items()}
+                    self._token = _SessionToken()
+                return dict(state_dict)
+        if adapter_state and not for_checkpoint_load:
+            base_state = {name: value for name, value in state_dict.items() if not _is_lora_key(name)}
+            converted = self.to_hf(base_state, quantization=quantization, v4_compatible=v4_compatible, **kwargs)
+            converted.update(adapter_state)
+            return converted
         tensors = [value for value in state_dict.values() if isinstance(value, torch.Tensor)]
         sharded = [isinstance(value, DTensor) for value in tensors]
         if for_checkpoint_load:
@@ -461,24 +521,25 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
     ) -> dict[str, torch.Tensor]:
         """Return the native state for tensors in the released layout, closing a load session if one is open.
 
-        Without a session, a complete mapping of plain tensors is converted on its own. Otherwise the mapping
-        must be the object that ``to_hf(..., for_checkpoint_load=True)`` returned for the open session, with the
-        same keys and the same tensor objects. Anything else makes the adapter refuse all further work: a copy
-        of the destinations, made during the session or after it, the destinations of another adapter or of a
-        session that has already ended, a mapping of DTensors or an empty mapping without a session.
+        Without a session, a complete mapping of plain base tensors is converted on its own. A base load requires
+        the object that ``to_hf(..., for_checkpoint_load=True)`` returned for the open session, with the same keys
+        and tensor objects. Copies, destinations of a different or ended session, a mapping of DTensors or an empty
+        mapping without a session are refused. A LoRA load instead accepts a replacement mapping only if its keys,
+        shapes and dtypes match the model-provided contract. A failed validation poisons the adapter.
 
         Args:
             hf_state_dict: Released Hugging Face names mapped to tensors in the released layouts: either the
                 destinations of the active load session after the read, or, when no session is open, exactly
                 the released tensors of the decoder-only model as plain tensors, none of which was a
-                destination of an earlier session.
-            device_mesh: Mesh of a distributed load. A sharded session does not need it. An unsharded session
-                and a conversion without a session require ``None``: loading into an unsharded model with a
-                device mesh is not supported.
+                destination of an earlier session. For a LoRA load, the reader's mapping under native PEFT names holds
+                plain tensors in the global shapes of the receiving model's adapter parameters.
+            device_mesh: Mesh of a distributed base load. A sharded base session does not need it. An unsharded
+                base session and a conversion without a session require ``None``; a LoRA session does not use it.
             **kwargs: Other options of the caller. None applies to this model; they are not read.
 
         Returns:
-            Native ``model.`` names mapped to tensors in the shapes of the model's parameters and buffers. For
+            A validated LoRA mapping is returned unchanged in a shallow copy for framework installation. For the
+            base model, native ``model.`` names map to tensors in the shapes of its parameters and buffers. For
             a session these are the tensors of the state that ``to_hf`` was given, in its order: the model's
             own tensors, now holding the checkpoint values (for a sharded state on every rank). For a
             conversion without a session they are converted from the given tensors: the grouped expert
@@ -487,11 +548,47 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
             or a view of one.
 
         Raises:
-            RuntimeError: If the mapping is not the destinations of the active session, or an earlier session
-                was abandoned, replaced or failed.
+            RuntimeError: If a LoRA mapping has no matching session, the adapter is poisoned, the mapping is
+                not the destinations of the active base session, or an earlier session was abandoned or replaced.
             ValueError: If the keys or tensors of the destinations were exchanged, a device mesh is given for
-                an unsharded conversion, or a conversion rejects its tensors.
+                an unsharded conversion, a LoRA key, shape or dtype differs, or a conversion rejects its tensors.
         """
+        # A PEFT reader can replace the destination mapping; validate its complete contract before the
+        # framework installs any returned tensors into model parameters.
+        if self._lora_expected is not None:
+            expected = self._lora_expected
+            try:
+                # Defensive invariant: an active LoRA contract is paired with a token and is not poisoned.
+                if self._poisoned or self._token is None:
+                    raise RuntimeError("Missing or failed LoRA load session: discard this model and adapter")
+                if hf_state_dict.keys() != expected.keys():
+                    missing = sorted(expected.keys() - hf_state_dict.keys())
+                    unexpected = sorted(hf_state_dict.keys() - expected.keys())
+                    raise ValueError(
+                        f"LoRA checkpoint keys do not match the model: {len(missing)} missing {missing[:3]}, "
+                        f"{len(unexpected)} unexpected {unexpected[:3]}"
+                    )
+                for name, (shape, dtype) in expected.items():
+                    tensor = hf_state_dict[name]
+                    if not isinstance(tensor, torch.Tensor):
+                        raise ValueError(f"LoRA checkpoint tensor {name} is not a tensor: got {type(tensor).__name__}")
+                    if tensor.shape != shape or tensor.dtype != dtype:
+                        raise ValueError(
+                            f"LoRA checkpoint tensor {name} has unexpected shape or dtype: "
+                            f"checkpoint shape={tuple(tensor.shape)} dtype={tensor.dtype}; "
+                            f"model shape={tuple(shape)} dtype={dtype}"
+                        )
+                return dict(hf_state_dict)
+            except BaseException:
+                self._poisoned = True
+                raise
+            finally:
+                self._lora_expected = None
+                self._token = None
+        if hf_state_dict and all(_is_lora_key(name) for name in hf_state_dict):
+            if self._token is not None:
+                self._poisoned = True
+            raise RuntimeError("LoRA checkpoint needs a matching load session")
         idle = self._active is None and self._token is None and not self._poisoned
         if (
             idle

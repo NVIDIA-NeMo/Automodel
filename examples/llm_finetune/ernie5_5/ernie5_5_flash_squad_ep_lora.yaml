@@ -1,0 +1,254 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA fine-tuning of the 43-layer main decoder of ERNIE-5.5-Flash-Base-BF16 on SQuAD:
+# single unpacked documents of at most 256 tokens, 100 updates, validation and an adapter
+# checkpoint after 50 and 100.
+# Target topology: 2 nodes x 4 GB200 GPUs, WORLD=8, EP=8, TP=PP=CP=1. Dense parameters use
+# FSDP2 over all 8 ranks. The 512 routed experts of each MoE layer are split into 8 groups
+# along the EP axis, one group per rank (ep_shard = WORLD / EP = 1), so no rank gathers the
+# experts of another. GBS=8/LBS=1 gives one document per rank and no accumulation.
+#
+# Only the adapters train: rank 8 on the plain linear projections that an attention module
+# owns directly (not those of its indexer or compressor), on the routed experts and on the
+# dense and shared FFN projections, 1.79 B parameters, 98% of them in the routed experts. The
+# base weights are loaded and stay frozen. LoRA removes the gradients and the optimizer state
+# of the base weights, which is what lets 2 nodes replace the 16 of
+# ernie5_5_flash_squad_ep.yaml. It does not shrink the weights a rank holds (its expert group
+# and its shard of the dense weights), and a step still keeps the activations of the forward
+# pass for the backward pass: a GPU holds 65.8 GiB after loading and peaked at 102.8 GiB
+# allocated in the validated run.
+#
+# Hardware: the six sparse-attention (DSA) layers run on the cuDNN path, which requires
+# nvidia-cudnn-frontend[cutedsl] and FlashMLA; validated on SM100-class GPUs (GB200) only. The
+# other values of backend.attn (eager, torch, sdpa) select an eager DSA path that accepts at most
+# 512 tokens per document; multi-GPU training of the released model has been validated with the
+# cuDNN path only. The HCA layers run on the eager PyTorch path with every value.
+#
+# Not supported: tensor, context and pipeline parallelism, activation checkpointing, packed
+# sequences and padded batches. LoRA on any module that peft.target_modules below does not
+# list: the grouped HCA projection wo_a, the FP32 projections of the HCA compressor and of the
+# latent MoE, the DSA indexers and the output head are rejected before the model is sharded;
+# k_b_proj and v_b_proj of a DSA layer, the router and the hyper-connections are parameters
+# without a linear module of their own and cannot be selected. DoRA (peft.use_dora) is
+# rejected when the model is built, and an adapter in another dtype than the weight it adapts
+# (peft.lora_dtype, or an FP32 model under a BF16 compute dtype) before the model is sharded.
+# The multi-token prediction (MTP) block of the released checkpoint is not loaded or trained.
+#
+# To run this recipe, from the repository root, on each of the 2 nodes with 4 GPUs, with
+# NODE_RANK set to 0 and 1 and MASTER_ADDR set to the first node:
+#   uv run torchrun --nnodes=2 --nproc-per-node=4 --node-rank=$NODE_RANK \
+#     --master-addr=$MASTER_ADDR --master-port=29500 \
+#     -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml
+# The model, the tokenizer and the SQuAD dataset come from the Hugging Face Hub, the model and
+# the tokenizer at the pinned revision below; the BF16 weights take about 534 GiB in the Hub
+# cache, which every node must be able to read. The validated run read all three from a cache
+# shared by the nodes, with HF_HUB_OFFLINE=1 and HF_DATASETS_OFFLINE=1.
+# checkpoint.checkpoint_dir must be on storage that both nodes share: every rank writes its
+# part of the optimizer state there. The recipe writes two checkpoints, about 40 GiB in all.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  # One unpadded document per rank and microbatch: padded input is not supported.
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  save_checkpoint_every_epoch: false
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+  revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+  trust_remote_code: false
+  dtype: bfloat16
+  # The released config declares one MTP block (num_nextn_predict_layers: 1) that this model
+  # does not construct; loading it unchanged is rejected. This override selects the 43
+  # decoder layers, and the MTP keys of the checkpoint are not loaded.
+  num_nextn_predict_layers: 0
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # cuDNN sparse attention for the DSA layers: requires nvidia-cudnn-frontend[cutedsl] and
+    # FlashMLA; validated on SM100-class GPUs (GB200) only.
+    attn: cudnn
+    # The model implements the torch kernels only: the next three fields must be torch, and
+    # every other BackendConfig field except enable_hf_state_dict_adapter must keep its default.
+    linear: torch
+    experts: torch
+    dispatcher: torch
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  # Every pattern must select supported modules only; the model's parallelizer rejects an
+  # adapter on any other module. Without target_modules the default pattern also selects
+  # unsupported projections.
+  target_modules:
+    # HCA attention (37 layers): the plain linear projections. wo_a is a grouped projection
+    # and is not supported.
+    - "model.layers.*.attention.wq_a"
+    - "model.layers.*.attention.wq_b"
+    - "model.layers.*.attention.wkv"
+    - "model.layers.*.attention.wo_b"
+    # Output gate of the attention: HCA and DSA layers.
+    - "model.layers.*.attention.gate_proj"
+    # DSA attention (6 layers). These patterns do not select the indexer (attention.indexer.*).
+    - "model.layers.*.attention.q_a_proj"
+    - "model.layers.*.attention.q_b_proj"
+    - "model.layers.*.attention.kv_a_proj_with_mqa"
+    - "model.layers.*.attention.o_proj"
+    # Routed experts of the 42 MoE layers: 98% of the adapter parameters.
+    - "model.layers.*.moe.experts"
+    # Dense FFN of layer 0 and shared expert of the MoE layers.
+    - "model.layers.*.mlp.gate_proj"
+    - "model.layers.*.mlp.up_proj"
+    - "model.layers.*.mlp.down_proj"
+    - "model.layers.*.moe.shared_experts.gate_proj"
+    - "model.layers.*.moe.shared_experts.up_proj"
+    - "model.layers.*.moe.shared_experts.down_proj"
+  dim: 8
+  alpha: 32
+
+distributed:
+  strategy: fsdp2
+  # FSDP2 with expert parallelism only: TP, PP, CP and dp_replicate_size must stay 1, and
+  # ep_size must be greater than 1.
+  tp_size: 1
+  pp_size: 1
+  cp_size: 1
+  # One rank per expert group. With more ranks than ep_size each group is FSDP-sharded and
+  # every rank gathers a whole group during the forward pass; that layout has not been
+  # validated with LoRA on the full model.
+  ep_size: 8
+  # Not supported: the model's parallelizer rejects activation checkpointing.
+  activation_checkpointing: false
+  # No compute cast: every parameter is used in its storage dtype (BF16, and FP32 where the
+  # model keeps FP32 parameters). Gradients are reduced in FP32.
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: null
+    reduce_dtype: float32
+    output_dtype: null
+    cast_forward_inputs: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+checkpoint:
+  # A checkpoint holds the adapter (model/adapter_model.safetensors, with the parameter names
+  # of this framework) and the optimizer state of the adapter, not the base weights: about
+  # 20 GiB, 3.3 GiB of adapter weights and 16.7 GiB of optimizer state. A resume loads the
+  # released checkpoint first and was validated with the same number of ranks and the same
+  # ep_size. A run with checkpoint.restore_from is a resume. Without it, a run resumes from the
+  # latest checkpoint in checkpoint_dir if that checkpoint's model configuration is compatible,
+  # so a second run with the same checkpoint_dir is normally a resume as well. A resume
+  # restores the adapter. The state of this optimizer and its update counter are restored only
+  # with the fix of pull request #4739; without it the optimizer restarts silently on the
+  # restored adapter.
+  enabled: true
+  # A LoRA run writes no consolidated export whatever this key says; false is kept explicit (the
+  # default is final).
+  save_consolidated: false
+  checkpoint_dir: checkpoints/ernie5_5_flash_squad_ep_lora/
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  # Truncate, never pad. 256 tokens is the length of the full fine-tuning recipe. The answer is
+  # at the end of a row, so about 11% of the training rows lose it to truncation and contribute
+  # no loss.
+  seq_length: 256
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+    revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
+
+packed_sequence:
+  # Packed sequences are not supported.
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  # No pad_seq_len_divisible: the collator must not pad.
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 128
+  seq_length: 256
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+    revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  # BF16 adapters with FP32 master weights, stored as 16-bit remainders, and BF16 moments, as
+  # in the full fine-tuning recipe.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  # Ten times the rate of the full fine-tuning recipe; the model card reports the comparison
+  # with 1.0e-4.
+  lr: 1.0e-5
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: gb200
+  # EP=8 over WORLD=8: 2 nodes x 4 GPUs. The cuDNN DSA path is validated on SM100-class GPUs
+  # (GB200) only.
+  recipe_owner: linmuchuiyang
+  nodes: 2
+  time: "01:00:00"
+  nproc_per_node: 4
