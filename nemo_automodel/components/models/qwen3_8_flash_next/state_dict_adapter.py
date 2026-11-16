@@ -261,6 +261,23 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         tensors[self._table_scale_key] = table.scale
         return tensors
 
+    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
+        """Return HF export dtype overrides, including the stored format of an FP8 PLE table.
+
+        Consolidated export otherwise takes dtypes from a cached snapshot of
+        the model ID, which need not be the snapshot this table was loaded
+        from. The FP8 shards and their BF16 scale keep their dtypes, so the
+        export always matches its config's ``ple_embedding_dtype``.
+        """
+        forced = super().forced_hf_dtype_mapping(state_dict)
+        if self._fp8_table:
+            for key in self._table_shard_keys:
+                if key in state_dict:
+                    forced[key] = _SAFETENSORS_FP8_E4M3
+            if self._table_scale_key in state_dict:
+                forced[self._table_scale_key] = "BF16"
+        return forced
+
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
         """Return the rank-independent global HF key set without gathering PLE.
 

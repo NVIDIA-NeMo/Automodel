@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -30,6 +32,7 @@ from huggingface_hub import constants as huggingface_constants
 from safetensors.torch import load_file, save_file
 from torch import nn
 
+from nemo_automodel.components.checkpoint import checkpointing as checkpointing_module
 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
@@ -802,12 +805,13 @@ def _write_model_checkpoint(path: Path, table: torch.Tensor, scale: torch.Tensor
     return path
 
 
-def _checkpointer(checkpoint_dir: Path, *, repo_id: str | None = None):
+def _checkpointer(checkpoint_dir: Path, *, repo_id: str | None = None, cache_dir: Path | None = None):
     return CheckpointingConfig(
         enabled=True,
         checkpoint_dir=str(checkpoint_dir),
         model_save_format="safetensors",
         model_repo_id=repo_id,
+        model_cache_dir=None if cache_dir is None else str(cache_dir),
         save_consolidated=True,
         is_peft=False,
     ).build(dp_rank=0, tp_rank=0, pp_rank=0)
@@ -954,3 +958,105 @@ def test_model_export_with_fp8_table_reloads_through_from_pretrained(
         assert torch.equal(table.scale, fp8_checkpoint.scale)
     finally:
         torch.distributed.destroy_process_group()
+
+
+class _TinyBF16CheckpointModel(HFCheckpointingMixin, nn.Module):
+    """Minimal model with the production PLE hierarchy, a trainable BF16 table, and one other parameter."""
+
+    def __init__(self, name_or_path: str) -> None:
+        super().__init__()
+        self.config = _text_config(None)
+        self.ordinary = nn.Parameter(torch.zeros(3))
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+        ple = nn.Module()
+        ple.ple_embedding = nn.Module()
+        ple.ple_embedding.ngram_embedding = Qwen3_8_FlashNextEngramTableConfig(
+            num_embeddings=_ROWS, embedding_dim=_DIM
+        ).build(process_group=None, dtype=torch.bfloat16)
+        self.model.language_model.layers[1].ple = ple
+        self.state_dict_adapter = Qwen3_8_FlashNextStateDictAdapter(
+            _text_config(None),
+            _moe_config(),
+            _backend(),
+            ple.ple_embedding.ngram_embedding,
+            dtype=torch.float32,
+            pretrained_model_name_or_path=name_or_path,
+        )
+        self._pre_shard_hf_state_dict_keys = self.state_dict_adapter.get_hf_state_dict_keys(self.state_dict())
+
+    @property
+    def table(self) -> nn.Module:
+        return self.model.language_model.layers[1].ple.ple_embedding.ngram_embedding
+
+
+def _safetensors_dtypes(checkpoint: Path) -> dict[str, str]:
+    """Return the stored safetensors dtype name of every key in a checkpoint directory."""
+    weight_map = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
+    dtypes: dict[str, str] = {}
+    for file_name in set(weight_map.values()):
+        with open(checkpoint / file_name, "rb") as handle:
+            header = json.loads(handle.read(int.from_bytes(handle.read(8), "little")))
+        dtypes.update({key: value["dtype"] for key, value in header.items() if key != "__metadata__"})
+    return dtypes
+
+
+@pytest.mark.parametrize("selected_fp8", [True, False], ids=["fp8-selected", "bf16-selected"])
+def test_export_keeps_the_ple_format_when_another_cached_snapshot_has_the_other_format(
+    selected_fp8: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two cached snapshots of one Hub ID: the run loads B, and A stores the PLE table in the other format.
+    hub = tmp_path / "hub"
+    snapshots = hub / "models--org--tiny" / "snapshots"
+    fp8_table = _finite_fp8_table(_ROWS, _DIM, seed=5)
+    fp8 = {"table": fp8_table, "scale": torch.tensor([_CHECKPOINT_SCALE], dtype=torch.bfloat16)}
+    bf16 = {"table": fp8_table.to(torch.bfloat16), "scale": None}
+    selected, other = (fp8, bf16) if selected_fp8 else (bf16, fp8)
+    _write_checkpoint(snapshots / ("a" * 40), **other, extra_tensors={"ordinary": torch.full((3,), 1.0)})
+    snapshot_b = _write_checkpoint(
+        snapshots / ("b" * 40), **selected, extra_tensors={"ordinary": torch.full((3,), 2.0)}
+    )
+    # Export metadata takes the dtypes of the first cached snapshot with an index; make that A.
+    monkeypatch.setattr(checkpointing_module, "glob", SimpleNamespace(glob=lambda pattern: sorted(glob.glob(pattern))))
+    assert checkpointing_module._get_hf_safetensors_reference_path(hub, "org/tiny") == str(snapshots / ("a" * 40))
+
+    def build(name_or_path: str, host_dir: Path) -> _TinyFP8CheckpointModel | _TinyBF16CheckpointModel:
+        return (
+            _TinyFP8CheckpointModel(name_or_path, host_dir) if selected_fp8 else _TinyBF16CheckpointModel(name_or_path)
+        )
+
+    source = build("org/tiny", tmp_path / "shm")
+    checkpointer = _checkpointer(tmp_path / "out", repo_id="org/tiny", cache_dir=hub)
+    try:
+        checkpointer.load_base_model(source, torch.device("cpu"), str(hub), str(snapshot_b))
+        with torch.no_grad():
+            source.ordinary.add_(10.0)  # a training update
+        checkpointer.save_model(source, str(tmp_path / "out" / "step_1"), is_final_checkpoint=True)
+    finally:
+        checkpointer.close()
+    export = tmp_path / "out" / "step_1" / "model" / "consolidated"
+
+    shard_keys = [f"{_PREFIX}.shard_{index}.weight" for index in range(_SPLIT_PARTS)]
+    dtypes = _safetensors_dtypes(export)
+    if selected_fp8:
+        assert {dtypes[key] for key in shard_keys} == {"F8_E4M3"}
+        assert dtypes[_SCALE_KEY] == "BF16"
+    else:
+        assert {dtypes[key] for key in shard_keys} == {"BF16"}
+        assert _SCALE_KEY not in dtypes
+
+    # The export loads on its own, with no cached snapshot left.
+    shutil.rmtree(hub)
+    target = build(str(export), tmp_path / "shm-reload")
+    checkpointer = _checkpointer(tmp_path / "out2")
+    try:
+        checkpointer.load_base_model(target, torch.device("cpu"), None, str(export))
+    finally:
+        checkpointer.close()
+    assert torch.equal(target.ordinary.detach(), torch.full((3,), 12.0))
+    if selected_fp8:
+        assert torch.equal(target.table.rows, fp8["table"].view(torch.uint8))
+        assert torch.equal(target.table.scale, fp8["scale"])
+    else:
+        assert torch.equal(target.table.weight.detach(), bf16["table"])
