@@ -171,6 +171,8 @@ class RankedVlmDatasetConfig(Protocol):
     """Dataset config whose build requires the runtime data-parallel rank."""
 
     builds_with_data_parallel_rank: bool
+    shard_data: bool
+    """Whether ``build`` returns only this rank's ``1/world_size`` slice, so the sampler must not split it again."""
 
     def build(self, *, rank: int, world_size: int) -> object:
         """Build the per-rank dataset shard."""
@@ -443,10 +445,15 @@ class VlmDataloaderConfig:
 
         if not isinstance(dataset, Sized):
             raise TypeError(f"VLM dataloaders require a sized dataset, got {type(dataset).__name__}")
+        # A rank-sharded dataset already holds only this rank's slice; splitting it
+        # across dp ranks again would leave each epoch with 1/dp_world_size of the data.
+        dataset_is_rank_shard = (
+            isinstance(self.dataset_config, RankedVlmDatasetConfig) and self.dataset_config.shard_data
+        )
         sampler = DistributedSampler(
             dataset,
-            num_replicas=dp_world_size,
-            rank=dp_rank,
+            num_replicas=1 if dataset_is_rank_shard else dp_world_size,
+            rank=0 if dataset_is_rank_shard else dp_rank,
             shuffle=self.shuffle,
         )
         num_workers = self.num_workers
