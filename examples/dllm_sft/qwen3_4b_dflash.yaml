@@ -50,7 +50,7 @@ model:
   _target_: transformers.AutoModel.from_pretrained
   pretrained_model_name_or_path: z-lab/Qwen3-4B-DFlash-b16
   trust_remote_code: true
-  dtype: bfloat16
+  dtype: float32  # FP32 resident weights and AdamW moments; BF16 compute via mp_policy
 
 checkpoint:
   enabled: true
@@ -67,9 +67,9 @@ distributed:
   activation_checkpointing: false
   mp_policy:
     param_dtype: bfloat16
+    cast_forward_inputs: true  # Cast FP32 activations at FSDP compute boundaries.
     reduce_dtype: float32
     output_dtype: float32
-  autocast_dtype: bfloat16
   offload_policy: null
   # Per-layer FSDP2 prefetch overlaps all-gather / reduce-scatter with compute.
   # Off by default in FSDP2Config, so enable it here.

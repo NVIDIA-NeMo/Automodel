@@ -72,10 +72,15 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
-# Models build their CP/fp32-gate-aware modules at construction; no load-time
-# runtime patching is registered here. (Qwen3.5 dense/MoE build the native
-# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
-_MODEL_RUNTIME_PATCHES = {}
+# Remote dLLM implementations need model-owned guards around explicitly FP32
+# math. Native implementations install their precision protections themselves.
+_MODEL_RUNTIME_PATCHES = {
+    "LLaDA2MoeModelLM": ("nemo_automodel.components.models.llada2.precision", "apply_precision_guards"),
+    "NemotronLabsDiffusionModel": (
+        "nemo_automodel.components.models.nemotron_labs_diffusion.precision",
+        "apply_precision_guards",
+    ),
+}
 
 
 def _set_global_sdpa_backends(sdpa_method):

@@ -90,7 +90,6 @@ distributed:
     param_dtype: bfloat16
     reduce_dtype: float32
     output_dtype: float32
-  autocast_dtype: bfloat16
   offload_policy: null
   moe:
     reshard_after_forward: false

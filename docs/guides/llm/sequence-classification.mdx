@@ -18,15 +18,15 @@ uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
 
 - Loads `roberta-large` with `num_labels: 2`
-- Builds GLUE MRPC datasets (train/validation)
-- Optionally, enables LoRA via the `peft` block
+- Builds GLUE MRPC datasets (train and validation)
+- Optionally, enables LoRA through the `peft` block
 - Trains and validates per `step_scheduler`
 
 ## What is the Sequence Classification Recipe?
 
 `TrainFinetuneRecipeForSequenceClassification` is a config-driven trainer that orchestrates:
 - Model and optimizer construction
-- Dataset/Dataloader setup
+- Dataset and dataloader setup
 - Training and validation loops
 - Checkpointing and logging
 
@@ -66,7 +66,9 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
-  autocast_dtype: bfloat16
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -116,7 +118,7 @@ optimizer:
 - `target_modules`: Glob to select linear layers (for example, `"*.proj"`).
 - `dim` (rank), `alpha`, `dropout`: Tune per model and compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
 - `freeze_config.unfreeze_modules`: Keeps the classification head fully trainable while PEFT freezes other non-LoRA parameters.
-- `distributed.autocast_dtype`: Runs the forward pass in the selected compute dtype while trainable parameters retain their configured storage dtype, including when single-rank FSDP is skipped.
+- `distributed.mp_policy.param_dtype`: Runs the forward pass in the selected compute dtype while trainable parameters retain their configured storage dtype, including when single-rank FSDP is skipped.
 - The recipe automatically applies the adapters; no additional code changes are required.
 
 ## Running on Multiple GPUs
@@ -124,4 +126,5 @@ optimizer:
 ```bash
 uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml --nproc-per-node 2
 ```
+
 You can adjust the number of GPUs as necessary using the `--nproc-per-node` knob.
