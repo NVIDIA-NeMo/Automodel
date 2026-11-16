@@ -1027,7 +1027,9 @@ class Qwen3_8_FlashNextHostNGramTable:
 
     The table is deliberately not an ``nn.Module``: it stays out of
     ``parameters()``, ``state_dict()``, FSDP, the optimizer, ``Module.to()``,
-    checkpoint saves, and weight refits. It is never trained.
+    and weight refits. It is never trained. A checkpoint save still writes its
+    shards and scale unchanged through the state-dict adapter, so a saved
+    checkpoint loads on its own.
 
     The rows keep the checkpoint bytes (``uint8`` storage of ``float8_e4m3fn``
     values). A lookup returns ``bf16(fp8_row) * weight_scale`` with the BF16

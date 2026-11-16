@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import NamedTuple
 
@@ -26,7 +27,7 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 from huggingface_hub import constants as huggingface_constants
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
@@ -308,8 +309,9 @@ def test_fp8_table_is_frozen_and_outside_the_module_tree(fp8_checkpoint: _Checkp
     assert torch.equal(table.rows, rows_before)
 
 
-def test_fp8_model_keeps_the_table_out_of_state_dict_and_init(fp8_checkpoint: _Checkpoint, tmp_path: Path) -> None:
-    text = Qwen3_8_FlashNextTextConfig(
+def _model_text_config() -> Qwen3_8_FlashNextTextConfig:
+    """Return a one-layer model config with an FP8 PLE table of ``_ROWS`` rows under layer 0."""
+    return Qwen3_8_FlashNextTextConfig(
         vocab_size=64,
         hidden_size=16,
         intermediate_size=32,
@@ -342,6 +344,41 @@ def test_fp8_model_keeps_the_table_out_of_state_dict_and_init(fp8_checkpoint: _C
         bos_token_id=1,
         eos_token_id=1,
     )
+
+
+def _model_kwargs(host_dir: Path) -> dict[str, object]:
+    """Return the constructor arguments of the tiny CPU model."""
+    return {
+        "moe_config": MoEConfig(
+            dim=16,
+            inter_dim=16,
+            moe_inter_dim=8,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            n_activated_experts=1,
+            n_expert_groups=0,
+            n_limited_groups=0,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            aux_loss_coeff=0.0,
+            norm_topk_prob=True,
+            expert_bias=False,
+            router_bias=False,
+            expert_activation="swiglu",
+            softmax_before_topk=True,
+            shared_expert_gate=True,
+            shared_expert_inter_dim=8,
+        ),
+        "backend": BackendConfig(linear="torch", attn="sdpa", experts="torch", dispatcher="torch"),
+        "engram_table_config": Qwen3_8_FlashNextEngramTableConfig(num_embeddings=_ROWS, embedding_dim=_DIM),
+        "engram_host_dir": str(host_dir),
+    }
+
+
+def test_fp8_model_keeps_the_table_out_of_state_dict_and_init(fp8_checkpoint: _Checkpoint, tmp_path: Path) -> None:
+    text = _model_text_config()
     # A checkpoint directory with this config and the table under layer 0 (ple_layer_ids=[1]).
     checkpoint = _write_checkpoint(
         tmp_path / "ckpt0",
@@ -355,31 +392,7 @@ def test_fp8_model_keeps_the_table_out_of_state_dict_and_init(fp8_checkpoint: _C
     with torch.device("meta"):
         model = Qwen3_8_FlashNextForConditionalGeneration.from_pretrained(
             str(checkpoint),
-            moe_config=MoEConfig(
-                dim=16,
-                inter_dim=16,
-                moe_inter_dim=8,
-                n_routed_experts=2,
-                n_shared_experts=1,
-                n_activated_experts=1,
-                n_expert_groups=0,
-                n_limited_groups=0,
-                train_gate=True,
-                gate_bias_update_factor=0.0,
-                score_func="softmax",
-                route_scale=1.0,
-                aux_loss_coeff=0.0,
-                norm_topk_prob=True,
-                expert_bias=False,
-                router_bias=False,
-                expert_activation="swiglu",
-                softmax_before_topk=True,
-                shared_expert_gate=True,
-                shared_expert_inter_dim=8,
-            ),
-            backend=BackendConfig(linear="torch", attn="sdpa", experts="torch", dispatcher="torch"),
-            engram_table_config=Qwen3_8_FlashNextEngramTableConfig(num_embeddings=_ROWS, embedding_dim=_DIM),
-            engram_host_dir=str(host_dir),
+            **_model_kwargs(host_dir),
         )
     table = model.model.language_model.layers["0"].ple.ple_embedding.ngram_embedding
     assert isinstance(table, Qwen3_8_FlashNextHostNGramTable)
@@ -834,3 +847,110 @@ def test_named_checkpoint_needs_the_checkpointer_snapshot(tmp_path: Path) -> Non
     adapter.pretrained_model_name_or_path = "org/tiny"
     with pytest.raises(RuntimeError, match="is not a local directory"):
         adapter.from_hf({})
+
+
+def test_consolidated_export_of_an_fp8_table_loads_on_its_own(fp8_checkpoint: _Checkpoint, tmp_path: Path) -> None:
+    base = _write_model_checkpoint(
+        tmp_path / "base", fp8_checkpoint.table, fp8_checkpoint.scale, torch.tensor([1.0, 2.0, 3.0])
+    )
+    source = _TinyFP8CheckpointModel(str(base), tmp_path / "shm")
+    checkpointer = _checkpointer(tmp_path / "out", repo_id=str(base))
+    try:
+        checkpointer.load_base_model(source, torch.device("cpu"), None, str(base))
+        with torch.no_grad():
+            source.ordinary.add_(10.0)  # a training update
+        checkpointer.save_model(source, str(tmp_path / "out" / "step_1"), is_final_checkpoint=True)
+    finally:
+        checkpointer.close()
+    export = tmp_path / "out" / "step_1" / "model" / "consolidated"
+
+    # The export loads through the same path as a base checkpoint, without the original base.
+    shutil.rmtree(base)
+    target = _TinyFP8CheckpointModel(str(export), tmp_path / "shm-reload")
+    checkpointer = _checkpointer(tmp_path / "out2")
+    try:
+        checkpointer.load_base_model(target, torch.device("cpu"), None, str(export))
+        assert torch.equal(target.ordinary.detach(), torch.tensor([11.0, 12.0, 13.0]))
+        # Resuming from the training checkpoint, which now holds the table too, keeps working.
+        with torch.no_grad():
+            target.ordinary.zero_()
+        checkpointer.load_model(target, str(tmp_path / "out" / "step_1" / "model"))
+    finally:
+        checkpointer.close()
+    assert torch.equal(target.ordinary.detach(), torch.tensor([11.0, 12.0, 13.0]))
+    assert torch.equal(target.table.rows, fp8_checkpoint.table.view(torch.uint8))
+    assert torch.equal(target.table.scale, fp8_checkpoint.scale)
+    # The table stays frozen and outside the state dict, the parameters, and weight refits.
+    assert all("ngram_embedding" not in key for key in target.state_dict())
+    assert [name for name, _ in target.named_parameters()] == ["ordinary"]
+    assert all("ngram_embedding" not in key for key in target.state_dict_adapter.to_hf(target.state_dict()))
+
+    # The export lists every FP8 shard and the scale; their bytes equal the source checkpoint's.
+    weight_map = json.loads((export / "model.safetensors.index.json").read_text())["weight_map"]
+    shard_keys = [f"{_PREFIX}.shard_{index}.weight" for index in range(_SPLIT_PARTS)]
+    assert set(shard_keys) | {_SCALE_KEY} <= set(weight_map)
+    exported = torch.cat([load_file(str(export / weight_map[key]))[key] for key in shard_keys])
+    assert exported.dtype == torch.float8_e4m3fn
+    assert torch.equal(exported.view(torch.uint8), fp8_checkpoint.table.view(torch.uint8))
+    exported_scale = load_file(str(export / weight_map[_SCALE_KEY]))[_SCALE_KEY]
+    assert exported_scale.dtype == torch.bfloat16 and torch.equal(exported_scale, fp8_checkpoint.scale)
+
+
+def test_model_export_with_fp8_table_reloads_through_from_pretrained(
+    fp8_checkpoint: _Checkpoint, tmp_path: Path
+) -> None:
+    # Single-rank process group: the model's grouped experts save as DTensors.
+    torch.distributed.init_process_group("gloo", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1)
+    try:
+        host_dir = tmp_path / "shm"
+        host_dir.mkdir()
+        base = _write_checkpoint(
+            tmp_path / "base",
+            table=fp8_checkpoint.table,
+            scale=fp8_checkpoint.scale,
+            prefix=_PREFIX.replace("layers.1.", "layers.0."),
+            extra_tensors={},
+        )
+        Qwen3_8_FlashNextConfig(text_config=_model_text_config(), language_model_only=True).save_pretrained(str(base))
+        # The base checkpoint's other weights: a fresh model's, in checkpoint names.
+        seed = Qwen3_8_FlashNextForConditionalGeneration.from_pretrained(str(base), **_model_kwargs(host_dir))
+        seed.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
+        other_weights = {
+            key: value.detach().clone().contiguous()
+            for key, value in seed.state_dict_adapter.to_hf(seed.state_dict()).items()
+        }
+        save_file(other_weights, str(base / "model-other.safetensors"))
+        index = json.loads((base / "model.safetensors.index.json").read_text())
+        index["weight_map"].update(dict.fromkeys(other_weights, "model-other.safetensors"))
+        (base / "model.safetensors.index.json").write_text(json.dumps(index))
+
+        source = Qwen3_8_FlashNextForConditionalGeneration.from_pretrained(str(base), **_model_kwargs(host_dir))
+        source._pre_shard_hf_state_dict_keys = source.state_dict_adapter.get_hf_state_dict_keys(source.state_dict())
+        checkpointer = _checkpointer(tmp_path / "out", repo_id=str(base))
+        try:
+            checkpointer.load_base_model(source, torch.device("cpu"), None, str(base))
+            with torch.no_grad():
+                source.lm_head.weight.add_(1.0)  # a training update
+            checkpointer.save_model(source, str(tmp_path / "out" / "step_1"), is_final_checkpoint=True)
+        finally:
+            checkpointer.close()
+        export = tmp_path / "out" / "step_1" / "model" / "consolidated"
+        shutil.rmtree(base)
+
+        target = Qwen3_8_FlashNextForConditionalGeneration.from_pretrained(
+            str(export), **_model_kwargs(tmp_path / "shm")
+        )
+        checkpointer = _checkpointer(tmp_path / "out2")
+        try:
+            checkpointer.load_base_model(target, torch.device("cpu"), None, str(export))
+        finally:
+            checkpointer.close()
+
+        source_state, target_state = source.state_dict(), target.state_dict()
+        assert source_state.keys() == target_state.keys()
+        assert all(torch.equal(source_state[key], target_state[key]) for key in source_state)
+        table = target.model.language_model.layers["0"].ple.ple_embedding.ngram_embedding
+        assert torch.equal(table.rows, fp8_checkpoint.table.view(torch.uint8))
+        assert torch.equal(table.scale, fp8_checkpoint.scale)
+    finally:
+        torch.distributed.destroy_process_group()

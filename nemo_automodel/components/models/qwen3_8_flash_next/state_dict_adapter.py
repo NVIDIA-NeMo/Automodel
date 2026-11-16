@@ -29,7 +29,10 @@ frozen host table outside the model's state dict: :meth:`from_hf` checks the
 checkpoint format and loads the table and its scale directly from the
 checkpoint directory, and the shards never pass through the DCP read.  That
 directory is the one the checkpointer reads the base weights from
-(:meth:`Qwen3_8_FlashNextStateDictAdapter.set_base_checkpoint_dir`).
+(:meth:`Qwen3_8_FlashNextStateDictAdapter.set_base_checkpoint_dir`).  A save
+writes the table and its scale unchanged
+(:meth:`Qwen3_8_FlashNextStateDictAdapter.hf_tensors_outside_state_dict`), so a
+saved checkpoint loads without the base checkpoint.
 """
 
 from __future__ import annotations
@@ -225,12 +228,47 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         """
         self._base_checkpoint_dir = Path(checkpoint_dir)
 
+    def hf_tensors_outside_state_dict(self) -> dict[str, torch.Tensor]:
+        """Return checkpoint tensors that a save writes although the model's state dict lacks them.
+
+        The frozen FP8 table stays out of the state dict, the optimizer and
+        FSDP, but a saved checkpoint must hold it to load on its own. The
+        returned shards are ``float8_e4m3fn`` views of shape
+        ``[num_embeddings / split_ngram_parts, embedding_dim]`` into the host
+        table, which holds the source checkpoint's bytes unchanged; the scale
+        is the BF16 tensor of shape ``[1]``. Every rank returns the same
+        tensors, and the checkpoint writer stores each one once.
+
+        Returns:
+            Checkpoint-named shards and scale of an FP8 table; empty for a BF16
+            table, which is in the state dict.
+
+        Raises:
+            RuntimeError: If the FP8 table was never loaded.
+        """
+        if not self._fp8_table:
+            return {}
+        table = self.engram_table
+        if table.rows is None or table.scale is None:
+            raise RuntimeError(
+                "Cannot save the FP8 Qwen3.8-Flash-Next PLE table: it was never loaded from a checkpoint"
+            )
+        rows_per_shard = table.num_embeddings // self.split_ngram_parts
+        tensors = {
+            key: table.rows.narrow(0, shard_idx * rows_per_shard, rows_per_shard).view(torch.float8_e4m3fn)
+            for shard_idx, key in enumerate(self._table_shard_keys)
+        }
+        tensors[self._table_scale_key] = table.scale
+        return tensors
+
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
         """Return the rank-independent global HF key set without gathering PLE.
 
         Consolidated checkpoint planning requires the same global key list on
         every rank, so the one local PLE weight is replaced by all
-        ``split_ngram_parts`` physical shard names.  No data is touched.
+        ``split_ngram_parts`` physical shard names.  An FP8 table is outside the
+        state dict; its shard and scale names, which a save writes, are added.
+        No data is touched.
         """
         keys: list[str] = []
         for fqn, tensor in state_dict.items():
@@ -250,6 +288,8 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
                     quantization=False,
                 )
             )
+        if self._fp8_table:
+            keys.extend([*self._table_shard_keys, self._table_scale_key])
         return keys
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
