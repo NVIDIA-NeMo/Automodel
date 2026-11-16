@@ -1,0 +1,135 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GB200 real-data training variant; runtime tuning migrated from
+# examples/llm_benchmark/deepseek/deepseek_v4_flash_mok_32gpu.yaml
+# Run with --nproc-per-node 4 and --nnodes 8. GPU validation is pending.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 100
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    # Keep standard finetuning MTP-free by default. Set to 1 to enable
+    # DeepSeek-V4 Flash MTP training with the auxiliary loss below.
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  load_base_model: true
+  # DeepSeek-V4 uses 0.3 for most pretraining, then 0.1 during LR decay.
+  # Keep finetuning/RL conservative unless explicitly reproducing pretraining.
+  mtp_loss_scaling_factor: 0.1
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: torch
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm  # Ignored by MoK; retained for parity with HybridEP recipes.
+    dispatcher: mok
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+    mok:
+      fwd_num_comm_sms: 40
+      bwd_num_comm_sms: 28
+      minibatch_size: 4096
+      macrobatch_size: 131072
+      schedule_capacity_multiplier: 0.5
+      all_gather_top_experts_chunk_bytes: 2048
+
+  torch_dtype: bfloat16
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  fp32_upcast: false
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0.1
+  foreach: false
+
+prewarm:
+  comm_groups: true
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: gb200
+  # ep_size(32) = 32 GPUs => 8 nodes (4 GB200/node).
+  recipe_owner: akoumpa
+  nodes: 8
+  # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.
+  time: "00:45:00"
+  perf_testing:
+    schedule: nightly
+  nproc_per_node: 4

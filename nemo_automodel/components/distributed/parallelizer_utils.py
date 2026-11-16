@@ -45,6 +45,7 @@ UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, 
 
 __all__ = [
     "fully_shard_by_dtype",
+    "get_internal_fsdp_mp_policy",
     "reject_unsupported_mtp_cp",
     "reject_unsupported_mtp_cp_pp",
 ]

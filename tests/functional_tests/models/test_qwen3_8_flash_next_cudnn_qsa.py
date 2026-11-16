@@ -19,7 +19,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention, select_qsa_token_ids
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
+    qsa_gqa_attention,
+    select_qsa_cuda_kernel,
+    select_qsa_token_ids,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
@@ -121,7 +125,7 @@ def test_forward_backward_packed_and_empty(
         Returns:
             BF16 output with q's layout.
         """
-        return qsa_gqa_attention(q, k, v, routes, backend="cudnn", softmax_scale=scale)
+        return qsa_gqa_attention(q, k, v, routes, cuda_kernel=select_qsa_cuda_kernel("cudnn"), softmax_scale=scale)
 
     out = checkpoint(attention, q, k, v, use_reentrant=False) if use_checkpoint else attention(q, k, v)
     dy = torch.randn_like(out)
@@ -143,7 +147,7 @@ def test_all_empty_and_nondefault_stream() -> None:
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        out = qsa_gqa_attention(*inputs, routes, backend="cudnn")
+        out = qsa_gqa_attention(*inputs, routes, cuda_kernel=select_qsa_cuda_kernel("cudnn"))
         grads = torch.autograd.grad(out, inputs, torch.randn_like(out))
     torch.cuda.current_stream().wait_stream(stream)
     for tensor in (out, *grads):
@@ -158,6 +162,6 @@ def test_deterministic_backward_rejected() -> None:
     try:
         torch.use_deterministic_algorithms(True)
         with pytest.raises(RuntimeError, match="not deterministic"):
-            qsa_gqa_attention(*inputs, routes, backend="cudnn")
+            qsa_gqa_attention(*inputs, routes, cuda_kernel=select_qsa_cuda_kernel("cudnn"))
     finally:
         torch.use_deterministic_algorithms(previous, warn_only=warn_only)

@@ -133,6 +133,7 @@ wandb:
   - 128-gpu
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: snowmanwwg
   cluster_tag: gb200
   nodes: 32

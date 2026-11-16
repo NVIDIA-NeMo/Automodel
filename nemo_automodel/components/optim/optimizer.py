@@ -47,7 +47,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict, cast
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
@@ -240,7 +240,9 @@ class OptimizerConfig:
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         """Construct a single optimizer for ``params`` (one model part)."""
         raise NotImplementedError(f"{type(self).__name__} must implement _build_optimizer()")
 
@@ -269,7 +271,9 @@ class AdamConfig(OptimizerConfig):
     eps: float = 1e-8
     amsgrad: bool = False
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         return torch.optim.Adam(
             params,
             **self._constructor_kwargs(),
@@ -288,7 +292,9 @@ class AdamWConfig(OptimizerConfig):
     amsgrad: bool = False
     fused: bool = False
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
             params,
             **self._constructor_kwargs(),
@@ -310,7 +316,9 @@ class FusedAdamConfig(OptimizerConfig):
     master_weights: bool = True
     master_weight_dtype: str | None = None
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         from transformer_engine.pytorch.optimizers import FusedAdam
 
         kwargs = self._constructor_kwargs()
@@ -330,10 +338,14 @@ class FlashAdamWConfig(OptimizerConfig):
     eps: float = 1e-8
     master_weight_bits: int = 24
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         from flashoptim import FlashAdamW
 
-        return FlashAdamW(params, **self._constructor_kwargs())
+        # FlashAdamW forwards params unchanged to torch's Optimizer, including
+        # parameter-group dicts, but its upstream annotation only names tensors.
+        return FlashAdamW(cast(list[torch.Tensor], params), **self._constructor_kwargs())
 
 
 # Fields used only for Dion-family parameter grouping; these are NOT dion
@@ -609,12 +621,15 @@ class MuonConfig(_DionConfigBase):
                 )
         return optimizers
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    def _make_optimizer(
+        self, param_groups: list[_DionParamGroup], ctor_kwargs: dict[str, Any]
+    ) -> torch.optim.Optimizer:
         from dion import Muon
 
         if self.adjust_lr == "spectral_norm":
             # torch's ParamsT takes plain dicts, so the typed groups are copied at this boundary.
-            param_groups = [dict(split) for group in param_groups for split in self._spectral_norm_groups(group)]
+            groups = [dict(split) for group in param_groups for split in self._spectral_norm_groups(group)]
+            return Muon(groups, **ctor_kwargs)
         return Muon(param_groups, **ctor_kwargs)
 
     def _spectral_norm_groups(self, group: _DionParamGroup) -> list[_DionParamGroup]:
@@ -691,7 +706,7 @@ class NorMuonConfig(_DionConfigBase):
     epsilon: float = 1e-8
     adjust_lr: str = "spectral_norm"
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
         from dion import NorMuon
 
         return NorMuon(param_groups, **ctor_kwargs)
@@ -707,7 +722,7 @@ class Dion2Config(_DionConfigBase):
     epsilon: float = 1e-8
     adjust_lr: str = "spectral_norm"
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
         from dion import Dion2
 
         return Dion2(param_groups, **ctor_kwargs)
@@ -731,7 +746,7 @@ class DionConfig(_DionConfigBase):
 
     _mesh_kwarg: ClassVar[str] = "outer_shard_mesh"
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
         from dion import Dion
 
         return Dion(param_groups, **ctor_kwargs)

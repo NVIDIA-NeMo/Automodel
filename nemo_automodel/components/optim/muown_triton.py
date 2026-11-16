@@ -31,16 +31,18 @@ _HAS_LANGUAGE, tl = safe_import("triton.language")
 HAVE_TRITON = _HAS_TRITON and _HAS_LANGUAGE
 
 
+# Runtime pointers and scalars are tl.tensor values inside the kernels. This
+# leaves launch-time dtype inference and constexpr specialization unchanged.
 @(triton.jit if HAVE_TRITON else null_decorator)
 def _prepare_kernel(
-    W,
-    G,
-    N,
-    Grad,
-    Mom,
-    D,
-    U,
-    GG,
+    W: tl.tensor,
+    G: tl.tensor,
+    N: tl.tensor,
+    Grad: tl.tensor,
+    Mom: tl.tensor,
+    D: tl.tensor,
+    U: tl.tensor,
+    GG: tl.tensor,
     R: tl.constexpr,
     INPUTS: tl.constexpr,
     TRANSPOSED: tl.constexpr,
@@ -49,7 +51,7 @@ def _prepare_kernel(
     NESTEROV: tl.constexpr,
     BR: tl.constexpr,
     BI: tl.constexpr,
-):
+) -> None:
     batch = tl.program_id(1)
     row = tl.program_id(0) * BR + tl.arange(0, BR)
     col = tl.arange(0, BI)
@@ -82,29 +84,29 @@ def _prepare_kernel(
 
 @(triton.jit if HAVE_TRITON else null_decorator)
 def _finish_kernel(
-    W,
-    G,
-    N,
-    M,
-    V,
-    D,
-    U,
-    GG,
+    W: tl.tensor,
+    G: tl.tensor,
+    N: tl.tensor,
+    M: tl.tensor,
+    V: tl.tensor,
+    D: tl.tensor,
+    U: tl.tensor,
+    GG: tl.tensor,
     R: tl.constexpr,
     INPUTS: tl.constexpr,
     TRANSPOSED: tl.constexpr,
-    LR,
-    DIRECTION_LR,
-    DECAY,
+    LR: tl.tensor,
+    DIRECTION_LR: tl.tensor,
+    DECAY: tl.tensor,
     B1: tl.constexpr,
     B2: tl.constexpr,
-    BC1,
-    BC2,
+    BC1: tl.tensor,
+    BC2: tl.tensor,
     EPS: tl.constexpr,
     WD: tl.constexpr,
     BR: tl.constexpr,
     BI: tl.constexpr,
-):
+) -> None:
     batch = tl.program_id(1)
     row = tl.program_id(0) * BR + tl.arange(0, BR)
     col = tl.arange(0, BI)
@@ -141,8 +143,16 @@ def _finish_kernel(
 
 @(triton.jit if HAVE_TRITON else null_decorator)
 def _magnitude_grad_kernel(
-    W, G, Grad, GG, R: tl.constexpr, INPUTS: tl.constexpr, EPS: tl.constexpr, BR: tl.constexpr, BI: tl.constexpr
-):
+    W: tl.tensor,
+    G: tl.tensor,
+    Grad: tl.tensor,
+    GG: tl.tensor,
+    R: tl.constexpr,
+    INPUTS: tl.constexpr,
+    EPS: tl.constexpr,
+    BR: tl.constexpr,
+    BI: tl.constexpr,
+) -> None:
     batch = tl.program_id(1)
     row = tl.program_id(0) * BR + tl.arange(0, BR)
     col = tl.arange(0, BI)
@@ -158,14 +168,14 @@ def _magnitude_grad_kernel(
 
 @(triton.jit if HAVE_TRITON else null_decorator)
 def _direction_kernel(
-    W,
-    G,
-    N,
-    Grad,
-    Mom,
-    D,
-    U,
-    GG,
+    W: tl.tensor,
+    G: tl.tensor,
+    N: tl.tensor,
+    Grad: tl.tensor,
+    Mom: tl.tensor,
+    D: tl.tensor,
+    U: tl.tensor,
+    GG: tl.tensor,
     SIZE: tl.constexpr,
     R: tl.constexpr,
     INPUTS: tl.constexpr,
@@ -173,7 +183,7 @@ def _direction_kernel(
     EPS: tl.constexpr,
     NESTEROV: tl.constexpr,
     BLOCK: tl.constexpr,
-):
+) -> None:
     offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offset < SIZE
     row = (offset // (R * INPUTS)) * R + offset % R
