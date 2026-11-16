@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-examples_dir: diffusion/finetune
-configs:
-  - wan2_1_t2v_flow.yaml
-  - hunyuan_t2v_flow.yaml
-  - flux_t2i_flow.yaml
-  - qwen_image_t2i_flow.yaml
-  - ltx2_3_t2v_flow.yaml
-  - wan2_1_t2v_flow_lora.yaml
-  - hunyuan_t2v_flow_lora.yaml
-  - flux_t2i_flow_lora.yaml
-  - ltx2_3_t2v_flow_lora.yaml
+"""Inkling2 native text reference; see model.py for the current execution scope."""

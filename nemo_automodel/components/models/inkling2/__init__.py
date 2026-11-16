@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-examples_dir: retrieval
-
-configs:
-  - bi_encoder/llama3_2_1b.yaml
-  - bi_encoder/ministral3_3b_instruct.yaml
-  - bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml
+"""Inkling2 native text reference; see model.py for the current execution scope."""

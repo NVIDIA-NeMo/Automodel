@@ -148,6 +148,7 @@ wandb:
   - gloo-load-metadata
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: HuiyingLi
   nodes: 16
   nproc_per_node: 4
