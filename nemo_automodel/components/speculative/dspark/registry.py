@@ -21,8 +21,9 @@ string so adding a target family is a one-line append, with no recipe change.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+import torch
 from torch import nn
 
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
@@ -30,6 +31,9 @@ from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSpa
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.config import DistributedSetup
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,23 @@ class ModelOwnedDSparkProvider(Protocol):
 
     def build_dspark_draft(self, options: _DSparkDraftOptions) -> nn.Module:
         """Build a draft from the generic recipe's declarative options."""
+
+
+@runtime_checkable
+class ModelOwnedDSparkTargetProvider(Protocol):
+    """Target config that owns construction of its frozen target on the recipe's EP/FSDP mesh."""
+
+    def build_dspark_target(
+        self,
+        *,
+        target_path: str,
+        trust_remote_code: bool,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+        distributed_setup: DistributedSetup,
+        load_metadata_with_gloo: bool,
+    ) -> nn.Module:
+        """Load the pretrained, frozen target whose hidden states feed the draft."""
 
 
 # Qwen3-style dense (and MoE) targets: the draft only consumes the target's
@@ -128,6 +149,7 @@ __all__ = [
     "DraftSpec",
     "DSPARK_DRAFT_REGISTRY",
     "ModelOwnedDSparkProvider",
+    "ModelOwnedDSparkTargetProvider",
     "resolve_dspark_draft_spec",
     "build_target_layer_ids",
 ]

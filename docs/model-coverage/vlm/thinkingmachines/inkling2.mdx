@@ -14,7 +14,8 @@ NeMo AutoModel provides a text recipe (`Inkling2ForCausalLM`) and two image-text
 The training loader dequantizes expert weights into floating-point storage.
 Numerical equivalence to the original quantized inference runtime is not
 established. The checkpoint's auxiliary multi-token prediction module is
-outside the training scope of these recipes.
+outside the training scope of these recipes; the DSpark recipe below trains a
+draft in its layout.
 
 </Note>
 
@@ -40,6 +41,7 @@ Run the text recipe with `examples/llm_finetune/finetune.py`.
 | 128K packed text SFT on Tulu 3 | [inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml) |
 | Image-text LoRA on MedPix | [inkling2_medpix_lora_ep32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml) |
 | Full image-text SFT on MedPix | [inkling2_medpix_sft_ep64_pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_sft_ep64_pp4.yaml) |
+| Train a draft in the released `mtp.safetensors` layout with DSpark | [inkling2_small_dspark.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/inkling2_small_dspark.yaml), see the [DSpark guide](/recipes-e2e-examples/dspark-speculative-decoding) |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ### Configuration
