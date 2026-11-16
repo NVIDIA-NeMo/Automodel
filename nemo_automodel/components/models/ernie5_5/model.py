@@ -23,10 +23,11 @@ Forward contract:
 3. Contract the streams with the hyper-head, then apply the final RMSNorm, the output projection and the MultiMax
    correction of the logits.
 
-One call processes one document: a single unpadded row whose positions start at zero. Padding, several documents in
-one row and a KV cache are rejected. ``forward`` declares no packed-sequence and no context-parallel input, so the
-framework refuses THD packing when it builds the data loader, and context parallelism through the capability
-declaration. The model returns logits only; the recipe computes the loss.
+One call processes one document: a single unpadded row whose positions start at zero. Padding, a row whose masks or
+positions mark several documents, and a KV cache are rejected; several documents concatenated in one row without such
+metadata are not detected. ``forward`` declares no packed-sequence and no context-parallel input, so the framework
+refuses THD packing when it builds the data loader, and context parallelism through the capability declaration. The
+model returns logits only; the recipe computes the loss.
 
 The MTP block of the released checkpoint is not built: the model accepts ``num_nextn_predict_layers == 0`` only and
 does not load the MTP weights. The DSA indexers only select keys, receive no gradient and stay frozen.
@@ -687,8 +688,10 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         """Compute the logits of one unpadded document.
 
         The signature has no ``seq_lens`` and no variadic keyword, so the framework's packed-sequence probe is
-        false for this model and THD packing is refused when the data loader is built. A row that packs several
-        documents in another format is rejected by the mask and position checks.
+        false for this model and THD packing is refused when the data loader is built. A row whose masks or
+        positions mark padding or several documents is rejected by the mask and position checks. Several documents
+        concatenated in one row without such metadata cannot be detected; the data pipeline must supply one
+        document per row.
 
         Args:
             input_ids: Integer tensor of shape [1, sequence]: one document without padding.
