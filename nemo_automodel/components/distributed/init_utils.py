@@ -22,6 +22,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed
 
+from nemo_automodel.shared.torch_patches import disable_unsupported_cutedsl_overrides
+
 
 def get_rank_safe() -> int:
     """
@@ -152,6 +154,9 @@ def initialize_distributed(
         # Skip barrier in single process case (e.g., torchrun --nproc-per-node=1)
         if get_world_size_safe() > 1:
             torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
+
+    if device is not None:
+        disable_unsupported_cutedsl_overrides(device)
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
