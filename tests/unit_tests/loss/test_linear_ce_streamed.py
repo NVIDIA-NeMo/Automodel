@@ -37,6 +37,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 _WORLD_SIZE = 4
+pytestmark = pytest.mark.cpu_only
 _HIDDEN = 16
 _SCENARIOS = (
     "fsdp_uneven_vocab_chunked_ce",
@@ -51,6 +52,8 @@ _SCENARIOS = (
     "mtp_depths_share_one_resolution",
     "autocast_recompute",
     "padded_vocab_adapter",
+    "negative_infinity_chunk",
+    "target_validation",
 )
 
 
@@ -193,6 +196,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
     linear_ce_base._STREAM_CHUNK_BYTES = 3 * _WORLD_SIZE * _HIDDEN * 4
     # The fused loss's torch_compile kernel is exercised eagerly; Inductor is not under test.
     linear_ce_base._compiled_chunk_lse_and_target = linear_ce_base._chunk_lse_and_target
+    linear_ce_base._compiled_chunk_logits = linear_ce_base._chunk_logits
     linear_ce.HAVE_CUT_CROSS_ENTROPY = True
 
     world = dist.group.WORLD
@@ -266,6 +270,20 @@ def _run_scenarios(rank: int) -> dict[str, str]:
             return model
 
         def main_plus_mtp(model, states, targets, group):
+            """Compute the normalized main and two auxiliary CE losses.
+
+            Args:
+                model: Module owning a dense or FSDP/HSDP-sharded LM-head
+                    weight of global shape [vocab, hidden].
+                states: Two tensors of shape [batch, sequence, hidden]. The
+                    first serves the main loss; the second is reused for both
+                    MTP depths. Batch is global for the reference, otherwise local.
+                targets: Integer tensor of shape [batch, sequence], with -100 ignored.
+                group: Group owning independent token batches, or None for the reference.
+
+            Returns:
+                FP32 scalar containing the normalized main and auxiliary losses.
+            """
             lm_weight = prepare_lm_weight(chunked, model, grad_reduce_group=group)
             loss = calculate_loss(
                 chunked,
@@ -399,6 +417,61 @@ def _run_scenarios(rank: int) -> dict[str, str]:
                     model.lm_head.weight.full_tensor(), weight - 0.1 * dense_weight.grad, rtol=2e-2, atol=1e-3
                 )
 
+    def negative_infinity_chunk() -> None:
+        """A chunk with only -inf logits has finite dense-equivalent gradients."""
+        old_budget = linear_ce_base._STREAM_CHUNK_BYTES
+        linear_ce_base._STREAM_CHUNK_BYTES = _WORLD_SIZE * 2
+        try:
+            weight = torch.tensor([[-2.0], [0.0]] * _WORLD_SIZE, dtype=torch.float16)
+            hidden = torch.full((1, 1), 65504.0, dtype=torch.float16, requires_grad=True)
+            labels = torch.tensor([1])
+            dense_weight = weight.clone().requires_grad_()
+            dense_hidden = hidden.detach().clone().requires_grad_()
+            expected = F.cross_entropy(F.linear(dense_hidden, dense_weight).float(), labels)
+            expected.backward()
+            sharded = torch.nn.Parameter(distribute_tensor(weight, flat, [Shard(0)]))
+            actual = chunked(hidden, labels, sharded, grad_reduce_group=world)
+            actual.backward()
+            grad = sharded.grad.full_tensor()
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(hidden.grad, dense_hidden.grad)
+            torch.testing.assert_close(grad, dense_weight.grad)
+        finally:
+            linear_ce_base._STREAM_CHUNK_BYTES = old_budget
+
+    def target_validation() -> None:
+        """One bad rank fails all FSDP/HSDP peers before streaming; ignores stay valid."""
+        for mesh, placements in ((flat, [Shard(0)]), (hsdp, [Replicate(), Shard(0)])):
+            weight = torch.arange(18, dtype=torch.float32).reshape(9, 2) * 0.01
+            sharded = torch.nn.Parameter(distribute_tensor(weight, mesh, placements))
+            # Physical vocabulary 9 includes padding; only ids 0..6 are usable.
+            operand = ShardedLMHeadWeight(sharded, dtype=torch.float32, vocab_size=7)
+            for bad in (-1, 7, 1.5):
+                labels = torch.tensor([bad if rank == 1 else -100])
+                error, match = (RuntimeError, "dtype") if bad == 1.5 else (IndexError, "Target ids")
+                with pytest.raises(error, match=match):
+                    chunked(torch.ones(1, 2), labels, operand, grad_reduce_group=world)
+            for ignore in (-7, 7):
+                loss_fn = ChunkedCrossEntropy(1, compile=False, ignore_index=ignore)
+                # Include a fully ignored rank and both vocabulary boundaries.
+                labels = torch.tensor([ignore, ignore if rank == 3 else (0 if rank == 0 else 6)])
+                hidden = torch.ones(2, 2, requires_grad=True)
+                dense_hidden = hidden.detach().clone().requires_grad_()
+                dense_weight = weight.clone().requires_grad_()
+                expected = F.cross_entropy(
+                    F.linear(dense_hidden, dense_weight[:7]), labels, ignore_index=ignore, reduction="sum"
+                )
+                expected.backward()
+                dist.all_reduce(dense_weight.grad)
+                dense_weight.grad.div_(_WORLD_SIZE)
+                sharded.grad = None
+                actual = loss_fn(hidden, labels, operand, grad_reduce_group=world)
+                actual.backward()
+                grad = sharded.grad.full_tensor()
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(hidden.grad, dense_hidden.grad)
+                torch.testing.assert_close(grad, dense_weight.grad)
+
     checks = {
         # 37 rows over 4 ranks: shards of 10, 10, 10 and 7 rows, streamed in chunks of 3.
         "fsdp_uneven_vocab_chunked_ce": lambda: _check_training_parity(
@@ -419,6 +492,8 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "mtp_depths_share_one_resolution": mtp_depths_share_one_resolution,
         "autocast_recompute": autocast_recompute,
         "padded_vocab_adapter": padded_vocab_adapter,
+        "negative_infinity_chunk": negative_infinity_chunk,
+        "target_validation": target_validation,
     }
     assert tuple(checks) == _SCENARIOS
     outcomes = {}

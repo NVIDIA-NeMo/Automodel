@@ -38,12 +38,15 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 _WORLD_SIZE = 4
+pytestmark = pytest.mark.cpu_only
 _SCENARIOS = (
     "masked_ce_sum_with_mask",
     "masked_ce_mean_and_none_with_empty_shard",
     "masked_ce_loss_weights",
     "kd_loss",
     "kd_loss_rejects_mixed_layouts",
+    "large_logit_offsets",
+    "target_validation",
     "mdlm_and_encoder_ar",
     "hybrid_legacy_concat",
     "idlm",
@@ -253,6 +256,58 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         with pytest.raises(ValueError, match="one vocabulary layout"):
             KDLoss()(student, randn(2, 5, 13), randint(13, 2, 5))
 
+    def large_logit_offsets() -> None:
+        """Match dense losses and both KL gradients with large common offsets."""
+        for offsets in (torch.zeros(9), torch.arange(9) * 8.0):
+            student = offsets.expand(2, 3, 9).clone()
+            teacher = student + 1e8
+            labels = torch.tensor([[0, 8, -100], [7, 1, 0]])
+            _check_parity(mesh, teacher, lambda x: MaskedCrossEntropy()(x, labels.clone()))
+            shard = vocab_parallel.vocab_shard(_as_sharded(mesh, teacher, requires_grad=False)[1])
+            probs = vocab_parallel.softmax(shard.local, shard.group)
+            total = vocab_parallel.vocab_sum(probs, shard.group)
+            torch.testing.assert_close(total, torch.ones_like(total))
+
+            local_s, sharded_s = _as_sharded(mesh, student, requires_grad=True)
+            local_t, sharded_t = _as_sharded(mesh, teacher, requires_grad=True)
+            loss = KDLoss()(sharded_s, sharded_t, labels)
+            loss.backward()
+            dense_s, dense_t = student.requires_grad_(), teacher.requires_grad_()
+            expected = KDLoss()(dense_s, dense_t, labels)
+            expected.backward()
+            start, end = _vocab_range(9, rank)
+            torch.testing.assert_close(loss, expected, atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(local_s.grad, dense_s.grad[..., start:end], atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(local_t.grad, dense_t.grad[..., start:end], atol=1e-6, rtol=1e-5)
+
+    def target_validation() -> None:
+        """Reject invalid ids/dtypes while preserving edge ids and custom ignores."""
+        logits = randn(2, 3, 9)
+        shard = vocab_parallel.vocab_shard(_as_sharded(mesh, logits, requires_grad=False)[1])
+        for target in (-1, 9):
+            with pytest.raises(IndexError, match="Target ids"):
+                vocab_parallel.cross_entropy(shard, torch.full((2, 3), target), ignore_index=-100)
+        for dtype in (torch.float32, torch.int32):
+            with pytest.raises(RuntimeError, match="dtype"):
+                vocab_parallel.cross_entropy(shard, torch.ones(2, 3, dtype=dtype), ignore_index=-100)
+        for ignore in (-7, 9):
+            labels = torch.tensor([[0, 8, ignore], [8, 0, ignore]])
+            _check_parity(
+                mesh,
+                logits,
+                lambda x: vocab_parallel.cross_entropy(
+                    vocab_parallel.vocab_shard(x), labels, ignore_index=ignore
+                ).sum(),
+            )
+            labels.fill_(ignore)
+            _check_parity(
+                mesh,
+                logits,
+                lambda x: vocab_parallel.cross_entropy(
+                    vocab_parallel.vocab_shard(x), labels, ignore_index=ignore
+                ).sum(),
+            )
+
     def mdlm_and_encoder_ar() -> None:
         logits = randn(2, 6, 13)
         targets = randint(13, 2, 6)
@@ -368,6 +423,8 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "masked_ce_loss_weights": masked_ce_loss_weights,
         "kd_loss": kd_loss,
         "kd_loss_rejects_mixed_layouts": kd_loss_rejects_mixed_layouts,
+        "large_logit_offsets": large_logit_offsets,
+        "target_validation": target_validation,
         "mdlm_and_encoder_ar": mdlm_and_encoder_ar,
         "hybrid_legacy_concat": hybrid_legacy_concat,
         "idlm": idlm,

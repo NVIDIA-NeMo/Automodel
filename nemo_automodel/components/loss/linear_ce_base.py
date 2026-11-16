@@ -33,6 +33,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from nemo_automodel.components.loss.vocab_parallel import validate_targets
+
 # Size budget for one gathered vocabulary chunk, in bytes. Backward holds about four
 # chunk-sized buffers at once: the current chunk, the prefetched next chunk, the
 # chunk gradient, and the previous gradient while it is reduce-scattered.
@@ -488,39 +490,43 @@ def sharded_linear_cross_entropy(
         ``hidden_states`` and ``lm_weight.weight``.
     """
     layout = _VocabShardLayout(lm_weight)
+    validate_targets(
+        labels,
+        vocab=layout.vocab,
+        ignore_index=ignore_index,
+        groups=(layout.group, *layout.replicate_groups),
+    )
+    labels = labels.long()
     valid = labels != ignore_index
     rows = valid.nonzero().squeeze(1)
     if rows.numel() == labels.numel():
-        hidden, targets = hidden_states.contiguous(), labels.long()
+        hidden, targets = hidden_states.contiguous(), labels
     else:
-        hidden, targets = hidden_states.index_select(0, rows).contiguous(), labels.index_select(0, rows).long()
+        hidden, targets = hidden_states.index_select(0, rows).contiguous(), labels.index_select(0, rows)
     losses = _StreamedLinearCrossEntropy.apply(hidden, lm_weight.weight.to_local(), targets, layout, kernel)
     if rows.numel() == labels.numel():
         return losses
     return losses.new_zeros(labels.shape).index_copy(0, rows, losses)
 
 
-def _chunk_lse_and_target(
+def _chunk_logits(
     hidden: torch.Tensor,
     weight: torch.Tensor,
-    targets: torch.Tensor,
     softcap: float | None,
     logits_dtype: torch.dtype | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Project one token block onto one vocabulary chunk and reduce the logits.
+) -> torch.Tensor:
+    """Project one token block onto one vocabulary chunk.
 
     Args:
         hidden: Tensor of shape [tokens, hidden]; cast to ``weight.dtype``.
         weight: Tensor of shape [chunk_vocab, hidden].
-        targets: Int64 tensor of shape [tokens] with the target row in
-            ``weight``, or -1 for targets in another chunk.
         softcap: Optional logit softcapping value.
         logits_dtype: Optional dtype that rounds the projection output, matching
             the owning model's logits.
 
     Returns:
-        Two FP32 tensors of shape [tokens]: the chunk log-sum-exp and the target
-        logit, zero where ``targets`` is -1.
+        FP32 logits of shape [tokens, chunk_vocab], preserving the projection's
+        autocast and explicit rounding boundaries before any softcapping.
     """
     logits = F.linear(hidden.to(weight.dtype), weight)
     if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:
@@ -532,12 +538,37 @@ def _chunk_lse_and_target(
         logits = logits.to(logits_dtype)
     if softcap is not None:
         logits = torch.tanh(logits / softcap) * softcap
-    logits = logits.float()
+    return logits.float()
+
+
+def _chunk_lse_and_target(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    softcap: float | None,
+    logits_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project a token block and reduce its logits.
+
+    Args:
+        hidden: Tensor of shape [tokens, hidden]; cast to ``weight.dtype``.
+        weight: Tensor of shape [chunk_vocab, hidden].
+        targets: Int64 tensor of shape [tokens], with a local target row or -1
+            when the target belongs to another chunk.
+        softcap: Optional logit softcapping value.
+        logits_dtype: Optional dtype that rounds the projection output.
+
+    Returns:
+        Two FP32 tensors of shape [tokens]: the chunk log-sum-exp and target
+        logit, zero where ``targets`` is -1.
+    """
+    logits = _chunk_logits(hidden, weight, softcap, logits_dtype)
     target_logit = logits.gather(-1, targets.clamp(min=0).unsqueeze(-1)).squeeze(-1)
     return torch.logsumexp(logits, dim=-1), torch.where(targets >= 0, target_logit, 0.0)
 
 
 _compiled_chunk_lse_and_target = torch.compile(_chunk_lse_and_target, dynamic=True)
+_compiled_chunk_logits = torch.compile(_chunk_logits, dynamic=True)
 
 
 class TorchVocabChunkKernel:
@@ -566,6 +597,7 @@ class TorchVocabChunkKernel:
         self._compute: Callable[..., tuple[torch.Tensor, torch.Tensor]] = (
             _compiled_chunk_lse_and_target if compile else _chunk_lse_and_target
         )
+        self._project: Callable[..., torch.Tensor] = _compiled_chunk_logits if compile else _chunk_logits
 
     def _block_len(self, tokens: int) -> int:
         return self.token_block or max(tokens, 1)
@@ -597,10 +629,11 @@ class TorchVocabChunkKernel:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """See :meth:`VocabChunkKernel.backward`.
 
-        Differentiates ``grad * (exp(chunk_lse - lse) * chunk_lse - target_logit)``
-        per token block. Its logit gradient equals the full-vocabulary CE gradient
-        restricted to the chunk, and autograd carries it through the same casts
-        and softcapping as the forward.
+        Applies the full-vocabulary CE derivative directly to each block's
+        logits. An all-negative-infinity chunk then receives zero probability
+        when another chunk has finite logits, without differentiating an
+        undefined chunk log-sum-exp. Autograd carries the logit gradient through
+        the same casts and softcapping as forward.
         """
         grad_hidden = torch.empty_like(hidden) if need_hidden else None
         grad_weight = torch.zeros_like(weight, dtype=torch.float32) if need_weight else None
@@ -610,13 +643,16 @@ class TorchVocabChunkKernel:
             for start in range(0, hidden.shape[0], block):
                 end = start + block
                 local_hidden = hidden[start:end].detach().requires_grad_(need_hidden)
-                chunk_lse, chunk_target = self._compute(
-                    local_hidden, local_weight, targets[start:end], self.softcap, self.logits_dtype
-                )
-                scale = torch.exp(chunk_lse.detach() - lse[start:end])
-                surrogate = (grad[start:end] * (scale * chunk_lse - chunk_target)).sum()
+                logits = self._project(local_hidden, local_weight, self.softcap, self.logits_dtype)
+                with torch.no_grad():
+                    grad_logits = torch.exp(logits - lse[start:end].unsqueeze(-1))
+                    block_targets = targets[start:end]
+                    grad_logits.scatter_add_(
+                        -1, block_targets.clamp(min=0).unsqueeze(-1), -(block_targets >= 0).float().unsqueeze(-1)
+                    )
+                    grad_logits.mul_(grad[start:end].unsqueeze(-1))
                 inputs = [x for x in (local_hidden, local_weight) if x.requires_grad]
-                grads = torch.autograd.grad(surrogate, inputs)
+                grads = torch.autograd.grad(logits, inputs, grad_outputs=grad_logits)
                 if need_hidden:
                     grad_hidden[start:end] = grads[0]
                 if need_weight:

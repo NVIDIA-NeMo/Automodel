@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup
 from nemo_automodel.components.distributed.context_parallel.utils import gather_context_parallel_tensor
@@ -449,18 +449,24 @@ class KDMeshBridge:
 
         Returns:
             Replicated tensor of shape ``[batch, sequence, vocab]`` for a
-            non-TP student, otherwise a contiguous tensor of shape
-            ``[batch, sequence, local_vocab]`` matching this rank's shard.
+            non-TP student, otherwise a DTensor with the student's global shape,
+            mesh, and placements, holding a contiguous local teacher slice of
+            shape ``[batch, sequence, local_vocab]``.
         """
         if not isinstance(student_logits, DTensor):
             return teacher_logits
-        vocab_dim = student_logits.ndim - 1
-        for mesh_dim, placement in enumerate(student_logits.placements):
-            if isinstance(placement, Shard) and placement.dim in {-1, vocab_dim}:
-                group = student_logits.device_mesh.get_group(mesh_dim)
-                chunks = torch.tensor_split(teacher_logits, dist.get_world_size(group), dim=-1)
-                return chunks[dist.get_rank(group)].contiguous()
-        return teacher_logits
+        shard = vocab_shard(student_logits)
+        if shard.group is None:
+            return teacher_logits
+        local = teacher_logits.narrow(-1, shard.start, shard.local.shape[-1]).contiguous()
+        return DTensor.from_local(
+            local,
+            student_logits.device_mesh,
+            student_logits.placements,
+            run_check=False,
+            shape=teacher_logits.shape,
+            stride=teacher_logits.stride(),
+        )
 
     def broadcast_command(self, command: int | None = None) -> int:
         """Broadcast one worker command from the first student rank.

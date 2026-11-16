@@ -101,6 +101,7 @@ def _worker(rank: int, port: int) -> None:
         linear_ce_mod.HAVE_CUT_CROSS_ENTROPY = True
         # Inductor on CPU is not under test; run the streamed kernel eagerly behind a dtype check.
         linear_ce_base._compiled_chunk_lse_and_target = _eager_chunk_projection
+        linear_ce_base._compiled_chunk_logits = linear_ce_base._chunk_logits
 
         torch.manual_seed(3)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")

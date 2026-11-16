@@ -76,8 +76,8 @@ def _kl_forward_tp(
         ``tp_group`` and is reduced without gathering the full vocabulary. Both
         inputs receive their exact gradients (``vocab_parallel`` convention).
     """
-    teacher_log_prob = t_logits - vocab_parallel.logsumexp(t_logits, tp_group).unsqueeze(-1)
-    student_log_prob = s_logits - vocab_parallel.logsumexp(s_logits, tp_group).unsqueeze(-1)
+    teacher_log_prob = vocab_parallel.log_softmax(t_logits, tp_group)
+    student_log_prob = vocab_parallel.log_softmax(s_logits, tp_group)
     kl_local = _forward_kl_from_log_probs(teacher_log_prob, student_log_prob)
     return vocab_parallel.replicated(vocab_parallel.sum_over_group(kl_local, tp_group), tp_group)
 

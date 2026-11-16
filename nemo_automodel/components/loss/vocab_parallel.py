@@ -189,6 +189,24 @@ def sum_over_group(value: torch.Tensor, group: dist.ProcessGroup | None) -> torc
     return dist_nn.all_reduce(value, op=dist.ReduceOp.SUM, group=group)
 
 
+def _global_max(local: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """Return the detached maximum across the whole vocabulary.
+
+    Args:
+        local: Tensor of shape [..., local_vocab] containing this rank's logits.
+        group: Vocabulary-sharding group; all ranks hold the same leading axes.
+
+    Returns:
+        Tensor of shape [...] in ``local.dtype``, equal on every rank.
+    """
+    if local.shape[-1]:
+        shift = local.detach().amax(dim=-1)
+    else:
+        shift = local.new_full(local.shape[:-1], float("-inf"))
+    dist.all_reduce(shift, op=dist.ReduceOp.MAX, group=group)
+    return shift
+
+
 def logsumexp(local: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tensor:
     """Log-sum-exp over the whole vocabulary.
 
@@ -201,14 +219,30 @@ def logsumexp(local: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Ten
     """
     if group is None:
         return torch.logsumexp(local, dim=-1)
-    if local.shape[-1]:
-        shift = local.detach().amax(dim=-1)
-    else:
-        shift = local.new_full(local.shape[:-1], float("-inf"))
     # The log-sum-exp does not depend on the shift, so it carries no gradient.
-    dist.all_reduce(shift, op=dist.ReduceOp.MAX, group=group)
+    shift = _global_max(local, group)
     total = sum_over_group(torch.exp(local - shift.unsqueeze(-1)).sum(dim=-1), group)
     return shift + torch.log(total)
+
+
+def log_softmax(local: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tensor:
+    """Normalize vocabulary slices without subtracting an absolute log-sum-exp.
+
+    Args:
+        local: Tensor of shape [..., local_vocab] containing this rank's logits.
+        group: Vocabulary-sharding group, or None for a whole vocabulary.
+
+    Returns:
+        FP32 log probabilities of shape [..., local_vocab], normalized over the
+        whole vocabulary. Centering before normalization preserves small log
+        probabilities even when the logits have a large common offset.
+    """
+    if group is None:
+        return F.log_softmax(local, dim=-1, dtype=torch.float32)
+    local = local.float()
+    centered = local - _global_max(local, group).unsqueeze(-1)
+    total = sum_over_group(centered.exp().sum(dim=-1), group)
+    return centered - total.log().unsqueeze(-1)
 
 
 def softmax(local: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tensor:
@@ -224,8 +258,51 @@ def softmax(local: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tenso
     """
     if group is None:
         return F.softmax(local, dim=-1, dtype=torch.float32)
-    local = local.float()
-    return torch.exp(local - logsumexp(local, group).unsqueeze(-1))
+    return log_softmax(local, group).exp()
+
+
+def validate_targets(
+    target: torch.Tensor,
+    *,
+    vocab: int,
+    ignore_index: int,
+    groups: tuple[dist.ProcessGroup, ...] = (),
+) -> None:
+    """Reject invalid CE targets before entering loss collectives.
+
+    Args:
+        target: Tensor of shape [...] containing global vocabulary ids. Long
+            and uint8 targets follow the dense cross-entropy dtype contract.
+        vocab: Usable vocabulary size, excluding padded LM-head rows.
+        ignore_index: The only id allowed outside [0, vocab).
+        groups: Independent mesh-axis groups whose ranks own different targets.
+            Every rank must call; errors propagate across every axis. Empty for
+            vocabulary-parallel targets, which are replicated across ranks.
+
+    Raises:
+        IndexError: On CPU, any participating rank has an out-of-range id.
+        RuntimeError: On CPU, any rank has an unsupported dtype. CUDA uses
+            asynchronous device assertions for either error, avoiding a host
+            synchronization on valid training steps.
+    """
+    if target.dtype in (torch.int64, torch.uint8):
+        ids = target.long()
+        invalid = (((ids < 0) | (ids >= vocab)) & (ids != ignore_index)).any().to(torch.int32)
+    else:
+        invalid = torch.full((), 2, device=target.device, dtype=torch.int32)
+    for group in groups:
+        dist.all_reduce(invalid, op=dist.ReduceOp.MAX, group=group)
+    dtype_message = "Cross entropy targets must have dtype torch.int64 or torch.uint8 on every rank"
+    range_message = f"Target ids must be in [0, {vocab}) or equal ignore_index={ignore_index} on every rank"
+    if target.is_cuda:
+        torch._assert_async(invalid != 2, dtype_message)
+        torch._assert_async(invalid != 1, range_message)
+    else:
+        error = invalid.item()
+        if error == 2:
+            raise RuntimeError(dtype_message)
+        if error == 1:
+            raise IndexError(range_message)
 
 
 def vocab_sum(values: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tensor:
@@ -313,9 +390,11 @@ def cross_entropy(shard: VocabShard, target: torch.Tensor, *, ignore_index: int)
             ignore_index=ignore_index,
             reduction="none",
         ).reshape(target.shape)
+    validate_targets(target, vocab=shard.vocab, ignore_index=ignore_index)
+    target = target.long()
     local = shard.local.float()
     valid = target != ignore_index
     safe_target = torch.where(valid, target, torch.zeros_like(target))
-    loss = logsumexp(local, shard.group) - gather(local, safe_target, start=shard.start, group=shard.group)
+    loss = -gather(log_softmax(local, shard.group), safe_target, start=shard.start, group=shard.group)
     loss = torch.where(valid, loss, torch.zeros_like(loss))
     return replicated(loss, shard.group).to(shard.local.dtype)
