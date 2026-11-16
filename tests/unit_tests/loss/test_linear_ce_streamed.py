@@ -49,6 +49,7 @@ _SCENARIOS = (
     "mismatched_group_raises",
     "unsupported_placement_raises",
     "mtp_depths_share_one_resolution",
+    "autocast_recompute",
 )
 
 
@@ -108,6 +109,14 @@ def _forbid_gather_and_full_saves(
     from torch.distributed.tensor import DTensor
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
+        """Reject full-head saves.
+
+        Args:
+            tensor: Tensor of arbitrary shape saved by autograd.
+
+        Returns:
+            The same tensor, preserving its shape and storage.
+        """
         if not allow_full_saves and tuple(tensor.shape) == (vocab, _HIDDEN):
             raise AssertionError("a [vocab, hidden] tensor was saved for backward")
         return tensor
@@ -242,6 +251,14 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         normalizer = int((labels != -100).sum())
 
         def head(lm_weight: torch.Tensor) -> torch.nn.Module:
+            """Wrap a projection weight in a model.
+
+            Args:
+                lm_weight: Tensor of global shape [vocab, hidden], possibly sharded.
+
+            Returns:
+                Module whose LM head owns the supplied weight.
+            """
             model = torch.nn.Module()
             model.lm_head = torch.nn.Linear(_HIDDEN, 37, bias=False)
             model.lm_head.weight = torch.nn.Parameter(lm_weight)
@@ -302,6 +319,26 @@ def _run_scenarios(rank: int) -> dict[str, str]:
                 local.grad / _WORLD_SIZE, dense_state.grad.unflatten(0, (_WORLD_SIZE, 2))[rank], rtol=1e-5, atol=1e-6
             )
 
+    def autocast_recompute() -> None:
+        weight, hidden, labels = _data(37)
+        sharded = torch.nn.Parameter(distribute_tensor(weight, flat, [Shard(0)]))
+        local_hidden = hidden[rank].clone().requires_grad_()
+        dense_weight = weight.clone().requires_grad_()
+        dense_hidden = hidden.clone().requires_grad_()
+        # Use one projection tile in each path to isolate recomputation precision.
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            loss = ChunkedCrossEntropy(32, compile=False)(local_hidden, labels[rank], sharded, grad_reduce_group=world)
+            reference = F.cross_entropy(
+                F.linear(dense_hidden, dense_weight).flatten(0, 2), labels.flatten(), reduction="sum"
+            )
+        # Production backward runs after leaving autocast.
+        (loss * _WORLD_SIZE).backward()
+        reference.backward()
+        dist.all_reduce(loss.detach())
+        torch.testing.assert_close(loss, reference, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(sharded.grad.full_tensor(), dense_weight.grad, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(local_hidden.grad / _WORLD_SIZE, dense_hidden.grad[rank], rtol=2e-2, atol=2e-2)
+
     checks = {
         # 37 rows over 4 ranks: shards of 10, 10, 10 and 7 rows, streamed in chunks of 3.
         "fsdp_uneven_vocab_chunked_ce": lambda: _check_training_parity(
@@ -320,6 +357,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "mismatched_group_raises": mismatched_group_raises,
         "unsupported_placement_raises": unsupported_placement_raises,
         "mtp_depths_share_one_resolution": mtp_depths_share_one_resolution,
+        "autocast_recompute": autocast_recompute,
     }
     assert tuple(checks) == _SCENARIOS
     outcomes = {}

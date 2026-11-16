@@ -230,7 +230,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
         self,
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
-        lm_weight: torch.Tensor,
+        lm_weight: torch.Tensor | ShardedLMHeadWeight,
         num_label_tokens: int | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
         loss_weights: torch.Tensor | None = None,

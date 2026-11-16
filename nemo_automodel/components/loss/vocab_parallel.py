@@ -280,10 +280,10 @@ def argmax(shard: VocabShard) -> torch.Tensor:
     if shard.group is None:
         return local.argmax(dim=-1)
     if local.shape[-1]:
-        value, index = local.float().max(dim=-1)
+        value, index = local.max(dim=-1)
         index = index + shard.start
     else:
-        value = local.new_full(local.shape[:-1], float("-inf"), dtype=torch.float32)
+        value = local.new_full(local.shape[:-1], float("-inf"))
         index = torch.full(local.shape[:-1], shard.vocab, dtype=torch.long, device=local.device)
     best = value.clone()
     dist.all_reduce(best, op=dist.ReduceOp.MAX, group=shard.group)

@@ -383,6 +383,9 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
         ctx.save_for_backward(hidden, shard, owner, offset, lse)
         ctx.layout = layout
         ctx.kernel = kernel
+        ctx.device_type = hidden.device.type
+        ctx.autocast_enabled = torch.is_autocast_enabled(ctx.device_type)
+        ctx.autocast_dtype = torch.get_autocast_dtype(ctx.device_type)
         return lse - target_logit
 
     @staticmethod
@@ -414,15 +417,18 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
         for chunk, weight in layout.stream(shard):
             chunk_grad_hidden, chunk_grad_weight = None, None
             if hidden.shape[0]:
-                chunk_grad_hidden, chunk_grad_weight = kernel.backward(
-                    hidden,
-                    weight,
-                    layout.chunk_targets(owner, offset, chunk),
-                    lse,
-                    grad_loss,
-                    need_hidden=need_hidden,
-                    need_weight=need_weight,
-                )
+                # Recompute the same projection as forward, even when backward
+                # runs outside the caller's autocast context.
+                with torch.autocast(ctx.device_type, enabled=ctx.autocast_enabled, dtype=ctx.autocast_dtype):
+                    chunk_grad_hidden, chunk_grad_weight = kernel.backward(
+                        hidden,
+                        weight,
+                        layout.chunk_targets(owner, offset, chunk),
+                        lse,
+                        grad_loss,
+                        need_hidden=need_hidden,
+                        need_weight=need_weight,
+                    )
             if chunk_grad_hidden is not None:
                 grad_hidden += chunk_grad_hidden
             if need_weight:

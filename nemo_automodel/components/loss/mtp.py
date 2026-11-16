@@ -21,7 +21,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers.utils import ModelOutput
 
-from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy, ShardedLMHeadWeight
 from nemo_automodel.components.loss.utils import (
     _get_final_hidden_states,
     _get_lm_head_module,
@@ -119,7 +119,7 @@ def calculate_mtp_loss(
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
-    lm_weight: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | ShardedLMHeadWeight | None = None,
     logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
@@ -141,7 +141,7 @@ def calculate_mtp_loss(
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
-    lm_weight: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | ShardedLMHeadWeight | None = None,
     logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
@@ -163,7 +163,7 @@ def calculate_mtp_loss(
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
-    lm_weight: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | ShardedLMHeadWeight | None = None,
     logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
@@ -184,7 +184,7 @@ def calculate_mtp_loss(
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
-    lm_weight: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | ShardedLMHeadWeight | None = None,
     logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,

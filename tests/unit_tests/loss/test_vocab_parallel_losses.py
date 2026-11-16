@@ -108,6 +108,14 @@ def _guarded(vocab: int, fn: Callable[[], torch.Tensor]) -> torch.Tensor:
     from torch.distributed.tensor.debug import CommDebugMode
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
+        """Reject full-vocabulary saves.
+
+        Args:
+            tensor: Tensor of arbitrary shape saved by autograd.
+
+        Returns:
+            The same tensor, preserving its shape and storage.
+        """
         local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
         if local.ndim and local.shape[-1] == vocab:
             raise AssertionError(f"a full-vocabulary tensor of shape {tuple(local.shape)} was saved for backward")
@@ -228,6 +236,14 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         loss_fn = KDLoss(temperature=2.0)
 
         def loss(x: torch.Tensor) -> torch.Tensor:
+            """Compute KD.
+
+            Args:
+                x: Student logits of global shape [batch, sequence, vocab].
+
+            Returns:
+                Scalar KL loss.
+            """
             return loss_fn(x, teacher if isinstance(x, DTensor) else dense_teacher, labels, 7)
 
         _check_parity(mesh, student, loss)
@@ -247,6 +263,14 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         mdlm = MDLMCrossEntropyLoss()
 
         def loss(x: torch.Tensor) -> torch.Tensor:
+            """Compute the diffusion and AR objectives.
+
+            Args:
+                x: Logits of global shape [batch, sequence, vocab].
+
+            Returns:
+                Scalar combined loss.
+            """
             diffusion = mdlm(x, targets, noise_mask, p_mask, loss_mask, num_diffusion_tokens=9).total_loss
             return diffusion + encoder_ar_loss(x, targets, valid_mask=loss_mask.bool())
 
@@ -286,6 +310,14 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         scdd_loss = SCDDLoss(mask_token_id=5, num_timesteps=10, max_ratio=0.2, chunk_size=3)
 
         def loss(x: torch.Tensor) -> torch.Tensor:
+            """Compute SCDD.
+
+            Args:
+                x: Logits of global shape [batch, sequence, vocab].
+
+            Returns:
+                Scalar diffusion loss.
+            """
             return scdd_loss(x, clean, None, p_mask, loss_mask, noisy_input_ids=noisy).total_loss
 
         _check_parity(mesh, logits, loss, rtol=1e-5, atol=1e-5)
@@ -320,6 +352,11 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         shard = vocab_parallel.vocab_shard(_as_sharded(mesh, logits, requires_grad=False)[1])
         assert (shard.start, shard.local.shape[-1]) == ([0, 3, 6, 9][rank], [3, 3, 3, 0][rank])
         assert torch.equal(_guarded(9, lambda: vocab_parallel.argmax(shard)), logits.argmax(dim=-1))
+        # FP64 values that round to the same FP32 value must retain their order.
+        precise = logits.double()
+        precise[0, 1], precise[0, 7] = 9.0, 9.0 + 1e-10
+        shard = vocab_parallel.vocab_shard(_as_sharded(mesh, precise, requires_grad=False)[1])
+        assert torch.equal(_guarded(9, lambda: vocab_parallel.argmax(shard)), precise.argmax(dim=-1))
         replicated = vocab_parallel.vocab_shard(distribute_tensor(logits, mesh, [Replicate()]))
         assert replicated.group is None and replicated.local.shape == logits.shape
         with pytest.raises(ValueError, match="sharded on the vocabulary axis"):

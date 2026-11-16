@@ -44,7 +44,14 @@ def _forward_kl_from_log_probs(
 
 
 def _vocab_layout(shard: vocab_parallel.VocabShard) -> tuple[tuple[int, ...] | None, int, int]:
-    """Return the ranks, first id, and size of a vocabulary slice, comparable across meshes."""
+    """Return a vocabulary slice's comparable layout.
+
+    Args:
+        shard: Logits of global shape [..., vocab] held locally as [..., local_vocab].
+
+    Returns:
+        The group's ranks (or None), first vocabulary id, and local vocabulary size.
+    """
     ranks = None if shard.group is None else tuple(torch.distributed.get_process_group_ranks(shard.group))
     return ranks, shard.start, shard.local.shape[-1]
 

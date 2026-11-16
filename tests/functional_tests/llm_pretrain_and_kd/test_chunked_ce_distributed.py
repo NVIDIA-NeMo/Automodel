@@ -105,7 +105,34 @@ def _check_fsdp_shared_projection(mesh, device, rank):
             torch.testing.assert_close(local.grad / 2, ref.grad[rank : rank + 1], rtol=2e-2, atol=2e-3)
 
 
+def _check_autocast_projection(mesh, device: torch.device, rank: int) -> None:
+    """Compare FP32 master gradients after BF16-autocast forward and FP32-context backward."""
+    torch.manual_seed(97)
+    hidden = torch.randn(2, 8, 16, device=device)
+    weight = torch.randn(32, 16, device=device)
+    labels = torch.randint(32, (2, 8), device=device)
+    sharded = torch.nn.Parameter(distribute_tensor(weight, mesh, [Shard(0)]))
+    local_hidden = hidden[rank].clone().requires_grad_()
+    ref_hidden = hidden.clone().requires_grad_()
+    ref_weight = weight.clone().requires_grad_()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = ChunkedCrossEntropy(32, compile=False)(
+            local_hidden, labels[rank], sharded, num_label_tokens=16, grad_reduce_group=dist.group.WORLD
+        )
+        reference = F.cross_entropy(F.linear(ref_hidden, ref_weight).flatten(0, 1), labels.flatten())
+    (loss * 2).backward()
+    reference.backward()
+    dist.all_reduce(loss.detach())
+    # BF16 GEMMs may round differently for the local and global token tiles.
+    torch.testing.assert_close(loss, reference, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(sharded.grad.full_tensor(), ref_weight.grad, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(local_hidden.grad / 2, ref_hidden.grad[rank], rtol=2e-2, atol=2e-3)
+
+
 def _worker():
+    # The FP32 assertions below require IEEE matmuls. TF32's shape-dependent
+    # rounding differs between streamed token tiles and the dense reference.
+    torch.set_float32_matmul_precision("highest")
     dist.init_process_group("nccl")
     try:
         rank = dist.get_rank()
@@ -147,6 +174,7 @@ def _worker():
             ref_optimizer.step()
             torch.testing.assert_close(sharded_weight.full_tensor(), ref_weight, rtol=2e-5, atol=2e-6)
         _check_fsdp_shared_projection(mesh, device, rank)
+        _check_autocast_projection(mesh, device, rank)
         if rank == 0:
             print("CHUNKED_CE_DISTRIBUTED_PASS", flush=True)
     finally:
@@ -157,6 +185,8 @@ def _worker():
 def test_sharded_weight_gradient_parity():
     repo_root = str(Path(__file__).resolve().parents[3])
     env = os.environ.copy()
+    # NGC images may force TF32 independently of PyTorch's matmul preference.
+    env["NVIDIA_TF32_OVERRIDE"] = "0"
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
     result = subprocess.run(
         [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2", __file__, "--worker"],
