@@ -591,14 +591,14 @@ loss of a row and the losses of single tokens.
 
 - Two runs with `cp_size: 8` give the same loss for every token before
   position 2,048 of its document; from there on the DSA layers discard keys,
-  and 46% of the tokens keep the same loss.
+  and 46% of those tokens keep the same loss.
 - Between two `cp_size` values the losses of single tokens differ by up to
   1e-2 on average, evenly over the row and for documents inside one shard as
   for documents that cross shards; `cp_size` 1 and 4 give the same loss for
   64% of the tokens. Recording the outputs of the modules for the
   first 512 tokens of a row shows where this starts: the embeddings are
   identical, and the first output that differs is the FP32 hyper-connection
-  of layer 0, by at most 8e-6, before any attention layer has run. Its
+  of layer 0, by at most 8.4e-6, before any attention layer has run. Its
   arithmetic depends on the number of tokens the rank holds. The next
   normalization then rounds a few hundred of 2 million BF16 values the other
   way, and the 43 layers spread that to every token.
