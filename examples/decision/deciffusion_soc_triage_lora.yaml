@@ -101,4 +101,5 @@ train:
   val_every_steps: 50
 
 ci:
+  nemo_ci_schedule: skipped  # needs a Deciffusion checkpoint; covered by the functional test
   cluster_tag: h100
