@@ -22,11 +22,13 @@ import yaml
 
 from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ernie5_5 import parallelization
 from nemo_automodel.components.models.ernie5_5.model import Ernie5_5_MoeForCausalLM
 from nemo_automodel.components.models.ernie5_5.parallelization import PARALLELIZER
+from nemo_automodel.components.moe import layers as shared_moe_layers
 from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from tests.unit_tests.models.ernie5_5.conftest import checkpoint_config
 from tests.unit_tests.models.ernie5_5.test_parallelization import _context, _Mesh
@@ -104,12 +106,17 @@ def test_lora_recipe_targets_select_supported_modules_of_the_released_layer_sche
     # other selectors of targets keep their defaults.
     assert (peft.dropout, peft.moe_rank_scaling, peft.match_all_linear, peft.exclude_modules) == (0.0, False, False, [])
 
+    backend_config = dict(recipe["model"]["backend"])
+    assert backend_config.pop("_target_") == "nemo_automodel.components.models.common.BackendConfig"
+    assert (backend_config["experts"], backend_config["dispatcher"]) == ("torch_mm", "hybridep")
+    monkeypatch.setattr(shared_moe_layers, "get_world_size_safe", lambda: 2)
     with torch.device("meta"):
         model = Ernie5_5_MoeForCausalLM(
             checkpoint_config(num_nextn_predict_layers=0),
-            BackendConfig(attn="cudnn", linear="torch", experts="torch", dispatcher="torch"),
+            BackendConfig(**backend_config),
         )
     assert apply_lora_to_linear_modules(model, peft, skip_freeze=True) == (37 + 6) * 5 + 42 * (1 + 3) + 3
+    assert isinstance(model.model.layers[1].moe.experts, GroupedExpertsDeepEPLoRA)
     _apply_trainability_policy(model, peft_enabled=True, freeze_config=None, strict=True)
 
     adapters = {name: parameter for name, parameter in model.named_parameters() if "lora_" in name}

@@ -112,6 +112,26 @@ def _model(ratios: tuple[int, ...] = WITH_DSA) -> Ernie5_5_MoeForCausalLM:
         return Ernie5_5_MoeForCausalLM(Ernie5_5Config(**values), _backend())
 
 
+def _hybridep_model(dtype: str = "bfloat16") -> Ernie5_5_MoeForCausalLM:
+    """Build the three released layers with the grouped-GEMM experts and the HybridEP dispatcher.
+
+    The model is built in one process, where the shared MoE warns that HybridEP needs several and holds the
+    experts without a token dispatcher. The sidecar reads the backend of the model, not the expert class.
+
+    Args:
+        dtype: Model dtype, ``"bfloat16"`` or ``"float32"``.
+
+    Returns:
+        A model on the meta device with an HCA layer and a dense MLP, an HCA layer and an MoE, and a DSA layer and
+        an MoE.
+    """
+    values = checkpoint_style_config()
+    values.update(num_hidden_layers=3, compress_ratios=list(WITH_DSA), num_nextn_predict_layers=0, torch_dtype=dtype)
+    backend = BackendConfig(attn="eager", linear="torch", experts="torch_mm", dispatcher="hybridep")
+    with torch.device("meta"), pytest.warns(UserWarning, match="'hybridep' dispatcher is enabled .* world size is 1"):
+        return Ernie5_5_MoeForCausalLM(Ernie5_5Config(**values), backend)
+
+
 def _context(**changes: object) -> SimpleNamespace:
     """Build the members of a mesh context that the sidecar and the dispatcher read before an executor runs."""
     values = {
@@ -365,6 +385,61 @@ def test_supported_topology_is_admitted_and_leaves_the_model_untouched(monkeypat
     context = _context(device_mesh=_Mesh(ranks=ranks), **changes)
     assert PARALLELIZER._prepare_model(model, context) is None
     _assert_untouched(model, hca_layers=ratios.count(128))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({}, id="bf16_compute_of_the_default_policy"),
+        pytest.param(
+            {"strategy_config": FSDP2Config(mp_policy=MixedPrecisionPolicy())}, id="compute_in_the_storage_dtype"
+        ),
+        pytest.param({"moe_parallel_config": MoEParallelizerConfig(mp_policy=BULK_POLICY)}, id="bf16_moe_policy"),
+    ],
+)
+def test_hybridep_dispatcher_with_bf16_compute_is_admitted(monkeypatch, changes):
+    model = _hybridep_model()
+    _set_world_size(monkeypatch)
+    assert PARALLELIZER._prepare_model(model, _context(**changes)) is None
+    _assert_untouched(model)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "changes", "message"),
+    [
+        pytest.param(
+            "bfloat16",
+            {"strategy_config": FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32))},
+            r"hybridep computes in bfloat16 only: set distributed\.mp_policy\.param_dtype to null or bfloat16, "
+            r".* got torch\.float32",
+            id="fp32_compute_of_the_strategy_policy",
+        ),
+        pytest.param(
+            "bfloat16",
+            {"moe_parallel_config": MoEParallelizerConfig(mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32))},
+            r"hybridep computes in bfloat16 only: set distributed\.moe\.mp_policy\.param_dtype to null or bfloat16, "
+            r".* got torch\.float32",
+            id="fp32_compute_of_the_moe_policy",
+        ),
+        pytest.param(
+            "float32",
+            {},
+            r"hybridep is validated with model\.dtype bfloat16 only: set model\.dtype to bfloat16, .* got "
+            r"model\.dtype torch\.float32",
+            id="fp32_model",
+        ),
+    ],
+)
+def test_hybridep_dispatcher_without_bf16_compute_is_rejected_before_any_executor(monkeypatch, dtype, changes, message):
+    """HybridEP exchanges 16-bit activations only; the torch pair admits the same FP32 policy (``fp32_compute``)."""
+    model = _hybridep_model(dtype)
+    _set_world_size(monkeypatch)
+    executors = _record_executors(monkeypatch)
+    with pytest.raises(ValueError, match=message):
+        parallelize_model(model, _context(**changes))
+    for executor in executors.values():
+        executor.assert_not_called()
+    _assert_untouched(model)
 
 
 def test_executor_that_bypasses_the_hook_is_reported(monkeypatch):

@@ -97,3 +97,7 @@ ci:
   recipe_owner: ZhiyuLi-Nvidia
   time: "00:15:00"
   nodes: 2
+  perf_testing:
+    schedule: nightly
+    # Fifty steps take about 13 minutes including compilation, close to the 15-minute ci.time.
+    time: "00:25:00"

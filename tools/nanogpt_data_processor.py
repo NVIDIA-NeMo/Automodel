@@ -389,7 +389,7 @@ def tokenize_chunk(chunk: list[dict], tokenizer_name: str, max_length: int) -> l
     tokenizer, bos_token_id = _get_tokenizer(tokenizer_name)  # first call builds, later calls reuse
     out = []
     for doc in chunk:
-        tokens = tokenizer.encode(doc["text"], max_length=max_length, truncation=False)
+        tokens = tokenizer.encode(doc["text"], max_length=max_length, truncation=True)
         if tokens and tokens[0] != bos_token_id:
             tokens = [bos_token_id] + tokens
         out.append(tokens)

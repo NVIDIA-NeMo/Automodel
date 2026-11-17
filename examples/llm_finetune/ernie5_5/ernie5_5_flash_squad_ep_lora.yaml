@@ -27,8 +27,13 @@
 # of the base weights, which is what lets 2 nodes replace the 16 of
 # ernie5_5_flash_squad_ep.yaml. It does not shrink the weights a rank holds (its expert group
 # and its shard of the dense weights), and a step still keeps the activations of the forward
-# pass for the backward pass: a GPU holds 65.8 GiB after loading and peaked at 102.8 GiB
-# allocated in the validated run.
+# pass for the backward pass. In a 100-update run with the torch expert and dispatcher
+# backends, a GPU held 65.8 GiB after loading and peaked at 102.8 GiB allocated; these
+# measurements do not characterize the HybridEP recipe below.
+# HybridEP requires DeepEP with HybridEP support and compiles kernels at the first dispatch.
+# Place both nodes of this 8-rank expert group in one NVLink domain. Leave
+# NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset; if the nodes share a home directory, set
+# HYBRID_EP_CACHE_DIR to a separate directory on each node.
 #
 # Hardware: the six sparse-attention (DSA) layers run on the cuDNN path, which requires
 # nvidia-cudnn-frontend[cutedsl] and FlashMLA; validated on SM100-class GPUs (GB200) only. The
@@ -92,11 +97,10 @@ model:
     # cuDNN sparse attention for the DSA layers: requires nvidia-cudnn-frontend[cutedsl] and
     # FlashMLA; validated on SM100-class GPUs (GB200) only.
     attn: cudnn
-    # The model implements the torch kernels only: the next three fields must be torch, and
-    # every other BackendConfig field except enable_hf_state_dict_adapter must keep its default.
+    # HybridEP exchanges routed-expert tokens in BF16; other BackendConfig fields keep their defaults.
     linear: torch
-    experts: torch
-    dispatcher: torch
+    experts: torch_mm
+    dispatcher: hybridep
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -170,6 +174,7 @@ checkpoint:
   # default is final).
   save_consolidated: false
   checkpoint_dir: checkpoints/ernie5_5_flash_squad_ep_lora/
+  load_metadata_with_gloo: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

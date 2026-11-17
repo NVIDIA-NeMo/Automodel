@@ -523,9 +523,12 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     share the compressed keys, and the DSA layers gather the latent and indexer keys of the row.
 
     The model reads one more ``BackendConfig`` field: ``enable_hf_state_dict_adapter`` attaches the checkpoint
-    adapter. Every other field must hold the value the layers implement: ``"torch"`` for ``linear``,
-    ``experts`` and ``dispatcher``, and the ``BackendConfig`` default for the rest. Other values are rejected at
-    construction. This includes ``enable_fsdp_optimizations``: ``MoEFSDPSyncMixin`` would honour it, but it has
+    adapter. Every other field must hold a value the layers implement. ``linear`` is ``"torch"``. ``experts`` and
+    ``dispatcher`` are ``"torch"`` and ``"torch"``, or ``"torch_mm"`` and ``"hybridep"``. With the second pair the
+    routed experts of a job of several processes exchange their tokens through HybridEP, which is supported for
+    BF16 compute only (the parallelizer rejects another compute dtype). The remaining fields, the tuning fields
+    of HybridEP among them, keep the ``BackendConfig`` default. Other values are rejected at construction. This
+    includes ``enable_fsdp_optimizations``: ``MoEFSDPSyncMixin`` would honour it, but it has
     not been validated with this model.
 
     The DSA indexers only select keys and are not trained. The constructor freezes their parameters, and a
@@ -663,25 +666,30 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
                 f"{DENSE_ATTENTION_BACKENDS} (eager PyTorch attention, at most 512 tokens in the DSA layers); "
                 f"got attn={backend.attn!r}. Set `model.backend.attn` in the recipe."
             )
-        # The layers implement the torch kernels only and read no tuning field, so apart from `attn` and the
-        # adapter switch copied below a backend is supported only when it equals this one. BackendConfig gains
-        # fields with every model family; comparing whole objects keeps the check complete when it does.
+        # The layers implement the torch linear kernels and one of two routed-expert paths: the torch experts with
+        # the torch dispatcher, or the grouped-GEMM experts with the HybridEP dispatcher. They read no tuning field,
+        # so apart from `attn` and the adapter switch, both copied below, a backend is supported only when it
+        # equals the template of its dispatcher. BackendConfig gains fields with every model family; comparing
+        # whole objects keeps the check complete when it does.
+        hybridep = backend.dispatcher == "hybridep"
         supported = BackendConfig(
             attn=backend.attn,
             linear="torch",
-            experts="torch",
-            dispatcher="torch",
+            experts="torch_mm" if hybridep else "torch",
+            dispatcher="hybridep" if hybridep else "torch",
             rope_fusion=False,
             enable_hf_state_dict_adapter=backend.enable_hf_state_dict_adapter,
         )
         if backend != supported:
             given, expected = asdict(backend), asdict(supported)
-            different = ", ".join(
-                f"{name}={value!r} (supported: {expected[name]!r})"
-                for name, value in given.items()
-                if value != expected[name]
+            names = [name for name, value in given.items() if value != expected[name]]
+            different = ", ".join(f"{name}={given[name]!r} (supported: {expected[name]!r})" for name in names)
+            pairs = (
+                ". `experts` and `dispatcher` must be 'torch' and 'torch', or 'torch_mm' and 'hybridep'"
+                if "experts" in names or "dispatcher" in names
+                else ""
             )
-            raise ValueError(f"ERNIE 5.5 does not support these `model.backend` settings: {different}")
+            raise ValueError(f"ERNIE 5.5 does not support these `model.backend` settings: {different}{pairs}")
         if dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(f"ERNIE 5.5 supports FP32 and BF16 only; got {dtype}")
         if backend.attn == "cudnn" and (

@@ -20,8 +20,12 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ernie5_5 import moe as moe_module
+from nemo_automodel.components.models.ernie5_5.layers import ernie_situ
 from nemo_automodel.components.models.ernie5_5.moe import Ernie5_5Gate, Ernie5_5MoE
+from nemo_automodel.components.moe import experts as shared_experts
+from nemo_automodel.components.moe import layers as shared_layers
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 
 # No test of this file uses CUDA.
 pytestmark = pytest.mark.cpu_only
@@ -258,3 +262,109 @@ def test_moe_ignores_a_context_parallel_mesh_and_rejects_unsharded_distributed_e
     monkeypatch.setattr(moe_module, "get_world_size_safe", lambda: 2)
     with pytest.raises(RuntimeError, match="requires sharded expert DTensors"):
         model(inputs)
+
+
+# Expert and dispatcher backends
+
+ONE_PROCESS_WARNING = "'hybridep' dispatcher is enabled .* world size is 1"
+
+
+def _hybridep_backend() -> BackendConfig:
+    """Return the grouped-GEMM experts with the HybridEP token dispatcher."""
+    return BackendConfig(experts="torch_mm", dispatcher="hybridep", linear="torch")
+
+
+def _build_for_job(monkeypatch: pytest.MonkeyPatch, ranks: int) -> None:
+    """Let the shared MoE constructor see a job of ``ranks`` processes; no process group exists in these tests."""
+    monkeypatch.setattr(shared_layers, "get_world_size_safe", lambda: ranks)
+
+
+def _state_layout(model: Ernie5_5MoE) -> dict[str, tuple[torch.Size, torch.dtype]]:
+    """Return shape and dtype of every parameter and buffer of the MoE by state-dict name."""
+    return {name: (tensor.shape, tensor.dtype) for name, tensor in model.state_dict().items()}
+
+
+def test_moe_installs_situ_on_grouped_experts_for_the_torch_pair_and_in_one_process():
+    gate_up, weights = torch.randn(4, 10), torch.rand(4, 1)
+    expected = ernie_situ(gate_up, beta=4.0, linear_beta=25.0, routing_weight=weights)
+    with pytest.warns(UserWarning, match=ONE_PROCESS_WARNING):
+        one_process = Ernie5_5MoE(_moe_config(), _hybridep_backend())
+    for model in (_moe_model(), one_process):
+        assert type(model.experts) is GroupedExperts
+        actual = model.experts.expert_activation_grouped(gate_up, weights)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_moe_installs_situ_on_the_hybridep_experts_of_a_job_and_keeps_the_state_layout(monkeypatch):
+    reference = _state_layout(_moe_model())
+    _build_for_job(monkeypatch, 2)
+    model = Ernie5_5MoE(_moe_config(), _hybridep_backend())
+    assert type(model.experts) is GroupedExpertsDeepEP
+    gate_up, weights = torch.randn(4, 10), torch.rand(4, 1)
+    expected = ernie_situ(gate_up, beta=4.0, linear_beta=25.0, routing_weight=weights)
+    torch.testing.assert_close(model.experts.expert_activation(gate_up, weights), expected, rtol=0, atol=0)
+    # Both expert classes hold the same tensors under the same names, so a checkpoint of one fits the other.
+    assert _state_layout(model) == reference
+    # The torch pair keeps the experts without a token dispatcher in a job as well.
+    assert type(_moe_model().experts) is GroupedExperts
+
+
+def test_moe_forward_in_one_process_matches_the_explicit_reference_with_the_hybridep_pair(monkeypatch):
+    """In one process the HybridEP pair runs the grouped-GEMM path of ``GroupedExperts``."""
+
+    def dense_grouped_mm(value: torch.Tensor, weights: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+        """Stand in for ``torch._grouped_mm``, which not every torch build has for CPU.
+
+        Args:
+            value: Tensor of shape [routed_tokens, input], with the rows of each expert together.
+            weights: Tensor of shape [experts, input, output].
+            offs: Integer tensor of shape [experts] with the cumulative row count after each expert.
+
+        Returns:
+            Tensor of shape [routed_tokens, output].
+        """
+        starts = [0, *offs.tolist()]
+        return torch.cat([value[starts[index] : starts[index + 1]] @ weights[index] for index in range(len(weights))])
+
+    monkeypatch.setattr(shared_experts, "select_grouped_mm", lambda use_mxfp8: dense_grouped_mm)
+    torch.manual_seed(5571)
+    with pytest.warns(UserWarning, match=ONE_PROCESS_WARNING):
+        model = Ernie5_5MoE(_moe_config(), _hybridep_backend())
+    model.init_weights(torch.device("cpu"))
+    x = torch.randn(3, 4, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    actual = model(x)
+    expected = _explicit_reference(model, reference_x)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    actual_grad = torch.autograd.grad(actual.square().sum(), x)[0]
+    reference_grad = torch.autograd.grad(expected.square().sum(), reference_x)[0]
+    torch.testing.assert_close(actual_grad, reference_grad, rtol=1e-4, atol=1e-6)
+
+
+def test_moe_rejects_activations_that_are_not_bf16_before_a_hybridep_dispatch(monkeypatch):
+    """HybridEP exchanges 16-bit activations only, so FP32 activations are refused before the experts run."""
+    _build_for_job(monkeypatch, 2)
+    model = Ernie5_5MoE(_moe_config(), _hybridep_backend())
+    model.init_weights(torch.device("cpu"))
+    # These experts have no token dispatcher: a forward that reached them would fail with an AttributeError.
+    with pytest.raises(RuntimeError, match=r"requires BF16 activations at the routed experts, got torch\.float32"):
+        model(torch.zeros(2, 4))
+
+
+def test_moe_rejects_a_hybridep_backend_whose_experts_were_built_for_one_process(monkeypatch):
+    with pytest.warns(UserWarning, match=ONE_PROCESS_WARNING):
+        model = Ernie5_5MoE(_moe_config(), _hybridep_backend())
+    monkeypatch.setattr(moe_module, "get_world_size_safe", lambda: 2)
+    with pytest.raises(RuntimeError, match="HybridEP dispatcher was requested, but this ERNIE MoE was built for one"):
+        model(torch.zeros(2, 4))
+
+
+@pytest.mark.parametrize(
+    ("experts", "dispatcher"),
+    [("torch", "hybridep"), ("te", "hybridep"), ("torch_mm", "torch"), ("torch_mm", "deepep")],
+)
+def test_moe_rejects_unsupported_expert_and_dispatcher_pairs(experts, dispatcher):
+    backend = BackendConfig(experts=experts, dispatcher=dispatcher, linear="torch")
+    message = rf"with dispatcher='hybridep'; got experts='{experts}' with dispatcher='{dispatcher}'"
+    with pytest.raises(ValueError, match=message):
+        Ernie5_5MoE(_moe_config(), backend)

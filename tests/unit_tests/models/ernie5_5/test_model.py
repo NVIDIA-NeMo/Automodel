@@ -46,6 +46,8 @@ from nemo_automodel.components.models.ernie5_5.model import (
     Ernie5_5Model,
     ModelClass,
 )
+from nemo_automodel.components.moe import layers as shared_moe_layers
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils import model_utils
 from tests.unit_tests.models.ernie5_5.conftest import checkpoint_config, checkpoint_style_config
@@ -360,7 +362,8 @@ def test_other_attention_backends_are_rejected(attn):
     [
         ("experts", "torch_mm", "torch"),
         ("dispatcher", "deepep", "torch"),
-        ("dispatcher", "hybridep", "torch"),
+        # A tuning field of HybridEP: the model implements none of them, with either dispatcher.
+        ("dispatcher_hybridep_max_tokens_per_rank", 256, None),
         ("linear", "te", "torch"),
         ("rope", "quack", "torch"),
         ("rope", "triton", "torch"),
@@ -404,6 +407,87 @@ def test_every_unsupported_backend_field_is_named_and_the_adapter_switch_is_acce
     # The HCA and MoE layers receive the model's backend with the eager attention name; nothing else differs.
     assert model.model.layers[0].attention.backend == replace(switches, attn="eager")
     assert model.model.layers[1].moe.backend == replace(switches, attn="eager")
+
+
+def _hybridep_backend(**fields: str | int | float | bool | None) -> BackendConfig:
+    """Return the grouped-GEMM experts with the HybridEP token dispatcher on the eager attention path.
+
+    Args:
+        **fields: ``BackendConfig`` fields that replace or extend those four.
+    """
+    values = {"attn": "eager", "linear": "torch", "experts": "torch_mm", "dispatcher": "hybridep", **fields}
+    return BackendConfig(**values)
+
+
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_hybridep_pair_is_accepted_and_keeps_the_state_and_the_checkpoint_keys(monkeypatch, ranks):
+    """A checkpoint written with one dispatcher has the names and shapes that the other loads.
+
+    In one process the shared MoE holds ``GroupedExperts`` and warns; in a job it holds ``GroupedExpertsDeepEP``.
+    """
+    with torch.device("meta"):
+        reference = Ernie5_5_MoeForCausalLM(_tiny_config(), _eager_backend())
+    backend = _hybridep_backend()
+    monkeypatch.setattr(shared_moe_layers, "get_world_size_safe", lambda: ranks)
+    with torch.device("meta"):
+        if ranks == 1:
+            with pytest.warns(UserWarning, match="'hybridep' dispatcher is enabled .* world size is 1"):
+                model = Ernie5_5_MoeForCausalLM(_tiny_config(), backend)
+        else:
+            model = Ernie5_5_MoeForCausalLM(_tiny_config(), backend)
+    assert model.backend is backend
+    moe = model.model.layers[1].moe
+    assert moe.backend == replace(backend, attn="eager")
+    assert type(moe.experts) is (GroupedExperts if ranks == 1 else GroupedExpertsDeepEP)
+    expected, state = reference.state_dict(), model.state_dict()
+    assert list(state) == list(expected)
+    assert [(value.shape, value.dtype) for value in state.values()] == [
+        (value.shape, value.dtype) for value in expected.values()
+    ]
+    expected_keys = reference.state_dict_adapter.get_hf_state_dict_keys(expected)
+    assert model.state_dict_adapter.get_hf_state_dict_keys(state) == expected_keys
+
+
+@pytest.mark.parametrize(
+    "field,value,supported",
+    [
+        ("experts", "torch", "torch_mm"),
+        ("experts", "te", "torch_mm"),
+        ("experts", "torch_mm_mxfp8", "torch_mm"),
+        ("dispatcher_num_sms", 32, 20),
+        ("dispatcher_share_token_dispatcher", False, True),
+        ("dispatcher_async_dispatch", True, False),
+        ("dispatcher_capacity_factor", 1.5, None),
+        # One unpadded document per rank: the ranks of an expert-parallel group hold different token counts.
+        ("dispatcher_equal_token_counts", True, False),
+        ("dispatcher_recompute_cache", "combine", "none"),
+        ("dispatcher_hybridep_permute_fusion", True, False),
+        ("dispatcher_hybridep_compact_routing", True, False),
+        ("dispatcher_hybridep_num_sms_preprocessing", 8, None),
+        ("dispatcher_hybridep_num_blocks_permute", 2, None),
+        ("dispatcher_hybridep_num_blocks_unpermute", 2, None),
+        ("dispatcher_hybridep_max_tokens_per_rank", 256, None),
+    ],
+)
+def test_hybridep_backend_fields_the_model_does_not_implement_are_rejected_by_name(field, value, supported):
+    expected = re.escape(f"{field}={value!r} (supported: {supported!r})")
+    with torch.device("meta"), pytest.raises(ValueError, match=expected):
+        Ernie5_5_MoeForCausalLM(_tiny_config(), _hybridep_backend(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "experts,dispatcher,named",
+    [
+        ("torch", "hybridep", "experts='torch' (supported: 'torch_mm')"),
+        ("torch_mm", "torch", "experts='torch_mm' (supported: 'torch')"),
+        ("torch_mm", "deepep", "experts='torch_mm' (supported: 'torch'), dispatcher='deepep' (supported: 'torch')"),
+    ],
+)
+def test_rejected_expert_and_dispatcher_pair_names_the_supported_pairs(experts, dispatcher, named):
+    backend = BackendConfig(attn="eager", linear="torch", experts=experts, dispatcher=dispatcher)
+    pairs = "`experts` and `dispatcher` must be 'torch' and 'torch', or 'torch_mm' and 'hybridep'"
+    with torch.device("meta"), pytest.raises(ValueError, match=re.escape(f"{named}. {pairs}")):
+        Ernie5_5_MoeForCausalLM(_tiny_config(), backend)
 
 
 def test_cudnn_requires_bf16_and_the_released_dsa_dimensions():

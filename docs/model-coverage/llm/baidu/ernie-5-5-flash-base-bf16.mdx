@@ -59,12 +59,37 @@ uv run torchrun --nnodes=16 --nproc-per-node=4 --node-rank=$NODE_RANK --master-a
   -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep.yaml
 ```
 
-The 64-GPU validation runs started this module through a wrapper that gives
-every rank its own compile-cache directories (`TRITON_CACHE_DIR`,
-`TORCHINDUCTOR_CACHE_DIR`, `CUDA_CACHE_PATH`, and `TORCH_EXTENSIONS_DIR`). Set
-them per rank if the ranks of a node would otherwise share a cache directory
-on a network file system. With `--nnodes=1` and without `uv run`, the command
-was run on one node with a three-layer model.
+The 100-update validation run did not start this module. It started the
+recipe through a script that gives every rank its own compile-cache
+directories (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `CUDA_CACHE_PATH`,
+and `TORCH_EXTENSIONS_DIR`) and then makes the calls this module makes in a
+worker process: it parses the configuration, constructs the recipe, and runs
+its setup and its training loop. The script also times every update and
+records the peak allocated memory; the step times and the allocated memory
+in the table under [Validated Configuration](#validated-configuration) are
+its measurements. Set these directories per rank if the ranks of a node would
+otherwise share a cache directory on a network file system. The routed
+experts exchange tokens through HybridEP,
+which compiles its kernels at the first dispatch of every process and writes
+them to a directory named after the process id under `HYBRID_EP_CACHE_DIR`, or
+under the home directory when that variable is unset. The validation runs set
+`HYBRID_EP_CACHE_DIR` to a separate directory of the job on every node; do the
+same if the nodes share the home directory. HybridEP compiles with `nvcc` from
+`CUDA_HOME`, which must be present at run time; the repository's shared kernel
+cache (`NEMO_HYBRIDEP_JIT_CACHE`) was not used in the validation runs. They left
+`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` unset, so that HybridEP detects
+which ranks of an expert group share an NVLink domain. An expert group is 8
+consecutive ranks (`ep_size: 8`), that is the two nodes with `NODE_RANK` 2k
+and 2k+1. These two nodes must be in one NVLink domain: on GB200 a domain can
+span several four-GPU nodes, and an expert group that is split over two
+domains has not been validated. Without `uv run` and without that script, the
+command was run on 64 GPUs for 10 updates, with
+`--step_scheduler.max_steps=10` and a `--checkpoint.checkpoint_dir` appended
+and without `checkpoint.load_metadata_with_gloo`; its first update took 90 s.
+With `--nnodes=1`, a three-layer model as
+`--model.pretrained_model_name_or_path`, `--distributed.ep_size=2`,
+`--step_scheduler.global_batch_size=4`, and the same two overrides, the
+recipe as it ships was run on one node for 10 updates.
 
 Dense parameters use FSDP2, and the routed experts of each MoE layer are
 distributed over the EP group. The parameters of the DSA indexers are frozen.
@@ -93,9 +118,15 @@ exercised in a forward pass over documents of 4,096 tokens (see
 three-layer model (see [Validated Configuration](#validated-configuration)).
 
 Multi-GPU training of the released model has been validated with the cuDNN
-path only. The model rejects every other `model.backend` setting: `linear`,
-`experts`, and `dispatcher` must be `torch`, and all remaining fields except
-`enable_hf_state_dict_adapter` must keep their defaults.
+path only. `model.backend.linear` must be `torch`. `experts` and `dispatcher`
+must be `torch_mm` and `hybridep`, the pair of the recipe, or `torch` and
+`torch`. The first pair exchanges the routed tokens through HybridEP and
+requires BF16 compute: `model.dtype: bfloat16` and an FSDP `param_dtype` of
+`null` or `bfloat16`. The second pair exchanges the tokens with all-gather and
+all-reduce over the EP group; the checkpoint and parity results on this page
+that name it were measured with it. All remaining fields except
+`enable_hf_state_dict_adapter` must keep their defaults, the tuning fields of
+HybridEP among them; the model rejects every other `model.backend` setting.
 
 Parameters use BF16, the dtype of the released checkpoint, except where the
 model keeps FP32 parameters, among them the mHC, hyper-head, router, and
@@ -106,13 +137,13 @@ expands the layer output back into the streams in FP32 with autocast disabled.
 The hyper head contracts the streams in FP32.
 
 <Note>
-The full fine-tuning recipe sets `checkpoint.enabled: false` because one
-checkpoint of the full model and optimizer is about 3.1 TiB: 523 GiB of
-weights and 2.5 TiB of optimizer state. To save, set
-`checkpoint.enabled: true` and `checkpoint.save_consolidated: false`. The
-validated save of the full model wrote one checkpoint, with
-`step_scheduler.ckpt_every_steps: 100` and `dist_env.timeout_minutes: 180`;
-that recipe's values of 50 and 30 were not run with saving enabled.
+The full fine-tuning recipe sets `checkpoint.enabled: false` because one checkpoint of the full
+model and optimizer is about 3.1 TiB: 523 GiB of weights and 2.5 TiB of
+optimizer state. To save, set `checkpoint.enabled: true` and
+`checkpoint.save_consolidated: false`. The validated save of the full model,
+run with the `torch` expert and dispatcher backends, wrote one checkpoint, with
+`step_scheduler.ckpt_every_steps: 100` and `dist_env.timeout_minutes: 180`; the
+full fine-tuning recipe's values of 50 and 30 were not run with saving enabled.
 [Validated Configuration](#validated-configuration) lists what was saved and
 restored. The consolidated Hugging Face export has not been validated.
 
@@ -122,7 +153,9 @@ The checkpoint adapter supports the two expert layouts that the shared MoE
 parallelizer produces: experts sharded over several data-parallel ranks per
 expert group, and one rank per expert group (for example 2 GPUs with
 `ep_size: 2`). Both layouts were saved and restored on GPUs with a three-layer
-model built from released layers.
+model built from released layers with the `torch` backends; with HybridEP, the
+layout with experts sharded over several ranks per expert group was saved and
+restored ([Validated Configuration](#validated-configuration)).
 
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 [Installation Guide](/get-started/installation) for setup.
@@ -134,28 +167,77 @@ This section covers the full fine-tuning recipe;
 
 | Area | Validated Configuration |
 |---|---|
-| Hardware | 16 nodes with 4 GB200 GPUs each (64 GPUs) |
+| Hardware | 16 nodes with 4 GB200 GPUs each (64 GPUs), in eight NVLink domains of two nodes each |
 | Parallelism | FSDP2 with `ep_size: 8`: the routed experts of each MoE layer form 8 groups, and each group is sharded over 8 ranks; TP1 / PP1 / CP1 |
 | Workload | SQuAD, single unpacked documents of at most 256 tokens; local batch size 1, global batch size 64; 100 optimizer updates |
-| Peak GPU memory | 133.3 GiB allocated (`torch.cuda.max_memory_allocated` on rank 0); 175.8 GiB used on the fullest GPU as sampled with `nvidia-smi` |
-| Step time | 31 s for the first update; median 6.2 s over the 95 updates from the sixth on, with single updates of up to 24 s |
-| Loss | Training loss 0.3469 at the first update and 0.1180 at the last; validation loss 0.1073 after 50 updates and 0.0982 after 100, on 367 label tokens |
+| Expert dispatch | HybridEP (`experts: torch_mm`, `dispatcher: hybridep`) with DeepEP 1.2.1 at revision `10d4dd7`; every expert group of 8 ranks on two nodes of one NVLink domain, as HybridEP reported on every rank |
+| Peak GPU memory | 132.9 GiB allocated (`torch.cuda.max_memory_allocated` on rank 0); 153.2 GiB used on the fullest GPU as sampled with `nvidia-smi` |
+| Step time | 64 s for the first update, which includes the compilation of the HybridEP kernels; median 5.9 s over the 95 updates from the sixth on, with single updates of up to 14 s |
+| Loss | Training loss 0.3458 at the first update and 0.1160 at the last; validation loss 0.1086 after 50 updates and 0.0980 after 100, on 367 label tokens |
 
-The run completed without non-finite losses or gradient norms. It validates the
-training mechanics, not model convergence.
+The values in this table were measured with HybridEP, the pair of the recipe,
+with the nodes placed as the Hardware row says, and with the recipe as it
+ships. The values differ between placements. The recipe without
+`checkpoint.load_metadata_with_gloo`, run for 10 updates on 16 nodes in four
+NVLink domains through the command above, gave the same training loss at the
+first update and 151.3 GiB used on the fullest GPU. By the step records that
+the recipe writes itself (`training.jsonl`: the tokens of an update divided by
+its tokens per second), the median over the updates from the sixth on was
+7.0 s in that run, 6.0 s in the 100-update run of the table, whose 5.9 s is
+the timer of the validation script, and 13.5 s with the `torch` backends in
+the placement of the 10-update run. An earlier run of 100 updates with the
+`torch` backends on 16 nodes of one rack took a median of 6.2 s per update and
+used 175.8 GiB on the fullest GPU; HybridEP was not run in that placement.
+The 100-update run completed without non-finite losses or gradient norms. It
+validates the training mechanics, not model convergence. In the same job, 20
+updates with the `torch` expert and dispatcher backends took a median of 10.0 s
+over the updates from the sixth on, against 6.0 s with HybridEP over the same
+updates, and peaked at 132.8 GiB allocated on rank 0; the training loss at the
+first update was 0.3469.
+
+The recipe sets `checkpoint.load_metadata_with_gloo: true`, which plans the
+loading of the weights over a CPU process group instead of NCCL; the run of
+the validated configuration used it. With NCCL, rank 0 can keep point-to-point
+buffers for other ranks for the whole run, and how much depends on the
+placement. Device memory in use after setup, before the first update (total
+minus free of `torch.cuda.mem_get_info`):
+
+| Model, GPUs, and placement | Without the switch | With the switch |
+|---|---|---|
+| 3 layers, 4 GPUs on one node | 10.047 GiB on rank 0, 9.297 GiB on the others | 8.879 GiB on all |
+| 3 layers, 8 GPUs on two nodes of one NVLink domain | 8.000 GiB on rank 0, 5.750 GiB on the others | 5.332 GiB on all |
+| 3 layers, 16 GPUs on four nodes in two NVLink domains | 4.133 GiB on rank 0, 3.727 to 3.995 GiB on the others | 3.666 to 3.668 GiB on all |
+| 43 layers, 64 GPUs in eight NVLink domains | 10.293 GiB on rank 0, 10.028 to 10.356 GiB on the others | 9.991 to 10.030 GiB on all |
+
+With the 64 GPUs in eight NVLink domains the difference was at most 0.33 GiB
+on a GPU. In an earlier run of the 43-layer model with the `torch` backends
+on 16 nodes of one rack, without the switch, the GPU of rank 0 held 36,133 MiB
+while the weights were being loaded and when the load ended, against 12,209 to
+12,215 MiB on the other 63 GPUs, as sampled with `nvidia-smi`; a run with all
+64 ranks in one rack and the switch on was not made. In every comparison of
+the table, every rank held the same bytes in all loaded tensors with and
+without the switch. The switch covers loads only; a save plans over NCCL. The
+save and restore of the 43-layer model in the table below ran without the
+switch; with the switch, a checkpoint was restored with the three-layer model
+only (the two rows that name HybridEP).
 
 Saving and resuming were run with `checkpoint.enabled: true` and
 `checkpoint.save_consolidated: false`, with the same number of ranks and the
-same `ep_size` before and after:
+same `ep_size` before and after, and with the `torch` expert and dispatcher
+backends unless a row names HybridEP. The dispatcher does not change what a
+checkpoint holds:
 
 | Model | GPUs | Result |
 |---|---|---|
 | 43 layers, released weights | 64, `ep_size: 8` | One checkpoint after 100 updates: 523 GiB of weights and 2.5 TiB of optimizer state. The save call returned after 174 s: 56 to 60 s for the weights, 57 to 61 s for the optimizer state, and the rest includes the checks of the validation. A new process loaded the released checkpoint (277 s), restored the saved weights in 106 s and the optimizer state in 53 s, then trained 16 more updates. Every rank cleared its model state before the restore and afterward held the same bytes in all 1,516 tensors as before the save; the serialized optimizer state was also the same. Host memory in use on a node peaked at 352 GiB during the save. |
 | 3 layers (released layers 0, 1, and 7) | 16, `ep_size: 4` | Four checkpoints over 512 updates, with a restart in a new process after 256. After the first save of each process, every rank cleared its model state, read the checkpoint back, and held the same values in all 106 tensors. The serialized optimizer state was the same after the restart. |
 | 3 layers (released layers 0, 1, and 7) | 2, `ep_size: 2` | The same checks over 128 updates, with a restart after 64. This is the layout with one rank per expert group. |
+| 3 layers (released layers 0, 1, and 7) | 16 on four nodes, `ep_size: 8`, HybridEP | Every expert group of 8 ranks on two nodes of one NVLink domain. One checkpoint after 16 updates: 29 GiB of weights and 142 GiB of optimizer state. Two new processes restored it, one with HybridEP and one with the `torch` backends, and trained 8 more updates. In both, every rank held the same bytes in all 106 tensors as the saving process after its last update, and the same optimizer state, including the update counter. |
+| 3 layers (released layers 0, 1, and 7) | 4 on one node, `ep_size: 2`, HybridEP and `torch` | Two checkpoints after 16 updates each, one saved with HybridEP and one with the `torch` backends. Each was restored by two new processes, one with HybridEP and one with the `torch` backends, which trained 8 more updates. In all four restores, every rank held the same bytes in all 106 tensors as the saving process after its last update, and the same optimizer state, including the update counter. |
 
 Training with documents long enough for the DSA layer to discard keys was run
-once, with the three-layer model on 4 GPUs (`ep_size: 2`): 16 updates on
+once, with the three-layer model on 4 GPUs (`ep_size: 2`) and the `torch`
+expert and dispatcher backends: 16 updates on
 documents of 4,096 tokens, with labels only on answer tokens from position
 2,176 on. The top-k step selected 2,048 of up to 3,968 remote keys, and the
 loss and the gradient norms stayed finite. The run was not compared with a
@@ -168,6 +250,11 @@ The LoRA recipe trains rank-8 adapters on the 43-layer main decoder on 8 GPUs
 (2 nodes with 4 GB200 GPUs per node). The released weights are loaded and stay
 frozen. Run it from the repository root on each of the 2 nodes, with
 `NODE_RANK` set to 0 and 1 and `MASTER_ADDR` set to the first node:
+
+Both nodes of the 8-rank expert group must be in one NVLink domain. HybridEP
+requires DeepEP with HybridEP support and compiles kernels on first use. Leave
+`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` unset; if the nodes share a home
+directory, set `HYBRID_EP_CACHE_DIR` to a separate directory on each node.
 
 ```bash
 uv run torchrun --nnodes=2 --nproc-per-node=4 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
@@ -183,8 +270,9 @@ one of the 8 expert groups of each MoE layer.
 LoRA removes the gradients and the optimizer state of the base weights, which
 is what lets 2 nodes take the place of 16. It does not reduce the weights that
 a GPU holds: every GPU keeps one eighth of the routed experts and its shard of
-the dense weights, 65.8 GiB after loading. A training step still gathers the
-dense weights and keeps the activations of the forward pass for the backward
+the dense weights. In the `torch` backend run these occupied 65.8 GiB after
+loading. A training step still gathers the dense weights and keeps the
+activations of the forward pass for the backward
 pass; in the validated run the allocation rose from 65.8 GiB to a peak of
 102.8 GiB.
 
@@ -225,6 +313,14 @@ stay FP32. The recipe loads the model in BF16 and sets the compute dtype to
 
 ### Validated LoRA Configuration
 
+The 100-update measurements below used the `torch` expert and dispatcher
+backends. They do not measure the HybridEP recipe above. On an earlier
+integration preview, the released 43-layer model also ran on 8 GPUs with
+HybridEP for 32 updates, saved after 24, and resumed in a new process for
+8 updates. On all ranks the restored adapter and optimizer state matched
+the save, and the frozen parameters remained unchanged. This preview is
+not a run of the final version of the recipe.
+
 | Area | Validated Configuration |
 |---|---|
 | Hardware | 2 nodes with 4 GB200 GPUs each (8 GPUs) |
@@ -257,8 +353,8 @@ resume in the row "Without it" of [LoRA Checkpoints](#lora-checkpoints) and
 the one-node run below. The runs on the 43-layer model started the recipe
 through a wrapper that adds these measurements; the two runs of 100 updates
 also ran a validation pass before training. The `nemo_automodel.cli.app`
-entry of the command above was run on one node with a three-layer model built
-from released layers (4 GPUs, `ep_size: 4`): 8 updates, one validation pass,
+entry of the command above was run with the `torch` backends on one node with a
+three-layer model built from released layers (4 GPUs, `ep_size: 4`): 8 updates, one validation pass,
 and one adapter checkpoint.
 
 ### LoRA Checkpoints
@@ -274,7 +370,7 @@ base weights:
 | Total | 20.06 GiB |
 
 The recipe writes one checkpoint after 50 updates and one after 100, 40 GiB
-in all. The two saves took 10.1 and 8.5 s.
+in all. In the `torch` backend run, the two saves took 10.1 and 8.5 s.
 
 A resume loads the released checkpoint first and then the adapter; it was
 validated with the same number of ranks and the same `ep_size`. It restores
@@ -294,8 +390,9 @@ reports as incompatible is skipped. A second run of the recipe in the same
 directory is therefore normally a resume. That second way was not run with
 LoRA for this model.
 
-Both cases were run on the 43-layer model from the checkpoint written after 50
-updates, each in a new process that loaded the released checkpoint (142 and
+Both cases used the `torch` expert and dispatcher backends on the 43-layer
+model from the checkpoint written after 50 updates, each in a new process that
+loaded the released checkpoint (142 and
 129 s), restored the adapter (5 and 9 s), and trained 8 more updates
 (`step_scheduler.max_steps: 58`, no save):
 
@@ -489,10 +586,11 @@ the shard of a row, which the model's CP sharder prepares for every `cp_size`.
 
 | Item | Value |
 |---|---|
-| Commit | Upstream commit `07b9d1a5947fbef57c5651034c8b1cfb26803d88` with the model package as submitted for review |
+| Commit | Upstream commit `c57935fc64faea913ce9f5e38ea7e57e6416cc93` with the model package as submitted for review. The comparison with documents of 4,096 tokens below was run earlier, at upstream commit `07b9d1a5947fbef57c5651034c8b1cfb26803d88`; at 256 tokens the result with the `torch` backends is the same at both commits on all 16,384 tokens. |
 | Reference | Megatron-Bridge `7c55987a027084e87e36277c9711e87bc52a2116` with Megatron-LM `f78809f6d9c88f8638ea7822966f35057a63fd5c` and a 10-line local change to the optimizer configuration in `training/config.py`, recipe `ernie55_sft_64gpu_gb300_bf16_config` on 64 GPUs (TP1 / PP1 / CP1 / EP64) in deterministic mode. The reference losses come from the forward of a training step with learning rate 0; two consecutive steps give the same loss on every token. |
-| Input | 64 documents of 256 tokens from the SQuAD validation split with a next-token target at every position (16,384 targets). Released BF16 weights, 43 decoder layers without the MTP block. NeMo AutoModel ran on 64 GPUs with `ep_size: 8` in evaluation mode; the loss of a token is the cross entropy computed in FP32 from the BF16 logits. |
-| Result | Mean per-token loss 1.27498 (NeMo AutoModel) and 1.27505 (reference). The absolute difference of the per-token losses has mean 0.0295, median 0.00045, 99th percentile 0.49, and maximum 4.11 nats; their Pearson correlation is 0.99968. A second NeMo AutoModel forward with every document on a different rank gave the same loss on all 16,384 tokens. |
+| Input | 64 documents of 256 tokens from the SQuAD validation split with a next-token target at every position (16,384 targets). Released BF16 weights, 43 decoder layers without the MTP block. NeMo AutoModel ran on 64 GPUs with `ep_size: 8` in evaluation mode, once with HybridEP (`experts: torch_mm`, `dispatcher: hybridep`) and once with the `torch` expert and dispatcher backends; the loss of a token is the cross entropy computed in FP32 from the BF16 logits. |
+| Result, HybridEP | Mean per-token loss 1.27435 (NeMo AutoModel) and 1.27505 (reference). The absolute difference of the per-token losses has mean 0.0293, median 0.00045, 99th percentile 0.50, and maximum 4.61 nats; their Pearson correlation is 0.99970. A repeat of the forward in a new process, and a forward in a new process with every document on a different rank and in a different expert group, each gave the same loss on all 16,384 tokens. |
+| Result, `torch` backends | Mean per-token loss 1.27498 (NeMo AutoModel) and 1.27505 (reference). The absolute difference of the per-token losses has mean 0.0295, median 0.00045, 99th percentile 0.49, and maximum 4.11 nats; their Pearson correlation is 0.99968. A forward in a new process with every document on a different rank and in a different expert group gave the same loss on all 16,384 tokens. |
 
 For scale, two forwards of the reference in its default, non-deterministic
 mode differ from each other by a mean of 0.0239 nats per token (maximum 2.15,
@@ -502,11 +600,30 @@ A full-model BF16 comparison measures a distance of this size; it does not
 separate rounding from a small difference in the arithmetic. At 256 tokens the
 DSA layers select every key.
 
-The comparison was repeated with 64 documents of 4,096 tokens, each a
-concatenation of consecutive SQuAD validation examples, so that the DSA layers
-discard keys from position 2,176 on. In this run the model was loaded by its
-Hub name and revision from a local Hub cache. Mean absolute difference of the
-per-token losses, in nats:
+HybridEP and the `torch` backends both add the ten expert outputs of a token
+in FP32. The `torch` backends round the sum to BF16 once; HybridEP first
+rounds the partial sum of each rank of the expert group. The two losses on the
+same weights therefore differ by rounding, and the HybridEP loss depends on
+`ep_size`. With the released 43-layer weights on the 64 GPUs of the validated
+configuration, the validation loss of the recipe before any update, on 367
+label tokens, was 0.3101 with the `torch` backends and 0.3104 with HybridEP;
+the HybridEP value is from a control run without
+`checkpoint.load_metadata_with_gloo`, in which every rank held the same bytes
+in all 1,516 loaded tensors as with it.
+On a three-layer model built from released layers 0, 1, and 7, the same
+validation gave 27.9237 with the `torch` backends and 27.9330 with HybridEP
+on 4 GPUs with `ep_size` 2, and 27.9238 and 27.9158 on 16 GPUs with
+`ep_size` 8. On the 16,384 targets of the comparison with the reference above,
+the per-token losses of the two backends differ by a mean of 0.0261 nats
+(median 0.00045, 99th percentile 0.40, maximum 2.71; Pearson correlation
+0.99977), and the mean loss is 0.00063 lower with HybridEP.
+
+The comparison with the reference was repeated with 64 documents of 4,096
+tokens, each a concatenation of consecutive SQuAD validation examples, so that
+the DSA layers discard keys from position 2,176 on. This comparison was run
+with the `torch` expert and dispatcher backends only; it was not repeated with
+HybridEP. In this run the model was loaded by its Hub name and revision from a
+local Hub cache. Mean absolute difference of the per-token losses, in nats:
 
 | Positions | NeMo AutoModel against the reference | Two forwards of the reference, at least one in default mode |
 |---|---|---|
@@ -519,8 +636,8 @@ Two NeMo AutoModel forwards with every document on a different rank gave the
 same loss on every token below position 2,176 and different losses on 25,780
 of the 122,880 tokens from position 2,176 on (mean absolute difference 0.0019
 nats, maximum 2.02). The deterministic reference repeats exactly, with every
-document on the same rank in both forwards. In a three-layer model the
-difference was traced to the top-k step: where keys tie at the selection
+document on the same rank in both forwards. In a three-layer model, also with
+the `torch` backends, the difference was traced to the top-k step: where keys tie at the selection
 threshold, the kernel's choice among them does not repeat, while the index
 scores and the attention over equal indices do, and every selected set is a
 correct top-k. The 43-layer run was not traced layer by layer.
@@ -556,8 +673,9 @@ FSDP2 on single unpacked documents, and LoRA on packed rows with CP.
 - `distributed.strategy` other than `fsdp2`, `dp_replicate_size` other than 1,
   `ep_size` of 1, the activation checkpointing values `selective` and `moe`,
   and an FSDP compute dtype other than FP32 or BF16 are rejected when the
-  model is parallelized. `activation_checkpointing: true` was run with the
-  packed LoRA recipe only.
+  model is parallelized. With the HybridEP dispatcher, a model dtype or an
+  FSDP compute dtype other than BF16 is rejected there as well.
+  `activation_checkpointing: true` was run with the packed LoRA recipe only.
 - The number of ranks must divide the 64 attention heads of the DSA layers, so
   a job has 2, 4, 8, 16, 32, or 64 ranks. A checkpoint stores the key and
   value projections of a DSA layer as one matrix, and it is loaded and saved
@@ -583,23 +701,27 @@ FSDP2 on single unpacked documents, and LoRA on packed rows with CP.
   the DSA layers, which requires `nvidia-cudnn-frontend[cutedsl]` and FlashMLA
   and is validated on SM100-class GPUs (GB200) only. Multi-GPU training of the
   released model has been validated with that path only, and, outside the
-  packed LoRA recipe, with documents of at most 256 tokens. With longer documents, full fine-tuning of the released
-  model was not run, only its forward pass. With LoRA, an earlier state of the
-  code ran three updates each at 384, 512, 768, and 1,024 tokens to measure
-  memory (113 to 161 GiB allocated at the peak); this is not a validation.
-  From position 2,176 of a document on, two forward passes of the same
-  document can give different losses; in a three-layer model this was traced
-  to the top-k step, which does not choose the same key among keys with equal
-  index scores every time.
+  packed LoRA recipe, with documents of at most 256 tokens. With longer
+  documents, full fine-tuning of the released model was not run, only its
+  forward pass, with the `torch` expert and dispatcher backends. With LoRA,
+  an earlier state of the code ran three updates each at 384, 512, 768, and
+  1,024 tokens to measure memory (113 to 161 GiB allocated at the peak);
+  this is not a validation. From position 2,176 of a document on, two
+  forward passes of the same document can give different losses; in a
+  three-layer model this was traced, with the `torch` backends, to the top-k
+  step, which does not choose the same key among keys with equal index
+  scores every time.
 - The full fine-tuning recipe sets `checkpoint.enabled: false` because of the
   checkpoint size (about 3.1 TiB with optimizer state). Saving and resuming
   full fine-tuning were run once on the full model and on a three-layer model
-  with 16 and with 2 GPUs, each time with the same number of ranks before and
-  after and with `checkpoint.save_consolidated: false`. A resume loads the
-  released checkpoint before the saved one. The consolidated Hugging Face
-  export and a resume on a different number of ranks have not been validated.
-  A saved checkpoint of full fine-tuning contains the 43 decoder layers and
-  declares no MTP block.
+  with 16 and with 2 GPUs, with the `torch` expert and dispatcher backends,
+  and with HybridEP on a three-layer model with 4 and with 16 GPUs, each time
+  with the same number of ranks before and after and with
+  `checkpoint.save_consolidated: false`. A resume loads the released
+  checkpoint before the saved one. The consolidated Hugging Face export and
+  a resume on a different number of ranks have not been validated. A saved
+  checkpoint of full fine-tuning contains the 43 decoder layers and declares
+  no MTP block.
 
 ## Related Resources
 

@@ -15,8 +15,9 @@
 """Model-owned distributed parallelization for ERNIE 5.5.
 
 ERNIE 5.5 is distributed with FSDP2 and expert parallelism, with or without context parallelism and activation
-checkpointing. The sidecar rejects every other topology before the shared dispatcher runs, keeps the shared
-expert-parallel flow, and adds two things while that flow builds the FSDP units:
+checkpointing. The sidecar rejects every other topology before the shared dispatcher runs, and with it a model
+whose routed experts exchange tokens through HybridEP unless the model and its FSDP policies compute in BF16. It
+keeps the shared expert-parallel flow, and adds two things while that flow builds the FSDP units:
 
 * Every HCA compressor receives the process group of the mesh over which its parameters are sharded. A row shorter
   than one compression window does not use the compressor. With the group, the ranks that share the compressor
@@ -50,6 +51,7 @@ from nemo_automodel.components.distributed.parallelizer_utils import fully_shard
 from nemo_automodel.components.models.ernie5_5.config import Ernie5_5ModelPlan
 from nemo_automodel.components.models.ernie5_5.hca import Ernie5_5HCAAttention
 from nemo_automodel.components.models.ernie5_5.layers import Ernie5_5HyperHead
+from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +255,10 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
     over all ranks of the job (``tp_size``, ``pp_size`` and ``dp_replicate_size`` equal to one) and FSDP compute in
     FP32 or BF16. ``cp_size`` splits every row over that many ranks, and ``activation_checkpointing: true``
     recomputes whole decoder layers in backward; the selective and MoE-only modes are not supported.
+    A model built with the HybridEP dispatcher (``model.backend.dispatcher: hybridep``) is admitted for BF16
+    compute only: a BF16 model whose FSDP policies have no compute dtype or BF16. The model was validated with
+    HybridEP in BF16 only, and the HybridEP combine fails a C++ assertion, which aborts the process, for
+    activations that are not 16 bits wide.
 
     A model with a DSA layer also restricts the number of ranks: it must divide
     ``config.hybrid_mla_num_attention_heads``. A checkpoint stores the key and value projections of a DSA layer as
@@ -293,7 +299,8 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
             ValueError: If the strategy is not FSDP2; if the tensor- or pipeline-parallel size or the
                 replicate size is not one; if ``model`` is a pipeline stage; if expert parallelism is off; if
                 activation checkpointing is neither off nor ``true``; if an FSDP compute dtype is neither FP32 nor
-                BF16; if the
+                BF16; if the model was built with the HybridEP dispatcher and its dtype or an FSDP compute dtype
+                is FP32; if the
                 data-parallel mesh does not cover all ranks of the job; if the model has a DSA layer and the
                 number of ranks does not divide its number of DSA attention heads; or if a LoRA adapter sits on a
                 module that does not support one, holds a tensor other than the LoRA factors, or has another
@@ -342,6 +349,24 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                     f"ERNIE 5.5 computes in float32 or bfloat16 only: set {name}.param_dtype to one of them, got "
                     f"{policy.param_dtype}"
                 )
+        if model.backend.dispatcher == "hybridep":
+            # The routed experts hand the latent activations to HybridEP in the compute dtype of their decoder
+            # block: the model dtype, or the compute dtype of an FSDP policy when it has one. An FP32 model
+            # under a BF16 policy would compute in BF16 as well; it is rejected because it was not validated.
+            model_dtype = dtype_from_str(model.config.dtype, torch.bfloat16)
+            if model_dtype != torch.bfloat16:
+                raise ValueError(
+                    "ERNIE 5.5 with model.backend.dispatcher hybridep is validated with model.dtype bfloat16 "
+                    "only: set model.dtype to bfloat16, or set model.backend.experts and "
+                    f"model.backend.dispatcher to torch; got model.dtype {model_dtype}"
+                )
+            for name, policy in policies.items():
+                if policy is not None and policy.param_dtype not in (None, torch.bfloat16):
+                    raise ValueError(
+                        "ERNIE 5.5 with model.backend.dispatcher hybridep computes in bfloat16 only: set "
+                        f"{name}.param_dtype to null or bfloat16, or set model.backend.experts and "
+                        f"model.backend.dispatcher to torch; got {policy.param_dtype}"
+                    )
         device_mesh = mesh_context.device_mesh
         if device_mesh is None:
             raise ValueError("ERNIE 5.5 requires a data-parallel device mesh, got mesh_context.device_mesh None")
