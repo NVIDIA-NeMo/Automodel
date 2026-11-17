@@ -1,6 +1,6 @@
 ---
 title: "LFM3-1.7B"
-description: "Use NeMo AutoModel to fine-tune LFM3-1.7B for LLM workflows with a checked-in text generation recipe and documented distributed settings."
+description: "Use NeMo AutoModel to fine-tune LFM3-1.7B for LLM workflows with checked-in text generation recipes, including Tulu-3 packed to 131,072 tokens with context parallelism."
 slug: model-coverage/large-language-models/liquidai/LFM3-1.7B
 ---
 
@@ -20,6 +20,7 @@ automodel examples/llm_finetune/lfm3/lfm3_1p7b_squad.yaml --nproc-per-node 8
 | Goal | Start Here |
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/lfm3/lfm3_1p7b_squad.yaml). |
+| Train on long packed sequences with context parallelism | Use the [131,072-token Tulu-3 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/lfm3/lfm3_1p7b_tulu3_packed128k_cp8.yaml). |
 
 ### Configuration
 
@@ -34,6 +35,29 @@ automodel examples/llm_finetune/lfm3/lfm3_1p7b_squad.yaml --nproc-per-node 8
 <Note>
 NeMo AutoModel runs its own `Lfm3ForCausalLM`, so the checkpoint loads without remote code on the pinned Transformers release. Full-attention layers rotate half of each attention head, as the released weights were trained. Transformers 5.23.0 reads the released `config.json` as a full rotation, which changes its outputs on long inputs. Checkpoints exported by NeMo AutoModel record the rotation as `proportional` and load correctly in both.
 </Note>
+
+## Packed Sequences and Context Parallelism
+
+The packed recipe trains on Tulu-3 rows of 131,072 tokens with `cp_size: 8` on one node with 8 GPUs:
+
+```bash
+automodel examples/llm_finetune/lfm3/lfm3_1p7b_tulu3_packed128k_cp8.yaml --nproc-per-node 8
+```
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8x H100 80 GB, one node |
+| Strategy | FSDP2; tp_size=1, cp_size=8 |
+| Data | Tulu-3 shuffled with a fixed seed, then THD-packed to 131,072 tokens; 4 rows per step |
+| Attention | FlashAttention 4 (`attn_implementation: flash_attention_4`) |
+| Throughput | 167K tokens/s, 3.1 s per step |
+| Peak memory | 66 GiB per GPU |
+
+Each row holds many documents. Positions restart at every document, and the short convolutions, full attention and sliding-window attention all stay inside a document, so a document gives the same outputs packed as it does alone.
+
+With context parallelism each GPU holds one contiguous shard of the row, 16,384 tokens here. A layer that needs tokens before the shard fetches only the part of the shard's first document that earlier GPUs hold: 6 tokens for a convolution, up to 255 keys and values for sliding-window attention, and the whole part for full attention.
+
+Packed THD rows work at any `cp_size`, with one row per GPU when `cp_size > 1`. Unpacked batches also run with `cp_size > 1`. Batched (non-THD) packing needs a FlashAttention backend.
 
 ## Model Reference
 
