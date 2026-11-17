@@ -78,8 +78,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
 packed_sequence:
@@ -91,10 +91,10 @@ dataloader:
   shuffle: True
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -112,6 +112,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   vllm_deploy: true
   vllm_smoke_test: true
@@ -125,11 +126,13 @@ ci:
     checkpoint.v4_compatible: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     distributed.ep_size: 8
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
 
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+  perf_testing:
+    schedule: nightly

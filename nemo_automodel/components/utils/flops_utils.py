@@ -686,7 +686,10 @@ def deepseekv3_flops(config: _DeepseekV3Config, gbs: int = 1, seq_len: int | Non
 
     # MoE fields
     moe_intermediate_size = config.moe_intermediate_size
-    moe_shared_expert_intermediate_size = moe_intermediate_size
+    # Every MoE layer runs n_shared_experts shared experts (Moonlight has two);
+    # configs that omit the field keep the DeepSeek-V3 default of one.
+    n_shared_experts = _int_attr(config, "n_shared_experts", 1)
+    moe_shared_expert_intermediate_size = moe_intermediate_size * n_shared_experts
     moe_ffn_hidden_size = moe_intermediate_size
     moe_router_topk = config.num_experts_per_tok
 

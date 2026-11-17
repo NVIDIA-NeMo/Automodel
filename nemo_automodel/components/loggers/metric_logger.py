@@ -188,10 +188,14 @@ class MetricLoggerDist(MetricLogger):
     def __init__(
         self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
     ) -> None:
-        super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
         assert dist.is_initialized(), "torch.distributed must be initialized with MetricLoggerDist"
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        # Only rank 0 writes, so other ranks must not open the file. They may lack write
+        # access on shared storage (seen with NFS root_squash).
+        if self.rank != 0:
+            return
+        super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
 
     def log(self, record: MetricsSample) -> None:
         if self.rank != 0:

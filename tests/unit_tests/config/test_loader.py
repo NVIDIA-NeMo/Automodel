@@ -28,6 +28,7 @@ from nemo_automodel.components.config.loader import (
     _resolve_target,
     load_module_from_file,
     load_yaml_config,
+    resolve_yaml_env_vars,
     translate_value,
 )
 
@@ -154,6 +155,15 @@ def test_dotted_get_set_contains():
     cfg.set_by_dotted("arr.values", ["a", "b", "c"])
     assert cfg.get("arr.values.1") == "b"
     assert cfg.get("non.existent", default="sentinel") == "sentinel"
+
+
+def test_contains_matches_get_for_leaves_and_lists():
+    cfg = ConfigNode({"optimizer": {"lr": 0.1, "betas": [0.9, 0.95]}, "peft": None, "steps": 0})
+    for key in ("optimizer.lr", "optimizer.betas", "optimizer.betas.1", "optimizer.betas.-1", "peft", "steps"):
+        assert key in cfg
+    for key in ("optimizer.lr.foo", "optimizer.betas.7", "optimizer.betas.x", "peft.dim", "steps.max", "nope"):
+        assert key not in cfg
+        assert cfg.get(key, "sentinel") == "sentinel"
 
 
 def test_set_by_dotted_indexes_into_lists():
@@ -470,6 +480,32 @@ def test_load_yaml_config_resolves_dotted_env_var_name(monkeypatch, tmp_path: Pa
     assert "qux/qux" not in s
 
 
+def test_resolved_env_var_value_is_not_expanded_again(monkeypatch, tmp_path: Path):
+    # A resolved value is data: a `$` inside it must not be read as another reference.
+    monkeypatch.setenv("DB_PASSWORD", "pa$word")
+    monkeypatch.setenv("word", "should-not-be-used")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text(
+        """
+        braced: ${DB_PASSWORD}
+        bare: $DB_PASSWORD
+        embedded: user:${DB_PASSWORD}@host
+        """
+    )
+    cfg = load_yaml_config(str(yml))
+    assert cfg.braced == "pa$word"
+    assert cfg.bare == "pa$word"
+    assert cfg.embedded == "user:pa$word@host"
+
+
+def test_env_var_default_may_reference_another_env_var(monkeypatch):
+    monkeypatch.delenv("PRIMARY_DIR", raising=False)
+    monkeypatch.setenv("FALLBACK_DIR", "/data")
+    assert resolve_yaml_env_vars("${PRIMARY_DIR,$FALLBACK_DIR}/x") == "/data/x"
+    monkeypatch.setenv("PRIMARY_DIR", "/fast")
+    assert resolve_yaml_env_vars("${PRIMARY_DIR,$FALLBACK_DIR}/x") == "/fast/x"
+
+
 def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("SECRET_ENV", "super_secret_value")
     yml = tmp_path / "cfg.yaml"
@@ -488,8 +524,9 @@ def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path)
     assert copied_value._orig_value == "${oc.env:SECRET_ENV}"
 
 
-def test_load_module_from_file(tmp_path):
-    """Module is imported, its globals are accessible, and it gets a unique name."""
+def test_load_module_from_file(tmp_path, monkeypatch):
+    """With user modules enabled, the file is imported, its globals are accessible, and it gets a unique name."""
+    monkeypatch.setattr("nemo_automodel.components.config.loader.ENABLE_USER_MODULES", True)
     py_file = tmp_path / "plugin.py"
     py_file.write_text(
         textwrap.dedent(
@@ -514,8 +551,9 @@ def test_resolve_target_non_string_passthrough():
     assert _resolve_target(42) == 42
 
 
-def test_resolve_target_file_colon(tmp_path):
-    """`path/to/file.py:object_name` is resolved correctly."""
+def test_resolve_target_file_colon(tmp_path, monkeypatch):
+    """With user modules enabled, `path/to/file.py:object_name` is resolved correctly."""
+    monkeypatch.setattr("nemo_automodel.components.config.loader.ENABLE_USER_MODULES", True)
     script = tmp_path / "tools.py"
     script.write_text(
         textwrap.dedent(
