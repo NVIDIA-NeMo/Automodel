@@ -209,8 +209,9 @@ Other recorded differences:
 
 The following legacy LoRA benchmarks were migrated to SQuAD fine-tuning.
 The replacements preserve TP2, local/global batch sizes, compilation settings,
-and one- or two-node topology. They use real examples padded to 4,096 tokens;
-performance figures from the historical mock workloads do not measure these replacements.
+and one- or two-node topology. They pack real examples into 4,096-token rows,
+so local batches count packed rows; performance figures from the historical mock
+workloads do not measure these replacements.
 Run each replacement with `automodel <config.yaml> --benchmark` for its nightly
 performance workload.
 

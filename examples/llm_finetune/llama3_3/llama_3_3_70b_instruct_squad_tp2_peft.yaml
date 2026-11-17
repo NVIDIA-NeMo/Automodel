@@ -69,23 +69,25 @@ distributed:
   enable_fsdp2_prefetch: true
   enable_compile: true
   defer_fsdp_grad_sync: false
-  patch_is_packed_sequence: true  # Patch transformers._is_packed_sequence to always return False: removes CPU-GPU sync per attention layer and ensures static shapes for torch.compile. Safe for non-packed (standard) training only.
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
-# Use real SQuAD examples padded to the original 4,096-token workload shape.
+# Pack real SQuAD examples into rows of the original 4,096-token workload shape.
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
-  seq_length: 4096
-  padding: max_length
-  truncation: true
+  padding: false
+
+packed_sequence:
+  # local_batch_size counts packed rows, not individual documents.
+  packed_sequence_size: 4096
+  packing_strategy: neat
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: true
   drop_last: true
 
