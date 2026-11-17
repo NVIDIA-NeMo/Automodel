@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.10-cuda13.4-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.11-cuda13.5-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.11-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
