@@ -53,6 +53,7 @@ __all__ = [
     "apply_submodule_checkpointing",
     "detect_kv_sharing_and_maybe_disable_cache",
     "ensure_fsdp_ops_sac_ignored",
+    "ensure_moe_recompute_cache_ops_sac_ignored",
     "ensure_profiler_ops_sac_ignored",
     "ignore_sac_ops",
     "is_selective_activation_checkpointing",

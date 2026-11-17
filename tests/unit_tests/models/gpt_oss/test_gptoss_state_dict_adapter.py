@@ -1035,6 +1035,6 @@ class TestDTensorPaths:
         assert out_local.shape == (1, 2, 1)
         torch.testing.assert_close(out_local[0, 0, 0], torch.tensor(1.0, dtype=torch.float32))
         torch.testing.assert_close(out_local[0, 1, 0], torch.tensor(0.5, dtype=torch.float32))
-        # placements match ('ep_shard','ep') -> (Shard(2), Shard(0))
-        assert out.placements[0] == ("Shard", 2)
+        # placements match ('ep_shard','ep') -> (Shard(1), Shard(0))
+        assert out.placements[0] == ("Shard", 1)
         assert out.placements[1] == ("Shard", 0)

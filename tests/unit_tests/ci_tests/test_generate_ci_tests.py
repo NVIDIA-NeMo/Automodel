@@ -18,7 +18,13 @@ import pytest
 from ruamel.yaml import YAML
 
 from nemo_automodel.recipes._dist_utils import parse_distributed_section
-from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
+from tests.ci_tests.utils.generate_ci_tests import (
+    generate_job,
+    generate_pipeline,
+    nemo_ci_schedule_folder,
+    nemo_ci_schedule_scopes,
+    read_nemo_ci_schedules,
+)
 
 # Over the default 5s budget on purpose: this module parses every example config under examples/.
 # Shrink the work or the process count before raising this further.
@@ -140,7 +146,8 @@ def test_generate_gpt_oss_120b_release_job_uses_ep64():
     variables = jobs[""]["variables"]
     world_size = variables["TEST_NODE_COUNT"] * 8
     assert variables["TEST_NODE_COUNT"] == 8
-    assert variables["LOCAL_BATCH_SIZE"] == 8
+    assert variables["LOCAL_BATCH_SIZE"] == 1
+    assert variables["LOCAL_BATCH_SIZE"] == recipe["step_scheduler"]["local_batch_size"]
     assert recipe["distributed"]["ep_size"] == world_size
     assert recipe["distributed"]["activation_checkpointing"] is False
 
@@ -470,7 +477,8 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
 
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
-    assert variables["TIME"] == "00:30:00"
+    assert variables["TIME"] == "00:40:00"
+    assert variables["TIME"] == ci_config["time"]
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
@@ -515,12 +523,9 @@ def test_deprecated_nightly_scope_completes_without_gpu_jobs(tmp_path: Path) -> 
     config_dir = tmp_path / "tests/ci_tests/configs/retrieval_cross_encoder"
     config_dir.mkdir(parents=True)
     (config_dir / "override_recipes.yml").write_text("exempt_models: []\nexempt_configs: {}\n")
-    (config_dir / "nightly_recipes.yml").write_text(
-        "examples_dir: retrieval\nconfigs: [cross_encoder/deprecated.yaml]\n"
-    )
     recipe = tmp_path / "examples/retrieval/cross_encoder/deprecated.yaml"
     recipe.parent.mkdir(parents=True)
-    recipe.write_text("ci: {deprecated: true}\n")
+    recipe.write_text("ci: {deprecated: true, nemo_ci_schedule: nightly}\n")
     pipeline = generate_pipeline(str(tmp_path), "nightly", "retrieval_cross_encoder")
     jobs = {name: job for name, job in pipeline.items() if name != "include"}
     assert len(jobs) == 1
@@ -529,6 +534,116 @@ def test_deprecated_nightly_scope_completes_without_gpu_jobs(tmp_path: Path) -> 
     assert "extends" not in job
     assert "parallel" not in job
     assert job["rules"] == [{"when": "always"}]
+
+
+@pytest.mark.parametrize(
+    ("value", "scopes"),
+    [
+        ("nightly", {"nightly"}),
+        ("release", {"release"}),
+        ("nightly,release", {"nightly", "release"}),
+        ("skipped", set()),
+    ],
+)
+def test_nemo_ci_schedule_scopes_accepts_exact_values(value: str, scopes: set[str]) -> None:
+    assert nemo_ci_schedule_scopes({"nemo_ci_schedule": value}) == scopes
+
+
+@pytest.mark.parametrize(
+    "ci_config",
+    [
+        {},
+        {"nemo_ci_schedule": None},
+        {"nemo_ci_schedule": True},
+        {"nemo_ci_schedule": ["nightly"]},
+        {"nemo_ci_schedule": ""},
+        {"nemo_ci_schedule": "test"},
+        {"nemo_ci_schedule": "release,nightly"},
+        {"nemo_ci_schedule": "nightly, release"},
+        {"nemo_ci_schedule": "nightly,skipped"},
+    ],
+)
+def test_nemo_ci_schedule_scopes_rejects_other_values(ci_config: dict) -> None:
+    with pytest.raises(ValueError, match="`ci.nemo_ci_schedule`"):
+        nemo_ci_schedule_scopes(ci_config)
+
+
+@pytest.mark.parametrize(
+    ("recipe", "test_folder"),
+    [
+        ("examples/llm_finetune/qwen/recipe.yaml", "llm_finetune"),
+        ("examples/diffusion/finetune/recipe.yaml", "diffusion_finetune"),
+        ("examples/retrieval/cross_encoder/recipe.yaml", "retrieval_cross_encoder"),
+        ("examples/retrieval/nemotron_3_5/recipe.yaml", None),
+        ("examples/diffusion/generate/recipe.yaml", None),
+        ("examples/llm_benchmark/recipe.yaml", None),
+    ],
+)
+def test_nemo_ci_schedule_folder_maps_recipe_paths(recipe: str, test_folder: str | None) -> None:
+    assert nemo_ci_schedule_folder(Path(recipe)) == test_folder
+
+
+def _write_scheduled_recipes(root: Path, values: dict[str, str]) -> None:
+    config_dir = root / "tests/ci_tests/configs/llm_finetune"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "override_recipes.yml").write_text("exempt_models: []\nexempt_configs: {}\n")
+    for name, value in values.items():
+        recipe = root / "examples/llm_finetune/family" / f"{name}.yaml"
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        recipe.write_text(f"ci:\n  nemo_ci_schedule: {value}\n  cluster_tag: h100\n")
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        ("nightly", {"both", "nightly_only"}),
+        ("release", {"both", "release_only"}),
+        ("test", set()),
+    ],
+)
+def test_schedule_scopes_select_recipes_by_nemo_ci_schedule(tmp_path: Path, scope: str, expected: set[str]) -> None:
+    _write_scheduled_recipes(
+        tmp_path,
+        {"both": "nightly,release", "nightly_only": "nightly", "release_only": "release", "skipped": "skipped"},
+    )
+    # A recipe list no longer enrolls recipes in the nightly or release scope.
+    (tmp_path / "tests/ci_tests/configs/llm_finetune" / f"{scope}_recipes.yml").write_text(
+        "configs: [family/skipped.yaml]\n"
+    )
+
+    pipeline = generate_pipeline(str(tmp_path), scope, "llm_finetune")
+
+    assert set(pipeline) - {"include"} == expected
+    for name in expected:
+        assert pipeline[name]["variables"]["TEST_LEVEL"] == scope
+
+
+def test_schedule_discovery_skips_invalid_recipes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _write_scheduled_recipes(tmp_path, {"valid": "nightly", "typo": "nighlty"})
+    family = tmp_path / "examples/llm_finetune/family"
+    (family / "missing.yaml").write_text("ci:\n  cluster_tag: h100\n")
+    (family / "broken.yaml").write_text("ci: [\n")
+    # PyYAML keeps the last duplicate, so the linter accepts this file; the generator cannot read it.
+    (family / "duplicate.yaml").write_text("ci:\n  nemo_ci_schedule: skipped\n  nemo_ci_schedule: nightly\n")
+
+    pipeline = generate_pipeline(str(tmp_path), "nightly", "llm_finetune")
+
+    assert set(pipeline) - {"include"} == {"valid"}
+    stderr = capsys.readouterr().err
+    for name in ("typo", "missing", "broken", "duplicate"):
+        assert f"WARNING: skipping examples/llm_finetune/family/{name}.yaml" in stderr
+    scopes, errors = read_nemo_ci_schedules(str(tmp_path), "llm_finetune")
+    assert scopes == {Path("examples/llm_finetune/family/valid.yaml"): {"nightly"}}
+    assert {path.stem for path in errors} == {"typo", "missing", "broken", "duplicate"}
+
+
+def test_schedule_discovery_reads_yml_recipes(tmp_path: Path) -> None:
+    _write_scheduled_recipes(tmp_path, {"yaml_recipe": "release"})
+    (tmp_path / "examples/llm_finetune/family/yml_recipe.yml").write_text("ci:\n  nemo_ci_schedule: release\n")
+
+    pipeline = generate_pipeline(str(tmp_path), "release", "llm_finetune")
+
+    assert set(pipeline) - {"include"} == {"yaml_recipe", "yml_recipe"}
 
 
 @pytest.fixture(scope="module")
@@ -542,7 +657,7 @@ def deprecated_recipe_paths() -> set[str]:
     return paths
 
 
-@pytest.mark.parametrize("scope", ["test", "nightly", "release", "performance"])
+@pytest.mark.parametrize("scope", ["nightly", "release", "performance"])
 @pytest.mark.parametrize(
     "folder",
     [
