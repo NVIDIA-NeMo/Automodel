@@ -1069,6 +1069,26 @@ def test_fa4_physical_dependency_identity_is_cached_and_unreadable_falls_back(tm
         utils._fa4_interface_sha256.cache_clear()
 
 
+def test_fa4_original_interface_hash_tracks_the_container_pin() -> None:
+    """The original-interface hash must describe the FA4 build the container installs.
+
+    The hash enables the FA4 max-length hint only for that exact source, so bumping
+    FLASH_ATTN_REF in docker/Dockerfile without recomputing it silently drops the hint.
+    """
+    import nemo_automodel.components.attention.utils as utils
+
+    hashed_ref = "3c2c6b31e730fd13e7d6f0d384af22684b24c532"  # pragma: allowlist secret
+    dockerfile = (Path(__file__).resolve().parents[3] / "docker" / "Dockerfile").read_text(encoding="utf-8")
+
+    assert f"ARG FLASH_ATTN_REF={hashed_ref}\n" in dockerfile, (
+        "docker/Dockerfile changed FLASH_ATTN_REF: recompute _FA4_ORIGINAL_INTERFACE_SHA256 from "
+        "flash_attn/cute/interface.py at the new ref, then update hashed_ref here."
+    )
+    assert utils._FA4_ORIGINAL_INTERFACE_SHA256 == (
+        "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"  # pragma: allowlist secret
+    )
+
+
 @pytest.mark.parametrize("dependency", ["patched", "original", "unknown"])
 @pytest.mark.parametrize("window", [(-1, 0), (128, 0)])
 def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency: str, window: tuple[int, int]) -> None:
