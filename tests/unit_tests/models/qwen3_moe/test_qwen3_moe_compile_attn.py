@@ -14,12 +14,15 @@
 
 """CPU unit tests for the Qwen3-MoE compile_attn (fullgraph attention compile) wiring.
 
-These mock the submodule initializers so Qwen3MoeAttention constructs without a GPU or
-TransformerEngine. They cover the compile_attn gating in __init__ (default off, and the
-warn/no-op path when attn != 'sdpa'); the actual torch.compile call (attn='sdpa' + GPU)
-is pragma-excluded as it only runs on the GPU benchmark.
+Attention kernels are replaced by stubs so Qwen3MoeAttention constructs without a GPU,
+TransformerEngine or FlashAttention-4. The tests cover the compile_attn gating in __init__
+(default off, the warn/no-op path for other backends, whole-attention SDPA compilation and
+FA4 projection compilation), deep-copy safety of the compiled callables under Dynamo's eager
+backend, TE output layouts and the native FA4 packing contract. Inductor compilation with
+real FA4 kernels is covered by tests/functional_tests/attention/test_qwen3_moe_compiled_fa4.py.
 """
 
+import copy
 from unittest.mock import Mock, patch
 
 import pytest
@@ -134,6 +137,58 @@ def test_te_flattened_attention_output_preserves_token_axes(thd: bool) -> None:
     assert inputs.grad.shape == inputs.shape
 
 
+@pytest.mark.parametrize("attn", ["fa4", "sdpa"])
+def test_compiled_attention_deep_copy_uses_copied_parameters(attn: str) -> None:
+    """Deep copies, such as pipeline stages, must run compiled code on their own parameters."""
+
+    def attention_stub(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        """Return the queries as the attention output.
+
+        Args:
+            q: Query tensor of shape [batch, sequence, heads, head_dim] for FA4, or
+                [batch, heads, sequence, head_dim] after SDPA preprocessing.
+            k: Key tensor with the layout of q and kv_heads in place of heads.
+            v: Value tensor with the layout of k.
+            **kwargs: Unused backend metadata.
+
+        Returns:
+            Tensor with the shape of q.
+        """
+        return q
+
+    config = _config()
+    config.dtype = torch.float32
+    backend = BackendConfig(attn=attn, linear="torch", rms_norm="torch", rope_fusion=False, compile_attn=True)
+    compile_function = torch.compile
+    with (
+        patch(
+            "nemo_automodel.components.models.qwen3_moe.layers.torch.compile",
+            side_effect=lambda function, **options: compile_function(function, backend="eager", **options),
+        ),
+        patch(
+            "nemo_automodel.components.models.qwen3_moe.layers.initialize_attn_module_and_func",
+            return_value=(None, attention_stub),
+        ),
+    ):
+        original = Qwen3MoeAttention(config, backend)
+    stage = copy.deepcopy(original)
+    with torch.no_grad():
+        stage.q_proj.weight.mul_(-2.0)
+        stage.o_proj.weight.mul_(0.5)
+    inputs = torch.randn(2, 5, 64)
+    frequencies = torch.cat([torch.rand(2, 5, 8), torch.rand(2, 5, 8)], dim=-1)
+
+    compiled = stage(inputs, freqs_cis=frequencies)
+    with (
+        patch.object(stage, "_compiled_forward", None),
+        patch.object(stage, "_compiled_qkv", None),
+        patch.object(stage, "_compiled_output", None),
+    ):
+        uncompiled = stage(inputs, freqs_cis=frequencies)
+    torch.testing.assert_close(compiled, uncompiled)
+    assert not torch.allclose(original(inputs, freqs_cis=frequencies), uncompiled)
+
+
 def test_native_fa4_model_declares_neat_metadata_contract() -> None:
     """The production model opts into document IDs and model-entry offset flattening."""
     from nemo_automodel.components.datasets.utils import neat_packed_collater
@@ -182,7 +237,16 @@ def test_native_fa4_model_declares_neat_metadata_contract() -> None:
     seen = {}
 
     def observe_metadata(module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
-        """Observe the metadata after the production model-entry normalizer."""
+        """Record the forward inputs after the production model-entry normalizer.
+
+        Args:
+            module: Model receiving the forward call.
+            args: Positional forward inputs; empty because the batch is passed by keyword.
+            kwargs: Forward inputs, including input_ids and document-ID attention_mask of
+                shape [batch, sequence], int64 packed_token_indices of shape [tokens]
+                indexing the flattened [batch * sequence] axis, and int32 cu_seqlens of
+                shape [documents + 1].
+        """
         seen.update(kwargs)
 
     handle = model.register_forward_pre_hook(observe_metadata, with_kwargs=True)
