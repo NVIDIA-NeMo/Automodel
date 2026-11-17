@@ -86,11 +86,7 @@ def hf_config_hub(tmp_path, monkeypatch, hub_http_transport):
 
 @pytest.fixture
 def cached_tree_listing():
-    """Return a writer that records a repository file listing in a Hub cache.
-
-    The Hub writes this listing on an online download, including a pattern-filtered
-    one, and then reports cached snapshots that miss a listed file as incomplete.
-    """
+    """Return a writer for the repository file listing that a Hub download caches."""
     from huggingface_hub._tree_cache import TreeCacheEntry, write_tree_cache
 
     def write(storage_folder: Path, commit: str, filenames: list[str]) -> None:

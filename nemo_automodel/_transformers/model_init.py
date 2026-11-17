@@ -463,6 +463,7 @@ def _download_model_weights(
                     pretrained_model_name_or_path,
                     revision=download_kwargs.get("revision"),
                     cache_dir=download_kwargs.get("cache_dir"),
+                    subfolder=kwargs.get("subfolder", ""),
                 )
             else:
                 snapshot_download(pretrained_model_name_or_path, **download_kwargs)
@@ -840,8 +841,11 @@ def _has_complete_weights(model_dir: str) -> bool:
     for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
         index_path = os.path.join(model_dir, index_name)
         if os.path.isfile(index_path):
-            with open(index_path) as f:
-                shard_names = set(json.load(f)["weight_map"].values())
+            try:
+                with open(index_path) as f:
+                    shard_names = set(json.load(f)["weight_map"].values())
+            except (OSError, ValueError, KeyError):
+                return False
             return all(os.path.isfile(os.path.join(model_dir, name)) for name in shard_names)
     return any(os.path.isfile(os.path.join(model_dir, name)) for name in ("model.safetensors", "pytorch_model.bin"))
 
