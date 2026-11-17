@@ -14,7 +14,8 @@
 
 import functools
 import logging
-from collections.abc import Collection, Sequence
+import math
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -157,11 +158,39 @@ def _select_peft_tensors(
     return selected
 
 
+def _iter_peft_full_module_buffers(
+    model: torch.nn.Module, full_modules: Collection[str]
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the persistent buffers of the modules a PEFT checkpoint stores whole.
+
+    Saving and the DCP-free load select these buffers the same way. Names follow
+    ``_get_peft_state_dict``, which names the parameters on the same paths.
+
+    Args:
+        model: One local model part.
+        full_modules: Modules the checkpoint stores whole, from ``_fully_trained_modules``.
+
+    Yields:
+        Each buffer's name and the registered buffer itself, not a copy: a tensor of arbitrary
+        shape and dtype, or a DTensor.
+    """
+    full_module_prefixes = tuple(f"{module}." for module in full_modules)
+    for module_name, module in model.named_modules():
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            # nn.Module exposes buffer persistence only through state_dict(), which modules such as
+            # grouped experts override with renamed keys, so read the flag state_dict() itself uses.
+            if buffer_name in module._non_persistent_buffers_set:
+                continue
+            name = canonical_parameter_fqn(f"{module_name}.{buffer_name}" if module_name else buffer_name)
+            if _dcp_parameter_name(name).startswith(full_module_prefixes):
+                yield name, buffer
+
+
 def _get_peft_full_module_buffers(model: torch.nn.Module, full_modules: Collection[str]) -> dict[str, Any]:
     """Collect the persistent buffers of the modules a PEFT checkpoint stores whole, bypassing DCP.
 
-    The local counterpart of the buffer selection in ``_select_peft_tensors``. Names follow
-    ``_get_peft_state_dict``, which collects the parameters on the same path.
+    The local counterpart of the buffer selection in ``_select_peft_tensors``; see
+    ``_iter_peft_full_module_buffers``.
 
     Args:
         model: One local model part.
@@ -171,20 +200,10 @@ def _get_peft_full_module_buffers(model: torch.nn.Module, full_modules: Collecti
         CPU copies of the persistent buffers under ``full_modules``, keyed by name. Each buffer keeps
         its shape and dtype; a DTensor buffer is gathered to its full tensor first.
     """
-    full_module_prefixes = tuple(f"{module}." for module in full_modules)
-    buffers = {}
-    for module_name, module in model.named_modules():
-        for buffer_name, buffer in module.named_buffers(recurse=False):
-            # nn.Module exposes buffer persistence only through state_dict(), which modules such as
-            # grouped experts override with renamed keys, so read the flag state_dict() itself uses.
-            if buffer_name in module._non_persistent_buffers_set:
-                continue
-            name = canonical_parameter_fqn(f"{module_name}.{buffer_name}" if module_name else buffer_name)
-            if not _dcp_parameter_name(name).startswith(full_module_prefixes):
-                continue
-            buffer = buffer.full_tensor() if hasattr(buffer, "full_tensor") else buffer
-            buffers[name] = buffer.detach().cpu()
-    return buffers
+    return {
+        name: (buffer.full_tensor() if hasattr(buffer, "full_tensor") else buffer).detach().cpu()
+        for name, buffer in _iter_peft_full_module_buffers(model, full_modules)
+    }
 
 
 @dataclass(frozen=True)
@@ -282,8 +301,10 @@ def _validate_trainable_module_layout(layout: _TrainableModuleLayout) -> None:
     Raises:
         ValueError: If a trainable non-LoRA parameter has several names (``modules_to_save``
             would restore each alias as a separate copy, untying them), belongs to the root
-            module (``modules_to_save`` names submodules), or shares a module path with a
-            LoRA adapter (the adapter and a full copy of the same module conflict on load).
+            module (``modules_to_save`` names submodules), shares a module path with a
+            LoRA adapter (the adapter and a full copy of the same module conflict on load), or
+            belongs to a module that also has frozen parameters (HF PEFT restores a
+            ``modules_to_save`` module whole, so the adapter would need those as well).
     """
     if layout.aliased:
         raise ValueError(
@@ -315,6 +336,16 @@ def _validate_trainable_module_layout(layout: _TrainableModuleLayout) -> None:
             "a full copy of the same module, which conflict. Keep these modules out of the PEFT targets, or "
             "narrow the selection that trains them in full: freeze_config.unfreeze_modules or "
             "unfreeze_parameters, or the recipe's default when freeze_config is not set."
+        )
+    partially_trained = sorted(
+        name for name in layout.trainable if not layout.fully_trainable.get(name.rpartition(".")[0], False)
+    )
+    if partially_trained:
+        raise ValueError(
+            f"PEFT checkpoints cannot store the trainable parameters {partially_trained[:10]}: their modules also "
+            "have frozen parameters. Hugging Face PEFT restores each modules_to_save module whole, so it would "
+            "look for the frozen parameters in the adapter too. Train these modules in full or keep them frozen; "
+            "freeze_config.unfreeze_parameters and freeze_parameters can select part of a module."
         )
 
 
@@ -504,9 +535,59 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     return state_dict
 
 
+def _broadcast_tensors_across_group(
+    local_tensors: dict[str, torch.Tensor], group: "torch.distributed.ProcessGroup"
+) -> dict[str, torch.Tensor]:
+    """Give every rank of ``group`` the tensors that each rank holds, one tensor at a time.
+
+    ``all_gather_object`` pickles each rank's whole payload and stages the payloads of all ranks
+    on every rank's device at once, so a large tensor, such as a trained embedding, costs several
+    times its size in device memory there. Here only names, shapes and dtypes go through the
+    object gather. Each tensor's bytes are then broadcast from the rank that holds it, so a rank
+    stages at most one tensor on its device at a time. Every rank of ``group`` must call this
+    together.
+
+    Args:
+        local_tensors: This rank's CPU tensors of arbitrary shape and dtype, keyed by name.
+        group: Process group whose ranks exchange their tensors.
+
+    Returns:
+        CPU tensors from every rank of ``group``, keyed by name. When several ranks hold a name,
+        the lowest rank's tensor wins. This rank's tensors are returned as passed; the others are
+        new tensors with their holder's shape and dtype.
+    """
+    world = torch.distributed.get_world_size(group=group)
+    metadata = [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in local_tensors.items()]
+    gathered: list[list[tuple[str, tuple[int, ...], torch.dtype]]] = [[] for _ in range(world)]
+    torch.distributed.all_gather_object(gathered, metadata, group=group)
+    # Collectives run on the device of the group's backend: CUDA for NCCL, CPU for gloo.
+    if "nccl" in str(torch.distributed.get_backend(group)):
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+    this_rank = torch.distributed.get_rank(group=group)
+    merged: dict[str, torch.Tensor] = {}
+    for source, entries in enumerate(gathered):
+        for name, shape, dtype in entries:
+            if name in merged:
+                continue
+            num_bytes = math.prod(shape) * dtype.itemsize
+            if source == this_rank:
+                # The raw bytes travel as uint8, so every dtype works with every backend.
+                payload = local_tensors[name].contiguous().reshape(-1).view(torch.uint8).to(device)
+            else:
+                payload = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+            if num_bytes:
+                torch.distributed.broadcast(payload, group=group, group_src=source)
+            merged[name] = local_tensors[name] if source == this_rank else payload.cpu().view(dtype).reshape(shape)
+    return merged
+
+
 def _gather_peft_state_dict_across_pp(
     local_state_dict: dict[str, Any],
     pp_group: "torch.distributed.ProcessGroup",
+    *,
+    full_modules: Collection[str] = (),
 ) -> dict[str, Any]:
     """All-gather PEFT adapter tensors across a pipeline-parallel group.
 
@@ -524,9 +605,15 @@ def _gather_peft_state_dict_across_pp(
     order-independent; on the rare chance the same key appears on two ranks (e.g.
     a replicated tied parameter) the lowest-rank value wins deterministically.
 
+    The tensors of the modules the checkpoint stores whole, such as a trained
+    embedding or LM head, can be large, so they skip the pickled object gather and
+    move one tensor at a time (``_broadcast_tensors_across_group``).
+
     Args:
         local_state_dict: This rank's PEFT tensors (already CPU, bf16/fp32).
         pp_group: The pipeline-parallel process group to gather over.
+        full_modules: Modules the checkpoint stores whole, from
+            ``_fully_trained_modules``. Every rank of ``pp_group`` passes the same modules.
 
     Returns:
         The merged PEFT state dict containing every PP stage's adapter tensors.
@@ -535,8 +622,15 @@ def _gather_peft_state_dict_across_pp(
     if world == 1:
         return local_state_dict
 
+    full_module_prefixes = tuple(f"{module}." for module in full_modules)
+    full_module_tensors = {
+        key: value
+        for key, value in local_state_dict.items()
+        if _dcp_parameter_name(key).startswith(full_module_prefixes)
+    }
+    pickled_state_dict = {key: value for key, value in local_state_dict.items() if key not in full_module_tensors}
     gathered: list[dict[str, Any]] = [None] * world
-    torch.distributed.all_gather_object(gathered, local_state_dict, group=pp_group)
+    torch.distributed.all_gather_object(gathered, pickled_state_dict, group=pp_group)
 
     merged: dict[str, Any] = {}
     # Iterate in rank order so a duplicate key resolves to the lowest rank.
@@ -554,7 +648,7 @@ def _gather_peft_state_dict_across_pp(
     # check when only one rank is non-empty: a valid PP layout can place all
     # trainable adapters on a single stage (per_rank=[N, 0, ...]), where
     # merged_n == max(per_rank) is correct, not a collapse.
-    local_n = len(local_state_dict)
+    local_n = len(pickled_state_dict)
     merged_n = len(merged)
     per_rank = [len(sd) if sd else 0 for sd in gathered]
     non_empty_ranks = sum(1 for n in per_rank if n > 0)
@@ -575,48 +669,68 @@ def _gather_peft_state_dict_across_pp(
             non_empty_ranks,
             world,
         )
+    if full_modules:
+        for key, value in _broadcast_tensors_across_group(full_module_tensors, pp_group).items():
+            merged.setdefault(key, value)
     return merged
 
 
-def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
-    """Load trainable PEFT adapter weights into the model, bypassing DCP.
+def _copy_full_tensor_into(target: torch.Tensor, full_tensor: torch.Tensor) -> None:
+    """Copy an unsharded checkpoint tensor into a parameter's or buffer's storage.
 
-    Mirrors _get_peft_state_dict: directly assigns saved tensors to model parameters
-    by name, handling DTensor re-sharding for EP-parallel weights. This avoids
-    DCP's set_model_state_dict() which raises KeyError on expert-parallel FQNs.
+    Args:
+        target: Destination parameter data or buffer, of arbitrary shape. A DTensor receives the
+            shard of ``full_tensor`` that its placements assign to this rank.
+        full_tensor: Tensor with the destination's global shape.
     """
     from torch.distributed.tensor import DTensor, Replicate
 
+    if isinstance(target, DTensor):
+        local_target = target.to_local()
+        full_dtensor = DTensor.from_local(
+            full_tensor.to(local_target.device),
+            device_mesh=target.device_mesh,
+            placements=[Replicate()] * target.device_mesh.ndim,
+        )
+        local_target.copy_(full_dtensor.redistribute(placements=target.placements).to_local())
+    else:
+        target.copy_(full_tensor.to(target.device))
+
+
+def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+    """Load PEFT checkpoint tensors into the model, bypassing DCP.
+
+    Mirrors the local collection in ``ModelState.state_dict``: assigns saved tensors by name to
+    the trainable parameters (``_get_peft_state_dict``) and to the persistent buffers of the
+    modules the checkpoint stores whole (``_get_peft_full_module_buffers``), handling DTensor
+    re-sharding for EP-parallel weights. This avoids DCP's set_model_state_dict() which raises
+    KeyError on expert-parallel FQNs.
+
+    Args:
+        model: One local model part.
+        state_dict: Checkpoint tensors keyed by native name, each with the global shape of its
+            parameter or buffer. Keys of other tensors are skipped.
+    """
     # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
     # Without this, activation checkpointing causes key mismatches on reload.
     param_dict = {canonical_parameter_fqn(name): param for name, param in model.named_parameters()}
+    full_modules = _fully_trained_modules(_trainable_module_layout([model]))
+    buffer_dict = dict(_iter_peft_full_module_buffers(model, full_modules))
     loaded, skipped = 0, 0
 
     for name, saved_tensor in state_dict.items():
-        if name not in param_dict:
-            skipped += 1
-            continue
-
-        param = param_dict[name]
-        if not param.requires_grad:
-            skipped += 1
-            continue
-
-        if isinstance(param.data, DTensor):
-            full_t = saved_tensor.to(param.data.to_local().device)
-            full_dt = DTensor.from_local(
-                full_t, device_mesh=param.data.device_mesh, placements=[Replicate()] * param.data.device_mesh.ndim
-            )
-            local_shard = full_dt.redistribute(placements=param.data.placements).to_local()
-            param.data.to_local().copy_(local_shard)
+        param = param_dict.get(name)
+        if param is not None and param.requires_grad:
+            _copy_full_tensor_into(param.data, saved_tensor)
+        elif name in buffer_dict:
+            _copy_full_tensor_into(buffer_dict[name], saved_tensor)
         else:
-            param.data.copy_(saved_tensor.to(param.data.device))
+            skipped += 1
+            continue
         loaded += 1
 
     if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-        import logging
-
-        logging.getLogger(__name__).info(f"_set_peft_state_dict: loaded {loaded} params, skipped {skipped} keys")
+        logging.getLogger(__name__).info("_set_peft_state_dict: loaded %d tensors, skipped %d keys", loaded, skipped)
 
 
 def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
@@ -802,9 +916,12 @@ class ModelState:
         # local adapter (collected above) only covers its own stages. Gather the
         # PEFT tensors across the PP group and union by FQN so every rank ends up
         # with the complete adapter. No-op when pp_group is None (pp_size==1).
-        # Done after the selection above so only adapter tensors travel.
+        # Done after the selection above so only adapter tensors travel; the tensors of
+        # the modules stored whole, which can be large, move one tensor at a time.
         if self.is_peft and self.pp_group is not None:
-            model_state_dict = _gather_peft_state_dict_across_pp(model_state_dict, self.pp_group)
+            model_state_dict = _gather_peft_state_dict_across_pp(
+                model_state_dict, self.pp_group, full_modules=full_modules
+            )
 
         self._refresh_local_tied_lm_head()
         if self.has_local_tied_lm_head:

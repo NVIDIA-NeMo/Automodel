@@ -39,6 +39,7 @@ from pathlib import Path
 import pytest
 import torch
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
@@ -1079,7 +1080,8 @@ def test_router_trained_next_to_lora_round_trips_with_its_bias_buffer(tmp_path: 
 
     Training an MoE router next to LoRA is a common case. DeepSeek-V3's router keeps its
     ``e_score_correction_bias`` in a persistent buffer, and PEFT's ``modules_to_save`` copy loads
-    every state-dict entry of the module, so an export without the buffer failed to load.
+    every state-dict entry of the module, so an export without the buffer failed to load. Resuming
+    restores the buffer as well, including under expert parallelism, whose load bypasses DCP.
     """
     from peft import PeftModel
     from safetensors.torch import load_file
@@ -1144,20 +1146,30 @@ def test_router_trained_next_to_lora_round_trips_with_its_bias_buffer(tmp_path: 
         merged_router = loaded.merge_and_unload().get_submodule(router)
     torch.testing.assert_close(merged_router.e_score_correction_bias, gate.e_score_correction_bias, rtol=0, atol=0)
 
-    resumed = adapted_model()
-    Checkpointer(
-        CheckpointingConfig(
-            enabled=True,
-            checkpoint_dir=str(tmp_path / "checkpoints"),
-            model_save_format="safetensors",
-            save_consolidated=False,
-            is_peft=True,
-        ),
-        dp_rank=0,
-        tp_rank=0,
-        pp_rank=0,
-        moe_mesh=None,
-    ).load_model(resumed, str(adapter_dir))
     expected_state = model.state_dict()
-    for key in (f"{router}.weight", f"{router}.e_score_correction_bias"):
-        torch.testing.assert_close(resumed.state_dict()[key], expected_state[key], rtol=0, atol=0)
+    # With expert parallelism the checkpointer loads PEFT tensors without DCP; both paths restore the buffer.
+    for moe_mesh in (None, init_device_mesh("cpu", (1,), mesh_dim_names=("ep",))):
+        resumed = adapted_model()
+        Checkpointer(
+            CheckpointingConfig(
+                enabled=True,
+                checkpoint_dir=str(tmp_path / "checkpoints"),
+                model_save_format="safetensors",
+                save_consolidated=False,
+                is_peft=True,
+            ),
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=moe_mesh,
+        ).load_model(resumed, str(adapter_dir))
+        for key in (f"{router}.weight", f"{router}.e_score_correction_bias"):
+            torch.testing.assert_close(
+                resumed.state_dict()[key],
+                expected_state[key],
+                rtol=0,
+                atol=0,
+                msg=lambda formatted, key=key, moe_mesh=moe_mesh: (
+                    f"resume with moe_mesh={moe_mesh} did not restore {key} -- {formatted}"
+                ),
+            )

@@ -736,6 +736,31 @@ def test_peft_model_state_refuses_to_drop_a_trainable_parameter(single_rank_proc
             ModelState(model, is_peft=True).state_dict()
 
 
+def test_peft_load_without_dcp_restores_the_buffers_of_modules_stored_whole(single_rank_process_group):
+    """The expert-parallel load path, which bypasses DCP, restores the buffers the checkpoint stores.
+
+    A module trained in full comes back with its persistent buffers, for example an MoE router's
+    score-correction bias, as it does on the DCP path. Buffers outside those modules are left alone.
+    """
+    trained = _peft_model(["classifier", "encoder.norm"])
+    with torch.no_grad():
+        trained.classifier.label_bias.add_(1.0)
+        for parameter in trained.parameters():
+            if parameter.requires_grad:
+                parameter.add_(torch.randn_like(parameter))
+    state = ModelState(trained, is_peft=True).state_dict()
+    state["base_model.model.position_ids"] = torch.full((4,), 7)
+    resumed = _peft_model(["classifier", "encoder.norm"])
+
+    ModelState(resumed, is_peft=True, has_expert_parallelism=True).load_state_dict(state)
+
+    torch.testing.assert_close(resumed.classifier.label_bias, trained.classifier.label_bias, rtol=0, atol=0)
+    for name, parameter in trained.named_parameters():
+        if parameter.requires_grad:
+            torch.testing.assert_close(resumed.get_parameter(name), parameter, rtol=0, atol=0)
+    torch.testing.assert_close(resumed.position_ids, torch.arange(4), rtol=0, atol=0)
+
+
 def test_hf_peft_config_lists_the_largest_fully_trained_modules():
     """modules_to_save names whole trained modules, which is what HF PEFT wraps and restores.
 
@@ -785,6 +810,14 @@ def _add_root_parameter(model: nn.Module) -> None:
     model.register_parameter("logit_scale", nn.Parameter(torch.ones(1)))
 
 
+def _unfreeze_only_the_norm_bias(model: nn.Module) -> None:
+    apply_parameter_freezing(model, {"unfreeze_parameters": ["encoder.norm.bias"]})
+
+
+def _freeze_the_head_output_bias(model: nn.Module) -> None:
+    apply_parameter_freezing(model, {"freeze_parameters": ["classifier.out_proj.bias"]})
+
+
 @pytest.mark.parametrize(
     ("unfreeze_modules", "modify", "message"),
     [
@@ -792,6 +825,10 @@ def _add_root_parameter(model: nn.Module) -> None:
         pytest.param(["encoder"], None, "module also holds LoRA adapters", id="module-around-lora"),
         pytest.param(["classifier"], _tie_classifier_to_a_second_head, "registered under several names", id="tied"),
         pytest.param([], _add_root_parameter, "belong to the root module", id="root-parameter"),
+        pytest.param([], _unfreeze_only_the_norm_bias, "also have frozen parameters", id="unfreeze-part-of-a-module"),
+        pytest.param(
+            ["classifier"], _freeze_the_head_output_bias, "also have frozen parameters", id="freeze-part-of-a-module"
+        ),
     ],
 )
 def test_peft_rejects_trainable_modules_hf_peft_cannot_restore(unfreeze_modules, modify, message):
