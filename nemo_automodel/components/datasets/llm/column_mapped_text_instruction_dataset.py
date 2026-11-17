@@ -256,7 +256,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False, name=name)
 
         if limit_dataset_samples is not None:
-            self.dataset = self.dataset.select(range(limit_dataset_samples))
+            self.dataset = self.dataset.select(range(min(limit_dataset_samples, len(self.dataset))))
 
         # Keep mapping: dest -> source (i.e. public_field -> raw_column_name)
 

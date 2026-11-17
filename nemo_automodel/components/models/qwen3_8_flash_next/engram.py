@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -27,6 +27,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_automodel.components.distributed.tp_replicas import exclude_from_tp_replica_sync
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
@@ -208,7 +209,15 @@ def _fixed_capacity_all_to_all(
 
 
 class _FixedCapacityAllToAll(torch.autograd.Function):
-    """Autograd-aware equal-split All-to-All for compact routed values."""
+    """Autograd-aware equal-split All-to-All for compact routed values.
+
+    The backward routes every requester's gradient back to the owner and divides
+    it by the owner-group size, so the owner accumulates the mean of the
+    per-rank contributions: the same average the data-parallel gradient
+    reduction gives every other parameter. Summing per-micro-batch means equals
+    the mean of the accumulated sum, so gradient accumulation needs no further
+    scaling.
+    """
 
     @staticmethod
     def forward(
@@ -260,7 +269,7 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
         ctx: Any,
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
-        """Route output gradients back to the ranks that supplied the rows.
+        """Route output gradients back to the ranks that supplied the rows, averaged over the group.
 
         Args:
             ctx: PyTorch autograd context populated by :meth:`forward`.
@@ -268,8 +277,9 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
                 source-rank segmentation as the forward output.
 
         Returns:
-            A gradient tensor of shape ``[input_rows, ...]`` followed by four
-            ``None`` entries for the non-tensor split and process-group inputs.
+            A gradient tensor of shape ``[input_rows, ...]``, divided by the
+            process-group size, followed by six ``None`` entries for the
+            non-tensor split, process-group and row-map inputs.
         """
         grad_input = _fixed_capacity_all_to_all(
             grad_output,
@@ -281,6 +291,7 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
             input_rows=ctx.output_rows,
             output_rows=ctx.input_rows,
         )
+        grad_input.div_(dist.get_world_size(ctx.process_group))
         return grad_input, None, None, None, None, None, None
 
 
@@ -288,7 +299,9 @@ class _PaddedAllToAll(torch.autograd.Function):
     """Equal-split All-to-All of an already padded ``[world_size * capacity, ...]`` buffer, both directions.
 
     The capacity-mode lookup keeps the owner side in the padded layout, so the value exchange and its backward are the
-    same symmetric collective on identically shaped buffers; nothing is read on the host.
+    same symmetric collective on identically shaped buffers; nothing is read on the host. As in
+    :class:`_FixedCapacityAllToAll`, the backward divides the routed gradient by the process-group size so the owner
+    accumulates the mean of the per-rank contributions.
     """
 
     @staticmethod
@@ -302,6 +315,7 @@ class _PaddedAllToAll(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         grad_input = torch.empty_like(grad_output)
         dist.all_to_all_single(grad_input, grad_output.contiguous(), group=ctx.process_group)
+        grad_input.div_(dist.get_world_size(ctx.process_group))
         return grad_input, None
 
 
@@ -358,6 +372,7 @@ class Qwen3_8_FlashNextEngramTableConfig:
         process_group: dist.ProcessGroup | None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        bind_owner_group_later: bool = False,
     ) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
         """Build a local or row-owner-sharded embedding table.
 
@@ -369,6 +384,11 @@ class Qwen3_8_FlashNextEngramTableConfig:
             device: Device on which the rank-local weight of shape
                 ``[local_rows, embedding_dim]`` is allocated.
             dtype: Data type of the rank-local weight tensor.
+            bind_owner_group_later: Build the table without an owner group and
+                without row storage. The parallelizer binds the owner group
+                through :meth:`Qwen3_8_FlashNextOwnerShardedEmbedding.parallelize_weight`
+                once the FSDP mesh of the pipeline stage that holds the table is
+                known. ``process_group`` must be ``None`` in this mode.
 
         Returns:
             An embedding whose input has shape ``[...]`` and whose output has
@@ -380,6 +400,7 @@ class Qwen3_8_FlashNextEngramTableConfig:
             process_group=process_group,
             device=device,
             dtype=dtype,
+            bind_owner_group_later=bind_owner_group_later,
         )
 
 
@@ -390,7 +411,10 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
     request rank groups global row IDs by owner and sends them in the first
     All-to-All. Owners perform a local embedding lookup. An autograd-aware
     second All-to-All returns values to request ranks and reverses direction in
-    backward, so only the owner accumulates and updates a row's gradient.
+    backward, so only the owner accumulates and updates a row's gradient. That
+    backward divides the routed gradient by the owner-group size, so the owner
+    row holds the mean of the per-rank contributions and the training loop
+    treats the table like any other data-parallel parameter.
 
     Args:
         config: Global table shape and initialization settings.
@@ -399,6 +423,10 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         device: Device for the local weight of shape
             ``[num_embeddings / owner_world_size, embedding_dim]``.
         dtype: Data type of the local weight tensor.
+        bind_owner_group_later: Leave the owner group unbound. The weight is a
+            ``[0, embedding_dim]`` placeholder until :meth:`parallelize_weight`
+            binds the FSDP mesh of the pipeline stage that holds the table, so
+            the row range is never sized for ranks that end up on another stage.
     """
 
     def __init__(
@@ -408,12 +436,53 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         process_group: dist.ProcessGroup | None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        bind_owner_group_later: bool = False,
     ) -> None:
         super().__init__()
+        if bind_owner_group_later and process_group is not None:
+            raise ValueError("bind_owner_group_later requires process_group=None; the mesh binds the group later")
         self.num_embeddings = config.num_embeddings
         self.embedding_dim = config.embedding_dim
         self.initializer_range = config.initializer_range
         self.strict_validation = config.strict_validation
+        # Capacity mode (opt-in, bounded workloads): the padded exchange is sized once from the first lookup and
+        # fixed afterwards; every rank sees the same count matrix, so every rank derives the same capacity without
+        # a collective on the host value, and a checkpointed forward and its recomputation agree by construction.
+        self.capacity_mode = bool(config.capacity_mode)
+        self._capacity: int | None = None
+        self.owner_group_pending = bind_owner_group_later
+        if bind_owner_group_later:
+            self.process_group = None
+            self.owner_world_size = 0
+            self.owner_rank = 0
+            self.num_embeddings_per_rank = 0
+        else:
+            self._set_owner_geometry(process_group)
+        self.weight = self._new_local_shard(device=device, dtype=dtype, requires_grad=True)
+        self.reset_parameters()
+
+    def _new_local_shard(
+        self,
+        *,
+        device: torch.device | str | None,
+        dtype: torch.dtype | None,
+        requires_grad: bool,
+    ) -> nn.Parameter:
+        """Allocate an uninitialized ``[num_embeddings_per_rank, embedding_dim]`` parameter.
+
+        A pending table has no rows yet, so its shard is the ``[0, embedding_dim]`` placeholder.
+        """
+        return nn.Parameter(
+            torch.empty(self.num_embeddings_per_rank, self.embedding_dim, device=device, dtype=dtype),
+            requires_grad=requires_grad,
+        )
+
+    def _set_owner_geometry(self, process_group: dist.ProcessGroup | None) -> None:
+        """Record the owner group and this rank's contiguous global row range.
+
+        Args:
+            process_group: Owner group, or ``None`` for one rank holding every row.
+        """
         self.process_group = process_group
         if process_group is None:
             self.owner_world_size = 1
@@ -435,51 +504,27 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         self.global_row_end = self.vocab_end_index
         self.local_row_start = 0
         self.local_row_end = self.num_embeddings_per_rank
-        # Capacity mode (opt-in, bounded workloads): the padded exchange is sized once from the first lookup and
-        # fixed afterwards; every rank sees the same count matrix, so every rank derives the same capacity without
-        # a collective on the host value, and a checkpointed forward and its recomputation agree by construction.
-        self.capacity_mode = bool(config.capacity_mode)
-        self._capacity: int | None = None
-        self.weight = nn.Parameter(
-            torch.empty(
-                self.num_embeddings_per_rank,
-                self.embedding_dim,
-                device=device,
-                dtype=dtype,
-            )
-        )
-        self.mark_sharding_contract()
-        self.reset_parameters()
 
-    def _apply(
-        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
-    ) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
-        """Restore ownership metadata after a module device or dtype conversion.
+    def bind_owner_group(self, process_group: dist.ProcessGroup) -> None:
+        """Bind a pending table to its owner group and allocate the local row shard.
+
+        The placeholder weight keeps its device and dtype; a meta placeholder
+        yields a meta shard that the usual materialization fills later, a real
+        placeholder is replaced by a freshly initialized shard.
 
         Args:
-            fn: Tensor conversion applied by ``Module.to`` or ``Module.to_empty``.
-            recurse: Whether to convert child modules as well.
-
-        Returns:
-            This module after the normal PyTorch conversion, with the current
-            row-sharded weight marked for owner-gradient averaging. Shapes,
-            placements and values follow ``fn`` without an additional copy.
+            process_group: Owner group whose ranks hold contiguous row ranges.
         """
-        result = super()._apply(fn, recurse=recurse)
-        self.mark_sharding_contract()
-        return result
-
-    def mark_sharding_contract(self) -> None:
-        """Stamp the model-owned contract on the current weight.
-
-        DTensor conversion can discard custom attributes even when PyTorch
-        preserves the Parameter identity. Ordinary module conversions restore
-        the marker through ``_apply``. Custom parameter-only materialization
-        bypasses that method, so model initialization stamps it afterwards.
-        The single-rank reference table needs no contract.
-        """
-        if isinstance(self.weight, DTensor):
-            self.weight._nemo_model_owned_grad_divisor = float(self.owner_world_size)
+        if not self.owner_group_pending:
+            raise RuntimeError("The Engram owner group is already bound")
+        self._set_owner_geometry(process_group)
+        placeholder = self.weight
+        self.weight = self._new_local_shard(
+            device=placeholder.device, dtype=placeholder.dtype, requires_grad=placeholder.requires_grad
+        )
+        self.owner_group_pending = False
+        if placeholder.device.type != "meta":
+            self.reset_parameters()
 
     def parallelize_weight(self, fsdp_mesh: DeviceMesh) -> nn.Parameter:
         """Represent the already-local owner shard as one global DTensor.
@@ -488,20 +533,26 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         method uses :meth:`DTensor.from_local` rather than redistributing or
         slicing it again.  It runs before FSDP records its ignored parameters;
         the returned parameter identity must be passed unchanged to every FSDP
-        unit containing the table.
+        unit containing the table. The module is also excluded from tensor-
+        parallel replica synchronization: its local tensor is an owner shard,
+        not a replica.
 
         Args:
-            fsdp_mesh: One-dimensional FSDP shard/CP mesh. Its rank order must
-                exactly match the PLE owner process group.
+            fsdp_mesh: One-dimensional FSDP shard/CP mesh of the pipeline stage
+                that holds the table. A pending table binds this mesh's group
+                as its owner group; an already bound table requires the same
+                rank order.
 
         Returns:
             The registered global ``[num_embeddings, embedding_dim]`` DTensor
             parameter with placement ``Shard(0)``.
         """
-        if self.process_group is None:
-            raise RuntimeError("A single-rank reference Engram table must remain an ordinary Parameter")
         if fsdp_mesh.ndim != 1:
             raise ValueError(f"The Engram DTensor requires a one-dimensional owner mesh, got ndim={fsdp_mesh.ndim}")
+        if self.owner_group_pending:
+            self.bind_owner_group(fsdp_mesh.get_group())
+        if self.process_group is None:
+            raise RuntimeError("A single-rank reference Engram table must remain an ordinary Parameter")
         if fsdp_mesh.size() != self.owner_world_size:
             raise ValueError(
                 "The Engram owner group and FSDP mesh must have the same size: "
@@ -535,26 +586,22 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
                     "Engram DTensor is already attached to a different mesh: "
                     f"current={current_mesh_ranks}, requested={mesh_ranks}"
                 )
-            self.mark_sharding_contract()
-            return self.weight
-
-        if tuple(self.weight.shape) != expected_local_shape:
-            raise ValueError(
-                "Engram local weight shape does not match its contiguous owner range: "
-                f"{tuple(self.weight.shape)} != {expected_local_shape}"
+        else:
+            if tuple(self.weight.shape) != expected_local_shape:
+                raise ValueError(
+                    "Engram local weight shape does not match its contiguous owner range: "
+                    f"{tuple(self.weight.shape)} != {expected_local_shape}"
+                )
+            distributed_weight = DTensor.from_local(
+                self.weight.detach(),
+                device_mesh=fsdp_mesh,
+                placements=(Shard(0),),
+                run_check=False,
+                shape=torch.Size(expected_global_shape),
+                stride=(self.embedding_dim, 1),
             )
-        local_weight = self.weight.detach()
-        requires_grad = self.weight.requires_grad
-        distributed_weight = DTensor.from_local(
-            local_weight,
-            device_mesh=fsdp_mesh,
-            placements=(Shard(0),),
-            run_check=False,
-            shape=torch.Size(expected_global_shape),
-            stride=(self.embedding_dim, 1),
-        )
-        self.weight = nn.Parameter(distributed_weight, requires_grad=requires_grad)
-        self.mark_sharding_contract()
+            self.weight = nn.Parameter(distributed_weight, requires_grad=self.weight.requires_grad)
+        exclude_from_tp_replica_sync(self)
         return self.weight
 
     @torch.no_grad()
@@ -960,6 +1007,11 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             order. The returned tensor does not alias ``global_ids`` or the
             rank-local table weight.
         """
+        if self.owner_group_pending:
+            raise RuntimeError(
+                "The Engram table was used before its owner group was bound; "
+                "apply the model's distributed parallelization first"
+            )
         self._validate_global_ids(global_ids)
         original_shape = global_ids.shape
         flattened_ids = global_ids.reshape(-1).to(dtype=torch.long)

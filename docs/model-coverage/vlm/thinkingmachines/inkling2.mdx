@@ -5,20 +5,23 @@ slug: model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small
 ---
 
 [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) is a vision-language
-Mixture-of-Experts model from Thinking Machines Lab with 594B total and 17B active parameters. It
+Mixture-of-Experts (MoE) model from Thinking Machines Lab with 594B total and 17B active parameters. It
 accepts text and image inputs, generates text, and supports a context window of up to 1M tokens.
 NeMo AutoModel provides a text recipe (`Inkling2ForCausalLM`) and two image-text recipes
 (`Inkling2ForConditionalGeneration`) for the released checkpoint.
 
 <Note>
-The recipes require the native Inkling-2-Small implementation, which is not yet part of NeMo
-AutoModel. They run once the implementation is merged.
+The training loader dequantizes expert weights into floating-point storage.
+Numerical equivalence to the original quantized inference runtime is not
+established. The checkpoint's auxiliary multi-token prediction module is
+outside the training scope of these recipes.
+
 </Note>
 
 ## Fine-Tune Inkling-2-Small
 
 Follow the [installation instructions](/get-started/installation). The recipes run on multiple
-GB200 nodes with four GPUs each; use the [Slurm launcher guide](/job-launchers/slurm-cluster) for
+GB200 nodes with four GPUs each. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for
 multi-node runs. For example, launch the LoRA recipe on 8 nodes:
 
 ```bash
@@ -61,8 +64,8 @@ weights at load time (`checkpoint.dequantize_base_checkpoint: true`). They use f
 vocabulary rows.
 
 The text recipe builds `Inkling2ForCausalLM` from the image-text checkpoint through
-`model.config.architectures`, without the vision tower. It reads pre-packed Tulu 3 rows from
-`dataset.dataset_path`. Both MedPix recipes freeze the vision tower.
+`model.config.architectures`, without the vision tower. It reads Tulu 3 from the Hugging Face
+Hub and packs it at startup. Both MedPix recipes freeze the vision tower.
 
 W&B is opt-in: set `wandb.enable: true` and configure your entity and project when launching.
 
@@ -77,15 +80,15 @@ W&B is opt-in: set `wandb.enable: true` and configure your entity and project wh
 | Parameters | 594B total, 17B active |
 | Inputs | Text and images |
 | Context length | Up to 1M tokens |
-| Language backbone | 48 layers, hidden size 4608 |
+| Language backbone | 48 layers, hidden size 4,608 |
 | Attention | 48 query heads, 8 KV heads, head dimension 128 |
 | Attention pattern | Five local layers followed by one full layer, repeated eight times |
-| Local attention window | 1024 tokens, causal |
-| Experts | 384 routed experts per layer, top-8 sigmoid routing, intermediate size 2304 |
+| Local attention window | 1,024 tokens, causal |
+| Experts | 384 routed experts per layer, top-8 sigmoid routing, intermediate size 2,304 |
 | Routing scale | 8 |
-| Vocabulary | 201024 embedding rows; 200058 usable token IDs |
+| Vocabulary | 201,024 embedding rows; 200,058 usable token IDs |
 | Output logits | Soft cap of 30; padded vocabulary rows excluded |
-| Vision tower | 23 layers, hidden size 1024, 16 attention heads |
+| Vision tower | 23 layers, hidden size 1,024, 16 attention heads |
 | Vision projection | Native 20-by-20 patches; neighboring 2-by-2 features merged before projection |
 | Expert weights | `Inkling-2-Small`: NVFP4 in layers 0-39, MXFP8 in layers 40-47; `Inkling-2-Small-MXFP8`: MXFP8 in all layers |
 
@@ -105,11 +108,11 @@ the residual values.
 
 Experts use a SwiGLU variant with separate gate and up soft caps of 4 and 25.
 The checkpoint stores packed gate/up weights in an interleaved layout. Each
-token selects eight of the 384 experts using sigmoid router scores; a routing
+token selects eight of the 384 experts using sigmoid router scores. A routing
 scale of 8 controls the contribution of the selected experts.
 
-The output projection has 201024 rows, of which 200058 correspond to usable
-token IDs. The extra rows pad the matrix dimensions for computation; they do
+The output projection has 201,024 rows, of which 200,058 correspond to usable
+token IDs. The extra rows pad the matrix dimensions for computation. They do
 not represent sequence padding tokens. A logit soft cap of 30 bounds the
 output scores before the probability distribution is computed.
 
@@ -126,12 +129,189 @@ remaining parameters in floating point, record the layout in
 `hf_quant_config.json`, and include an auxiliary multi-token prediction module
 in `mtp.safetensors`.
 
+## Prepare the Checkpoint
+
+Follow the [installation instructions](/get-started/installation) and
+[Slurm cluster guide](/job-launchers/slurm-cluster). Use a CUDA environment
+with PyTorch FlexAttention, grouped matrix multiplication, Triton gradient
+clipping, and Transformer Engine's FusedAdam for the LoRA and Tulu 3 recipes.
+
+Each released checkpoint records quantization in `hf_quant_config.json`. The
+native model reads that sidecar directly and stages the packed expert tensors
+through the shared checkpoint loader, decoding them into floating-point storage.
+Set the path to a complete downloaded checkpoint directory, accessible on every
+training node:
+
+```bash
+export INKLING2_MODEL=/path/to/Inkling-2-Small
+```
+
+Both the image-text and text recipes use this directory. The Tulu 3 recipe
+selects `Inkling2ForCausalLM` through `model.config.architectures`. It constructs
+the text backbone without a vision tower. No separate metadata-preparation
+helper or checkpoint copy is required.
+
+## Run MedPix LoRA
+
+Set shared output paths and a W&B run identity. Authenticate W&B in the
+training environment through your usual account setup:
+
+```bash
+export INKLING2_RUN_DIR=/path/to/shared/inkling2-medpix-lora
+export WANDB_ENTITY=your-wandb-entity
+export WANDB_PROJECT=inkling2
+export WANDB_RUN_ID=inkling2-medpix-lora-001
+mkdir -p "${INKLING2_RUN_DIR}/wandb"
+```
+
+Within an eight-node allocation with four GB200 GPUs per node, run one
+launcher per node. Set `NODE_RANK` from 0 to 7 and `MASTER_ADDR` to the first
+node's reachable hostname:
+
+```bash
+uv run torchrun --nnodes=8 --nproc-per-node=4 \
+  --node-rank="${NODE_RANK}" \
+  --rdzv-id="${WANDB_RUN_ID}" \
+  --rdzv-backend=c10d --rdzv-endpoint="${MASTER_ADDR}:29500" \
+  -m nemo_automodel.cli.app \
+  examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml \
+  --model.pretrained_model_name_or_path "${INKLING2_MODEL}" \
+  --processor.pretrained_model_name_or_path "${INKLING2_MODEL}" \
+  --checkpoint.enabled=true \
+  --checkpoint.checkpoint_dir="${INKLING2_RUN_DIR}/checkpoints" \
+  --wandb.enable=true --wandb.mode=online \
+  --wandb.entity="${WANDB_ENTITY}" --wandb.project="${WANDB_PROJECT}" \
+  --wandb.id="${WANDB_RUN_ID}" --wandb.name="${WANDB_RUN_ID}" \
+  --wandb.dir="${INKLING2_RUN_DIR}/wandb"
+```
+
+The LoRA recipe uses local batch 1 and global batch 32. Base weights and LoRA
+parameters use BF16, with FP32 router computation. TE FusedAdam maintains FP32
+master weights and BF16 optimizer moments. W&B and checkpoint writing are
+disabled in the portable YAML and enabled explicitly by this command.
+
+## Run MedPix SFT
+
+Use the MedPix SFT recipe in a 64-node allocation with four GB200 GPUs per node:
+
+```bash
+uv run torchrun --nnodes=64 --nproc-per-node=4 \
+  --node-rank="${NODE_RANK}" \
+  --rdzv-id="${WANDB_RUN_ID}" \
+  --rdzv-backend=c10d --rdzv-endpoint="${MASTER_ADDR}:29500" \
+  -m nemo_automodel.cli.app \
+  examples/vlm_finetune/inkling2/inkling2_medpix_sft_ep64_pp4.yaml \
+  --model.pretrained_model_name_or_path "${INKLING2_MODEL}" \
+  --processor.pretrained_model_name_or_path "${INKLING2_MODEL}" \
+  --checkpoint.enabled=true \
+  --checkpoint.checkpoint_dir="${INKLING2_RUN_DIR}/checkpoints" \
+  --wandb.enable=true --wandb.mode=online \
+  --wandb.entity="${WANDB_ENTITY}" --wandb.project="${WANDB_PROJECT}" \
+  --wandb.id="${WANDB_RUN_ID}" --wandb.name="${WANDB_RUN_ID}" \
+  --wandb.dir="${INKLING2_RUN_DIR}/wandb"
+```
+
+Before this launch, set a new `INKLING2_RUN_DIR` and `WANDB_RUN_ID` for SFT,
+create its W&B directory, and set `NODE_RANK` from 0 to 63. This recipe uses
+FP32 model storage with BF16 FSDP compute and PyTorch AdamW. It trains the
+language model while freezing the vision tower.
+
+PP4 uses two virtual chunks per stage, six decoder layers per chunk,
+Interleaved1F1B, and pipeline microbatch size 1. Local batch 4 supplies four
+microbatches per pipeline iteration; global batch 256 preserves that
+relationship across the 64 data replicas. EP shards expert ownership across
+those replicas. It is not an extra divisor for the data batch. Stage 0 owns
+the vision encoder, and each microbatch receives its matching image patches.
+
+## Checkpoint and Resume
+
+The portable recipes disable checkpoint writing by default. With checkpoints
+enabled, MedPix LoRA saves every 25 steps and MedPix SFT saves every 50. A
+resumable save includes model or adapter weights, optimizer shards, scheduler,
+and data-loader state. Full SFT optimizer checkpoints require substantially
+more storage than adapter-only weights. Wait for checkpoint completion before
+stopping a job.
+
+To resume MedPix SFT, use the same recipe, base checkpoint, optimizer, and
+distributed topology. Keep the W&B run ID and append these arguments to its
+launch command:
+
+```bash
+--checkpoint.restore_from="${INKLING2_RUN_DIR}/checkpoints/epoch_0_step_49" \
+--step_scheduler.max_steps=100 \
+--wandb.resume=allow
+```
+
+Use the actual completed checkpoint directory. The example name uses the
+zero-based step index after 50 updates. W&B resume reconnects metrics,
+and `checkpoint.restore_from` restores training state.
+
+## Packed Context Parallelism
+
+The recipe reads `allenai/tulu-3-sft-mixture` from the Hugging Face Hub and
+packs it when training starts. Conversations are rendered with the Inkling chat
+template in `examples/llm_finetune/inkling2/inkling2_chat_template.jinja`,
+shuffled with seed 1234, truncated to 131,072 tokens, and packed into 416 THD
+rows of 131,072 tokens with 64-token document alignment. Labels cover the
+assistant turns only. THD cumulative lengths and position IDs retain document
+boundaries. Local attention and short convolutions cannot cross those
+boundaries.
+
+Use a 16-node allocation with four GB200 GPUs per node:
+
+```bash
+uv run torchrun --nnodes=16 --nproc-per-node=4 \
+  --node-rank="${NODE_RANK}" \
+  --rdzv-id="${WANDB_RUN_ID}" \
+  --rdzv-backend=c10d --rdzv-endpoint="${MASTER_ADDR}:29500" \
+  -m nemo_automodel.cli.app \
+  examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml \
+  --model.pretrained_model_name_or_path "${INKLING2_MODEL}" \
+  --dataset.tokenizer.pretrained_model_name_or_path "${INKLING2_MODEL}" \
+  --wandb.enable=true --wandb.mode=online \
+  --wandb.entity="${WANDB_ENTITY}" --wandb.project="${WANDB_PROJECT}" \
+  --wandb.id="${WANDB_RUN_ID}" --wandb.name="${WANDB_RUN_ID}" \
+  --wandb.dir="${INKLING2_RUN_DIR}/wandb"
+```
+
+Choose a new run ID and output directory and set `NODE_RANK` from 0 to 15.
+PP2/CP32 leaves one data replica. Local and global batches are both 8.
+Interleaved1F1B uses twelve layers per virtual chunk and microbatch size 1.
+The recipe uses FlexAttention with the Inkling CP implementation, BF16 model
+storage, and TE FusedAdam with FP32 master weights and BF16 moments.
+
+## Distributed and Kernel Support
+
+The recipes use the following distributed and kernel features:
+
+- FSDP2, expert parallelism, pipeline parallelism with Interleaved1F1B, and
+  context parallelism with document-aware packed text.
+- PyTorch grouped experts (`experts: torch_mm`) and the shared HybridEP dispatcher
+  (`dispatcher: hybridep`). The torch dispatcher remains available for reference checks.
+- FlexAttention for learned relative-position and sink gradients, and a dense
+  PyTorch reference path for small numerical checks.
+- Activation checkpointing and separate dense and MoE reshard controls.
+- Shared fused linear cross entropy over usable vocabulary rows, with BF16
+  projection inputs, FP32 accumulation, and the soft cap of 30.
+
+The recipes now select HybridEP; full-model training with this dispatcher
+remains to be qualified. Tensor parallelism greater than one, MTP training, and
+quantized activation training are not qualified by these recipes. Packed CP
+training covers text. Image-text pipeline training uses the non-packed path.
+
+See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared
+training options.
+
 ## Hugging Face Model Card
+
+View the model cards for both checkpoints:
 
 - [thinkingmachines/Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)
 - [thinkingmachines/Inkling-2-Small-MXFP8](https://huggingface.co/thinkingmachines/Inkling-2-Small-MXFP8)
 
 ## Related Resources
+
+Refer to the following resources for related information:
 
 - [Multi-modal dataset guide](/datasets/multi-modal-dataset)
 - [Run on a cluster](/job-launchers/slurm-cluster)

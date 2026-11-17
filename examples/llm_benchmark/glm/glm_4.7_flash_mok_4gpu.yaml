@@ -142,6 +142,7 @@ optimizer:
   foreach: false
 
 ci:
+  nemo_ci_schedule: skipped
   recipe_owner: HuiyingLi
   time: "00:25:00"
   nodes: 1

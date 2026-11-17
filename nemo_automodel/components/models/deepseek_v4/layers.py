@@ -586,6 +586,80 @@ def _compressed_window_metadata(
     return window_seq_ids, window_positions
 
 
+def _align_packed_compressor_windows(
+    kv: torch.Tensor,
+    gate: torch.Tensor,
+    seq_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Move every complete per-document compressor window onto a row-aligned chunk.
+
+    Pooling cuts the row into consecutive ``ratio``-token chunks. For a packed document that does not
+    start at a row offset that is a multiple of ``ratio``, such a chunk holds a different token range
+    than the window ``position // ratio`` it is labelled with, and it becomes visible to queries that
+    precede some of its tokens. Here a window is a run of ``ratio`` tokens of one document whose
+    positions are consecutive and share ``position // ratio``. Every such window is copied, in row
+    order, to the front of the output. The remaining slots are marked as padding (document id 0), so
+    they never become visible keys.
+
+    The output keeps the row's number of chunks, so the pooled tensor has the same shape as without
+    alignment. Windows of one document stay adjacent and ordered, which the ratio-4 overlap relies on,
+    and a window never moves to a later chunk than the one that holds its last token. Each input token
+    is copied at most once.
+
+    Rows whose documents already start at multiples of ``ratio`` keep the same set of windows as before,
+    and so do rows whose positions run over the whole row instead of restarting per document.
+
+    Args:
+        kv: Projected values of shape [batch, sequence, features].
+        gate: Pooling gate logits of shape [batch, sequence, features].
+        seq_ids: Document ids of shape [batch, sequence] or [sequence]; zero marks padding. The tokens of
+            a document are contiguous.
+        position_ids: Positions of shape [batch, sequence] or [sequence]. Tokens whose positions do not
+            continue the previous token's, such as padding that repeats one position, form no window.
+        ratio: Compression ratio.
+
+    Returns:
+        ``kv`` and ``gate`` of shape [batch, (sequence // ratio) * ratio, features], and the document ids
+        and positions of the same slots, each of shape [batch, (sequence // ratio) * ratio]. The tensors
+        are new; they do not alias the inputs.
+    """
+    batch, sequence, _ = kv.shape
+    usable = (sequence // ratio) * ratio
+    seq_ids = seq_ids.to(device=kv.device, dtype=torch.long)
+    position_ids = position_ids.to(device=kv.device, dtype=torch.long)
+    if seq_ids.dim() == 1:
+        seq_ids = seq_ids.unsqueeze(0)
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    seq_ids = seq_ids.expand(batch, -1)
+    position_ids = position_ids.expand(batch, -1)
+    window = position_ids // ratio
+    real = seq_ids > 0
+    previous_seq = F.pad(seq_ids[:, :-1], (1, 0), value=0)
+    previous_window = F.pad(window[:, :-1], (1, 0), value=-1)
+    previous_position = F.pad(position_ids[:, :-1], (1, 0), value=-2)
+    run_start = real & (
+        (seq_ids != previous_seq) | (window != previous_window) | (position_ids != previous_position + 1)
+    )
+    # Runs are numbered from 1 along each row; index 0 collects padding.
+    run_id = torch.where(real, run_start.cumsum(dim=1), torch.zeros_like(seq_ids))
+    run_length = torch.zeros(batch, sequence + 1, dtype=torch.long, device=kv.device).scatter_add_(
+        1, run_id, real.long()
+    )
+    rows = torch.arange(batch, device=kv.device).unsqueeze(1)
+    complete = real & (run_length[rows, run_id] == ratio)
+    # Stable sort: tokens of complete windows first, in row order. No host synchronization is needed
+    # because the output always has room for every window the row could hold.
+    order = torch.argsort((~complete).to(torch.int8), dim=1, stable=True)[:, :usable]
+    kept = complete[rows, order]
+    aligned_seq_ids = torch.where(kept, seq_ids[rows, order], torch.zeros_like(order))
+    aligned_positions = torch.where(kept, position_ids[rows, order], torch.zeros_like(order))
+    # Indexing, unlike ``torch.gather``, does not keep the unaligned projections alive for backward.
+    return kv[rows, order], gate[rows, order], aligned_seq_ids, aligned_positions
+
+
 def _pool_windows(
     kv: torch.Tensor,
     gate: torch.Tensor,
@@ -954,7 +1028,8 @@ class DeepseekV4Indexer(nn.Module):
         Returns:
             Int64 tensor of shape [batch, local_sequence, selected_keys]
             indexing the (CP-global) compressed pool, with -1 for packed
-            selections outside the query's document.
+            selections outside the query's document. Packed inputs without CP
+            use the compressor's per-document window order.
         """
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
@@ -962,12 +1037,18 @@ class DeepseekV4Indexer(nn.Module):
         hidden_states_fp32 = hidden_states.float()
         kv = self.wkv(hidden_states_fp32)
         gate = self.wgate(hidden_states_fp32)
+        window_seq_source, window_position_source = packed_seq_ids, position_ids
+        if packed_seq_ids is not None and position_ids is not None and not cp_active:
+            # Same per-document windows, in the same order, as the compressor pool these scores index.
+            kv, gate, window_seq_source, window_position_source = _align_packed_compressor_windows(
+                kv, gate, packed_seq_ids, position_ids, self.compress_ratio
+            )
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
         )
         window_seq_ids, window_positions = _compressed_window_metadata(
-            seq_ids=packed_seq_ids,
-            position_ids=position_ids,
+            seq_ids=window_seq_source,
+            position_ids=window_position_source,
             ready_len=ready_kv.shape[1],
             ratio=self.compress_ratio,
         )
@@ -1125,18 +1206,56 @@ class DeepseekV4Compressor(nn.Module):
         packed_seq_ids: torch.Tensor | None = None,
         cp_group=None,
     ) -> tuple[torch.Tensor, torch.LongTensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Pool the row into compressed keys and, at ratio 4, select the keys each query attends to.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden], where local_sequence is
+                this rank's query shard under CP.
+            q_residual: Tensor of shape [batch, local_sequence, q_lora_rank]; used by the indexer only.
+            rotary: Rotary module for compressed keys.
+            position_embeddings: Query cosine and sine, each of shape
+                [batch, local_sequence, rotary_channels].
+            cache: Per-attention-call scratch cache.
+            layer_idx: Index of the current transformer layer.
+            start_pos: First query position.
+            enable_hca_fsdp_graph_alignment: Whether a row shorter than one window still builds the
+                compressor graph when another rank of the parameter sync group has a complete window.
+            position_ids: Optional tensor of shape [batch, local_sequence] or [local_sequence] with each
+                token's position inside its document.
+            packed_seq_ids: Optional tensor of shape [batch, local_sequence] or [local_sequence] with
+                positive document identities; zero marks padding.
+            cp_group: Optional context-parallel process group.
+
+        Returns:
+            Compressed keys of shape [batch, 1, pooled, head_dim], concatenated across CP ranks when CP
+            is active; the indexer selection of shape [batch, local_sequence, selected_keys] with -1
+            for unattended entries, or None without an indexer; and, for packed inputs, the document id
+            and the window index of every pooled key, each of shape [batch, pooled], or None. For packed
+            inputs without CP the leading pooled keys are the complete windows of each document in row
+            order and the remaining ones carry document id 0.
+        """
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
         cp_active = dsv4_cp_enabled(cp_group)
         hidden_states_fp32 = hidden_states.float()
         kv = self.wkv(hidden_states_fp32)
         gate = self.wgate(hidden_states_fp32)
+        # ``kv`` and ``gate`` stay in row order for the short-row branch below.
+        window_kv, window_gate = kv, gate
+        window_seq_source, window_position_source = packed_seq_ids, position_ids
+        if packed_seq_ids is not None and position_ids is not None and not cp_active:
+            # Packed documents need not start at a multiple of the ratio. Pool each document's own
+            # windows instead of the row's, so a compressed key holds the tokens its position names.
+            # With context parallelism the sharder has already padded every document to the windows.
+            window_kv, window_gate, window_seq_source, window_position_source = _align_packed_compressor_windows(
+                kv, gate, packed_seq_ids, position_ids, self.compress_ratio
+            )
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
-            kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
+            window_kv, window_gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
         )
         window_seq_ids, window_positions = _compressed_window_metadata(
-            seq_ids=packed_seq_ids,
-            position_ids=position_ids,
+            seq_ids=window_seq_source,
+            position_ids=window_position_source,
             ready_len=ready_kv.shape[1],
             ratio=self.compress_ratio,
         )

@@ -17,6 +17,7 @@ mocked so these tests stay CPU-only and don't need RADIO weights.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -244,3 +245,82 @@ def test_forward_tile_branch_single_image_list_synthesizes_one_flag():
     assert final is not None
     assert final.shape == (1, 6, 64)
     torch.testing.assert_close(final[0, 1:5].float(), torch.full((4, 64), _marker(8, 8)))
+
+
+class _FloatVisionProjector(VisionProjector):
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        patch_grid_shapes: list[tuple[int, int]] | None = None,
+        ps_version: str = "v2",
+    ) -> torch.Tensor:
+        """Use FP32 projection to test batching independently of BF16 reductions.
+
+        Args:
+            x: Raw vision features [batch, patches, vision_hidden].
+            patch_grid_shapes: Per-image patch grids.
+            ps_version: Pixel shuffle convention.
+
+        Returns:
+            Projected features [batch, image_tokens, hidden].
+        """
+        return super().forward(x.float(), patch_grid_shapes=patch_grid_shapes, ps_version=ps_version)
+
+
+class _DifferentiableVisionModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.patch_size = 2
+        self.conv = nn.Conv2d(3, 4, kernel_size=2, stride=2)
+
+    def forward(self, x: torch.Tensor) -> SimpleNamespace:
+        """Encode images shaped [tiles, channels, height, width].
+
+        Args:
+            x: Images [tiles, channels, height, width].
+
+        Returns:
+            A namespace containing features [tiles, patches, vision_hidden].
+        """
+        return SimpleNamespace(features=self.conv(x).flatten(2).transpose(1, 2))
+
+
+@pytest.mark.cpu_only
+def test_extract_feature_list_projects_once_with_output_and_gradient_parity() -> None:
+    """Different image counts must not change the number of projector collectives."""
+    from copy import deepcopy
+    from unittest.mock import patch
+
+    torch.manual_seed(19)
+    model = _make_model_stub(c_feat=4, hidden=8)
+    model.vision_model = _DifferentiableVisionModel()
+    model.vision_projector = _FloatVisionProjector(
+        vit_hidden_size=4,
+        projector_hidden_size=8,
+        llm_hidden_size=8,
+        vision_final_layernorm_eps=1e-5,
+    )
+    reference = deepcopy(model)
+    pixels = [torch.randn(3, 8, 8), torch.randn(2, 3, 8, 12), torch.randn(3, 12, 8)]
+    actual_inputs = [image.clone().requires_grad_() for image in pixels]
+    expected_inputs = [image.clone().requires_grad_() for image in pixels]
+    expected = [
+        reference.extract_feature(image.unsqueeze(0) if image.dim() == 3 else image) for image in expected_inputs
+    ]
+    with patch.object(model.vision_projector, "forward", wraps=model.vision_projector.forward) as projector:
+        actual = model.extract_feature(actual_inputs)
+    for actual_image, expected_image in zip(actual, expected):
+        torch.testing.assert_close(actual_image, expected_image)
+    coefficients = [torch.randn_like(image) for image in actual]
+    sum((image * weight).sum() for image, weight in zip(actual, coefficients)).backward()
+    sum((image * weight).sum() for image, weight in zip(expected, coefficients)).backward()
+    for (name, parameter), (reference_name, reference_parameter) in zip(
+        model.named_parameters(), reference.named_parameters()
+    ):
+        assert name == reference_name
+        if parameter.grad is not None or reference_parameter.grad is not None:
+            torch.testing.assert_close(parameter.grad, reference_parameter.grad, atol=2e-6, rtol=2e-5)
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=2e-6, rtol=2e-5)
+    assert projector.call_count == 1, "Per-image projector calls desynchronize FSDP when DP image counts differ"

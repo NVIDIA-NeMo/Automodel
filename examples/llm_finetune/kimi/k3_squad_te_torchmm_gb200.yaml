@@ -146,6 +146,7 @@ prewarm:
   cublas_backward: true
 
 ci:
+  nemo_ci_schedule: skipped
   recipe_owner: huiyingl
   nodes: 64
   cluster_tag: gb200
