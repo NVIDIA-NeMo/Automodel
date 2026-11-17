@@ -389,17 +389,10 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi
 
-# Backport PyTorch #198292: the optional NVGEMM probe must tolerate CUTLASS
-# operators that cannot import against the FA4/FFPA-compatible CuTe DSL version.
+# The optional NVGEMM probe must tolerate CUTLASS operators that cannot import against
+# the FA4/FFPA-compatible CuTe DSL version (PyTorch #198292, in the base since 26.11).
 # This preserves torch.compile's other GEMM backends and all compiled tests.
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        torch_dir=$(python -c "from pathlib import Path; import torch; print(Path(torch.__file__).parent)") && \
-        patch_file=/opt/Automodel/docker/common/pytorch-nvgemm-availability.patch && \
-        if git -C "$torch_dir" apply --check "$patch_file" 2>/dev/null; then \
-            git -C "$torch_dir" apply "$patch_file"; \
-        else \
-            git -C "$torch_dir" apply --reverse --check "$patch_file"; \
-        fi && \
         python -c "from torch._inductor.utils import ensure_nv_universal_gemm_available; ensure_nv_universal_gemm_available()"; \
     fi
 
