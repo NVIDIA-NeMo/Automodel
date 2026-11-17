@@ -247,6 +247,11 @@ The LoRA recipe trains rank-8 adapters on the 43-layer main decoder on 8 GPUs
 frozen. Run it from the repository root on each of the 2 nodes, with
 `NODE_RANK` set to 0 and 1 and `MASTER_ADDR` set to the first node:
 
+Both nodes of the 8-rank expert group must be in one NVLink domain. HybridEP
+requires DeepEP with HybridEP support and compiles kernels on first use. Leave
+`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` unset; if the nodes share a home
+directory, set `HYBRID_EP_CACHE_DIR` to a separate directory on each node.
+
 ```bash
 uv run torchrun --nnodes=2 --nproc-per-node=4 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
   -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml
@@ -261,8 +266,9 @@ one of the 8 expert groups of each MoE layer.
 LoRA removes the gradients and the optimizer state of the base weights, which
 is what lets 2 nodes take the place of 16. It does not reduce the weights that
 a GPU holds: every GPU keeps one eighth of the routed experts and its shard of
-the dense weights, 65.8 GiB after loading. A training step still gathers the
-dense weights and keeps the activations of the forward pass for the backward
+the dense weights. In the `torch` backend run these occupied 65.8 GiB after
+loading. A training step still gathers the dense weights and keeps the
+activations of the forward pass for the backward
 pass; in the validated run the allocation rose from 65.8 GiB to a peak of
 102.8 GiB.
 
@@ -303,6 +309,14 @@ stay FP32. The recipe loads the model in BF16 and sets the compute dtype to
 
 ### Validated LoRA Configuration
 
+The 100-update measurements below used the `torch` expert and dispatcher
+backends. They do not measure the HybridEP recipe above. On an earlier
+integration preview, the released 43-layer model also ran on 8 GPUs with
+HybridEP for 32 updates, saved after 24, and resumed in a new process for
+8 updates. On all ranks the restored adapter and optimizer state matched
+the save, and the frozen parameters remained unchanged. This preview is
+not a run of the final version of the recipe.
+
 | Area | Validated Configuration |
 |---|---|
 | Hardware | 2 nodes with 4 GB200 GPUs each (8 GPUs) |
@@ -335,8 +349,8 @@ resume in the row "Without it" of [LoRA Checkpoints](#lora-checkpoints) and
 the one-node run below. The runs on the 43-layer model started the recipe
 through a wrapper that adds these measurements; the two runs of 100 updates
 also ran a validation pass before training. The `nemo_automodel.cli.app`
-entry of the command above was run on one node with a three-layer model built
-from released layers (4 GPUs, `ep_size: 4`): 8 updates, one validation pass,
+entry of the command above was run with the `torch` backends on one node with a
+three-layer model built from released layers (4 GPUs, `ep_size: 4`): 8 updates, one validation pass,
 and one adapter checkpoint.
 
 ### LoRA Checkpoints
@@ -352,7 +366,7 @@ base weights:
 | Total | 20.06 GiB |
 
 The recipe writes one checkpoint after 50 updates and one after 100, 40 GiB
-in all. The two saves took 10.1 and 8.5 s.
+in all. In the `torch` backend run, the two saves took 10.1 and 8.5 s.
 
 A resume loads the released checkpoint first and then the adapter; it was
 validated with the same number of ranks and the same `ep_size`. It restores
@@ -372,8 +386,9 @@ reports as incompatible is skipped. A second run of the recipe in the same
 directory is therefore normally a resume. That second way was not run with
 LoRA for this model.
 
-Both cases were run on the 43-layer model from the checkpoint written after 50
-updates, each in a new process that loaded the released checkpoint (142 and
+Both cases used the `torch` expert and dispatcher backends on the 43-layer
+model from the checkpoint written after 50 updates, each in a new process that
+loaded the released checkpoint (142 and
 129 s), restored the adapter (5 and 9 s), and trained 8 more updates
 (`step_scheduler.max_steps: 58`, no save):
 
