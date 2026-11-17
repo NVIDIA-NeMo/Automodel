@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml
+# torchrun --nproc-per-node=8 -m nemo_automodel.cli.app examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
@@ -22,7 +22,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 8
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000  # will run every x number of gradient steps
   max_steps: 100
@@ -41,6 +41,7 @@ model:
   pretrained_model_name_or_path: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
   trust_remote_code: true
   force_hf: true
+  attn_implementation: flash_attention_2
 
 checkpoint:
   enabled: true
@@ -71,13 +72,16 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  padding: false
 
 packed_sequence:
-  packed_sequence_size: 0
+  # local_batch_size counts packed rows, not individual documents.
+  packed_sequence_size: 4096
+  packing_strategy: neat
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: True
 
 validation_dataset:
@@ -85,10 +89,13 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  padding: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  # NEAT validation evaluates individual documents.
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 1
 
 optimizer:
   _target_: torch.optim.Adam
