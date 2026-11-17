@@ -54,20 +54,27 @@ weights without attaching the draft objective to the frozen backbone.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
-from typing import Any
+from collections.abc import Callable
+from functools import partial
+from typing import Any, Iterator
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Shard
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
-from nemo_automodel.components.moe.state_dict_utils import is_dtensor, should_load_expert_for_rank
+from nemo_automodel.components.moe.state_dict_utils import (
+    is_dtensor,
+    should_load_expert_for_rank,
+    split_experts_weights_dtensor_aware,
+)
 
 _ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.(\d+)\.engram\.embed\.weight$")
 _DSPARK_EXPERT_PATTERN = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(gate_and_up_projs|down_projs)$")
@@ -141,6 +148,54 @@ def _local_offsets(tensor: DTensor) -> tuple[int, ...]:
     return tuple(offsets)
 
 
+_FUSED_EXPERT_KEY = re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(gate_and_up_projs|down_projs)$")
+
+_QUANTIZED_RELEASED_WEIGHT = re.compile(
+    r"layers\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b|indexer\.wq_b)"
+    r"|ffn\.(?:shared_experts|experts\.\d+)\.w[123]|engram\.(?:embed|wkv))\.weight"
+)
+
+
+def _finish_part_loads(
+    adapter_dtype: torch.dtype,
+    generic: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool], ...],
+    engrams: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]], ...],
+    experts: tuple[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int | None], ...],
+) -> None:
+    """Install one load part's FP8 tensors into final model storage.
+
+    Args:
+        adapter_dtype: Decoded storage dtype (``self.dtype`` of the owning adapter).
+        generic: ``(target, fp8_temp, scale_temp, rowwise)`` per quantized tensor. Targets are
+            final model tensors (plain or DTensor) of shape [rows, columns]; the decoded
+            tensor of the same global shape is copied in.
+        engrams: ``(target, fp8_temp, scale_temp, restore_fn)`` per Engram table. The temps
+            are true-row-count owner-sharded views; the decoded tensor restores equal owner
+            padding via ``restore_fn`` (the adapter's ``_restore_engram_padding`` partial)
+            before copying into the padded target storage.
+        experts: ``(fused_local, expert_index, projection, fp8_temp, scale_temp, inter_dim)``
+            per per-expert projection. ``fused_local`` is the rank-local grouped storage;
+            the destination holds only this rank's input-axis shard of the checkpoint
+            tensor, so the decoded shard of shape [output, local_input] is transposed
+            exactly as ``_from_hf_w_merged_experts`` does and copied into the expert's
+            slice; ``inter_dim`` is ``None`` for ``w2``.
+    """
+    for target, fp8, scale, rowwise in generic:
+        target.copy_(dequantize_checkpoint_weight(fp8, scale, dtype=adapter_dtype, rowwise=rowwise))
+    for target, fp8, scale, restore_fn in engrams:
+        decoded = dequantize_checkpoint_weight(fp8, scale, dtype=adapter_dtype, rowwise=True)
+        target.copy_(restore_fn(decoded))
+    for fused_local, expert_index, projection, fp8, scale, inter_dim in experts:
+        decoded = dequantize_checkpoint_weight(fp8, scale, dtype=adapter_dtype)
+        shard = (decoded.to_local() if isinstance(decoded, DTensor) else decoded).transpose(0, 1)
+        if projection == "w1":
+            fused_local[expert_index, :, :inter_dim] = shard
+        elif projection == "w3":
+            fused_local[expert_index, :, inter_dim:] = shard
+        else:
+            fused_local[expert_index] = shard
+
+
 def dequantize_checkpoint_weight(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -163,9 +218,10 @@ def dequantize_checkpoint_weight(
         rowwise: Use per-row scales for FP8 Engram tables. FP4 always uses them.
 
     Returns:
-        Independent tensor of shape [rows, columns] in ``dtype``; DTensor
-        inputs retain their mesh and placements. No input is modified, and
-        FP32/expanded-scale temporaries cover at most 4M weight elements.
+        Independent tensor of shape [rows, columns] in ``dtype`` on the operands'
+        device; DTensor inputs retain their mesh and placements. No input is
+        modified, and FP32/expanded-scale temporaries cover at most 4M weight
+        elements.
     """
     if weight.ndim != 2 or scale.ndim != 2:
         raise ValueError("Checkpoint weights and scales must both be two-dimensional")
@@ -461,10 +517,244 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                     raise ValueError(f"Quantized weight {key} is missing its scale tensor {scale_key}")
                 continue
             scale = state_dict.pop(scale_key)
-            state_dict[key] = dequantize_checkpoint_weight(
-                weight, scale, dtype=self.dtype, rowwise=".engram.embed." in key
-            )
+            state_dict[key] = self._dequantize_one(weight, scale, key)
         return state_dict
+
+    def _dequantize_one(self, weight: torch.Tensor, scale: torch.Tensor, key: str) -> torch.Tensor:
+        """Dequantize one weight/scale pair.
+
+        Args:
+            weight: Quantized weight; plain tensor or DTensor of FP8/INT8 payload.
+            scale: Companion block-wise scale tensor on the same device.
+            key: State-dict key, used to select the rowwise Engram scale layout.
+
+        Returns:
+            Decoded tensor in ``self.dtype`` on the weight's device.
+        """
+        return dequantize_checkpoint_weight(weight, scale, dtype=self.dtype, rowwise=".engram.embed." in key)
+
+    def iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        device_mesh: "DeviceMesh" | None = None,
+    ) -> Iterator[CheckpointLoadPart] | None:
+        """Load the released V4.1 FP8 checkpoint in bounded per-layer parts.
+
+        Every temporary destination is derived from the model tensors' own shapes
+        and placements through ``_quantized_load_targets``, so the quantization
+        layout has a single source, while non-quantized tensors use their final
+        model storage directly. ``finish`` decodes one part and writes it straight
+        into the parameter shells: per-expert ``w1``/``w3``/``w2`` tensors are
+        decoded, transposed, and written into their slices of the grouped expert
+        storage, reproducing ``_from_hf_w_merged_experts``'s layout. Only one
+        layer's temporaries co-reside with the parameter shells, so peak load
+        memory is the model plus one layer instead of the model plus a full
+        decoded copy (the small-world OOM).
+
+        Engram tables keep their checkpoint-side shapes (the model pads rows up
+        to a multiple of the owner count) and install through an offset-aware
+        local copy.
+
+        Checkpoint completeness is enforced by the loader against the DCP
+        metadata it already reads: a tensor the checkpoint cannot serve rejects
+        in ``_load_model_in_parts`` before that part's collective load. Returns
+        ``None`` (falling back to the full-state path) for DSpark-shaped state
+        dicts, non-tensor entries, dtype mismatches, or grouped expert
+        state-dict tensors that do not alias model storage (TE / MoK experts).
+
+        Args:
+            model_state_dict: Native names mapped to final parameter and persistent-buffer
+                tensors, with their model-specific shapes and distributed placements.
+            device_mesh: Optional mesh describing distributed model storage; expert
+                ownership is read from the grouped tensors' own placements.
+
+        Returns:
+            One load part per decoder layer plus one for shared tensors, or ``None``.
+        """
+        if any(key.startswith("mtp.") for key in model_state_dict):
+            logging.info("%s: part loading declined (DSpark-shaped state dict)", type(self).__name__)
+            return None
+        non_tensor_keys = [key for key, value in model_state_dict.items() if not isinstance(value, torch.Tensor)]
+        if non_tensor_keys:
+            logging.info(
+                "%s: part loading declined (%d non-tensor entries, examples=%s)",
+                type(self).__name__,
+                len(non_tensor_keys),
+                non_tensor_keys[:5],
+            )
+            return None
+        n_experts = self.moe_config.n_routed_experts if self.moe_config is not None else 0
+        for model_key, target in model_state_dict.items():
+            kind = self._classify_model_key(model_key)
+            if kind == "fused" and not self._expert_checkpoint_tensors_use_model_storage:
+                # GroupedExpertsTE and the MoK gate/up storage expose grouped experts through
+                # stacked copies of the real parameters, so part destinations would write into
+                # the copies while the model keeps its initialization. The full-state path
+                # rebuilds and installs those tensors after the read; serve it there.
+                logging.info(
+                    "%s: part loading declined (grouped expert state-dict tensors do not alias model storage)",
+                    type(self).__name__,
+                )
+                return None
+            if kind == "quantized" and (target.ndim != 2 or target.dtype != self.dtype):
+                logging.info(
+                    "%s: part loading declined (%s has %dD %s targets, expected 2D %s)",
+                    type(self).__name__,
+                    model_key,
+                    target.ndim,
+                    target.dtype,
+                    self.dtype,
+                )
+                return None
+            if (
+                kind == "fused"
+                and isinstance(target, DTensor)
+                and not all(
+                    placement.is_replicate() or (isinstance(placement, Shard) and placement.dim in (0, 1))
+                    for placement in target.placements
+                )
+            ):
+                # Grouped experts shard on dim 0 (EP) and dim 1 (the ep_shard FSDP axis,
+                # see _moe_shard_placement). Anything else needs the full-state path.
+                logging.info(
+                    "%s: part loading declined (%s shards outside the expert/inner axes)",
+                    type(self).__name__,
+                    model_key,
+                )
+                return None
+        return self._iter_checkpoint_load_parts(model_state_dict, n_experts)
+
+    def _classify_model_key(self, model_key: str) -> str:
+        """Classify one model state-dict key for part-based checkpoint loading.
+
+        Args:
+            model_key: Native model state-dict name.
+
+        Returns:
+            ``"fused"``, ``"engram"``, ``"quantized"``, or ``"direct"`` naming the
+            destination-building rule. Every classified key gets a checkpoint
+            destination; a checkpoint that cannot serve it rejects in the loader's
+            missing-tensor check. V4.1 registers ``tie_word_embeddings_support =
+            UNTIED_ONLY``, so ``lm_head.weight`` is an ordinary direct destination.
+        """
+        if _FUSED_EXPERT_KEY.match(model_key):
+            return "fused"
+        released = _released_key(model_key)
+        if _QUANTIZED_RELEASED_WEIGHT.fullmatch(released):
+            return "engram" if ".engram.embed." in released else "quantized"
+        return "direct"
+
+    def _iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        n_experts: int,
+    ) -> Iterator[CheckpointLoadPart]:
+        """Build per-layer load parts after :meth:`iter_checkpoint_load_parts` validated the inputs.
+
+        Args:
+            model_state_dict: Native names mapped to final tensors with their placements.
+            n_experts: Total routed experts per MoE layer.
+
+        Yields:
+            One load part per decoder layer plus one for shared tensors.
+        """
+        groups: dict[str, list[str]] = {}
+        for model_key in model_state_dict:
+            layer_match = re.match(r"^model\.layers\.(\d+)\.", model_key)
+            group = f"layer-{layer_match.group(1)}" if layer_match is not None else "shared"
+            groups.setdefault(group, []).append(model_key)
+
+        for group_keys in groups.values():
+            checkpoint_tensors: dict[str, torch.Tensor] = {}
+            temporary_keys: set[str] = set()
+            generic: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]] = []
+            engrams: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]] = []
+            experts: list[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int | None]] = []
+            for model_key in group_keys:
+                target = model_state_dict[model_key]
+                kind = self._classify_model_key(model_key)
+                if kind == "fused":
+                    fused_local = target.to_local() if isinstance(target, DTensor) else target
+                    layer_match = _FUSED_EXPERT_KEY.match(model_key)
+                    layer_num, which = layer_match.group(1), layer_match.group(2)
+                    inter_dim = int(target.shape[-1]) // 2 if which == "gate_and_up_projs" else None
+                    # Splitting the grouped tensor reuses the shared MoE contract: each
+                    # per-expert view keeps this rank's inner-axis shard and drops the expert
+                    # axis. Transposing to the checkpoint's [output, input] layout and sizing
+                    # through _quantized_load_targets yields destinations that DCP plans as
+                    # shard-only reads, exactly like the full-state conversion.
+                    splits, expert_ids = split_experts_weights_dtensor_aware(target, n_experts)
+                    for local_index, (split_value, global_expert) in enumerate(zip(splits, expert_ids)):
+                        if which == "gate_and_up_projs":
+                            views = (
+                                split_value[:, :inter_dim].transpose(0, 1),
+                                split_value[:, inter_dim:].transpose(0, 1),
+                            )
+                            projections = ("w1", "w3")
+                        else:
+                            views = (split_value.transpose(0, 1),)
+                            projections = ("w2",)
+                        for projection, value in zip(projections, views):
+                            weight_key = f"layers.{layer_num}.ffn.experts.{global_expert}.{projection}.weight"
+                            destinations = dict(self._quantized_load_targets(weight_key, value))
+                            checkpoint_tensors.update(destinations)
+                            temporary_keys.update(destinations)
+                            experts.append(
+                                (
+                                    fused_local,
+                                    local_index,
+                                    projection,
+                                    destinations[weight_key],
+                                    destinations[weight_key.removesuffix(".weight") + ".scale"],
+                                    inter_dim,
+                                )
+                            )
+                elif kind == "engram":
+                    released = _released_key(model_key)
+                    layer_id = int(_ENGRAM_EMBED_PATTERN.match(released).group(1))
+                    # The Engram table is a ~100GB monolith: expose only the logical-row
+                    # owner-sharded view of the padded model storage
+                    # (_engram_checkpoint_tensor) and size both destinations from that
+                    # view, so each rank reads only its own rows.
+                    checkpoint_view = self._engram_checkpoint_tensor(target, layer_id)
+                    destinations = dict(self._quantized_load_targets(released, checkpoint_view))
+                    checkpoint_tensors.update(destinations)
+                    temporary_keys.update(destinations)
+                    engrams.append(
+                        (
+                            target,
+                            destinations[released],
+                            destinations[released.removesuffix(".weight") + ".scale"],
+                            partial(self._restore_engram_padding, layer_id=layer_id),
+                        )
+                    )
+                elif kind == "quantized":
+                    released = _released_key(model_key)
+                    destinations = dict(self._quantized_load_targets(released, target))
+                    checkpoint_tensors.update(destinations)
+                    temporary_keys.update(destinations)
+                    generic.append(
+                        (
+                            target,
+                            destinations[released],
+                            destinations[released.removesuffix(".weight") + ".scale"],
+                            False,
+                        )
+                    )
+                else:
+                    checkpoint_tensors[_released_key(model_key)] = target
+            yield CheckpointLoadPart(
+                checkpoint_tensors=checkpoint_tensors,
+                model_keys=frozenset(group_keys),
+                temporary_checkpoint_keys=frozenset(temporary_keys),
+                finish=partial(
+                    _finish_part_loads,
+                    self.dtype,
+                    tuple(generic),
+                    tuple(engrams),
+                    tuple(experts),
+                ),
+            )
 
     # ------------------------------------------------------------------
     # to_hf
@@ -616,11 +906,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             match = _ENGRAM_EMBED_PATTERN.match(key)
             if match:
                 value = self._engram_checkpoint_tensor(value, int(match.group(1)))
-            quantized = re.fullmatch(
-                r"layers\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b|indexer\.wq_b)"
-                r"|ffn\.(?:shared_experts|experts\.\d+)\.w[123]|engram\.(?:embed|wkv))\.weight",
-                key,
-            )
+            quantized = _QUANTIZED_RELEASED_WEIGHT.fullmatch(key)
             if quantization and quantized:
                 converted.extend(self._quantized_load_targets(key, value))
             else:
