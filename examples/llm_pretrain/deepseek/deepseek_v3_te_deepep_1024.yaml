@@ -88,5 +88,5 @@ ci:
   recipe_owner: akoumpa
   nproc_per_node: 8
   perf_testing:
-    schedule: weekly
+    schedule: nightly
     fake_balanced_gate: true
