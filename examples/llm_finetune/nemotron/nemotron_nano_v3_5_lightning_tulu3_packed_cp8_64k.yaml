@@ -136,3 +136,5 @@ ci:
   max_steps: 2
   env_vars:
     REQUIRE_FINITE_METRICS: "true"
+  perf_testing:
+    schedule: nightly
