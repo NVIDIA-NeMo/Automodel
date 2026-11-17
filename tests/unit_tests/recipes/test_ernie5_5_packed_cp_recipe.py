@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contract tests for the ERNIE 5.5 Flash packed context-parallel LoRA recipe."""
+"""Contract tests for the ERNIE 5.5 Flash packed context-parallel recipes."""
 
 from pathlib import Path
 
@@ -30,8 +30,12 @@ from tests.unit_tests.models.ernie5_5.conftest import checkpoint_config
 from tests.unit_tests.models.ernie5_5.test_parallelization import _context, _Mesh
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-RECIPE = REPO_ROOT / "examples/llm_finetune/ernie5_5/ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml"
-LORA_RECIPE = REPO_ROOT / "examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml"
+RECIPES = REPO_ROOT / "examples/llm_finetune/ernie5_5"
+PACKED_LORA = RECIPES / "ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml"
+PACKED_FULL = RECIPES / "ernie5_5_flash_tulu3_packed128k_cp8.yaml"
+LORA_RECIPE = RECIPES / "ernie5_5_flash_squad_ep_lora.yaml"
+FULL_RECIPE = RECIPES / "ernie5_5_flash_squad_ep.yaml"
+PACKED = pytest.mark.parametrize("recipe", [PACKED_LORA, PACKED_FULL], ids=["lora", "full"])
 
 # The contract checks parse YAML and build the model on the meta device; they never use CUDA.
 pytestmark = pytest.mark.cpu_only
@@ -42,14 +46,22 @@ def _load(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def test_packed_recipe_keeps_the_model_adapters_and_optimizer_of_the_lora_recipe() -> None:
-    packed, lora = _load(RECIPE), _load(LORA_RECIPE)
+def test_packed_lora_recipe_keeps_the_model_adapters_and_optimizer_of_the_lora_recipe() -> None:
+    packed, lora = _load(PACKED_LORA), _load(LORA_RECIPE)
     for section in ("model", "peft", "optimizer", "loss_fn", "clip_grad_norm", "seed"):
         assert packed[section] == lora[section], section
 
 
-def test_packed_recipe_splits_one_row_per_update_over_all_ranks() -> None:
-    config = _load(RECIPE)
+def test_packed_full_recipe_keeps_the_model_and_optimizer_of_the_full_recipe() -> None:
+    packed, full = _load(PACKED_FULL), _load(FULL_RECIPE)
+    assert "peft" not in packed
+    for section in ("model", "optimizer", "loss_fn", "clip_grad_norm", "seed"):
+        assert packed[section] == full[section], section
+
+
+@pytest.mark.parametrize(("recipe", "rows"), [(PACKED_LORA, 1), (PACKED_FULL, 8)], ids=["lora", "full"])
+def test_packed_recipe_splits_every_row_over_8_ranks(recipe: Path, rows: int) -> None:
+    config = _load(recipe)
     parsed = parse_distributed_section(config["distributed"])
     sizes = parsed["parallelism_sizes"]
 
@@ -57,15 +69,17 @@ def test_packed_recipe_splits_one_row_per_update_over_all_ranks() -> None:
     assert (sizes.tp_size, sizes.pp_size, sizes.cp_size, sizes.ep_size) == (1, 1, 8, 8)
     ci = config["ci"]
     assert ci["cluster_tag"] == "gb200"
-    assert ci["nodes"] * ci["nproc_per_node"] == sizes.cp_size
+    # An update takes one packed row per group of 8 context-parallel ranks.
+    assert ci["nodes"] * ci["nproc_per_node"] == sizes.cp_size * rows
     scheduler = config["step_scheduler"]
-    assert scheduler["global_batch_size"] == scheduler["local_batch_size"] == 1
+    assert scheduler["global_batch_size"] == rows and scheduler["local_batch_size"] == 1
     assert config["distributed"]["activation_checkpointing"] is True
     assert config["distributed"]["moe"]["reshard_after_forward"] is True
 
 
-def test_packed_recipe_packs_shuffled_tulu3_rows_of_whole_compression_windows() -> None:
-    config = _load(RECIPE)
+@PACKED
+def test_packed_recipe_packs_shuffled_tulu3_rows_of_whole_compression_windows(recipe: Path) -> None:
+    config = _load(recipe)
     packing, dataset, loader = config["packed_sequence"], config["dataset"], config["dataloader"]
 
     assert packing["packing_strategy"] == "thd" and packing["packed_sequence_size"] == 131072
@@ -82,12 +96,21 @@ def test_packed_recipe_packs_shuffled_tulu3_rows_of_whole_compression_windows() 
     assert (REPO_ROOT / dataset["chat_template"]).is_file()
 
 
-def test_packed_recipe_topology_is_admitted_for_the_released_layer_schedule(monkeypatch) -> None:
-    config = _load(RECIPE)
+@PACKED
+def test_packed_recipe_topology_is_admitted_for_the_released_layer_schedule(
+    recipe: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _load(recipe)
+    backend = config["model"]["backend"]
     with torch.device("meta"):
         model = Ernie5_5_MoeForCausalLM(
             checkpoint_config(num_nextn_predict_layers=0),
-            BackendConfig(attn="cudnn", linear="torch", experts="torch", dispatcher="torch"),
+            BackendConfig(
+                attn=backend["attn"],
+                linear=backend["linear"],
+                experts=backend["experts"],
+                dispatcher=backend["dispatcher"],
+            ),
         )
     assert model.packed_alignment == config["packed_sequence"]["pad_to_multiple_of"]
     ranks = config["ci"]["nodes"] * config["ci"]["nproc_per_node"]

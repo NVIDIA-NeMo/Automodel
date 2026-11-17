@@ -37,9 +37,9 @@
 # both, 16384 tokens per rank fit one GB200 next to the frozen weights: a GPU peaked at
 # 160 GiB allocated in the validated run.
 #
-# The LoRA targets, the unsupported settings other than packing and context parallelism, and
-# the notes on the model, the tokenizer and the Hub cache are those of
-# ernie5_5_flash_squad_ep_lora.yaml.
+# The LoRA targets, the HybridEP notes, the unsupported settings other than packing and
+# context parallelism, and the notes on the model, the tokenizer and the Hub cache are those
+# of ernie5_5_flash_squad_ep_lora.yaml.
 #
 # To run this recipe, from the repository root, on each of the 2 nodes with 4 GPUs, with
 # NODE_RANK set to 0 and 1 and MASTER_ADDR set to the first node:
@@ -80,9 +80,10 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     # cuDNN sparse attention for the DSA layers and for the HCA layers of packed rows.
     attn: cudnn
+    # HybridEP exchanges routed-expert tokens in BF16; other BackendConfig fields keep their defaults.
     linear: torch
-    experts: torch
-    dispatcher: torch
+    experts: torch_mm
+    dispatcher: hybridep
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -130,6 +131,8 @@ checkpoint:
   enabled: false
   save_consolidated: false
   checkpoint_dir: checkpoints/ernie5_5_flash_tulu3_packed128k_cp8_lora/
+  # Plans the loading of the weights over a CPU process group, as ernie5_5_flash_squad_ep_lora.yaml does.
+  load_metadata_with_gloo: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
