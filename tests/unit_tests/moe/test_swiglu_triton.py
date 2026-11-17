@@ -21,6 +21,8 @@ from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.experts import (
     _swiglu_clamped_deepep_compiled,
     swiglu_clamped_deepep,
+    swiglu_routed_rows,
+    weighted_swiglu_deepep,
 )
 
 pytestmark = pytest.mark.timeout(600)
@@ -65,6 +67,31 @@ def test_triton_matches_the_eager_reference(rows, inter, limit):
 
 
 @requires_gpu_triton
+@pytest.mark.parametrize("limit", [float("inf"), 7.0])
+@pytest.mark.parametrize("rows,routed,inter", [(257, 200, 96), (64, 0, 32), (40, 40, 1000)])
+def test_routed_rows_bound_ignores_the_unused_tail(rows, routed, inter, limit):
+    """A fixed-capacity buffer's rows past the routed count hold garbage; they must not reach routed rows."""
+    x, probs, grad = _inputs(rows, inter, 7.0, "cuda", seed=3)
+    with torch.no_grad():
+        x[routed:] = float("nan")
+        probs[routed:] = float("nan")
+    grad[routed:] = float("nan")
+    routed_rows = torch.tensor([routed], device="cuda", dtype=torch.int64)
+    out = swiglu_routed_rows(x, probs, routed_rows=routed_rows, limit=limit)
+    out.backward(grad)
+    # The bound only selects rows: routed rows match the unbounded kernel on the routed slice bit for bit.
+    x_ref = x.detach()[:routed].clone().requires_grad_(True)
+    probs_ref = probs.detach()[:routed].clone().requires_grad_(True)
+    expected = swiglu_triton.swiglu_clamped_triton(x_ref, probs_ref, limit)
+    expected.backward(grad[:routed])
+    torch.testing.assert_close(out[:routed], expected, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad[:routed], x_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(probs.grad[:routed], probs_ref.grad, rtol=0, atol=0)
+    if routed and limit == float("inf"):
+        torch.testing.assert_close(expected.float(), _reference(x_ref, probs_ref, limit).float(), rtol=1e-2, atol=1e-2)
+
+
+@requires_gpu_triton
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_clamp_boundary_gradients_match_the_installed_pytorch(dtype: torch.dtype) -> None:
     """Follow the framework's scalar-clamp subgradient at both exact bounds."""
@@ -91,6 +118,26 @@ def test_dispatcher_prefers_triton_on_cuda_and_matches_the_compiled_function():
 
 
 @requires_gpu_triton
+def test_weighted_swiglu_takes_triton_on_cuda_and_matches_the_fp32_reference():
+    x, probs, grad = _inputs(300, 768, 3.0, "cuda")
+    out = weighted_swiglu_deepep(x, probs)
+    assert type(out.grad_fn).__name__.startswith("SwigluClampedTriton")
+    out.backward(grad)
+    x_ref, probs_ref = x.detach().clone().requires_grad_(True), probs.detach().clone().requires_grad_(True)
+    gate, up = torch.chunk(x_ref.float(), 2, dim=-1)
+    ref = F.silu(gate) * up * probs_ref
+    ref.backward(grad.float())
+    torch.testing.assert_close(out, ref.to(x.dtype))
+    torch.testing.assert_close(x.grad, x_ref.grad.to(x.dtype))
+    torch.testing.assert_close(probs.grad, probs_ref.grad, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("inter,block_n", [(2048, 1024), (2880, 1024), (1536, 512), (768, 256), (96, 128)])
+def test_forward_block_is_the_widest_with_little_padding(inter, block_n):
+    assert swiglu_triton._forward_block_n(inter) == block_n
+
+
+@requires_gpu_triton
 def test_probability_gradient_is_skipped_when_not_required():
     x, probs, grad = _inputs(8, 32, 2.0, "cuda")
     probs = probs.detach()
@@ -110,6 +157,17 @@ def test_cpu_inputs_take_the_compiled_path():
     torch.testing.assert_close(out, _reference(x, probs, 2.0), rtol=0, atol=0)
     out.backward(grad)
     assert x.grad is not None and probs.grad is not None
+
+
+def test_routed_rows_fallback_matches_the_unbounded_activation_on_cpu():
+    x, probs, grad = _inputs(6, 8, 2.0, "cpu")
+    routed_rows = torch.tensor([6])
+    plain = swiglu_routed_rows(x, probs, routed_rows=routed_rows, limit=float("inf"))
+    gate, up = torch.chunk(x.detach().float(), 2, dim=-1)
+    torch.testing.assert_close(plain.float(), (F.silu(gate) * up * probs.detach()).to(x.dtype).float(), rtol=0, atol=0)
+    torch._dynamo.reset()
+    clamped = swiglu_routed_rows(x, probs, routed_rows=routed_rows, limit=2.0)
+    torch.testing.assert_close(clamped, _reference(x, probs, 2.0), rtol=0, atol=0)
 
 
 def test_guard_rejects_unsupported_layouts():

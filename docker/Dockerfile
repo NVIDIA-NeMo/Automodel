@@ -121,6 +121,9 @@ FROM update_base_container AS automodel_dep
 # Install TE
 ARG INSTALL_TE=True
 ARG TE_COMMIT=v2.20.2
+# CI enables NCCL-EP on the PyTorch image, which supplies NCCL >= 2.30.4
+# and the private symmetric-memory headers absent from public torch wheels.
+ARG TE_WITH_NCCL_EP=0
 # TE 2.19+ expands the 100 family target to 107a when CUDA 13.4+ is used.
 ARG TE_CUDA_ARCHS="80;90;100;120"
 ARG TE_BUILD_MAX_JOBS=8
@@ -128,7 +131,7 @@ ARG TE_BUILD_THREADS_PER_JOB=8
 # INSTALL_TE=False may reuse TE from the base image only when its PyTorch
 # binding is already compatible. Otherwise rebuild it against the exact
 # PyTorch/CUDA stack in this image to avoid carrying a stale native extension.
-RUN if [ "$INSTALL_TE" = "True" ] || \
+RUN if [ "$INSTALL_TE" = "True" ] || [ "$TE_WITH_NCCL_EP" = "1" ] || \
         ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.20.2'); import transformer_engine.pytorch"; then \
     pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
@@ -142,7 +145,7 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
         NVTE_RELEASE_BUILD=0 \
         NVTE_BUILD_METAPACKAGE=0 \
         NVTE_CUDA_ARCHS="$TE_CUDA_ARCHS" \
-        NVTE_WITH_NCCL_EP=0 \
+        NVTE_WITH_NCCL_EP="$TE_WITH_NCCL_EP" \
         NVTE_BUILD_MAX_JOBS="$TE_BUILD_MAX_JOBS" \
         NVTE_BUILD_THREADS_PER_JOB="$TE_BUILD_THREADS_PER_JOB" \
         NVTE_NO_LOCAL_VERSION=1 \
@@ -354,6 +357,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
 # dependency compilation. Ordinary Docker builds still build the stage above.
 FROM automodel_dependencies AS automodel_final
 ARG BASE_IMAGE=cuda
+ARG TE_WITH_NCCL_EP=0
 ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532
 
@@ -408,7 +412,7 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
 RUN mkdir -p /tmp/cuda-driver-stubs && \
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
     LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
-        MAX_JOBS=2 python docker/common/verify_native_runtime.py --base-image "$BASE_IMAGE" && \
+        MAX_JOBS=2 python docker/common/verify_native_runtime.py --base-image "$BASE_IMAGE" --nccl-ep="$TE_WITH_NCCL_EP" && \
     rm -rf /tmp/cuda-driver-stubs && \
     python -c "from _pytest.config import get_config; get_config().pluginmanager.load_setuptools_entrypoints('pytest11')"
 
