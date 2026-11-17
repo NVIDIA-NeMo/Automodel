@@ -174,12 +174,12 @@ Other recorded differences:
 
 | Retained benchmark | Canonical finetuning config |
 |---|---|
-| [deepseek/deepseek_v4_flash_h100_optimized.yaml](deepseek/deepseek_v4_flash_h100_optimized.yaml) | [deepseek_v4/deepseek_v4_flash_hellaswag.yaml](../llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) |
+| [deepseek/deepseek_v4_flash_h100_optimized.yaml](deepseek/deepseek_v4_flash_h100_optimized.yaml) | [deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml](../llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml) |
 | [glm/glm_4.7_flash_te_deepep.yaml](glm/glm_4.7_flash_te_deepep.yaml) | [glm/glm_4.7_flash_te_deepep.yaml](../llm_finetune/glm/glm_4.7_flash_te_deepep.yaml) |
 | [glm/glm_4.7_te_deepep.yaml](glm/glm_4.7_te_deepep.yaml) | [glm/glm_4.7_te_deepep.yaml](../llm_finetune/glm/glm_4.7_te_deepep.yaml) |
 | [glm/glm_5_te_deepep.yaml](glm/glm_5_te_deepep.yaml) | [glm/glm_5_hellaswag_pp.yaml](../llm_finetune/glm/glm_5_hellaswag_pp.yaml) |
 | [gpt_oss/gptoss_120b_te_deepep.yaml](gpt_oss/gptoss_120b_te_deepep.yaml) | [gpt_oss/gpt_oss_120b.yaml](../llm_finetune/gpt_oss/gpt_oss_120b.yaml) |
-| [gpt_oss/gptoss_20b_te_deepep.yaml](gpt_oss/gptoss_20b_te_deepep.yaml) | [gpt_oss/gpt_oss_20b.yaml](../llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
+| [gpt_oss/gptoss_20b_te_deepep.yaml](gpt_oss/gptoss_20b_te_deepep.yaml) | [gpt_oss/gpt_oss_20b_te_packed_sequence.yaml](../llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml) |
 | [llama3_3/llama_3_3_70b_instruct_squad_peft_pp.yaml](llama3_3/llama_3_3_70b_instruct_squad_peft_pp.yaml) | [llama3_3/llama_3_3_70b_instruct_squad_peft.yaml](../llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft.yaml) |
 | [minimax/minimax_m2.5_te_deepep.yaml](minimax/minimax_m2.5_te_deepep.yaml) | [minimax_m2/minimax_m2.5_hellaswag_pp.yaml](../llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
 | [moonlight/moonlight_16b_te_deepep.yaml](moonlight/moonlight_16b_te_deepep.yaml) | [moonlight/moonlight_16b_te.yaml](../llm_finetune/moonlight/moonlight_16b_te.yaml) |
@@ -206,6 +206,20 @@ Other recorded differences:
 | [qwen/qwen3_moe_30b_te_deepep_gb200.yaml](qwen/qwen3_moe_30b_te_deepep_gb200.yaml) | [qwen/qwen3_moe_30b_squad_te_deepep_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_squad_te_deepep_gb200.yaml) |
 | [qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml](qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml) | [qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml) |
 | [qwen/qwen3_moe_30b_torchmm_gb200.yaml](qwen/qwen3_moe_30b_torchmm_gb200.yaml) | [qwen/qwen3_moe_30b_squad_torchmm_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_squad_torchmm_gb200.yaml) |
+
+The following legacy LoRA benchmarks were migrated to SQuAD fine-tuning.
+The replacements preserve TP2, local/global batch sizes, compilation settings,
+and one- or two-node topology. They pack real examples into 4,096-token rows,
+so local batches count packed rows; performance figures from the historical mock
+workloads do not measure these replacements.
+Run each replacement with `automodel <config.yaml> --benchmark` for its nightly
+performance workload.
+
+| Removed benchmark | Fine-tuning replacement |
+|---|---|
+| `llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml` | [llama3_3/llama_3_3_70b_instruct_squad_tp2_peft.yaml](../llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_tp2_peft.yaml) |
+| `llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml` | [llama3_3/llama_3_3_70b_instruct_squad_tp2_peft_2nodes.yaml](../llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_tp2_peft_2nodes.yaml) |
+| `qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml` | [qwen/qwen2_5_32b_squad_tp2_peft_2nodes.yaml](../llm_finetune/qwen/qwen2_5_32b_squad_tp2_peft_2nodes.yaml) |
 
 ## Interpreting throughput
 

@@ -395,7 +395,6 @@ class TestGptOssAttentionWithTE:
             except Exception as e:
                 pytest.fail(f"TE forward pass with BSHD format failed: {e}")
 
-    @pytest.mark.skip(reason="THD format is not supported for GPT-OSS")
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_forward_with_thd_format(self, gpt_config, te_backend_config, device):
         """Test TE attention forward pass with THD format."""
@@ -421,6 +420,128 @@ class TestGptOssAttentionWithTE:
                 assert output.device == device
             except Exception as e:
                 pytest.fail(f"TE forward pass with THD format failed: {e}")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("use_sliding_attention", [False, True], ids=["full", "sliding"])
+    def test_te_thd_packed_documents_match_separate_execution(
+        self, gpt_config, te_backend_config, device, use_sliding_attention
+    ):
+        """Packed TE THD attention reproduces separate-document execution.
+
+        The production packer, THD collater and THD preparation flatten two
+        48-token rows: documents of 17 and 26 tokens, then one of 35 tokens,
+        each row ending in padding. Valid-token outputs and the gradients of
+        every projection and of the learnable sinks must match separate BSHD
+        runs. Changing the first document or the padding must leave the other
+        documents' outputs bit-identical. The attention uses GPT-OSS's released
+        head dimension of 64.
+        """
+        pytest.importorskip("transformer_engine")
+        from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
+        from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+        from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+        from nemo_automodel.components.models.common.utils import get_rope_config
+        from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
+        from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+
+        torch.manual_seed(0)
+        # Shorter than every document, so the window limits attention.
+        gpt_config.sliding_window = 8
+        # Released GPT-OSS head dimension. Before cuDNN 9.26, TE's packed sink
+        # backward is wrong for generic head dimensions such as the fixture's 32
+        # when a call holds several documents (NVIDIA/TransformerEngine#3249).
+        gpt_config.head_dim = 64
+        attention = GptOssAttention(gpt_config, te_backend_config, use_sliding_attention=use_sliding_attention)
+        attention = attention.to(device)
+        attention.init_weights(device)
+        rope_theta, rope_scaling, _ = get_rope_config(gpt_config)
+        rotary_emb = RotaryEmbedding(
+            head_dim=gpt_config.head_dim,
+            base=rope_theta,
+            dtype=torch.float32,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
+            device=device,
+        )
+
+        doc_lens = (17, 26, 35)
+        docs = [{"input_ids": list(range(1, n + 1)), "labels": list(range(1, n + 1))} for n in doc_lens]
+        thd = process_input_for_thd(packed_sequence_thd_collater(list(pack_dataset(docs, None, 48))))
+        attn_keys = ("qkv_format", "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "pad_between_seqs")
+        _, position_ids, _, attn_kwargs = squeeze_input_for_thd(
+            None, thd["position_ids"], None, {key: thd[key] for key in attn_keys}
+        )
+        attn_kwargs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in attn_kwargs.items()}
+        # The first row's trailing padding sits between documents in the flattened stream.
+        assert attn_kwargs["pad_between_seqs"]
+        starts = attn_kwargs["cu_seqlens_padded"][:-1].tolist()
+        spans = [slice(start, start + n) for start, n in zip(starts, doc_lens, strict=True)]
+        num_tokens = position_ids.numel()
+        assert num_tokens == 2 * 48
+        packed_freqs_cis = position_ids_to_freqs_cis(
+            rotary_emb, position_ids.to(device), qkv_format="thd", for_fused_rope=False
+        )
+
+        def run_packed(hidden_states: torch.Tensor) -> torch.Tensor:
+            """Run packed TE THD attention.
+
+            Args:
+                hidden_states: Tensor of shape [tokens, hidden] holding both
+                    flattened packed rows, including their padding.
+
+            Returns:
+                Tensor of shape [tokens, hidden]; padding positions are unspecified.
+            """
+            return attention(hidden_states, packed_freqs_cis, **attn_kwargs)
+
+        def run_separate(hidden_states: torch.Tensor) -> torch.Tensor:
+            """Run one document alone through TE BSHD attention.
+
+            Args:
+                hidden_states: Tensor of shape [sequence, hidden] for one document.
+
+            Returns:
+                Tensor of shape [sequence, hidden].
+            """
+            positions = torch.arange(hidden_states.shape[0], device=device).unsqueeze(0)
+            freqs_cis = position_ids_to_freqs_cis(rotary_emb, positions, qkv_format="bshd", for_fused_rope=False)
+            return attention(hidden_states.unsqueeze(0), freqs_cis).squeeze(0)
+
+        x = torch.randn(num_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+        loss_weights = torch.randn_like(x)
+
+        packed = run_packed(x)
+        separate = [run_separate(x[span]) for span in spans]
+        for span, expected in zip(spans, separate, strict=True):
+            torch.testing.assert_close(packed[span], expected)
+
+        # Both losses read only real tokens and receive identical upstream gradients.
+        packed_loss = sum((packed[span] * loss_weights[span]).float().sum() for span in spans)
+        separate_loss = sum((out * loss_weights[span]).float().sum() for span, out in zip(spans, separate, strict=True))
+        params = dict(attention.named_parameters())
+        assert any("softmax_offset" in name for name in params)
+        packed_grads = torch.autograd.grad(packed_loss, list(params.values()))
+        separate_grads = torch.autograd.grad(separate_loss, list(params.values()))
+        for name, got, expected in zip(params, packed_grads, separate_grads, strict=True):
+            # Parameter gradients accumulate the same BF16 products in a different
+            # order. Observed relative L2 differences are below 0.5%.
+            relative = (got.float() - expected.float()).norm() / expected.float().norm()
+            assert relative < 2e-2, f"{name} gradient differs by relative L2 {relative.item():.3e}"
+
+        padding = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        for span in spans:
+            padding[span] = False
+        changed = x.clone()
+        changed[spans[0]] += torch.randn_like(changed[spans[0]])
+        changed[padding] = 100 * torch.randn_like(changed[padding])
+        with torch.no_grad():
+            reference = run_packed(x)
+            perturbed = run_packed(changed)
+        assert not torch.equal(perturbed[spans[0]], reference[spans[0]])
+        for span in spans[1:]:
+            assert torch.equal(perturbed[span], reference[span])
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_forward_with_sliding_window(self, gpt_config, te_backend_config, device):
