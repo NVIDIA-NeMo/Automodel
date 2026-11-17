@@ -41,6 +41,19 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class _PackedInput:
+    """Loader metadata for the documents packed into padded rows.
+
+    Attributes:
+        indices: int64 Tensor of shape [batch, sequence] holding row-local token
+            positions with ``-1`` padding, or a pre-flattened Tensor of shape
+            [tokens] indexing the row-major [batch, sequence] layout.
+        cu: int32 Tensor of shape [batch, max_documents + 1] holding row-local
+            cumulative document lengths with ``-1`` after each row's last
+            boundary, or a pre-flattened Tensor of shape [documents + 1] over
+            the unpadded token stream.
+        maximum: Longest document in tokens, excluding the memory prefix.
+    """
+
     indices: torch.Tensor
     cu: torch.Tensor
     maximum: int
@@ -48,6 +61,17 @@ class _PackedInput:
 
 @dataclass(frozen=True)
 class _PhysicalDocuments:
+    """Boundaries of the expanded stream, where every document starts with its own memory prefix.
+
+    Attributes:
+        cu: int32 Tensor of shape [documents + 1] holding cumulative lengths of
+            the prefixed documents over the [physical_tokens] stream, where
+            physical_tokens = tokens + documents * prefix.
+        seq_idx: int32 Tensor of shape [1, physical_tokens] holding each
+            physical token's document index.
+        maximum: Longest prefixed document, in tokens.
+    """
+
     cu: torch.Tensor
     seq_idx: torch.Tensor
     maximum: int
@@ -58,7 +82,30 @@ def _expand_documents(
     memory: torch.Tensor,
     packed: _PackedInput,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, _PhysicalDocuments]:
-    """Insert one learned prefix per document, retaining differentiable gathers."""
+    """Insert one learned prefix per document, retaining differentiable gathers.
+
+    Args:
+        embeddings: Tensor of shape [batch, sequence, hidden] holding the padded
+            packed rows' token embeddings.
+        memory: Tensor of shape [prefix, hidden] holding the learned memory
+            tokens prepended to every document.
+        packed: Locations of the real tokens and document boundaries in
+            ``embeddings``.
+
+    Returns:
+        A tuple of:
+        - Tensor of shape [1, physical_tokens, hidden], where physical_tokens =
+          tokens + documents * prefix. Each document's prefix precedes its
+          tokens; the tensor is new and differentiable with respect to
+          ``embeddings`` and ``memory``.
+        - int64 Tensor of shape [1, physical_tokens] holding positions that
+          restart at zero at each prefix.
+        - int64 Tensor of shape [tokens] holding each real token's physical
+          position.
+        - int64 Tensor of shape [tokens] holding each real token's index into
+          ``embeddings.flatten(0, 1)``.
+        - The prefixed documents' boundaries.
+    """
     indices, cu = flatten_packed_sequence_metadata(
         packed.indices,
         packed.cu,
@@ -124,6 +171,48 @@ def _root_forward(
     padding_mask: torch.Tensor | None = None,
     _packed_seq_ids: torch.Tensor | None = None,
 ) -> Any:
+    """Route loader packing metadata into the released causal-LM forward.
+
+    Args:
+        input_ids: Tensor of shape [batch, sequence] holding token IDs. Packed
+            rows hold several documents followed by padding.
+        attention_mask: Tensor of shape [batch, sequence] holding the release's
+            0/1 padding mask. Packed calls replace it with the packing metadata.
+        position_ids: Tensor of shape [batch, sequence]. Packed calls ignore it
+            and restart positions at each document's memory prefix.
+        past_key_values: Release attention cache; packed calls reject it.
+        inputs_embeds: Tensor of shape [batch, sequence, hidden], used instead
+            of ``input_ids``.
+        labels: Tensor of shape [batch, sequence] for the release's own loss.
+        use_cache: Whether to return caches; packed calls reject True.
+        output_attentions: Release flag; packed calls reject True.
+        output_hidden_states: Release flag; packed calls reject True.
+        return_dict: Whether the release returns a ``ModelOutput``.
+        calc_logits_for_entire_prompt: Release flag selecting full-prompt logits.
+        fla_past_key_values: Release DeltaNet cache; packed calls reject it.
+        mamba_inference_params: Release Mamba cache; packed calls reject it.
+        packed_token_indices: Real-token positions; see ``_PackedInput.indices``.
+        cu_seqlens: Document boundaries; see ``_PackedInput.cu``.
+        max_seqlen: Longest document in tokens.
+        cu_seq_lens_q: int32 Tensor of shape [segments + 1] from the generic
+            FlashAttention packer; rejected without ``packed_token_indices``.
+        cu_seq_lens_k: int32 Tensor of shape [segments + 1]; rejected likewise.
+        max_length_q: Generic FlashAttention maximum; rejected likewise.
+        max_length_k: Generic FlashAttention maximum; rejected likewise.
+        padding_mask: bool Tensor of shape [batch, sequence] from the collater;
+            ignored.
+        _packed_seq_ids: Tensor of shape [batch, sequence] holding document IDs
+            from the collater; ignored.
+
+    Returns:
+        The release's causal-LM output. Its logits have shape [batch, sequence,
+        vocab] in the padded input layout; packed padding positions carry zero
+        hidden states.
+
+    Raises:
+        ValueError: If packing metadata is incomplete, a cache is requested
+            with packing, or only generic FlashAttention metadata is supplied.
+    """
     del padding_mask, _packed_seq_ids
     kwargs = dict(
         input_ids=input_ids,
@@ -162,6 +251,28 @@ def _backbone_forward(
     inputs_embeds: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> Any:
+    """Run the released backbone over prefixed documents when packing metadata is present.
+
+    Args:
+        input_ids: Tensor of shape [batch, sequence] holding token IDs.
+        attention_mask: Tensor of shape [batch, sequence] holding the release's
+            0/1 padding mask, or the packing metadata on packed calls.
+        position_ids: Tensor of shape [batch, sequence]; unused on packed calls.
+        inputs_embeds: Tensor of shape [batch, sequence, hidden], used instead
+            of ``input_ids``.
+        **kwargs: Remaining release arguments, forwarded unchanged on unpacked
+            calls.
+
+    Returns:
+        On packed calls, a ``MoeModelOutputWithPast`` whose last_hidden_state
+        is a new Tensor of shape [batch, sequence, hidden] in the padded input
+        layout, without memory prefixes and with zeros at padding positions; a
+        one-element tuple holding that tensor when ``return_dict`` is False.
+        Unpacked calls return the release's output.
+
+    Raises:
+        ValueError: If a packed call requests attention or hidden-state outputs.
+    """
     if not isinstance(attention_mask, _PackedInput):
         return self._nemo_unpacked_forward(
             input_ids=input_ids,
@@ -203,6 +314,23 @@ def _mamba_forward(
     attention_mask: torch.Tensor | _PhysicalDocuments | None = None,
     **kwargs: Any,
 ) -> Any:
+    """Reset the Mamba2 convolution and scan state at packed document boundaries.
+
+    Args:
+        hidden_states: Tensor of shape [batch, sequence, hidden]. Packed calls
+            pass the prefixed stream as [1, physical_tokens, hidden].
+        attention_mask: The release's mask, or the prefixed documents'
+            boundaries on packed calls.
+        **kwargs: Remaining release arguments, forwarded unchanged on unpacked
+            calls.
+
+    Returns:
+        A tuple of a Tensor with the shape of ``hidden_states`` and the
+        release's unchanged ``past_key_value``.
+
+    Raises:
+        ValueError: If a packed call uses Mamba tensor parallelism.
+    """
     if not isinstance(attention_mask, _PhysicalDocuments):
         return self._nemo_unpacked_forward(hidden_states, attention_mask=attention_mask, **kwargs)
     if self.process_group is not None:
@@ -238,6 +366,21 @@ def _delta_forward(
     attention_mask: torch.Tensor | _PhysicalDocuments | None = None,
     **kwargs: Any,
 ) -> Any:
+    """Pass packed document boundaries to the released DeltaNet kernels.
+
+    Args:
+        hidden_states: Tensor of shape [batch, sequence, hidden]. Packed calls
+            pass the prefixed stream as [1, physical_tokens, hidden].
+        attention_mask: Tensor of shape [batch, sequence] holding the release's
+            0/1 padding mask, or the prefixed documents' boundaries. On packed
+            calls the boundaries reach the delta rule as ``cu_seqlens`` and the
+            short convolutions through the release's ``position_ids`` argument.
+        **kwargs: Remaining release arguments.
+
+    Returns:
+        The release's DeltaNet output tuple, whose first element has the shape
+        of ``hidden_states``.
+    """
     if isinstance(attention_mask, _PhysicalDocuments):
         kwargs.update(position_ids=attention_mask, cu_seqlens=attention_mask.cu)
         attention_mask = None
@@ -250,6 +393,21 @@ def _short_convolution_forward(
     seq_idx: torch.Tensor | _PhysicalDocuments | None = None,
     **kwargs: Any,
 ) -> Any:
+    """Translate packed boundaries into the installed FLA short-convolution API.
+
+    Args:
+        *args: Positional release arguments.
+        seq_idx: int32 Tensor of shape [batch, sequence] holding document
+            indices, or the prefixed documents' boundaries on packed calls.
+            Those become ``cu_seqlens`` when the installed convolution accepts
+            it and otherwise its ``seq_idx`` tensor.
+        **kwargs: Remaining release arguments, including ``x``: Tensor of shape
+            [batch, sequence, channels].
+
+    Returns:
+        The convolution's output tuple, whose first element has the shape of
+        ``x``.
+    """
     if isinstance(seq_idx, _PhysicalDocuments):
         if self._nemo_packing_uses_cu:
             kwargs["cu_seqlens"] = seq_idx.cu
@@ -267,6 +425,23 @@ def _attention_forward(
     query_length: int,
     **kwargs: Any,
 ) -> torch.Tensor:
+    """Run released FlashAttention-2 inputs with variable-length document boundaries.
+
+    Args:
+        query: Tensor of shape [batch, sequence, heads, head_dim]. Packed calls
+            pass [1, physical_tokens, heads, head_dim].
+        key: Tensor of shape [batch, sequence, heads, head_dim], already
+            repeated to the query heads by the release.
+        value: Tensor of shape [batch, sequence, heads, value_head_dim].
+        attention_mask: Tensor of shape [batch, sequence] holding the release's
+            0/1 padding mask, or the prefixed documents' boundaries.
+        query_length: Query sequence length.
+        **kwargs: Release options: ``dropout``, ``softmax_scale`` and
+            ``use_sliding_windows``.
+
+    Returns:
+        Tensor of shape [batch, sequence, heads, value_head_dim].
+    """
     if not isinstance(attention_mask, _PhysicalDocuments):
         return self._nemo_unpacked_flash(query, key, value, attention_mask, query_length, **kwargs)
     _, flash = safe_import_from("flash_attn", "flash_attn_varlen_func")

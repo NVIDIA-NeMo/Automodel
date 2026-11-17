@@ -35,6 +35,18 @@ from nemo_automodel.shared.import_utils import safe_import_from
 
 @dataclass(frozen=True)
 class _FlashBoundaries:
+    """Generic FlashAttention varlen boundaries for packed rows.
+
+    Attributes:
+        cu_q: int32 Tensor of shape [segments + 1] holding cumulative query
+            lengths over the row-major flattened [batch * sequence] stream.
+            Physical padding runs are segments of their own.
+        cu_k: int32 Tensor of shape [segments + 1] holding the matching key
+            boundaries.
+        max_q: Longest query segment, in tokens.
+        max_k: Longest key segment, in tokens.
+    """
+
     cu_q: torch.Tensor
     cu_k: torch.Tensor
     max_q: int
@@ -42,7 +54,25 @@ class _FlashBoundaries:
 
 
 def _packed_attention(self: nn.Module, hidden: torch.Tensor, metadata: _FlashBoundaries, **kwargs: Any) -> Any:
-    """Use the released projections/RoPE with explicit, padding-aware segments."""
+    """Use the released projections/RoPE with explicit, padding-aware segments.
+
+    Args:
+        hidden: Tensor of shape [batch, sequence, hidden] holding normalized
+            packed rows.
+        metadata: Segment boundaries over the flattened rows.
+        **kwargs: Release attention arguments. ``position_embeddings`` is a
+            tuple of cos and sin Tensors of shape [batch, sequence, head_dim];
+            without it, ``position_ids`` (Tensor of shape [batch, sequence])
+            rebuilds them.
+
+    Returns:
+        A tuple of a Tensor of shape [batch, sequence, hidden] holding the
+        attention output after ``o_proj``, and two ``None`` placeholders for
+        the release's attention weights and cache.
+
+    Raises:
+        ValueError: If a KV cache or sink attention is requested.
+    """
     if kwargs.get("use_cache") or kwargs.get("past_key_value") is not None:
         raise ValueError("Packed DeciLM attention does not support a KV cache")
     if self.attention_config.is_sink:
@@ -94,6 +124,41 @@ def _root_forward(
     padding_mask: torch.Tensor | None = None,
     _packed_seq_ids: torch.Tensor | None = None,
 ) -> Any:
+    """Route generic FlashAttention packing metadata into the released DeciLM forward.
+
+    Args:
+        input_ids: Tensor of shape [batch, sequence] holding token IDs. Packed
+            rows hold several documents followed by padding.
+        attention_mask: Tensor of shape [batch, sequence] holding the release's
+            0/1 padding mask. Packed calls replace it with segment boundaries.
+        position_ids: Tensor of shape [batch, sequence] holding positions that
+            restart at each packed document.
+        past_key_values: Release KV cache; packed calls reject it.
+        inputs_embeds: Tensor of shape [batch, sequence, hidden], used instead
+            of ``input_ids``.
+        labels: Tensor of shape [batch, sequence] for the release's own loss.
+        use_cache: Whether to return a cache; packed calls reject True.
+        output_attentions: Release flag.
+        output_hidden_states: Release flag.
+        return_dict: Whether the release returns a ``ModelOutput``.
+        cache_position: Tensor of shape [sequence] holding cache positions.
+        cu_seq_lens_q: Query boundaries; see ``_FlashBoundaries.cu_q``.
+        cu_seq_lens_k: Key boundaries; see ``_FlashBoundaries.cu_k``.
+        max_length_q: Longest query segment, in tokens.
+        max_length_k: Longest key segment, in tokens.
+        padding_mask: bool Tensor of shape [batch, sequence] from the collater;
+            ignored.
+        _packed_seq_ids: Tensor of shape [batch, sequence] holding document IDs
+            from the collater; ignored.
+
+    Returns:
+        The release's causal-LM output, whose logits have shape [batch,
+        sequence, vocab].
+
+    Raises:
+        ValueError: If packing metadata is incomplete or a cache is requested
+            with packing.
+    """
     del padding_mask, _packed_seq_ids
     kwargs = dict(
         input_ids=input_ids,
@@ -124,6 +189,17 @@ def _causal_mask(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
+    """Keep packed boundaries instead of building the release's causal mask.
+
+    Args:
+        attention_mask: Tensor of shape [batch, sequence] holding the release's
+            0/1 padding mask, or packed segment boundaries.
+        *args: Remaining release mask arguments.
+        **kwargs: Remaining release mask arguments.
+
+    Returns:
+        The boundaries unchanged on packed calls; otherwise the release's mask.
+    """
     if isinstance(attention_mask, _FlashBoundaries):
         return attention_mask
     return self._nemo_unpacked_causal_mask(attention_mask, *args, **kwargs)
@@ -138,6 +214,27 @@ def _attention_forward(
     max_length_k: int | None = None,
     **kwargs: Any,
 ) -> Any:
+    """Dispatch packed calls to varlen attention and others to the released forward.
+
+    Args:
+        *args: Positional release arguments; the first is ``hidden_states``.
+        cu_seq_lens_q: Query boundaries forwarded by the shared pipeline
+            forward; see ``_FlashBoundaries.cu_q``.
+        cu_seq_lens_k: Key boundaries; see ``_FlashBoundaries.cu_k``.
+        max_length_q: Longest query segment, in tokens.
+        max_length_k: Longest key segment, in tokens.
+        **kwargs: Release arguments, including ``hidden_states``: Tensor of
+            shape [batch, sequence, hidden] and ``attention_mask``: Tensor of
+            shape [batch, sequence] or packed segment boundaries.
+
+    Returns:
+        The release's attention tuple, whose first element is a Tensor of shape
+        [batch, sequence, hidden].
+
+    Raises:
+        ValueError: If pipeline metadata is incomplete or a cache is requested
+            with packing.
+    """
     # PP preserves these tensor kwargs even though the legacy top-level forward
     # has been replaced by the shared pipeline forward.
     if cu_seq_lens_q is not None:
