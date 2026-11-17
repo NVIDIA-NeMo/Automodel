@@ -95,6 +95,16 @@ def _dcp_parameter_name(name: str) -> str:
     return canonical_parameter_fqn(name).replace("_orig_mod.", "")
 
 
+def _dcp_module_path(path: str) -> str:
+    """Normalize a ``named_modules()`` path the way ``_dcp_parameter_name`` normalizes parameter names."""
+    return _dcp_parameter_name(f"{path}.").removesuffix(".")
+
+
+# Containers that Hugging Face PEFT refuses to wrap in modules_to_save: they have no callable
+# forward, and models index or slice them (e.g. ``self.layers[: num_layers]``).
+_UNWRAPPABLE_MODULE_TYPES = (torch.nn.ModuleList, torch.nn.ModuleDict, torch.nn.ParameterList, torch.nn.ParameterDict)
+
+
 def _trainable_non_lora_parameter_names(model_parts: list[torch.nn.Module]) -> set[str]:
     """Return the DCP state-dict names of trainable parameters that are not LoRA weights.
 
@@ -223,12 +233,15 @@ class _TrainableModuleLayout:
         adapted: Paths of the modules that own LoRA parameters.
         fully_trainable: For every module path that holds parameters, whether all of
             them are trainable non-LoRA parameters.
+        containers: Paths of the ``ModuleList``, ``ModuleDict``, ``ParameterList`` and
+            ``ParameterDict`` modules, which HF PEFT cannot wrap in ``modules_to_save``.
     """
 
     trainable: frozenset[str]
     aliased: tuple[tuple[str, ...], ...]
     adapted: frozenset[str]
     fully_trainable: dict[str, bool]
+    containers: frozenset[str]
 
     def merge(self, other: "_TrainableModuleLayout") -> "_TrainableModuleLayout":
         """Combine the layouts of two pipeline stages that hold different parameters.
@@ -243,6 +256,7 @@ class _TrainableModuleLayout:
             aliased=self.aliased + other.aliased,
             adapted=self.adapted | other.adapted,
             fully_trainable=fully_trainable,
+            containers=self.containers | other.containers,
         )
 
 
@@ -266,9 +280,16 @@ def _trainable_module_layout(model_parts: Sequence[torch.nn.Module]) -> _Trainab
     aliased: list[tuple[str, ...]] = []
     adapted: set[str] = set()
     fully_trainable: dict[str, bool] = {}
+    containers: set[str] = set()
     for part in model_parts:
+        module = _unwrap_ddp_model(part)
+        containers.update(
+            _dcp_module_path(path)
+            for path, submodule in module.named_modules(remove_duplicate=False)
+            if isinstance(submodule, _UNWRAPPABLE_MODULE_TYPES)
+        )
         names_by_parameter: dict[int, list[str]] = {}
-        for raw_name, parameter in _unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
+        for raw_name, parameter in module.named_parameters(remove_duplicate=False):
             name = _dcp_parameter_name(raw_name)
             is_lora = "lora_" in name
             is_full_weight = parameter.requires_grad and not is_lora
@@ -289,7 +310,36 @@ def _trainable_module_layout(model_parts: Sequence[torch.nn.Module]) -> _Trainab
         aliased=tuple(aliased),
         adapted=frozenset(adapted),
         fully_trainable=fully_trainable,
+        containers=frozenset(containers),
     )
+
+
+def _full_module_of(layout: _TrainableModuleLayout, name: str) -> str:
+    """Return the module a PEFT checkpoint stores whole for the trainable parameter ``name``.
+
+    This is the largest module on the parameter's path that HF PEFT can wrap and whose parameters
+    all train in full; an empty string when there is none. HF PEFT wraps every module listed in
+    ``modules_to_save`` and loads all of its state-dict entries from the adapter file. Listing a
+    submodule of a fully trained module breaks loading when PEFT also wraps the parent; for
+    sequence classification it always wraps ``classifier``/``score``. Containers such as a
+    ``ModuleList`` of decoder layers cannot be wrapped, so the search continues past them: a
+    trained ``model.layers`` is stored as ``model.layers.0``, ``model.layers.1``, and so on, unless
+    an enclosing module such as ``model`` trains in full as well.
+
+    Args:
+        layout: Layout of the whole model, from ``_combined_trainable_module_layout``.
+        name: A trainable non-LoRA parameter name from ``layout.trainable``.
+
+    Returns:
+        The module's native name.
+    """
+    full_module = ""
+    module = name.rpartition(".")[0]
+    while module and layout.fully_trainable.get(module, False):
+        if module not in layout.containers:
+            full_module = module
+        module = module.rpartition(".")[0]
+    return full_module
 
 
 def _validate_trainable_module_layout(layout: _TrainableModuleLayout) -> None:
@@ -302,9 +352,11 @@ def _validate_trainable_module_layout(layout: _TrainableModuleLayout) -> None:
         ValueError: If a trainable non-LoRA parameter has several names (``modules_to_save``
             would restore each alias as a separate copy, untying them), belongs to the root
             module (``modules_to_save`` names submodules), shares a module path with a
-            LoRA adapter (the adapter and a full copy of the same module conflict on load), or
+            LoRA adapter (the adapter and a full copy of the same module conflict on load),
             belongs to a module that also has frozen parameters (HF PEFT restores a
-            ``modules_to_save`` module whole, so the adapter would need those as well).
+            ``modules_to_save`` module whole, so the adapter would need those as well), or
+            belongs to a container that HF PEFT cannot wrap, such as a ``ParameterList``,
+            with no enclosing module that trains in full.
     """
     if layout.aliased:
         raise ValueError(
@@ -346,6 +398,14 @@ def _validate_trainable_module_layout(layout: _TrainableModuleLayout) -> None:
             "have frozen parameters. Hugging Face PEFT restores each modules_to_save module whole, so it would "
             "look for the frozen parameters in the adapter too. Train these modules in full or keep them frozen; "
             "freeze_config.unfreeze_parameters and freeze_parameters can select part of a module."
+        )
+    in_containers = sorted(name for name in layout.trainable if not _full_module_of(layout, name))
+    if in_containers:
+        raise ValueError(
+            f"PEFT checkpoints cannot store the trainable parameters {in_containers[:10]}: they belong to a "
+            "ParameterList, ParameterDict, ModuleList or ModuleDict, which Hugging Face PEFT cannot restore "
+            "through modules_to_save, and no enclosing module trains in full. Train the enclosing module in "
+            "full or keep these parameters frozen."
         )
 
 
@@ -393,11 +453,8 @@ def _combined_trainable_module_layout(
 def _fully_trained_modules(layout: _TrainableModuleLayout) -> list[str]:
     """Return the modules a PEFT checkpoint stores whole, under their native names.
 
-    Each entry is the largest module whose parameters are all trainable and none of them LoRA
-    weights. HF PEFT wraps every module listed in ``modules_to_save`` and loads all of its
-    state-dict entries from the adapter file. Naming a submodule of a fully trained module
-    breaks loading when PEFT also wraps the parent; for sequence classification it always
-    wraps ``classifier``/``score``.
+    Each entry is the largest module that HF PEFT can wrap and whose parameters are all trainable
+    and none of them LoRA weights; see ``_full_module_of``.
 
     This only names the modules. Writers of ``adapter_config.json`` reject layouts HF PEFT
     cannot restore first, with ``_validate_trainable_module_layout``.
@@ -408,14 +465,7 @@ def _fully_trained_modules(layout: _TrainableModuleLayout) -> list[str]:
     Returns:
         Sorted module names. Empty when only LoRA weights train.
     """
-    modules = set()
-    for name in layout.trainable:
-        module = name.rpartition(".")[0]
-        while "." in module and layout.fully_trainable.get(module.rpartition(".")[0], False):
-            module = module.rpartition(".")[0]
-        if module:
-            modules.add(module)
-    return sorted(modules)
+    return sorted({_full_module_of(layout, name) for name in layout.trainable} - {""})
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:

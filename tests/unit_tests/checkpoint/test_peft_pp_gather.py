@@ -368,6 +368,30 @@ class TestExtractModulesToSavePPUnion:
                 "model.norm",
             ]
 
+    def test_trained_layer_container_split_across_stages_is_listed_by_block(self, monkeypatch):
+        """Each stage's ``model.layers`` ModuleDict holds one trained block; HF PEFT cannot wrap the container.
+
+        The last stage holds no frozen ``model`` parameter, so only the combined layout keeps it
+        from listing ``model`` whole.
+        """
+        stages = []
+        for index in range(2):
+            stage = nn.Module()
+            stage.model = nn.Module()
+            stage.model.layers = nn.ModuleDict({str(index): nn.LayerNorm(2)})
+            stages.append(stage)
+        stages[0].model.embed_tokens = nn.Embedding(4, 2).requires_grad_(False)
+        stages[1].lm_head = nn.Linear(2, 4).requires_grad_(False)
+        stages[1].lm_head.lora_A = nn.Linear(2, 1, bias=False)
+        layouts = [_trainable_module_layout([stage]) for stage in stages]
+        _install_fake_distributed(monkeypatch, layouts)
+
+        for stage in stages:
+            assert _extract_modules_to_save([stage], pp_group=_FakePPGroup(layouts)) == [
+                "model.layers.0",
+                "model.layers.1",
+            ]
+
 
 class TestExtractTargetParametersPPUnion:
     def test_remote_expert_lora_enables_v5_metadata_on_every_stage(self, monkeypatch):

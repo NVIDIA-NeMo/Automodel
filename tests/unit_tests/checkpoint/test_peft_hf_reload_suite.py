@@ -947,6 +947,49 @@ def test_fully_trained_modules_reload_in_hf_peft(
             )
 
 
+@pytest.mark.parametrize(
+    ("unfreeze_modules", "modules_to_save"),
+    [
+        pytest.param(["model.layers"], ["model.layers.0"], id="decoder-layer-list"),
+        pytest.param(["model"], ["model"], id="whole-backbone"),
+    ],
+)
+def test_trained_module_lists_are_saved_as_modules_hf_peft_can_wrap(
+    unfreeze_modules: list[str], modules_to_save: list[str], tmp_path: Path, peft_process_group
+):
+    """A trained ``ModuleList`` is listed through its blocks, and an enclosing trained module still wins.
+
+    HF PEFT rejects a ``ModuleList`` in ``modules_to_save``, so training ``model.layers`` next to
+    LoRA used to save and resume fine but give an adapter that HF PEFT could not load. The layers
+    are listed one by one instead, unless the whole backbone trains in full, which PEFT wraps
+    as one module.
+    """
+    from peft import PeftModel
+
+    model, reference, peft_config = _adapted_model(
+        _Family("llama_lm_head_lora", _build_llama, {"target_modules": ["lm_head"]}), tmp_path / "source"
+    )
+    apply_parameter_freezing(model, {"unfreeze_modules": [{"path": path} for path in unfreeze_modules]})
+    trained = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
+    with torch.no_grad():
+        for name, parameter in trained.items():
+            if ".lora_" not in name:
+                parameter.add_(torch.randn_like(parameter), alpha=0.05)
+    adapter_dir = _save_through_checkpointer(model, peft_config, tmp_path)
+
+    config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    assert config["modules_to_save"] == modules_to_save
+
+    loaded = PeftModel.from_pretrained(reference, str(adapter_dir), autocast_adapter_dtype=False).eval()
+    with torch.no_grad():
+        expected = model(_INPUT_IDS, use_cache=False).logits
+        torch.testing.assert_close(loaded(_INPUT_IDS, use_cache=False).logits, expected, rtol=1e-5, atol=1e-6)
+    merged = dict(loaded.merge_and_unload().named_parameters())
+    for name, parameter in trained.items():
+        if ".lora_" not in name:
+            torch.testing.assert_close(merged[name], parameter, rtol=0, atol=0, msg=f"merged {name} is not trained")
+
+
 @pytest.mark.parametrize("family", _params(tuple(family for family in _FAMILIES if family.layout_is_native)))
 def test_fully_trained_modules_resume_through_our_loader(family: _Family, tmp_path: Path, peft_process_group):
     """Resuming from the adapter checkpoint restores the fully trained modules with the LoRA weights.

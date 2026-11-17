@@ -801,6 +801,47 @@ def test_modules_to_save_split_combined_projections_and_follow_adapter_renames()
     ]
 
 
+def _model_with_blocks_in(container: type[nn.Module]) -> nn.Module:
+    """LoRA on the head only, and a backbone whose two blocks sit in ``container`` next to a norm."""
+    model = nn.Module()
+    model.backbone = nn.Module()
+    blocks = [nn.LayerNorm(4), nn.LayerNorm(4)]
+    model.backbone.layers = (
+        nn.ModuleDict({str(index): block for index, block in enumerate(blocks)})
+        if container is nn.ModuleDict
+        else nn.ModuleList(blocks)
+    )
+    model.backbone.norm = nn.LayerNorm(4)
+    model.head = nn.Linear(4, 2)
+    assert apply_lora_to_linear_modules(model, PeftConfig(target_modules=["head"], dim=2, alpha=4)) == 1
+    return model
+
+
+@pytest.mark.parametrize("container", [nn.ModuleList, nn.ModuleDict], ids=["module-list", "module-dict"])
+@pytest.mark.parametrize(
+    ("unfreeze_modules", "modules_to_save"),
+    [
+        pytest.param(["backbone.layers"], ["backbone.layers.0", "backbone.layers.1"], id="whole-container"),
+        pytest.param(["backbone.layers.1"], ["backbone.layers.1"], id="one-block"),
+        pytest.param(["backbone"], ["backbone"], id="enclosing-module"),
+    ],
+)
+def test_modules_to_save_never_names_a_module_container(container, unfreeze_modules, modules_to_save):
+    """HF PEFT refuses to wrap a ModuleList or ModuleDict, so a trained one is listed through its blocks.
+
+    A trained enclosing module is still listed whole, the same way a trained classifier is.
+    """
+    model = _model_with_blocks_in(container)
+    apply_parameter_freezing(model, {"unfreeze_modules": [{"path": path} for path in unfreeze_modules]})
+
+    validate_peft_trainable_modules(model)
+    assert _extract_modules_to_save([model]) == modules_to_save
+
+
+def _add_a_trained_parameter_list(model: nn.Module) -> None:
+    model.encoder.scales = nn.ParameterList([nn.Parameter(torch.ones(4))])
+
+
 def _tie_classifier_to_a_second_head(model: nn.Module) -> None:
     model.head = nn.Linear(4, 2)
     model.head.weight = model.classifier.out_proj.weight
@@ -829,6 +870,7 @@ def _freeze_the_head_output_bias(model: nn.Module) -> None:
         pytest.param(
             ["classifier"], _freeze_the_head_output_bias, "also have frozen parameters", id="freeze-part-of-a-module"
         ),
+        pytest.param([], _add_a_trained_parameter_list, "belong to a ParameterList", id="parameter-list"),
     ],
 )
 def test_peft_rejects_trainable_modules_hf_peft_cannot_restore(unfreeze_modules, modify, message):
