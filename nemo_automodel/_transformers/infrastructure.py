@@ -40,6 +40,7 @@ from nemo_automodel._transformers.v4_patches.kv_sharing import (
 )
 from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components.checkpoint.addons import validate_peft_trainable_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
@@ -919,6 +920,11 @@ def apply_model_infrastructure(
                 "The configured trainability policy left no trainable parameters; "
                 "check freeze_config and the PEFT configuration."
             )
+    if peft_config is not None:
+        # Modules freeze_config unfreezes next to LoRA are saved whole with the adapter;
+        # reject layouts the adapter checkpoint cannot restore before training starts.
+        for mp in trainability_models:
+            validate_peft_trainable_modules(mp)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded

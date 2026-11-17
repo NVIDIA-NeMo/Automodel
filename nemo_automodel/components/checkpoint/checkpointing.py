@@ -56,7 +56,6 @@ from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
-from torch.nn.parallel import DistributedDataParallel
 from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
@@ -79,7 +78,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState, _unwrap_ddp_model
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
     estimate_state_dict_bytes,
@@ -222,13 +221,6 @@ def load_torch_ckpt(
         )
     except pickle.UnpicklingError as err:
         raise RuntimeError(_format_restricted_load_error(f)) from err
-
-
-def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
-    """Return the module that owns model metadata hidden by DDP."""
-    if isinstance(model, DistributedDataParallel):
-        return model.module
-    return model
 
 
 def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None) -> bool:
@@ -777,6 +769,7 @@ class Checkpointer:
                 hf_metadata_dir=hf_metadata_dir,
                 tokenizer=tokenizer,
                 peft_config=peft_config,
+                exported_tensor_names=tuple(state_dict),
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),

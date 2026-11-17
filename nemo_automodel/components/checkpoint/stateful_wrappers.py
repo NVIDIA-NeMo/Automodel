@@ -59,6 +59,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -72,6 +73,77 @@ from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 _PREFIX = "model."
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
 _OPTIMIZER_PART_KEY_PREFIX = "stage_"
+
+
+def _unwrap_ddp_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the module that owns model metadata and parameter names hidden by DDP."""
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def _dcp_parameter_name(name: str) -> str:
+    """Normalize a ``named_parameters()`` name to the key DCP's state dict uses for it.
+
+    DCP drops activation-checkpoint and ``torch.compile`` wrapper components; DDP's
+    ``module.`` prefix is handled by unwrapping the model before naming parameters.
+    """
+    return canonical_parameter_fqn(name).replace("_orig_mod.", "")
+
+
+def _trainable_non_lora_parameter_names(model_parts: list[torch.nn.Module]) -> set[str]:
+    """Return the DCP state-dict names of trainable parameters that are not LoRA weights.
+
+    Under PEFT these are parameters ``freeze_config`` made trainable next to the adapters
+    (``unfreeze_modules``/``unfreeze_parameters``), which train in full and must be saved
+    with the adapter.
+
+    Args:
+        model_parts: Model or pipeline-stage parts, optionally wrapped in DDP.
+
+    Returns:
+        Normalized parameter names, matching the keys of ``get_model_state_dict``. A shared
+        parameter appears once, under its first registered name.
+    """
+    return {
+        _dcp_parameter_name(name)
+        for part in model_parts
+        for name, param in _unwrap_ddp_model(part).named_parameters()
+        if param.requires_grad and "lora_" not in name
+    }
+
+
+def _select_peft_parameters(model_state_dict: dict[str, Any], model_parts: list[torch.nn.Module]) -> dict[str, Any]:
+    """Keep the trainable parameters of a PEFT model's DCP state dict and drop its buffers.
+
+    ``get_model_state_dict(..., ignore_frozen_params=True)`` returns trainable parameters
+    together with every buffer. A PEFT checkpoint holds the LoRA weights plus any
+    parameter ``freeze_config`` made trainable, so buffers are dropped and fully trained
+    modules are kept.
+
+    Args:
+        model_state_dict: DCP model state dict mapping names to tensors of arbitrary
+            shape. DCP materializes it on rank 0 only, so other ranks pass an empty dict.
+        model_parts: The model parts ``model_state_dict`` was collected from.
+
+    Returns:
+        A new dict holding the same tensor objects (not copies) for LoRA weights and the
+        trainable non-LoRA parameters.
+
+    Raises:
+        RuntimeError: If a trainable non-LoRA parameter is missing from a non-empty
+            ``model_state_dict``. Saving would otherwise drop trained weights silently.
+    """
+    trainable = _trainable_non_lora_parameter_names(model_parts)
+    selected = {k: v for k, v in model_state_dict.items() if "lora_" in k or k in trainable}
+    missing = trainable - selected.keys()
+    if model_state_dict and missing:
+        raise RuntimeError(
+            "The PEFT checkpoint would drop trainable parameters that are missing from the model state dict: "
+            f"{sorted(missing)[:10]}. Their names do not match the state-dict keys "
+            f"(examples: {sorted(model_state_dict)[:5]})."
+        )
+    return selected
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:
@@ -460,7 +532,10 @@ class ModelState:
             or any(_has_expert_parallelism(m) for m in self.model)
             or any(_has_quantized_params(m) for m in self.model)
         )
+        # A PEFT checkpoint holds every trainable parameter: the LoRA weights plus any
+        # module freeze_config made trainable next to them (e.g. unfreeze_modules).
         if use_local_peft_collection:
+            # Collects exactly the trainable parameters, so nothing needs filtering.
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
             options = StateDictOptions(cpu_offload=True) if self.cpu_offload else None
@@ -469,18 +544,15 @@ class ModelState:
 
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
-
-        # @akoumpa: the second is_peft statement above keeps buffers in the state dict
-        # this filtering removes them.
-        # TODO: this is a hack and we should find a better way to do this.
-        if self.is_peft:
-            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+            if self.is_peft:
+                # ignore_frozen_params still returns every buffer; keep only the parameters.
+                model_state_dict = _select_peft_parameters(model_state_dict, self.model)
 
         # Pipeline parallelism partitions layers across PP ranks, so each rank's
         # local adapter (collected above) only covers its own stages. Gather the
         # PEFT tensors across the PP group and union by FQN so every rank ends up
         # with the complete adapter. No-op when pp_group is None (pp_size==1).
-        # Done after the lora_ filter so only adapter tensors travel.
+        # Done after the selection above so only adapter tensors travel.
         if self.is_peft and self.pp_group is not None:
             model_state_dict = _gather_peft_state_dict_across_pp(model_state_dict, self.pp_group)
 

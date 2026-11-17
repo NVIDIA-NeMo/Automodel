@@ -22,18 +22,24 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.addons import (
     ConsolidatedHFAddon,
+    _check_modules_to_save_cover_exported_tensors,
+    _extract_modules_to_save,
     _extract_target_modules,
     _get_automodel_peft_metadata,
+    _get_hf_peft_config,
     _group_barrier,
     _is_group_rank_0,
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
     load_automodel_peft_config_dict,
+    validate_peft_trainable_modules,
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
 
 def test_group_barrier_uses_model_process_group():
@@ -583,3 +589,184 @@ def test_load_automodel_peft_config_dict_round_trips_the_saved_metadata(tmp_path
     assert loaded.target_modules == ["*.qkv_proj"] and (loaded.dim, loaded.alpha) == (16, 8)
     assert loaded.lora_dtype == "torch.bfloat16"
     assert loaded.use_memory_efficient_lora is legacy_defaults
+
+
+# ----------------------------------------------- PEFT with modules trained in full
+
+
+@pytest.fixture
+def single_rank_process_group(tmp_path):
+    """DCP's full-state-dict collection, used by the PEFT save path, needs a process group."""
+    torch.distributed.init_process_group("gloo", init_method=f"file://{tmp_path}/rendezvous", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class _TinyEncoderClassifier(nn.Module):
+    """LoRA targets in the encoder, a two-layer classification head, and a persistent buffer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Module()
+        self.encoder.query = nn.Linear(4, 4)
+        self.encoder.value = nn.Linear(4, 4)
+        self.encoder.norm = nn.LayerNorm(4)
+        self.classifier = nn.Module()
+        self.classifier.dense = nn.Linear(4, 4)
+        self.classifier.out_proj = nn.Linear(4, 2)
+        self.register_buffer("position_ids", torch.arange(4))
+
+
+_LORA_KEYS = {
+    f"base_model.model.encoder.{name}.lora_{side}.weight" for name in ("query", "value") for side in ("A", "B")
+}
+_PEFT = PeftConfig(target_modules=["*.query", "*.value"], dim=2, alpha=4, use_triton=False)
+
+
+def _peft_model(unfreeze_modules: list[str]) -> _TinyEncoderClassifier:
+    """The tiny model with LoRA on the encoder and ``unfreeze_modules`` trained in full."""
+    model = _TinyEncoderClassifier()
+    assert apply_lora_to_linear_modules(model, _PEFT) == 2
+    if unfreeze_modules:
+        apply_parameter_freezing(model, {"unfreeze_modules": [{"path": path} for path in unfreeze_modules]})
+    return model
+
+
+@pytest.mark.parametrize("local_collection", [False, True], ids=["dcp", "local"])
+def test_peft_model_state_keeps_fully_trained_modules_and_drops_buffers(
+    single_rank_process_group, local_collection: bool
+):
+    """A PEFT checkpoint holds every trainable parameter, not only the LoRA weights.
+
+    The DCP collection also returns buffers, which must stay out of the adapter. The local
+    collection (pipeline parallel, expert parallel, or quantized models) has none.
+    """
+    model = _peft_model(["classifier", "encoder.norm"])
+    pp_group = torch.distributed.group.WORLD if local_collection else None
+
+    state = ModelState(model, is_peft=True, pp_group=pp_group).state_dict()
+
+    full_weight_keys = {
+        f"base_model.model.{name}"
+        for name in (
+            "classifier.dense.weight",
+            "classifier.dense.bias",
+            "classifier.out_proj.weight",
+            "classifier.out_proj.bias",
+            "encoder.norm.weight",
+            "encoder.norm.bias",
+        )
+    }
+    assert set(state) == _LORA_KEYS | full_weight_keys
+    parameters = dict(model.named_parameters())
+    for key in full_weight_keys:
+        torch.testing.assert_close(state[key], parameters[key.removeprefix("base_model.model.")], rtol=0, atol=0)
+
+
+def test_lora_only_peft_model_state_is_unchanged(single_rank_process_group):
+    """Without modules trained in full, the adapter keeps exactly the LoRA weights."""
+    assert set(ModelState(_peft_model([]), is_peft=True).state_dict()) == _LORA_KEYS
+
+
+def test_peft_model_state_refuses_to_drop_a_trainable_parameter(single_rank_process_group):
+    """A trainable parameter missing from the DCP state dict fails the save instead of vanishing."""
+    model = _peft_model(["classifier"])
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+    def renamed_state_dict(module, options=None):
+        # Stands in for a wrapper whose prefix DCP keeps, so the names no longer match.
+        state = get_model_state_dict(module, options=options)
+        return {f"wrapper.{key}" if key.startswith("classifier.") else key: value for key, value in state.items()}
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict", side_effect=renamed_state_dict
+    ):
+        with pytest.raises(RuntimeError, match="would drop trainable parameters"):
+            ModelState(model, is_peft=True).state_dict()
+
+
+def test_hf_peft_config_lists_the_largest_fully_trained_modules():
+    """modules_to_save names whole trained modules, which is what HF PEFT wraps and restores.
+
+    Listing ``classifier.dense`` and ``classifier.out_proj`` instead of ``classifier`` breaks
+    loading a sequence-classification adapter, because PEFT always wraps ``classifier`` too.
+    """
+    model = _peft_model(["classifier", "encoder.norm"])
+
+    config = _get_hf_peft_config(_PEFT, ModelState(model, is_peft=True))
+
+    assert config["modules_to_save"] == ["classifier", "encoder.norm"]
+    assert config["target_modules"] == ["encoder.query", "encoder.value"]
+
+
+def test_lora_only_hf_peft_config_has_no_modules_to_save():
+    """Adapters without modules trained in full keep the previous adapter_config.json."""
+    assert "modules_to_save" not in _get_hf_peft_config(_PEFT, ModelState(_peft_model([]), is_peft=True))
+
+
+def test_modules_to_save_split_combined_projections_and_follow_adapter_renames():
+    """modules_to_save uses the same HF names as target_modules and the exported tensors."""
+
+    class _RenamingAdapter(_StubStateDictAdapter):
+        def map_peft_target_module_to_hf(self, name, *, v4_compatible=False):
+            return f"language_model.{name}"
+
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].qkv_proj = nn.Linear(4, 12)
+    model.layers[0].o_proj = nn.Linear(4, 4)
+    model.layers[0].o_proj.requires_grad_(False)
+    model.state_dict_adapter = _RenamingAdapter()
+
+    assert _extract_modules_to_save([model]) == [
+        "language_model.layers.0.k_proj",
+        "language_model.layers.0.q_proj",
+        "language_model.layers.0.v_proj",
+    ]
+
+
+def _tie_classifier_to_a_second_head(model: nn.Module) -> None:
+    model.head = nn.Linear(4, 2)
+    model.head.weight = model.classifier.out_proj.weight
+
+
+def _add_root_parameter(model: nn.Module) -> None:
+    model.register_parameter("logit_scale", nn.Parameter(torch.ones(1)))
+
+
+@pytest.mark.parametrize(
+    ("unfreeze_modules", "modify", "message"),
+    [
+        pytest.param(["encoder.query"], None, "module also holds LoRA adapters", id="lora-module-base-weight"),
+        pytest.param(["encoder"], None, "module also holds LoRA adapters", id="module-around-lora"),
+        pytest.param(["classifier"], _tie_classifier_to_a_second_head, "registered under several names", id="tied"),
+        pytest.param([], _add_root_parameter, "belong to the root module", id="root-parameter"),
+    ],
+)
+def test_peft_rejects_trainable_modules_hf_peft_cannot_restore(unfreeze_modules, modify, message):
+    """Layouts the adapter checkpoint cannot restore fail at startup and on save, never silently."""
+    model = _peft_model(unfreeze_modules)
+    if modify is not None:
+        modify(model)
+
+    with pytest.raises(ValueError, match=message):
+        validate_peft_trainable_modules(model)
+    with pytest.raises(ValueError, match=message):
+        _get_hf_peft_config(_PEFT, ModelState(model, is_peft=True))
+
+
+def test_modules_to_save_must_cover_the_exported_full_weights():
+    """The save path rejects an export whose modules_to_save and tensors name different modules."""
+    exported = [
+        "base_model.model.model.norm_f.weight",
+        "base_model.model.model.layers.0.q_proj.lora_A.weight",
+        "base_model.model.model.layers.0.q_proj.lora_B.weight",
+    ]
+    _check_modules_to_save_cover_exported_tensors(["model.norm_f"], exported)
+
+    with pytest.raises(ValueError, match="tensors outside modules_to_save: \\['model.norm_f.weight'\\]"):
+        _check_modules_to_save_cover_exported_tensors(["model.norm"], exported)
+    with pytest.raises(ValueError, match="entries without tensors: \\['lm_head'\\]"):
+        _check_modules_to_save_cover_exported_tensors(["model.norm_f", "lm_head"], exported)

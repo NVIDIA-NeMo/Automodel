@@ -35,7 +35,12 @@ import pytest
 import torch
 from torch import nn
 
-from nemo_automodel.components.checkpoint.addons import _extract_target_modules, _extract_target_parameters
+from nemo_automodel.components.checkpoint.addons import (
+    _extract_modules_to_save,
+    _extract_target_modules,
+    _extract_target_parameters,
+    _trainable_module_layout,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import (
     _gather_peft_state_dict_across_pp,
 )
@@ -255,6 +260,35 @@ class TestExtractTargetModulesPPUnion:
         )
         result = _extract_target_modules(model, pp_group=None)
         assert result == ["model.layers.0.self_attn.wq_a"]
+
+
+class TestExtractModulesToSavePPUnion:
+    def test_stage_layouts_are_combined_before_naming_modules(self, monkeypatch):
+        """Every stage names the same modules, and a partial view never widens one.
+
+        The last stage holds model.norm but no decoder layer, so on its own every parameter
+        under ``model`` looks trained in full and ``model`` itself would be listed. HF PEFT
+        would then wrap the whole backbone and fail to load it from the adapter.
+        """
+        first = nn.Module()
+        first.model = nn.Module()
+        first.model.embed_tokens = nn.Embedding(4, 2)
+        first.model.layers = nn.ModuleList([nn.Module()])
+        first.model.layers[0].q_proj = nn.Linear(2, 2).requires_grad_(False)
+        first.model.layers[0].q_proj.lora_A = nn.Linear(2, 1, bias=False)
+        last = nn.Module()
+        last.model = nn.Module()
+        last.model.norm = nn.LayerNorm(2)
+        last.lm_head = nn.Linear(2, 4)
+        layouts = [_trainable_module_layout([first]), _trainable_module_layout([last])]
+        _install_fake_distributed(monkeypatch, layouts)
+
+        for stage in (first, last):
+            assert _extract_modules_to_save([stage], pp_group=_FakePPGroup(layouts)) == [
+                "lm_head",
+                "model.embed_tokens",
+                "model.norm",
+            ]
 
 
 class TestExtractTargetParametersPPUnion:
