@@ -133,21 +133,30 @@ class LengthGroupedSampler(Sampler[int]):
 
     @staticmethod
     def _compute_lengths(dataset: Dataset) -> list[int]:
-        """Compute token lengths for all samples."""
-        # Fast path: access underlying list directly if available
-        raw = dataset
-        while hasattr(raw, "dataset"):
-            raw = raw.dataset
-        if not isinstance(raw, list):
-            raw = None
+        """Compute token lengths for all samples.
 
+        Lengths always come from ``dataset[i]``.  An inner ``dataset`` attribute
+        is never indexed in its place: a wrapper may tokenize inside
+        ``__getitem__`` (``ChatDataset`` keeps untokenized rows in
+        ``self.dataset``), remap or repeat indices
+        (``torch.utils.data.Subset``), or rewrite ``input_ids`` altogether, and
+        none of that is observable from the inner object.  A matching length
+        does not make the two interchangeable.
+
+        Args:
+            dataset: The dataset to measure.  Samples are expected to expose an
+                ``input_ids`` key.
+
+        Returns:
+            The token length of each sample, ``0`` where ``input_ids`` is absent.
+        """
         n = len(dataset)
         logger.info("Computing token lengths for %d samples...", n)
         t0 = time.monotonic()
         lengths = [0] * n
 
         for i in range(n):
-            sample = raw[i] if raw is not None else dataset[i]
+            sample = dataset[i]
             ids = sample.get("input_ids")
             if ids is not None:
                 lengths[i] = len(ids) if isinstance(ids, list) else ids.numel()
@@ -160,6 +169,13 @@ class LengthGroupedSampler(Sampler[int]):
                     elapsed,
                     (i + 1) / max(elapsed, 1e-6),
                 )
+
+        if n > 0 and not any(lengths):
+            logger.warning(
+                "LengthGroupedSampler could not determine a token length for any of the %d samples: "
+                "no sample exposes a non-empty `input_ids`. Length grouping will have no effect.",
+                n,
+            )
 
         logger.info("Length computation done in %.1fs", time.monotonic() - t0)
         return lengths
