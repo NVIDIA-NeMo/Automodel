@@ -81,9 +81,12 @@ and 2k+1. These two nodes must be in one NVLink domain: on GB200 a domain can
 span several four-GPU nodes, and an expert group that is split over two
 domains has not been validated. Without `uv run` and without that script, the
 command was run on 64 GPUs for 10 updates, with
-`--step_scheduler.max_steps=10` and a `--checkpoint.checkpoint_dir` appended;
-its first update took 90 s. With `--nnodes=1` it was run on one node with a
-three-layer model.
+`--step_scheduler.max_steps=10` and a `--checkpoint.checkpoint_dir` appended
+and without `checkpoint.load_metadata_with_gloo`; its first update took 90 s.
+With `--nnodes=1`, a three-layer model as
+`--model.pretrained_model_name_or_path`, `--distributed.ep_size=2`,
+`--step_scheduler.global_batch_size=4`, and the same two overrides, the
+recipe as it ships was run on one node for 10 updates.
 
 Dense parameters use FSDP2, and the routed experts of each MoE layer are
 distributed over the EP group. The parameters of the DSA indexers are frozen.
@@ -164,10 +167,10 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 | Loss | Training loss 0.3458 at the first update and 0.1160 at the last; validation loss 0.1086 after 50 updates and 0.0980 after 100, on 367 label tokens |
 
 The values in this table were measured with HybridEP, the pair of the recipe,
-with the nodes placed as the Hardware row says. The job also set
-`checkpoint.load_metadata_with_gloo: true`, which the recipe does not set.
-The values differ between placements. The recipe as written, run for 10
-updates on 16 nodes in four NVLink domains, gave the same training loss at the
+with the nodes placed as the Hardware row says, and with the recipe as it
+ships. The values differ between placements. The recipe without
+`checkpoint.load_metadata_with_gloo`, run for 10 updates on 16 nodes in four
+NVLink domains through the command above, gave the same training loss at the
 first update and 151.3 GiB used on the fullest GPU. By the step records that
 the recipe writes itself (`training.jsonl`: the tokens of an update divided by
 its tokens per second), the median over the updates from the sixth on was
@@ -182,6 +185,32 @@ updates with the `torch` expert and dispatcher backends took a median of 10.0 s
 over the updates from the sixth on, against 6.0 s with HybridEP over the same
 updates, and peaked at 132.8 GiB allocated on rank 0; the training loss at the
 first update was 0.3469.
+
+The recipe sets `checkpoint.load_metadata_with_gloo: true`, which plans the
+loading of the weights over a CPU process group instead of NCCL; the run of
+the validated configuration used it. With NCCL, rank 0 can keep point-to-point
+buffers for other ranks for the whole run, and how much depends on the
+placement. Device memory in use after setup, before the first update (total
+minus free of `torch.cuda.mem_get_info`):
+
+| Model, GPUs, and placement | Without the switch | With the switch |
+|---|---|---|
+| 3 layers, 4 GPUs on one node | 10.047 GiB on rank 0, 9.297 GiB on the others | 8.879 GiB on all |
+| 3 layers, 8 GPUs on two nodes of one NVLink domain | 8.000 GiB on rank 0, 5.750 GiB on the others | 5.332 GiB on all |
+| 3 layers, 16 GPUs on four nodes in two NVLink domains | 4.133 GiB on rank 0, 3.727 to 3.995 GiB on the others | 3.666 to 3.668 GiB on all |
+| 43 layers, 64 GPUs in eight NVLink domains | 10.293 GiB on rank 0, 10.028 to 10.356 GiB on the others | 9.991 to 10.030 GiB on all |
+
+With the 64 GPUs in eight NVLink domains the difference was at most 0.33 GiB
+on a GPU. In an earlier run of the 43-layer model with the `torch` backends
+on 16 nodes of one rack, without the switch, the GPU of rank 0 held 36,133 MiB
+while the weights were being loaded and when the load ended, against 12,209 to
+12,215 MiB on the other 63 GPUs, as sampled with `nvidia-smi`; a run with all
+64 ranks in one rack and the switch on was not made. In every comparison of
+the table, every rank held the same bytes in all loaded tensors with and
+without the switch. The switch covers loads only; a save plans over NCCL. The
+save and restore of the 43-layer model in the table below ran without the
+switch; with the switch, a checkpoint was restored with the three-layer model
+only (the two rows that name HybridEP).
 
 Saving and resuming were run with `checkpoint.enabled: true` and
 `checkpoint.save_consolidated: false`, with the same number of ranks and the
@@ -251,7 +280,10 @@ rounds the partial sum of each rank of the expert group. The two losses on the
 same weights therefore differ by rounding, and the HybridEP loss depends on
 `ep_size`. With the released 43-layer weights on the 64 GPUs of the validated
 configuration, the validation loss of the recipe before any update, on 367
-label tokens, was 0.3101 with the `torch` backends and 0.3104 with HybridEP.
+label tokens, was 0.3101 with the `torch` backends and 0.3104 with HybridEP;
+the HybridEP value is from a control run without
+`checkpoint.load_metadata_with_gloo`, in which every rank held the same bytes
+in all 1,516 loaded tensors as with it.
 On a three-layer model built from released layers 0, 1, and 7, the same
 validation gave 27.9237 with the `torch` backends and 27.9330 with HybridEP
 on 4 GPUs with `ep_size` 2, and 27.9238 and 27.9158 on 16 GPUs with

@@ -124,6 +124,11 @@ checkpoint:
   # dist_env.timeout_minutes: 180.
   enabled: false
   checkpoint_dir: checkpoints/ernie5_5_flash_squad_ep/
+  # Plan the loading of the released weights, and of a resume, over a CPU (Gloo) process group
+  # instead of NCCL. With NCCL, rank 0 can keep point-to-point buffers for other ranks for the
+  # whole run; how much depends on the placement of the ranks (see the model card). The switch
+  # covers loads only; a save still plans over NCCL. The validated run used this value.
+  load_metadata_with_gloo: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

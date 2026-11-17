@@ -83,6 +83,8 @@ def test_ernie5_5_flash_recipe_feeds_single_unpadded_documents() -> None:
         assert loader["collate_fn"] == {"_target_": "nemo_automodel.components.datasets.utils.default_collater"}
     assert "peft" not in config
     assert config["checkpoint"]["enabled"] is False
+    # The released weights are loaded whether or not checkpoints are written; their load is planned over Gloo.
+    assert config["checkpoint"]["load_metadata_with_gloo"] is True
 
 
 def test_ernie5_5_flash_recipe_requests_expert_parallelism_only() -> None:
