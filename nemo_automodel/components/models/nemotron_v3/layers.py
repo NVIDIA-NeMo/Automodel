@@ -448,6 +448,8 @@ class NemotronV3Mamba2Mixer(nn.Module):
             else:
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(A_log.float())
+                # Adapters and sharded wrappers must execute their module forward/hooks.
+                fuse_out_proj = type(self.out_proj) is nn.Linear
 
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
@@ -461,14 +463,16 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     activation=self.activation,
                     rmsnorm_weight=self.norm.weight,
                     rmsnorm_eps=self.norm.variance_epsilon,
-                    outproj_weight=self.out_proj.weight,
-                    outproj_bias=self.out_proj.bias,
+                    outproj_weight=self.out_proj.weight if fuse_out_proj else None,
+                    outproj_bias=self.out_proj.bias if fuse_out_proj else None,
                     headdim=self.head_dim,
                     ngroups=self.n_groups,
                     norm_before_gate=False,
                     return_final_states=False,
                     **dt_limit_kwargs,
                 )
+                if not fuse_out_proj:
+                    out = self.out_proj(out)
                 if squeezed:
                     out = out.squeeze(0)
                 return out
