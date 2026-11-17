@@ -41,9 +41,9 @@ model:
   pretrained_model_name_or_path: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
   trust_remote_code: true
   force_hf: true
+  attn_implementation: flash_attention_2
 
 # torch.compile configuration
-  attn_implementation: flash_attention_2
 compile:
   enabled: false
   mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
