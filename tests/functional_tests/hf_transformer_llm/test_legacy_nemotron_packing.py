@@ -14,18 +14,29 @@
 
 """Numerical isolation against the real released remote-code models on one GPU.
 
-Set LEGACY_PACKING_FLASH_CHECKPOINT / LEGACY_PACKING_NAS_CHECKPOINT to cached
-publisher snapshots. Only model dimensions shrink; the actual released layers,
+The configurations and remote code come from the publisher revisions that the
+packing adapters target; no weights are downloaded. Set
+LEGACY_PACKING_FLASH_CHECKPOINT / LEGACY_PACKING_NAS_CHECKPOINT to use local
+snapshots instead. Only model dimensions shrink; the actual released layers,
 attention, recurrent kernels, memory prefixes and checkpoint names are used.
 """
 
+import importlib
+import importlib.util
+import math
 import os
+import sys
 from collections.abc import Iterator
+from datetime import timedelta
 from typing import Protocol, cast
 
 import pytest
 import torch
 import torch.distributed as dist
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
+from triton import Config
+from triton.runtime.autotuner import Autotuner
 
 from nemo_automodel import NeMoAutoConfig, NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -36,24 +47,71 @@ from nemo_automodel.components.models.common.packing import configure_packing
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
+# Publisher revisions whose remote-code interfaces the packing adapters target.
+_RELEASES = {
+    "flash": ("nvidia/Nemotron-Flash-1B", "da87f707f678b5936e67fdcfe598f76ebcc5fdbc"),
+    "nas": ("nvidia/Llama-3_3-Nemotron-Super-49B-v1_5", "420ba7d28211abf116b8b103ab700d92619daf98"),
+}
+
+
+def _footprint(config: Config) -> tuple[int, int, int]:
+    blocks = math.prod(value for value in config.kwargs.values() if isinstance(value, int))
+    return config.num_stages, blocks, config.num_warps
+
 
 @pytest.fixture(scope="module", autouse=True)
-def distributed_context() -> Iterator[None]:
+def single_triton_configs() -> Iterator[None]:
+    # Cold autotuning compiles every candidate configuration of every FLA and
+    # Mamba kernel, which dominated this module's CI time. Parity does not depend
+    # on the launch configuration, so compile only the smallest-footprint
+    # candidate; Triton skips benchmarking when one configuration remains.
+    for package in ("fla.modules", "fla.ops.delta_rule", "mamba_ssm.ops.triton.ssd_combined"):
+        if importlib.util.find_spec(package.partition(".")[0]) is not None:
+            importlib.import_module(package)
+    original: dict[Autotuner, list[Config]] = {}
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith(("fla.", "mamba_ssm.")):
+            continue
+        for value in vars(module).values():
+            for _ in range(3):  # Heuristics and Autotuner wrappers nest via .fn.
+                if isinstance(value, Autotuner) and len(value.configs) > 1 and value not in original:
+                    original[value] = value.configs
+                    value.configs = [min(value.configs, key=_footprint)]
+                value = getattr(value, "fn", None)
+    yield
+    for tuner, configs in original.items():
+        tuner.configs = configs
+
+
+@pytest.fixture(scope="module", autouse=True)
+def distributed_context(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     apply_cache_compatibility_patches()
     created = not dist.is_initialized()
     if created:
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-        dist.init_process_group("nccl")
+        # CI collects this module with plain pytest, so rendezvous through a private file.
+        rendezvous = tmp_path_factory.mktemp("nccl") / "rendezvous"
+        dist.init_process_group(
+            "nccl", init_method=f"file://{rendezvous}", rank=0, world_size=1, timeout=timedelta(seconds=120)
+        )
     yield
     if created:
         dist.destroy_process_group()
 
 
-def _model(family: str, attn_implementation: str = "flash_attention_2") -> torch.nn.Module:
+def _release_path(family: str) -> str:
     path = os.environ.get(f"LEGACY_PACKING_{family.upper()}_CHECKPOINT")
-    if not path:
-        pytest.skip(f"No cached {family} release configured")
-    cfg = NeMoAutoConfig.from_pretrained(path, trust_remote_code=True)
+    if path:
+        return path
+    repo_id, revision = _RELEASES[family]
+    try:
+        return snapshot_download(repo_id, revision=revision, allow_patterns=["config.json", "*.py"])
+    except LocalEntryNotFoundError as error:
+        pytest.skip(f"{repo_id}@{revision} is neither cached nor reachable on the Hugging Face Hub: {error}")
+
+
+def _model(family: str, attn_implementation: str = "flash_attention_2") -> torch.nn.Module:
+    cfg = NeMoAutoConfig.from_pretrained(_release_path(family), trust_remote_code=True)
     data = cfg.to_dict()
     data.update(
         hidden_size=128,
@@ -103,6 +161,12 @@ def _model(family: str, attn_implementation: str = "flash_attention_2") -> torch
         # as a loaded checkpoint would, so the reference itself is finite.
         with torch.no_grad():
             model.get_input_embeddings().weight[0].normal_(std=cfg.initializer_range)
+        # Use FLA's fused_recurrent delta rule, which the release selects for
+        # short inputs. The adapter passes chunk mode the same cu_seqlens, but its
+        # kernels take minutes to compile cold in CI.
+        for kind, layer in zip(cfg.layer_types, model.model.layers, strict=True):
+            if kind == "deltanet":
+                layer.gla.mode = "fused_recurrent"
     return model
 
 
@@ -129,6 +193,15 @@ class _HasLogits(Protocol):
 
 
 def _logits(output: torch.Tensor | _HasLogits) -> torch.Tensor:
+    """Return a causal LM's logits.
+
+    Args:
+        output: Tensor of shape [batch, sequence, vocab], or a model output
+            whose ``logits`` has that shape.
+
+    Returns:
+        Tensor of shape [batch, sequence, vocab]; the input itself, not a copy.
+    """
     return output if isinstance(output, torch.Tensor) else output.logits
 
 
