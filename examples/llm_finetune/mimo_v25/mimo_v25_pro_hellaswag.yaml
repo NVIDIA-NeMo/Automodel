@@ -151,3 +151,7 @@ ci:
   # pp_size(18) * ep_size(8) = 144 GPUs => 18 nodes (8 H100/node).
   nodes: 18
   time: "00:15:00"
+  perf_testing:
+    schedule: nightly
+    # ci.time stops the 15-minute functional run near step 21; fifty steps need about 20 minutes.
+    time: "00:30:00"

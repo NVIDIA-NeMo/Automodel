@@ -14,13 +14,16 @@
 
 import logging
 from functools import partial
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
-from nemo_automodel.shared.import_utils import safe_import_te
+from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
 
 HAS_TE, transformer_engine = safe_import_te()
+HAS_FUSED_ADAM, FusedAdam = (
+    safe_import_from("transformer_engine.pytorch.optimizers", "FusedAdam") if HAS_TE else (False, None)
+)
 
 # The Conflict:
 # PyTorch DCP passes an _EXTRA_STATE sentinel for missing keys, but Transformer Engine (TE)
@@ -67,6 +70,21 @@ from nemo_automodel.components.checkpoint.utils import (
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
+
+
+@runtime_checkable
+class SketchStateOptimizer(Protocol):
+    """Optimizer exposing extra state that DCP's optimizer state dict does not carry (gradient sketch).
+
+    Matched structurally so checkpointing does not import the optim component; plain
+    ``torch.optim.Optimizer`` instances have neither method.
+    """
+
+    def sketch_state_dict(self) -> dict[str, torch.Tensor]: ...
+
+    def load_sketch_state_dict(self, sketch_state: dict[str, torch.Tensor]) -> None: ...
+
+
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
 _OPTIMIZER_PART_KEY_PREFIX = "stage_"
 
@@ -112,6 +130,8 @@ def _zeros_like_optimizer_param(param: torch.Tensor) -> torch.Tensor:
 
 def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
     """Create zero-valued Adam state for parameters that do not have state yet."""
+    # Wrapper optimizers (e.g. gradient sketch) delegate ordinary parameters to a native optimizer.
+    optimizer = getattr(optimizer, "native", optimizer)
     if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
         return
 
@@ -136,6 +156,37 @@ def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
                 state["exp_avg_sq"] = _zeros_like_optimizer_param(param)
             if group.get("amsgrad", False) and "max_exp_avg_sq" not in state:
                 state["max_exp_avg_sq"] = _zeros_like_optimizer_param(param)
+
+
+def _materialize_native_fused_adam_state(optimizer: torch.optim.Optimizer) -> None:
+    """Create the state a never-stepped TE FusedAdam would otherwise allocate in its first ``step()``.
+
+    TE FusedAdam keeps the step counter in each parameter group and allocates the moments and master weights
+    lazily inside ``step()``. A fresh optimizer therefore returns an empty ``state_dict()``, and DCP only loads
+    keys present in that skeleton, so a resume on the native optimizer checkpoint path would restore nothing.
+    This mirrors the initialization in ``FusedAdam.step``: a zero step counter for every group (an int32 tensor
+    of shape [1] when capturable) and TE's own ``initialize_state`` for every parameter without state, which
+    allocates zero moments plus the fp32 master copy, or the zero int16 remainder of a bf16 parameter. The first
+    real update after materialization is unchanged.
+
+    Args:
+        optimizer: Optimizer to populate; every other optimizer type is left untouched. Each parameter keeps its
+            shape, dtype, device and DTensor placements, and TE allocates matching per-parameter buffers.
+    """
+    if not HAS_FUSED_ADAM or not isinstance(optimizer, FusedAdam):
+        return
+    for group in optimizer.param_groups:
+        if "step" not in group:
+            if optimizer.capturable:
+                # FusedAdam.step() keeps the counter on the group's first parameter and, for a group without
+                # parameters, on the optimizer's own overflow buffer.
+                step_device = group["params"][0].device if group["params"] else optimizer._dummy_overflow_buf.device
+                group["step"] = torch.zeros(1, dtype=torch.int32, device=step_device)
+            else:
+                group["step"] = 0
+        for param in group["params"]:
+            if not optimizer.state[param]:
+                optimizer.initialize_state(param, optimizer.store_param_remainders and param.dtype == torch.bfloat16)
 
 
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
@@ -629,6 +680,13 @@ class OptimizerState:
             or any(_has_quantized_params(model_part) for model_part in self.model)
         )
 
+    def _sketch_optimizer(self) -> SketchStateOptimizer | None:
+        """Return the single gradient sketch optimizer among the parts, or ``None``."""
+        sketch_optimizers = [opt for opt in self.optimizer if isinstance(opt, SketchStateOptimizer)]
+        if len(sketch_optimizers) > 1:
+            raise ValueError("gradient sketch checkpointing supports a single optimizer part")
+        return sketch_optimizers[0] if sketch_optimizers else None
+
     def state_dict(self) -> dict[str, Any]:
         """
         Get the optimizer and scheduler state dictionaries.
@@ -646,8 +704,14 @@ class OptimizerState:
         # can remain trainable yet unused for a step, so normalize missing state before both native and flattened DCP
         # serialization. This makes the save and subsequent load skeletons agree without changing a future first
         # update: the materialized step and moment tensors are all zero.
+        # TE FusedAdam allocates all of its state, including the per-group step counter, in its first step(), so a
+        # fresh optimizer would hand DCP an empty native load skeleton and a resume would silently keep fresh
+        # optimizer state. The flattened path needs no help: torch's get_optimizer_state_dict() initializes a fresh
+        # optimizer itself.
         for optimizer in self.optimizer:
             _materialize_missing_adam_state(optimizer)
+            if self._use_native_optimizer_state:
+                _materialize_native_fused_adam_state(optimizer)
         if self._use_native_optimizer_state:
             if self.optimizer_part_ids is None:
                 if len(self.optimizer) != 1:
@@ -675,6 +739,10 @@ class OptimizerState:
         state_dict = {
             "optim": optimizer_state_dict,
         }
+        if not self._use_native_optimizer_state:
+            sketch_optimizer = self._sketch_optimizer()
+            if sketch_optimizer is not None:
+                state_dict["sketch"] = sketch_optimizer.sketch_state_dict()
         if self.scheduler is not None:
             state_dict["sched"] = self.scheduler[0].state_dict()
 
@@ -719,6 +787,13 @@ class OptimizerState:
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
             )
             list(map(func, self.model, self.optimizer))
+            if "sketch" in state_dict:
+                sketch_optimizer = self._sketch_optimizer()
+                if sketch_optimizer is None:
+                    raise ValueError(
+                        "checkpoint holds gradient sketch state but no gradient sketch optimizer is in use"
+                    )
+                sketch_optimizer.load_sketch_state_dict(state_dict["sketch"])
 
         # load the scheduler state if it exists
         if "sched" in state_dict and self.scheduler is not None:
