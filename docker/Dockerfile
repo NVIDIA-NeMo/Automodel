@@ -120,7 +120,7 @@ FROM update_base_container AS automodel_dep
 
 # Install TE
 ARG INSTALL_TE=True
-ARG TE_COMMIT=v2.20.2
+ARG TE_COMMIT=v2.21.0
 # CI enables NCCL-EP on the PyTorch image, which supplies NCCL >= 2.30.4
 # and the private symmetric-memory headers absent from public torch wheels.
 ARG TE_WITH_NCCL_EP=0
@@ -132,7 +132,7 @@ ARG TE_BUILD_THREADS_PER_JOB=8
 # binding is already compatible. Otherwise rebuild it against the exact
 # PyTorch/CUDA stack in this image to avoid carrying a stale native extension.
 RUN if [ "$INSTALL_TE" = "True" ] || [ "$TE_WITH_NCCL_EP" = "1" ] || \
-        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.20.2'); import transformer_engine.pytorch"; then \
+        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.21.0'); import transformer_engine.pytorch"; then \
     pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \

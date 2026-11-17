@@ -5,7 +5,7 @@ override-dependencies = [
     # shadows its module while pytest still discovers the system entry point.
     # Update this pin with the base image; remove once the regular lock is aligned.
     "platformdirs==4.14.5",
-    # TE 2.20.2 requires >=1.29, newer than the regular lock's version. The 26.11
+    # TE 2.21.0 requires >=1.29, newer than the regular lock's version. The 26.11
     # base ships 1.32.0, but 1.32 requires nvidia-cutlass-dsl>=4.8 while FA4,
     # quack-kernels and ffpa pin 4.6.2; move to the base's version with that pin.
     "nvidia-cudnn-frontend==1.30.0",
