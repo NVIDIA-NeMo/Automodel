@@ -20,7 +20,7 @@ import math
 import os
 import time
 import types
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 import torch
 import torch.nn as nn
@@ -517,14 +517,35 @@ def _default_return_outputs_to_false(schedule: _PipelineSchedule) -> None:
     vocabulary. Callers that need the merged output pass ``return_outputs=True``.
 
     ``eval()`` calls ``self.step()``, so it gets the same default. PyTorch releases before
-    2.10 have no ``return_outputs`` and keep their behavior.
+    2.10 have no ``return_outputs``. On those releases the replacement ``step()`` accepts the
+    argument and drops it, so callers can pass it on every supported release, and the last
+    stage keeps and returns its outputs as before.
 
     Args:
-        schedule: The schedule whose ``step()`` default is changed in place.
+        schedule: The schedule whose ``step()`` is replaced in place.
     """
-    if not is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION):
+    step = schedule.step
+    if is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION):
+        schedule.step = functools.partial(step, return_outputs=False)
         return
-    schedule.step = functools.partial(schedule.step, return_outputs=False)
+
+    def step_ignoring_return_outputs(*args: Any, return_outputs: bool = False, **kwargs: Any) -> Any:
+        """Run a ``step()`` that always keeps and returns the last stage's outputs.
+
+        Args:
+            *args: Whole-batch positional schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+            return_outputs: Ignored, because this PyTorch release has no such argument.
+            **kwargs: The other ``step()`` arguments: ``target``, ``losses``, and whole-batch
+                keyword inputs. Tensor values have arbitrary model-defined layouts.
+
+        Returns:
+            The merged last-stage output on the rank that owns the last stage, else ``None``.
+        """
+        del return_outputs
+        return step(*args, **kwargs)
+
+    schedule.step = step_ignoring_return_outputs
 
 
 def reset_pp_stage_shapes(
@@ -886,9 +907,11 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages. On PyTorch 2.10 and
-        newer, its ``step()`` and ``eval()`` return ``None`` unless called with
-        ``return_outputs=True``; read the loss from their ``losses`` list.
+        _PipelineSchedule: The pipeline schedule for the given stages. Its ``step()`` and
+        ``eval()`` accept ``return_outputs`` and default it to ``False``: they return ``None``,
+        and the last stage keeps no outputs, unless called with ``return_outputs=True``. Read
+        the loss from their ``losses`` list. PyTorch releases before 2.10 ignore the argument
+        and always keep and return the last stage's outputs.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 

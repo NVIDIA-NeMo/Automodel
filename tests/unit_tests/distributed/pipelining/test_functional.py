@@ -497,7 +497,7 @@ class _StepRecordingSchedule(PipelineScheduleSingle):
     def __init__(self, *args, **kwargs):
         self.step_kwargs = []
 
-    def step(self, *args, **kwargs):
+    def step(self, **kwargs: bool) -> None:
         self.step_kwargs.append(kwargs)
 
     def _step_microbatches(self, *args, **kwargs):
@@ -510,15 +510,19 @@ class TestBuildPipelineSchedule:
     @pytest.mark.cpu_only
     @pytest.mark.skipif(
         not is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION),
-        reason="PyTorch schedules before 2.10 have no return_outputs argument",
+        reason="PyTorch schedules before 2.10 always keep and return the last stage's outputs",
     )
-    def test_last_stage_outputs_are_not_kept_or_returned_by_default(self, one_rank_gloo_group: None) -> None:
+    # 1F1B runs PipelineScheduleSingle.step(); interleaved 1F1B runs PipelineScheduleMulti.step().
+    @pytest.mark.parametrize("schedule_name", ["1f1b", "interleaved1f1b"])
+    def test_last_stage_outputs_are_not_kept_or_returned_by_default(
+        self, one_rank_gloo_group: None, schedule_name: str
+    ) -> None:
         # One stage on one rank is both the first and the last stage.
         model = torch.nn.Linear(4, 6)
         stage = PipelineStage(model, stage_index=0, num_stages=1, device=torch.device("cpu"))
         schedule = build_pipeline_schedule(
             pipeline_parallel_schedule_csv=None,
-            pipeline_parallel_schedule="1f1b",
+            pipeline_parallel_schedule=schedule_name,
             microbatch_size=2,
             local_batch_size=8,
             stages=[stage],
@@ -543,7 +547,10 @@ class TestBuildPipelineSchedule:
         [
             (True, {}, {"return_outputs": False}),
             (True, {"return_outputs": True}, {"return_outputs": True}),
+            # Older PyTorch has no such argument: step() accepts it and drops it.
             (False, {}, {}),
+            (False, {"return_outputs": True}, {}),
+            (False, {"return_outputs": False}, {}),
         ],
     )
     def test_step_return_outputs_default(
