@@ -42,8 +42,13 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     model_keeps_self_forward,
     patch_hf_model_for_pp,
 )
+from nemo_automodel.shared.import_utils import is_torch_min_version
 
 logger = logging.getLogger(__name__)
+
+# PyTorch 2.10 added ``return_outputs`` to the schedules' ``step()`` (pytorch/pytorch#165822). The
+# 2.10.0 pre-releases compare as older, because the earliest of them predate that change.
+_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION = "2.10.0"
 
 
 def _get_optional_hook(module: nn.Module, name: str) -> Callable | None:
@@ -501,6 +506,27 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
         stage._post_metadata_inference_cleanup = types.MethodType(_cleanup_preserving_grads, stage)
 
 
+def _default_return_outputs_to_false(schedule: _PipelineSchedule) -> None:
+    """Make ``schedule.step()`` and ``schedule.eval()`` default to ``return_outputs=False``.
+
+    PyTorch defaults ``return_outputs`` to ``True``. The last stage then keeps every
+    microbatch's output until the next step and concatenates them into a full-batch output
+    for ``step()`` to return. AutoModel reads the loss from the ``losses`` list, so both
+    copies only cost memory. For an LM head each copy holds the logits of the whole local
+    batch: 63 GiB in bf16 for 64 microbatches of 4,096 tokens and a 129,280-token
+    vocabulary. Callers that need the merged output pass ``return_outputs=True``.
+
+    ``eval()`` calls ``self.step()``, so it gets the same default. PyTorch releases before
+    2.10 have no ``return_outputs`` and keep their behavior.
+
+    Args:
+        schedule: The schedule whose ``step()`` default is changed in place.
+    """
+    if not is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION):
+        return
+    schedule.step = functools.partial(schedule.step, return_outputs=False)
+
+
 def reset_pp_stage_shapes(
     schedule: _PipelineSchedule,
     stages: list[PipelineStage],
@@ -860,7 +886,9 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages.
+        _PipelineSchedule: The pipeline schedule for the given stages. On PyTorch 2.10 and
+        newer, its ``step()`` and ``eval()`` return ``None`` unless called with
+        ``return_outputs=True``; read the loss from their ``losses`` list.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 
@@ -911,6 +939,7 @@ def build_pipeline_schedule(
         )
         schedule._load_csv(pp_schedule_csv)
 
+    _default_return_outputs_to_false(schedule)
     return schedule
 
 

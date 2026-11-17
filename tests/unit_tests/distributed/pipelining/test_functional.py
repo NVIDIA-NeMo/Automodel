@@ -14,16 +14,19 @@
 
 import importlib
 import types
+from collections.abc import Iterator
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
     PipelineScheduleMulti,
     PipelineScheduleSingle,
 )
 
 from nemo_automodel.components.distributed.pipelining.functional import (
+    _SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION,
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
     _preserve_grads_across_stage_reinit,
@@ -39,6 +42,7 @@ from nemo_automodel.components.distributed.pipelining.functional import (
     split_model_into_stages,
     stage_ids_this_rank,
 )
+from nemo_automodel.shared.import_utils import is_torch_min_version
 
 
 class TestStageIdsThisRank:
@@ -477,8 +481,99 @@ class TestSplitModelIntoStages:
                 assert "language_model.lm_head" in call_kwargs["lm_head_fqn"]
 
 
+@pytest.fixture
+def one_rank_gloo_group() -> Iterator[None]:
+    """Initialize a one-rank Gloo process group and destroy it after the test."""
+    torch.distributed.init_process_group("gloo", rank=0, world_size=1, store=torch.distributed.HashStore())
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class _StepRecordingSchedule(PipelineScheduleSingle):
+    """Schedule stub that records the keyword arguments its ``step()`` receives."""
+
+    def __init__(self, *args, **kwargs):
+        self.step_kwargs = []
+
+    def step(self, *args, **kwargs):
+        self.step_kwargs.append(kwargs)
+
+    def _step_microbatches(self, *args, **kwargs):
+        pass
+
+
 class TestBuildPipelineSchedule:
     """Test build_pipeline_schedule function."""
+
+    @pytest.mark.cpu_only
+    @pytest.mark.skipif(
+        not is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION),
+        reason="PyTorch schedules before 2.10 have no return_outputs argument",
+    )
+    def test_last_stage_outputs_are_not_kept_or_returned_by_default(self, one_rank_gloo_group: None) -> None:
+        # One stage on one rank is both the first and the last stage.
+        model = torch.nn.Linear(4, 6)
+        stage = PipelineStage(model, stage_index=0, num_stages=1, device=torch.device("cpu"))
+        schedule = build_pipeline_schedule(
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule="1f1b",
+            microbatch_size=2,
+            local_batch_size=8,
+            stages=[stage],
+            loss_fn=torch.nn.MSELoss(),
+        )
+        inputs = torch.randn(8, 4)
+        target = torch.randn(8, 6)
+
+        for run in (schedule.step, schedule.eval):
+            losses = []
+            assert run(inputs, target=target, losses=losses) is None
+            assert stage.output_chunks == []
+            assert len(losses) == 4
+
+        merged = schedule.step(inputs, target=target, losses=[], return_outputs=True)
+        assert len(stage.output_chunks) == 4
+        torch.testing.assert_close(merged, model(inputs))
+
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize(
+        ("torch_has_return_outputs", "call_kwargs", "received_kwargs"),
+        [
+            (True, {}, {"return_outputs": False}),
+            (True, {"return_outputs": True}, {"return_outputs": True}),
+            (False, {}, {}),
+        ],
+    )
+    def test_step_return_outputs_default(
+        self,
+        torch_has_return_outputs: bool,
+        call_kwargs: dict[str, bool],
+        received_kwargs: dict[str, bool],
+    ) -> None:
+        with (
+            patch(
+                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
+                return_value=_StepRecordingSchedule,
+            ),
+            patch(
+                "nemo_automodel.components.distributed.pipelining.functional.is_torch_min_version",
+                return_value=torch_has_return_outputs,
+            ),
+        ):
+            schedule = build_pipeline_schedule(
+                pipeline_parallel_schedule_csv=None,
+                pipeline_parallel_schedule="1f1b",
+                microbatch_size=2,
+                local_batch_size=8,
+                stages=[Mock()],
+                loss_fn=Mock(),
+            )
+
+        schedule.step(**call_kwargs)
+
+        assert schedule.step_kwargs == [received_kwargs]
 
     @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
     def test_build_schedule_single(self, mock_get_schedule):
@@ -575,6 +670,7 @@ class TestBuildPipelineSchedule:
                 self.n_microbatches = kwargs.get("n_microbatches", 0)
                 self.loss_fn = kwargs.get("loss_fn", None)
                 self._load_csv = Mock()
+                self.step = Mock()
                 self._mock_instance = self  # Store reference for assertions
 
         # Patch _PipelineScheduleRuntime with our mock class
