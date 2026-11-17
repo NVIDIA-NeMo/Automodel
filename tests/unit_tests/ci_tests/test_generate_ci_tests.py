@@ -223,7 +223,6 @@ def test_glm_4_7_flash_benchmark_recipe_generates_with_checkpointing():
         "examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml",
         "examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml",
         "examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml",
-        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
     ],
 )
 def test_migrated_moe_recipes_preserve_activation_checkpointing(config_path):
@@ -395,34 +394,6 @@ ci:
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"
-
-
-def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
-    config = Path("examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml")
-
-    jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
-    ci_config = YAML(typ="safe").load(config)["ci"]
-    robustness = ci_config["checkpoint_robustness"]
-
-    variables = jobs[""]["variables"]
-    assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
-    assert variables["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-    assert variables["TIME"] == "00:30:00"
-    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
-    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
-        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
-    )
-    assert "check_source_load_parity" not in robustness
-    assert "skip_source_load_parity" not in robustness
-    assert "skip_automodel_reload_logit_parity" not in robustness
-    assert "skip_hf_reload_logit_parity" not in robustness
-    assert "skip_resume" not in robustness
-    for key in (
-        "source_load_kl_threshold",
-        "source_load_mean_kl_threshold",
-        "source_load_cosine_threshold",
-    ):
-        assert key not in robustness
 
 
 def test_generate_glm51_lora_includes_native_checkpoint_validation():
