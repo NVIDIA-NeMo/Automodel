@@ -149,7 +149,7 @@ def test_loader_overrides_cannot_request_rope_scaling(tmp_path, monkeypatch, loa
     config = path if from_path else get_hf_config(path, "sdpa")
 
     with pytest.raises(ValueError, match="frequency scaling is not implemented for LFM3"):
-        loader.from_config(config, **copy.deepcopy(override))
+        loader.from_config(config, attn_implementation="sdpa", **copy.deepcopy(override))
 
 
 def test_loader_override_with_supported_rope_builds_the_model(tmp_path, monkeypatch):
