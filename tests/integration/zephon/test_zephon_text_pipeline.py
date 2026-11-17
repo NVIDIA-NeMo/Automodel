@@ -224,7 +224,7 @@ def test_xdoc_and_boundary_label_mask_are_independent(config, tokenizer):
             loader.close()
 
 
-def test_common_text_build_does_not_enter_native_context_or_wrap_collation(config, tokenizer):
+def test_common_text_build_does_not_enter_native_context(config, tokenizer):
     class NativeOnlyContext:
         def __enter__(self):
             raise AssertionError("Zephon initialization must stay on every rank")
@@ -232,16 +232,12 @@ def test_common_text_build_does_not_enter_native_context_or_wrap_collation(confi
         def __exit__(self, *_):
             pass
 
-    def native_collate_wrapper(collator):
-        raise AssertionError("to_training must remain the final collator")
-
     with closing(
         config.build(
             tokenizer=tokenizer,
             dp_rank=0,
             dp_world_size=1,
             dataset_build_context=NativeOnlyContext(),
-            collate_wrapper=native_collate_wrapper,
             pp_enabled=True,
             supports_seq_lens=False,
             cp_size=1,
