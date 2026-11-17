@@ -56,6 +56,10 @@ class _FlashBoundaries:
 def _packed_attention(self: nn.Module, hidden: torch.Tensor, metadata: _FlashBoundaries, **kwargs: Any) -> Any:
     """Use the released projections/RoPE with explicit, padding-aware segments.
 
+    As in the release, FP32 query, key and value return to the autocast dtype
+    before FlashAttention; without autocast, to the pre-quantization or
+    query-projection weight dtype.
+
     Args:
         hidden: Tensor of shape [batch, sequence, hidden] holding normalized
             packed rows.
@@ -85,6 +89,16 @@ def _packed_attention(self: nn.Module, hidden: torch.Tensor, metadata: _FlashBou
     if position_embeddings is None:
         position_embeddings = self.rotary_emb(value, kwargs.get("position_ids"))
     query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
+    if query.dtype == torch.float32:
+        # As in the release's FlashAttention-2 path: RoPE tables built from FP32
+        # activations promote Q/K, but FlashAttention needs matching 16-bit inputs.
+        if torch.is_autocast_enabled(query.device.type):
+            target = torch.get_autocast_dtype(query.device.type)
+        elif hasattr(self.config, "_pre_quantization_dtype"):
+            target = self.config._pre_quantization_dtype
+        else:
+            target = self.q_proj.weight.dtype
+        query, key, value = query.to(target), key.to(target), value.to(target)
     _, flash = safe_import_from("flash_attn", "flash_attn_varlen_func")
     window = self.sliding_window
     output = flash(

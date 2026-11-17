@@ -277,6 +277,22 @@ def test_packed_logits_gradients_and_document_isolation(family: str, with_lora: 
             )
 
 
+def test_nas_packing_keeps_release_precision_with_fp32_parameters_under_autocast() -> None:
+    # FP32 embeddings build FP32 RoPE tables, which promote the BF16 query and
+    # key; the release casts them back before FlashAttention, so packing must too.
+    model = _model("nas").float()
+    batch = _batch(model)
+    ids = cast(torch.Tensor, batch["input_ids"])
+    documents = [(0, 0, 80), (0, 80, 176), (1, 0, 96), (1, 96, 176)]
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        references = [
+            _logits(model(input_ids=ids[row : row + 1, start:end], use_cache=False)) for row, start, end in documents
+        ]
+        packed = _logits(model(**batch))
+    for (row, start, end), reference in zip(documents, references, strict=True):
+        torch.testing.assert_close(packed[row : row + 1, start:end].float(), reference.float(), atol=3e-3, rtol=3e-2)
+
+
 def test_flash_non_flash_backend_constructs_and_rejects_packing() -> None:
     model = _model("flash", "sdpa")
     assert type(model.model.layers[-1].self_attn).__name__ == "NemotronFlashSDPAAttention"
