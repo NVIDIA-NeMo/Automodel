@@ -26,6 +26,8 @@ optimizer:
 
 The nested `native` target must be a dotted class path. Registry short names such as `adamw` are not resolved inside nested mappings. Omitting the nested `_target_` selects AdamW. The registry key `gradient_sketch` is accepted only by the top-level `build_optimizer_config` and `build_optimizer` entry points, not inside recipe YAML.
 
+Two example recipes use this optimizer: [`qwen3_0p6b_squad_gradient_sketch.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_squad_gradient_sketch.yaml) (Qwen3-0.6B on SQuAD) and [`qwen2_5_1p5b_tulu3_gradient_sketch.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_1p5b_tulu3_gradient_sketch.yaml) (Qwen2.5-1.5B chat SFT on Tulu-3).
+
 ## Fields
 
 | Field | Type | Default | Meaning |
