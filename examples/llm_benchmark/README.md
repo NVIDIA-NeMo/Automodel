@@ -207,6 +207,19 @@ Other recorded differences:
 | [qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml](qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml) | [qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml) |
 | [qwen/qwen3_moe_30b_torchmm_gb200.yaml](qwen/qwen3_moe_30b_torchmm_gb200.yaml) | [qwen/qwen3_moe_30b_squad_torchmm_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_squad_torchmm_gb200.yaml) |
 
+The following legacy LoRA benchmarks were migrated to SQuAD fine-tuning.
+The replacements preserve TP2, local/global batch sizes, compilation settings,
+and one- or two-node topology. They use real examples padded to 4,096 tokens;
+performance figures from the historical mock workloads do not measure these replacements.
+Run each replacement with `automodel <config.yaml> --benchmark` for its nightly
+performance workload.
+
+| Removed benchmark | Fine-tuning replacement |
+|---|---|
+| `llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml` | [llama3_3/llama_3_3_70b_instruct_squad_tp2_peft.yaml](../llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_tp2_peft.yaml) |
+| `llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml` | [llama3_3/llama_3_3_70b_instruct_squad_tp2_peft_2nodes.yaml](../llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_tp2_peft_2nodes.yaml) |
+| `qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml` | [qwen/qwen2_5_32b_squad_tp2_peft_2nodes.yaml](../llm_finetune/qwen/qwen2_5_32b_squad_tp2_peft_2nodes.yaml) |
+
 ## Interpreting throughput
 
 Fewer measured steps do not by themselves explain a large steady-state TPS loss.

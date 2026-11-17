@@ -668,7 +668,6 @@ def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
                 "examples/llm_benchmark/qwen/qwen2_5_7b_quack.yaml",
                 "examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml",
                 "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml",
-                "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml",
             ],
         ),
         (
@@ -680,6 +679,9 @@ def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
                 "examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml",
                 "examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml",
                 "examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_32b_squad_tp2_peft_2nodes.yaml",
+                "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_tp2_peft.yaml",
+                "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_tp2_peft_2nodes.yaml",
                 "examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml",
                 "examples/llm_finetune/llama3_2/llama3_2_1b_squad_flashoptim.yaml",
                 "examples/llm_finetune/llama3_2/llama3_2_1b_squad_qat.yaml",
