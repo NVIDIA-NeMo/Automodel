@@ -182,14 +182,19 @@ def _validation_loader_config(
 ) -> DataloaderConfig:
     """Return the validation loader config, unpacked unless validation must use the training packer.
 
-    An unpacked validation loader must not keep ``neat_packed_collater`` from the
-    ``validation_dataloader`` collate_fn: it stacks pre-packed samples and fails on the
-    variable-length raw examples.
+    Skipping the online packer leaves raw examples, which ``neat_packed_collater`` cannot stack, so
+    that collate_fn is dropped only when this loader would have packed them itself. Already-packed
+    data (``packing.prepacked`` or no ``packing``) keeps its configured collater.
     """
     if _should_pack_validation(training_dataloader, validation_dataloader, model):
         return validation_dataloader
+    packing = validation_dataloader.packing
     collate_fn = validation_dataloader.collate_fn
-    if getattr(collate_fn, "func", collate_fn) is neat_packed_collater:
+    if (
+        packing is not None
+        and not packing.prepacked
+        and getattr(collate_fn, "func", collate_fn) is neat_packed_collater
+    ):
         collate_fn = None
     return replace(validation_dataloader, packing=None, collate_fn=collate_fn)
 
