@@ -204,6 +204,11 @@ def _worker(root: Path, method: str) -> None:
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.recipes.decision.train_deciffusion import TrainDeciffusionDecisionRecipe
 
+    # IEEE fp32 matmuls for the native and reference reads: an fp32 MixedPrecisionPolicy does not disable TF32.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+
     repository = Path(__file__).resolve().parents[4]
     cfg = yaml.safe_load((repository / "examples/decision/deciffusion_support_routing_lora.yaml").read_text())
     cfg["model"]["pretrained_model_name_or_path"] = str(root / "base")
@@ -274,7 +279,13 @@ def test_deciffusion_recipe_two_gpu(tmp_path, method):
     _tiny_checkpoint(tmp_path / "base", seed=0)
     _tiny_checkpoint(tmp_path / "other", seed=1)
     _rows(tmp_path / "data")
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[4])}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[4]),
+        # Containers can force TF32 in cuBLAS regardless of the torch flags; the parity check needs IEEE fp32.
+        "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE": "0",
+        "NVIDIA_TF32_OVERRIDE": "0",
+    }
     subprocess.run(
         [
             sys.executable,

@@ -361,9 +361,11 @@ def test_clef_training_rejects_disabled_checkpoints_before_training_or_loading_o
 def test_deciffusion_selection_prefers_accuracy_then_lower_cross_entropy():
     from nemo_automodel.recipes.decision.train_deciffusion import selection_value
 
-    assert selection_value(0.9, 5.0) < selection_value(0.8999, 0.01)  # one row in 10^4 outranks any CE
-    assert selection_value(0.9, 0.3) < selection_value(0.9, 0.4)
-    assert selection_value(0.9, 1000.0) < selection_value(0.8999, 0.0)
+    assert selection_value(9, 0.3) < selection_value(9, 0.4)
+    assert selection_value(9, 1000.0) < selection_value(8, 0.0)  # one more correct row outranks any CE
+    # exact at any validation size: 90,000 vs 89,999 correct of 100,000 rows
+    assert selection_value(90_000, 99.0) < selection_value(89_999, 0.0)
+    assert selection_value(10**9, 99.0) < selection_value(10**9 - 1, 0.0)
 
 
 @pytest.mark.parametrize("batch,world", [(0, 1), (6, 4), (-4, 2)])

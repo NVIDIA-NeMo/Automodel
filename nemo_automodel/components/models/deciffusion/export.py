@@ -33,11 +33,18 @@ from nemo_automodel.components.models.deciffusion.scorer import SHARED_CONTEXT_F
 _NOT_COPIED = ("*.safetensors", "*.safetensors.index.json", ".cache", "merge-receipt.json", "export-receipt.json")
 
 
-def checkpoint_fingerprint(checkpoint_dir: str | Path, *, window: int = 1 << 20) -> str:
-    """Cheap content fingerprint of a local checkpoint: ``config.json`` plus size, head and tail bytes of every shard.
+def checkpoint_fingerprint(checkpoint_dir: str | Path, *, chunk_size: int = 1 << 24) -> str:
+    """SHA-256 over ``config.json`` and the full contents of every ``*.safetensors`` shard of a local checkpoint.
 
-    Distinguishes checkpoints whose tensor names and shapes agree but whose weights differ, without reading every
-    weight. Not a cryptographic proof of identical weights.
+    Reads every weight byte, so a base whose interior weights differ (for example, an ordinary fine-tune of the same
+    architecture) gets a different fingerprint.
+
+    Args:
+        checkpoint_dir: Local checkpoint directory.
+        chunk_size: Bytes read per step.
+
+    Returns:
+        Hex digest.
 
     Raises:
         FileNotFoundError: If the directory has no ``*.safetensors`` shard.
@@ -48,12 +55,10 @@ def checkpoint_fingerprint(checkpoint_dir: str | Path, *, window: int = 1 << 20)
         raise FileNotFoundError(f"{root} has no *.safetensors weights")
     digest = hashlib.sha256((root / "config.json").read_bytes() if (root / "config.json").exists() else b"")
     for shard in shards:
-        size = shard.stat().st_size
-        digest.update(f"{shard.name}|{size}".encode())
+        digest.update(f"{shard.name}|{shard.stat().st_size}".encode())
         with open(shard, "rb") as handle:
-            digest.update(handle.read(window))
-            handle.seek(max(0, size - window))
-            digest.update(handle.read(window))
+            while block := handle.read(chunk_size):
+                digest.update(block)
     return digest.hexdigest()
 
 

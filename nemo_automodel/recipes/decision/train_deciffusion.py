@@ -77,9 +77,17 @@ MODES = ("eval", "train")
 STAGE_FORMAT = "deciffusion-decision-stage-v1"
 
 
-def selection_value(accuracy: float, cross_entropy: float) -> float:
-    """Lower-is-better scalar ordering (accuracy desc, cross-entropy asc) for up to 10^4 validation rows."""
-    return -accuracy + 1e-6 * min(cross_entropy, 99.0)
+def selection_value(correct: int, cross_entropy: float) -> float:
+    """Lower-is-better scalar that orders stages by correct validation rows, then by lower cross-entropy.
+
+    The cross-entropy term lies in ``[0, 0.99]``, below the gap of one correct row, so the order is exactly
+    lexicographic for any validation size (every stage is scored on the same validation rows).
+
+    Args:
+        correct: Number of correctly decided validation rows.
+        cross_entropy: Mean validation cross-entropy (clipped to 99).
+    """
+    return -float(correct) + min(cross_entropy, 99.0) / 100.0
 
 
 class TrainDeciffusionDecisionRecipe(BaseRecipe):
@@ -278,6 +286,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
         summary: dict[str, Any] = {
             "split": split,
             "rows": int(stats[2]),
+            "correct": int(round(float(stats[0]))),
             "skipped_rows": len(self.rows[split]) - len(examples),
             "accuracy": float(stats[0]) / count,
             "cross_entropy": float(stats[1]) / count,
@@ -292,7 +301,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
         """Publish the trainable weights (LoRA adapter or consolidated full weights) as an immutable stage."""
         self.checkpointer.lifecycle.reserve(str(path))
         self.checkpointer.save_model(self.model, str(path), peft_config=self.peft_config)
-        value = selection_value(validation["accuracy"], validation["cross_entropy"]) if validation else None
+        value = selection_value(validation["correct"], validation["cross_entropy"]) if validation else None
 
         def write_metadata() -> None:
             (path / "stage.json").write_text(json.dumps({**self.identity, "validation": validation}, indent=2))
@@ -395,7 +404,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             if "validation" not in self.examples:
                 return None
             summary = self.evaluate("validation")
-            record = {k: summary[k] for k in ("accuracy", "cross_entropy", "rows")}
+            record = {k: summary[k] for k in ("accuracy", "correct", "cross_entropy", "rows")}
             self._log("validation.jsonl", {"step": step, **record})
             return record
 
@@ -457,8 +466,8 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 self._save_stage(self.output_dir / f"step_{step:08d}", record)
                 if record is not None and (
                     best[0] is None
-                    or selection_value(record["accuracy"], record["cross_entropy"])
-                    < selection_value(best[0]["accuracy"], best[0]["cross_entropy"])
+                    or selection_value(record["correct"], record["cross_entropy"])
+                    < selection_value(best[0]["correct"], best[0]["cross_entropy"])
                 ):
                     best = (record, step)
         if self.dist_env.is_main:

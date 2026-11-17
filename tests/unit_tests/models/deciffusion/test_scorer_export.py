@@ -212,6 +212,19 @@ def test_fingerprint_separates_same_shape_bases(tmp_path):
         checkpoint_fingerprint(tmp_path)
 
 
+def test_fingerprint_detects_interior_weight_changes(tmp_path):
+    """A same-architecture base that differs only in the middle of a large shard (a fine-tuned projection)."""
+    base = {"encoder.layers.0.mlp.up_proj.weight": torch.zeros(1024, 1024)}  # 4 MiB shard
+    tuned = {"encoder.layers.0.mlp.up_proj.weight": torch.zeros(1024, 1024)}
+    tuned["encoder.layers.0.mlp.up_proj.weight"][512, 512] = 1.0  # ~2 MiB from both ends of the file
+    for name, weights in (("base", base), ("tuned", tuned)):
+        (tmp_path / name).mkdir()
+        save_file(weights, str(tmp_path / name / "model.safetensors"))
+        (tmp_path / name / "config.json").write_text("{}")
+    assert checkpoint_fingerprint(tmp_path / "base") != checkpoint_fingerprint(tmp_path / "tuned")
+    assert checkpoint_fingerprint(tmp_path / "base", chunk_size=7) == checkpoint_fingerprint(tmp_path / "base")
+
+
 def test_full_export_casts_to_base_dtypes_and_rejects_mismatched_tensors(tmp_path):
     base = _write_base(tmp_path / "base")
     trained_dir = tmp_path / "consolidated"
