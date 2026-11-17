@@ -13,11 +13,14 @@
 # limitations under the License.
 """Unit tests for the embedding-distillation recipe helpers and setup guards."""
 
+from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
+from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 from nemo_automodel._transformers.retrieval import RetrieverStudentWithProjection
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
@@ -32,7 +35,10 @@ from nemo_automodel.recipes.retrieval.distill_bi_encoder import (
     _split_grouped_passages,
     _unpack_qpn,
 )
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
+from nemo_automodel.recipes.retrieval.train_bi_encoder import (
+    TrainBiEncoderRecipe,
+    _configure_sentence_transformer_export,
+)
 
 
 class _DictLikeConfig(SimpleNamespace):
@@ -54,9 +60,16 @@ class _FakeEncoder(nn.Module):
     def forward(self, inputs):
         return torch.zeros(inputs["input_ids"].shape[0], self.model.config.hidden_size)
 
-    def configure_sentence_transformer_prompts(self, query_prompt, document_prompt):
+    def configure_sentence_transformer_prompts(
+        self,
+        query_prompt: str,
+        document_prompt: str,
+        *,
+        tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None = None,
+    ) -> None:
         self.sentence_transformer_export_config.query_prompt = query_prompt
         self.sentence_transformer_export_config.document_prompt = document_prompt
+        self.prompt_tokenizer = tokenizer
 
     def disable_sentence_transformer_export(self):
         self.sentence_transformer_export_config = None
@@ -73,6 +86,23 @@ class _OptimizerGroupingModel(nn.Module):
         self.projection = nn.Linear(4, 6)
 
 
+class _TrainableEncoder(_FakeEncoder):
+    def __init__(self, dtype: torch.dtype) -> None:
+        super().__init__(hidden_size=4)
+        self.embedding = nn.Embedding(8, 4, dtype=dtype)
+
+    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Pool tiny token embeddings for gradient comparisons.
+
+        Args:
+            inputs: input_ids tensor of shape [batch, sequence].
+
+        Returns:
+            Tensor of shape [batch, hidden].
+        """
+        return self.embedding(inputs["input_ids"]).mean(dim=1)
+
+
 def _param_group_by_id(optimizer):
     return {id(param): group for group in optimizer.param_groups for param in group["params"]}
 
@@ -80,6 +110,102 @@ def _param_group_by_id(optimizer):
 # ---------------------------------------------------------------------------
 # RetrieverStudentWithProjection projection restore
 # ---------------------------------------------------------------------------
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_retriever_student_without_projection_matches_direct_training(dtype: torch.dtype) -> None:
+    student = _TrainableEncoder(dtype)
+    reference = deepcopy(student)
+    model = RetrieverStudentWithProjection(student=student, teacher_hidden_size=4, use_projection=False)
+    inputs = {"input_ids": torch.tensor([[0, 1, 2], [3, 4, 5]])}
+    target = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
+
+    recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
+    recipe.cfg = _DictLikeConfig(optimizer={"lr": 0.1, "distill_projection_lr": 1.0})
+    recipe.model_parts = [model]
+    optimizer = torch.optim.SGD(recipe._build_optimizer_param_groups(), lr=0.1)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+
+    pooled, distill_embeddings, captures = model(inputs)
+    expected = reference(inputs).float()
+    assert model.projection is None
+    assert distill_embeddings is pooled
+    assert distill_embeddings.dtype == torch.float32
+    assert captures == {}
+    assert recipe._projection_parameters() == []
+    assert set(model.state_dict()) == {f"student.{key}" for key in student.state_dict()}
+    assert {id(param) for group in optimizer.param_groups for param in group["params"]} == {
+        id(param) for param in student.parameters()
+    }
+    torch.testing.assert_close(distill_embeddings, expected, rtol=0, atol=0)
+
+    loss = torch.nn.functional.mse_loss(distill_embeddings, target)
+    reference_loss = torch.nn.functional.mse_loss(expected, target)
+    loss.backward()
+    reference_loss.backward()
+    for param, reference_param in zip(student.parameters(), reference.parameters(), strict=True):
+        assert param.grad is not None
+        assert torch.isfinite(param.grad).all()
+        assert param.grad.abs().sum() > 0
+        torch.testing.assert_close(param.grad, reference_param.grad, rtol=0, atol=0)
+
+    optimizer.step()
+    reference_optimizer.step()
+    for param, reference_param in zip(student.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(param, reference_param, rtol=0, atol=0)
+
+    restored = RetrieverStudentWithProjection(
+        student=_TrainableEncoder(dtype), teacher_hidden_size=4, use_projection=False
+    )
+    restored.load_state_dict(model.state_dict(), strict=True)
+    torch.testing.assert_close(restored(inputs)[1], model(inputs)[1], rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+def test_retriever_student_without_projection_requires_equal_hidden_sizes() -> None:
+    with pytest.raises(ValueError, match="student_hidden_size=4, teacher_hidden_size=6"):
+        RetrieverStudentWithProjection(student=_FakeEncoder(), teacher_hidden_size=6, use_projection=False)
+
+
+@pytest.mark.cpu_only
+def test_retriever_student_without_projection_rejects_projection_restore(tmp_path: Path) -> None:
+    model = RetrieverStudentWithProjection(student=_FakeEncoder(), teacher_hidden_size=4, use_projection=False)
+
+    with pytest.raises(ValueError, match="Cannot restore.*use_projection=False"):
+        model.restore_projection_from_checkpoint(str(tmp_path))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_projection", [False, True])
+def test_retriever_student_build_selects_projection(monkeypatch: pytest.MonkeyPatch, use_projection: bool) -> None:
+    from nemo_automodel import NeMoAutoModelBiEncoder
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(NeMoAutoModelBiEncoder, "from_pretrained", lambda **kwargs: _FakeEncoder())
+
+    model = RetrieverStudentWithProjection.build("unused", teacher_hidden_size=4, use_projection=use_projection)
+
+    assert isinstance(model.projection, nn.Linear) if use_projection else model.projection is None
+
+
+@pytest.mark.cpu_only
+def test_retriever_student_without_projection_checkpoint_omits_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkpoint_dir = tmp_path / "epoch_0_step_1"
+    checkpoint_dir.mkdir()
+    monkeypatch.setattr(TrainBiEncoderRecipe, "save_checkpoint", lambda *args, **kwargs: None)
+    recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
+    recipe.checkpointer = SimpleNamespace(config=SimpleNamespace(enabled=True, checkpoint_dir=str(tmp_path)))
+    recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.model_parts = [
+        RetrieverStudentWithProjection(student=_FakeEncoder(), teacher_hidden_size=4, use_projection=False)
+    ]
+
+    recipe.save_checkpoint(epoch=0, step=1, train_loss=0.0)
+
+    assert not (checkpoint_dir / "projection.pt").exists()
+
+
 def test_retriever_student_restores_projection_from_epoch_checkpoint(tmp_path):
     checkpoint_dir = tmp_path / "epoch_0_step_10"
     consolidated_dir = checkpoint_dir / "model" / "consolidated"
@@ -140,6 +266,25 @@ def test_retriever_student_projection_delegates_sentence_transformer_export_conf
     assert model.sentence_transformer_export_config.document_prompt == "passage:"
     assert model.student.sentence_transformer_export_config.query_prompt == "query:"
     assert model.student.sentence_transformer_export_config.document_prompt == "passage:"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("with_tokenizer", [False, True])
+def test_retriever_student_projection_configures_export_during_recipe_setup(
+    monkeypatch: pytest.MonkeyPatch, with_tokenizer: bool
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    student = _FakeEncoder(hidden_size=4)
+    model = RetrieverStudentWithProjection(student=student, teacher_hidden_size=6)
+    tokenizer = PreTrainedTokenizerBase() if with_tokenizer else None
+    collator = SimpleNamespace(query_prefix="query:", passage_prefix="passage:")
+
+    _configure_sentence_transformer_export(model, collator, tokenizer=tokenizer)
+
+    assert model.sentence_transformer_export_config is student.sentence_transformer_export_config
+    assert model.sentence_transformer_export_config.query_prompt == "query: "
+    assert model.sentence_transformer_export_config.document_prompt == "passage: "
+    assert student.prompt_tokenizer is tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +579,7 @@ def test_dp_group_src_rank_none_group():
 def test_dp_group_src_rank_error_returns_zero():
     # A bogus group object makes torch.distributed raise, which is swallowed.
     assert _dp_group_src_rank(object()) == 0
+
 
 # ---------------------------------------------------------------------------
 # setup() intermediate-loss guards

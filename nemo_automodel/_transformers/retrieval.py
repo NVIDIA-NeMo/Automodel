@@ -1308,14 +1308,28 @@ class _RetrieverStudentProjectionStateDictAdapter(EncoderStateDictAdapter):
 
 
 class RetrieverStudentWithProjection(nn.Module):
-    """Bi-encoder student with a trainable linear projection into teacher space."""
+    """Bi-encoder student with an optional trainable projection into teacher space."""
 
     def __init__(
         self,
         student: BiEncoderModel,
         teacher_hidden_size: int,
         capture_layers: Sequence[int] | None = None,
+        *,
+        use_projection: bool = True,
     ) -> None:
+        """Wrap a student for embedding distillation.
+
+        Args:
+            student: Bi-encoder being trained.
+            teacher_hidden_size: Width of the teacher embeddings.
+            capture_layers: Student layer indices to capture for intermediate losses.
+            use_projection: Whether to learn a linear map into teacher space.
+                Disabling it requires matching student and teacher hidden sizes.
+
+        Raises:
+            ValueError: If projection is disabled and hidden sizes differ.
+        """
         super().__init__()
         self.student = student
         self.config = student.config
@@ -1328,13 +1342,20 @@ class RetrieverStudentWithProjection(nn.Module):
         self.student_hidden = student_hidden
         self.teacher_hidden = int(teacher_hidden_size)
 
-        self.projection = nn.Linear(student_hidden, self.teacher_hidden, bias=True)
-        nn.init.xavier_uniform_(self.projection.weight)
-        nn.init.zeros_(self.projection.bias)
-        self.projection = self.projection.float()
-        if torch.cuda.is_available():
-            # Keep projection colocated with rank-local activations under distributed training.
-            self.projection = self.projection.to(device=torch.cuda.current_device())
+        self.projection: nn.Linear | None = None
+        if use_projection:
+            self.projection = nn.Linear(student_hidden, self.teacher_hidden, bias=True)
+            nn.init.xavier_uniform_(self.projection.weight)
+            nn.init.zeros_(self.projection.bias)
+            self.projection = self.projection.float()
+            if torch.cuda.is_available():
+                # Keep projection colocated with rank-local activations under distributed training.
+                self.projection = self.projection.to(device=torch.cuda.current_device())
+        elif student_hidden != self.teacher_hidden:
+            raise ValueError(
+                "use_projection=False requires matching hidden sizes: "
+                f"student_hidden_size={student_hidden}, teacher_hidden_size={self.teacher_hidden}"
+            )
 
         self._capture = LayerCapture(detach=False)
         if capture_layers:
@@ -1351,8 +1372,28 @@ class RetrieverStudentWithProjection(nn.Module):
         trust_remote_code: bool = True,
         restore_projection: bool = False,
         projection_path: str | None = None,
+        *,
+        use_projection: bool = True,
         **kwargs,
     ) -> "RetrieverStudentWithProjection":
+        """Load a bi-encoder student for embedding distillation.
+
+        Args:
+            pretrained_model_name_or_path: Student checkpoint path or model identifier.
+            teacher_hidden_size: Width of the teacher embeddings.
+            pooling: Student embedding pooling strategy.
+            l2_normalize: Whether to normalize pooled student embeddings.
+            capture_layers: Student layer indices to capture for intermediate losses.
+            trust_remote_code: Whether to allow custom checkpoint modeling code.
+            restore_projection: Whether to load a saved linear projection.
+            projection_path: Optional explicit path to the projection checkpoint.
+            use_projection: Whether to learn a projection. False requires matching
+                student and teacher hidden sizes and forbids projection restoration.
+            **kwargs: Additional arguments for the student model loader.
+
+        Returns:
+            Student wrapper providing pooled and distillation embeddings.
+        """
         from nemo_automodel import NeMoAutoModelBiEncoder
 
         student = NeMoAutoModelBiEncoder.from_pretrained(
@@ -1366,6 +1407,7 @@ class RetrieverStudentWithProjection(nn.Module):
             student=student,
             teacher_hidden_size=teacher_hidden_size,
             capture_layers=capture_layers,
+            use_projection=use_projection,
         )
         if restore_projection:
             model.restore_projection_from_checkpoint(
@@ -1379,6 +1421,19 @@ class RetrieverStudentWithProjection(nn.Module):
         pretrained_model_name_or_path: str,
         projection_path: str | None = None,
     ) -> None:
+        """Restore linear projection weights from a distillation checkpoint.
+
+        Args:
+            pretrained_model_name_or_path: Student checkpoint path.
+            projection_path: Optional explicit path to the projection checkpoint.
+
+        Raises:
+            ValueError: If the projection is disabled or the checkpoint layout is invalid.
+            FileNotFoundError: If the projection checkpoint does not exist.
+            RuntimeError: If projection weights are missing or incompatible.
+        """
+        if self.projection is None:
+            raise ValueError("Cannot restore a distillation projection when use_projection=False")
         checkpoint_path = _resolve_projection_checkpoint_path(pretrained_model_name_or_path, projection_path)
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"Could not find distillation projection checkpoint: {checkpoint_path}")
@@ -1430,11 +1485,24 @@ class RetrieverStudentWithProjection(nn.Module):
             return None
         return get_exporter(tokenizer=tokenizer, original_model_path=original_model_path)
 
-    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
-        configure_prompts = getattr(self.student, "configure_sentence_transformer_prompts", None)
-        if callable(configure_prompts):
-            configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
-        self.sentence_transformer_export_config = getattr(self.student, "sentence_transformer_export_config", None)
+    def configure_sentence_transformer_prompts(
+        self,
+        query_prompt: str,
+        document_prompt: str,
+        *,
+        tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None = None,
+    ) -> None:
+        """Delegate prompt configuration and runtime export validation to the student.
+
+        Args:
+            query_prompt: Exact prompt used for queries by the training pipeline.
+            document_prompt: Exact prompt used for documents by the training pipeline.
+            tokenizer: Runtime tokenizer or processor supplied during recipe setup.
+        """
+        self.student.configure_sentence_transformer_prompts(
+            query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer
+        )
+        self.sentence_transformer_export_config = self.student.sentence_transformer_export_config
 
     def disable_sentence_transformer_export(self) -> None:
         disable_export = getattr(self.student, "disable_sentence_transformer_export", None)
@@ -1455,12 +1523,28 @@ class RetrieverStudentWithProjection(nn.Module):
         self,
         input_dict: dict,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
+        """Encode a batch and optionally map its embeddings into teacher space.
+
+        Args:
+            input_dict: Tokenized backbone inputs. input_ids and attention_mask
+                are tensors of shape [batch, sequence]. Optional multimodal
+                tensors follow the wrapped BiEncoderModel.forward contract.
+
+        Returns:
+            Pooled fp32 embeddings of shape [batch, student_hidden], fp32
+            distillation embeddings of shape [batch, teacher_hidden], and captured
+            hidden states keyed by layer index, each of shape
+            [batch, sequence, student_hidden]. Without a projection, the first
+            two outputs alias the same tensor and preserve its gradient graph.
+        """
         self._capture.reset()
         pooled = self._encode(input_dict)
         pooled_fp32 = pooled.float()
 
-        with torch.amp.autocast(device_type=pooled.device.type, enabled=False):
-            projected = self.projection(pooled_fp32)
+        projected = pooled_fp32
+        if self.projection is not None:
+            with torch.amp.autocast(device_type=pooled.device.type, enabled=False):
+                projected = self.projection(pooled_fp32)
 
         return pooled_fp32, projected, dict(self._capture.outputs)
 
