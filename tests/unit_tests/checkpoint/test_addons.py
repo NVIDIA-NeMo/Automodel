@@ -35,10 +35,9 @@ from nemo_automodel.components.checkpoint.addons import (
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
     load_automodel_peft_config_dict,
-    validate_peft_trainable_modules,
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, validate_peft_trainable_modules
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
 
@@ -605,7 +604,10 @@ def single_rank_process_group(tmp_path):
 
 
 class _TinyEncoderClassifier(nn.Module):
-    """LoRA targets in the encoder, a two-layer classification head, and a persistent buffer."""
+    """LoRA targets in the encoder, a two-layer classification head, and buffers.
+
+    The head owns a persistent and a non-persistent buffer; the root owns a persistent one.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -616,6 +618,8 @@ class _TinyEncoderClassifier(nn.Module):
         self.classifier = nn.Module()
         self.classifier.dense = nn.Linear(4, 4)
         self.classifier.out_proj = nn.Linear(4, 2)
+        self.classifier.register_buffer("label_bias", torch.full((2,), 0.5))
+        self.classifier.register_buffer("scratch", torch.zeros(2), persistent=False)
         self.register_buffer("position_ids", torch.arange(4))
 
 
@@ -634,35 +638,80 @@ def _peft_model(unfreeze_modules: list[str]) -> _TinyEncoderClassifier:
     return model
 
 
+_FULL_MODULE_KEYS = {
+    f"base_model.model.{name}"
+    for name in (
+        "classifier.dense.weight",
+        "classifier.dense.bias",
+        "classifier.out_proj.weight",
+        "classifier.out_proj.bias",
+        "classifier.label_bias",
+        "encoder.norm.weight",
+        "encoder.norm.bias",
+    )
+}
+
+
 @pytest.mark.parametrize("local_collection", [False, True], ids=["dcp", "local"])
-def test_peft_model_state_keeps_fully_trained_modules_and_drops_buffers(
+def test_peft_model_state_keeps_fully_trained_modules_with_their_persistent_buffers(
     single_rank_process_group, local_collection: bool
 ):
-    """A PEFT checkpoint holds every trainable parameter, not only the LoRA weights.
+    """A PEFT checkpoint holds every trainable parameter and the full modules' persistent buffers.
 
-    The DCP collection also returns buffers, which must stay out of the adapter. The local
-    collection (pipeline parallel, expert parallel, or quantized models) has none.
+    HF PEFT restores a ``modules_to_save`` module from all of its state-dict entries, so the
+    head's persistent buffer goes with it. Non-persistent buffers and buffers of other modules
+    stay out. The local collection serves pipeline-parallel, expert-parallel and quantized models.
     """
     model = _peft_model(["classifier", "encoder.norm"])
     pp_group = torch.distributed.group.WORLD if local_collection else None
 
     state = ModelState(model, is_peft=True, pp_group=pp_group).state_dict()
 
-    full_weight_keys = {
-        f"base_model.model.{name}"
-        for name in (
-            "classifier.dense.weight",
-            "classifier.dense.bias",
-            "classifier.out_proj.weight",
-            "classifier.out_proj.bias",
-            "encoder.norm.weight",
-            "encoder.norm.bias",
-        )
-    }
-    assert set(state) == _LORA_KEYS | full_weight_keys
-    parameters = dict(model.named_parameters())
-    for key in full_weight_keys:
-        torch.testing.assert_close(state[key], parameters[key.removeprefix("base_model.model.")], rtol=0, atol=0)
+    assert set(state) == _LORA_KEYS | _FULL_MODULE_KEYS
+    expected = model.state_dict()
+    for key in _FULL_MODULE_KEYS:
+        torch.testing.assert_close(state[key], expected[key.removeprefix("base_model.model.")], rtol=0, atol=0)
+
+
+def _wrap_ddp(model: nn.Module) -> nn.Module:
+    return DistributedDataParallel(model)
+
+
+def _wrap_head_for_activation_checkpointing(model: nn.Module) -> nn.Module:
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model.classifier = checkpoint_wrapper(model.classifier)
+    return model
+
+
+def _compile_head(model: nn.Module) -> nn.Module:
+    model.classifier = torch.compile(model.classifier, backend="eager")
+    return model
+
+
+@pytest.mark.parametrize(
+    ("wrap", "local_collection"),
+    [
+        pytest.param(_wrap_ddp, False, id="ddp"),
+        pytest.param(_wrap_head_for_activation_checkpointing, False, id="activation-checkpoint-dcp"),
+        pytest.param(_wrap_head_for_activation_checkpointing, True, id="activation-checkpoint-local"),
+        pytest.param(_compile_head, False, id="torch-compile"),
+    ],
+)
+def test_peft_export_names_ignore_training_wrappers(single_rank_process_group, wrap, local_collection: bool):
+    """Wrappers training adds around modules do not change the exported names or modules_to_save.
+
+    A trainable parameter whose name does not match its state-dict key fails the save, so the
+    names have to follow DCP's normalization through DDP, activation checkpointing and torch.compile.
+    """
+    model = wrap(_peft_model(["classifier", "encoder.norm"]))
+    pp_group = torch.distributed.group.WORLD if local_collection else None
+
+    state = ModelState(model, is_peft=True, pp_group=pp_group).state_dict()
+    config = _get_hf_peft_config(_PEFT, ModelState(model, is_peft=True, pp_group=pp_group))
+
+    assert set(state) == _LORA_KEYS | _FULL_MODULE_KEYS
+    assert config["modules_to_save"] == ["classifier", "encoder.norm"]
 
 
 def test_lora_only_peft_model_state_is_unchanged(single_rank_process_group):

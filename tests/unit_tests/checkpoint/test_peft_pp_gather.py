@@ -39,10 +39,10 @@ from nemo_automodel.components.checkpoint.addons import (
     _extract_modules_to_save,
     _extract_target_modules,
     _extract_target_parameters,
-    _trainable_module_layout,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import (
     _gather_peft_state_dict_across_pp,
+    _trainable_module_layout,
 )
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 

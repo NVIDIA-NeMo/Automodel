@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import glob
 import json
 import os
 import shutil
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -31,8 +30,10 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import (
     ModelState,
-    _dcp_parameter_name,
+    _combined_trainable_module_layout,
+    _fully_trained_modules,
     _unwrap_ddp_model,
+    _validate_trainable_module_layout,
 )
 from nemo_automodel.components.moe.state_dict_mixin import (
     _PARAMWRAPPER_LAYOUT_LEGACY,
@@ -391,46 +392,6 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     return config
 
 
-@dataclass(frozen=True)
-class _TrainableModuleLayout:
-    """Where a PEFT model's trainable non-LoRA parameters sit in its module tree.
-
-    ``freeze_config`` can make parameters trainable next to the LoRA adapters (for
-    example ``unfreeze_modules``). Those train in full, so the adapter checkpoint
-    stores them whole and names their modules in ``modules_to_save``, which tells
-    Hugging Face PEFT to restore them. All names use the DCP state-dict normalization.
-
-    Attributes:
-        trainable: Names of trainable parameters that are not LoRA weights, one name
-            per parameter.
-        aliased: Name groups of trainable non-LoRA parameters that are registered
-            under several names, such as tied input and output embeddings.
-        adapted: Paths of the modules that own LoRA parameters.
-        fully_trainable: For every module path that holds parameters, whether all of
-            them are trainable non-LoRA parameters.
-    """
-
-    trainable: frozenset[str]
-    aliased: tuple[tuple[str, ...], ...]
-    adapted: frozenset[str]
-    fully_trainable: dict[str, bool]
-
-    def merge(self, other: "_TrainableModuleLayout") -> "_TrainableModuleLayout":
-        """Combine the layouts of two pipeline stages that hold different parameters.
-
-        A module path present on both stages is fully trainable only if it is on each.
-        """
-        fully_trainable = dict(self.fully_trainable)
-        for path, value in other.fully_trainable.items():
-            fully_trainable[path] = fully_trainable.get(path, True) and value
-        return _TrainableModuleLayout(
-            trainable=self.trainable | other.trainable,
-            aliased=self.aliased + other.aliased,
-            adapted=self.adapted | other.adapted,
-            fully_trainable=fully_trainable,
-        )
-
-
 # Combined projections and the HF projection modules their weights are split into.
 _COMBINED_TO_SPLIT = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
@@ -451,128 +412,13 @@ def _split_combined_projection(module_name: str) -> list[str]:
     return [f"{parent}.{split_name}" if parent else split_name for split_name in _COMBINED_TO_SPLIT[last_component]]
 
 
-def _lora_adapted_module(name: str) -> str:
-    """Return the path of the module that owns the LoRA parameter ``name``."""
-    if ".lora_" in name:
-        return name.split(".lora_", 1)[0]
-    return name.rpartition(".")[0]
-
-
-def _trainable_module_layout(model_parts: Sequence[nn.Module]) -> _TrainableModuleLayout:
-    """Describe the trainable non-LoRA parameters of local model parts.
-
-    Args:
-        model_parts: This rank's model or pipeline-stage parts, optionally wrapped in DDP.
-
-    Returns:
-        The layout of the parameters these parts hold.
-    """
-    trainable: set[str] = set()
-    aliased: list[tuple[str, ...]] = []
-    adapted: set[str] = set()
-    fully_trainable: dict[str, bool] = {}
-    for part in model_parts:
-        names_by_parameter: dict[int, list[str]] = {}
-        for raw_name, parameter in _unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
-            name = _dcp_parameter_name(raw_name)
-            is_lora = "lora_" in name
-            is_full_weight = parameter.requires_grad and not is_lora
-            if is_lora:
-                adapted.add(_lora_adapted_module(name))
-            if is_full_weight:
-                names_by_parameter.setdefault(id(parameter), []).append(name)
-            components = name.split(".")
-            for depth in range(1, len(components)):
-                path = ".".join(components[:depth])
-                fully_trainable[path] = fully_trainable.get(path, True) and is_full_weight
-        for names in names_by_parameter.values():
-            trainable.add(names[0])
-            if len(names) > 1:
-                aliased.append(tuple(names))
-    return _TrainableModuleLayout(
-        trainable=frozenset(trainable),
-        aliased=tuple(aliased),
-        adapted=frozenset(adapted),
-        fully_trainable=fully_trainable,
-    )
-
-
-def _validate_trainable_module_layout(layout: _TrainableModuleLayout) -> None:
-    """Reject trainable non-LoRA parameters that an HF PEFT adapter cannot restore.
-
-    Args:
-        layout: Layout of the whole model, or of the pipeline stages this rank holds.
-
-    Raises:
-        ValueError: If a trainable non-LoRA parameter has several names (``modules_to_save``
-            would restore each alias as a separate copy, untying them), belongs to the root
-            module (``modules_to_save`` names submodules), or shares a module path with a
-            LoRA adapter (the adapter and a full copy of the same module conflict on load).
-    """
-    if layout.aliased:
-        raise ValueError(
-            "PEFT checkpoints cannot store a trainable parameter that is registered under several names, "
-            f"such as tied input and output embeddings: {sorted(layout.aliased)[:5]}. Hugging Face PEFT "
-            "would restore each name as a separate copy. Keep these parameters frozen, or untie them."
-        )
-    root_owned = sorted(name for name in layout.trainable if "." not in name)
-    if root_owned:
-        raise ValueError(
-            f"PEFT checkpoints cannot store the trainable parameters {root_owned[:10]}: they belong to the "
-            "root module, and modules_to_save can only restore submodules. Keep them frozen."
-        )
-    adapted_and_ancestors = set()
-    for module in layout.adapted:
-        components = module.split(".")
-        adapted_and_ancestors.update(".".join(components[:depth]) for depth in range(1, len(components) + 1))
-    overlapping = []
-    for name in sorted(layout.trainable):
-        components = name.split(".")[:-1]
-        owner = ".".join(components)
-        owner_and_ancestors = {".".join(components[:depth]) for depth in range(1, len(components) + 1)}
-        if owner in adapted_and_ancestors or owner_and_ancestors & layout.adapted:
-            overlapping.append(name)
-    if overlapping:
-        raise ValueError(
-            "PEFT checkpoints cannot store trainable parameters whose module also holds LoRA adapters or "
-            f"lies inside or around one: {overlapping[:10]}. Hugging Face PEFT would restore the adapter and "
-            "a full copy of the same module, which conflict. Narrow freeze_config.unfreeze_modules or "
-            "unfreeze_parameters to modules without LoRA, or remove those modules from the PEFT targets."
-        )
-
-
-def validate_peft_trainable_modules(model: nn.Module) -> None:
-    """Check that a PEFT model's trainable parameters fit an HF PEFT adapter checkpoint.
-
-    Run this after the trainability policy is final and before training starts, so an
-    unsupported ``freeze_config`` fails at startup instead of at the first checkpoint save.
-
-    Args:
-        model: A PEFT model or pipeline stage, optionally wrapped in DDP.
-
-    Raises:
-        ValueError: If a trainable non-LoRA parameter cannot be restored by Hugging Face
-            PEFT; see ``_validate_trainable_module_layout``.
-    """
-    _validate_trainable_module_layout(_trainable_module_layout([model]))
-
-
 def _extract_modules_to_save(
     model_parts: Sequence[nn.Module],
     *,
     v4_compatible: bool = False,
     pp_group: "ProcessGroup | None" = None,
 ) -> list[str]:
-    """Return the modules a PEFT checkpoint stores in full, for ``modules_to_save``.
-
-    Each entry is the largest module whose parameters are all trainable and none of
-    them LoRA weights. Hugging Face PEFT wraps every listed module and loads all of its
-    parameters from the adapter file. Naming a submodule of a fully trained module
-    breaks loading when PEFT also wraps the parent; for sequence classification it
-    always wraps ``classifier``/``score``.
-
-    Under pipeline parallelism the layouts of all stages are combined first, so every
-    rank returns the same list.
+    """Return the HF names of the modules a PEFT checkpoint stores whole, for ``modules_to_save``.
 
     Args:
         model_parts: This rank's model or pipeline-stage parts.
@@ -580,27 +426,18 @@ def _extract_modules_to_save(
         pp_group: Pipeline-parallel process group, or None without pipeline parallelism.
 
     Returns:
-        Sorted module names in the Hugging Face layout. Empty when only LoRA weights train.
+        Sorted module names in the Hugging Face layout, with the same combined-projection splits and
+        adapter renames as ``target_modules``. Empty when only LoRA weights train.
 
     Raises:
-        ValueError: If a trainable non-LoRA parameter cannot be restored by Hugging Face
-            PEFT; see ``_validate_trainable_module_layout``.
+        ValueError: If a trainable non-LoRA parameter cannot be restored by Hugging Face PEFT;
+            see ``_validate_trainable_module_layout``.
     """
-    layout = _trainable_module_layout(model_parts)
-    if pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1:
-        gathered: list[_TrainableModuleLayout] = [layout] * torch.distributed.get_world_size(group=pp_group)
-        torch.distributed.all_gather_object(gathered, layout, group=pp_group)
-        # The gathered list includes this rank's own layout, so merge it from scratch.
-        layout = functools.reduce(_TrainableModuleLayout.merge, gathered)
+    layout = _combined_trainable_module_layout(model_parts, pp_group=pp_group)
     _validate_trainable_module_layout(layout)
-
-    modules = set()
-    for name in layout.trainable:
-        module = name.rpartition(".")[0]
-        while "." in module and layout.fully_trainable.get(module.rpartition(".")[0], False):
-            module = module.rpartition(".")[0]
-        modules.update(_split_combined_projection(module))
-
+    modules = {
+        split_name for module in _fully_trained_modules(layout) for split_name in _split_combined_projection(module)
+    }
     # Same renames as target_modules: the names must match the exported tensors.
     adapter = getattr(_unwrap_ddp_model(model_parts[0]), "state_dict_adapter", None)
     if isinstance(adapter, StateDictAdapter):

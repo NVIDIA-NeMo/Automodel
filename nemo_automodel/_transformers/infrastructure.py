@@ -40,12 +40,12 @@ from nemo_automodel._transformers.v4_patches.kv_sharing import (
 )
 from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.addons import validate_peft_trainable_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
+from nemo_automodel.components.checkpoint.stateful_wrappers import validate_peft_trainable_modules
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedStrategyConfig,

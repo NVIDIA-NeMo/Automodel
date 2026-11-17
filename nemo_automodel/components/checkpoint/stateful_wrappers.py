@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
@@ -113,29 +116,37 @@ def _trainable_non_lora_parameter_names(model_parts: list[torch.nn.Module]) -> s
     }
 
 
-def _select_peft_parameters(model_state_dict: dict[str, Any], model_parts: list[torch.nn.Module]) -> dict[str, Any]:
-    """Keep the trainable parameters of a PEFT model's DCP state dict and drop its buffers.
+def _select_peft_tensors(
+    model_state_dict: dict[str, Any], model_parts: list[torch.nn.Module], full_modules: Collection[str]
+) -> dict[str, Any]:
+    """Keep the entries of a PEFT model's DCP state dict that its checkpoint holds.
 
-    ``get_model_state_dict(..., ignore_frozen_params=True)`` returns trainable parameters
-    together with every buffer. A PEFT checkpoint holds the LoRA weights plus any
-    parameter ``freeze_config`` made trainable, so buffers are dropped and fully trained
-    modules are kept.
+    ``get_model_state_dict(..., ignore_frozen_params=True)`` returns the trainable parameters
+    together with every persistent buffer. A PEFT checkpoint holds the LoRA weights, every other
+    trainable parameter, and the persistent buffers of the modules it stores whole, because HF
+    PEFT restores a ``modules_to_save`` module from all of its state-dict entries. Other buffers
+    are dropped.
 
     Args:
-        model_state_dict: DCP model state dict mapping names to tensors of arbitrary
-            shape. DCP materializes it on rank 0 only, so other ranks pass an empty dict.
+        model_state_dict: DCP model state dict mapping names to tensors of arbitrary shape. DCP
+            materializes it on rank 0 only, so other ranks pass an empty dict.
         model_parts: The model parts ``model_state_dict`` was collected from.
+        full_modules: Modules the checkpoint stores whole, from ``_fully_trained_modules``.
 
     Returns:
-        A new dict holding the same tensor objects (not copies) for LoRA weights and the
-        trainable non-LoRA parameters.
+        A new dict holding the same tensor objects (not copies) for the selected entries.
 
     Raises:
         RuntimeError: If a trainable non-LoRA parameter is missing from a non-empty
             ``model_state_dict``. Saving would otherwise drop trained weights silently.
     """
     trainable = _trainable_non_lora_parameter_names(model_parts)
-    selected = {k: v for k, v in model_state_dict.items() if "lora_" in k or k in trainable}
+    full_module_prefixes = tuple(f"{module}." for module in full_modules)
+    selected = {
+        k: v
+        for k, v in model_state_dict.items()
+        if "lora_" in k or k in trainable or k.startswith(full_module_prefixes)
+    }
     missing = trainable - selected.keys()
     if model_state_dict and missing:
         raise RuntimeError(
@@ -144,6 +155,236 @@ def _select_peft_parameters(model_state_dict: dict[str, Any], model_parts: list[
             f"(examples: {sorted(model_state_dict)[:5]})."
         )
     return selected
+
+
+def _get_peft_full_module_buffers(model: torch.nn.Module, full_modules: Collection[str]) -> dict[str, Any]:
+    """Collect the persistent buffers of the modules a PEFT checkpoint stores whole, bypassing DCP.
+
+    The local counterpart of the buffer selection in ``_select_peft_tensors``. Names follow
+    ``_get_peft_state_dict``, which collects the parameters on the same path.
+
+    Args:
+        model: One local model part.
+        full_modules: Modules the checkpoint stores whole, from ``_fully_trained_modules``.
+
+    Returns:
+        CPU copies of the persistent buffers under ``full_modules``, keyed by name. Each buffer keeps
+        its shape and dtype; a DTensor buffer is gathered to its full tensor first.
+    """
+    full_module_prefixes = tuple(f"{module}." for module in full_modules)
+    buffers = {}
+    for module_name, module in model.named_modules():
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            # nn.Module exposes buffer persistence only through state_dict(), which modules such as
+            # grouped experts override with renamed keys, so read the flag state_dict() itself uses.
+            if buffer_name in module._non_persistent_buffers_set:
+                continue
+            name = canonical_parameter_fqn(f"{module_name}.{buffer_name}" if module_name else buffer_name)
+            if not _dcp_parameter_name(name).startswith(full_module_prefixes):
+                continue
+            buffer = buffer.full_tensor() if hasattr(buffer, "full_tensor") else buffer
+            buffers[name] = buffer.detach().cpu()
+    return buffers
+
+
+@dataclass(frozen=True)
+class _TrainableModuleLayout:
+    """Where a PEFT model's trainable non-LoRA parameters sit in its module tree.
+
+    ``freeze_config`` can make parameters trainable next to the LoRA adapters (for
+    example ``unfreeze_modules``). Those train in full, so the adapter checkpoint
+    stores them whole and names their modules in ``modules_to_save``, which tells
+    Hugging Face PEFT to restore them. All names use the DCP state-dict normalization.
+
+    Attributes:
+        trainable: Names of trainable parameters that are not LoRA weights, one name
+            per parameter.
+        aliased: Name groups of trainable non-LoRA parameters that are registered
+            under several names, such as tied input and output embeddings.
+        adapted: Paths of the modules that own LoRA parameters.
+        fully_trainable: For every module path that holds parameters, whether all of
+            them are trainable non-LoRA parameters.
+    """
+
+    trainable: frozenset[str]
+    aliased: tuple[tuple[str, ...], ...]
+    adapted: frozenset[str]
+    fully_trainable: dict[str, bool]
+
+    def merge(self, other: "_TrainableModuleLayout") -> "_TrainableModuleLayout":
+        """Combine the layouts of two pipeline stages that hold different parameters.
+
+        A module path present on both stages is fully trainable only if it is on each.
+        """
+        fully_trainable = dict(self.fully_trainable)
+        for path, value in other.fully_trainable.items():
+            fully_trainable[path] = fully_trainable.get(path, True) and value
+        return _TrainableModuleLayout(
+            trainable=self.trainable | other.trainable,
+            aliased=self.aliased + other.aliased,
+            adapted=self.adapted | other.adapted,
+            fully_trainable=fully_trainable,
+        )
+
+
+def _lora_adapted_module(name: str) -> str:
+    """Return the path of the module that owns the LoRA parameter ``name``."""
+    if ".lora_" in name:
+        return name.split(".lora_", 1)[0]
+    return name.rpartition(".")[0]
+
+
+def _trainable_module_layout(model_parts: Sequence[torch.nn.Module]) -> _TrainableModuleLayout:
+    """Describe the trainable non-LoRA parameters of local model parts.
+
+    Args:
+        model_parts: This rank's model or pipeline-stage parts, optionally wrapped in DDP.
+
+    Returns:
+        The layout of the parameters these parts hold.
+    """
+    trainable: set[str] = set()
+    aliased: list[tuple[str, ...]] = []
+    adapted: set[str] = set()
+    fully_trainable: dict[str, bool] = {}
+    for part in model_parts:
+        names_by_parameter: dict[int, list[str]] = {}
+        for raw_name, parameter in _unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
+            name = _dcp_parameter_name(raw_name)
+            is_lora = "lora_" in name
+            is_full_weight = parameter.requires_grad and not is_lora
+            if is_lora:
+                adapted.add(_lora_adapted_module(name))
+            if is_full_weight:
+                names_by_parameter.setdefault(id(parameter), []).append(name)
+            components = name.split(".")
+            for depth in range(1, len(components)):
+                path = ".".join(components[:depth])
+                fully_trainable[path] = fully_trainable.get(path, True) and is_full_weight
+        for names in names_by_parameter.values():
+            trainable.add(names[0])
+            if len(names) > 1:
+                aliased.append(tuple(names))
+    return _TrainableModuleLayout(
+        trainable=frozenset(trainable),
+        aliased=tuple(aliased),
+        adapted=frozenset(adapted),
+        fully_trainable=fully_trainable,
+    )
+
+
+def _validate_trainable_module_layout(layout: _TrainableModuleLayout) -> None:
+    """Reject trainable non-LoRA parameters that an HF PEFT adapter cannot restore.
+
+    Args:
+        layout: Layout of the whole model, or of the pipeline stages this rank holds.
+
+    Raises:
+        ValueError: If a trainable non-LoRA parameter has several names (``modules_to_save``
+            would restore each alias as a separate copy, untying them), belongs to the root
+            module (``modules_to_save`` names submodules), or shares a module path with a
+            LoRA adapter (the adapter and a full copy of the same module conflict on load).
+    """
+    if layout.aliased:
+        raise ValueError(
+            "PEFT checkpoints cannot store a trainable parameter that is registered under several names, "
+            f"such as tied input and output embeddings: {sorted(layout.aliased)[:5]}. Hugging Face PEFT "
+            "would restore each name as a separate copy. Keep these parameters frozen, or untie them."
+        )
+    root_owned = sorted(name for name in layout.trainable if "." not in name)
+    if root_owned:
+        raise ValueError(
+            f"PEFT checkpoints cannot store the trainable parameters {root_owned[:10]}: they belong to the "
+            "root module, and modules_to_save can only restore submodules. Keep them frozen."
+        )
+    adapted_and_ancestors = set()
+    for module in layout.adapted:
+        components = module.split(".")
+        adapted_and_ancestors.update(".".join(components[:depth]) for depth in range(1, len(components) + 1))
+    overlapping = []
+    for name in sorted(layout.trainable):
+        components = name.split(".")[:-1]
+        owner = ".".join(components)
+        owner_and_ancestors = {".".join(components[:depth]) for depth in range(1, len(components) + 1)}
+        if owner in adapted_and_ancestors or owner_and_ancestors & layout.adapted:
+            overlapping.append(name)
+    if overlapping:
+        raise ValueError(
+            "PEFT checkpoints cannot store trainable parameters whose module also holds LoRA adapters or "
+            f"lies inside or around one: {overlapping[:10]}. Hugging Face PEFT would restore the adapter and "
+            "a full copy of the same module, which conflict. Keep these modules out of the PEFT targets, or "
+            "narrow the selection that trains them in full: freeze_config.unfreeze_modules or "
+            "unfreeze_parameters, or the recipe's default when freeze_config is not set."
+        )
+
+
+def validate_peft_trainable_modules(model: torch.nn.Module) -> None:
+    """Check that a PEFT model's trainable parameters fit an HF PEFT adapter checkpoint.
+
+    Run this after the trainability policy is final and before training starts, so an
+    unsupported ``freeze_config`` fails at startup instead of at the first checkpoint save.
+
+    Args:
+        model: A PEFT model or pipeline stage, optionally wrapped in DDP.
+
+    Raises:
+        ValueError: If a trainable non-LoRA parameter cannot be restored by Hugging Face
+            PEFT; see ``_validate_trainable_module_layout``.
+    """
+    _validate_trainable_module_layout(_trainable_module_layout([model]))
+
+
+def _combined_trainable_module_layout(
+    model_parts: Sequence[torch.nn.Module], *, pp_group: "torch.distributed.ProcessGroup | None" = None
+) -> _TrainableModuleLayout:
+    """Return the trainable-module layout of the whole model, combining pipeline stages.
+
+    Under pipeline parallelism each rank holds some stages, so the layouts of all stages are
+    gathered and merged, and every rank returns the same layout. Every rank of ``pp_group``
+    must call this together.
+
+    Args:
+        model_parts: This rank's model or pipeline-stage parts, optionally wrapped in DDP.
+        pp_group: Pipeline-parallel process group, or None without pipeline parallelism.
+
+    Returns:
+        The layout of every parameter of the model.
+    """
+    layout = _trainable_module_layout(model_parts)
+    if pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1:
+        gathered: list[_TrainableModuleLayout] = [layout] * torch.distributed.get_world_size(group=pp_group)
+        torch.distributed.all_gather_object(gathered, layout, group=pp_group)
+        # The gathered list includes this rank's own layout, so merge it from scratch.
+        layout = functools.reduce(_TrainableModuleLayout.merge, gathered)
+    return layout
+
+
+def _fully_trained_modules(layout: _TrainableModuleLayout) -> list[str]:
+    """Return the modules a PEFT checkpoint stores whole, under their native names.
+
+    Each entry is the largest module whose parameters are all trainable and none of them LoRA
+    weights. HF PEFT wraps every module listed in ``modules_to_save`` and loads all of its
+    state-dict entries from the adapter file. Naming a submodule of a fully trained module
+    breaks loading when PEFT also wraps the parent; for sequence classification it always
+    wraps ``classifier``/``score``.
+
+    This only names the modules. Writers of ``adapter_config.json`` reject layouts HF PEFT
+    cannot restore first, with ``_validate_trainable_module_layout``.
+
+    Args:
+        layout: Layout of the whole model, from ``_combined_trainable_module_layout``.
+
+    Returns:
+        Sorted module names. Empty when only LoRA weights train.
+    """
+    modules = set()
+    for name in layout.trainable:
+        module = name.rpartition(".")[0]
+        while "." in module and layout.fully_trainable.get(module.rpartition(".")[0], False):
+            module = module.rpartition(".")[0]
+        if module:
+            modules.add(module)
+    return sorted(modules)
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:
@@ -532,11 +773,20 @@ class ModelState:
             or any(_has_expert_parallelism(m) for m in self.model)
             or any(_has_quantized_params(m) for m in self.model)
         )
-        # A PEFT checkpoint holds every trainable parameter: the LoRA weights plus any
-        # module freeze_config made trainable next to them (e.g. unfreeze_modules).
+        # A PEFT checkpoint holds every trainable parameter (the LoRA weights plus any module
+        # freeze_config made trainable next to them, e.g. unfreeze_modules) and the persistent
+        # buffers of the modules it stores whole, which HF PEFT restores with their parameters.
+        full_modules = (
+            _fully_trained_modules(_combined_trainable_module_layout(self.model, pp_group=self.pp_group))
+            if self.is_peft
+            else []
+        )
         if use_local_peft_collection:
-            # Collects exactly the trainable parameters, so nothing needs filtering.
+            # Collects exactly the trainable parameters; add the full modules' buffers.
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
+            if full_modules:
+                for part in self.model:
+                    model_state_dict.update(_get_peft_full_module_buffers(part, full_modules))
         else:
             options = StateDictOptions(cpu_offload=True) if self.cpu_offload else None
             if self.is_peft:
@@ -545,8 +795,8 @@ class ModelState:
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
             if self.is_peft:
-                # ignore_frozen_params still returns every buffer; keep only the parameters.
-                model_state_dict = _select_peft_parameters(model_state_dict, self.model)
+                # ignore_frozen_params still returns every persistent buffer; keep those of full modules.
+                model_state_dict = _select_peft_tensors(model_state_dict, self.model, full_modules)
 
         # Pipeline parallelism partitions layers across PP ranks, so each rank's
         # local adapter (collected above) only covers its own stages. Gather the

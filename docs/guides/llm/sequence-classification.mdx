@@ -115,7 +115,7 @@ optimizer:
 
 - `target_modules`: Glob to select linear layers (for example, `"*.proj"`).
 - `dim` (rank), `alpha`, `dropout`: Tune per model and compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
-- `freeze_config.unfreeze_modules`: Keeps the classification head fully trainable while PEFT freezes other non-LoRA parameters. The checkpoint stores the trained head with the adapter and lists it in `modules_to_save`, so Hugging Face PEFT restores it when it loads or merges the adapter.
+- `freeze_config.unfreeze_modules`: Keeps the classification head fully trainable while PEFT freezes other non-LoRA parameters. The checkpoint stores the trained head with the adapter and lists it in `modules_to_save`, so Hugging Face PEFT restores it when it loads or merges the adapter. Without a `freeze_config` section, the recipe applies this selector itself. Keep the classifier out of the LoRA targets in either case (`match_all_linear: true` includes it), because a module that holds LoRA adapters cannot also be trained in full.
 - `distributed.autocast_dtype`: Runs the forward pass in the selected compute dtype while trainable parameters retain their configured storage dtype, including when single-rank FSDP is skipped.
 - The recipe automatically applies the adapters; no additional code changes are required.
 

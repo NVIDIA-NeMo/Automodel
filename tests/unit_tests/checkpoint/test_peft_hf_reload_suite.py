@@ -1072,3 +1072,92 @@ def test_sequence_classifier_head_round_trips_through_hf_peft_and_resume(tmp_pat
     for name, parameter in resumed.named_parameters():
         if parameter.requires_grad:
             torch.testing.assert_close(parameter, trained[name], rtol=0, atol=0)
+
+
+def test_router_trained_next_to_lora_round_trips_with_its_bias_buffer(tmp_path: Path, peft_process_group):
+    """A module stored whole carries its persistent buffers, which PEFT restores with its parameters.
+
+    Training an MoE router next to LoRA is a common case. DeepSeek-V3's router keeps its
+    ``e_score_correction_bias`` in a persistent buffer, and PEFT's ``modules_to_save`` copy loads
+    every state-dict entry of the module, so an export without the buffer failed to load.
+    """
+    from peft import PeftModel
+    from safetensors.torch import load_file
+    from transformers import DeepseekV3Config, DeepseekV3ForCausalLM
+
+    config = DeepseekV3Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        first_k_dense_replace=0,
+        q_lora_rank=8,
+        kv_lora_rank=8,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=4,
+        max_position_embeddings=32,
+        use_cache=False,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(1234)
+    source = DeepseekV3ForCausalLM(config).eval()
+    peft_config = PeftConfig(target_modules=["*.o_proj"], dim=2, alpha=4, use_triton=False)
+    router = "model.layers.0.mlp.gate"
+
+    def adapted_model() -> nn.Module:
+        model = DeepseekV3ForCausalLM(config).eval()
+        model.load_state_dict(source.state_dict())
+        apply_lora_to_linear_modules(model, peft_config)
+        apply_parameter_freezing(model, {"unfreeze_modules": [{"path": router}]})
+        return model
+
+    model = adapted_model()
+    with torch.no_grad():
+        gate = model.get_submodule(router)
+        gate.weight.add_(torch.randn_like(gate.weight), alpha=0.05)
+        # Stands in for load-balancing updates: the trained router routes with a different bias.
+        gate.e_score_correction_bias.copy_(torch.randn_like(gate.e_score_correction_bias))
+        for name, parameter in model.named_parameters():
+            if ".lora_" in name:
+                parameter.normal_(std=0.05)
+    adapter_dir = _save_through_checkpointer(model, peft_config, tmp_path)
+
+    adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    assert adapter_config["modules_to_save"] == [router]
+    exported = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    assert {f"base_model.model.{router}.weight", f"base_model.model.{router}.e_score_correction_bias"} <= set(exported)
+
+    reference = DeepseekV3ForCausalLM(config).eval()
+    reference.load_state_dict(source.state_dict())
+    loaded = PeftModel.from_pretrained(reference, str(adapter_dir), autocast_adapter_dtype=False).eval()
+    with torch.no_grad():
+        expected = model(_INPUT_IDS).logits
+        torch.testing.assert_close(loaded(_INPUT_IDS).logits, expected, rtol=1e-5, atol=1e-6)
+        merged_router = loaded.merge_and_unload().get_submodule(router)
+    torch.testing.assert_close(merged_router.e_score_correction_bias, gate.e_score_correction_bias, rtol=0, atol=0)
+
+    resumed = adapted_model()
+    Checkpointer(
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            model_save_format="safetensors",
+            save_consolidated=False,
+            is_peft=True,
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+        moe_mesh=None,
+    ).load_model(resumed, str(adapter_dir))
+    expected_state = model.state_dict()
+    for key in (f"{router}.weight", f"{router}.e_score_correction_bias"):
+        torch.testing.assert_close(resumed.state_dict()[key], expected_state[key], rtol=0, atol=0)
