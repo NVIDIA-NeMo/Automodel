@@ -430,7 +430,18 @@ exactly, so they are the scale for the other rows.
 
 `cp_size: 1` holds a whole row on one GPU, which limits it to rows of 16,384
 tokens. Rows of 131,072 tokens were run with `cp_size: 8` only.
-The differences between `cp_size` values have the size of the differences between two runs of one configuration. Two such runs already differ at the first update, by about 1e-5: the top-k step of the DSA layers does not choose the same key among keys with equal index scores every time, and the backward pass of the cuDNN kernels does not repeat bit for bit. The gradient norms agree within 1e-4 at the first update. Later they differ by 11 to 16% on average, between two `cp_size` values and between two runs of one configuration alike, and on single updates one run has a norm up to three times that of the other.
+The differences between `cp_size` values have the size of the differences
+between two runs of one configuration, so the training loss is the measure of
+agreement here. Two runs of one configuration differ at the first update by
+about 1e-5: the forward pass repeats exactly while the DSA layers keep every
+key, and where they discard keys the top-k step does not choose the same key
+among keys with equal index scores every time (see
+[Current Scope](#current-scope)). From the second update on, the runs also
+differ because the backward pass of the cuDNN kernels does not repeat bit for
+bit. The gradient norms agree within 2e-4 at the first update. Later they
+differ by 10 to 17% on average, between two `cp_size` values and between two
+runs of one configuration alike, and on single updates one run has a norm up
+to three times that of the other.
 
 Small models were compared in FP32 on the eager attention path. A packed row
 gives the logits of its documents run one by one, and 2 and 4 CP ranks give
