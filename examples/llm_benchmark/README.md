@@ -174,12 +174,12 @@ Other recorded differences:
 
 | Retained benchmark | Canonical finetuning config |
 |---|---|
-| [deepseek/deepseek_v4_flash_h100_optimized.yaml](deepseek/deepseek_v4_flash_h100_optimized.yaml) | [deepseek_v4/deepseek_v4_flash_hellaswag.yaml](../llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) |
+| [deepseek/deepseek_v4_flash_h100_optimized.yaml](deepseek/deepseek_v4_flash_h100_optimized.yaml) | [deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml](../llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml) |
 | [glm/glm_4.7_flash_te_deepep.yaml](glm/glm_4.7_flash_te_deepep.yaml) | [glm/glm_4.7_flash_te_deepep.yaml](../llm_finetune/glm/glm_4.7_flash_te_deepep.yaml) |
 | [glm/glm_4.7_te_deepep.yaml](glm/glm_4.7_te_deepep.yaml) | [glm/glm_4.7_te_deepep.yaml](../llm_finetune/glm/glm_4.7_te_deepep.yaml) |
 | [glm/glm_5_te_deepep.yaml](glm/glm_5_te_deepep.yaml) | [glm/glm_5_hellaswag_pp.yaml](../llm_finetune/glm/glm_5_hellaswag_pp.yaml) |
 | [gpt_oss/gptoss_120b_te_deepep.yaml](gpt_oss/gptoss_120b_te_deepep.yaml) | [gpt_oss/gpt_oss_120b.yaml](../llm_finetune/gpt_oss/gpt_oss_120b.yaml) |
-| [gpt_oss/gptoss_20b_te_deepep.yaml](gpt_oss/gptoss_20b_te_deepep.yaml) | [gpt_oss/gpt_oss_20b.yaml](../llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
+| [gpt_oss/gptoss_20b_te_deepep.yaml](gpt_oss/gptoss_20b_te_deepep.yaml) | [gpt_oss/gpt_oss_20b_te_packed_sequence.yaml](../llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml) |
 | [llama3_3/llama_3_3_70b_instruct_squad_peft_pp.yaml](llama3_3/llama_3_3_70b_instruct_squad_peft_pp.yaml) | [llama3_3/llama_3_3_70b_instruct_squad_peft.yaml](../llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft.yaml) |
 | [minimax/minimax_m2.5_te_deepep.yaml](minimax/minimax_m2.5_te_deepep.yaml) | [minimax_m2/minimax_m2.5_hellaswag_pp.yaml](../llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
 | [moonlight/moonlight_16b_te_deepep.yaml](moonlight/moonlight_16b_te_deepep.yaml) | [moonlight/moonlight_16b_te.yaml](../llm_finetune/moonlight/moonlight_16b_te.yaml) |
