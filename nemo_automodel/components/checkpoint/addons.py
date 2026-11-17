@@ -28,13 +28,8 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.checkpoint.stateful_wrappers import (
-    ModelState,
-    _combined_trainable_module_layout,
-    _fully_trained_modules,
-    _unwrap_ddp_model,
-    _validate_trainable_module_layout,
-)
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, fully_trained_peft_modules
+from nemo_automodel.components.checkpoint.utils import unwrap_ddp_model
 from nemo_automodel.components.moe.state_dict_mixin import (
     _PARAMWRAPPER_LAYOUT_LEGACY,
     _PARAMWRAPPER_LAYOUT_METADATA_KEY,
@@ -177,7 +172,7 @@ class ConsolidatedHFAddon:
         original_model_path = kwargs["original_model_path"]
         process_group = kwargs.get("process_group")
 
-        export_model = _unwrap_ddp_model(model_part)
+        export_model = unwrap_ddp_model(model_part)
         get_metadata_exporter = getattr(export_model, "_get_consolidated_hf_metadata_exporter", None)
         metadata_exporter: _ConsolidatedHFMetadataExporter | None = (
             get_metadata_exporter(
@@ -288,7 +283,7 @@ class PeftAddon:
             # LoRA-only exports are unchanged; check the modules this save stores in full.
             _check_modules_to_save_cover_exported_tensors(modules_to_save, exported_tensor_names)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
-        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         layout_stamp = _get_paramwrapper_layout_stamp(
             adapter, v4_compatible, kwargs.get("legacy_paramwrapper_layout", False)
         )
@@ -351,7 +346,7 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     # config.architectures can instead name the base checkpoint's class, such as
     # RobertaForMaskedLM for a roberta-large sequence classifier, or be missing for a
     # model built from a config; HF PEFT cannot load a classifier adapter typed CAUSAL_LM.
-    class_task = type(_unwrap_ddp_model(model_part)).__name__.rpartition("For")[2]
+    class_task = type(unwrap_ddp_model(model_part)).__name__.rpartition("For")[2]
     if class_task in MODEL_TYPE_TO_PEFT_TASK_TYPE:
         model_task = class_task
     else:
@@ -431,15 +426,15 @@ def _extract_modules_to_save(
 
     Raises:
         ValueError: If a trainable non-LoRA parameter cannot be restored by Hugging Face PEFT;
-            see ``_validate_trainable_module_layout``.
+            see ``fully_trained_peft_modules``.
     """
-    layout = _combined_trainable_module_layout(model_parts, pp_group=pp_group)
-    _validate_trainable_module_layout(layout)
     modules = {
-        split_name for module in _fully_trained_modules(layout) for split_name in _split_combined_projection(module)
+        split_name
+        for module in fully_trained_peft_modules(model_parts, pp_group=pp_group)
+        for split_name in _split_combined_projection(module)
     }
     # Same renames as target_modules: the names must match the exported tensors.
-    adapter = getattr(_unwrap_ddp_model(model_parts[0]), "state_dict_adapter", None)
+    adapter = getattr(unwrap_ddp_model(model_parts[0]), "state_dict_adapter", None)
     if isinstance(adapter, StateDictAdapter):
         modules = {adapter.map_peft_target_module_to_hf(name, v4_compatible=v4_compatible) for name in modules}
     return sorted(modules)
@@ -667,23 +662,14 @@ def _extract_target_modules(
                                 final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
                         break
 
-    # Strip "model." prefix for encoder adapters so adapter_config.json
-    # is compatible with HF PEFT / merge_lora.
-    adapter = getattr(model_parts[0], "state_dict_adapter", None)
-    if adapter is not None:
-        from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
-
-        if isinstance(adapter, EncoderStateDictAdapter):
-            final_target_modules = {
-                name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
-            }
-
     # Adapters whose HF checkpoint layout renames modules (e.g. Kimi K3's
-    # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1) convert the
-    # state-dict keys on save, so adapter_config.json's target_modules must get
-    # the same treatment or PEFT can't resolve them against the real model.
+    # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1, or the
+    # encoder wrapper's model. prefix) convert the state-dict keys on save, so
+    # adapter_config.json's target_modules must get the same treatment or PEFT
+    # can't resolve them against the real model.
     # The base method defaults to the identity; legacy adapters that don't
     # subclass StateDictAdapter (e.g. kimivl) skip it, as before.
+    adapter = getattr(model_parts[0], "state_dict_adapter", None)
     if isinstance(adapter, StateDictAdapter):
         final_target_modules = {
             adapter.map_peft_target_module_to_hf(name, v4_compatible=v4_compatible) for name in final_target_modules

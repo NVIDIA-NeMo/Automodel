@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
 
 from nemo_automodel.shared.tied_weights import (
@@ -47,6 +48,20 @@ logger = logging.getLogger(__name__)
 _AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_(\d+)_step_(\d+)$")
 _CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
 _INCOMPLETE_CHECKPOINT_MARKER = ".incomplete"
+
+
+def unwrap_ddp_model(model: nn.Module) -> nn.Module:
+    """Return the module DDP wraps, which owns the model metadata and parameter names DDP hides.
+
+    Args:
+        model: A model or pipeline-stage part, optionally wrapped in ``DistributedDataParallel``.
+
+    Returns:
+        ``model.module`` for a DDP-wrapped model, otherwise ``model`` itself.
+    """
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 def get_rank_safe() -> int:

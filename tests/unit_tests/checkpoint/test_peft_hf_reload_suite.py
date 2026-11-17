@@ -1118,6 +1118,68 @@ def test_sequence_classifier_head_round_trips_through_hf_peft_and_resume(tmp_pat
             torch.testing.assert_close(parameter, trained[name], rtol=0, atol=0)
 
 
+def test_encoder_wrapped_classifier_head_reloads_in_hf_peft(tmp_path: Path, peft_process_group):
+    """A retrieval-style wrapper exports its trained head under the backbone's own name.
+
+    The wrapper holds the backbone under ``model.`` and its state-dict adapter drops that
+    prefix from every exported tensor, so ``modules_to_save`` has to drop it too. The save
+    used to stop with an inconsistent-export error naming ``model.classifier``.
+    """
+    from peft import PeftModel
+    from safetensors.torch import load_file
+    from transformers import BertConfig, BertForSequenceClassification
+
+    from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+
+    config = BertConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        num_labels=2,
+        architectures=["BertForSequenceClassification"],
+    )
+    torch.manual_seed(1234)
+    source = BertForSequenceClassification(config).eval()
+    wrapper = nn.Module()
+    wrapper.model = BertForSequenceClassification(config).eval()
+    wrapper.model.load_state_dict(source.state_dict())
+    wrapper.config = config
+    wrapper.state_dict_adapter = EncoderStateDictAdapter()
+    peft_config = PeftConfig(target_modules=["*.query", "*.value"], dim=2, alpha=4, use_triton=False)
+    apply_lora_to_linear_modules(wrapper, peft_config)
+    apply_parameter_freezing(wrapper, {"unfreeze_modules": [{"path": "model.classifier"}]})
+    with torch.no_grad():
+        for parameter in wrapper.parameters():
+            if parameter.requires_grad:
+                parameter.add_(torch.randn_like(parameter), alpha=0.05)
+    adapter_dir = _save_through_checkpointer(wrapper, peft_config, tmp_path)
+
+    adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    assert adapter_config["modules_to_save"] == ["classifier"]
+    assert all(not name.startswith("model.") for name in adapter_config["target_modules"])
+    exported = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    for name in ("weight", "bias"):
+        torch.testing.assert_close(
+            exported[f"base_model.model.classifier.{name}"],
+            wrapper.model.classifier.get_parameter(name),
+            rtol=0,
+            atol=0,
+        )
+
+    reference = BertForSequenceClassification(config).eval()
+    reference.load_state_dict(source.state_dict())
+    loaded = PeftModel.from_pretrained(reference, str(adapter_dir), autocast_adapter_dtype=False).eval()
+    with torch.no_grad():
+        expected = wrapper.model(_INPUT_IDS).logits
+        torch.testing.assert_close(loaded(_INPUT_IDS).logits, expected, rtol=1e-5, atol=1e-6)
+        merged = loaded.merge_and_unload()
+        torch.testing.assert_close(merged(_INPUT_IDS).logits, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(merged.classifier.weight, wrapper.model.classifier.weight, rtol=0, atol=0)
+
+
 def test_router_trained_next_to_lora_round_trips_with_its_bias_buffer(tmp_path: Path, peft_process_group):
     """A module stored whole carries its persistent buffers, which PEFT restores with its parameters.
 

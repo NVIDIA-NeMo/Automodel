@@ -269,16 +269,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # Detect whether the source checkpoint uses the remote-code ``backbone``
         # namespace or Transformers v5's native ``model`` namespace. MTP keys
         # never carry either prefix. Adapter-only restores must not change the
-        # base checkpoint's export namespace: legacy PEFT keys can use native
+        # base checkpoint's export namespace: PEFT exports name their tensors,
+        # LoRA weights and the modules they store in full alike, in native
         # ``model`` names even when the base checkpoint uses ``backbone``.
         for key in backbone_state_dict.keys():
-            if any(part.startswith("lora_") for part in key.split(".")):
+            if key.startswith("base_model.model.") or any(part.startswith("lora_") for part in key.split(".")):
                 continue
-            bare_key = key.removeprefix("base_model.model.")
-            if bare_key.startswith("backbone."):
+            if key.startswith("backbone."):
                 self._uses_model_prefix = False
                 break
-            if bare_key.startswith("model."):
+            if key.startswith("model."):
                 self._uses_model_prefix = True
                 break
 

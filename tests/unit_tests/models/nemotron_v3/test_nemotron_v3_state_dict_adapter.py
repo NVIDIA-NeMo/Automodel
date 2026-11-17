@@ -329,19 +329,30 @@ class TestNemotronV3AdapterDense:
     @pytest.mark.parametrize("base_prefix", ["backbone", "model"])
     @pytest.mark.parametrize("adapter_prefix", ["backbone", "model"])
     def test_adapter_restore_preserves_base_checkpoint_namespace(self, adapter, base_prefix, adapter_prefix):
-        """Legacy LoRA names must not rename frozen embeddings in the merged export."""
+        """Adapter tensors must not rename frozen embeddings in the merged export.
+
+        Neither the LoRA weights nor the modules the adapter stores in full (``modules_to_save``,
+        here the final norm and the embeddings) say which namespace the base checkpoint uses.
+        """
         base_state = {
             f"{base_prefix}.embeddings.weight": torch.randn(16, 8),
             f"{base_prefix}.norm_f.weight": torch.randn(8),
         }
         native_base = adapter.from_hf(dict(base_state))
-        lora_tensor = torch.randn(2, 8)
-        native_lora = adapter.from_hf(
-            {f"base_model.model.{adapter_prefix}.layers.0.mixer.in_proj.lora_A.weight": lora_tensor}
-        )
-        native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
-        assert set(native_lora) == {native_key}
-        torch.testing.assert_close(native_lora[native_key], lora_tensor, rtol=0, atol=0)
+        uses_model_prefix = adapter._uses_model_prefix
+        native_names = {
+            f"base_model.model.{adapter_prefix}.norm_f.weight": "base_model.model.model.norm.weight",
+            f"base_model.model.{adapter_prefix}.embeddings.weight": "base_model.model.model.embed_tokens.weight",
+            f"base_model.model.{adapter_prefix}.layers.0.mixer.in_proj.lora_A.weight": (
+                "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
+            ),
+        }
+        adapter_state = {key: torch.randn(8) for key in native_names}
+        native_adapter = adapter.from_hf(dict(adapter_state))
+        assert adapter._uses_model_prefix is uses_model_prefix
+        assert set(native_adapter) == set(native_names.values())
+        for hf_key, native_key in native_names.items():
+            torch.testing.assert_close(native_adapter[native_key], adapter_state[hf_key], rtol=0, atol=0)
 
         exported = adapter.to_hf(dict(native_base))
         assert set(exported) == set(base_state)

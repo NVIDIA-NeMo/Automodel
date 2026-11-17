@@ -695,7 +695,8 @@ def _compile_head(model: nn.Module) -> nn.Module:
         pytest.param(_wrap_ddp, False, id="ddp"),
         pytest.param(_wrap_head_for_activation_checkpointing, False, id="activation-checkpoint-dcp"),
         pytest.param(_wrap_head_for_activation_checkpointing, True, id="activation-checkpoint-local"),
-        pytest.param(_compile_head, False, id="torch-compile"),
+        pytest.param(_compile_head, False, id="torch-compile-dcp"),
+        pytest.param(_compile_head, True, id="torch-compile-local"),
     ],
 )
 def test_peft_export_names_ignore_training_wrappers(single_rank_process_group, wrap, local_collection: bool):
@@ -736,28 +737,34 @@ def test_peft_model_state_refuses_to_drop_a_trainable_parameter(single_rank_proc
             ModelState(model, is_peft=True).state_dict()
 
 
-def test_peft_load_without_dcp_restores_the_buffers_of_modules_stored_whole(single_rank_process_group):
-    """The expert-parallel load path, which bypasses DCP, restores the buffers the checkpoint stores.
+@pytest.mark.parametrize(
+    "wrap", [pytest.param(lambda model: model, id="plain"), pytest.param(_compile_head, id="torch-compile")]
+)
+def test_peft_load_without_dcp_restores_the_buffers_of_modules_stored_whole(single_rank_process_group, wrap):
+    """The expert-parallel save and load paths, which bypass DCP, restore the tensors the checkpoint stores.
 
     A module trained in full comes back with its persistent buffers, for example an MoE router's
     score-correction bias, as it does on the DCP path. Buffers outside those modules are left alone.
+    Both paths name tensors as DCP does, so a compiled module round-trips too.
     """
-    trained = _peft_model(["classifier", "encoder.norm"])
+    trained = wrap(_peft_model(["classifier", "encoder.norm"]))
     with torch.no_grad():
         trained.classifier.label_bias.add_(1.0)
         for parameter in trained.parameters():
             if parameter.requires_grad:
                 parameter.add_(torch.randn_like(parameter))
-    state = ModelState(trained, is_peft=True).state_dict()
+    state = ModelState(trained, is_peft=True, pp_group=torch.distributed.group.WORLD).state_dict()
+    assert set(state) == _LORA_KEYS | _FULL_MODULE_KEYS
     state["base_model.model.position_ids"] = torch.full((4,), 7)
-    resumed = _peft_model(["classifier", "encoder.norm"])
+    resumed = wrap(_peft_model(["classifier", "encoder.norm"]))
 
     ModelState(resumed, is_peft=True, has_expert_parallelism=True).load_state_dict(state)
 
     torch.testing.assert_close(resumed.classifier.label_bias, trained.classifier.label_bias, rtol=0, atol=0)
+    resumed_parameters = dict(resumed.named_parameters())
     for name, parameter in trained.named_parameters():
         if parameter.requires_grad:
-            torch.testing.assert_close(resumed.get_parameter(name), parameter, rtol=0, atol=0)
+            torch.testing.assert_close(resumed_parameters[name], parameter, rtol=0, atol=0)
     torch.testing.assert_close(resumed.position_ids, torch.arange(4), rtol=0, atol=0)
 
 
