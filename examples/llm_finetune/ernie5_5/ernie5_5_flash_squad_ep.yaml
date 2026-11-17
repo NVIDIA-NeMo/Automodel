@@ -25,6 +25,18 @@
 # 512 tokens per document; multi-GPU training of the released model has been validated with the
 # cuDNN path only. The HCA layers run on the eager PyTorch path with every value.
 #
+# The routed experts exchange tokens through HybridEP (backend.dispatcher: hybridep), which
+# requires DeepEP with HybridEP in the environment and compiles its kernels at the first dispatch
+# of every process: in the validation runs the first update took 64 to 90 s and later updates
+# a median of 6 to 7 s. HybridEP writes the kernels to a directory named after the process id
+# under HYBRID_EP_CACHE_DIR, or under the home directory when that variable is unset; give every
+# node its own HYBRID_EP_CACHE_DIR if the nodes share the home directory.
+# Leave NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset: HybridEP detects which ranks of an expert
+# group share an NVLink domain. An expert group is 8 consecutive ranks, that is the two nodes with
+# NODE_RANK 2k and 2k+1. On GB200 an NVLink domain can span several four-GPU nodes; this recipe
+# was validated with the two nodes of every expert group in one domain, and an expert group split
+# over two domains has not been run.
+#
 # Not supported: tensor, context and pipeline parallelism, activation checkpointing, packed
 # sequences and padded batches. LoRA has not been validated. The multi-token prediction (MTP)
 # block of the released checkpoint is not loaded or trained. The parameters of the DSA indexers
@@ -74,11 +86,13 @@ model:
     # cuDNN sparse attention for the DSA layers: requires nvidia-cudnn-frontend[cutedsl] and
     # FlashMLA; validated on SM100-class GPUs (GB200) only.
     attn: cudnn
-    # The model implements the torch kernels only: the next three fields must be torch, and
-    # every other BackendConfig field except enable_hf_state_dict_adapter must keep its default.
+    # linear must be torch. experts and dispatcher must be torch_mm and hybridep, the values this
+    # recipe was validated with (HybridEP token dispatch, BF16 compute only), or torch and torch
+    # (all-gather and all-reduce over the EP group). Every other BackendConfig field except
+    # enable_hf_state_dict_adapter must keep its default.
     linear: torch
-    experts: torch
-    dispatcher: torch
+    experts: torch_mm
+    dispatcher: hybridep
 
 distributed:
   strategy: fsdp2
@@ -105,8 +119,9 @@ distributed:
 checkpoint:
   # Disabled because of size: one checkpoint of the full model and optimizer is about 3.1 TiB.
   # Metrics are still written to checkpoint_dir. To save, set enabled: true and
-  # save_consolidated: false. The validated save wrote one checkpoint, with
-  # step_scheduler.ckpt_every_steps: 100 and dist_env.timeout_minutes: 180.
+  # save_consolidated: false. The validated save of the full model, run with the torch experts
+  # and dispatcher, wrote one checkpoint, with step_scheduler.ckpt_every_steps: 100 and
+  # dist_env.timeout_minutes: 180.
   enabled: false
   checkpoint_dir: checkpoints/ernie5_5_flash_squad_ep/
 
@@ -120,8 +135,9 @@ dataset:
   # Truncate, never pad. Longer documents need more GPU memory; 256 tokens is the length
   # this topology has been run with. The answer is at the end of a row, so about 11% of
   # the training rows lose it to truncation and contribute no loss. 384 tokens keep 99% of
-  # them; an earlier state of this code ran 40 steps at 384 tokens on this topology with 2.5%
-  # of the device memory left. The full model has not been trained with longer documents. From
+  # them; an earlier state of this code ran 40 steps at 384 tokens on this topology with the
+  # torch experts and dispatcher, with 2.5% of the device memory left. The full model has not been
+  # trained with longer documents. From
   # position 2,176 of a document on, the DSA layers discard keys; the model card reports what
   # was run at 4,096 tokens.
   seq_length: 256

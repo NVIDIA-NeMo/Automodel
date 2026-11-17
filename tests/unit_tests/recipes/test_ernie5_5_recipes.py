@@ -39,7 +39,7 @@ def _load_recipe() -> dict:
 
 
 def test_ernie5_5_flash_recipe_loads_decoder_only_from_the_pinned_release() -> None:
-    """Check the model block: pinned release, explicit decoder-only override, cuDNN DSA backend."""
+    """Check the model block: pinned release, decoder-only override, cuDNN DSA backend, HybridEP token dispatch."""
     config = _load_recipe()
     model = config["model"]
 
@@ -48,15 +48,18 @@ def test_ernie5_5_flash_recipe_loads_decoder_only_from_the_pinned_release() -> N
     assert model["pretrained_model_name_or_path"] == MODEL_ID
     assert len(model["revision"]) == 40
     assert model["trust_remote_code"] is False
+    # HybridEP exchanges 16-bit activations only, so the recipe must compute in BF16.
     assert model["dtype"] == "bfloat16"
     assert model["num_nextn_predict_layers"] == 0
     backend = model["backend"]
     assert (backend["attn"], backend["linear"], backend["experts"], backend["dispatcher"]) == (
         "cudnn",
         "torch",
-        "torch",
-        "torch",
+        "torch_mm",
+        "hybridep",
     )
+    # The model implements no tuning field of HybridEP, so the recipe sets none.
+    assert set(backend) == {"_target_", "attn", "linear", "experts", "dispatcher"}
     for section in ("dataset", "validation_dataset"):
         tokenizer = config[section]["tokenizer"]
         assert tokenizer["pretrained_model_name_or_path"] == MODEL_ID
@@ -103,6 +106,8 @@ def test_ernie5_5_flash_recipe_requests_expert_parallelism_only() -> None:
     assert ci["cluster_tag"] == "gb200"
     world_size = ci["nodes"] * ci["nproc_per_node"]
     assert world_size % sizes.ep_size == 0
+    # HybridEP detects the NVLink domain of an expert group; a pinned value overrides the detection.
+    assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in ci.get("env_vars", {})
     scheduler = config["step_scheduler"]
     assert scheduler["global_batch_size"] % (scheduler["local_batch_size"] * world_size) == 0
 

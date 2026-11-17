@@ -22,6 +22,7 @@ from tests.utils.test_utils import run_test_script
 TEST_FOLDER = "moe"
 ERNIE5_5_EP2 = "L2_Ernie5_5_MoE_EP2.sh"
 DSA_BACKEND_VARIABLE = "ERNIE5_5_DSA_BACKEND"
+DISPATCHER_VARIABLE = "ERNIE5_5_DISPATCHER"
 
 
 def _cudnn_dsa_skip_reason() -> str | None:
@@ -48,4 +49,11 @@ class TestErnie5_5EP2Training:
         if reason is not None:
             pytest.skip(reason)
         monkeypatch.setenv(DSA_BACKEND_VARIABLE, "cudnn")
+        run_test_script(TEST_FOLDER, ERNIE5_5_EP2)
+
+    @pytest.mark.timeout(600)
+    def test_trains_with_eager_dsa_and_the_hybridep_dispatcher(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Run the eager-DSA check with the grouped-GEMM experts and the HybridEP dispatcher; requires HybridEP."""
+        monkeypatch.setenv(DSA_BACKEND_VARIABLE, "eager")
+        monkeypatch.setenv(DISPATCHER_VARIABLE, "hybridep")
         run_test_script(TEST_FOLDER, ERNIE5_5_EP2)

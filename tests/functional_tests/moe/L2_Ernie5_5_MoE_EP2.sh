@@ -26,6 +26,11 @@
 #                    validated on SM100-class GPUs (GB200) only.
 # The HCA layers run on the eager PyTorch path in both cases.
 #
+# ERNIE5_5_DISPATCHER selects how the routed experts exchange tokens between the two ranks:
+#   torch (default)  the experts and dispatcher of ernie5_5_proxy.yaml: all-gather and all-reduce.
+#   hybridep         grouped-GEMM experts (experts: torch_mm) with the HybridEP dispatcher; requires
+#                    HybridEP (deep_ep).
+#
 # The proxy generates its own synthetic token sequences, so this test stages no
 # tokenizer or dataset.
 
@@ -35,6 +40,7 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 DSA_BACKEND="${ERNIE5_5_DSA_BACKEND:-eager}"
+DISPATCHER="${ERNIE5_5_DISPATCHER:-torch}"
 MAX_STEPS=8
 # vocab_size of ernie5_5_proxy.yaml.
 VOCAB_SIZE=4096
@@ -43,10 +49,26 @@ RUN_DIR=$(mktemp -d)
 cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
 
+BACKEND_ARGS=(--model.backend.attn "$DSA_BACKEND")
+case "$DISPATCHER" in
+    torch) ;;
+    hybridep)
+        BACKEND_ARGS+=(--model.backend.experts torch_mm --model.backend.dispatcher hybridep)
+        # HybridEP compiles its kernels on first use. Keep them in the run directory, which is
+        # removed at exit, unless the caller provides a directory.
+        export HYBRID_EP_CACHE_DIR="${HYBRID_EP_CACHE_DIR:-$RUN_DIR/hybrid_ep}"
+        mkdir -p "$HYBRID_EP_CACHE_DIR"
+        ;;
+    *)
+        echo "Unknown ERNIE5_5_DISPATCHER: $DISPATCHER (expected torch or hybridep)" >&2
+        exit 2
+        ;;
+esac
+
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     --config tests/functional_tests/moe/ernie5_5_proxy.yaml \
-    --model.backend.attn "$DSA_BACKEND" \
+    "${BACKEND_ARGS[@]}" \
     --step_scheduler.max_steps "$MAX_STEPS" \
     --checkpoint.checkpoint_dir "$RUN_DIR/$DSA_BACKEND"
 
