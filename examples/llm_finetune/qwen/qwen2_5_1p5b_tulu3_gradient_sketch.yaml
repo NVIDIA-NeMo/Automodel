@@ -22,7 +22,7 @@
 # Parameters are kept in fp32; the sketch state adds one fp32 second moment per output row
 # instead of two dense Adam moments. See docs/guides/gradient-sketch.mdx.
 #
-# The validation split is the first 512 shuffled samples and training uses the rest, with
+# The validation split is the first 5000 shuffled samples and training uses the rest, with
 # the same shuffle_seed on both so the two splits are disjoint and mixed-source.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -68,7 +68,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: "train[512:]"
+  split: "train[5000:]"
   shuffle_seed: 1234
   seq_length: 2048
   truncation: true
@@ -87,7 +87,7 @@ dataloader:
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: "train[:512]"
+  split: "train[:5000]"
   shuffle_seed: 1234
   seq_length: 2048
   truncation: true
