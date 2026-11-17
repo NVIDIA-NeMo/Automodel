@@ -1,6 +1,6 @@
 ---
 title: "ERNIE-5.5-Flash-Base-BF16"
-description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: full-parameter SFT and LoRA of the 43-layer decoder with expert parallelism and FSDP2 on single documents."
+description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: SFT and LoRA of the 43-layer decoder with expert parallelism, and LoRA on packed rows with context parallelism."
 slug: model-coverage/large-language-models/baidu/ERNIE-5.5-Flash-Base-BF16
 ---
 
@@ -17,10 +17,12 @@ and the output projection, and MultiMax corrects the logits. The checkpoint
 also stores one multi-token prediction (MTP) block.
 
 <Note>
-This page covers two configurations of the 43-layer main decoder with expert
-parallelism (EP) and FSDP2 on single unpacked documents: full-parameter
-supervised fine-tuning (SFT) on 16 nodes and [LoRA](#lora) on 2 nodes.
-[Current Scope](#current-scope) lists what is outside them.
+This page covers three configurations of the 43-layer main decoder with expert
+parallelism (EP) and FSDP2: full-parameter supervised fine-tuning (SFT) on 16
+nodes and [LoRA](#lora) on 2 nodes, both on single unpacked documents, and
+LoRA on [packed rows of 131,072 tokens](#packed-sequences-and-context-parallelism)
+with context parallelism (CP) on 2 nodes. [Current Scope](#current-scope)
+lists what is outside them.
 
 </Note>
 
@@ -82,8 +84,10 @@ path that accepts at most 512 tokens per document.
 
 A DSA layer attends to a local window of 128 keys and to the 2,048 remote keys
 with the highest index scores, so it discards keys only from position 2,176 of
-a document on. Training of the released model was validated with documents
-of at most 256 tokens, where every key is selected. The key selection was
+a document on. Training of the released model on single documents was
+validated with documents of at most 256 tokens, where every key is selected;
+the [packed LoRA recipe](#packed-sequences-and-context-parallelism) trains on
+documents of up to 66,418 tokens. The key selection was
 exercised in a forward pass over documents of 4,096 tokens (see
 [Numerical Validation](#numerical-validation)) and in one training run of a
 three-layer model (see [Validated Configuration](#validated-configuration)).
@@ -328,6 +332,125 @@ whatever `checkpoint.save_consolidated` says. Loading the adapter with Hugging
 Face PEFT and merging it into the base weights with
 `export_merged_peft_checkpoint` have not been tested.
 
+## Packed Sequences and Context Parallelism
+
+A packed row holds several documents. Every document starts at a multiple of
+128 tokens, the compression window of the HCA layers, and a token attends only
+to keys of its own document: the window keys and the compressed keys of the
+HCA layers, and the window keys and the selected remote keys of the DSA
+layers. Position ids restart at 0 in every document, and padding tokens are
+excluded from the experts and carry no label.
+
+With `distributed.cp_size` greater than 1, a row is split into contiguous
+shards of equal length, one per rank of a context-parallel (CP) group. For the
+HCA layers a rank reads the last 127 window keys of the preceding rank and the
+compressed keys of the whole row; for the DSA layers it reads the latent keys
+and the index keys of the whole row. The expert groups span the CP ranks.
+
+The packed LoRA recipe trains on rows of 131,072 tokens on 8 GPUs (2 nodes
+with 4 GB200 GPUs per node) with `cp_size: 8` and `ep_size: 8`: every rank
+holds 16,384 tokens of the row and one of the 8 expert groups. Run it from the
+repository root on each of the 2 nodes, with `NODE_RANK` set to 0 and 1 and
+`MASTER_ADDR` set to the first node:
+
+```bash
+uv run torchrun --nnodes=2 --nproc-per-node=4 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml
+```
+
+| Recipe | Dataset | Description |
+|---|---|---|
+| [ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml) | Tulu-3 SFT mixture | LoRA on rows of 131,072 packed tokens with CP8 and EP8 on 2 nodes; checkpoint saving disabled |
+
+The recipe keeps the model, the adapters, and the optimizer of the LoRA
+recipe. It differs in the data and in the parallelism:
+
+- `ChatDataset` renders `allenai/tulu-3-sft-mixture` with
+  [tulu3_chat_template.jinja](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/tulu3_chat_template.jinja),
+  supervises the assistant turns, and shuffles the documents with
+  `shuffle_seed: 1234` before packing. The released tokenizer has no chat
+  template.
+- THD packing fills rows of 131,072 tokens with
+  `packed_sequence.pad_to_multiple_of: 128`, and one row is one update
+  (`global_batch_size: 1`). `max_packs: 104` stops the packing after the rows
+  that 100 updates use.
+- With `model.backend.attn: cudnn`, the HCA and the DSA layers of a packed row
+  run the cuDNN sparse-attention kernels with the key list of every query.
+- `distributed.activation_checkpointing: true` and
+  `distributed.moe.reshard_after_forward: true` reduce the peak memory so that
+  16,384 tokens per rank fit a GB200 GPU next to the frozen weights.
+
+`forward` takes a whole packed row with `seq_lens` and `seq_lens_padded`, or
+a row or shard that the model's CP sharder has laid out, with `position_ids`
+and `packed_seq_ids`. It rejects document spans that do not add up to the row
+length, positions that do not count up from zero in every document, document
+ids that are not in row order, and documents that do not start at a multiple
+of 128 tokens.
+
+### Validated Packed Configuration
+
+| Area | Validated Configuration |
+|---|---|
+| Hardware | 2 nodes with 4 GB200 GPUs each (8 GPUs) |
+| Parallelism | FSDP2 with `cp_size: 8` and `ep_size: 8`: one CP group of 8 ranks with one expert group per rank; TP1 / PP1 |
+| Adapters | The adapters of the [LoRA](#lora) recipe: rank 8, alpha 32 |
+| Workload | Tulu-3, rows of 131,072 tokens with 55 to 216 documents per row, the longest document 66,418 tokens; one row per update; 100 optimizer updates with 29,664 to 88,999 label tokens each |
+| GPU memory | Peak 159.9 GiB allocated (`torch.cuda.max_memory_allocated` on rank 0) |
+| Step time | 62 s for the first update; median 22.5 s over the updates from the third on, at most 24.2 s |
+| Throughput | 5,319 tokens per second (median). The `tps` of the training log, 5,769, also counts the padding that aligns documents to 128 tokens: a row holds 119,476 tokens and 10,141 such padding tokens on average |
+| Loss | Training loss 0.5119 at the first update and 0.5216 at the last; the mean training loss is 0.6547 over the first 10 updates and 0.5875 over the last 10 |
+
+The run completed without non-finite losses or gradient norms. It validates
+the training mechanics, not model convergence.
+
+An update costs about the same time for 8,192 and for 16,384 tokens per rank:
+22.4 s with one row of 16,384 tokens per rank and `cp_size: 1`,
+42.3 s with `cp_size: 2`, where the same rows take two forward and
+backward passes of 8,192 tokens per rank. The recipe therefore puts as many
+tokens on a rank as its memory holds. One row of 131,072 tokens with
+`cp_size: 8` takes 22.5 s, against 22.4 s for eight rows of
+16,384 tokens with `cp_size: 1`.
+
+### Agreement Between CP Sizes
+
+The released model was trained with LoRA on the same packed rows at different
+`cp_size` values, each time on 2 nodes with `ep_size: 8`, and every update had
+the same label tokens in the compared runs. The table gives the absolute
+difference of the training losses per update. "Repeat" rows compare two runs
+of one configuration: BF16 training with these kernels does not repeat
+exactly, so they are the scale for the other rows.
+
+| Rows | Compared runs | Updates | First update | Mean | Maximum |
+|---|---|---|---|---|---|
+| 16,384 tokens, 8 per update | `cp_size: 2` against `cp_size: 1` | 30 | 6.7e-6 | 1.4e-4 | 3.2e-4 |
+| 16,384 tokens, 8 per update | `cp_size: 1`, repeat | 30 | 1.5e-5 | 3.4e-4 | 6.9e-4 |
+| 65,536 tokens, 2 per update | `cp_size: 8` against `cp_size: 4` | 30 | 4.5e-6 | 1.3e-4 | 3.1e-4 |
+| 65,536 tokens, 2 per update | `cp_size: 4`, repeat | 30 | 9.5e-6 | 1.2e-4 | 2.9e-4 |
+| 131,072 tokens, 1 per update | `cp_size: 8`, repeat | 30 | 9.1e-6 | 2.1e-4 | 5.1e-4 |
+
+`cp_size: 1` holds a whole row on one GPU, which limits it to rows of 16,384
+tokens. Rows of 131,072 tokens were run with `cp_size: 8` only.
+The differences between `cp_size` values have the size of the differences between two runs of one configuration. Two such runs already differ at the first update, by about 1e-5: the top-k step of the DSA layers does not choose the same key among keys with equal index scores every time, and the backward pass of the cuDNN kernels does not repeat bit for bit. The gradient norms agree within 1e-4 at the first update. Later they differ by 11 to 16% on average, between two `cp_size` values and between two runs of one configuration alike, and on single updates one run has a norm up to three times that of the other.
+
+Small models were compared in FP32 on the eager attention path. A packed row
+gives the logits of its documents run one by one, and 2 and 4 CP ranks give
+the logits of one process, within 1e-6; the gradients agree within 1e-3 of
+the largest entry of each tensor. Changing the tokens of one document leaves
+the logits of every other document bit-identical, with and without CP, on
+the eager path and on the cuDNN path. On a packed row, the gradients of the
+cuDNN path differ from those of the eager path in BF16 by 1.1% of the
+gradient norm, less than the 1.4% between the eager path in BF16 and in
+FP32; two backward passes of the cuDNN path over the same input differ by
+0.5%.
+
+These FP32 comparisons hold as long as the DSA layers select the same keys.
+The index scores are rounded to BF16 in every model dtype, so two keys can
+tie at the selection threshold; a different packing or shard layout can then
+select the other key, and the logits of that document differ from that query
+on (by up to 8.8e-3 with dense FFN layers in the measured rows, and by order 1
+on single tokens once the routing of an expert changes). Every selected key
+stays in the query's document and before the query.
+
 ## Loading and Inputs
 
 Both recipes load revision `68d19ee51c032344fa0a8018e7dc21b2668a55c4` of
@@ -344,10 +467,12 @@ released configuration cannot be loaded unchanged. Set
 of the checkpoint are then not loaded. Both example recipes set it. A
 configuration that does not come from the released file defaults to 0.
 
-Inputs are single unpacked documents. The model's `forward` accepts one
-unpadded document, `input_ids` of shape `[1, sequence]`, which the recipes
-provide with `step_scheduler.local_batch_size: 1`. `forward` rejects a padded
-batch, and THD sequence packing is refused when the data loader is built.
+The SQuAD recipes feed single unpacked documents: `forward` accepts one
+unpadded document, `input_ids` of shape `[1, sequence]`, which they provide
+with `step_scheduler.local_batch_size: 1`, and rejects a padded batch. The
+packed recipe feeds THD-packed rows. `forward` then takes `seq_lens` and
+`seq_lens_padded` for a whole row, or `position_ids` and `packed_seq_ids` for
+the shard of a row, which the model's CP sharder prepares for every `cp_size`.
 
 ## Numerical Validation
 
@@ -397,7 +522,7 @@ was not compared.
 ## Current Scope
 
 Supported: full-parameter SFT and LoRA of the 43-layer main decoder with EP and
-FSDP2 on single unpacked documents.
+FSDP2 on single unpacked documents, and LoRA on packed rows with CP.
 
 - The MTP block is not loaded or trained. Its 1,582 checkpoint keys under
   `model.layers.43.*` are excluded, and loading requires
@@ -409,12 +534,19 @@ FSDP2 on single unpacked documents.
   The router correction bias is a fixed buffer, not a parameter. No indexer
   loss is computed; the reference training recipe trains the indexers with a KL
   term against the attention distribution, which this implementation does not.
-- Tensor parallelism (TP), context parallelism (CP), and pipeline parallelism
-  (PP) are not supported and raise an error. Packed sequences are refused
-  when the data loader is built.
+- Tensor parallelism (TP) and pipeline parallelism (PP) are not supported and
+  raise an error.
+- Packed rows and CP are validated with LoRA, the cuDNN attention path, and
+  `ep_size: 8` on 8 GPUs, on rows of 16,384, 65,536, and 131,072 tokens (see
+  [Packed Sequences and Context Parallelism](#packed-sequences-and-context-parallelism)).
+  Not run: full fine-tuning on packed rows, more than 8 ranks, and rows of
+  131,072 tokens with a `cp_size` other than 8. The eager attention path of
+  packed rows is covered by the small-model tests only.
 - `distributed.strategy` other than `fsdp2`, `dp_replicate_size` other than 1,
-  `ep_size` of 1, activation checkpointing, and an FSDP compute dtype other
-  than FP32 or BF16 are rejected when the model is parallelized.
+  `ep_size` of 1, the activation checkpointing values `selective` and `moe`,
+  and an FSDP compute dtype other than FP32 or BF16 are rejected when the
+  model is parallelized. `activation_checkpointing: true` was run with the
+  packed LoRA recipe only.
 - The number of ranks must divide the 64 attention heads of the DSA layers, so
   a job has 2, 4, 8, 16, 32, or 64 ranks. A checkpoint stores the key and
   value projections of a DSA layer as one matrix, and it is loaded and saved
@@ -424,7 +556,7 @@ FSDP2 on single unpacked documents.
   true.
 - LoRA is validated with the targets, adapter rank 8 (`peft.dim`), and alpha
   32 of the LoRA recipe, with one rank per expert group, and with documents of
-  at most 256 tokens. The modules that [LoRA Targets](#lora-targets) lists as
+  at most 256 tokens or the packed rows of the packed recipe. The modules that [LoRA Targets](#lora-targets) lists as
   rejected raise an error when the model is parallelized. DoRA
   (`peft.use_dora`) is rejected on every target when the model is built, and
   an adapter in another dtype than the weight it adapts when the model is
@@ -439,8 +571,8 @@ FSDP2 on single unpacked documents.
 - Documents longer than 512 tokens require the cuDNN sparse-attention path of
   the DSA layers, which requires `nvidia-cudnn-frontend[cutedsl]` and FlashMLA
   and is validated on SM100-class GPUs (GB200) only. Multi-GPU training of the
-  released model has been validated with that path only, and with documents of
-  at most 256 tokens. With longer documents, full fine-tuning of the released
+  released model has been validated with that path only, and, outside the
+  packed LoRA recipe, with documents of at most 256 tokens. With longer documents, full fine-tuning of the released
   model was not run, only its forward pass. With LoRA, an earlier state of the
   code ran three updates each at 384, 512, 768, and 1,024 tokens to measure
   memory (113 to 161 GiB allocated at the peak); this is not a validation.

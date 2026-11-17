@@ -31,7 +31,6 @@ from nemo_automodel._transformers.capabilities import attach_capabilities_and_va
 from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
-from nemo_automodel.components.datasets.loader import ThdPackingConfig
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -154,9 +153,9 @@ def test_registered_class_declares_capabilities_and_tie_support_itself():
     assert "tie_word_embeddings_support" in Ernie5_5_MoeForCausalLM.__dict__
     assert Ernie5_5_MoeForCausalLM.tie_word_embeddings_support is TieSupport.UNTIED_ONLY
     capabilities = Ernie5_5_MoeForCausalLM.ModelCapabilities()
-    assert capabilities.supports_ep
-    assert not (capabilities.supports_tp or capabilities.supports_cp or capabilities.supports_pp)
-    assert not capabilities.supports_thd
+    assert capabilities.supports_ep and capabilities.supports_cp and capabilities.supports_thd
+    assert not (capabilities.supports_tp or capabilities.supports_pp)
+    assert Ernie5_5_MoeForCausalLM._owns_cp_attention and Ernie5_5_MoeForCausalLM._owns_packed_attention
     assert issubclass(Ernie5_5_MoeForCausalLM, (HFCheckpointingMixin, MoEFSDPSyncMixin))
     package = model_module.__name__.rpartition(".")[0]
     assert [cls for cls in Ernie5_5_MoeForCausalLM.__mro__ if cls.__module__.startswith(package)] == [
@@ -335,17 +334,19 @@ def test_eager_backend_names_select_the_eager_path_in_both_attention_kinds(attn)
     with torch.device("meta"):
         model = Ernie5_5_MoeForCausalLM(_tiny_config(), _eager_backend(attn))
     hca, dsa = model.model.layers[0].attention, model.model.layers[2].attention
-    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == "eager"
+    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == attn
     assert isinstance(dsa, Ernie5_5DSAAttention) and not dsa.uses_cudnn
+    assert not model.model.dsa_uses_cudnn
 
 
-def test_cudnn_backend_selects_cudnn_dsa_and_eager_hca():
+def test_cudnn_backend_reaches_both_attention_kinds():
     with torch.device("meta"):
         model = Ernie5_5_MoeForCausalLM(_two_layer_checkpoint_config(ratios=(128, -2)), _cudnn_backend())
     hca, dsa = model.model.layers[0].attention, model.model.layers[1].attention
-    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == "eager"
+    # An HCA layer runs the kernels for packed rows only; a row that holds one document keeps the eager path.
+    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == "cudnn"
     assert isinstance(dsa, Ernie5_5DSAAttention) and dsa.uses_cudnn
-    assert model.backend.attn == "cudnn"
+    assert model.backend.attn == "cudnn" and model.model.dsa_uses_cudnn
 
 
 @pytest.mark.parametrize("attn", ["te", "flex", "tilelang", "fa4", "magi"])
@@ -497,7 +498,7 @@ def test_block_registers_the_feed_forward_under_its_native_name(layer_index, chi
 
     # A module installed in place of the child, as activation checkpointing does, is used by the next forward.
     class _Zero(nn.Module):
-        def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        def forward(self, hidden: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
             """Return zeros with the shape [batch, sequence, hidden] of the input."""
             return torch.zeros_like(hidden)
 
@@ -575,10 +576,11 @@ def test_each_attention_kind_receives_the_inputs_of_its_path():
     cudnn = Ernie5_5Model(config, _cudnn_backend(), eager.moe_config)
     assert cudnn.layers[2].attention.uses_cudnn
     packed = _capture_attention_call(cudnn, 2, tokens)
-    assert set(packed) == {"position_ids", "cu_seqlens", "max_seqlen"}
+    assert set(packed) == {"position_ids", "cu_seqlens", "max_seqlen", "metadata"}
     assert torch.equal(packed["position_ids"], torch.tensor([[0, 1, 2, 3]]))
     assert torch.equal(packed["cu_seqlens"], torch.tensor([0, 4], dtype=torch.int32))
     assert packed["max_seqlen"] == 4
+    assert packed["metadata"] is None
 
 
 def test_attention_inputs_use_the_window_captured_at_construction():
@@ -659,29 +661,39 @@ def test_rejects_padding_packed_rows_restarted_positions_and_a_cache(hca_model, 
         hca_model(torch.tensor([[4, 2, 9]]), **kwargs)
 
 
-def test_forward_declares_no_packed_sequence_or_context_parallel_input(hca_model):
+def test_forward_declares_the_packed_sequence_inputs(hca_model):
     parameters = inspect.signature(Ernie5_5_MoeForCausalLM.forward).parameters
-    assert list(parameters) == ["self", "input_ids", "attention_mask", "padding_mask", "position_ids", "use_cache"]
-    assert parameters["use_cache"].kind is inspect.Parameter.KEYWORD_ONLY
-    # The framework probes the signature for ``seq_lens``; without it THD packing is refused at loader construction.
-    assert not model_utils._supports_seq_lens(hca_model)
-    assert not capabilities._supports_seq_lens(hca_model)
-    with pytest.raises(ValueError, match="THD packing requires a model that consumes seq_lens"):
-        ThdPackingConfig(packed_sequence_size=8).build([], supports_seq_lens=model_utils._supports_seq_lens(hca_model))
+    assert list(parameters) == [
+        "self",
+        "input_ids",
+        "attention_mask",
+        "padding_mask",
+        "position_ids",
+        "packed_seq_ids",
+        "seq_lens",
+        "seq_lens_padded",
+        "use_cache",
+    ]
+    assert parameters["packed_seq_ids"].kind is inspect.Parameter.KEYWORD_ONLY
+    # The framework probes the signature for ``seq_lens`` before it builds a THD loader.
+    assert model_utils._supports_seq_lens(hca_model)
+    assert capabilities._supports_seq_lens(hca_model)
     # Batch keys that the signature does not declare are dropped by the recipe before the call.
     batch = {
         "input_ids": torch.tensor([[4, 2, 9]]),
         "seq_lens": torch.tensor([[3]]),
         "labels": torch.tensor([[2, 9, 1]]),
+        "qkv_format": "thd",
+        "cp_group": None,
     }
-    assert set(model_utils.filter_forward_kwargs(hca_model, batch)) == {"input_ids"}
+    assert set(model_utils.filter_forward_kwargs(hca_model, batch)) == {"input_ids", "seq_lens"}
 
 
 def test_rejects_the_padding_token_and_unknown_inputs(hca_model):
     assert hca_model.config.pad_token_id == 0
     with pytest.raises(ValueError, match="pad_token_id=0"):
         hca_model(torch.tensor([[1, 0, 2]]))
-    for name in ("packed_seq_params", "seq_lens", "cu_seqlens", "cp_group", "past_key_values"):
+    for name in ("packed_seq_params", "cu_seqlens", "cp_group", "past_key_values"):
         with pytest.raises(TypeError, match=name):
             hca_model(torch.tensor([[4, 2, 9]]), **{name: None})
 

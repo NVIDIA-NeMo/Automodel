@@ -14,9 +14,9 @@
 
 """Model-owned distributed parallelization for ERNIE 5.5.
 
-ERNIE 5.5 is distributed with FSDP2 and expert parallelism only. The sidecar rejects every other topology before
-the shared dispatcher runs, keeps the shared expert-parallel flow, and adds two things while that flow builds the
-FSDP units:
+ERNIE 5.5 is distributed with FSDP2 and expert parallelism, with or without context parallelism and activation
+checkpointing. The sidecar rejects every other topology before the shared dispatcher runs, keeps the shared
+expert-parallel flow, and adds two things while that flow builds the FSDP units:
 
 * Every HCA compressor receives the process group of the mesh over which its parameters are sharded. A row shorter
   than one compression window does not use the compressor. With the group, the ranks that share the compressor
@@ -45,6 +45,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy
 
 from nemo_automodel.components.distributed import FSDP2Config, MeshContext, ModelParallelizer
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.ernie5_5.config import Ernie5_5ModelPlan
 from nemo_automodel.components.models.ernie5_5.hca import Ernie5_5HCAAttention
@@ -248,9 +249,10 @@ def _reject_unsupported_lora_adapters(model: nn.Module) -> None:
 class Ernie5_5ModelParallelizer(ModelParallelizer):
     """Distribute ERNIE 5.5 with FSDP2 and expert parallelism, and reject every other topology.
 
-    The supported topology is ``distributed.strategy: fsdp2`` with ``ep_size`` greater than one, one data-parallel
-    sharding dimension over all ranks of the job (``tp_size``, ``cp_size``, ``pp_size`` and ``dp_replicate_size``
-    equal to one), FSDP compute in FP32 or BF16, and no activation checkpointing.
+    The supported topology is ``distributed.strategy: fsdp2`` with ``ep_size`` greater than one, FSDP sharding
+    over all ranks of the job (``tp_size``, ``pp_size`` and ``dp_replicate_size`` equal to one) and FSDP compute in
+    FP32 or BF16. ``cp_size`` splits every row over that many ranks, and ``activation_checkpointing: true``
+    recomputes whole decoder layers in backward; the selective and MoE-only modes are not supported.
 
     A model with a DSA layer also restricts the number of ranks: it must divide
     ``config.hybrid_mla_num_attention_heads``. A checkpoint stores the key and value projections of a DSA layer as
@@ -288,9 +290,10 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                 mode of the run.
 
         Raises:
-            ValueError: If the strategy is not FSDP2; if the tensor-, context- or pipeline-parallel size or the
+            ValueError: If the strategy is not FSDP2; if the tensor- or pipeline-parallel size or the
                 replicate size is not one; if ``model`` is a pipeline stage; if expert parallelism is off; if
-                activation checkpointing is on; if an FSDP compute dtype is neither FP32 nor BF16; if the
+                activation checkpointing is neither off nor ``true``; if an FSDP compute dtype is neither FP32 nor
+                BF16; if the
                 data-parallel mesh does not cover all ranks of the job; if the model has a DSA layer and the
                 number of ranks does not divide its number of DSA attention heads; or if a LoRA adapter sits on a
                 module that does not support one, holds a tensor other than the LoRA factors, or has another
@@ -303,14 +306,13 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
             )
         sizes = {
             "tp_size": mesh_context.tp_size,
-            "cp_size": mesh_context.cp_size,
             "pp_size": mesh_context.pp_size,
             "dp_replicate_size": mesh_context.dp_replicate_size or 1,
         }
         unsupported = {name: size for name, size in sizes.items() if size != 1}
         if unsupported:
             raise ValueError(
-                "ERNIE 5.5 supports FSDP2 with expert parallelism only; set these distributed sizes to 1: "
+                "ERNIE 5.5 supports FSDP2 with expert and context parallelism only; set these distributed sizes to 1: "
                 f"{unsupported}"
             )
         if _is_pipeline_stage(model):
@@ -324,10 +326,10 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                 "ERNIE 5.5 requires expert parallelism: set distributed.ep_size to a value greater than 1, got "
                 f"{ep_size}"
             )
-        if mesh_context.activation_checkpointing:
+        if mesh_context.activation_checkpointing not in (False, True):
             raise ValueError(
-                "ERNIE 5.5 does not support activation checkpointing: set distributed.activation_checkpointing to "
-                f"false, got {mesh_context.activation_checkpointing!r}"
+                "ERNIE 5.5 supports activation checkpointing of whole decoder layers only: set "
+                f"distributed.activation_checkpointing to true or false, got {mesh_context.activation_checkpointing!r}"
             )
         moe = mesh_context.moe_parallel_config
         policies = {
@@ -390,7 +392,7 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                 "The expert-parallel flow did not shard ERNIE 5.5 through its sidecar: the hyper-head is not an "
                 "FSDP unit, so its FP32 boundary and the HCA synchronization groups are missing"
             )
-        for layer in model.model.layers:
+        for layer in map(unwrap_checkpoint_wrapper, model.model.layers):
             if layer.is_moe:
                 layer.moe.experts.ep_size = mesh_context.ep_size
         return model

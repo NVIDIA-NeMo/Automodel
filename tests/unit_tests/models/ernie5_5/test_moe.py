@@ -250,11 +250,11 @@ def test_moe_meta_initialization_and_fp32_guard():
         model(torch.zeros(1, 4, dtype=torch.bfloat16))
 
 
-def test_moe_rejects_unsharded_distributed_execution_and_context_parallel(monkeypatch):
+def test_moe_ignores_a_context_parallel_mesh_and_rejects_unsharded_distributed_execution(monkeypatch):
     model = _moe_model()
     inputs = torch.zeros(2, 4)
-    with pytest.raises(RuntimeError, match="does not support context parallelism"):
-        model(inputs, cp_mesh=object())
+    model.cp_mesh = object()
+    assert torch.equal(model(inputs, cp_mesh=object()), model(inputs))
     monkeypatch.setattr(moe_module, "get_world_size_safe", lambda: 2)
     with pytest.raises(RuntimeError, match="requires sharded expert DTensors"):
         model(inputs)

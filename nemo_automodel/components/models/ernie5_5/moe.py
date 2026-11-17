@@ -26,7 +26,8 @@
 Supported execution: the torch expert, dispatcher and linear backends only. In a single process there is no
 placement requirement. With more than one process the expert weights must be ``DTensor`` objects on an ``("ep",)``
 mesh with placements ``(Shard(0),)`` or on an ``("ep_shard", "ep")`` mesh with placements ``(Shard(1), Shard(0))``;
-``Ernie5_5MoE.forward`` raises ``RuntimeError`` for any other layout and for context parallelism.
+``Ernie5_5MoE.forward`` raises ``RuntimeError`` for any other layout. Routing uses the local token states, so a
+context-parallel shard is routed like any other row.
 
 Provenance: the expert-selection and routing-weight contracts of ``route`` are those of the ERNIE 5.5 implementation
 in Megatron-Bridge (Apache License 2.0) at revision ``a38833622b88969564fe8bfa053c5e4e4989c6cd``:
@@ -322,8 +323,7 @@ def _make_callable_projection(projection: nn.Linear) -> _FP32LatentLinear:
 class Ernie5_5MoE(MoE):
     """ERNIE dual-router latent experts and shared SiTU expert.
 
-    Distributed execution is restricted to the torch expert-parallel layouts that ``forward`` checks. Context
-    parallelism is not supported.
+    Distributed execution is restricted to the torch expert-parallel layouts that ``forward`` checks.
     """
 
     def __init__(
@@ -386,13 +386,13 @@ class Ernie5_5MoE(MoE):
         Args:
             hidden: Tensor of shape [..., hidden] with arbitrary leading dimensions.
             padding_mask: Boolean tensor of shape [...] where true marks padding.
-            cp_mesh: Context-parallel mesh; only None is supported.
+            cp_mesh: Context-parallel mesh; unused, because the gate computes no auxiliary loss.
 
         Returns:
             Output of shape [..., hidden].
 
         Raises:
-            RuntimeError: If a context-parallel mesh is passed or set on the module; if, with more than one
+            RuntimeError: If, with more than one
                 process, the expert weights are not ``DTensor`` objects with the same mesh and placements in a
                 supported layout (mesh ``("ep",)`` with placements ``(Shard(0),)``, or mesh ``("ep_shard", "ep")``
                 with placements ``(Shard(1), Shard(0))``, with more than one expert-parallel rank); or if a latent
@@ -400,8 +400,7 @@ class Ernie5_5MoE(MoE):
             ValueError: If ``hidden`` is empty, has fewer than two dimensions or does not end in the configured
                 hidden size, or ``padding_mask`` does not have the shape of ``hidden`` without its final axis.
         """
-        if cp_mesh is not None or self.cp_mesh is not None:
-            raise RuntimeError("ERNIE 5.5 MoE does not support context parallelism")
+        del cp_mesh
         if get_world_size_safe() != 1:
             gate_up, down = self.experts.gate_and_up_projs, self.experts.down_projs
             if not isinstance(gate_up, DTensor) or not isinstance(down, DTensor):

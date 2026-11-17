@@ -56,10 +56,12 @@ of the same document that an indexer selects. This module holds the layer and it
   eager path.
 * ``latent_mqa_core``: the eager attention core over a dense [sequence, sequence] selection.
 * ``merge_remote_and_window`` and ``cudnn_dsa_core``: the sparse key indices and the attention core of the cuDNN path.
+* ``cudnn_dsa_layout``: the document layout of a packed row, or of a context-parallel shard of it, for the cuDNN path.
 * ``Ernie5_5DSAFP32Parameters`` and ``Ernie5_5DSASparseFP32Parameters``: the FP32 sink and virtual-head parameters,
   each with the core that consumes them.
-* ``Ernie5_5DSAAttention``: the layer. ``backend.attn`` selects the eager path for short sequences or the cuDNN path
-  for one unpadded row that holds one document; both paths share all parameters.
+* ``Ernie5_5DSAAttention``: the layer. ``backend.attn`` selects the eager path for short sequences or the cuDNN
+  path; both paths share all parameters, and both attend within each document of a packed row and across the
+  context-parallel shards of a row.
 * ``freeze_ernie5_5_indexer_params``: disables gradients for the indexer parameters.
 
 Provenance: the projection layout, the indexer precision contract and the operation order follow two sources.
@@ -78,12 +80,17 @@ from collections.abc import Callable
 from dataclasses import replace
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention, plan_sparse_indices
-from nemo_automodel.components.models.ernie5_5.layers import DENSE_ATTENTION_BACKENDS, virtual_head_mix
+from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
+from nemo_automodel.components.models.ernie5_5.layers import DENSE_ATTENTION_BACKENDS, shard_start, virtual_head_mix
 from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
+    CudnnDsaPackedMetadata,
     cudnn_indexer_topk,
     prepare_cudnn_dsa_packed_metadata,
 )
@@ -336,7 +343,13 @@ def ernie5_5_index_scores(q: torch.Tensor, k: torch.Tensor, weights: torch.Tenso
 
 @torch.no_grad()
 def select_window_and_remote(
-    scores: torch.Tensor, document_ids: torch.Tensor, *, window: int, remote_topk: int
+    scores: torch.Tensor,
+    document_ids: torch.Tensor,
+    *,
+    window: int,
+    remote_topk: int,
+    key_document_ids: torch.Tensor | None = None,
+    first_query: int = 0,
 ) -> torch.Tensor:
     """Select, for every query, a causal local window and the top-scoring remote keys of its document.
 
@@ -344,32 +357,39 @@ def select_window_and_remote(
     query. The local window is the query and the ``window - 1`` eligible keys before it. The other eligible keys are
     remote, and the ``remote_topk`` highest-scoring of them are added. The function runs without gradient tracking.
 
+    The queries are the keys, or, with ``key_document_ids``, the consecutive keys that start at ``first_query``:
+    one context-parallel shard of the row.
+
     Args:
-        scores: Finite floating tensor of shape [batch, sequence, sequence], indexed [batch, query, key].
-        document_ids: Integer tensor of shape [batch, sequence] on the device of ``scores``. Tokens of one document
+        scores: Finite floating tensor of shape [batch, queries, keys], indexed [batch, query, key].
+        document_ids: Integer tensor of shape [batch, queries] on the device of ``scores``. Tokens of one document
             carry the same id, and a negative id marks padding. The caller must give every contiguous document of a
             row its own id: tokens that share an id are treated as one document.
         window: Positive number of local keys per query, the query included.
         remote_topk: Non-negative number of remote keys per query. Zero selects the local window only.
+        key_document_ids: Optional integer tensor of shape [batch, keys] with the document of every key. None
+            means that the keys are the queries.
+        first_query: Index of the first query among the keys.
 
     Returns:
-        Boolean tensor of shape [batch, sequence, sequence], indexed [batch, query, key], that is True for the
+        Boolean tensor of shape [batch, queries, keys], indexed [batch, query, key], that is True for the
         selected keys. The rows of padding queries are all False.
 
     Raises:
-        ValueError: If ``scores`` is not [batch, sequence, sequence], ``document_ids`` is not [batch, sequence],
-            ``window`` is not positive, ``remote_topk`` is negative or a score is not finite.
+        ValueError: If ``scores`` is not [batch, queries, keys], ``document_ids`` is not [batch, queries], the key
+            ids are not [batch, keys], ``window`` is not positive, ``remote_topk`` is negative or a score is not
+            finite.
     """
-    if scores.ndim != 3 or scores.shape[1] != scores.shape[2] or document_ids.shape != scores.shape[:2]:
-        raise ValueError("Expected scores [batch, sequence, sequence] and matching document IDs")
+    key_ids = document_ids if key_document_ids is None else key_document_ids
+    if scores.ndim != 3 or document_ids.shape != scores.shape[:2] or key_ids.shape != scores.shape[::2]:
+        raise ValueError("Expected scores [batch, queries, keys] and matching document IDs")
     if window < 1 or remote_topk < 0 or not torch.isfinite(scores).all():
         raise ValueError("Scores must be finite, window positive and remote_topk non-negative")
-    length = scores.shape[1]
-    positions = torch.arange(length, device=scores.device)
-    query, key = positions[:, None], positions[None, :]
-    valid = document_ids >= 0
-    same = document_ids[:, :, None] == document_ids[:, None, :]
-    allowed = same & valid[:, :, None] & valid[:, None, :] & (key <= query)
+    length = scores.shape[2]
+    query = torch.arange(scores.shape[1], device=scores.device)[:, None] + first_query
+    key = torch.arange(length, device=scores.device)[None, :]
+    same = document_ids[:, :, None] == key_ids[:, None, :]
+    allowed = same & (document_ids >= 0)[:, :, None] & (key_ids >= 0)[:, None, :] & (key <= query)
     local = allowed & (key > query - window)
     remote = allowed & ~local
     count = min(remote_topk, length)
@@ -395,6 +415,8 @@ def latent_mqa_core(
     window: int,
     remote_topk: int,
     softmax_scale: float,
+    key_document_ids: torch.Tensor | None = None,
+    first_query: int = 0,
 ) -> torch.Tensor:
     """Run the eager DSA core: latent multi-query attention with a sink, value up-projection, head mix and gate.
 
@@ -411,9 +433,10 @@ def latent_mqa_core(
     Args:
         query: Tensor of shape [batch, sequence, heads, latent + rope]: the query of each head in the key space,
             ``latent`` content channels followed by ``rope`` rotary channels.
-        latent_kv: Tensor of shape [batch, sequence, latent + rope], the key shared by all heads. Its first
-            ``latent`` channels are also the value.
-        scores: Finite index scores of shape [batch, sequence, sequence], indexed [batch, query, key].
+        latent_kv: Tensor of shape [batch, keys, latent + rope], the key shared by all heads. Its first
+            ``latent`` channels are also the value. ``keys`` equals ``sequence`` unless the queries are one
+            context-parallel shard of the row.
+        scores: Finite index scores of shape [batch, sequence, keys], indexed [batch, query, key].
         document_ids: Integer tensor of shape [batch, sequence]; see ``select_window_and_remote``.
         sink: Per-head sink logits of shape [heads].
         value_up: Value up-projection of shape [heads, value_dim, latent].
@@ -423,6 +446,8 @@ def latent_mqa_core(
         window: Positive number of local keys per query.
         remote_topk: Non-negative number of remote keys per query.
         softmax_scale: Factor applied to the query-key products.
+        key_document_ids: Optional integer tensor of shape [batch, keys]; see ``select_window_and_remote``.
+        first_query: Index of the first query among the keys.
 
     Returns:
         Tensor of shape [batch, sequence, heads * value_dim] in the dtype of ``query``, with the value channels of
@@ -435,13 +460,21 @@ def latent_mqa_core(
     if query.ndim != 4 or latent_kv.ndim != 3 or value_up.ndim != 3:
         raise ValueError("Expected rank-4 query and rank-3 latent KV and value projection")
     batch, sequence, heads, qdim = query.shape
-    if latent_kv.shape != (batch, sequence, qdim) or value_up.shape[0] != heads or sink.shape != (heads,):
+    keys = sequence if key_document_ids is None else key_document_ids.shape[1]
+    if latent_kv.shape != (batch, keys, qdim) or value_up.shape[0] != heads or sink.shape != (heads,):
         raise ValueError("Query, latent KV, sink and value projection dimensions do not agree")
     value_dim, latent = value_up.shape[1:]
     if latent > qdim or gate_logits.shape != (batch, sequence, heads * value_dim):
         raise ValueError("Invalid latent width or output gate dimensions")
-    selected = select_window_and_remote(scores, document_ids, window=window, remote_topk=remote_topk)
-    if selected.shape != (batch, sequence, sequence):
+    selected = select_window_and_remote(
+        scores,
+        document_ids,
+        window=window,
+        remote_topk=remote_topk,
+        key_document_ids=key_document_ids,
+        first_query=first_query,
+    )
+    if selected.shape != (batch, sequence, keys):
         raise ValueError("Index scores and document IDs must match query batch and sequence")
     with torch.autocast(device_type=query.device.type, enabled=False):
         logits = torch.einsum("bqhd,bkd->bhqk", query.float(), latent_kv.float()) * softmax_scale
@@ -464,13 +497,14 @@ def merge_remote_and_window(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Combine the remote indices of every query with its local causal window.
 
-    Queries and keys are the tokens of one unpadded row, and an index is the offset of a token in that row. The
-    remote part of the result keeps the input order and replaces with -1 every index that is absent, belongs to
-    another document, or lies inside or after the local window. The local part lists the last ``window`` offsets up
-    to the query in ascending order, with -1 for positions before the start of the document.
+    Keys are the tokens of one row, queries are all of them or one context-parallel shard, and an index is the
+    offset of a token in that row. The remote part of the result keeps the input order and replaces with -1 every
+    index that is absent, belongs to another document, or lies inside or after the local window. The local part
+    lists the last ``window`` offsets up to the query in ascending order, with -1 for positions before the start of
+    the document.
 
-    All inputs must describe contiguous real documents. Their values are not checked for consistency, and
-    context-parallel and padded-storage metadata are not validated.
+    The real tokens of a document must be contiguous from its start. The values of the inputs are not checked for
+    consistency.
 
     Args:
         remote_indices: Int32 tensor of shape [queries, remote_topk] with row offsets of remote keys, or -1 for
@@ -532,19 +566,22 @@ def cudnn_dsa_core(
     window: int,
     remote_topk: int,
     softmax_scale: float,
+    metadata: CudnnDsaPackedMetadata | None = None,
 ) -> torch.Tensor:
-    """Run the cuDNN DSA core on the tokens of one unpadded row that holds one document.
+    """Run the cuDNN DSA core on the tokens of one row.
 
     ``cudnn_indexer_topk`` selects the remote keys of every query, ``merge_remote_and_window`` adds the local
     window, and ``cudnn_sparse_attention`` attends over the union with the per-head sink. The attended latent is
     then projected to the value channels of each head in FP32, mixed across heads and gated in the dtype of
     ``query``, as in ``latent_mqa_core``. The indexer inputs are detached, so the selection receives no gradient.
 
-    Queries and keys are the same ``tokens`` rows. Context parallelism is not supported, and neither is a row
-    that holds several documents: ``cu_seqlens`` with more than two entries raises ``NotImplementedError``. Before
-    the first kernel is called, ``prepare_cudnn_dsa_packed_metadata`` validates the rest of the document metadata:
-    it raises ``TypeError`` unless ``cu_seqlens`` is int32, and ``ValueError`` unless ``cu_seqlens`` is
-    one-dimensional, starts at zero and ends at ``tokens`` and ``max_seqlen`` equals ``tokens``.
+    Without ``metadata`` the row is unpadded and holds one document, and queries and keys are the same ``tokens``
+    rows: ``cu_seqlens`` with more than two entries raises ``NotImplementedError``, and before the first kernel is
+    called ``prepare_cudnn_dsa_packed_metadata`` validates the rest of the document metadata: it raises
+    ``TypeError`` unless ``cu_seqlens`` is int32, and ``ValueError`` unless ``cu_seqlens`` is one-dimensional,
+    starts at zero and ends at ``tokens`` and ``max_seqlen`` equals ``tokens``. With the ``metadata`` of
+    ``cudnn_dsa_layout`` the row is packed, the keys are all of its tokens and the queries are all of them or one
+    context-parallel shard.
 
     All tensors must be on one CUDA device. The two kernels accept BF16 inputs with ``latent + rope`` equal to 512
     or 576, ``index_dim`` equal to 128, 32 or 64 indexer heads and ``remote_topk`` of at most 2048, and raise
@@ -552,10 +589,10 @@ def cudnn_dsa_core(
 
     Args:
         query: BF16 tensor of shape [tokens, heads, latent + rope].
-        latent_kv: BF16 tensor of shape [tokens, latent + rope], the key shared by all heads. Its first ``latent``
-            channels are also the value.
+        latent_kv: BF16 tensor of shape [keys, latent + rope], the key shared by all heads. Its first ``latent``
+            channels are also the value. ``keys`` equals ``tokens`` unless ``metadata`` describes a shard.
         index_q: BF16 indexer query of shape [tokens, index_heads, index_dim].
-        index_k: BF16 indexer key of shape [tokens, index_dim].
+        index_k: BF16 indexer key of shape [keys, index_dim].
         index_weights: FP32 or BF16 indexer head weights of shape [tokens, index_heads], as ``Ernie5_5Indexer``
             returns them. They are multiplied by ``sqrt(index_dim)`` in their own dtype before the kernel.
         sink: FP32 per-head sink logits of shape [heads].
@@ -563,12 +600,13 @@ def cudnn_dsa_core(
         gate_logits: Tensor of shape [tokens, heads * value_dim].
         vha_u: Virtual-head input factor of shape [heads, rank].
         vha_v: Virtual-head output factor of shape [heads, rank].
-        cu_seqlens: Int32 tensor ``[0, tokens]`` of shape [2]: the cumulative document lengths of a row that holds
-            one document.
-        max_seqlen: Length of the document, equal to ``tokens``.
+        cu_seqlens: Int32 cumulative document lengths of the row: ``[0, tokens]`` of shape [2] without
+            ``metadata``, of shape [documents + 1] with it.
+        max_seqlen: Length of the document, equal to ``tokens``. Not read with ``metadata``.
         window: Positive number of local causal keys per query.
         remote_topk: Positive number of remote keys the indexer selects per query.
         softmax_scale: Factor applied to the query-key products.
+        metadata: Layout of a packed row and of the queries in it, as ``cudnn_dsa_layout`` returns it.
 
     Returns:
         Core output of shape [tokens, heads * value_dim] in the dtype of ``query``.
@@ -577,22 +615,24 @@ def cudnn_dsa_core(
         ValueError: If ``tokens`` is zero, the shapes of the query, the latent key/value, the value projection or
             the gate logits disagree, ``latent`` exceeds ``latent + rope``, or ``window`` or ``remote_topk`` is not
             positive.
-        NotImplementedError: If ``cu_seqlens`` has more than two entries, that is, the row holds several documents.
+        NotImplementedError: If ``cu_seqlens`` has more than two entries without ``metadata``.
     """
     tokens, heads, qdim = query.shape
-    if tokens == 0 or latent_kv.shape != (tokens, qdim) or value_up.shape[0] != heads:
+    keys = tokens if metadata is None else metadata.total_key_tokens
+    if tokens == 0 or latent_kv.shape != (keys, qdim) or value_up.shape[0] != heads:
         raise ValueError("Incompatible query, latent KV or value projection")
     value_dim, latent = value_up.shape[1:]
     if gate_logits.shape != (tokens, heads * value_dim) or latent > qdim:
         raise ValueError("Incompatible output gate or latent dimensions")
     if window < 1 or remote_topk < 1:
         raise ValueError("The cuDNN DSA core requires a positive window and a positive remote top-k")
-    if cu_seqlens.ndim == 1 and cu_seqlens.shape[0] > 2:
-        raise NotImplementedError(
-            "The cuDNN DSA core does not support a row that holds several documents; "
-            f"cu_seqlens must have two entries, got {cu_seqlens.shape[0]}"
-        )
-    metadata = prepare_cudnn_dsa_packed_metadata(cu_seqlens, tokens, max_seqlen=max_seqlen)
+    if metadata is None:
+        if cu_seqlens.ndim == 1 and cu_seqlens.shape[0] > 2:
+            raise NotImplementedError(
+                "The cuDNN DSA core does not support a row that holds several documents without the metadata "
+                f"of cudnn_dsa_layout; cu_seqlens must have two entries, got {cu_seqlens.shape[0]}"
+            )
+        metadata = prepare_cudnn_dsa_packed_metadata(cu_seqlens, tokens, max_seqlen=max_seqlen)
     remote_metadata = replace(metadata, causal_lengths=(metadata.causal_lengths - window).clamp_min(0))
     remote = cudnn_indexer_topk(
         index_q.detach(),
@@ -609,20 +649,50 @@ def cudnn_dsa_core(
         metadata.query_valid,
         window=window,
     )
-    indices, counts = plan_sparse_indices(union, tokens)
+    indices, counts = plan_sparse_indices(union, keys)
     attended = cudnn_sparse_attention(
         query,
         latent_kv[:, None],
         indices[:, None],
         softmax_scale,
         topk_length=counts,
-        all_rows_nonempty=True,
+        all_rows_nonempty=metadata.all_rows_nonempty,
+        valid_row_indices=metadata.valid_row_indices,
         attn_sink=sink,
     )
     with torch.autocast(device_type=query.device.type, enabled=False):
         values = torch.einsum("qhc,hvc->qhv", attended[..., :latent].float(), value_up.float())
         mixed = virtual_head_mix(values.to(query.dtype), vha_u, vha_v)
         return mixed.reshape(tokens, heads * value_dim) * gate_logits.sigmoid().to(query.dtype)
+
+
+def cudnn_dsa_layout(
+    document_ids: torch.Tensor, first_query: int, queries: int
+) -> tuple[torch.Tensor, CudnnDsaPackedMetadata]:
+    """Describe the documents of a packed row, and the queries in it, for the cuDNN DSA core.
+
+    Args:
+        document_ids: Integer tensor of shape [row] on a CUDA device with the document of every token of the row.
+            The ids increase along the row, a negative id marks padding, the row starts with a document, and the
+            padding of a document follows its tokens.
+        first_query: Row offset of the first query.
+        queries: Number of queries: the whole row, or one context-parallel shard of it.
+
+    Returns:
+        The int32 cumulative document lengths of shape [documents + 1], and the metadata of the queries.
+    """
+    row = document_ids.numel()
+    real = document_ids >= 0
+    starts = torch.nonzero(real & (document_ids != F.pad(document_ids[:-1], (1, 0), value=-1))).flatten()
+    lengths = torch.bincount(document_ids[real])
+    cu_seqlens = F.pad(lengths[lengths > 0].cumsum(0), (1, 0)).to(torch.int32)
+    spans = torch.cat((starts, starts.new_tensor([row]))).to(torch.int32)
+    query_indices = None
+    if queries != row:
+        query_indices = torch.arange(first_query, first_query + queries, device=document_ids.device)
+    return cu_seqlens, prepare_cudnn_dsa_packed_metadata(
+        cu_seqlens, row, query_indices=query_indices, cu_seqlens_padded=spans
+    )
 
 
 class Ernie5_5DSAFP32Parameters(nn.Module):
@@ -659,6 +729,8 @@ class Ernie5_5DSAFP32Parameters(nn.Module):
         window: int,
         remote_topk: int,
         softmax_scale: float,
+        key_document_ids: torch.Tensor | None = None,
+        first_query: int = 0,
     ) -> torch.Tensor:
         """Run ``latent_mqa_core`` with the parameters of this module.
 
@@ -669,13 +741,15 @@ class Ernie5_5DSAFP32Parameters(nn.Module):
         Args:
             query: Tensor of shape [batch, sequence, heads, latent + rope].
             latent_kv: Tensor of shape [batch, sequence, latent + rope] shared by all heads.
-            scores: Finite index scores of shape [batch, sequence, sequence], indexed [batch, query, key].
+            scores: Finite index scores of shape [batch, sequence, keys], indexed [batch, query, key].
             document_ids: Integer tensor of shape [batch, sequence]; negative ids are padding.
             value_up: Value up-projection of shape [heads, value_dim, latent].
             gate_logits: Tensor of shape [batch, sequence, heads * value_dim].
             window: Positive number of local causal keys per query.
             remote_topk: Non-negative number of remote keys per query.
             softmax_scale: Factor applied to the query-key products.
+            key_document_ids: Optional integer tensor of shape [batch, keys]; see ``select_window_and_remote``.
+            first_query: Index of the first query among the keys.
 
         Returns:
             Core output of shape [batch, sequence, heads * value_dim] in the dtype of ``query``.
@@ -698,6 +772,8 @@ class Ernie5_5DSAFP32Parameters(nn.Module):
             window=window,
             remote_topk=remote_topk,
             softmax_scale=softmax_scale,
+            key_document_ids=key_document_ids,
+            first_query=first_query,
         )
 
 
@@ -722,6 +798,7 @@ class Ernie5_5DSASparseFP32Parameters(Ernie5_5DSAFP32Parameters):
         window: int,
         remote_topk: int,
         softmax_scale: float,
+        metadata: CudnnDsaPackedMetadata | None = None,
     ) -> torch.Tensor:
         """Run ``cudnn_dsa_core`` with the parameters of this module.
 
@@ -736,12 +813,12 @@ class Ernie5_5DSASparseFP32Parameters(Ernie5_5DSAFP32Parameters):
             index_weights: Indexer head weights of shape [tokens, index_heads].
             value_up: Value up-projection of shape [heads, value_dim, latent].
             gate_logits: Tensor of shape [tokens, heads * value_dim].
-            cu_seqlens: Int32 tensor ``[0, tokens]`` of shape [2]: the cumulative document lengths of a row that
-                holds one document.
-            max_seqlen: Length of the document, equal to ``tokens``.
+            cu_seqlens: Int32 cumulative document lengths of the row; see ``cudnn_dsa_core``.
+            max_seqlen: Length of the document, equal to ``tokens``. Not read with ``metadata``.
             window: Positive number of local causal keys per query.
             remote_topk: Positive number of remote keys the indexer selects per query.
             softmax_scale: Factor applied to the query-key products.
+            metadata: Layout of a packed row and of the queries in it, as ``cudnn_dsa_layout`` returns it.
 
         Returns:
             Core output of shape [tokens, heads * value_dim] in the dtype of ``query``.
@@ -767,6 +844,7 @@ class Ernie5_5DSASparseFP32Parameters(Ernie5_5DSAFP32Parameters):
             window=window,
             remote_topk=remote_topk,
             softmax_scale=softmax_scale,
+            metadata=metadata,
         )
 
 
@@ -780,9 +858,9 @@ class Ernie5_5DSAAttention(nn.Module):
     The attention backend selects one of two paths that share all parameters:
 
     - ``backend.attn == "cudnn"``: cuDNN top-k selection and sparse attention for
-      one unpadded row that holds one document; a row with several documents is
-      rejected. The forward runs with autocast disabled, and the kernels require
-      BF16 inputs and the released latent and indexer dimensions.
+      one row: an unpadded document, or a packed row with the metadata of
+      ``cudnn_dsa_layout``. The forward runs with autocast disabled, and the
+      kernels require BF16 inputs and the released latent and indexer dimensions.
     - ``backend.attn`` in ``("eager", "torch", "sdpa")``, or no backend: eager
       PyTorch attention over a dense [sequence, sequence] mask, limited to
       ``max_eager_sequence`` tokens. The three names select this same path; no
@@ -790,7 +868,9 @@ class Ernie5_5DSAAttention(nn.Module):
 
     Every other value of ``backend.attn`` is rejected.
 
-    Neither path supports context parallelism or a KV cache.
+    Under context parallelism a rank holds one contiguous shard of the row as
+    queries and gathers the latent and indexer keys of all ranks. Neither path
+    supports a KV cache.
 
     The indexer only selects keys. Its projections receive no gradient from the
     attention output, and this layer computes no indexer loss, so the indexer is
@@ -886,6 +966,7 @@ class Ernie5_5DSAAttention(nn.Module):
         self.fp32_params = holder(num_heads, vha_rank)
         self.gate_proj = nn.Linear(q_rank, num_heads * value_dim, bias=False, dtype=dtype)
         self.o_proj = nn.Linear(num_heads * value_dim, hidden_size, bias=False, dtype=dtype)
+        self.cp_group: dist.ProcessGroup | None = None
         nn.init.normal_(self.k_b_proj, std=0.02)
         nn.init.normal_(self.v_b_proj, std=0.02)
         nn.init.normal_(self.vha_postmix_U, std=0.02)
@@ -904,6 +985,14 @@ class Ernie5_5DSAAttention(nn.Module):
     def vha_postmix_V(self) -> torch.Tensor:
         """FP32 virtual-head output factor of shape [heads, vha_rank], owned by ``fp32_params``."""
         return self.fp32_params.vha_postmix_V
+
+    def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
+        """Record the context-parallel group whose ranks hold consecutive shards of a row.
+
+        Args:
+            cp_mesh: Context-parallel device mesh offered by the parallelizer.
+        """
+        self.cp_group = cp_mesh.get_group()
 
     def init_weights(self, init_std: float = 0.02) -> None:
         """Initialize all parameters, including after meta-device materialization.
@@ -975,23 +1064,30 @@ class Ernie5_5DSAAttention(nn.Module):
         document_ids: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
+        metadata: CudnnDsaPackedMetadata | None = None,
     ) -> tuple[torch.Tensor, None]:
         """Return the attention output.
 
         The eager path takes ``document_ids``; the cuDNN path takes ``cu_seqlens``
-        and ``max_seqlen``. Passing the metadata of the other path raises. On the
-        cuDNN path a row that holds several documents is rejected here, before the
-        projections run; ``cudnn_dsa_core`` describes the remaining checks of
-        ``cu_seqlens`` and ``max_seqlen``.
+        and ``max_seqlen``, and ``metadata`` for a packed row. Passing the metadata
+        of the other path raises. On the cuDNN path a row that holds several
+        documents without ``metadata`` is rejected here, before the projections run;
+        ``cudnn_dsa_core`` describes the remaining checks of ``cu_seqlens`` and
+        ``max_seqlen``.
 
         Args:
-            hidden: Tensor of shape [batch, sequence, hidden]. The cuDNN path requires batch 1.
+            hidden: Tensor of shape [batch, sequence, hidden]. The cuDNN path requires batch 1. Under
+                context parallelism, ``sequence`` is this rank's shard of the row.
             position_ids: Integer tensor of shape [batch, sequence]; positions restart for each document.
             document_ids: Eager path only. Integer tensor of shape [batch, sequence] that
                 identifies each contiguous document of a row; negative ids are padding.
-            cu_seqlens: cuDNN path only. Int32 tensor ``[0, sequence]`` of shape [2]: the
-                cumulative document lengths of an unpadded row that holds one document.
-            max_seqlen: cuDNN path only. Length of the document, equal to ``sequence``.
+            cu_seqlens: cuDNN path only. Int32 cumulative document lengths of the row: ``[0, sequence]``
+                of shape [2] for an unpadded row that holds one document, and of shape
+                [documents + 1] with ``metadata``.
+            max_seqlen: cuDNN path only. Length of the document, equal to ``sequence``. Not read with
+                ``metadata``.
+            metadata: cuDNN path only. Layout of a packed row and of the queries in it, as
+                ``cudnn_dsa_layout`` returns it.
 
         Returns:
             Output of shape [batch, sequence, hidden], and None in the place where
@@ -1000,22 +1096,21 @@ class Ernie5_5DSAAttention(nn.Module):
         Raises:
             ValueError: If shapes disagree, the metadata does not match the path, or
                 the eager path receives no token or more than ``max_eager_sequence`` tokens.
-            NotImplementedError: If ``cu_seqlens`` has more than two entries, that is,
-                the row holds several documents.
+            NotImplementedError: If ``cu_seqlens`` has more than two entries without ``metadata``.
         """
         if self.uses_cudnn:
             if cu_seqlens is None or max_seqlen is None or document_ids is not None:
                 raise ValueError("The cuDNN DSA path requires cu_seqlens and max_seqlen and no document_ids")
-            if cu_seqlens.ndim == 1 and cu_seqlens.shape[0] > 2:
+            if metadata is None and cu_seqlens.ndim == 1 and cu_seqlens.shape[0] > 2:
                 raise NotImplementedError(
-                    "The cuDNN DSA path does not support a row that holds several documents; "
-                    f"cu_seqlens must have two entries, got {cu_seqlens.shape[0]}"
+                    "The cuDNN DSA path does not support a row that holds several documents without the metadata "
+                    f"of cudnn_dsa_layout; cu_seqlens must have two entries, got {cu_seqlens.shape[0]}"
                 )
             # The cuDNN kernels require BF16 inputs: keep the tested operation dtypes under an outer autocast.
             with torch.autocast(device_type=hidden.device.type, enabled=False):
-                output = self._forward_cudnn(hidden, position_ids, cu_seqlens, max_seqlen=max_seqlen)
+                output = self._forward_cudnn(hidden, position_ids, cu_seqlens, max_seqlen=max_seqlen, metadata=metadata)
             return output, None
-        if document_ids is None or cu_seqlens is not None or max_seqlen is not None:
+        if document_ids is None or cu_seqlens is not None or max_seqlen is not None or metadata is not None:
             raise ValueError("The eager DSA path requires document_ids and no cu_seqlens or max_seqlen")
         return self._forward_eager(hidden, document_ids, position_ids), None
 
@@ -1046,10 +1141,10 @@ class Ernie5_5DSAAttention(nn.Module):
         if sequence < 1 or sequence > self.max_eager_sequence:
             raise ValueError("Sequence length must be between 1 and max_eager_sequence on the eager DSA path")
         q_latent, query, latent_kv, index_q, index_k, index_weights = self._project(hidden, position_ids)
-        scores = ernie5_5_index_scores(index_q, index_k, index_weights)
+        scores = ernie5_5_index_scores(index_q, gather_sequence(index_k, self.cp_group), index_weights)
         core = self.fp32_params(
             query,
-            latent_kv,
+            gather_sequence(latent_kv, self.cp_group),
             scores,
             document_ids,
             self.v_b_proj.reshape(self.num_heads, self.value_dim, self.kv_rank),
@@ -1057,6 +1152,8 @@ class Ernie5_5DSAAttention(nn.Module):
             window=self.window,
             remote_topk=self.remote_topk,
             softmax_scale=self.softmax_scale,
+            key_document_ids=gather_sequence(document_ids, self.cp_group),
+            first_query=shard_start(self.cp_group, sequence),
         )
         return self.o_proj(core)
 
@@ -1067,14 +1164,17 @@ class Ernie5_5DSAAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         *,
         max_seqlen: int,
+        metadata: CudnnDsaPackedMetadata | None,
     ) -> torch.Tensor:
-        """Run the cuDNN path on one unpadded row that holds one document.
+        """Run the cuDNN path on one row, or on this rank's shard of it.
 
         Args:
-            hidden: Tensor of shape [1, sequence, hidden]: one row without padding.
-            position_ids: Integer tensor of shape [1, sequence] with the position of each token in the document.
-            cu_seqlens: Int32 tensor ``[0, sequence]`` of shape [2]: the cumulative document lengths of the row.
-            max_seqlen: Length of the document, equal to ``sequence``.
+            hidden: Tensor of shape [1, sequence, hidden].
+            position_ids: Integer tensor of shape [1, sequence] with the position of each token in its document.
+            cu_seqlens: Int32 cumulative document lengths of the row; see ``cudnn_dsa_core``.
+            max_seqlen: Length of the document, equal to ``sequence``. Not read with ``metadata``.
+            metadata: Layout of a packed row and of the queries in it, or None for an unpadded row that holds one
+                document.
 
         Returns:
             Output of shape [1, sequence, hidden].
@@ -1087,9 +1187,9 @@ class Ernie5_5DSAAttention(nn.Module):
         q_latent, query, latent_kv, index_q, index_k, index_weights = self._project(hidden, position_ids)
         core = self.fp32_params(
             query[0],
-            latent_kv[0],
+            gather_sequence(latent_kv, self.cp_group)[0],
             index_q[0],
-            index_k[0],
+            gather_sequence(index_k, self.cp_group)[0],
             index_weights[0],
             self.v_b_proj.reshape(self.num_heads, self.value_dim, self.kv_rank),
             self.gate_proj(q_latent)[0],
@@ -1098,5 +1198,6 @@ class Ernie5_5DSAAttention(nn.Module):
             window=self.window,
             remote_topk=self.remote_topk,
             softmax_scale=self.softmax_scale,
+            metadata=metadata,
         )
         return self.o_proj(core[None])
