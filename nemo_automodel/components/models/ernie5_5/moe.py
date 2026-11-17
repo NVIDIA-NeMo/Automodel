@@ -23,10 +23,23 @@
 * ``Ernie5_5MoE``: the MoE block: FP32 latent projections around the routed experts, a latent RMSNorm and the shared
   expert.
 
-Supported execution: the torch expert, dispatcher and linear backends only. In a single process there is no
-placement requirement. With more than one process the expert weights must be ``DTensor`` objects on an ``("ep",)``
-mesh with placements ``(Shard(0),)`` or on an ``("ep_shard", "ep")`` mesh with placements ``(Shard(1), Shard(0))``;
-``Ernie5_5MoE.forward`` raises ``RuntimeError`` for any other layout and for context parallelism.
+Supported execution: the torch linear backend with one of two expert and dispatcher pairs.
+
+* ``experts="torch"`` with ``dispatcher="torch"``: the routed experts run in ``GroupedExperts``, which gathers the
+  tokens of the expert-parallel group, loops over the local experts and sums the selected expert outputs of a
+  token in FP32.
+* ``experts="torch_mm"`` with ``dispatcher="hybridep"``: with more than one process the routed experts run in
+  ``GroupedExpertsDeepEP``, which exchanges the tokens through HybridEP and runs two grouped GEMMs. The HybridEP
+  combine also sums the selected expert outputs of a token in FP32, but it rounds the partial sum of every
+  expert-parallel rank to the activation dtype before it adds the partial sums. The result differs from the
+  first pair by BF16 rounding and depends on ``ep_size``. Only BF16 activations are supported there. In a single
+  process the shared ``MoE`` builds ``GroupedExperts`` on its grouped-GEMM path.
+
+The two pairs store the expert weights in the same parameters with the same placements. In a single process there
+is no placement requirement. With more than one process the expert weights must be ``DTensor`` objects on an
+``("ep",)`` mesh with placements ``(Shard(0),)`` or on an ``("ep_shard", "ep")`` mesh with placements
+``(Shard(1), Shard(0))``; ``Ernie5_5MoE.forward`` raises ``RuntimeError`` for any other layout and for context
+parallelism.
 
 Provenance: the expert-selection and routing-weight contracts of ``route`` are those of the ERNIE 5.5 implementation
 in Megatron-Bridge (Apache License 2.0) at revision ``a38833622b88969564fe8bfa053c5e4e4989c6cd``:
@@ -45,8 +58,11 @@ from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ernie5_5.layers import ernie_situ
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MLP, Gate, MoE
+
+# The supported pairs of ``BackendConfig.experts`` and ``BackendConfig.dispatcher``.
+_EXPERT_BACKENDS = (("torch", "torch"), ("torch_mm", "hybridep"))
 
 
 def route(
@@ -322,8 +338,10 @@ def _make_callable_projection(projection: nn.Linear) -> _FP32LatentLinear:
 class Ernie5_5MoE(MoE):
     """ERNIE dual-router latent experts and shared SiTU expert.
 
-    Distributed execution is restricted to the torch expert-parallel layouts that ``forward`` checks. Context
-    parallelism is not supported.
+    The routed experts are the shared ``GroupedExperts`` (torch dispatcher, or one process) or the shared
+    ``GroupedExpertsDeepEP`` (HybridEP dispatcher in a job of several processes), with SiTU installed as their
+    activation. Distributed execution is restricted to the expert-parallel layouts that ``forward`` checks, and
+    with the HybridEP dispatcher to BF16 activations. Context parallelism is not supported.
     """
 
     def __init__(
@@ -335,23 +353,28 @@ class Ernie5_5MoE(MoE):
         linear_beta: float | None = 25.0,
         norm_eps: float = 1e-6,
     ) -> None:
-        """Build the latent MoE on the torch backends.
+        """Build the latent MoE on the torch linear backend with a supported expert and dispatcher pair.
 
         Args:
             config: MoE configuration with a latent width, exactly one shared expert, routing weights applied
                 before the down projection, and bias-free, ungated experts.
-            backend: Backend configuration. The dispatcher, expert and linear backends must be ``"torch"``, with
-                the fake balanced gate and the shared-expert overlap disabled.
+            backend: Backend configuration. ``experts`` and ``dispatcher`` must be ``"torch"`` and ``"torch"``, or
+                ``"torch_mm"`` and ``"hybridep"``; ``linear`` must be ``"torch"``, with the fake balanced gate and
+                the shared-expert overlap disabled.
             beta: Gate-clamp parameter of SiTU.
             linear_beta: Optional up-projection clamp parameter of SiTU.
             norm_eps: Positive epsilon of the latent RMSNorm.
 
         Raises:
             ValueError: If ``config``, ``backend`` or ``norm_eps`` does not meet these requirements.
-            TypeError: If the parent class did not build ``GroupedExperts`` or torch linear projections.
+            TypeError: If the parent class built neither ``GroupedExperts`` nor ``GroupedExpertsDeepEP``, or no
+                torch linear projections.
         """
-        if backend.dispatcher != "torch" or backend.experts != "torch":
-            raise ValueError("ERNIE 5.5 MoE requires the torch expert and dispatcher backends")
+        if (backend.experts, backend.dispatcher) not in _EXPERT_BACKENDS:
+            raise ValueError(
+                "ERNIE 5.5 MoE supports experts='torch' with dispatcher='torch' and experts='torch_mm' with "
+                f"dispatcher='hybridep'; got experts={backend.experts!r} with dispatcher={backend.dispatcher!r}"
+            )
         if backend.linear != "torch" or backend.fake_balanced_gate or backend.shared_expert_overlap:
             raise ValueError(
                 "ERNIE 5.5 MoE requires the torch linear backend, no fake balanced gate and no shared-expert overlap"
@@ -364,10 +387,19 @@ class Ernie5_5MoE(MoE):
             raise ValueError("norm_eps must be positive")
         super().__init__(config, backend)
         self.shared_experts = Ernie5_5SharedExpert(self.shared_experts, beta=beta, linear_beta=linear_beta)
-        if not isinstance(self.experts, GroupedExperts):
-            raise TypeError("Expected unsharded AutoModel GroupedExperts")
+        # The shared constructor builds GroupedExpertsDeepEP for the HybridEP dispatcher in a job of several
+        # processes and GroupedExperts otherwise. The two classes take the same activation callable under
+        # different attribute names and share no method to set it, so the class is looked at here, once;
+        # ``forward`` reads the recorded result.
+        activation = partial(_routed_situ, beta=beta, linear_beta=linear_beta)
+        self._dispatches_through_hybridep = isinstance(self.experts, GroupedExpertsDeepEP)
+        if self._dispatches_through_hybridep:
+            self.experts.expert_activation = activation
+        elif isinstance(self.experts, GroupedExperts):
+            self.experts.expert_activation_grouped = activation
+        else:
+            raise TypeError("Expected unsharded AutoModel GroupedExperts or GroupedExpertsDeepEP")
         self.gate = Ernie5_5Gate(config)
-        self.experts.expert_activation_grouped = partial(_routed_situ, beta=beta, linear_beta=linear_beta)
         self.fc1_latent_proj.to(dtype=torch.float32)
         self.fc2_latent_proj.to(dtype=torch.float32)
         self.fc1_latent_proj = _make_callable_projection(self.fc1_latent_proj)
@@ -395,14 +427,22 @@ class Ernie5_5MoE(MoE):
             RuntimeError: If a context-parallel mesh is passed or set on the module; if, with more than one
                 process, the expert weights are not ``DTensor`` objects with the same mesh and placements in a
                 supported layout (mesh ``("ep",)`` with placements ``(Shard(0),)``, or mesh ``("ep_shard", "ep")``
-                with placements ``(Shard(1), Shard(0))``, with more than one expert-parallel rank); or if a latent
-                projection weight is not FP32.
+                with placements ``(Shard(1), Shard(0))``, with more than one expert-parallel rank); if, with more
+                than one process, the HybridEP dispatcher was requested but the module was built for one process;
+                if a latent projection weight is not FP32; or if the routed experts dispatch through HybridEP and
+                the latent activations are not BF16.
             ValueError: If ``hidden`` is empty, has fewer than two dimensions or does not end in the configured
                 hidden size, or ``padding_mask`` does not have the shape of ``hidden`` without its final axis.
         """
         if cp_mesh is not None or self.cp_mesh is not None:
             raise RuntimeError("ERNIE 5.5 MoE does not support context parallelism")
         if get_world_size_safe() != 1:
+            if self.backend.dispatcher == "hybridep" and not self._dispatches_through_hybridep:
+                raise RuntimeError(
+                    "The HybridEP dispatcher was requested, but this ERNIE MoE was built for one process and "
+                    "holds experts without a token dispatcher: build the model after the distributed job is "
+                    "initialized"
+                )
             gate_up, down = self.experts.gate_and_up_projs, self.experts.down_projs
             if not isinstance(gate_up, DTensor) or not isinstance(down, DTensor):
                 raise RuntimeError("Distributed ERNIE MoE requires sharded expert DTensors")
@@ -429,6 +469,15 @@ class Ernie5_5MoE(MoE):
         )
         weights, indices, _ = self.gate(x, token_mask, None)
         latent = self.fc1_latent_proj(x)
+        if self._dispatches_through_hybridep and latent.dtype != torch.bfloat16:
+            # HybridEP exchanges 16-bit activations only. Its dispatch copies the tensor as 16-bit elements without
+            # a check, and its combine fails a C++ assertion for another width, which aborts the process, so the
+            # dtype is checked before the dispatch.
+            raise RuntimeError(
+                "ERNIE 5.5 with the HybridEP dispatcher requires BF16 activations at the routed experts, got "
+                f"{latent.dtype}: use model.dtype bfloat16 with an FSDP param_dtype of null or bfloat16, or the "
+                "torch expert and dispatcher backends"
+            )
         routed = self.experts(latent, token_mask, weights, indices)
         routed = self.latent_norm(routed)
         routed = self.fc2_latent_proj(routed)
