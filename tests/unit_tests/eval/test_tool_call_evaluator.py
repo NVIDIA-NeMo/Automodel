@@ -309,7 +309,7 @@ def test_sample_shard_property_round_trips_and_drives_sharding(monkeypatch):
     assert evaluator._iter_my_samples() == [{"i": 1}, {"i": 5}]
 
 
-@pytest.mark.cpu
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("output_kind", ["model_output", "tensor", "tuple", "list"])
 def test_manual_greedy_matches_real_transformers_model(output_kind):
     from transformers import GPT2Config, GPT2LMHeadModel
@@ -354,7 +354,7 @@ def test_manual_greedy_matches_real_transformers_model(output_kind):
     assert evaluator._greedy_generate_manual(forward, input_ids, attention_mask, 0, None) is input_ids
 
 
-@pytest.mark.cpu
+@pytest.mark.cpu_only
 def test_render_prompt_with_real_transformers_tokenizer():
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
