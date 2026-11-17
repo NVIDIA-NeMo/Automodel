@@ -5,16 +5,20 @@
 # It requires at least 8 GPUs (e.g., 8x A100 80GB or 8x H100 80GB) to run,
 # but you can potentially run it on less GPUs by reducing the local batch size.
 # ------------------------------------------------------------------------------------------------
+# Runtime tuning is migrated from examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml, so this
+# recipe uses the PyTorch attention, dispatcher and expert backends. For TE and DeepEP, use
+# examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 4
+  global_batch_size: 256  #PR4637: 1024
+  local_batch_size: 4  #PR4637: 64
   ckpt_every_steps: 100
   val_every_steps: 50
   num_epochs: 2
   max_steps: 1000
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -31,12 +35,13 @@ model:
   trust_remote_code: true
   torch_dtype: bfloat16
   backend:
+    #PR4637: removed model.backend.enable_fsdp_optimizations: true
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: sdpa  #PR4637: te
     linear: torch
-    rms_norm: torch
-    experts: torch
-    dispatcher: torch
+    rms_norm: torch  #PR4637: torch_fp32
+    experts: torch  #PR4637: torch_mm
+    dispatcher: torch  #PR4637: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 checkpoint:
@@ -69,32 +74,32 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
-  pad_to_max_length: false
+  padding: false
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
   num_workers: 4
 
   drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
 
-  pad_to_max_length: false
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   num_workers: 4
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   lr: 1.0e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
@@ -105,16 +110,16 @@ packed_sequence:
   packing_strategy: neat
 ci:
   cluster_tag: h100
-  recipe_owner: hemildesai
-  time: "01:00:00"
+  recipe_owner: akoumpa  #PR4637: hemildesai
+  time: "01:00:00"  #PR4637: "00:25:00"
   known_issue_id: AM-648
   allow_failure: true
   checkpoint_robustness:
     tokenizer_name: Qwen/Qwen3-30B-A3B
     trust_remote_code: true
     hf_device_map_auto: true
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
   perf_testing:
     fake_balanced_gate: true
     schedule: nightly

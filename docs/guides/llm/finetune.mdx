@@ -24,7 +24,7 @@ NeMo AutoModel supports two fine-tuning modes:
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
-The following table outlines each step in the fine-tuning workflow for SFT and PEFT modes.
+The following table outlines each step in the fine-tuning workflow for SFT and PEFT modes:
 
 | Step | Section | SFT | PEFT |
 |------|---------|-----|------|
@@ -33,7 +33,7 @@ The following table outlines each step in the fine-tuning workflow for SFT and P
 | **3. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Same command for both modes | Same command for both modes |
 | **4. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
 | **5. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
-| **6. Publish** | [Publish to HF Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
+| **6. Publish** | [Publish to the Hugging Face Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
 | **7. Deploy** | [Deploy with vLLM](#deploy-with-vllm) | `vllm.LLM(model=...)` | Base model + native vLLM `LoRARequest` |
 
 ## Install NeMo AutoModel
@@ -62,7 +62,7 @@ For the full set of installation methods, see the [Installation Guide](/get-star
 
 Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) config file. For the `automodel` CLI, the file must name a **recipe**. The fine-tuning runtime also requires `model`, `dataset`, `dataloader`, `loss_fn`, `optimizer`, and `distributed` sections. If you configure a `validation_dataset`, also configure a `validation_dataloader`. The `step_scheduler` section is optional because it has typed default values, but you should set its global and local batch sizes explicitly for a predictable effective batch. Add `peft` only for LoRA. For the complete copy-pastable file, see [Full Config YAML](#full-config-yaml).
 
-Under the hood, both SFT and PEFT are executed by a **recipe**, which is a self-contained Python class that integrates model loading, dataset preparation, training, checkpointing, and logging. The fine-tuning recipe is [`TrainFinetuneRecipeForNextTokenPrediction`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). The config file tells the recipe *what* to build; the recipe decides *how* to build it.
+Both SFT and PEFT run through a **recipe**, which is a self-contained Python class that integrates model loading, dataset preparation, training, checkpointing, and logging. The fine-tuning recipe is [`TrainFinetuneRecipeForNextTokenPrediction`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). The config file tells the recipe *what* to build; the recipe decides *how* to build it.
 
 <Accordion title="How the Config System Works">
 NeMo AutoModel configs use a convention borrowed from [Hydra](https://hydra.cc/): the special `_target_` key tells the framework *which* Python class or function to call, and **every other key** in the same YAML block is passed as a keyword argument to that call. For example:
@@ -489,7 +489,7 @@ PEFT adapters must be loaded on top of the base model. Because the base NeMo Aut
 uv pip install "peft>=0.19.1"
 ```
 
-LoRA adapters for models with fused MoE expert weights (for example, Qwen3-MoE, MiniMax-M2, Nemotron 3) are exported in the ParamWrapper layout that `peft` has used since 0.19.1, when `peft` changed it (huggingface/peft#3165); that is why the step above installs `peft>=0.19.1`. If such an adapter has to be loaded by a consumer pinned to an older `peft` version, set `checkpoint.legacy_paramwrapper_layout: true` in the training config to export the pre-0.19.1 layout instead. An adapter exported that way does not load with `peft` 0.19.1 or newer.
+LoRA adapters for models with fused MoE expert weights (for example, Qwen3-MoE, MiniMax-M2, and Nemotron 3) are exported in the ParamWrapper layout that `peft` has used since 0.19.1, when `peft` changed it (huggingface/peft#3165); that is why the step above installs `peft>=0.19.1`. If such an adapter has to be loaded by a consumer pinned to an older `peft` version, set `checkpoint.legacy_paramwrapper_layout: true` in the training config to export the pre-0.19.1 layout instead. An adapter exported that way does not load with `peft` 0.19.1 or newer.
 
 ```python
 import torch
@@ -686,7 +686,7 @@ This section documents all available config fields for the fine-tuning recipe. F
 
 ### Switch Between SFT and PEFT
 
-The `peft:` section controls which mode runs, as described in the following table.
+The `peft:` section controls which mode runs, as described in the following table:
 
 | Mode | What to Do in the YAML |
 |------|----------------------|
@@ -880,7 +880,7 @@ optimizer:
 
 ### Config Field Reference
 
-The following table describes the config fields for the fine-tuning recipe.
+The following table describes the config fields for the fine-tuning recipe:
 
 | Section | Required? | What to Change |
 |---------|-----------|----------------|
@@ -952,9 +952,9 @@ param_group_overrides:
     wd_mult: 0.0
 ```
 
-The optional `adamw_param_patterns` list matches canonical parameter names with Python `re.search`; matching any pattern selects auxiliary AdamW, even when `scalar_opt` is `lion`. It defaults to an empty list. The example selects modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr` (or `lr` if unset), `scalar_betas` and `scalar_eps`. The independent LR/WD rule then gives those parameters half the auxiliary learning rate and zero weight decay. Existing embedding/head LR/WD settings are preserved before overrides, frozen parameters are excluded, and a pattern matching no trainable parameters is skipped with a warning. `adamw_param_patterns` works without `param_group_overrides`, and ordinary LR/WD overrides do not change the selected optimizer algorithm.
+The optional `adamw_param_patterns` list matches canonical parameter names with Python `re.search`; matching any pattern selects auxiliary AdamW, even when `scalar_opt` is `lion`. It defaults to an empty list. The example selects modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr` (or `lr` if unset), `scalar_betas`, and `scalar_eps`. The independent LR/WD rule then gives those parameters half the auxiliary learning rate and zero weight decay. Existing embedding/head LR/WD settings are preserved before overrides, frozen parameters are excluded, and a pattern matching no trainable parameters is skipped with a warning. `adamw_param_patterns` works without `param_group_overrides`, and ordinary LR/WD overrides do not change the selected optimizer algorithm.
 
-Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. `MuonConfig` keeps grouped expert tensors on the scalar optimizer.
+Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. `MuonConfig` also trains grouped expert tensors as batches of matrices (unless `flatten: true`, which keeps them on the scalar optimizer). Because `dion.Muon`'s `spectral_norm` LR adjustment assumes `[output, input]`, `MuonConfig` gives each transposed expert shape its own param group with `lr` scaled by `sqrt(output / input)` and `weight_decay` divided by the same factor, so the applied decay is unchanged; `rms_norm` and `null` do not depend on orientation and need no extra groups. `dion.Muon` gathers sharded matrix axes only over its data-parallel mesh, so `MuonConfig` raises an error for grouped experts when `ep_size` is greater than 1 but smaller than the data-parallel size; use `ep_size` equal to the data-parallel size, `ep_size: 1`, or `MuownConfig`.
 
 Muown selects communication groups from each parameter's DTensor placements, allowing dense FSDP weights and EP weights with a different FSDP mesh in one optimizer. A matrix can have one evenly sharded matrix axis plus sharded expert or batch axes. Sharding both matrix axes is unsupported. EP-local complete matrices are updated locally. Magnitude and direction states use the normal optimizer checkpoint path; FP32 master parameters are recommended.
 

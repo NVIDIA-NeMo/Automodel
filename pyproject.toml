@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 83.0.0"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -72,6 +72,7 @@ classifiers = [
     'Operating System :: OS Independent',
 ]
 dependencies = [
+    "zephon>=0.2.1",
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]>=1.13.0",
@@ -112,7 +113,7 @@ diffusion_kernels = [
 cuda = [
     "causal-conv1d",
     "mamba-ssm",
-    "nvidia-cudnn-frontend[cutedsl]>=1.27.0",
+    "nvidia-cudnn-frontend[cutedsl]>=1.30.0",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]>=2.19.0",
@@ -208,7 +209,7 @@ mlflow = [
 mlflow-full = [
     # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
     # Use when you need the MLflow server or UI.
-    "mlflow>=3.16.1",
+    "mlflow>=3.17.2",
 ]
 wandb = ["wandb>=0.30.0"]
 trackio = ["trackio[gpu]>=0.40.0"]  # [gpu] adds nvidia-ml-py for automatic GPU metrics
@@ -249,7 +250,7 @@ automodel = "nemo_automodel.cli.app:main"
 am = "nemo_automodel.cli.app:main"
 
 [dependency-groups]
-build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
+build = ["setuptools>=84.1.0", "torch<=2.10.0", "packaging", "psutil"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -319,34 +320,34 @@ constraint-dependencies = [
     "multidict>=6.9.1", # Address CVE-2026-104874
     "python-dotenv>=1.2.2", # Address CVE-2026-28684
     "requests>=2.33.0", # Address CVE-2026-25645
-    "virtualenv>=21.7.13", # Address activation, seed-wheel, and directory-creation CVEs
+    "virtualenv>=21.14.13", # Address activation, seed-wheel, and directory-creation CVEs
     "werkzeug>=3.1.9", # Address Windows safe_join security fixes through CVE-2026-102598
     "accelerate>=1.15.0", # Security floor requested by AUT-2490
     "click>=8.3.3", # Security floor requested by AUT-2490
     "anyio>=4.14.2", # Security floor requested by AUT-2465
-    "aiohttp>=3.14.3", # Address aiohttp security fixes through CVE-2026-69244
+    "aiohttp>=3.14.4", # Address aiohttp security fixes through CVE-2026-69244
     "cryptography>=50.0.0", # Security floor requested by AUT-2490
     "diffusers>=0.38.0",
     "fsspec>=2026.6.0", # Security floor requested by AUT-2490
-    "gitpython>=3.1.60",
+    "gitpython>=3.2.1",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.4.2", # Address CVE-2026-102991
-    "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
+    "msgpack>=1.2.3", # Address CVE GHSA-6v7p-g79w-8964
     "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
     # PyArrow 26 requires NumPy 2; retain this cap while the build uses NumPy 1.26.
     "pyarrow>=23.0.1,<26", # Address CVE GHSA-rgxp-2hwp-jwgg
-    "pyasn1>=0.6.4", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
+    "pyasn1>=0.6.5", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
     "ray>=2.56.0", # Address CVE-2026-57516
     "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes
-    "setuptools>=83.0.0", # Address CVE-2026-59890
+    "setuptools>=84.1.0", # Address CVE-2026-59890
     "soupsieve>=2.8.4", # Address GHSA-836r-79rf-4m37 and GHSA-2wc2-fm75-p42x
     "sqlparse>=0.6.0", # Security floor requested by AUT-2465
     "urllib3>=2.8.0", # Address CVE GHSA-gm62-xv2j-4w53
     "wandb>=0.30.0", # Address GO-2026-5970 in the golang.org/x/text bundled by wandb-core
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
     "fonttools>=4.60.2", # Address CVE-2025-66034
-    "mlflow>=3.16.1", # Security floor requested by AUT-2465
+    "mlflow>=3.17.2", # Security floor requested by AUT-2465
     "mlflow-skinny>=3.16.1", # Keep the tracking-only extra on the same security floor
     "thrift>=0.25.0", # Security floor for patched Apache Thrift releases
     "tornado>=6.5.5",
@@ -360,6 +361,12 @@ constraint-dependencies = [
     # bundled TVM and breaks the tilelang kernels (SIGABRT/instability on the GPU
     # paths). Upstream capped it to <=0.1.11 (tile-ai/tilelang#2373); mirror that.
     "apache-tvm-ffi<=0.1.11",
+    "brotli>=1.2.1",
+    "certifi>=2026.10.18",
+    "filelock>=4.2.1",
+    "graphql-core>=3.2.12",
+    "oauthlib>=4.0.1",
+    "opentelemetry-api>=1.45.1",
 ]
 override-dependencies = [
     # Override Trackio's Pillow<13 cap to enforce the security update.
@@ -675,101 +682,4 @@ forbidden_modules = [
 ]
 allow_indirect_imports = true
 
-# ty: type checking (https://github.com/astral-sh/ty)
-# Default: permissive. Strict checks are opt-in per-file via overrides below.
-# Phase 1 modules: launcher, attention, config, optim, loggers
-# To advance to the next phase, move module paths from the "Phase 2" comment
-# into the active overrides list and fix any new errors.
-[tool.ty.environment]
-python-version = "3.11"
-
-[tool.ty.src]
-include = ["nemo_automodel", "examples"]
-exclude = [
-    "tests/**",
-    "nemo_automodel/components/checkpoint/_backports/**",
-]
-
-[tool.ty.analysis]
-# Optional dependencies that ty cannot resolve in this env but are legitimately
-# imported under try/except or feature gates. Keep this list narrow so that
-# accidental stale imports (e.g. after a package reorg) are still surfaced.
-allowed-unresolved-imports = [
-    "bitsandbytes",
-    "causal_conv1d",
-    "comet_ml",
-    "cut_cross_entropy",
-    "cut_cross_entropy.**",
-    "databricks",
-    "databricks.**",
-    "deep_ep",
-    "deep_ep.**",
-    "dion",
-    "dion.**",
-    "fast_hadamard_transform",
-    "ffpa_attn",
-    "ffpa_attn.**",
-    "fla.**",
-    "flash_attn",
-    "liger_kernel.**",
-    "lmdb",
-    "mamba_ssm.**",
-    "megatron.**",
-    "mlflow",
-    "mlflow.**",
-    "nemo_run",
-    "pynvml",
-    "sky",
-    "torch.distributed._mesh_layout",
-    "transformer_engine",
-    "transformer_engine.**",
-    "transformer_engine_torch",
-    "transformers.tokenization_utils",
-    "uccl",
-    "uccl.**",
-    "wandb",
-    "wandb.**",
-]
-
-[tool.ty.rules]
-unused-ignore-comment = "warn"
-possibly-missing-attribute = "ignore"
-
-# Phase 1: small, well-typed, leaf-dependency modules
-[[tool.ty.overrides]]
-include = [
-    "nemo_automodel/components/attention/**",
-    "nemo_automodel/components/_peft/**",
-    "nemo_automodel/components/config/**",
-    "nemo_automodel/components/launcher/**",
-    "nemo_automodel/components/loggers/**",
-    "nemo_automodel/components/optim/**",
-]
-
-[tool.ty.overrides.rules]
-# Stricter checking for Phase 1 modules
-possibly-unresolved-reference = "error"
-unresolved-import = "error"
-
-# Phase 2 (uncomment when ready):
-# [[tool.ty.overrides]]
-# include = [
-#     "nemo_automodel/components/loss/**",
-#     "nemo_automodel/components/quantization/**",
-# ]
-#
-# [tool.ty.overrides.rules]
-# possibly-unresolved-reference = "error"
-# unresolved-import = "error"
-
-# Phase 3 (uncomment when ready):
-# [[tool.ty.overrides]]
-# include = [
-#     "nemo_automodel/components/training/**",
-#     "nemo_automodel/components/distributed/**",
-#     "nemo_automodel/components/utils/**",
-# ]
-#
-# [tool.ty.overrides.rules]
-# possibly-unresolved-reference = "error"
-# unresolved-import = "error"
+# Type checking is configured in ty.toml; annotation policy in tools/annotation_policy.toml.

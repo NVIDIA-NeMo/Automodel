@@ -15,7 +15,7 @@
 """Serve an Automodel-trained EAGLE / EAGLE-3 drafter with SGLang.
 
 The EAGLE drafter checkpoints produced by the EAGLE recipes
-(``recipes/llm/train_eagle{1,2,3}.py``) are written by the consolidated
+(``recipes/speculative_decoding/train_eagle{1,2,3}.py``) are written by the consolidated
 checkpointer as an HF-style ``model/`` directory (``model.safetensors`` +
 ``config.json``) inside each ``epoch_<E>_step_<S>/`` checkpoint, alongside the
 EAGLE-3 vocab metadata (``eagle_meta.pt``). This script resolves that directory
@@ -212,7 +212,7 @@ def _find_eagle_meta(checkpoint_dir: Path) -> Path | None:
     The recipes write the metadata as ``eagle_meta.pt``; older hand-exported
     checkpoints used ``eagle3_meta.pt``. Prefer the current name and fall back to
     the legacy one, mirroring the recipe's own loader (``_load_extra_state`` in
-    ``recipes/llm/train_eagle3.py``).
+    ``recipes/speculative_decoding/train_eagle3.py``).
     """
     for name in ("eagle_meta.pt", "eagle3_meta.pt"):
         candidate = checkpoint_dir / name

@@ -54,7 +54,7 @@ All layers share the same sliding-window causal mask on the local KV path.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import torch
 import torch.distributed as dist
@@ -292,6 +292,14 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+class _GroupedProjectionContext(Protocol):
+    saved_tensors: tuple[torch.Tensor, ...]
+    needs_input_grad: tuple[bool, ...]
+    grad_dtypes: tuple[torch.dtype, torch.dtype]
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
+
+
 class _GroupedLinearTokenMajor(torch.autograd.Function):
     """Per-group matmul that reads and writes token-major activations in place.
 
@@ -305,7 +313,7 @@ class _GroupedLinearTokenMajor(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx: object, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    def forward(ctx: _GroupedProjectionContext, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Args: x ``[tokens, groups, d_in]`` (contiguous), w ``[groups, d_out, d_in]``. Returns ``[tokens, groups, d_out]``.
 
         ``torch.bmm(..., out=)`` is not an autocast op, so the cast autocast would apply to a plain ``bmm`` is done
@@ -326,7 +334,9 @@ class _GroupedLinearTokenMajor(torch.autograd.Function):
         return y
 
     @staticmethod
-    def backward(ctx: object, grad_y: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def backward(
+        ctx: _GroupedProjectionContext, grad_y: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Input gradient written token-major; weight gradient as a grouped ``bmm`` over the token axis. Both are
         computed in the forward's compute dtype and returned in the dtype of the tensor they belong to (what
         autograd does for a plain autocast ``bmm`` whose operands were cast)."""

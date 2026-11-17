@@ -2,10 +2,10 @@
 # the frozen target runs in its own server process and this run holds only the
 # draft. Both processes read this file. Start the server, then training:
 #
-#   CUDA_VISIBLE_DEVICES=0 python -m nemo_automodel.recipes.llm.serve_dspark_target \
+#   CUDA_VISIBLE_DEVICES=0 python -m nemo_automodel.recipes.speculative_decoding.serve_dspark_target \
 #     -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
 #
-#   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 -m nemo_automodel.recipes.llm.train_dspark \
+#   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 -m nemo_automodel.recipes.speculative_decoding.train_dspark \
 #     -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
 #
 # See "Target Backends" in examples/speculative/README.md for what the remote

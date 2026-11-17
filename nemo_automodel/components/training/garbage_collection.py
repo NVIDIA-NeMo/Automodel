@@ -22,9 +22,11 @@ logger = logging.getLogger(__name__)
 class GarbageCollection:
     """Utility for periodic manual garbage collection during training."""
 
+    gc_every_steps: int
+
     # Reference:
     # https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py#L46
-    def __init__(self, gc_every_steps: int = 1000):
+    def __init__(self, gc_every_steps: int = 1000) -> None:
         assert gc_every_steps > 0, "gc_every_steps must be a positive integer"
         self.gc_every_steps = gc_every_steps
         gc.disable()

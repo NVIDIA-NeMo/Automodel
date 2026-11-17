@@ -23,7 +23,7 @@ from typing import Literal
 from huggingface_hub import ResolvedRevision, hf_hub_download, snapshot_download, try_to_load_from_cache
 from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
 from torch import nn
-from transformers import PretrainedConfig, ProcessorMixin
+from transformers import PretrainedConfig, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
 from nemo_automodel.shared.tokenizer_serialization import restore_source_tokenizer_serialization_state
@@ -356,7 +356,7 @@ def _cache_hub_source_legal_assets(model_name_or_path: str, hf_kwargs: dict) -> 
         return None
 
 
-def _resolve_effective_text_config(model_part: nn.Module) -> object | None:
+def _resolve_effective_text_config(model_part: nn.Module) -> PretrainedConfig | None:
     """Return the Transformers-defined config for the text tower."""
     config = getattr(model_part, "config", None)
     if config is None:
@@ -659,7 +659,9 @@ class _CrossEncoderMetadataExporter:
     def __init__(self, model_part: nn.Module) -> None:
         self.model_part = model_part
 
-    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+    def validate(
+        self, *, tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None, original_model_path: str | None
+    ) -> None:
         """Validate the processor contract before any rank writes checkpoint assets."""
         if self.model_part._sentence_transformer_input_mode == "structured_multimodal":
             if not isinstance(tokenizer, ProcessorMixin) or not tokenizer.chat_template:
@@ -701,7 +703,12 @@ class _CrossEncoderMetadataExporter:
         _copy_source_legal_assets(original_model_path, hf_metadata_dir)
 
     def save(
-        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None, v4_compatible: bool
+        self,
+        *,
+        hf_metadata_dir: str,
+        tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None,
+        original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
         """Write custom model/processor code and CrossEncoder metadata for consolidation."""
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets

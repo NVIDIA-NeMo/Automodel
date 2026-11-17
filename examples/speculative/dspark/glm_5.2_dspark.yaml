@@ -27,7 +27,7 @@
 # --node-rank; node 0 is the rendezvous master. See README-glm-5.2.md.
 #   torchrun --nnodes=8 --node-rank=0 --nproc_per_node=8 \
 #     --master-addr=<NODE0_IP> --master-port=29500 \
-#     -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/glm_5.2_dspark.yaml
+#     -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/glm_5.2_dspark.yaml
 #
 # To first sanity-check the whole path on ONE node in minutes, run
 # tests/functional_tests/speculative/run_glm_5.2_smoke.sh. It derives a temporary

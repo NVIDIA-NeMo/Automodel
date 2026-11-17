@@ -46,7 +46,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _get_optional_hook(module: object, name: str) -> Callable | None:
+def _get_optional_hook(module: nn.Module, name: str) -> Callable | None:
     try:
         inspect.getattr_static(module, name)
     except AttributeError:

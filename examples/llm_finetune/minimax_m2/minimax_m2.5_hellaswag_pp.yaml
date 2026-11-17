@@ -28,8 +28,10 @@ step_scheduler:
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 2
+  gc_every_steps: 10
 
 distributed:
+  #PR4637: removed distributed.dp_replicate_size: 1
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
@@ -60,8 +62,8 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: te
-    rope_fusion: false  # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.
+    rms_norm: te  #PR4637: torch_fp32
+    rope_fusion: false  # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.  #PR4637: true
     experts: torch_mm
     dispatcher: hybridep
     fake_balanced_gate: false
@@ -76,30 +78,30 @@ loss_fn:
 
 # Data configuration from llama finetuning
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
-  pad_to_max_length: false
+  padding: false
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 4096  #PR4637: 0
 
   packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: {_target_: nemo_automodel.components.datasets.utils.default_collater, pad_seq_len_divisible: 160}
   shuffle: true
 
   drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
-  pad_to_max_length: false
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: {_target_: nemo_automodel.components.datasets.utils.default_collater, pad_seq_len_divisible: 160}
   shuffle: true
   drop_last: true
 
@@ -114,8 +116,8 @@ optimizer:
 
 ci:
   cluster_tag: h100
-  recipe_owner: hemildesai
-  time: "00:40:00"
+  recipe_owner: akoumpa  #PR4637: hemildesai
+  time: "00:40:00"  #PR4637: "00:25:00"
   nodes: 8
   perf_testing:
     fake_balanced_gate: true

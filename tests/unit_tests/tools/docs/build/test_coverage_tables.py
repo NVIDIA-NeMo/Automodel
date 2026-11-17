@@ -520,9 +520,11 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     assert len([line for line in support_log.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]) == len(
         releases
     )
-    assert (
-        len([line for line in homepage.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]) == TABLE_ROW_COUNT
-    )
+    homepage_rows = [
+        line for line in homepage.splitlines() if re.match(r"\| (?:\d{4}-\d{2}-\d{2}|Unreleased) \|", line)
+    ]
+    assert len(homepage_rows) == TABLE_ROW_COUNT
+    assert sum(line.startswith("| Unreleased |") for line in homepage_rows) == 1
     assert "[Model-0](/model-coverage/large-language-models/test/model)" in homepage
     assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in (
         tmp_path / "docs" / "model-coverage" / "overview.mdx"
@@ -838,3 +840,14 @@ def test_recent_support_uses_permalink_for_documented_card(tmp_path, monkeypatch
 
     without_recipe = coverage._collect_support_entries(tmp_path, old_releases, [model], {})
     assert without_recipe[0].recipe_link == ""
+
+
+def test_uncommitted_reference_card_is_included_before_first_commit(tmp_path, monkeypatch):
+    from tools.docs.build import coverage_tables as coverage
+
+    monkeypatch.setattr(coverage, "_load_file_addition_date", lambda root, path: None)
+    model = _ModelDoc("VLM", "/model-coverage/vision-language-models/org/Model", (), "Model", "docs/model.mdx")
+    entries = coverage._collect_support_entries(tmp_path, [], [model], {})
+    assert len(entries) == 1
+    assert entries[0].date == "Unreleased"
+    assert entries[0].model_link == "[Model](/model-coverage/vision-language-models/org/Model)"

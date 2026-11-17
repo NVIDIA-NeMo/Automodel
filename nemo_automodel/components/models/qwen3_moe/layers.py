@@ -91,6 +91,9 @@ class Qwen3MoeAttention(nn.Module):
 
         # SDPA can compile the whole attention. Packed FA4 keeps variable-length
         # gathers, offsets and kernel dispatch outside the fixed-shape projections.
+        # Compile the unbound methods and pass the module explicitly: a compiled
+        # bound method is shared by copy.deepcopy (used to build pipeline stages)
+        # and would keep running this instance's parameters instead of the copy's.
         self._compiled_forward = None
         self._compiled_qkv = None
         self._compiled_output = None
@@ -100,19 +103,19 @@ class Qwen3MoeAttention(nn.Module):
                     raise ValueError(
                         "Qwen3-MoE compiled FA4 requires linear='torch', rms_norm='torch', and rope_fusion=False"
                     )
-                self._compiled_qkv = torch.compile(self._project_qkv, fullgraph=True, dynamic=False)
-                self._compiled_output = torch.compile(self._project_output, fullgraph=True, dynamic=False)
+                self._compiled_qkv = torch.compile(type(self)._project_qkv, fullgraph=True, dynamic=False)
+                self._compiled_output = torch.compile(type(self)._project_output, fullgraph=True, dynamic=False)
             elif backend.attn != "sdpa":
                 logger.warning(
                     "backend.compile_attn=True ignored: requires attn='sdpa' or 'fa4' (got attn='%s'); "
                     "TE fused attention is not fullgraph-compilable.",
                     backend.attn,
                 )
-            else:  # pragma: no cover - torch.compile path exercised on GPU benchmark runs only
+            else:
                 logger.warning(
                     "backend.compile_attn=True: torch.compile(fullgraph=True) the Qwen3-MoE attention (attn=sdpa)."
                 )
-                self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
+                self._compiled_forward = torch.compile(type(self)._forward_impl, fullgraph=True, dynamic=False)
 
     def forward(
         self,
@@ -130,14 +133,15 @@ class Qwen3MoeAttention(nn.Module):
                 rotary_dim]; fused TE RoPE uses [sequence, 1, 1, rotary_dim].
             attention_mask: Optional [batch, sequence] padding/document IDs or
                 [batch, 1, sequence, sequence] dense mask accepted by the backend.
-            **attn_kwargs: Backend metadata, including int32 cu_seqlens [documents + 1]
-                and int64 packed_token_indices [valid_tokens] for packed FA4.
+            **attn_kwargs: Backend metadata. Packed FA4 uses int32 cu_seqlens of
+                shape [documents + 1] and int64 packed_token_indices of shape
+                [tokens], indexing the flattened [batch * sequence] axis.
 
         Returns:
             Hidden states with the same shape and dtype as x.
         """
-        if self._compiled_forward is not None:  # pragma: no cover - compiled path only on GPU benchmark runs
-            return self._compiled_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
+        if self._compiled_forward is not None:
+            return self._compiled_forward(self, x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
         return self._forward_impl(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
 
     def _forward_impl(
@@ -156,15 +160,16 @@ class Qwen3MoeAttention(nn.Module):
                 [sequence, 1, 1, rotary_dim].
             attention_mask: Optional [batch, sequence] padding/document IDs or
                 [batch, 1, sequence, sequence] dense mask.
-            **attn_kwargs: Backend metadata, including int32 cu_seqlens [documents + 1]
-                and int64 packed_token_indices [valid_tokens].
+            **attn_kwargs: Backend metadata. Packed FA4 uses int32 cu_seqlens of
+                shape [documents + 1] and int64 packed_token_indices of shape
+                [tokens], indexing the flattened [batch * sequence] axis.
 
         Returns:
             Hidden states with the same shape and dtype as x.
         """
         if self._compiled_qkv is not None:
             # FA4's document offsets never enter the fixed-shape compiled graph.
-            q, k, v = self._compiled_qkv(x, freqs_cis=freqs_cis)
+            q, k, v = self._compiled_qkv(self, x, freqs_cis=freqs_cis)
         else:
             q, k, v = self._project_qkv(
                 x,
@@ -183,7 +188,7 @@ class Qwen3MoeAttention(nn.Module):
         # THD TE outputs retain their batch/sequence dimensions.
         out = out.flatten(x.ndim - 1)
         if self._compiled_output is not None:
-            return self._compiled_output(out)
+            return self._compiled_output(self, out)
         return self._project_output(out)
 
     def _project_qkv(

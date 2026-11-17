@@ -226,12 +226,20 @@ def add_causal_masks_to_batch(batch_dict, model_config):
             - input_ids: [batch_size, seq_length]
             - position_ids: [batch_size, seq_length] (optional)
             - labels: [batch_size, seq_length]
+            - _packed_seq_ids: [batch_size, seq_length] document IDs (optional).
+              Retained while flat Flash offsets are removed for PP microbatching.
         model_config: HuggingFace model config for creating causal masks
-        precompute_masks: If False, skip mask creation (for compatibility with train_ft.py wrapper)
 
     Returns:
         dict: Same batch with added causal_mask_mapping field
     """
+    if "_packed_seq_ids" in batch_dict:
+        # Flat Flash offsets span the whole local batch and cannot be split
+        # along its batch axis. Model-entry hooks rebuild them from the
+        # preserved document IDs after pipeline microbatching.
+        for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+            batch_dict.pop(key, None)
+
     # Extract info from batch
     batch_size = batch_dict["input_ids"].shape[0]
     seq_len = batch_dict["input_ids"].shape[1]

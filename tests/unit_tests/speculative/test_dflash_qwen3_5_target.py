@@ -32,7 +32,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel, resolve_text_config
-from nemo_automodel.recipes.llm.train_dflash import _project_onto_qwen3_config_keys
+from nemo_automodel.recipes.speculative_decoding.train_dflash import _project_onto_qwen3_config_keys
 
 
 def test_qwen3_5_targets_resolve_to_the_qwen3_shaped_drafts():
@@ -141,7 +141,7 @@ def test_saved_draft_config_declares_it_is_not_causal():
     ``sliding_attention``, so omitting the key serves the draft causally after it
     was trained non-causally.
     """
-    from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+    from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
 
     # Drive the recipe's own derivation rather than grepping its source, so the
     # assertion survives the code moving between methods.

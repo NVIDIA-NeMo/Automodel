@@ -14,10 +14,12 @@
 
 """Model-owned policy for input and output embedding ties."""
 
+from transformers import PretrainedConfig
+
 from nemo_automodel.shared.tied_weights import TieSupport, get_controlling_tie_word_embeddings
 
 
-def reject_unsupported_tie_word_embeddings(model_cls: type, config: object) -> None:
+def reject_unsupported_tie_word_embeddings(model_cls: type, config: PretrainedConfig) -> None:
     """Reject a ``tie_word_embeddings`` setting the model class cannot honor.
 
     Reads the class's declared :class:`TieSupport` policy from
@@ -71,7 +73,9 @@ def reject_unsupported_tie_word_embeddings(model_cls: type, config: object) -> N
         )
 
 
-def reject_tie_word_embeddings_flip(checkpoint_config: object, requested_config: object, model_class_name: str) -> None:
+def reject_tie_word_embeddings_flip(
+    checkpoint_config: PretrainedConfig, requested_config: PretrainedConfig, model_class_name: str
+) -> None:
     """Reject loading a checkpoint with ``tie_word_embeddings`` flipped from its own value.
 
     The class-level :class:`TieSupport` declaration cannot catch flipping the flag away

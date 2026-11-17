@@ -328,20 +328,38 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Compute logits while preserving packed document and padding metadata.
 
         Args:
-            input_ids: Token IDs [batch, sequence], or the supported THD input layout.
-            position_ids: Optional document-local positions matching input_ids.
-            attention_mask: Optional [batch, sequence] padding/document IDs or
-                [batch, 1, sequence, sequence] dense attention mask.
-            padding_mask: Optional boolean [batch, sequence] mask, true at padding.
-            logits_to_keep: Number of trailing logits, or indices [selected_tokens].
+            input_ids: Token IDs of shape [batch, sequence], or [1, tokens] for
+                pre-packed THD input. Pipeline stages after the first receive
+                hidden states of shape [batch, sequence, hidden] in this slot.
+            position_ids: Optional document-local positions of shape
+                [batch, sequence], or [1, tokens] for THD input.
+            attention_mask: Optional tensor of shape [batch, sequence] holding
+                either a padding mask (nonzero at valid tokens) or packed
+                1-based document IDs with zero at padding, or a dense mask of
+                shape [batch, 1, sequence, sequence] for backends that accept one.
+            padding_mask: Optional boolean tensor of shape [batch, sequence],
+                true at padding. Native FA4 derives its valid-token mask from it
+                when attention_mask is None.
+            logits_to_keep: Number of trailing positions to project, or position
+                indices of shape [selected_tokens].
             output_hidden_states: Whether to include final hidden states.
-            **attn_kwargs: Backend metadata, including packed_token_indices
-                [batch, valid_tokens] and cu_seqlens [batch, documents + 1]
-                before the native FA4 model-entry hook flattens them.
+            **attn_kwargs: Backend metadata. Native FA4 packing passes int64
+                packed_token_indices of shape [batch, sequence] (row-local token
+                indices, -1 at padding), int32 cu_seqlens of shape
+                [batch, max_documents + 1] (row-local offsets, -1 at unused
+                entries) and an integer max_seqlen. The model-entry hook flattens
+                them to indices of shape [tokens] into the flattened
+                [batch * sequence] axis and offsets of shape [documents + 1];
+                already flattened metadata passes through unchanged.
 
         Returns:
-            CausalLMOutputWithPast containing logits [batch, sequence, vocabulary]
-            or [tokens, vocabulary] for THD input, restricted by logits_to_keep.
+            CausalLMOutputWithPast whose logits have shape [batch, sequence,
+            vocab], or [1, tokens, vocab] for THD input, along the positions
+            selected by logits_to_keep. Pipeline stages without the LM head
+            return their hidden states of shape [batch, sequence, hidden] as
+            logits. When output_hidden_states is true, hidden_states holds the
+            final hidden states with the same leading axes and a trailing
+            hidden axis; otherwise it is None.
         """
         output_hidden_states = (
             output_hidden_states

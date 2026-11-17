@@ -34,10 +34,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   num_epochs: 1
   max_steps: 17
-  global_batch_size: 128  # local_batch_size(4) * dp_size(64) -> no grad accumulation.
-  local_batch_size: 1
+  global_batch_size: 128  # local_batch_size(1) * dp_size(128) -> no grad accumulation.  #PR4637: 256
+  local_batch_size: 1  #PR4637: 4
   ckpt_every_steps: 50
   val_every_steps: 50
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -74,14 +75,15 @@ checkpoint:
   save_consolidated: final
 
 distributed:
+  #PR4637: removed distributed.pipeline: {layers_per_stage: 14, patch_causal_lm_model: false, patch_inner_model: false, pp_microbatch_size: 1, pp_schedule: interleaved1f1b, round_virtual_stages_to_pp_multiple: down, scale_grads_in_schedule: false}
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
+  pp_size: 1  #PR4637: 4
   ep_size: 64
   activation_checkpointing: true
   moe:
-    reshard_after_forward: true
+    reshard_after_forward: true  #PR4637: false
     wrap_outer_model: false
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
@@ -114,7 +116,7 @@ validation_dataloader:
   shuffle: false
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
   eps: 1.0e-8
   lr: 5.0e-6
@@ -129,8 +131,8 @@ ci:
   cluster_tag: h100
   # pp_size(4) * ep_size(64) = 256 GPUs => 32 nodes (8 H100/node).
   recipe_owner: adil-a
-  nodes: 16
-  time: "00:40:00"
+  nodes: 16  #PR4637: 32
+  time: "00:40:00"  #PR4637: "00:30:00"
   max_steps: 17
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

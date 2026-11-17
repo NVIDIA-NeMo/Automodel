@@ -32,7 +32,7 @@ from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypedDict, TypeVar, cast, runtime_checkable
 
 from torch.utils.data import Dataset, IterableDataset
 from torch.utils.data.sampler import Sampler
@@ -601,6 +601,19 @@ def _make_sampler(
     )
 
 
+class _DataloaderKwargs(TypedDict, total=False):
+    """Options assembled for the stateful PyTorch dataloader constructor."""
+
+    num_workers: int
+    pin_memory: bool
+    persistent_workers: bool
+    prefetch_factor: int
+    batch_size: int | None
+    sampler: Sampler[int]
+    batch_sampler: Sampler[list[int]]
+    drop_last: bool
+
+
 class ParallelAwareDataloader(StatefulDataLoader):
     """Stateful, data-parallel-aware ``DataLoader``.
 
@@ -630,7 +643,7 @@ class ParallelAwareDataloader(StatefulDataLoader):
         drop_last: bool = False,
     ) -> None:
         """Shard / sample ``dataset`` for the given ranks, then construct the ``StatefulDataLoader``."""
-        loader_kwargs: dict[str, object] = {
+        loader_kwargs: _DataloaderKwargs = {
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "persistent_workers": persistent_workers,

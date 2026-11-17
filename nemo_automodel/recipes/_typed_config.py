@@ -73,7 +73,7 @@ _LoaderConfig = TypeVar("_LoaderConfig")
 
 
 def _loader_config_class(
-    target: object, base: type[_LoaderConfig], *, dataset_config: DatasetConfig
+    target: str | type[_LoaderConfig] | None, base: type[_LoaderConfig], *, dataset_config: DatasetConfig
 ) -> type[_LoaderConfig]:
     """Resolve an explicit loader target or its dataset-owned default."""
     from nemo_automodel.components.config.loader import ConfigNode

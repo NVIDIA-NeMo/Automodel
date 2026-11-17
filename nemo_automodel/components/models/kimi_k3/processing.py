@@ -24,7 +24,7 @@ import base64
 import io
 import math
 from pathlib import Path
-from typing import TypeAlias, TypedDict
+from typing import TypeAlias, TypedDict, Unpack
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.processing_utils import ProcessorMixin
 from transformers.utils import TensorType
+from transformers.video_utils import VideoInput
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
@@ -42,6 +43,16 @@ _, TikTokenTokenizer = safe_import_from("nemo_automodel.components.models.kimi_k
 
 _ImageSource: TypeAlias = "Image.Image | str | Path | bytes"
 _Conversation: TypeAlias = list[dict[str, object]]
+
+
+class _ImagePreprocessKwargs(TypedDict, total=False):
+    do_sample_frames: bool
+
+
+class _ProcessorKwargs(_ImagePreprocessKwargs, total=False):
+    padding: bool | str
+    truncation: bool
+    max_length: int | None
 
 
 class _BackgroundConfig(TypedDict, total=False):
@@ -146,7 +157,7 @@ class KimiK3ImageProcessor(BaseImageProcessor):
         self,
         images: _ImageSource | list[_ImageSource],
         return_tensors: str | TensorType | None = None,
-        **kwargs: object,
+        **kwargs: Unpack[_ImagePreprocessKwargs],
     ) -> BatchFeature:
         """Resize, pad, normalize and flatten images in input order.
 
@@ -324,7 +335,7 @@ class KimiK3Processor(ProcessorMixin):
         text: str | list[str],
         images: _ImageSource | list[_ImageSource] | None = None,
         *,
-        videos: object | None = None,
+        videos: VideoInput | None = None,
         padding: bool | str = False,
         truncation: bool = False,
         max_length: int | None = None,
@@ -379,7 +390,7 @@ class KimiK3Processor(ProcessorMixin):
         max_length: int | None = None,
         add_generation_prompt: bool = False,
         return_assistant_tokens_mask: bool = False,
-        processor_kwargs: dict[str, object] | None = None,
+        processor_kwargs: _ProcessorKwargs | None = None,
         **kwargs: object,
     ) -> str | list[str] | list[int] | list[list[int]] | torch.Tensor | BatchFeature:
         """Render native XTML chats and optionally process images and assistant masks.

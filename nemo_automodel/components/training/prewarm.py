@@ -504,7 +504,7 @@ def _prewarm_fla_gdn_cp_kernels(
                 dtype=torch.float32,
             )
 
-            def _merge_grid(meta, _V=head_v_dim, _H=num_heads):
+            def _merge_grid(meta: dict[str, Any], _V: int = head_v_dim, _H: int = num_heads) -> tuple[int, int]:
                 return (triton.cdiv(_V, meta["BV"]), _H)
 
             try:
@@ -776,7 +776,7 @@ def _prewarm_pipeline_stages(stages: list[Any] | None, device: torch.device | in
                 raise RuntimeError(
                     "pipeline-stage compile prewarm: the stage produced no floating-point output to backpropagate"
                 )
-            loss = sum(t.float().sum() for t in tensors)
+            loss = torch.sum(torch.stack([t.float().sum() for t in tensors]))
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             t_bwd = time.perf_counter()
