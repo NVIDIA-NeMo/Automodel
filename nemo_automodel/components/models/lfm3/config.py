@@ -93,21 +93,40 @@ class Lfm3Config(PreTrainedConfig):
                 },
                 "sliding_attention": {"rope_type": "default", "rope_theta": 10_000.0},
             }
-        attention_types = [layer_type for layer_type in self._rope_type_labels if layer_type in self.layer_types]
-        if missing := [layer_type for layer_type in attention_types if layer_type not in self.rope_parameters]:
-            raise ValueError(f"`rope_parameters` has no entry for the {missing} layers in `layer_types`.")
         relabelled = {
-            layer_type: {**self.rope_parameters[layer_type], "rope_type": "proportional"}
-            for layer_type in attention_types
-            if self.rope_parameters[layer_type].get("rope_type", "default") == "default"
-            and self.rope_parameters[layer_type].get("partial_rotary_factor", 1.0) < 1.0
+            layer_type: {**rope, "rope_type": "proportional"}
+            for layer_type, rope in self.rope_parameters.items()
+            if layer_type in self._rope_type_labels
+            and rope.get("rope_type", "default") == "default"
+            and rope.get("partial_rotary_factor", 1.0) < 1.0
         }
         self.rope_parameters = {**self.rope_parameters, **relabelled}
         super().__post_init__(**kwargs)
+        self.validate_architecture()
+
+    def validate_architecture(self) -> None:
+        """Reject RoPE settings this implementation does not run.
+
+        Transformers runs this before saving. The config runs it on construction and
+        the model runs it again when built, because loader overrides are written onto
+        an existing config and skip construction.
+
+        Raises:
+            ValueError: If an attention layer type has no RoPE entry, uses a RoPE type
+                other than ``default`` or ``proportional``, or scales its frequencies
+                with a non-unit ``factor``.
+        """
+        super().validate_architecture()
+        attention_types = [layer_type for layer_type in self._rope_type_labels if layer_type in self.layer_types]
+        if missing := [layer_type for layer_type in attention_types if layer_type not in self.rope_parameters]:
+            raise ValueError(f"`rope_parameters` has no entry for the {missing} layers in `layer_types`.")
+        rope_types = {
+            layer_type: self.rope_parameters[layer_type].get("rope_type", "default") for layer_type in attention_types
+        }
         if unsupported := {
-            layer_type: self.rope_parameters[layer_type]["rope_type"]
-            for layer_type in attention_types
-            if self.rope_parameters[layer_type]["rope_type"] not in ("default", "proportional")
+            layer_type: rope_type
+            for layer_type, rope_type in rope_types.items()
+            if rope_type not in ("default", "proportional")
         }:
             raise ValueError(f"LFM3 supports `default` and `proportional` RoPE only, got {unsupported}.")
         if scaled := {
@@ -115,7 +134,8 @@ class Lfm3Config(PreTrainedConfig):
             for layer_type in attention_types
             if self.rope_parameters[layer_type].get("factor", 1.0) != 1.0
         }:
-            raise ValueError(f"LFM3 does not support RoPE frequency scaling, got `factor` {scaled}.")
+            # The loader retries other attention backends on errors that say "does not support".
+            raise ValueError(f"RoPE frequency scaling is not implemented for LFM3, got `factor` {scaled}.")
 
 
 @strict

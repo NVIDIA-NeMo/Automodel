@@ -251,6 +251,8 @@ class Lfm3Model(Lfm3PreTrainedModel):
     """LFM3 decoder: token embeddings, the mixed convolution and attention stack, and a final norm."""
 
     def __init__(self, config: Lfm3Config) -> None:
+        # Loader overrides are written onto an existing config and skip its construction-time checks.
+        config.validate_architecture()
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(Lfm3DecoderLayer(config, idx) for idx in range(config.num_hidden_layers))

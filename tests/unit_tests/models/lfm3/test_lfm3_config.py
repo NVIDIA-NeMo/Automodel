@@ -18,7 +18,9 @@ import copy
 import json
 
 import pytest
+import torch
 
+from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
 from nemo_automodel._transformers.model_init import get_hf_config
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.lfm3.config import Lfm3Config, Lfm3VlConfig, Lfm3VlVisionConfig
@@ -40,6 +42,23 @@ PUBLISHED_TEXT = {
     "rope_parameters": PUBLISHED_ROPE,
     "transformers_version": "5.12.1",
 }
+PUBLISHED_VL = {
+    "architectures": ["Lfm3VlForConditionalGeneration"],
+    "auto_map": {"AutoConfig": "configuration_lfm3_vl.Lfm3VlConfig"},
+    "model_type": "lfm3_vl",
+    "downsample_factor": 2,
+    "projector_hidden_size": 40,
+    "projector_layer_norm_eps": 1e-06,
+    "text_config": {key: value for key, value in PUBLISHED_TEXT.items() if key not in ("architectures", "auto_map")},
+    "vision_config": {
+        "model_type": "lfm3_vl_vision",
+        "hidden_size": 32,
+        "intermediate_size": 48,
+        "num_hidden_layers": 4,
+        "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "axial"},
+    },
+}
+SCALED_ROPE = {**PUBLISHED_ROPE, "full_attention": {**PUBLISHED_ROPE["full_attention"], "factor": 2.0}}
 
 
 def _checkpoint(tmp_path, config):
@@ -56,23 +75,7 @@ def test_published_text_config_resolves_locally_without_remote_code(tmp_path):
 
 
 def test_published_vl_config_resolves_local_sub_configs(tmp_path):
-    published = {
-        "architectures": ["Lfm3VlForConditionalGeneration"],
-        "auto_map": {"AutoConfig": "configuration_lfm3_vl.Lfm3VlConfig"},
-        "model_type": "lfm3_vl",
-        "downsample_factor": 2,
-        "projector_layer_norm_eps": 1e-06,
-        "text_config": {
-            key: value for key, value in PUBLISHED_TEXT.items() if key not in ("architectures", "auto_map")
-        },
-        "vision_config": {
-            "model_type": "lfm3_vl_vision",
-            "num_hidden_layers": 4,
-            "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "axial"},
-        },
-    }
-
-    config = get_hf_config(_checkpoint(tmp_path, published), "sdpa")
+    config = get_hf_config(_checkpoint(tmp_path, PUBLISHED_VL), "sdpa")
 
     assert (type(config), type(config.text_config), type(config.vision_config)) == (
         Lfm3VlConfig,
@@ -115,8 +118,8 @@ def test_relabelled_config_survives_a_save_and_reload(tmp_path):
         ),
         ({**PUBLISHED_ROPE, "sliding_attention": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 2.0}}, "yarn"),
         (
-            {**PUBLISHED_ROPE, "full_attention": {**PUBLISHED_ROPE["full_attention"], "factor": 2.0}},
-            "frequency scaling, got `factor` \\{'full_attention': 2.0\\}",
+            SCALED_ROPE,
+            "frequency scaling is not implemented for LFM3, got `factor` \\{'full_attention': 2.0\\}",
         ),
     ],
 )
@@ -129,3 +132,32 @@ def test_unit_rope_factor_is_accepted():
     rope = {**PUBLISHED_ROPE, "full_attention": {**PUBLISHED_ROPE["full_attention"], "factor": 1.0}}
 
     assert Lfm3Config(rope_parameters=rope).rope_parameters["full_attention"]["factor"] == 1.0
+
+
+@pytest.mark.parametrize("from_path", [False, True], ids=["config object", "config.json path"])
+@pytest.mark.parametrize(
+    ("loader", "published", "override"),
+    [
+        (NeMoAutoModelForCausalLM, PUBLISHED_TEXT, {"rope_parameters": SCALED_ROPE}),
+        (NeMoAutoModelForImageTextToText, PUBLISHED_VL, {"text_config": {"rope_parameters": SCALED_ROPE}}),
+    ],
+    ids=["text", "vl"],
+)
+def test_loader_overrides_cannot_request_rope_scaling(tmp_path, monkeypatch, loader, published, override, from_path):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    path = _checkpoint(tmp_path, published)
+    config = path if from_path else get_hf_config(path, "sdpa")
+
+    with pytest.raises(ValueError, match="frequency scaling is not implemented for LFM3"):
+        loader.from_config(config, **copy.deepcopy(override))
+
+
+def test_loader_override_with_supported_rope_builds_the_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    config = get_hf_config(_checkpoint(tmp_path, PUBLISHED_TEXT), "sdpa")
+    rope = {**PUBLISHED_ROPE, "sliding_attention": {"rope_type": "default", "rope_theta": 5000.0}}
+
+    model = NeMoAutoModelForCausalLM.from_config(config, rope_parameters=rope)
+
+    assert type(model).__name__ == "Lfm3ForCausalLM"
+    assert model.config.rope_parameters["sliding_attention"]["rope_theta"] == 5000.0
