@@ -385,6 +385,8 @@ navigation:
                 path: ../../model-coverage/llm/qwen/qwen2-moe.mdx
               - page: "Qwen2.5-0.5B"
                 path: ../../model-coverage/llm/qwen/qwen2-5-0-5b.mdx
+              - page: "Qwen2.5-1.5B"
+                path: ../../model-coverage/llm/qwen/qwen2-5-1-5b.mdx
               - page: "Qwen2.5-32B-Instruct"
                 path: ../../model-coverage/llm/qwen/qwen2-5-32b-instruct.mdx
               - page: "Qwen2.5-3B"
