@@ -29,6 +29,6 @@ nemo_automodel/recipes/llm/train_ft.py \
     --model.num_hidden_layers=2 \
     --distributed.tp_size=2 \
     --distributed.pp_size=1 \
-    --distributed.sequence_parallel=False \
+    --dataset.dataset_name $HF_CACHE/squad/ \
     --benchmark \
     --step_scheduler.max_steps=4
