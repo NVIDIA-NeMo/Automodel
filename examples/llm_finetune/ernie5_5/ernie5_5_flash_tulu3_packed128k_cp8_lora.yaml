@@ -35,7 +35,7 @@
 # Memory: activation checkpointing recomputes every decoder layer in backward, and the dense
 # weights are resharded after each layer has used them (moe.reshard_after_forward). With
 # both, 16384 tokens per rank fit one GB200 next to the frozen weights: a GPU peaked at
-# 160 GiB allocated in the validated run.
+# 162 GiB allocated in the validated run.
 #
 # The LoRA targets, the HybridEP notes, the unsupported settings other than packing and
 # context parallelism, and the notes on the model, the tokenizer and the Hub cache are those

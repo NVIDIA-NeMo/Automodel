@@ -29,7 +29,8 @@
 # Memory: activation checkpointing recomputes every decoder layer in backward, and the
 # weights of a layer are resharded after the layer has used them (moe.reshard_after_forward),
 # so that a rank holds the weights of one layer at a time next to its shard of the weights,
-# the gradients and the optimizer state.
+# the gradients and the optimizer state: a GPU peaked at 128 GiB allocated in the validated
+# run.
 #
 # To run this recipe, from the repository root, on each of the 16 nodes with 4 GPUs, with
 # NODE_RANK set from 0 to 15 and MASTER_ADDR set to the first node:
