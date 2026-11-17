@@ -4580,3 +4580,61 @@ def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[l
     recipe._forward_backward_step(0, batch, loss_buffer=[], num_label_tokens=8, num_batches=1)
     assert len(seen) == 2
     assert set(batch) == original_keys
+
+
+class VariableLengthDataset:
+    """Unpacked tokenized examples of different lengths, as SQuAD yields them."""
+
+    def __init__(self):
+        self.samples = [{"input_ids": list(range(1, 4 + i)), "labels": list(range(1, 4 + i))} for i in range(4)]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+@pytest.mark.parametrize(
+    "collate_fn",
+    [
+        "nemo_automodel.components.datasets.utils.neat_packed_collater",
+        {"_target_": "nemo_automodel.components.datasets.utils.neat_packed_collater", "attn_implementation": "sdpa"},
+    ],
+)
+def test_setup_unpacked_validation_ignores_neat_packed_collater(monkeypatch, collate_fn):
+    """NEAT training keeps validation unpacked, so validation must not use the NEAT collater (#4817)."""
+    dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.VariableLengthDataset"}
+    typed_cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "model": {},
+                "dataset": dataset,
+                "dataloader": {"collate_fn": collate_fn},
+                "validation_dataset": dataset,
+                "validation_dataloader": {"collate_fn": collate_fn},
+                "packed_sequence": {"packed_sequence_size": 64, "packing_strategy": "neat"},
+                "step_scheduler": {"local_batch_size": 2, "global_batch_size": 2},
+                "optimizer": {},
+                "loss_fn": {},
+                "checkpoint": {"best_metric_key": "default"},
+                "distributed": {"cp_size": 1},
+            }
+        )
+    )
+    dataloader, validation_dataloaders = typed_cfg.dataloader, typed_cfg.validation_dataloaders
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: dataloader))
+    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: validation_dataloaders))
+    build = DataloaderConfig.build
+    # Build only the validation loader for real; packing the training data is not under test.
+    monkeypatch.setattr(
+        DataloaderConfig, "build", lambda self, **kwargs: build(self, **kwargs) if not kwargs["is_training"] else "dl"
+    )
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(typed_cfg)
+    trainer.setup()
+    batch = next(iter(trainer.val_dataloaders["default"]))
+
+    assert batch["input_ids"].shape == batch["labels"].shape
+    assert batch["input_ids"].shape[0] == 2

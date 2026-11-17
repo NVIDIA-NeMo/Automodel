@@ -65,6 +65,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule, close_dataloader
+from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -172,6 +173,25 @@ def _should_pack_validation(
         or bool(getattr(model, "_te_attention_injected", False))
         or model_requires_packing
     )
+
+
+def _validation_loader_config(
+    training_dataloader: DataloaderConfig | None,
+    validation_dataloader: DataloaderConfig,
+    model: nn.Module,
+) -> DataloaderConfig:
+    """Return the validation loader config, unpacked unless validation must use the training packer.
+
+    An unpacked validation loader must not keep ``neat_packed_collater`` from the
+    ``validation_dataloader`` collate_fn: it stacks pre-packed samples and fails on the
+    variable-length raw examples.
+    """
+    if _should_pack_validation(training_dataloader, validation_dataloader, model):
+        return validation_dataloader
+    collate_fn = validation_dataloader.collate_fn
+    if getattr(collate_fn, "func", collate_fn) is neat_packed_collater:
+        collate_fn = None
+    return replace(validation_dataloader, packing=None, collate_fn=collate_fn)
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -853,9 +873,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.pack_size = packing.packed_sequence_size if packing is not None else None
         self.val_dataloaders = {
             name: materialize_loader(
-                dl_config
-                if _should_pack_validation(self.cfg.dataloader, dl_config, self.model_parts[0])
-                else replace(dl_config, packing=None),
+                _validation_loader_config(self.cfg.dataloader, dl_config, self.model_parts[0]),
                 is_training=False,
             )
             for name, dl_config in self.cfg.validation_dataloaders.items()
