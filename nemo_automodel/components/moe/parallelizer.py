@@ -993,25 +993,13 @@ def apply_fsdp(
     # cheap) and turn it into a globally shaped DTensor only after the runtime
     # mesh exists. Run that private capability before collecting ignored
     # parameters so every FSDP unit records the final Parameter identity.
+    # Those parameters are already physically sharded by model-owned
+    # communication; letting FSDP shard the local owner partitions again would
+    # invalidate the model's lookup and autograd routing.
     prepare_model_owned_dtensors = getattr(model, "_nemo_prepare_model_owned_dtensors", None)
-    prepared_model_owned_dtensors: set[nn.Parameter] = set()
+    externally_sharded_params: set[nn.Parameter] = set()
     if prepare_model_owned_dtensors is not None:
-        prepared_model_owned_dtensors = set(prepare_model_owned_dtensors(fsdp_mesh))
-
-    # Some trainable parameters are already physically sharded by model-owned
-    # communication. Letting FSDP shard those local owner partitions again
-    # would invalidate the model's lookup and autograd routing. The explicit
-    # parameter marker keeps this exception narrow and fail-visible.
-    # Some unit-test and integration wrappers intentionally expose the nested
-    # model without subclassing nn.Module.  They cannot own parameters
-    # themselves, so treat a missing ``parameters`` method as an empty outer
-    # parameter set while preserving the normal nn.Module path.
-    outer_parameters = model.parameters() if hasattr(model, "parameters") else ()
-    externally_sharded_params = prepared_model_owned_dtensors | {
-        parameter
-        for parameter in outer_parameters
-        if getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
-    }
+        externally_sharded_params = set(prepare_model_owned_dtensors(fsdp_mesh))
     if externally_sharded_params:
         logger.info(
             "Excluding %d model-owned sharded parameters from FSDP ownership",
