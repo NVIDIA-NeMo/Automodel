@@ -491,11 +491,12 @@ def test_fa4_preserves_te_sink_owner_order_and_window(
     modules = {
         "flash_attn.cute": external,
         "transformer_engine.pytorch.attention": SimpleNamespace(DotProductAttention=SinkOwner),
-        "transformer_engine.pytorch.quantization": SimpleNamespace(),
+        "transformer_engine.pytorch.quantization": SimpleNamespace(
+            FP8GlobalStateManager=SimpleNamespace(is_fp8_enabled=lambda: False)
+        ),
     }
-    monkeypatch.setitem(
-        sys.modules, "transformer_engine.pytorch.attention", modules["transformer_engine.pytorch.attention"]
-    )
+    for name in ("transformer_engine.pytorch.attention", "transformer_engine.pytorch.quantization"):
+        monkeypatch.setitem(sys.modules, name, modules[name])
     monkeypatch.setattr(attention_utils, "safe_import", lambda name: (name in modules, modules.get(name)))
     monkeypatch.setattr(layers_module, "is_te_min_version", lambda version: True)
     monkeypatch.setattr(layers_module, "apply_rotary_emb_qk", lambda q, k, *args, **kwargs: (q, k))
