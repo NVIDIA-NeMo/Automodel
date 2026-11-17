@@ -1,0 +1,49 @@
+# Patch for flash-linear-attention (fla-core) 0.4.2, file fla/ops/cp/chunk_delta_h.py.
+# Source: https://github.com/fla-org/flash-linear-attention, fla-core 0.4.2 from PyPI.
+# Two triton.autotune keys name values that are not kernel arguments ("STAGE"; "BT" and
+# "USE_EXP2"). Triton 3.9 (PyTorch 26.11 base) rejects such keys when fla is imported. Earlier
+# Triton dropped the unknown names, so removing them keeps the same tuning keys. fla 0.5 no longer
+# has these keys; remove this patch with that upgrade. Docker accepts only the original or the
+# already-patched source.
+#
+# MIT License
+#
+# Copyright (c) 2023-2025 Songlin Yang
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+--- a/fla/ops/cp/chunk_delta_h.py
++++ b/fla/ops/cp/chunk_delta_h.py
+@@ -27,7 +27,7 @@
+         for num_stages in [2, 3, 4]
+         for BV in [32, 64]
+     ],
+-    key=['H', 'K', 'V', 'BT', 'USE_EXP2', "STAGE"],
++    key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
+     use_cuda_graph=USE_CUDA_GRAPH,
+     **autotune_cache_kwargs,
+ )
+@@ -528,7 +528,7 @@
+         for num_stages in [2, 3, 4]
+         for BV in [32, 64]
+     ],
+-    key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
++    key=['H', 'K', 'V'],
+     use_cuda_graph=USE_CUDA_GRAPH,
+     **autotune_cache_kwargs,
+ )

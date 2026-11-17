@@ -396,6 +396,20 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         python -c "from torch._inductor.utils import ensure_nv_universal_gemm_available; ensure_nv_universal_gemm_available()"; \
     fi
 
+# fla-core 0.4.2 names non-arguments in two triton.autotune keys, which Triton 3.9 (26.11 base)
+# rejects when fla is imported; see docker/common/fla-autotune-keys.patch. find_spec locates fla
+# without importing it.
+RUN site_packages=$(python -c "import importlib.util, pathlib; spec = importlib.util.find_spec('fla'); print(pathlib.Path(spec.origin).parents[1] if spec else '')") && \
+    if [ -n "$site_packages" ]; then \
+        patch_file=/opt/Automodel/docker/common/fla-autotune-keys.patch && \
+        if git -C "$site_packages" apply --check "$patch_file" 2>/dev/null; then \
+            git -C "$site_packages" apply "$patch_file"; \
+        else \
+            git -C "$site_packages" apply --reverse --check "$patch_file"; \
+        fi && \
+        chown "${RUNTIME_UID}:${RUNTIME_GID}" "$site_packages/fla/ops/cp/chunk_delta_h.py"; \
+    fi
+
 # Fail the image build before publication if PyTorch headers cannot compile as
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
 # unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
