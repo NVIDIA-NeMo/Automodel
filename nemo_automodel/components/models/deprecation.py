@@ -26,7 +26,7 @@ _DEPRECATED_MODEL_YAMLS: dict[str, tuple[str, ...]] = {
     ),
     "Qwen2ForCausalLM": (
         "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml",
-        "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_32b_squad_tp2_peft_2nodes.yaml",
         "examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml",
         "examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml",
         "examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml",
