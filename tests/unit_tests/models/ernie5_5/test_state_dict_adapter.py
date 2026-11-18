@@ -746,8 +746,14 @@ def test_public_loader_loads_a_hugging_face_checkpoint_in_one_process(tmp_path: 
     """``NeMoAutoModelForCausalLM`` builds the registered model and loads its weights without any mesh."""
     checkpoint = tmp_path / "hf_checkpoint"
     source = _write_hf_checkpoint(checkpoint, "bfloat16", seed=19)
-    # The loader asks CUDA for the current device even for a CPU model. Nothing of the load path is replaced.
-    with patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+    # The loader asks CUDA for the current device even for a CPU model, and this test answers with the CPU device.
+    # Where CUDA is available, the checkpointer asks again when it chooses the checkpoint reader and uses the
+    # answer as a CUDA index. So CUDA is reported as unavailable and the load takes the path of a host without
+    # CUDA on every host. Nothing of the load path is replaced.
+    with (
+        patch.object(torch.cuda, "is_available", return_value=False),
+        patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")),
+    ):
         model = NeMoAutoModelForCausalLM.from_config(
             str(checkpoint),
             load_base_model=True,
