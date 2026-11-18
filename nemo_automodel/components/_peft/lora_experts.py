@@ -439,19 +439,17 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         # Keep empty/fully masked ranks attached without indexing nonexistent tokens.
         if active_local_experts == 0:
-            y = (
-                y
-                + (
-                    x.sum(dtype=torch.float32)
-                    + weights.sum(dtype=torch.float32)
-                    + gate_and_up_projs.sum(dtype=torch.float32)
-                    + down_projs.sum(dtype=torch.float32)
-                    + lora_gate_and_up_A.sum(dtype=torch.float32)
-                    + lora_gate_and_up_B.sum(dtype=torch.float32)
-                    + lora_down_A.sum(dtype=torch.float32)
-                    + lora_down_B.sum(dtype=torch.float32)
-                )
-                * 0.0
+            # Save the zero output for backward so checkpoint replays the EP gather
+            # before its backward collectives, even when this rank owns no routes.
+            y = y * (
+                x.sum(dtype=torch.float32)
+                + weights.sum(dtype=torch.float32)
+                + gate_and_up_projs.sum(dtype=torch.float32)
+                + down_projs.sum(dtype=torch.float32)
+                + lora_gate_and_up_A.sum(dtype=torch.float32)
+                + lora_gate_and_up_B.sum(dtype=torch.float32)
+                + lora_down_A.sum(dtype=torch.float32)
+                + lora_down_B.sum(dtype=torch.float32)
             )
             if post_expert_output is not None:
                 y = y + post_expert_output(x.new_zeros((1, x.size(1)))).sum(dtype=torch.float32) * 0.0
@@ -563,20 +561,17 @@ class GroupedExpertsLoRA(GroupedExperts):
                 scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
                 y.scatter_add_(0, scatter_ids, output2.float())
         else:
-            # Preserve the output layout and all gradients even for zero tokens.
-            y = (
-                y
-                + (
-                    x.sum(dtype=torch.float32)
-                    + weights.sum(dtype=torch.float32)
-                    + gate_and_up_projs.sum(dtype=torch.float32)
-                    + down_projs.sum(dtype=torch.float32)
-                    + lora_gate_and_up_A.sum(dtype=torch.float32)
-                    + lora_gate_and_up_B.sum(dtype=torch.float32)
-                    + lora_down_A.sum(dtype=torch.float32)
-                    + lora_down_B.sum(dtype=torch.float32)
-                )
-                * 0.0
+            # Multiplication saves y even when empty, keeping checkpoint gather
+            # replay ordered with the ranks that executed the grouped GEMMs.
+            y = y * (
+                x.sum(dtype=torch.float32)
+                + weights.sum(dtype=torch.float32)
+                + gate_and_up_projs.sum(dtype=torch.float32)
+                + down_projs.sum(dtype=torch.float32)
+                + lora_gate_and_up_A.sum(dtype=torch.float32)
+                + lora_gate_and_up_B.sum(dtype=torch.float32)
+                + lora_down_A.sum(dtype=torch.float32)
+                + lora_down_B.sum(dtype=torch.float32)
             )
             if post_expert_output is not None:
                 y = y + post_expert_output(x.new_zeros((1, x.size(1)))).sum(dtype=torch.float32) * 0.0

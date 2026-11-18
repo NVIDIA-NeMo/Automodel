@@ -24,6 +24,7 @@ nonzero so adapter A gradients are exercised. No dispatch or collective is mocke
 PR CI runs seven representative cases per dispatcher, covering every variant,
 both LoRA ranks, checkpoint replay, and empty expert routing. Scheduled CI sets
 NEMO_MOE_TEST_FULL_MATRIX=true to retain all 96 original combinations.
+Standard EP additionally checks idle-rank checkpoint replay with loop experts.
 """
 
 import argparse
@@ -85,7 +86,9 @@ def _rounded_weight(shape: tuple[int, ...], seed: int) -> torch.Tensor:
     return dequantize_mxfp4(packed, scales, torch.bfloat16).transpose(-2, -1)
 
 
-def _model(variant: str, dispatcher: str, device: torch.device, lora_rank: int) -> torch.nn.Module:
+def _model(
+    variant: str, dispatcher: str, device: torch.device, lora_rank: int, expert_backend: str = "torch_mm"
+) -> torch.nn.Module:
     """Construct identical rounded weights for the CPU reference and CUDA implementation."""
     config = MoEConfig(
         n_routed_experts=_EXPERTS,
@@ -104,7 +107,7 @@ def _model(variant: str, dispatcher: str, device: torch.device, lora_rank: int) 
         norm_topk_prob=False,
         dtype=torch.float32 if device.type == "cpu" else torch.bfloat16,
     )
-    backend = BackendConfig(experts="torch_mm", dispatcher=dispatcher)
+    backend = BackendConfig(experts=expert_backend, dispatcher=dispatcher)
     deep = device.type == "cuda" and dispatcher != "torch"
     with torch.device(device):
         orig = (
@@ -168,7 +171,9 @@ def _compare(actual: torch.Tensor, expected: torch.Tensor, name: str) -> dict[st
     return {"relative_l2": relative_l2, "max_abs": max_abs}
 
 
-def _run_case(variant: str, dispatcher: str, case: str, lora_rank: int, mesh: DeviceMesh) -> None:
+def _run_case(
+    variant: str, dispatcher: str, case: str, lora_rank: int, mesh: DeviceMesh, expert_backend: str = "torch_mm"
+) -> None:
     rank, world = dist.get_rank(), dist.get_world_size()
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     lengths = [16] * world if case == "balanced" else [17 + 14 * r for r in range(world)]
@@ -189,7 +194,7 @@ def _run_case(variant: str, dispatcher: str, case: str, lora_rank: int, mesh: De
     expected.backward(upstream)
     assert x.grad is not None and weights.grad is not None
 
-    model = _model(variant, dispatcher, device, lora_rank)
+    model = _model(variant, dispatcher, device, lora_rank, expert_backend)
     # Match checkpoint passthrough: shard meta parameters before loading their local values.
     # NCCL cannot broadcast float8_e8m0fnu scales from materialized full parameters.
     full_params = {name: param.detach().cpu().clone() for name, param in model.named_parameters()}
@@ -239,6 +244,7 @@ def _run_case(variant: str, dispatcher: str, case: str, lora_rank: int, mesh: De
             {
                 "rank": rank,
                 "dispatcher": dispatcher,
+                "expert_backend": expert_backend,
                 "variant": variant,
                 "case": case,
                 "lora_rank": lora_rank,
@@ -256,8 +262,13 @@ def main() -> None:
     parser.add_argument("--variants", nargs="+", choices=_VARIANTS, default=list(_VARIANTS))
     parser.add_argument("--cases", nargs="+", choices=_CASES, default=list(_CASES))
     parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--expert-backend", choices=("torch_mm", "torch"), default="torch_mm")
     parser.add_argument("--matrix", choices=("smoke", "full"))
     args = parser.parse_args()
+    if args.expert_backend == "torch" and (
+        args.dispatcher != "torch" or args.variants != ["lora"] or args.matrix is not None
+    ):
+        parser.error("--expert-backend torch requires --dispatcher torch --variants lora without --matrix")
     initialize_distributed("nccl", timeout_minutes=1)
     try:
         mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("ep",))
@@ -273,7 +284,7 @@ def main() -> None:
         )
         for variant, case, lora_rank in cases:
             start = time.perf_counter()
-            _run_case(variant, args.dispatcher, case, lora_rank, mesh)
+            _run_case(variant, args.dispatcher, case, lora_rank, mesh, args.expert_backend)
             print(
                 f"MXFP4 parity: dispatcher={args.dispatcher} variant={variant} case={case} "
                 f"lora_rank={lora_rank} elapsed={time.perf_counter() - start:.2f}s",
@@ -308,6 +319,30 @@ def _launch_dispatcher(dispatcher: str) -> None:
         check=True,
         timeout=600 if env.get("NEMO_MOE_TEST_FULL_MATRIX") == "true" else 300,
     )
+    if dispatcher == "torch":
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc-per-node=2",
+                str(Path(__file__).resolve()),
+                "--dispatcher",
+                "torch",
+                "--variants",
+                "lora",
+                "--expert-backend",
+                "torch",
+                "--cases",
+                "empty_rank_checkpoint",
+                "--lora-rank",
+                "8",
+            ],
+            env=env,
+            check=True,
+            timeout=300,
+        )
 
 
 @pytest.mark.parametrize(

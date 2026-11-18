@@ -65,8 +65,12 @@ def test_empty_dispatch_participates_in_checkpoint_replay(
     x = torch.randn(tokens, 4, requires_grad=input_grad)
     weights = torch.randn(tokens, 2, requires_grad=input_grad)
     output = checkpoint(
-        layer, x, torch.ones(tokens, dtype=torch.bool), weights,
-        torch.zeros(tokens, 2, dtype=torch.long), use_reentrant=False,
+        layer,
+        x,
+        torch.ones(tokens, dtype=torch.bool),
+        weights,
+        torch.zeros(tokens, 2, dtype=torch.long),
+        use_reentrant=False,
     )
     assert output.shape == (0, 4)
     output.sum().backward()
@@ -86,6 +90,48 @@ def _cpu_kernels(monkeypatch):
     with torch.compiler.set_stance("force_eager"), torch.random.fork_rng(devices=[]):
         torch.manual_seed(913)
         yield
+
+
+@pytest.mark.parametrize("backend", ["loop", "grouped_mm"])
+@pytest.mark.parametrize("after_down", [False, True])
+@pytest.mark.parametrize("empty_case", ["zero_tokens", "masked", "no_local_routes"])
+@pytest.mark.parametrize("input_grad", [False, True])
+def test_standard_empty_routes_replay_checkpoint(
+    backend: str, after_down: bool, empty_case: str, input_grad: bool
+) -> None:
+    """Require real checkpoint replay and zero gradients; native collective parity is tested separately."""
+    layer = _wrap(_source(backend=backend, after_down=after_down, bias=False, dtype=torch.float32))
+    calls: list[bool] = []
+
+    def observe(module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        """Observe forward entry without changing tensors.
+
+        Args:
+            module: Expert LoRA wrapper.
+            args: Activations [tokens, hidden], mask [tokens], probabilities
+                [tokens, top_k], and expert IDs [tokens, top_k].
+        """
+        calls.append(True)
+
+    tokens = 0 if empty_case == "zero_tokens" else 3
+    x = torch.randn(tokens, 4, requires_grad=input_grad)
+    weights = torch.randn(tokens, 2, requires_grad=input_grad)
+    mask = torch.full((tokens,), empty_case != "masked", dtype=torch.bool)
+    indices = torch.full((tokens, 2), 3 if empty_case == "no_local_routes" else 0, dtype=torch.long)
+    handle = layer.register_forward_pre_hook(observe)
+    try:
+        output = checkpoint(layer, x, mask, weights, indices, use_reentrant=False)
+        assert output.shape == x.shape and torch.count_nonzero(output) == 0
+        output.backward(torch.randn_like(output))
+    finally:
+        handle.remove()
+    assert len(calls) == 2, "idle standard-EP rank must replay the forward before gather backward"
+    for value in (x, weights, *(layer.get_parameter(name) for name in _ADAPTER_NAMES)):
+        if value.requires_grad:
+            assert value.grad is not None
+            assert torch.isfinite(value.grad).all() and torch.count_nonzero(value.grad) == 0
+        else:
+            assert value.grad is None
 
 
 def _grouped_mm(x: torch.Tensor, weight: torch.Tensor, *, offs: torch.Tensor) -> torch.Tensor:
