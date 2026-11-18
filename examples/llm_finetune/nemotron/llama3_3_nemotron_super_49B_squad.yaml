@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad.yaml
+# torchrun --nproc-per-node=8 -m nemo_automodel.cli.app examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad.yaml
 # This recipe is validated on 2 8xH100 nodes.
 
 
@@ -77,15 +77,17 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
   seq_length: 1024
-  padding: max_length
+  padding: false
   truncation: true
 
 packed_sequence:
-  packed_sequence_size: 0
+  # local_batch_size counts packed rows, not individual documents.
+  packed_sequence_size: 2048
+  packing_strategy: neat
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: True
   drop_last: True
 
@@ -125,7 +127,7 @@ ci:
   vllm_smoke_test: true  # 49B exceeds 1 GPU; use vLLM's native nemotron-nas backend (no HF reference load)
   vllm_deploy_gpus: 4  # expose 4 of the node's 8 GPUs for tensor-parallel vLLM load
   checkpoint_robustness:
-    # PP buffers are fixed to the recipe's 1024-token sequence length.
+    # Preserve the original checkpoint-parity input length.
     parity_sequence_length: 1024
     training_reproducibility_loss_threshold: 5e-2
     # TP8/PP2 shared-trajectory runs show ~0.35-0.55% first-forward loss drift.

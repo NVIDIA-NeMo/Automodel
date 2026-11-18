@@ -71,7 +71,8 @@ model:
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: stepfun-ai/Step-3.5-Flash
-    trust_remote_code: true
+    # Use the registered text config: the checkpoint lists include three MTP layers.
+    trust_remote_code: false
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig

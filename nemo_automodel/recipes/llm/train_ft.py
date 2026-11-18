@@ -49,7 +49,6 @@ _HAS_WANDB, wandb = safe_import(
 )
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoConfig
 
 from nemo_automodel._transformers import (
     NeMoAutoModelForCausalLM,
@@ -71,6 +70,7 @@ from nemo_automodel.components.distributed.context_parallel import ContextParall
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
@@ -103,12 +103,12 @@ from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
+    clip_grads_for_optimizers,
     count_tail_padding,
     get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
-    scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
@@ -172,12 +172,6 @@ def _should_pack_validation(
         or bool(getattr(model, "_te_attention_injected", False))
         or model_requires_packing
     )
-
-
-def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
-    """Return whether the recipe should attach PP causal-mask precomputation."""
-    # TODO: Replace model-type exceptions with a shared mask-ownership capability.
-    return getattr(model_config, "model_type", None) not in ("deepseek_v4", "glm_moe_dsa")
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -432,55 +426,6 @@ def _build_tokenizer(cfg_model, cfg_ds):
             # If we can't get the signature, skip adding tokenizer
             pass
     return kwargs, tokenizer
-
-
-def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
-    """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
-
-    ``None`` when PP is disabled, the model config can't be loaded, or the model
-    computes masks internally (e.g. ``deepseek_v4`` or ``glm_moe_dsa``).  Passed to
-    :meth:`DataloaderConfig.build` as ``collate_wrapper``.
-    """
-    if not pp_enabled:
-        return None
-    try:
-        hf_model_config = AutoConfig.from_pretrained(
-            _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
-        )
-    except Exception:
-        logger.warning(
-            "Failed to load model config for causal mask precomputation. "
-            "Pipeline parallel mask precomputation will be skipped."
-        )
-        return None
-    if not _should_precompute_pp_causal_masks(hf_model_config):
-        logger.info(
-            "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
-            getattr(hf_model_config, "model_type", None),
-        )
-        return None
-
-    from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
-
-    def wrapper(base_collate_fn):
-        def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
-            """Collate examples and attach pipeline-parallel causal masks.
-
-            Args:
-                batch: Raw examples accepted by ``base_fn``. Standard token-list fields have per-example shape
-                    ``[S_i]`` and pre-batched tensor fields have shape ``[B_i, ...]``, where ``S_i`` is an
-                    example sequence length and ``B_i`` is a source batch size.
-
-            Returns:
-                Collated mapping whose standard token tensors have shape ``[B, S]``, where ``B`` is local batch
-                size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
-                same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
-            """
-            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
-
-        return chained_collate_fn
-
-    return wrapper
 
 
 def _build_partial_cuda_graph_manager(
@@ -867,7 +812,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             validate_thd_packing_support(self.model_parts)
         elif dataloader_config.is_packed:
             configure_packing_for_models(self.model_parts)
-        collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config: DataloaderConfig, *, is_training: bool = True):
             process_group = getattr(self.mesh_context, "process_group", None)
@@ -893,7 +837,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     else self.cfg.get("distributed.cp_size", 1)
                 ),
                 packing_contract=packing_contract,
-                collate_wrapper=collate_wrapper,
                 ignore_index=_get_loss_ignore_index(self.loss_fn),
                 training_schedule=DatasetBuildSchedule(
                     local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
@@ -1288,6 +1231,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
         """
+        if self.pp_enabled and "_packed_seq_ids" in batch:
+            # Flat Flash offsets span the whole local batch and cannot be split
+            # into PP microbatches. Each model stage rebuilds them from its rows'
+            # document IDs after splitting; keep THD-only metadata unchanged.
+            batch = {
+                key: value
+                for key, value in batch.items()
+                if key not in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+            }
         batch = move_batch_to_device(batch, self.dist_env.device)
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
@@ -1577,6 +1529,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
+    def _get_dp_process_group(self, include_cp: bool = True):
+        """Process group over which ranks hold the same parameters (dp, plus cp when enabled).
+
+        Unlike ``_get_dp_group`` this returns the group even when its size is 1, so callers never
+        fall back to the default (world) group. Returns ``None`` only without a device mesh.
+        """
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh:
+            return None
+        dp_mesh = get_flat_mesh(device_mesh, "dp")
+        if include_cp and device_mesh["cp"].size() > 1:
+            dp_mesh = get_flat_mesh(device_mesh, "dp_cp")
+        return dp_mesh.get_group()
+
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
@@ -1655,9 +1621,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 prepare_after_first_microbatch()
 
         synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
-        grad_norm = scale_grads_and_clip_grad_norm(
+        grad_norm = clip_grads_for_optimizers(
+            self.optimizer,
             max_grad_norm,
             self.model_parts,
+            dp_group=self._get_dp_process_group(include_cp=True),
             norm_type=2.0,
             pp_enabled=self.pp_enabled,
             device_mesh=self.device_mesh,
