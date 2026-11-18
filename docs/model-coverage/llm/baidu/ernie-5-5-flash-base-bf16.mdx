@@ -346,7 +346,7 @@ on the same topology, without `uv run` and with checkpoint saving disabled.
 | Expert dispatch | HybridEP (`experts: torch_mm`, `dispatcher: hybridep`) |
 | Adapters | Adapter rank 8 (`peft.dim`), alpha 32 on the targets of the recipe: 856 BF16 tensors on 386 modules, 1,790,614,528 parameters (0.64% of all parameters) |
 | Workload | SQuAD, single unpacked documents of at most 256 tokens; local batch size 1, global batch size 8; 100 optimizer updates |
-| GPU memory | 65.8 GiB allocated on every GPU after loading; peak 102.5 GiB allocated (`torch.cuda.max_memory_allocated`, largest of the 8 ranks); 109.9 GiB used on the fullest GPU as sampled with `nvidia-smi` |
+| GPU memory | 65.8 GiB allocated on every GPU after loading; peak 102.5 GiB allocated during an update (`torch.cuda.max_memory_allocated`, largest of the 8 ranks); 109.9 GiB used on the fullest GPU as sampled with `nvidia-smi` |
 | Step time | 32.4 s for the first update, after the extra initial validation; median 1.95 s over the 98 updates from the third on, with single updates of up to 3.56 s. The first update is not a cold-start measurement because validation had already initialized HybridEP |
 | Loss | Validation loss 0.3104 before training, 0.1351 after 50 updates, and 0.1323 after 100, on 367 label tokens. Training loss 0.3184 at the first update and 0.3044 at the last; an update has 11 to 58 label tokens, and the mean training loss is 0.3066 over the first 10 updates and 0.2171 over the last 10 |
 

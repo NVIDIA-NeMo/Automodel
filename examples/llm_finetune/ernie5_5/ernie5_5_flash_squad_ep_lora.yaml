@@ -28,8 +28,8 @@
 # ernie5_5_flash_squad_ep.yaml. It does not shrink the weights a rank holds (its expert group
 # and its shard of the dense weights), and a step still keeps the activations of the forward
 # pass for the backward pass. In a 100-update HybridEP run, a GPU held 65.8 GiB after
-# loading and the fullest rank peaked at 102.5 GiB allocated. The run used a measuring
-# wrapper and the recipe's schedule, with only the checkpoint directory changed.
+# loading and the fullest rank peaked at 102.5 GiB allocated during an update. The run used
+# a measuring wrapper and the recipe's schedule, with only the checkpoint directory changed.
 # HybridEP requires DeepEP with HybridEP support and compiles kernels at the first dispatch.
 # Place both nodes of this 8-rank expert group in one NVLink domain. Leave
 # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset; if the nodes share a home directory, set
