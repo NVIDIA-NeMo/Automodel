@@ -546,6 +546,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        """Replace the language-model head inside the multimodal wrapper."""
         self.lm_head = new_embeddings
 
     def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:

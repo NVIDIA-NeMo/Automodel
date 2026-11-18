@@ -27,6 +27,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 
 from .config import Inkling2TextConfig
 from .context_parallel import convolution_history
@@ -146,6 +147,23 @@ class Inkling2MoE(MoE):
             self.experts.expert_activation = activation
         else:
             cast(GroupedExperts, self.experts).expert_activation_grouped = activation
+
+
+class Inkling2LMHead(Float32LogitsLinear):
+    """Bias-free output projection with FP32 arithmetic and ordinary FSDP hooks."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Project through the module boundary so FSDP gathers its weight.
+
+        Args:
+            input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            FP32 tensor of shape [..., vocab]. Weight storage may be FP32 or BF16.
+            The caller applies softcapping and unused-vocabulary masking.
+        """
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            return F.linear(input.float(), self.weight.float(), self.bias.float() if self.bias is not None else None)
 
 
 class ShortConvolution(nn.Module):

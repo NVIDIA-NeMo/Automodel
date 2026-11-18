@@ -25,7 +25,7 @@ from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.infrastructure import _use_fp32_logits
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 
 _VOCAB = 128
 

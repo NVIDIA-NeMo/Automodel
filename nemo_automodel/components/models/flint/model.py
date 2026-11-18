@@ -30,7 +30,6 @@ from transformers.modeling_utils import PreTrainedModel
 
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_round_robin
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -44,6 +43,7 @@ from nemo_automodel.components.models.flint.packing import _prepare_inputs_for_c
 from nemo_automodel.components.models.flint.parallelization import FlintModelParallelizer
 from nemo_automodel.components.models.flint.state_dict_adapter import FlintStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str
 
 

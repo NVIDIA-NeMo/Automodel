@@ -34,8 +34,8 @@ from transformers import Glm4MoeLiteConfig, MiniMaxM2Config, Mistral3Config, Nem
 from nemo_automodel._transformers.infrastructure import _use_fp32_logits
 from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.hy_mt2.config import HyMT2Config
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 
 # Registered classes without a vocabulary head: embedding, decision and policy models.
 _NO_LM_HEAD = {

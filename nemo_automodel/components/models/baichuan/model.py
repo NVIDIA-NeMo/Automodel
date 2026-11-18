@@ -48,11 +48,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
-from nemo_automodel.components.models.common.fp32_logits import (
-    Float32LogitsConvertible,
-    Float32LogitsLinear,
-    linear_with_fp32_logits,
-)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -60,6 +55,11 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
+from nemo_automodel.shared.fp32_logits import (
+    Float32LogitsConvertible,
+    Float32LogitsLinear,
+    linear_with_fp32_logits,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -278,7 +278,8 @@ def _normalized_weight(head: NormHead | Float32LogitsNormHead) -> torch.Tensor:
         return F.normalize(head.weight)
     if head.first_flag:
         head.first_flag = False
-        head.weight.data = F.normalize(head.weight)
+        with torch.no_grad():
+            head.weight.copy_(F.normalize(head.weight))
     return head.weight
 
 

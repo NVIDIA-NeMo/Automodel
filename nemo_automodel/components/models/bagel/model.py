@@ -389,6 +389,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         return self.model.language_model.get_output_embeddings()
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        """Replace the language-model head inside the multimodal wrapper."""
         self.model.language_model.set_output_embeddings(new_embeddings)
 
     # ------------------------------------------------------------------

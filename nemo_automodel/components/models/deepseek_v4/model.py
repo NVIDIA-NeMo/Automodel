@@ -57,7 +57,6 @@ from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -105,6 +104,7 @@ from nemo_automodel.components.models.deepseek_v4.vision import (
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import Gate, MoE
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 

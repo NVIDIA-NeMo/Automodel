@@ -36,7 +36,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
 
 pytestmark = pytest.mark.cpu_only
 

@@ -330,7 +330,7 @@ def test_transformed_head_rejected_before_training():
 
 @pytest.mark.parametrize("chunk_len", [4, 64])
 def test_fp32_projection_reproduces_the_fp32_logits_head(chunk_len):
-    from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+    from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 
     torch.manual_seed(71)
     model = torch.nn.Module()
@@ -386,7 +386,7 @@ def test_compiled_chunks_keep_the_fp32_projection():
 
 
 def test_validate_lm_head_accepts_plain_and_fp32_logits_heads():
-    from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+    from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 
     class TransformedHead(Float32LogitsLinear):
         def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -413,7 +413,7 @@ def test_validate_lm_head_accepts_plain_and_fp32_logits_heads():
 def test_mtp_depths_project_like_the_fp32_logits_head():
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-    from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+    from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 
     torch.manual_seed(73)
     bf16_head = torch.nn.Linear(24, 53, bias=False, dtype=torch.bfloat16)
@@ -438,7 +438,7 @@ def test_mtp_depths_project_like_the_fp32_logits_head():
 def test_recipe_setup_accepts_an_fp32_logits_head_for_chunked_ce(recipe):
     import importlib
 
-    from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+    from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 
     _maybe_downgrade_loss_fn = importlib.import_module(f"nemo_automodel.recipes.{recipe}")._maybe_downgrade_loss_fn
 

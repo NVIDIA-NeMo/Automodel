@@ -23,7 +23,6 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -46,6 +45,7 @@ from nemo_automodel.components.models.muse_spark.state_dict_adapter import MuseS
 from nemo_automodel.components.models.muse_spark.vision import MuseSparkVisionModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 from nemo_automodel.shared.import_utils import safe_import
 
 

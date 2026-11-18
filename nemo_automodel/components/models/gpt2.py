@@ -168,9 +168,11 @@ class GPT2LMHeadModel(nn.Module):
         self._init_weights()
 
     def get_output_embeddings(self) -> nn.Module:
+        """Return the language-model output head."""
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        """Replace the language-model output head."""
         self.lm_head = new_embeddings
 
     def forward(self, input_ids: torch.LongTensor, **kwargs) -> torch.Tensor:  # (B, T) → (B, T, V)

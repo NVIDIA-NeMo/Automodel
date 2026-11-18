@@ -33,10 +33,10 @@ from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.kd_loss import KDLoss
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 from tests.unit_tests.recipes.test_train_ft import _patch_setup_minimals
 
 pytestmark = pytest.mark.cpu_only

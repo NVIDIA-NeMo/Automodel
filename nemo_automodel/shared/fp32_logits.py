@@ -48,6 +48,8 @@ from torch import nn
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
+from nemo_automodel.shared.import_utils import safe_import_from
+
 __all__ = ["Float32LogitsConvertible", "Float32LogitsLinear", "head_compute_dtype", "linear_with_fp32_logits"]
 
 
@@ -106,10 +108,11 @@ class _Float32LogitsMatmul(torch.autograd.Function):
         input, weight = ctx.saved_tensors
         grad = grad_logits.reshape(-1, grad_logits.shape[-1]).to(weight.dtype)
         grad_input = grad_weight = None
-        if ctx.needs_input_grad[0]:
-            grad_input = (grad @ weight).view(input.shape)
-        if ctx.needs_input_grad[1]:
-            grad_weight = grad.t() @ input.reshape(-1, input.shape[-1])
+        with torch.autocast(device_type=weight.device.type, enabled=False):
+            if ctx.needs_input_grad[0]:
+                grad_input = (grad @ weight).view(input.shape)
+            if ctx.needs_input_grad[1]:
+                grad_weight = grad.t() @ input.reshape(-1, input.shape[-1])
         return grad_input, grad_weight
 
 
@@ -196,14 +199,11 @@ def _linear_backend_classes() -> tuple[type[nn.Module], ...]:
         ``nn.Linear`` and the imported Transformer Engine and quack ``Linear`` classes.
     """
     classes: list[type[nn.Module]] = [nn.Linear]
-    if "transformer_engine.pytorch.module.linear" in sys.modules:
-        from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
-
-        classes.append(TransformerEngineLinear)
-    if "quack.linear" in sys.modules:
-        from quack.linear import Linear as QuackLinear
-
-        classes.append(QuackLinear)
+    for module_name in ("transformer_engine.pytorch.module.linear", "quack.linear"):
+        if module_name in sys.modules:
+            available, linear = safe_import_from(module_name, "Linear")
+            if available:
+                classes.append(linear)
     return tuple(classes)
 
 

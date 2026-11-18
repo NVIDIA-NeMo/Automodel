@@ -31,8 +31,8 @@ from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.models.common.fp32_logits import head_compute_dtype
 from nemo_automodel.components.moe.config import NcclEpConfig
+from nemo_automodel.shared.fp32_logits import head_compute_dtype
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
@@ -1608,8 +1608,7 @@ def compute_lm_head_logits(
                 sliced = hidden_states[slice_indices, :]
             else:
                 sliced = hidden_states[:, slice_indices, :]
-        compute_dtype = head_compute_dtype(lm_head)
-        logits = lm_head(sliced.to(compute_dtype) if compute_dtype is not None else sliced)
+        logits = lm_head(sliced.to(head_compute_dtype(lm_head)))
     if is_thd and logits.dim() == 2:
         logits = logits.unsqueeze(0)
 

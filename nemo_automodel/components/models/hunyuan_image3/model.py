@@ -318,6 +318,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        """Replace the output head used by text generation."""
         self.lm_head = new_embeddings
 
     def forward(

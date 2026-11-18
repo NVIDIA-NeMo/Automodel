@@ -257,22 +257,22 @@ model:
   logits_dtype: float32
 ```
 
-The head GEMM reads the hidden states and the head weight in the head's compute dtype (bf16 by default), accumulates in fp32 and writes fp32 logits, so no logit is rounded to bf16. This differs from `mp_policy.output_dtype: float32`, which upcasts logits that were already rounded to bf16. Parameter storage, master weights, optimizer state, gradient reduction and checkpoint keys are unchanged, and tied embeddings stay tied. In backward, the logits gradient is cast to the compute dtype and the head uses the same GEMMs as the default head.
+For a standard linear head, the GEMM reads the hidden states and the head weight in the head's compute dtype (bf16 by default), accumulates in fp32 and writes fp32 logits, so no logit is rounded to bf16. This differs from `mp_policy.output_dtype: float32`, which upcasts logits that were already rounded to bf16. Parameter storage, master weights, optimizer state, gradient reduction and checkpoint keys are unchanged, and tied embeddings stay tied. In backward, the logits gradient is cast to the compute dtype and the head uses the same GEMMs as the default head.
 
 Some models compute fp32 logits by design and return them without `logits_dtype`: DeepSeek-V4, DeepSeek-V4.1, Flint, Inkling2, HY-MT2 with `enable_lm_head_fp32` (its default), and Muse Spark with `use_fp32_for_output`.
 
 | Configuration | Status |
 | --- | --- |
-| Any model with a language-model head, NeMo AutoModel or Hugging Face implementation, including `force_hf` | Supported. The head can be a PyTorch, Transformer Engine or quack linear layer, with or without a bias. Models without a language-model head, such as embedding models, are rejected at setup. |
-| FSDP2, including a tied input embedding and head | Supported |
+| NeMo AutoModel or Hugging Face model that calls its replaceable language-model head, including `force_hf` | Supported for PyTorch, Transformer Engine and quack linear heads, and native heads with a custom conversion. Models without an output head are rejected at setup. |
+| FSDP2, including a tied input embedding and head | Supported. Use an outer FSDP `mp_policy.output_dtype` of `null` or `float32` to keep the FP32 logits at the model boundary. |
 | Tensor parallelism with a column-parallel head, with or without sequence parallelism | Supported for bias-free heads |
 | HSDP, context parallelism, and FSDP2 combined with tensor parallelism | Not yet validated |
 | Pipeline parallelism | Rejected at setup |
 | LoRA, quantized or QAT LM heads | Rejected at setup |
 | A Transformer Engine head under FP8 training | Supported; the head projects in its compute dtype instead of fp8. |
 | `MaskedCrossEntropy` and other logits-based losses | Supported; they consume the fp32 logits. |
-| `ChunkedCrossEntropy` | Supported; each chunk reproduces the fp32 projection. |
-| `FusedLinearCrossEntropy` with `impl: cce` | Supported; the kernel computes logits in fp32 internally. |
+| `ChunkedCrossEntropy` | Supported for a bias-free linear head without model-specific logit transformations. Each chunk reproduces the FP32 projection. |
+| `FusedLinearCrossEntropy` with `impl: cce` | The CUDA kernel computes logits in FP32 internally and requires BF16 or FP16 hidden states and head weights. |
 | `FusedLinearCrossEntropy` with `impl: torch_compile` | Rounds logits to the head's compute dtype, so the loss does not see fp32 logits; use `impl: cce`. |
 
 The fp32 logits tensor is twice the size of bf16 logits. Losses that upcast logits to fp32 already hold a tensor of that size, so measure end-to-end memory for your workload.

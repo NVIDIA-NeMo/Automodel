@@ -68,7 +68,6 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
@@ -98,6 +97,7 @@ from nemo_automodel.components.utils.model_utils import (
     parse_freeze_config,
     print_trainable_parameters,
 )
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
@@ -698,8 +698,8 @@ def apply_model_infrastructure(
             models that already use TE via BackendConfig). Default: False.
         load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
         logits_dtype: ``torch.float32`` (or ``"float32"``) makes the LM-head GEMM write FP32
-            logits from operands in the head's compute dtype, for any model with an LM head.
-            Parameter storage and the FSDP policy are unchanged. Default: None (model default).
+            logits from operands in the head's compute dtype when the model calls a supported
+            output head. Parameter storage and the FSDP policy are unchanged. Default: None.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:

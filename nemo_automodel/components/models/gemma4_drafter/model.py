@@ -27,12 +27,12 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 
 _GEMMA4_ASSISTANT_MSG = "transformers.models.gemma4_assistant is not available."

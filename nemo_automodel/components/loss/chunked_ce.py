@@ -22,7 +22,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.components.models.common.fp32_logits import (
+from nemo_automodel.shared.fp32_logits import (
     Float32LogitsLinear,
     head_compute_dtype,
     linear_with_fp32_logits,

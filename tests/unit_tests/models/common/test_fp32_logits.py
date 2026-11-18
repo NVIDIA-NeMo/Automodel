@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.models.common.fp32_logits import (
+from nemo_automodel.shared.fp32_logits import (
     Float32LogitsConvertible,
     Float32LogitsLinear,
     head_compute_dtype,
@@ -101,6 +101,20 @@ def test_autocast_does_not_lower_logits():
 
     assert logits.dtype == torch.float32
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
+def test_fp32_head_backward_keeps_fp32_under_autocast():
+    generator = torch.Generator().manual_seed(17)
+    head = Float32LogitsLinear(5, 7, bias=False, dtype=torch.float32)
+    hidden = torch.randn(3, 5, generator=generator, requires_grad=True)
+    upstream = torch.randn(3, 7, generator=generator)
+    expected = torch.autograd.grad(head(hidden), (hidden, head.weight), upstream)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = torch.autograd.grad(head(hidden), (hidden, head.weight), upstream)
+
+    for actual_grad, expected_grad in zip(actual, expected):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("bias", [False, True])

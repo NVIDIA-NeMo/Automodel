@@ -59,7 +59,6 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -109,6 +108,7 @@ from nemo_automodel.components.models.deepseek_v41.vision import (
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str
 
 
