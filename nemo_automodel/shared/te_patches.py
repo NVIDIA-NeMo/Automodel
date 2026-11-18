@@ -287,6 +287,7 @@ def _apply_fused_adam_in_place_load_patch() -> None:
 # for it every time without replaying the per-parameter walk first. Dropped with the plans on
 # ``load_state_dict`` / ``add_param_group``; the uninitialised-state case (first step) is *not* negative-cached.
 _FUSED_ADAM_NO_PLAN = object()
+_FUSED_ADAM_MAX_TENSORS_PER_CALL = 1024
 
 
 class _FusedAdamGroupPlan:
@@ -359,6 +360,8 @@ def _apply_fused_adam_cached_lists_patch() -> None:
     dropped on ``load_state_dict`` and ``add_param_group``; a group that can never take the cached
     path (FP8 parameters, fp16 moments or master weights, mixed fp16 + bf16) is remembered as such,
     so the original ``step`` runs for it without a per-parameter walk first.
+    Cached kernel calls use batches of at most 1024 parameters per tensor list, preserving TE 2.20.2's bounded
+    native tensor-handle allocation while retaining the cache for larger parameter groups.
 
     Deliberately *not* checked between steps: parameter dtype and shape, the identity of
     ``state["exp_avg"]`` / ``state["exp_avg_sq"]`` / ``state["master_param"]``, and the optimizer's
@@ -506,10 +509,16 @@ def _apply_fused_adam_cached_lists_patch() -> None:
                     tensor_lists.append(plan.f16_master)
                     if self.store_param_remainders and plan.has_bf16 and not plan.has_fp16:
                         adam_func = self.multi_tensor_adam_param_remainder
-                applier(adam_func, self._dummy_overflow_buf, tensor_lists, *kernel_args)
+                # Match the per-list limit in TE 2.20.2 (commit 6ea2a74a9e98),
+                # bounding native tensor handles without rebuilding the cached plan.
+                for start in range(0, len(plan.f16_params), _FUSED_ADAM_MAX_TENSORS_PER_CALL):
+                    batch = [column[start : start + _FUSED_ADAM_MAX_TENSORS_PER_CALL] for column in tensor_lists]
+                    applier(adam_func, self._dummy_overflow_buf, batch, *kernel_args)
             if plan.f32_params:
                 tensor_lists = [grads_of(plan.f32_params), datas_of(plan.f32_params), plan.f32_m, plan.f32_v]
-                applier(self.multi_tensor_adam, self._dummy_overflow_buf, tensor_lists, *kernel_args)
+                for start in range(0, len(plan.f32_params), _FUSED_ADAM_MAX_TENSORS_PER_CALL):
+                    batch = [column[start : start + _FUSED_ADAM_MAX_TENSORS_PER_CALL] for column in tensor_lists]
+                    applier(self.multi_tensor_adam, self._dummy_overflow_buf, batch, *kernel_args)
         return None
 
     def load_state_dict(self, state_dict):

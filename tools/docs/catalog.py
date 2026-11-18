@@ -122,6 +122,7 @@ MODEL_TYPE_OVERVIEW_PATHS = (
     ("Diffusion", "diffusion/index.mdx"),
     ("Embedding", "embedding/index.mdx"),
     ("Reranking", "reranker/index.mdx"),
+    ("WAM", "wam/index.mdx"),
 )
 
 
@@ -135,6 +136,7 @@ MODEL_TYPE_ROUTE_CATEGORIES = {
     "Diffusion": "diffusion",
     "Embedding": "embedding-models",
     "Reranking": "reranking-models",
+    "WAM": "wam",
 }
 
 
@@ -170,15 +172,16 @@ PROVIDER_ORGS = {
     "internlm": "internlm",
     "lgai-exaone": "LGAI-EXAONE",
     "lightricks": "Lightricks",
+    "liquidai": "LiquidAI",
     "llava-hf": "llava-hf",
     "lmms-lab": "lmms-lab",
     "meta": "meta-llama",
+    "meta-models": "meta-models",
     "microsoft": "microsoft",
     "MiniMaxAI": "MiniMaxAI",
     "mistralai": "mistralai",
     "moonshotai": "moonshotai",
     "nanbeige": "Nanbeige",
-    "meta-models": "meta-models",
     "nvidia": "nvidia",
     "openai": "openai",
     "openai-community": "openai-community",
@@ -190,6 +193,7 @@ PROVIDER_ORGS = {
     "qwen": "Qwen",
     "recursivesi": "RecursiveSI",
     "reflection": "reflection",
+    "runwayml": "runwayml",
     "stabilityai": "stabilityai",
     "stepfun-ai": "stepfun-ai",
     "tencent": "tencent",

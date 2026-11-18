@@ -76,7 +76,7 @@ class ColorFormatter(logging.Formatter):
     Colors can be disabled by setting the NO_COLOR env var, or forced with FORCE_COLOR.
     """
 
-    def __init__(self, fmt: str | None = None, datefmt: str | None = None, use_color: bool = True):
+    def __init__(self, fmt: str | None = None, datefmt: str | None = None, use_color: bool = True) -> None:
         if fmt is None:
             fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
         if datefmt is None:

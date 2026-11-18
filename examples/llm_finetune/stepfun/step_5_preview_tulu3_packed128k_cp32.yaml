@@ -132,6 +132,7 @@ clip_grad_norm:
 #   dir: <your_wandb_save_dir>
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: HuiyingLi
   nodes: 16
   cluster_tag: h100

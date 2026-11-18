@@ -27,6 +27,7 @@ from torch.utils.checkpoint import checkpoint
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.minimax_m3_vl import msa, msa_bindings
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.kernels import MSA_CAPABILITIES
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
     MiniMaxM3Attention,
     MiniMaxM3Indexer,
@@ -43,8 +44,8 @@ _PP_WORKER = __name__ == "__main__" and "--pp-worker" in sys.argv
 
 
 def _unavailable() -> str | None:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        return "requires an SM100 GPU"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in MSA_CAPABILITIES:
+        return "requires an SM100 or SM103 GPU"
     try:
         msa_bindings.kernels()
     except UnavailableError:
@@ -368,8 +369,10 @@ def test_full_model_runs_dense_layers_through_a_varlen_backend() -> None:
 
 
 def test_two_rank_pipeline_forward_backward_parity() -> None:
-    if torch.cuda.device_count() < 2 or any(torch.cuda.get_device_capability(i) != (10, 0) for i in range(2)):
-        pytest.skip("requires two SM100 GPUs")
+    if torch.cuda.device_count() < 2 or any(
+        torch.cuda.get_device_capability(i) not in MSA_CAPABILITIES for i in range(2)
+    ):
+        pytest.skip("requires two SM100 or SM103 GPUs")
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(env.get("CUDA_VISIBLE_DEVICES", "0,1").split(",")[:2])
     root = str(Path(__file__).resolve().parents[4])

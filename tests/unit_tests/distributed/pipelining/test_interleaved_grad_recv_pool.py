@@ -41,6 +41,8 @@ def make_schedule(virtual: int, microbatches: int, physical: int = 4) -> Schedul
     schedule._stages = []
     schedule.stage_index_to_group_rank = {stage: stage % physical for stage in range(physical * virtual)}
     schedule._defer_pp_recv = False
+    # Match _PipelineScheduleRuntime.__init__ in PyTorch 2.15; older generators ignore it.
+    schedule._max_active_stages = 3
     schedule.number_of_rounds = max(1, microbatches // physical)
     schedule.microbatches_per_round = microbatches // schedule.number_of_rounds
     schedule.pipeline_order = {rank: schedule._calculate_single_rank_operations(rank) for rank in range(physical)}

@@ -343,6 +343,8 @@ def build_kimi_k3_dflash_draft_config(
     draft_config.num_experts = None
     draft_config.num_shared_experts = 0
     draft_config.linear_attn_config = {"kda_layers": [], "full_attn_layers": list(range(1, num_draft_layers + 1))}
+    # A Kimi K3.1 target's DSA layer indices do not describe the draft's dense MLA layers.
+    draft_config.dsa_config = None
     draft_config.num_nextn_predict_layers = 0
     draft_config.attn_res_block_size = None
     draft_config.tie_word_embeddings = False

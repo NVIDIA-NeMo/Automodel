@@ -107,8 +107,12 @@ def test_selected_keys_match_independent_half_split_rotation(indexer):
     torch.testing.assert_close(_late_sets(actual), _late_sets(expected))
 
 
-def test_selected_keys_match_transformers_indexer(indexer):
+@pytest.mark.parametrize("key_scale", [1.0, 1e-4])
+def test_selected_keys_match_transformers_indexer(indexer: DeepseekV32Indexer, key_scale: float) -> None:
+    """Compare sparse key selections with HF for ordinary and low-variance keys."""
     x, q_resid, angles, freqs_cis, causal = _inputs()
+    # Low-variance keys expose the epsilon mismatch that ordinary random inputs hide.
+    x = x * key_scale
     hf_config = HFDeepseekV32Config(
         hidden_size=HIDDEN,
         q_lora_rank=Q_LORA_RANK,

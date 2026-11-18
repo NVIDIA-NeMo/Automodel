@@ -170,6 +170,9 @@ def test_single_rank_gloo_device_train_save_reload(case: str, device_index: int,
         pytest.skip(f"requires CUDA device {device_index}")
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), case, str(device_index), str(tmp_path)],
+        # These tiny CPU/Gloo cases also run in GPU CI jobs, where the unit-test
+        # launcher does not bound host thread pools. Keep each child bounded.
+        env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"},
         capture_output=True,
         text=True,
         timeout=60,

@@ -33,6 +33,40 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 class TestCreatePipelineForwardInner:
     """Test create_pipeline_forward_inner function."""
 
+    def test_public_flash_metadata_reaches_each_decoder_layer(self):
+        model = nn.Module()
+        model.config = Mock(layer_types=None)
+        model.embed_tokens = nn.Embedding(16, 4)
+        model.rotary_emb = None
+        model.norm = None
+
+        class CaptureLayer(nn.Module):
+            def forward(self, hidden_states, **kwargs):
+                """Capture decoder kwargs for hidden states [batch, sequence, hidden]."""
+                self.received = kwargs
+                return hidden_states
+
+        model.layers = nn.ModuleList([CaptureLayer(), CaptureLayer()])
+        offsets = torch.tensor([0, 2, 4], dtype=torch.int32)
+        metadata = {
+            "cu_seq_lens_q": offsets,
+            "cu_seq_lens_k": offsets,
+            "max_length_q": 2,
+            "max_length_k": 2,
+        }
+        positions = torch.tensor([[0, 1, 0, 1]])
+        create_pipeline_forward_inner("PipelineStage")(
+            model,
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            position_ids=positions,
+            causal_mask_mapping={"full_attention": None},
+            **metadata,
+        )
+        for layer in model.layers:
+            for key, value in metadata.items():
+                assert layer.received[key] is value
+            assert layer.received["position_ids"] is positions
+
     def test_returns_callable(self):
         forward_fn = create_pipeline_forward_inner("AutoModel")
         assert callable(forward_fn)
@@ -41,7 +75,7 @@ class TestCreatePipelineForwardInner:
     def test_forward_with_embeddings(self, mock_arange):
         # Create mock model with embeddings
         mock_model = Mock()
-        mock_model.config = Mock(output_attentions=False, output_hidden_states=False, use_cache=True)
+        mock_model.config = Mock(layer_types=None, output_attentions=False, output_hidden_states=False, use_cache=True)
         mock_model.gradient_checkpointing = False
 
         # Mock embed_tokens
@@ -535,7 +569,7 @@ class TestValidateHfModelForPipelineSupport:
 
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
-            tie_word_embeddings = True  # Needed to enable the tied-weights check
+            tie_word_embeddings = True
             is_encoder_decoder = False
 
         class _Inner(nn.Module):
@@ -555,6 +589,26 @@ class TestValidateHfModelForPipelineSupport:
         model = MockModel()
 
         with pytest.raises(ValueError, match="Pipeline parallelism does not support tie_word_embeddings=True"):
+            validate_hf_model_for_pipeline_support(model)
+
+    @pytest.mark.parametrize("tied", [False, True])
+    def test_validate_meta_alias_independent_of_nested_tie_flag(self, tied):
+        model = nn.Module()
+        model.config = SimpleNamespace(
+            model_type="mistral3",
+            tie_word_embeddings=True,
+            text_config=SimpleNamespace(tie_word_embeddings=False),
+        )
+        model.model = nn.Module()
+        model.model.language_model = nn.Module()
+        model.model.language_model.embed_tokens = nn.Embedding(4, 4, device="meta")
+        model.lm_head = nn.Linear(4, 4, bias=False, device="meta")
+        if tied:
+            model.lm_head.weight = model.model.language_model.embed_tokens.weight
+            with pytest.raises(ValueError, match="does not support tie_word_embeddings=True"):
+                validate_hf_model_for_pipeline_support(model)
+        else:
+            # Distinct meta parameters both have a null data pointer, but are not tied.
             validate_hf_model_for_pipeline_support(model)
 
     def test_validate_encoder_decoder_model(self):
@@ -761,7 +815,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_hidden_states_not_collected(self):
         """Hidden states are not collected in the new inner forward."""
         mock_model = Mock()
-        mock_model.config = Mock()
+        mock_model.config = Mock(layer_types=None)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.rotary_emb = None
@@ -784,7 +838,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_attention_type_handling(self):
         """Test attention type handling for layers."""
         mock_model = Mock()
-        mock_model.config = Mock()
+        mock_model.config = Mock(layer_types=None)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.rotary_emb = None
@@ -829,7 +883,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_attentions_not_collected(self):
         """Attentions are not collected in the new inner forward."""
         mock_model = Mock()
-        mock_model.config = Mock()
+        mock_model.config = Mock(layer_types=None)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.rotary_emb = None
@@ -1200,18 +1254,25 @@ class TestPipelineForwardMistral3Vlm:
         call_kwargs = m.model.get_image_features.call_args.kwargs
         assert call_kwargs["vision_feature_layer"] == -1
 
-    def test_chunk_retrieval_skipped_when_no_image_tokens(self):
-        """If input_ids has no image_token_id, the chunk-retrieval gate
-        does not fire (defensive — text-only batches may still pass through)."""
+    def test_text_microbatch_advances_to_next_image_chunk(self):
+        """Text-only input consumes its empty chunk without calling the vision model."""
         m = self._make_first_stage_model(image_token_id=10)
-        m._vlm_pixel_values_chunks = [torch.zeros(1, 3, 8, 8)]
-        m._vlm_image_grid_hws_chunks = None
+        image = torch.ones(1, 3, 8, 8)
+        sizes = torch.tensor([[8, 8]])
+        m._vlm_pixel_values_chunks = [image[:0], image]
+        m._vlm_image_grid_hws_chunks = [sizes[:0], sizes]
         m._vlm_chunk_idx = 0
-        # input_ids contains NO image tokens (token 10 absent).
-        m.model.language_model.forward = Mock(return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16))
         m(input_ids=torch.tensor([[1, 2, 3, 4, 5]]), pixel_values=None)
         m.model.get_image_features.assert_not_called()
-        assert m._vlm_chunk_idx == 0  # unchanged
+        assert m._vlm_chunk_idx == 1
+
+        m.model.get_image_features.return_value = SimpleNamespace(pooler_output=(torch.zeros(1, 4),))
+        m.model.get_placeholder_mask.return_value = torch.zeros(1, 5, 4, dtype=torch.bool)
+        m(input_ids=torch.tensor([[10, 2, 3, 4, 5]]), pixel_values=None)
+        assert m._vlm_chunk_idx == 2
+        m.model.get_image_features.assert_called_once()
+        assert m.model.get_image_features.call_args.kwargs["pixel_values"] is image
+        assert m.model.get_image_features.call_args.kwargs["image_sizes"] is sizes
 
     def test_non_first_stage_passes_hidden_states(self):
         """Non-first stage: input_ids carries float hidden states — promote to

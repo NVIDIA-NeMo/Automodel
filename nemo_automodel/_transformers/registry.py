@@ -19,6 +19,7 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
+from types import ModuleType
 from typing import Dict, Tuple, Type, Union
 
 import torch.nn as nn
@@ -35,6 +36,11 @@ logger = logging.getLogger(__name__)
 # parallelization.PARALLELIZER; it requires compatibility with the HF layout.
 MODEL_ARCH_MAPPING = OrderedDict(
     [
+        (
+            "Lfm2VlForConditionalGeneration",
+            ("nemo_automodel.components.models.d1.vl_model", "Lfm2VlForConditionalGeneration"),
+        ),
+        ("D1OmniModel", ("nemo_automodel.components.models.d1.model", "D1OmniModel")),
         (
             "BagelForUnifiedMultimodal",
             (
@@ -140,6 +146,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.kimi_k3.model", "KimiK3ForCausalLM"),
         ),
         (
+            "KimiK31ForConditionalGeneration",
+            ("nemo_automodel.components.models.kimi_k3.multimodal", "KimiK31ForConditionalGeneration"),
+        ),
+        (
             "KimiVLForConditionalGeneration",
             ("nemo_automodel.components.models.kimivl.model", "KimiVLForConditionalGeneration"),
         ),
@@ -193,6 +203,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "LagunaForCausalLM",
             ("nemo_automodel.components.models.laguna.model", "LagunaForCausalLM"),
+        ),
+        (
+            "Lfm3ForCausalLM",
+            ("nemo_automodel.components.models.lfm3.model", "Lfm3ForCausalLM"),
+        ),
+        (
+            "Lfm3VlForConditionalGeneration",
+            ("nemo_automodel.components.models.lfm3.vl_model", "Lfm3VlForConditionalGeneration"),
         ),
         (
             "Ministral3ForCausalLM",
@@ -401,9 +419,18 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
         ),
         (
+            "Inkling2ForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling2.multimodal", "Inkling2ForConditionalGeneration"),
+        ),
+        (
+            "Inkling2ForCausalLM",
+            ("nemo_automodel.components.models.inkling2.model", "Inkling2ForCausalLM"),
+        ),
+        (
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
+        ("PraxisPolicy", ("nemo_automodel.components.models.praxis.model", "PraxisPolicy")),
     ]
 )
 
@@ -412,6 +439,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "d1_omni": ("nemo_automodel.components.models.d1.config", "D1OmniConfig"),
     "step5": ("nemo_automodel.components.models.step5.configuration", "Step5Config"),
     "step5_vl": ("nemo_automodel.components.models.step5.configuration", "Step5VLConfig"),
     "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
@@ -427,13 +455,20 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
+    "inkling2": ("nemo_automodel.components.models.inkling2.config", "Inkling2Config"),
+    "inkling2_mm_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2LegacyConfig"),
+    "inkling2_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2TextConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
+    "kimi_k31": ("nemo_automodel.components.models.kimi_k3.config", "KimiK31Config"),
     "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
     "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
+    "lfm3": ("nemo_automodel.components.models.lfm3.config", "Lfm3Config"),
+    "lfm3_vl": ("nemo_automodel.components.models.lfm3.config", "Lfm3VlConfig"),
+    "lfm3_vl_vision": ("nemo_automodel.components.models.lfm3.config", "Lfm3VlVisionConfig"),
     "llama_nemotron_vl": ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
@@ -472,6 +507,8 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
         "nemo_automodel.components.models.qwen3_8_flash_next.config",
         "Qwen3_8_FlashNextLegacyTextConfig",
     ),
+    # Step-3.5 and Step-3.7 share this text backbone config, including MTP metadata.
+    "step3p5": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7TextConfig"),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
@@ -479,7 +516,9 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 # Checkpoint model_type to local image/text processor implementation.
 _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
+    "kimi_k31": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
+    "lfm3_vl": ("nemo_automodel.components.models.lfm3.processing", "Lfm3VlProcessor"),
 }
 
 # model_types whose custom model implementation should win over a transformers
@@ -570,7 +609,7 @@ class _LazyArchMapping:
                 self._tags[key] = value[2]
         self._loaded: Dict[str, Type[nn.Module]] = {}
         self._extra: Dict[str, Type[nn.Module]] = {}
-        self._modules: Dict[str, object] = {}
+        self._modules: Dict[str, ModuleType] = {}
 
     def _load(self, key: str) -> Type[nn.Module]:
         if key in self._loaded:

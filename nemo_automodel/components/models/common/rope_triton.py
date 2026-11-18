@@ -43,6 +43,7 @@ Numerics follow the eager path by construction wherever PyTorch allows it:
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Protocol
 
 import torch
 
@@ -232,17 +233,25 @@ def _launch(values: torch.Tensor, frequencies: torch.Tensor, *, negate_sin: bool
     return output
 
 
+class _RopeContext(Protocol):
+    saved_tensors: tuple[torch.Tensor, ...]
+    needs_input_grad: tuple[bool, ...]
+    inverse: bool
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
+
+
 class _FusedRope(torch.autograd.Function):
     """Rotate with the fused kernel and rotate the gradient by the conjugate frequency."""
 
     @staticmethod
-    def forward(ctx: object, values: torch.Tensor, frequencies: torch.Tensor, inverse: bool) -> torch.Tensor:
+    def forward(ctx: _RopeContext, values: torch.Tensor, frequencies: torch.Tensor, inverse: bool) -> torch.Tensor:
         ctx.save_for_backward(frequencies)
         ctx.inverse = inverse
         return _launch(values, frequencies, negate_sin=inverse)
 
     @staticmethod
-    def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
+    def backward(ctx: _RopeContext, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
         if not ctx.needs_input_grad[0]:
             return None, None, None
         (frequencies,) = ctx.saved_tensors

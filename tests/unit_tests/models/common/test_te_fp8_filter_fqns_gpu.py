@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``te_fp8.filter_fqns`` keeps real Transformer Engine modules out of the FP8 autocast."""
+"""``te_fp8.exclude_fqns`` keeps real Transformer Engine modules out of the FP8 autocast."""
 
 from collections import OrderedDict
 
@@ -44,7 +44,7 @@ def test_filtered_te_linear_runs_in_the_model_dtype_inside_the_fp8_autocast():
     ).to(device)
     x = torch.randn(64, 256, device=device, dtype=torch.bfloat16)
     cfg = TEFp8Config(recipe="current")
-    assert cfg.apply_module_filter(model) == ["lm_head"]
+    assert cfg.exclude_modules(model) == ["lm_head"]
 
     with torch.no_grad():
         hidden = model.body(x)  # plain bf16 GEMM, outside any FP8 scope

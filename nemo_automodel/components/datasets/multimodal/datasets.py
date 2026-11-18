@@ -41,7 +41,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import yaml
 from PIL import Image, ImageFile, PngImagePlugin
@@ -422,13 +422,16 @@ DATASET_REGISTRY = {
 DEFAULT_DATASET_INFO = {}
 
 
+_ConfigValue: TypeAlias = str | int | float | bool | None | list["_ConfigValue"] | dict[str, "_ConfigValue"]
+
+
 @dataclass
 class BagelDatasetConfig:
     """Declarative configuration for the packed BAGEL multimodal dataset."""
 
-    grouped_datasets: Mapping[str, object] | None = None
+    grouped_datasets: Mapping[str, _ConfigValue] | None = None
     grouped_datasets_path: str | None = None
-    dataset_info: Mapping[str, object] | None = None
+    dataset_info: Mapping[str, _ConfigValue] | None = None
     dataset_info_path: str | None = None
     expected_num_tokens: int = 32768
     max_num_tokens_per_sample: int = 16384
@@ -449,10 +452,10 @@ class BagelDatasetConfig:
     @staticmethod
     def _resolve_mapping(
         *,
-        inline: Mapping[str, object] | None,
+        inline: Mapping[str, _ConfigValue] | None,
         path: str | None,
         name: str,
-    ) -> dict[str, object]:
+    ) -> dict[str, _ConfigValue]:
         """Resolve one inline or YAML/JSON mapping without mutating config state."""
         if path is not None:
             config_path = Path(path)
@@ -470,12 +473,12 @@ class BagelDatasetConfig:
         self,
         *,
         tokenizer: "PreTrainedTokenizerBase",
-        special_tokens: Mapping[str, object],
+        special_tokens: Mapping[str, int],
         rank: int,
         world_size: int,
         num_workers: int,
         global_seed: int,
-        data_status: object | None = None,
+        data_status: Mapping[str, list[int | list[int] | None]] | None = None,
     ) -> "PackedDataset":
         """Build and initialize the packed BAGEL dataset.
 

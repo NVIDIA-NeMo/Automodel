@@ -488,7 +488,7 @@ class Step5Attention(nn.Module):
                 # Padding is local: transport still exchanges exactly window - 1.
                 tile_width = (
                     128
-                    if hidden.is_cuda and torch.cuda.get_device_capability(hidden.device) == (10, 0)
+                    if hidden.is_cuda and torch.cuda.get_device_capability(hidden.device)[0] == 10
                     else (112 if self.head_dim == 192 else 80)
                 )
                 left_padding = first_key % tile_width if self.backend.attn == "fa4" else 0

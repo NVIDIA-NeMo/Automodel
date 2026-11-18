@@ -492,7 +492,7 @@ class Buffer:
             hook,
         )
 
-    def get_next_low_latency_combine_buffer(self, handle: object):
+    def get_next_low_latency_combine_buffer(self, handle: tuple[torch.Tensor, torch.Tensor, int, int, int]):
         """
         Get the raw registered RDMA buffer tensor for next low-latency combine, so that the next combine kernel can skip the copying.
 

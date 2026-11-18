@@ -24,7 +24,12 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+    generation_config_from_model_config,
+    restore_pretrained_generation_config,
+)
 from nemo_automodel.components.models.glm5_next.config import Glm5NextConfig, Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -248,9 +253,11 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         *model_args: Any,
         **kwargs: Any,
     ) -> "Glm5NextForConditionalGeneration":
-        """Resolve the local config; checkpoint loading is owned by AutoModel."""
+        """Resolve the local config and generation settings; checkpoint loading is owned by AutoModel."""
         config = Glm5NextConfig.from_pretrained(pretrained_model_name_or_path)
-        return cls.from_config(config, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
+        restore_pretrained_generation_config(model, pretrained_model_name_or_path)
+        return model
 
     def __init__(
         self,
@@ -262,6 +269,9 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
+        # Match PreTrainedModel behavior so consolidated HF exports preserve
+        # generation defaults even for this native nn.Module implementation.
+        self.generation_config = generation_config_from_model_config(config)
         self.backend = copy.copy(backend) if backend is not None else BackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32

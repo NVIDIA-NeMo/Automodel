@@ -87,8 +87,10 @@ fp8:
 ```
 
 The Transformer Engine path (`model.backend.te_fp8`, used with the `te` `linear` / `experts` backends) has the
-same knob with the same substring matching, and it defaults to `["lm_head"]`: the output head runs in the model
-dtype unless the list is overridden. The train recipe applies it to every model part after construction.
+same substring matching under the name `exclude_fqns`, and it defaults to `["lm_head"]`: the output head runs in
+the model dtype unless the list is overridden. The train recipe applies it to every model part after construction;
+a module that already has its own instance-level forward (for example from a tensor-parallel style) keeps it and
+runs it outside FP8.
 
 ```yaml
 model:
@@ -96,7 +98,7 @@ model:
     linear: te
     te_fp8:
       recipe: block
-      filter_fqns: ["lm_head"]  # default; add names to keep more modules out of FP8
+      exclude_fqns: ["lm_head"]  # default; add names to keep more modules out of FP8
 ```
 
 ### Speed and Convergence

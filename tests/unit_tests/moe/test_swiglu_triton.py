@@ -65,6 +65,22 @@ def test_triton_matches_the_eager_reference(rows, inter, limit):
 
 
 @requires_gpu_triton
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_clamp_boundary_gradients_match_the_installed_pytorch(dtype: torch.dtype) -> None:
+    """Follow the framework's scalar-clamp subgradient at both exact bounds."""
+    gate = torch.tensor([[-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]], device="cuda", dtype=dtype)
+    x = torch.cat((gate, gate.flip(-1)), dim=-1).requires_grad_()
+    probs = torch.tensor([[0.7]], device="cuda", requires_grad=True)
+    actual = swiglu_triton.swiglu_clamped_triton(x, probs, 2.0)
+    expected = _reference(x, probs, 2.0)
+    actual_grads = torch.autograd.grad(actual, (x, probs), torch.ones_like(actual))
+    expected_grads = torch.autograd.grad(expected, (x, probs), torch.ones_like(expected))
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    for grad, reference in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(grad, reference, rtol=1e-2, atol=1e-2)
+
+
+@requires_gpu_triton
 def test_dispatcher_prefers_triton_on_cuda_and_matches_the_compiled_function():
     x, probs, _ = _inputs(16, 64, 2.0, "cuda")
     out = swiglu_clamped_deepep(x, probs, 2.0)

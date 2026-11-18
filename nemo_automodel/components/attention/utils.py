@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, cast
+from functools import lru_cache, partial
+from hashlib import sha256
+from math import prod
+from pathlib import Path
+from typing import Any, Callable, Protocol, TypedDict, Unpack, cast
 
 import torch
 import torch.nn as nn
@@ -20,6 +24,138 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.shared.import_utils import safe_import
+
+# Public source checksums, not credentials. Remove this compatibility gate once
+# upstream FA4 advertises initialized unused seqused output/gradient rows.
+_FA4_ORIGINAL_INTERFACE_SHA256 = (
+    "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"  # pragma: allowlist secret
+)
+_FA4_PHYSICAL_INTERFACE_SHA256 = (
+    "de3781369943fcfa1df9344999c7ad7496bfb607d80e852406e07ebf8e28ed22"  # pragma: allowlist secret
+)
+
+
+@lru_cache(maxsize=1)
+def _fa4_interface_sha256() -> str | None:
+    """Identify the installed dependency once before selecting a validated layout.
+
+    The external FA4 API does not advertise whether unused physical rows are
+    initialized. Source identity is a conservative compatibility boundary until
+    the dependency exposes that guarantee; unavailable source uses compact THD.
+    """
+    available, module = safe_import("flash_attn.cute.interface")
+    if not available or not getattr(module, "__file__", None):
+        return None
+    try:
+        return sha256(Path(module.__file__).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+class _TEAttentionKwargs(TypedDict, total=False):
+    """TE keywords produced by this component's attention preprocessing."""
+
+    qkv_format: str
+    attention_mask: torch.Tensor | None
+    attn_mask_type: str
+    window_size: tuple[int, int]
+    cu_seqlens_q: torch.Tensor | None
+    cu_seqlens_kv: torch.Tensor | None
+    cu_seqlens_q_padded: torch.Tensor | None
+    cu_seqlens_kv_padded: torch.Tensor | None
+    max_seqlen_q: int
+    max_seqlen_kv: int
+    pad_between_seqs: bool
+
+
+class _TEAttentionModule(Protocol):
+    """The native TE module contract used by the call adapter."""
+
+    cp_group: torch.distributed.ProcessGroup | list[torch.distributed.ProcessGroup] | None
+    qkv_format: str
+    attention_dropout: float
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Unpack[_TEAttentionKwargs]
+    ) -> torch.Tensor:
+        """Call native TE with BSHD or THD Q/K/V and TE sequence metadata.
+
+        Args:
+            q: Tensor [batch, sequence, heads, head_dim] or [tokens, heads, head_dim].
+            k: Tensor with the same layout as q, with KV heads and KV tokens.
+            v: Tensor with the same layout as k, with value head dimension.
+            **kwargs: TE keywords; cumulative offsets are int32 [documents + 1],
+                attention_mask is [batch, 1, 1, sequence].
+
+        Returns:
+            Tensor [batch, sequence, heads * value_dim] or [tokens, heads * value_dim].
+        """
+        ...
+
+
+def _call_te_attention(
+    module: _TEAttentionModule,
+    quantization_enabled: Callable[[], bool],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    **kwargs: Unpack[_TEAttentionKwargs],
+) -> torch.Tensor:
+    """Reuse TE plans by adding empty trailing documents at the TE boundary.
+
+    Args:
+        module: Original TE module, retaining its parameters and parallel setup.
+        quantization_enabled: TE's active quantization-context query.
+        q: Tensor [batch, sequence, heads, head_dim] or packed [tokens, heads, head_dim].
+        k: Tensor with the same layout as q, with KV heads and KV tokens.
+        v: Tensor with the same layout as k, with value head dimension.
+        **kwargs: TE keywords. Logical and optional physical cumulative offsets
+            are int32 [documents + 1] on the input device. Q and KV must have the
+            same document count, but may have different lengths and offsets.
+            attention_mask, when provided, is [batch, 1, 1, sequence].
+
+    Returns:
+        Native TE output [batch, sequence, heads * value_dim] or
+        [tokens, heads * value_dim]. Inputs and caller-owned offsets are never
+        mutated. Only the private TE call sees [capacity + 1] offset copies.
+    """
+    if (
+        kwargs.get("qkv_format", module.qkv_format) == "thd"
+        and module.cp_group is None
+        and module.attention_dropout == 0
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and q.numel() > 0
+        and kwargs.get("attention_mask") is None
+        and not quantization_enabled()
+        and kwargs.keys().isdisjoint(
+            ("core_attention_bias", "alibi_slopes", "inference_params", "thd_attention_policies")
+        )
+    ):
+        cu_q, cu_kv = kwargs.get("cu_seqlens_q"), kwargs.get("cu_seqlens_kv")
+        if cu_q is not None and cu_kv is not None and cu_q.numel() > 1:
+            documents = cu_q.numel() - 1
+            keys = ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded")
+            for key in keys:
+                offsets = kwargs.get(key)
+                if offsets is not None and (
+                    offsets.ndim != 1 or offsets.dtype != torch.int32 or offsets.numel() != documents + 1
+                ):
+                    raise ValueError("TE packed offsets must be int32 vectors with matching document counts")
+            # Deterministic geometry also during activation recomputation: a
+            # module-level high-water mark could grow between forward/backward.
+            # The coarse minimum amortizes rare document-count changes; larger
+            # buckets still incur a new plan and extra empty-document overhead.
+            capacity = max(128, 1 << (documents - 1).bit_length())
+            padded_offsets: dict[int, torch.Tensor] = {}
+            for key in keys:
+                offsets = kwargs.get(key)
+                if offsets is not None and capacity > documents:
+                    # TE may infer physical padding from tensor identity. Keep
+                    # logical/physical aliases shared inside this call, too.
+                    if id(offsets) not in padded_offsets:
+                        padded_offsets[id(offsets)] = torch.cat((offsets, offsets[-1:].expand(capacity - documents)))
+                    kwargs[key] = padded_offsets[id(offsets)]
+    return module(q, k, v, **kwargs)
 
 
 def initialize_attn_module_and_func(
@@ -36,6 +172,7 @@ def initialize_attn_module_and_func(
     """Initialize an attention backend module and callable."""
     if attn_impl == "te":
         from transformer_engine.pytorch.attention import DotProductAttention
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         attn_module = DotProductAttention(
             num_attention_heads=num_attention_heads,
@@ -46,7 +183,9 @@ def initialize_attn_module_and_func(
             num_gqa_groups=num_gqa_groups,
             **kwargs,
         )
-        attn_func = attn_module.__call__
+        # Keep the native module and state-dict paths unchanged. A partial also
+        # preserves the module reference correctly when its owner is deep-copied.
+        attn_func = partial(_call_te_attention, attn_module, FP8GlobalStateManager.is_fp8_enabled)
         return attn_module, attn_func
     elif attn_impl == "sdpa":
         supported_sdpa_kwargs = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
@@ -113,8 +252,8 @@ def initialize_attn_module_and_func(
         flash_attn_func = flash_attn_cute.flash_attn_func
         flash_attn_varlen_func = flash_attn_cute.flash_attn_varlen_func
 
-        if qkv_format != "bshd":
-            raise ValueError(f"attn_impl='fa4' requires BSHD inputs; pre-packed THD is unsupported, got {qkv_format!r}")
+        if qkv_format not in ("bshd", "thd"):
+            raise ValueError(f"attn_impl='fa4' requires BSHD or prepared THD inputs, got {qkv_format!r}")
 
         supported_fa4_kwargs = {
             "causal",
@@ -127,6 +266,8 @@ def initialize_attn_module_and_func(
             "learnable_sink",
             "packed_token_indices",
             "_fa4_padded_output_shape",
+            "seqused_q",
+            "seqused_kv",
         }
         default_causal = attn_mask_type == "causal"
 
@@ -149,7 +290,8 @@ def initialize_attn_module_and_func(
                     indexing the flattened [batch * sequence] axis.
                     ``learnable_sink`` has shape [heads].
                     ``_fa4_padded_output_shape`` is
-                    [batch, sequence, heads, v_head_dim].
+                    [batch, sequence, heads, v_head_dim] or, for prepared THD,
+                    [physical_tokens, heads, v_head_dim].
 
             Returns:
                 Tensor of shape [batch, sequence, heads, v_head_dim] for dense
@@ -194,12 +336,19 @@ def initialize_attn_module_and_func(
                 # Empty reductions retain all gradient paths without reading discarded
                 # FP16 values, whose full reductions could overflow before multiplying by zero.
                 zero = q[:0].sum() + k[:0].sum() + v[:0].sum()
-                empty = torch.zeros_like(v) + zero
+                if call_kwargs.get("learnable_sink") is not None:
+                    zero = zero + call_kwargs["learnable_sink"][:0].sum().to(q.dtype)
+                empty = q.new_zeros((*q.shape[:-1], v.shape[-1])) + zero
                 padded_shape = call_kwargs.get("_fa4_padded_output_shape")
                 return empty if padded_shape is None else v.new_zeros(padded_shape) + zero
 
             cu_seqlens_kv = call_kwargs.get("cu_seqlens_kv", cu_seqlens_q)
             max_seqlen_q = call_kwargs.get("max_seqlen_q")
+            used_kwargs = {}
+            if call_kwargs.get("seqused_q") is not None:
+                if _fa4_interface_sha256() != _FA4_PHYSICAL_INTERFACE_SHA256:
+                    raise ValueError("Physical FA4 padding requires the validated zero-allocation dependency patch")
+                used_kwargs = {"seqused_q": call_kwargs["seqused_q"], "seqused_k": call_kwargs["seqused_kv"]}
             output, _lse = flash_attn_varlen_func(
                 q,
                 k,
@@ -208,6 +357,7 @@ def initialize_attn_module_and_func(
                 cu_seqlens_k=cu_seqlens_kv,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=call_kwargs.get("max_seqlen_kv", max_seqlen_q),
+                **used_kwargs,
                 **common,
             )
             padded_output_shape = call_kwargs.get("_fa4_padded_output_shape")
@@ -217,11 +367,26 @@ def initialize_attn_module_and_func(
             unpad_indices = call_kwargs.get("packed_token_indices")
             if unpad_indices is None:
                 return output.reshape(padded_output_shape)
-            padded_output = output.new_zeros((padded_output_shape[0] * padded_output_shape[1], *output.shape[1:]))
+            padded_output = output.new_zeros((prod(padded_output_shape[:-2]), *output.shape[1:]))
             padded_output = padded_output.index_copy(0, unpad_indices, output)
             return padded_output.reshape(padded_output_shape)
 
-        return None, attn_func
+        attn_module = None
+        if kwargs.get("softmax_type") == "learnable":
+            # Preserve the existing TE-owned parameter name, dtype and initialization.
+            # Only its parameter is used; attention execution stays in the shared FA4 callable.
+            attn_module, _ = initialize_attn_module_and_func(
+                "te",
+                num_attention_heads,
+                num_qk_channels,
+                num_v_channels,
+                softmax_scale,
+                attn_mask_type=attn_mask_type,
+                qkv_format=qkv_format,
+                num_gqa_groups=num_gqa_groups,
+                **kwargs,
+            )
+        return attn_module, attn_func
     elif attn_impl == "flex":
         attn_module = FlexAttention()
         # We still return the module and a reference to its call for parity with other backends
@@ -260,6 +425,8 @@ def preprocess_args_and_kwargs_for_attn(
     v: torch.Tensor,
     attention_mask: torch.Tensor | None,
     attn_impl: str,
+    *,
+    fa4_physical_layout: bool = False,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Preprocess attention inputs based on backend requirements.
@@ -277,7 +444,12 @@ def preprocess_args_and_kwargs_for_attn(
             padding mask (1/True for valid tokens, 0/False for padding).
             Packed TE inputs require None and THD sequence metadata instead.
         attn_impl: Attention backend name.
-        **kwargs: Backend metadata. Packed FA4 accepts ``cu_seqlens`` of shape
+        fa4_physical_layout: Model-owned eligibility for physical-prefix THD and
+            a conservative host maximum. False preserves compact dispatch. The
+            dependency compatibility check still gates physical buffer use.
+        **kwargs: Backend metadata. Prepared THD FA4 uses private compact offsets
+            [documents + 1] and indices [valid_tokens] computed once at model entry;
+            outputs retain [physical_tokens, heads, channels] layout. Packed FA4 accepts ``cu_seqlens`` of shape
             [documents + 1] and ``packed_token_indices`` of shape [tokens].
             For SDPA and FA4, a positive left ``window_size`` counts visible
             keys including the current token; negative/None means unbounded.
@@ -289,8 +461,9 @@ def preprocess_args_and_kwargs_for_attn(
     Returns:
         Query, key, and value tensors in the backend layout plus its keyword
         arguments. SDPA/flex transpose to [batch, heads, sequence, head_dim];
-        TE/Magi retain the input layout. FA4 accepts BSHD input only and rejects
-        pre-packed THD (including physical padding offsets).
+        TE/Magi retain the input layout. FA4 accepts BSHD or model-prepared THD;
+        the validated physical-prefix route retains THD tensors, otherwise valid
+        tokens are gathered and scattered by the existing compact route.
         Packed BSHD FA4 tensors are unpadded to [tokens, heads,
         head_dim]; the FA4 callable restores its output to BSHD using the value
         head dimension.
@@ -371,8 +544,14 @@ def preprocess_args_and_kwargs_for_attn(
                 attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen_kv"]
 
     elif attn_impl == "fa4":
-        if q.ndim != 4 or kwargs.get("qkv_format") == "thd" or kwargs.get("cu_seqlens_padded") is not None:
-            raise ValueError("attn_impl='fa4' requires BSHD inputs; pre-packed THD is unsupported. Use NEAT packing.")
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd:
+            if q.ndim != 3 or kwargs.get("_fa4_cu_seqlens") is None or kwargs.get("packed_token_indices") is None:
+                raise ValueError("FA4 THD requires [physical_tokens, heads, channels] and model-entry metadata")
+            if k.ndim != 3 or v.ndim != 3 or q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+                raise ValueError("FA4 prepared THD requires equal physical Q/K/V token lengths")
+        elif q.ndim != 4 or kwargs.get("cu_seqlens_padded") is not None:
+            raise ValueError("FA4 requires BSHD or prepared THD inputs")
         if attention_mask is not None and attention_mask.ndim != 2:
             raise ValueError(
                 "attn_impl='fa4' cannot consume an explicit attention_mask "
@@ -397,9 +576,9 @@ def preprocess_args_and_kwargs_for_attn(
             if kwargs.get(opt) is not None:
                 attn_kwargs[opt] = kwargs[opt]
 
-        cu_seqlens = kwargs.get("cu_seqlens")
+        cu_seqlens = kwargs.get("_fa4_cu_seqlens", kwargs.get("cu_seqlens"))
         unpad_indices = kwargs.get("packed_token_indices")
-        max_seqlen = kwargs.get("max_seqlen")
+        max_seqlen = kwargs.get("_fa4_max_seqlen", kwargs.get("max_seqlen"))
         if cu_seqlens is None and attention_mask is not None and attention_mask.ndim == 2:
             if attention_mask.numel() == 0:
                 raise ValueError("FA4 attention_mask must contain at least one valid token")
@@ -420,16 +599,38 @@ def preprocess_args_and_kwargs_for_attn(
                 f"got indices={tuple(unpad_indices.shape)} and cu_seqlens={tuple(cu_seqlens.shape)}."
             )
 
+        if cu_seqlens is not None and max_seqlen is None:
+            raise ValueError("FA4 cu_seqlens requires max_seqlen")
+        if is_thd and isinstance(max_seqlen, int) and fa4_physical_layout:
+            interface_sha = _fa4_interface_sha256()
+            if interface_sha in (
+                _FA4_ORIGINAL_INTERFACE_SHA256,
+                _FA4_PHYSICAL_INTERFACE_SHA256,
+            ):
+                # A conservative host bound selects the existing multi-block specialization.
+                # Actual document lengths, masking and native stride guards are unchanged.
+                max_seqlen = max(max_seqlen, 129)
+            if interface_sha == _FA4_PHYSICAL_INTERFACE_SHA256:
+                attn_kwargs.update(
+                    cu_seqlens_q=kwargs["_fa4_physical_cu_seqlens"],
+                    cu_seqlens_kv=kwargs["_fa4_physical_cu_seqlens"],
+                    seqused_q=kwargs["_fa4_seqused"],
+                    seqused_kv=kwargs["_fa4_seqused"],
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_kv=max_seqlen,
+                )
+                return q, k, v, attn_kwargs
+
+        if is_thd:
+            q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
         if cu_seqlens is not None:
-            if max_seqlen is None:
-                raise ValueError("FA4 cu_seqlens requires max_seqlen")
             attn_kwargs["cu_seqlens_q"] = cu_seqlens
             attn_kwargs["cu_seqlens_kv"] = cu_seqlens
             attn_kwargs["max_seqlen_q"] = max_seqlen
             attn_kwargs["max_seqlen_kv"] = max_seqlen
 
             if q.ndim == 4:
-                padded_output_shape = (*q.shape[:-1], v.shape[-1])
+                padded_output_shape = (*(q.shape[1:-1] if is_thd else q.shape[:-1]), v.shape[-1])
                 flat_q = q.reshape(-1, *q.shape[2:])
                 flat_k = k.reshape(-1, *k.shape[2:])
                 flat_v = v.reshape(-1, *v.shape[2:])
@@ -483,7 +684,10 @@ def preprocess_args_and_kwargs_for_attn(
         if attention_mask is not None:
             if attention_mask.dim() <= 2:
                 key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
-                has_padding_mask = not bool(key_mask.all().item())
+                # Tensor-value branches cannot be captured by fullgraph compilation.
+                # Preserve the supplied mask in compiled attention; eager all-valid
+                # batches can still use SDPA's implicit causal fast path.
+                has_padding_mask = torch.compiler.is_compiling() or not bool(key_mask.all().item())
             else:
                 explicit_mask = attention_mask.to(device=q.device)
                 has_padding_mask = False

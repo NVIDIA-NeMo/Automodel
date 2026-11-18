@@ -364,15 +364,15 @@ class TestSeparateParamGroups:
 
 
 # ---------------------------------------------------------------------------
-# Tests for _get_dion_mesh()
+# Tests for get_dion_mesh()
 # ---------------------------------------------------------------------------
 
 
 class TestGetDionMesh:
     def _call(self, mesh):
-        from nemo_automodel.components.optim.dion import _get_dion_mesh
+        from nemo_automodel.components.optim.dion import get_dion_mesh
 
-        return _get_dion_mesh(mesh)
+        return get_dion_mesh(mesh)
 
     def test_none_returns_none(self):
         assert self._call(None) is None

@@ -23,11 +23,18 @@ import inspect
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.models.common.packed_seq import (
+    FLASH_VARLEN_KWARGS,
+    indexed_mask_to_4d_block_causal,
+    packed_seq_params_from_doc_ids,
+    to_flash_attention_kwargs,
+)
 from nemo_automodel.components.models.common.utils import AttentionBackend
 
 logger = logging.getLogger(__name__)
@@ -39,18 +46,86 @@ PackedMaskType = Literal["block_causal", "document_ids", "flash_varlen"]
 
 @dataclass(frozen=True)
 class PackingCapabilities:
-    """Model-owned requirements for dataset packing and model adaptation."""
+    """Model-derived loader requests and native attention setup information.
+
+    ``packed_mask_type`` and ``return_packed_sequence_metadata`` apply only to
+    batched packed inputs. THD derives kernel metadata from lengths instead.
+    ``return_document_ids`` requests original membership in either format.
+    ``uses_native_fa4`` is model setup information, not an emitted batch field.
+    ``max_sequence_length`` is the configured decoder input-token limit per packed
+    document, before batch flattening; it applies to either output format.
+    """
 
     packed_mask_type: PackedMaskType
-    requires_packed_sequence_metadata: bool = False
+    return_packed_sequence_metadata: bool = False
     uses_native_fa4: bool = False
+    return_document_ids: bool = False
+    max_sequence_length: int | None = None
+
+    def prepare_attention_inputs(self, document_ids: torch.Tensor) -> dict[str, torch.Tensor | int]:
+        """Convert native collator document IDs using the selected model interface.
+
+        Args:
+            document_ids: Integer tensor [batch, sequence], with positive IDs
+                for document membership and zero for padding. CPU collation stays
+                on CPU; model-entry preparation independently handles transfer.
+
+        Returns:
+            An attention mask [batch, 1, sequence, sequence], compact document
+            IDs [batch, sequence], or HF cumulative lengths [segments + 1] and
+            integer maximum lengths. Inputs are read-only; compact IDs may alias
+            the input. This bound callback retains only this scalar contract,
+            never the model, and can run in spawned dataloader workers.
+        """
+        if self.packed_mask_type == "block_causal":
+            return {"attention_mask": indexed_mask_to_4d_block_causal(document_ids)}
+        if self.packed_mask_type == "document_ids":
+            return {"attention_mask": document_ids}
+        if self.packed_mask_type == "flash_varlen":
+            return to_flash_attention_kwargs(packed_seq_params_from_doc_ids(document_ids))
+        raise ValueError(f"Unsupported packed_mask_type: {self.packed_mask_type!r}")
 
 
 @runtime_checkable
 class PackingMetadataConsumer(Protocol):
-    """Model that needs dataset-constructed metadata for packed recurrent state."""
+    """Consumer of AutoModel's gathered-token indices and cumulative lengths.
+
+    ``packed_token_indices`` selects non-padding tokens; ``cu_seqlens`` and
+    ``max_seqlen`` describe that gathered stream, not physical padded storage.
+    Qwen3.5, Kimi Linear/K3 use these boundaries for recurrent-state processing;
+    AutoModel's FA4 path also needs the unpadded layout. This is independent of
+    the data loader or packing algorithm. The batch-major bundle is normalized
+    by ``flatten_packed_sequence_metadata`` after PP splitting, where needed.
+    """
 
     requires_packed_sequence_metadata: bool
+
+
+@runtime_checkable
+class DocumentAttentionMaskConsumer(Protocol):
+    """Model that composes document eligibility with its own attention policy."""
+
+    def prepare_document_attention_mask(
+        self,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None,
+        mm_token_type_ids: torch.Tensor | None,
+        document_ids: torch.Tensor | None,
+    ) -> torch.Tensor | dict[str, torch.Tensor] | None:
+        """Compose selected document attention with a model-owned policy.
+
+        Args:
+            attention_mask: Integer selected IDs [batch, sequence], a prepared
+                mask [batch, 1, sequence, sequence], a mapping of such masks,
+                or None for native masking.
+            mm_token_type_ids: Optional modality IDs [batch, sequence].
+            document_ids: Optional original membership [batch, sequence], used
+                only by this model policy rather than attention/MTP segmentation.
+
+        Returns:
+            A prepared mask or mapping of masks [batch, 1, sequence, sequence],
+            or the unchanged input. Implementations do not mutate input tensors.
+        """
+        ...
 
 
 @runtime_checkable
@@ -65,6 +140,25 @@ class NativeFA4Consumer(Protocol):
     """Model whose attention layers invoke Automodel's native FA4 callable."""
 
     _uses_native_fa4: bool
+
+
+@runtime_checkable
+class PackedMetadataEntryOwner(Protocol):
+    """Model whose attention policy needs metadata at a specific forward entry."""
+
+    @property
+    def packed_metadata_entry_module(self) -> torch.nn.Module:
+        """Return the called module that owns packed attention preparation."""
+        ...
+
+
+@runtime_checkable
+class PackedAttentionBackendValidator(Protocol):
+    """Model with additional constraints beyond a backend's generic contract."""
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject a backend that cannot preserve this model's packed policy."""
+        ...
 
 
 @runtime_checkable
@@ -92,47 +186,77 @@ def get_packing_capabilities(
     *,
     model: torch.nn.Module | None = None,
 ) -> PackingCapabilities:
-    """Map a model attention implementation to semantic packed-data requirements.
+    """Describe loader requests without configuring or validating packed execution.
+
+    This cheap query also serves unpacked and THD loaders. It does not install
+    hooks or invoke model packed-backend validators. Batched packing support is
+    checked separately by ``configure_packing``; THD has its own validation.
 
     Args:
-        attn_implementation: Attention implementation resolved from the built model.
-        model: Optional built model, inspected through explicit packed-metadata,
-            mask, and native-FA4 consumer capabilities.
+        attn_implementation: Resolved attention implementation.
+        model: Optional built consumer declaring its metadata requirements.
 
     Returns:
-        Structural capabilities consumed by dataset packing. Backend names do not
-        cross the dataset boundary.
-
-    Raises:
-        ValueError: If native FA4 packing is requested without a native consumer.
+        Loader return requests plus model-owned native FA4 setup information.
+        Mask representation and gathered-token requests are batched-only;
+        original document membership can be requested in either format.
+        The input-token limit comes from the decoder's configured
+        ``max_position_embeddings``, independently of attention layout.
     """
     model = getattr(model, "module", model)
+    model = getattr(model, "_orig_mod", model)
+    config = getattr(model, "config", None)
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config(decoder=True) if callable(get_text_config) else config
+    max_sequence_length = getattr(text_config, "max_position_embeddings", None)
+    if isinstance(max_sequence_length, bool) or not isinstance(max_sequence_length, int) or max_sequence_length <= 0:
+        max_sequence_length = None
     requires_metadata = isinstance(model, PackingMetadataConsumer) and model.requires_packed_sequence_metadata
     model_mask_type = model.packed_mask_type if isinstance(model, PackedMaskConsumer) else None
-    if attn_implementation == "fa4":
-        uses_native_fa4 = isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
-        if not uses_native_fa4:
-            if model_mask_type is not None:
-                # Model-owned FA4 attention consumes its declared compact mask,
-                # without the shared varlen implementation's metadata hook.
-                return PackingCapabilities(
-                    packed_mask_type=model_mask_type,
-                    requires_packed_sequence_metadata=requires_metadata,
-                )
-            raise ValueError("Native FA4 packing requires a model declaring native FA4 support.")
-        return PackingCapabilities(
-            packed_mask_type="document_ids",
-            requires_packed_sequence_metadata=True,
-            uses_native_fa4=True,
-        )
-    if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
-        return PackingCapabilities(
-            packed_mask_type="flash_varlen",
-            requires_packed_sequence_metadata=requires_metadata,
-        )
+    uses_native_fa4 = attn_implementation == "fa4" and isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
+    if uses_native_fa4:
+        mask_type: PackedMaskType = "document_ids"
+    elif attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
+        mask_type = "flash_varlen"
+    else:
+        mask_type = model_mask_type or "block_causal"
     return PackingCapabilities(
-        packed_mask_type=model_mask_type or "block_causal",
-        requires_packed_sequence_metadata=requires_metadata,
+        packed_mask_type=mask_type,
+        return_packed_sequence_metadata=requires_metadata or uses_native_fa4,
+        return_document_ids=isinstance(model, DocumentAttentionMaskConsumer),
+        uses_native_fa4=uses_native_fa4,
+        max_sequence_length=max_sequence_length,
+    )
+
+
+def get_packing_capabilities_for_models(models: Sequence[torch.nn.Module]) -> PackingCapabilities:
+    """Combine loader return requests across local model or pipeline stages.
+
+    This query does not configure models or validate an execution format.
+    Batched packed execution separately checks that stage mask layouts agree.
+
+    Args:
+        models: Nonempty sequence of built local stages consuming the same batch.
+
+    Returns:
+        The first stage's mask interface, the union of optional return requests,
+        and the smallest declared input-token limit across local stages.
+
+    Raises:
+        ValueError: If no model stages were supplied.
+    """
+    if not models:
+        raise ValueError("Packing requirements need at least one model")
+    contracts = [get_packing_capabilities(get_model_attn_implementation(model), model=model) for model in models]
+    return replace(
+        contracts[0],
+        return_packed_sequence_metadata=any(contract.return_packed_sequence_metadata for contract in contracts),
+        return_document_ids=any(contract.return_document_ids for contract in contracts),
+        uses_native_fa4=any(contract.uses_native_fa4 for contract in contracts),
+        max_sequence_length=min(
+            (contract.max_sequence_length for contract in contracts if contract.max_sequence_length is not None),
+            default=None,
+        ),
     )
 
 
@@ -238,7 +362,7 @@ def flatten_packed_sequence_metadata(
     return flat_indices, flat_cu_seqlens
 
 
-def _flatten_packed_metadata_at_model_entry(
+def prepare_packed_metadata(
     _module: torch.nn.Module,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
@@ -248,10 +372,15 @@ def _flatten_packed_metadata_at_model_entry(
     Args:
         _module: Native FA4 model receiving the forward call.
         args: Positional model inputs. Tensor entries retain their model-specific
-            layouts and are returned unchanged.
+            layouts and are returned unchanged. THD requires token IDs [tokens]
+            or [1, tokens] as the first positional input or keyword input_ids.
         kwargs: Model inputs containing ``packed_token_indices`` of shape
             [batch, sequence] or [tokens] and ``cu_seqlens`` of shape
-            [batch, max_documents + 1] or [documents + 1].
+            [batch, max_documents + 1] or [documents + 1]. For THD, padding_mask
+            is bool [physical_tokens] (True at padding), and cu_seqlens_padded
+            or cu_seqlens is int32 [documents + 1] with physical boundaries.
+            Original mask/boundaries remain unchanged; private FA4 offsets
+            index the compact stream selected by packed_token_indices.
 
     Returns:
         Updated positional and keyword inputs whose packed token indices have
@@ -259,11 +388,69 @@ def _flatten_packed_metadata_at_model_entry(
         ``None`` when neither packed-metadata tensor was supplied.
 
     Raises:
-        ValueError: If pre-packed THD is requested, only one metadata tensor is
-            supplied, or either layout is inconsistent with the current microbatch.
+        ValueError: If THD lacks its authoritative mask/boundaries, only one NEAT
+            metadata tensor is supplied, or a layout is inconsistent with the microbatch.
     """
     if kwargs.get("qkv_format") == "thd":
-        raise ValueError("Native FA4 does not support pre-packed THD inputs. Use NEAT packing.")
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        if not isinstance(input_ids, torch.Tensor) or not (
+            input_ids.ndim == 1 or (input_ids.ndim == 2 and input_ids.shape[0] == 1)
+        ):
+            raise ValueError("FA4 THD requires token IDs [physical_tokens] or [1, physical_tokens]")
+        physical_tokens = input_ids.shape[-1]
+        padding_mask = kwargs.get("padding_mask")
+        boundaries = kwargs.get("cu_seqlens_padded")
+        if boundaries is None:
+            boundaries = kwargs.get("cu_seqlens")
+        if not isinstance(padding_mask, torch.Tensor) or not isinstance(boundaries, torch.Tensor):
+            raise ValueError("FA4 THD requires the prepared padding_mask and sequence boundaries")
+        if padding_mask.ndim == 2 and padding_mask.shape[0] == 1:
+            padding_mask = padding_mask.squeeze(0)
+        if (
+            padding_mask.ndim != 1
+            or padding_mask.dtype != torch.bool
+            or boundaries.ndim != 1
+            or boundaries.dtype != torch.int32
+        ):
+            raise ValueError("FA4 THD requires a bool [physical_tokens] mask and flat sequence boundaries")
+        if padding_mask.numel() != physical_tokens:
+            raise ValueError("FA4 THD padding_mask length must match physical input tokens")
+        if boundaries.numel() < 2 or bool(
+            (
+                (boundaries[0] != 0)
+                | (boundaries < 0).any()
+                | (boundaries > physical_tokens).any()
+                | (boundaries[1:] < boundaries[:-1]).any()
+            ).item()
+        ):
+            raise ValueError("FA4 THD physical boundaries must start at zero, be ordered and lie within input tokens")
+        if "_fa4_cu_seqlens" in kwargs:
+            return None
+        valid_tokens = ~padding_mask
+        flat_indices = torch.nonzero(valid_tokens, as_tuple=False).flatten()
+        # Sample the authoritative mask at existing physical boundaries; never
+        # reconstruct document membership or mutate the MoE/RoPE metadata.
+        valid_prefix = torch.cat((boundaries.new_zeros(1), valid_tokens.cumsum(0, dtype=torch.int32)))
+        compact_offsets = valid_prefix.index_select(0, boundaries.to(torch.long))
+        flat_indices, compact_offsets = flatten_packed_sequence_metadata(
+            flat_indices, compact_offsets, batch_size=1, sequence_length=padding_mask.numel()
+        )
+        updated_kwargs = dict(kwargs)
+        updated_kwargs["packed_token_indices"] = flat_indices
+        updated_kwargs["_fa4_cu_seqlens"] = compact_offsets
+        used_lengths = (compact_offsets[1:] - compact_offsets[:-1]).contiguous()
+        updated_kwargs["_fa4_max_seqlen"] = int(used_lengths.max().item())
+        # A used-length kernel describes valid prefixes, unlike general compact indices.
+        # Establish eligibility once at model entry; keep all public metadata unchanged.
+        positions = torch.arange(physical_tokens, device=boundaries.device)
+        document = torch.bucketize(positions, boundaries[1:], right=True)
+        represented = document < used_lengths.numel()
+        safe_document = document.clamp_max(used_lengths.numel() - 1)
+        prefix_mask = represented & (positions < (boundaries[:-1] + used_lengths)[safe_document])
+        if flat_indices.numel() and bool(torch.equal(prefix_mask, valid_tokens)):
+            updated_kwargs["_fa4_physical_cu_seqlens"] = boundaries
+            updated_kwargs["_fa4_seqused"] = used_lengths
+        return args, updated_kwargs
     packed_token_indices = kwargs.get("packed_token_indices")
     cu_seqlens = kwargs.get("cu_seqlens")
     if packed_token_indices is None and cu_seqlens is None:
@@ -319,7 +506,7 @@ def _install_native_fa4_metadata_hook(model: torch.nn.Module) -> None:
     if getattr(model, "_native_fa4_metadata_hook_handle", None) is not None:
         return
     handle = model.register_forward_pre_hook(
-        _flatten_packed_metadata_at_model_entry,
+        prepare_packed_metadata,
         with_kwargs=True,
     )
     setattr(model, "_native_fa4_metadata_hook_handle", handle)
@@ -381,8 +568,146 @@ def get_model_attn_implementation(model: torch.nn.Module) -> str:
     return hf_implementation or "sdpa"
 
 
-# FlashAttentionKwargs the collater emits and the flash varlen path consumes.
-_PACKED_VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+def _allows_ordinary_causal_attention(document_ids: torch.Tensor) -> bool:
+    """Whether each [B,S] attention-ID map is one eligible prefix plus padding.
+
+    Any positive ID is valid, independently in each batch document. Prefix or
+    interior exclusions and distinct subdocuments require an explicit mask.
+    Trailing padding cannot affect earlier causal outputs; its loss is ignored.
+    """
+    allowed = document_ids > 0
+    return not bool((allowed & ((document_ids != document_ids[:, :1]) | (~allowed).cumsum(dim=-1).gt(0))).any())
+
+
+def _prepare_packed_attention_at_model_entry(
+    module: torch.nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    packed_mask_type: PackedMaskType,
+    attn_implementation: str,
+) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    """Materialize the selected document segmentation after PP splitting.
+
+    Args:
+        module: Consumer owning the attention implementation.
+        args: Forward inputs, including token IDs [batch, sequence] or hidden
+            states [batch, sequence, hidden].
+        kwargs: Forward inputs with integer ``_packed_seq_ids`` [batch, sequence]
+            describing effective attention and MTP boundaries, zero at excluded
+            slots. CPU IDs allow host Flash offset construction before transfer.
+            Optional ``document_ids`` [batch, sequence] retain original membership
+            for a model-owned policy. Positions [batch, sequence] or
+            [position_axes, batch, sequence] are passed through unchanged.
+        packed_mask_type: Required attention input representation.
+        attn_implementation: Configured backend, used for mask dtype.
+
+    Returns:
+        Updated args/kwargs retaining all input layouts. Selected IDs move to
+        the input device. Flash adds int32 cumulative lengths [documents + 1]
+        and integer maxima; SDPA/eager adds masks [batch, 1, sequence, sequence]
+        on that device, or a boolean [batch, sequence] mask for ordinary causal
+        attention. Existing masks, public Flash metadata and THD inputs pass
+        through. No input tensor is mutated.
+    """
+    flash_kwargs = kwargs.get("_packed_flash_kwargs")
+    if flash_kwargs is not None:
+        kwargs.pop("_packed_flash_kwargs")
+        kwargs.update(flash_kwargs)
+        return args, kwargs
+    document_ids = kwargs.get("_packed_seq_ids")
+    if document_ids is None or kwargs.get("qkv_format") == "thd":
+        return None
+    if kwargs.get("attention_mask") is not None or any(kwargs.get(key) is not None for key in FLASH_VARLEN_KWARGS):
+        return None
+    if not isinstance(document_ids, torch.Tensor) or document_ids.ndim != 2:
+        raise ValueError("_packed_seq_ids must be a tensor of shape [batch, sequence]")
+    # Runtime token/hidden-state inputs determine the device even on PP stages
+    # whose embedding or output modules have been removed.
+    inputs = (*args, *(kwargs.get(key) for key in ("input_ids", "inputs_embeds", "hidden_states")))
+    input_tensor = next((value for value in inputs if isinstance(value, torch.Tensor)), None)
+    parameter = next(module.parameters(), None)
+    device = (
+        input_tensor.device
+        if input_tensor is not None
+        else parameter.device
+        if parameter is not None
+        else document_ids.device
+    )
+    dtype = (
+        input_tensor.dtype
+        if input_tensor is not None and input_tensor.is_floating_point()
+        else parameter.dtype
+        if parameter is not None
+        else torch.float32
+    )
+    updated = dict(kwargs)
+    updated["_packed_seq_ids"] = document_ids.to(device=device, non_blocking=True)
+    if packed_mask_type == "flash_varlen":
+        if document_ids.device.type != "cpu":
+            raise ValueError("Keep _packed_seq_ids on CPU until model entry; Flash offsets are host metadata")
+        params = packed_seq_params_from_doc_ids(document_ids)
+        metadata = to_flash_attention_kwargs(params)
+        cu_seqlens = params.cu_seqlens.to(device=device, non_blocking=True)
+        metadata.update(cu_seq_lens_q=cu_seqlens, cu_seq_lens_k=cu_seqlens)
+        updated.update(metadata)
+    elif packed_mask_type == "block_causal":
+        if isinstance(module, DocumentAttentionMaskConsumer):
+            original_ids = kwargs.get("document_ids", document_ids)
+            if not isinstance(original_ids, torch.Tensor) or original_ids.shape != document_ids.shape:
+                raise ValueError("Original document_ids must have shape [batch, sequence]")
+            updated["attention_mask"] = module.prepare_document_attention_mask(
+                document_ids.to(device=device, non_blocking=True),
+                kwargs.get("mm_token_type_ids"),
+                original_ids.to(device=device, non_blocking=True),
+            )
+        elif _allows_ordinary_causal_attention(document_ids):
+            # HF otherwise infers packing from reset padding positions during training.
+            updated["attention_mask"] = torch.ones(document_ids.shape, dtype=torch.bool, device=device)
+        else:
+            allowed = indexed_mask_to_4d_block_causal(document_ids.to(device=device, non_blocking=True))
+            updated["attention_mask"] = (
+                torch.zeros_like(allowed, dtype=dtype).masked_fill(~allowed, torch.finfo(dtype).min)
+                if attn_implementation == "eager"
+                else allowed
+            )
+    else:
+        raise ValueError(f"Unsupported compact attention contract: {packed_mask_type}")
+    return args, updated
+
+
+def _prepare_flash_metadata_before_input_transfer(
+    module: torch.nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    attn_implementation: str,
+) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    """Prepare host offsets before FSDP moves the document map to CUDA.
+
+    PP has already selected the microbatch. Keep text Flash kwargs bundled until
+    the decoder hook consumes them: VLM vision towers have their own boundaries
+    and must not receive the text offsets through forwarded keyword arguments.
+
+    Args:
+        module: Outer model or pipeline stage, before its FSDP input-transfer hook.
+        args: Token IDs [batch, sequence] or hidden states [batch, sequence, hidden].
+        kwargs: Forward inputs with CPU attention document IDs [batch, sequence].
+        attn_implementation: Configured FlashAttention backend.
+
+    Returns:
+        Prepared inputs with device-local document IDs and privately bundled
+        int32 cumulative lengths [documents + 1] plus integer maximum lengths,
+        or None when an explicit mask/Flash representation is already present.
+    """
+    prepared = _prepare_packed_attention_at_model_entry(
+        module, args, kwargs, packed_mask_type="flash_varlen", attn_implementation=attn_implementation
+    )
+    if prepared is None:
+        return None
+    args, updated = prepared
+    updated["_packed_flash_kwargs"] = {key: updated.pop(key) for key in FLASH_VARLEN_KWARGS}
+    return args, updated
 
 
 def validate_flash_packing_support(attn_implementation: str = "sdpa", model: torch.nn.Module | None = None) -> None:
@@ -413,6 +738,10 @@ def validate_flash_packing_support(attn_implementation: str = "sdpa", model: tor
             varlen kwargs, or the model's ``forward`` can consume neither the
             varlen kwargs nor ``_packed_seq_ids``.
     """
+    target = getattr(model, "module", model)
+    target = getattr(target, "_orig_mod", target)
+    if isinstance(target, PackedAttentionBackendValidator):
+        target.validate_packed_attention_backend(attn_implementation)
     if attn_implementation not in _FLASH_ATTN_IMPLEMENTATIONS:
         return
 
@@ -428,7 +757,7 @@ def validate_flash_packing_support(attn_implementation: str = "sdpa", model: tor
         ) from exc
 
     available = set(inspect.signature(_flash_attention_forward).parameters)
-    missing = set(_PACKED_VARLEN_KWARGS) - available
+    missing = set(FLASH_VARLEN_KWARGS) - available
     if missing:
         raise RuntimeError(
             f"Cannot enable flash-attention neat packing: transformers {transformers.__version__} lacks "
@@ -469,7 +798,7 @@ def _validate_model_consumes_packed_contract(model: torch.nn.Module | None) -> N
     # Transformers enters its varlen path only when all four cumulative-length
     # kwargs are present; a forward exposing only some of them would have the rest
     # dropped by ``filter_forward_kwargs``, so require the full set here.
-    if set(_PACKED_VARLEN_KWARGS).issubset(params):
+    if set(FLASH_VARLEN_KWARGS).issubset(params):
         return
     raise RuntimeError(
         f"Cannot enable flash-attention neat packing: {type(target).__name__}.forward accepts neither "
@@ -485,8 +814,11 @@ def configure_packing(
 ) -> PackingCapabilities:
     """Configure the model consumer and return its dataset packing contract.
 
-    HF flash attention receives public varlen kwargs from the collater, without
-    modifying Transformers globals. Native FA4 receives batch-major metadata
+    HF attention accepts public masks/varlen kwargs or a CPU batch-major
+    attention document map. Maps are materialized at the model-owned entry point
+    (HF decoder by default) without modifying Transformers globals. Flash offsets
+    are prepared before FSDP input transfer and exposed only to the text consumer.
+    Native FA4 receives batch-major metadata
     flattened at model entry after microbatch splitting. Other consumers strip
     unused native metadata so it cannot accidentally select their THD path.
 
@@ -498,10 +830,18 @@ def configure_packing(
         Structural packed-data requirements for the dataset collater.
 
     Raises:
+        ValueError: If native FA4 packing lacks a declared compatible consumer.
         RuntimeError: If HF flash attention cannot consume the public varlen contract.
     """
     capabilities = get_packing_capabilities(attn_implementation, model=model)
-    if model is not None and not capabilities.requires_packed_sequence_metadata:
+    if attn_implementation == "fa4" and not capabilities.uses_native_fa4:
+        target = getattr(model, "module", model)
+        target = getattr(target, "_orig_mod", target)
+        if not isinstance(target, PackedMaskConsumer):
+            raise ValueError("Native FA4 packing requires a model declaring native FA4 support.")
+    if not capabilities.uses_native_fa4:
+        validate_flash_packing_support(attn_implementation, model=model)
+    if model is not None and not capabilities.return_packed_sequence_metadata:
         model = getattr(model, "module", model)
         if getattr(model, "_unused_packed_metadata_hook_handle", None) is None:
             model._unused_packed_metadata_hook_handle = model.register_forward_pre_hook(
@@ -512,30 +852,85 @@ def configure_packing(
             raise ValueError("Native FA4 packing requires the built model")
         _install_native_fa4_metadata_hook(model)
         return capabilities
-    validate_flash_packing_support(attn_implementation, model=model)
+    if model is not None and capabilities.packed_mask_type in ("flash_varlen", "block_causal"):
+        from transformers import PreTrainedModel
+
+        uncompiled = getattr(model, "_orig_mod", model)
+        if isinstance(uncompiled, PackedMetadataEntryOwner):
+            entry = uncompiled.packed_metadata_entry_module
+        else:
+            entry = uncompiled.get_decoder() if isinstance(uncompiled, PreTrainedModel) else uncompiled
+        selection = (capabilities.packed_mask_type, attn_implementation)
+        handle = getattr(entry, "_packed_attention_hook_handle", None)
+        if handle is not None and getattr(entry, "_packed_attention_hook_selection", None) != selection:
+            handle.remove()
+            handle = None
+        if handle is None:
+            entry._packed_attention_hook_selection = selection
+            entry._packed_attention_hook_handle = entry.register_forward_pre_hook(
+                partial(
+                    _prepare_packed_attention_at_model_entry,
+                    packed_mask_type=capabilities.packed_mask_type,
+                    attn_implementation=attn_implementation,
+                ),
+                with_kwargs=True,
+            )
+        flash_handle = getattr(uncompiled, "_packed_flash_preparation_hook_handle", None)
+        if capabilities.packed_mask_type == "flash_varlen" and flash_handle is None:
+            # FSDP transfers CPU tensor kwargs before entering the text decoder.
+            uncompiled._packed_flash_preparation_hook_handle = uncompiled.register_forward_pre_hook(
+                partial(_prepare_flash_metadata_before_input_transfer, attn_implementation=attn_implementation),
+                with_kwargs=True,
+                prepend=True,
+            )
+        elif capabilities.packed_mask_type != "flash_varlen" and flash_handle is not None:
+            flash_handle.remove()
+            del uncompiled._packed_flash_preparation_hook_handle
     return capabilities
 
 
-def configure_packing_for_models(
-    models: Sequence[torch.nn.Module],
-) -> PackingCapabilities:
-    """Configure local pipeline stages and combine their dataset requirements.
+def validate_thd_packing_support(models: Sequence[torch.nn.Module]) -> None:
+    """Reject THD inputs before loader construction if a local stage cannot consume them.
+
+    THD uses the model's seq_lens path rather than the mask/Flash conversion
+    installed by configure_packing_for_models. Validate the existing model/backend
+    capability without selecting a different backend or disabling packing.
+    """
+    from nemo_automodel._transformers.capabilities import ModelSupports
+
+    for model in models:
+        model = getattr(model, "module", model)
+        model = getattr(model, "_orig_mod", model)
+        if not ModelSupports(model).supports_sequence_packing:
+            raise ValueError(
+                f"{type(model).__name__} with attention backend {get_model_attn_implementation(model)!r} "
+                "cannot consume THD seq_lens inputs; select a supported model/backend or packed input format"
+            )
+
+
+def configure_packing_for_models(models: Sequence[torch.nn.Module]) -> PackingCapabilities:
+    """Validate and install the adapters for batched packed execution.
+
+    Always obtain loader requests with ``get_packing_capabilities_for_models``.
+    Call this setup only for packed batched input. THD validates its length-based
+    interface separately and must not install these mask/Flash/gather hooks.
 
     Args:
-        models: Nonempty sequence of built model stages consuming the same batch.
+        models: Nonempty sequence of built local stages consuming the same batch.
 
     Returns:
-        Packing contract with metadata enabled if any stage needs it.
+        The same loader requests as the side-effect-free model query.
 
     Raises:
-        ValueError: If there are no models or their packed mask layouts disagree.
+        ValueError: If stages require incompatible batched mask layouts.
     """
-    if not models:
-        raise ValueError("Packing setup requires at least one model")
-    contracts = [configure_packing(get_model_attn_implementation(model), model=model) for model in models]
-    if any(contract.packed_mask_type != contracts[0].packed_mask_type for contract in contracts):
-        raise ValueError("Pipeline stages must agree on the NEAT packed mask layout")
-    return replace(
-        contracts[0],
-        requires_packed_sequence_metadata=any(contract.requires_packed_sequence_metadata for contract in contracts),
-    )
+    contract = get_packing_capabilities_for_models(models)
+    if any(
+        get_packing_capabilities(get_model_attn_implementation(model), model=model).packed_mask_type
+        != contract.packed_mask_type
+        for model in models
+    ):
+        raise ValueError("Pipeline stages must agree on the batched packed mask layout")
+    for model in models:
+        configure_packing(get_model_attn_implementation(model), model=model)
+    return contract
