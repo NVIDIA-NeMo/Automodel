@@ -264,15 +264,16 @@ The LoRA recipe trains rank-8 adapters on the 43-layer main decoder on 8 GPUs
 frozen. Run it from the repository root on each of the 2 nodes, with
 `NODE_RANK` set to 0 and 1 and `MASTER_ADDR` set to the first node:
 
-Both nodes of the 8-rank expert group must be in one NVLink domain. HybridEP
-requires DeepEP with HybridEP support and compiles kernels on first use. Leave
-`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` unset; if the nodes share a home
-directory, set `HYBRID_EP_CACHE_DIR` to a separate directory on each node.
-
 ```bash
 uv run torchrun --nnodes=2 --nproc-per-node=4 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
   -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml
 ```
+
+Both nodes of the 8-rank expert group must be in one NVLink domain; an expert
+group split across domains has not been validated. HybridEP requires DeepEP
+with HybridEP support and compiles kernels on first use. Leave
+`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` unset; if the nodes share a home
+directory, set `HYBRID_EP_CACHE_DIR` to a separate directory on each node.
 
 The recipe keeps the model, the data, the precision policy, and the optimizer
 of the full fine-tuning recipe. It adds the `peft` section, runs one document
@@ -286,7 +287,7 @@ a GPU holds: every GPU keeps one eighth of the routed experts and its shard of
 the dense weights. In the `torch` backend run these occupied 65.8 GiB after
 loading. A training step still gathers the dense weights and keeps the
 activations of the forward pass for the backward
-pass; in the validated run the allocation rose from 65.8 GiB to a peak of
+pass; in that `torch` run the allocation rose from 65.8 GiB to a peak of
 102.8 GiB.
 
 ### LoRA Targets
@@ -327,12 +328,15 @@ stay FP32. The recipe loads the model in BF16 and sets the compute dtype to
 ### Validated LoRA Configuration
 
 The 100-update measurements below used the `torch` expert and dispatcher
-backends. They do not measure the HybridEP recipe above. On an earlier
-integration preview, the released 43-layer model also ran on 8 GPUs with
-HybridEP for 32 updates, saved after 24, and resumed in a new process for
-8 updates. On all ranks the restored adapter and optimizer state matched
-the save, and the frozen parameters remained unchanged. This preview is
-not a run of the final version of the recipe.
+backends. They do not measure the HybridEP recipe above. On commit
+`9bfb59a219d0a1a8f42f0ad69b0fbee6a0b8ea9d`, the released 43-layer model ran
+on 8 GPUs with HybridEP for 32 updates, saved after 24, and resumed in a new
+process for 8 updates. On all ranks the restored adapter and optimizer state
+matched the save, and the frozen parameters remained unchanged. The run used
+a measuring wrapper and a shortened schedule; the 100-update HybridEP
+schedule and the CLI command above have not been run. It set
+`HYBRID_EP_CACHE_DIR`, `NEMO_HYBRIDEP_JIT_CACHE`, and `TMPDIR` per rank; the
+restore reused cached kernels from the training phase.
 
 | Area | Validated Configuration |
 |---|---|
@@ -388,9 +392,9 @@ in all. In the `torch` backend run, the two saves took 10.1 and 8.5 s.
 A resume loads the released checkpoint first and then the adapter; it was
 validated with the same number of ranks and the same `ep_size`. It restores
 the adapter exactly. The state of the recipe's optimizer (Transformer Engine
-`FusedAdam`: moments, master weights, and the update counter) is restored only
-with the fix of pull request
-[#4739](https://github.com/NVIDIA-NeMo/Automodel/pull/4739). A version without
+`FusedAdam`: moments, master weights, and the update counter) is restored with
+the fix of pull request [#4739](https://github.com/NVIDIA-NeMo/Automodel/pull/4739),
+which is included in this repository. A version without
 that fix restarts the optimizer silently on the restored adapter: no error is
 raised, the moments start empty, and the update counter starts again.
 
@@ -582,8 +586,7 @@ FSDP2 on single unpacked documents. The following limits apply:
   validated: `peft.moe_rank_scaling`, the full model with more ranks than
   `ep_size`, merging an adapter into the base weights with
   `export_merged_peft_checkpoint`, and loading an adapter with Hugging Face
-  PEFT. A resume restores the optimizer state only with the change of pull
-  request #4739; see [LoRA Checkpoints](#lora-checkpoints).
+  PEFT. See [LoRA Checkpoints](#lora-checkpoints) for optimizer restoration.
 - Documents longer than 512 tokens require the cuDNN sparse-attention path of
   the DSA layers, which requires `nvidia-cudnn-frontend[cutedsl]` and FlashMLA
   and is validated on SM100-class GPUs (GB200) only. Multi-GPU training of the
