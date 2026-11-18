@@ -26,7 +26,6 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from nemo_automodel.components.distributed.pipelining.functional import (
-    _SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION,
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
     _preserve_grads_across_stage_reinit,
@@ -42,7 +41,6 @@ from nemo_automodel.components.distributed.pipelining.functional import (
     split_model_into_stages,
     stage_ids_this_rank,
 )
-from nemo_automodel.shared.import_utils import is_torch_min_version
 
 
 class TestStageIdsThisRank:
@@ -508,10 +506,6 @@ class TestBuildPipelineSchedule:
     """Test build_pipeline_schedule function."""
 
     @pytest.mark.cpu_only
-    @pytest.mark.skipif(
-        not is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION),
-        reason="PyTorch schedules before 2.10 always keep and return the last stage's outputs",
-    )
     # 1F1B runs PipelineScheduleSingle.step(); interleaved 1F1B runs PipelineScheduleMulti.step().
     @pytest.mark.parametrize("schedule_name", ["1f1b", "interleaved1f1b"])
     def test_last_stage_outputs_are_not_kept_or_returned_by_default(
@@ -554,15 +548,9 @@ class TestBuildPipelineSchedule:
         call_kwargs: dict[str, bool],
         received_kwargs: dict[str, bool],
     ) -> None:
-        with (
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
-                return_value=_StepRecordingSchedule,
-            ),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.is_torch_min_version",
-                return_value=True,
-            ),
+        with patch(
+            "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
+            return_value=_StepRecordingSchedule,
         ):
             schedule = build_pipeline_schedule(
                 pipeline_parallel_schedule_csv=None,
@@ -576,28 +564,6 @@ class TestBuildPipelineSchedule:
         schedule.step(**call_kwargs)
 
         assert schedule.step_kwargs == [received_kwargs]
-
-    @pytest.mark.cpu_only
-    def test_rejects_unsupported_torch(self) -> None:
-        with (
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
-                return_value=_StepRecordingSchedule,
-            ),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.is_torch_min_version",
-                return_value=False,
-            ),
-            pytest.raises(RuntimeError, match=r"PyTorch >= 2\.10\.0"),
-        ):
-            build_pipeline_schedule(
-                pipeline_parallel_schedule_csv=None,
-                pipeline_parallel_schedule="1f1b",
-                microbatch_size=2,
-                local_batch_size=8,
-                stages=[Mock()],
-                loss_fn=Mock(),
-            )
 
     @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
     def test_build_schedule_single(self, mock_get_schedule):
