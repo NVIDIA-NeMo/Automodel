@@ -154,14 +154,11 @@ def test_hybridep_lora_expert_preserves_situ_and_adapter_math(monkeypatch, num_t
     output = experts(x, torch.ones(num_tokens, dtype=torch.bool), weights, indices)
     if num_tokens:
         gate_up = x @ (
-            experts.gate_and_up_projs[0]
-            + experts.scale * experts.lora_gate_and_up_A[0] @ experts.lora_gate_and_up_B[0]
+            experts.gate_and_up_projs[0] + experts.scale * experts.lora_gate_and_up_A[0] @ experts.lora_gate_and_up_B[0]
         )
         gate, up = gate_up.chunk(2, dim=-1)
         activated = _situ(gate, up) * weights
-        expected = activated @ (
-            experts.down_projs[0] + experts.scale * experts.lora_down_A[0] @ experts.lora_down_B[0]
-        )
+        expected = activated @ (experts.down_projs[0] + experts.scale * experts.lora_down_A[0] @ experts.lora_down_B[0])
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
         output.sum().backward()
         assert experts.lora_gate_and_up_B.grad is not None
