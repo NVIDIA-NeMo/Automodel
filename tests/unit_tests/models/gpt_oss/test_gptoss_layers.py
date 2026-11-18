@@ -568,3 +568,204 @@ class TestGptOssAttentionWithTE:
                 assert output.shape == (batch_size, seq_len, gpt_config.hidden_size)
             except Exception as e:
                 pytest.fail(f"TE forward pass with sliding window failed: {e}")
+
+
+@pytest.mark.cpu_only
+def test_fa4_preserves_te_sink_owner_order_and_window(
+    monkeypatch: pytest.MonkeyPatch, gpt_config: GptOssConfig
+) -> None:
+    """Actual layer construction preserves checkpoint keys and forwards the original window."""
+    import sys
+    from types import SimpleNamespace
+
+    import nemo_automodel.components.attention.utils as attention_utils
+    import nemo_automodel.components.models.gpt_oss.layers as layers_module
+
+    class SinkOwner(torch.nn.Module):
+        """Mock only the external TE parameter owner, not GPT construction."""
+
+        def __init__(self, num_attention_heads, **kwargs):
+            super().__init__()
+            self.softmax_offset = torch.nn.Parameter(torch.zeros(num_attention_heads))
+
+    calls = []
+
+    def external_kernel(q, k, v, **kwargs):
+        """Keep gradient connections while recording external call arguments.
+
+        Args:
+            q: Query tensor [tokens, heads, channels].
+            k: Key tensor [tokens, kv_heads, channels].
+            v: Value tensor [tokens, kv_heads, channels].
+            **kwargs: Backend options including sink [heads].
+
+        Returns:
+            Mock output [tokens, heads, channels] and absent LSE. This is not attention math.
+        """
+        calls.append(kwargs)
+        ratio = q.shape[-2] // k.shape[-2]
+        return q + k.repeat_interleave(ratio, -2) + v.repeat_interleave(ratio, -2) + kwargs["learnable_sink"].to(
+            q.dtype
+        )[None, :, None], None
+
+    external = SimpleNamespace(flash_attn_func=external_kernel, flash_attn_varlen_func=external_kernel)
+    modules = {
+        "flash_attn.cute": external,
+        "transformer_engine.pytorch.attention": SimpleNamespace(DotProductAttention=SinkOwner),
+        "transformer_engine.pytorch.quantization": SimpleNamespace(
+            FP8GlobalStateManager=SimpleNamespace(is_fp8_enabled=lambda: False)
+        ),
+    }
+    for name in ("transformer_engine.pytorch.attention", "transformer_engine.pytorch.quantization"):
+        monkeypatch.setitem(sys.modules, name, modules[name])
+    monkeypatch.setattr(attention_utils, "safe_import", lambda name: (name in modules, modules.get(name)))
+    monkeypatch.setattr(layers_module, "is_te_min_version", lambda version: True)
+    monkeypatch.setattr(layers_module, "apply_rotary_emb_qk", lambda q, k, *args, **kwargs: (q, k))
+    gpt_config.sliding_window = 128
+    layers = {}
+    for backend in ("te", "fa4"):
+        torch.manual_seed(909)
+        layers[backend] = GptOssAttention(
+            gpt_config, BackendConfig(attn=backend, linear="torch", rope_fusion=False), True
+        )
+    assert list(layers["te"].state_dict()) == list(layers["fa4"].state_dict())
+    assert list(dict(layers["te"].named_parameters())) == list(dict(layers["fa4"].named_parameters()))
+    for expected, actual in zip(layers["te"].parameters(), layers["fa4"].parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert sum("softmax_offset" in name for name, _ in layers["fa4"].named_parameters()) == 1
+    assert layers["fa4"].sinks is None
+    x = torch.randn(2, gpt_config.hidden_size, dtype=layers["fa4"].q_proj.weight.dtype, requires_grad=True)
+    output = layers["fa4"](
+        x,
+        torch.ones(2, gpt_config.head_dim),
+        qkv_format="thd",
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        _fa4_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        _fa4_max_seqlen=2,
+        packed_token_indices=torch.tensor([0, 1]),
+    )
+    output.sum().backward()
+    assert calls[-1]["window_size"] == (127, None)
+    for name, parameter in layers["fa4"].named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+    assert torch.count_nonzero(layers["fa4"].attn_module.softmax_offset.grad)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [None, "small_valid", "softcap", "window", "sink_dtype", "sink_device", "missing_used", "cpu", "other_arch"],
+)
+def test_fa4_physical_canonical_scope(change: str | None) -> None:
+    from types import SimpleNamespace
+
+    import nemo_automodel.components.models.gpt_oss.layers as layers_module
+
+    device = torch.device("cuda:0")
+    q = SimpleNamespace(shape=(32768, 64, 64), dtype=torch.bfloat16, is_cuda=True, device=device)
+    k = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
+    v = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
+    sink = SimpleNamespace(shape=(64,), dtype=torch.bfloat16, device=device)
+    kwargs = dict(
+        _fa4_seqused=torch.ones(512, dtype=torch.int32),
+        packed_token_indices=torch.arange(32768),
+        _fa4_physical_cu_seqlens=torch.arange(513, dtype=torch.int32),
+        learnable_sink=sink,
+        window_size=(128, 0),
+    )
+    if change == "small_valid":
+        kwargs["packed_token_indices"] = torch.arange(128)
+    if change == "softcap":
+        kwargs["softcap"] = 1.0
+    if change == "window":
+        kwargs["window_size"] = (65, 0)
+    if change == "sink_dtype":
+        sink.dtype = torch.float32
+    if change == "sink_device":
+        sink.device = torch.device("cpu")
+    if change == "missing_used":
+        kwargs.pop("_fa4_seqused")
+    if change == "cpu":
+        q.is_cuda = False
+    with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0) if change == "other_arch" else (10, 0)):
+        assert layers_module._use_physical_fa4_layout(q, k, v, kwargs) is (change is None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("layout", ["bshd", "thd"])
+def test_fa4_sliding_window_reference_boundary(monkeypatch: pytest.MonkeyPatch, layout: str) -> None:
+    """A width of 128 excludes key zero at query 128, including its gradients."""
+    import nemo_automodel.components.models.gpt_oss.layers as layers_module
+
+    class SinkOwner(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.softmax_offset = torch.nn.Parameter(torch.zeros(1))
+
+    def kernel(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        window_size: tuple[int, None],
+        learnable_sink: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Evaluate the external kernel's inclusive-distance contract on CPU.
+
+        Args:
+            q: Query tensor [1, sequence, heads, channels] or [tokens, heads, channels].
+            k: Key tensor with the same layout as q in this single-head fixture.
+            v: Value tensor with the same layout as q.
+            window_size: Inclusive left distance and unbounded right distance.
+            learnable_sink: Sink logits [heads].
+            **kwargs: Unused backend metadata.
+
+        Returns:
+            Attention output with the same layout as q.
+        """
+        dense = q.ndim == 4
+        q, k, v = (t.squeeze(0) if dense else t for t in (q, k, v))
+        positions = torch.arange(q.shape[0])
+        left, _ = window_size
+        allowed = (positions[None, :] <= positions[:, None]) & (positions[None, :] >= positions[:, None] - left)
+        scores = torch.einsum("qhd,khd->hqk", q, k) * 0.5
+        scores = scores.masked_fill(~allowed, float("-inf"))
+        sink = learnable_sink[:, None, None].expand(-1, q.shape[0], 1)
+        weights = torch.cat((scores, sink), dim=-1).softmax(dim=-1)[..., :-1]
+        output = torch.einsum("hqk,khd->qhd", weights, v)
+        return output.unsqueeze(0) if dense else output
+
+    monkeypatch.setattr(layers_module, "is_te_min_version", lambda version: True)
+    monkeypatch.setattr(layers_module, "initialize_attn_module_and_func", lambda **kwargs: (SinkOwner(), kernel))
+    config = GptOssConfig(hidden_size=4, num_attention_heads=1, num_key_value_heads=1, head_dim=4, sliding_window=128)
+    attention = GptOssAttention(config, BackendConfig(attn="fa4", linear="torch", rope_fusion=False), True).double()
+    with torch.no_grad():
+        for projection in (attention.q_proj, attention.k_proj, attention.v_proj, attention.o_proj):
+            projection.weight.zero_()
+            projection.bias.zero_()
+        attention.v_proj.weight.copy_(torch.eye(4))
+        attention.o_proj.weight.copy_(torch.eye(4))
+    x = torch.zeros(130, 4, dtype=torch.float64)
+    x[0, 0] = 1
+    x.requires_grad_()
+    # Identity RoPE: cosine ones followed by sine zeros.
+    frequencies = torch.cat((torch.ones(130, 2), torch.zeros(130, 2)), dim=-1)
+    metadata = {}
+    if layout == "thd":
+        metadata = dict(
+            qkv_format="thd",
+            _fa4_cu_seqlens=torch.tensor([0, 130], dtype=torch.int32),
+            _fa4_max_seqlen=130,
+            packed_token_indices=torch.arange(130),
+        )
+    else:
+        x = x.unsqueeze(0)
+        frequencies = frequencies.unsqueeze(0)
+    output = attention(x, frequencies, **metadata).reshape(130, 4)
+    # Independent model contract: 128 causal keys including self, plus the sink.
+    expected = torch.zeros_like(output)
+    expected[:128, 0] = 1 / (torch.arange(128, dtype=torch.float64) + 2)
+    torch.testing.assert_close(output, expected, rtol=0, atol=1e-15)
+    hidden_grad, sink_grad = torch.autograd.grad(output[128, 0], (x, attention.attn_module.softmax_offset))
+    assert torch.count_nonzero(hidden_grad.reshape(130, 4)[0]) == 0
+    assert torch.count_nonzero(sink_grad) == 0
