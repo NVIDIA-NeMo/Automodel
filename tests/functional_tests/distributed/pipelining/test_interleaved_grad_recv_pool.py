@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Actual NCCL interleaved schedule gradient/update parity with pooled receives."""
+"""NCCL interleaved schedule gradient/update parity with pooled or native JIT receives."""
 
 import datetime
 import os
@@ -33,19 +33,14 @@ from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
     install_interleaved_recv_pool,
 )
 
-# The implementation keeps native buffers on the older prepare-infra API, and on
-# PyTorch 2.15, which allocates each receive buffer just in time.
-# Remove the first gate when interleaved pooling supports that allocation layout.
-pytestmark = [
-    pytest.mark.skipif(
-        not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")),
-        reason="Interleaved pooling requires PyTorch per-direction stage setup",
-    ),
-    pytest.mark.skipif(
-        _native_recv_buffers_are_just_in_time(),
-        reason="PyTorch allocates receive buffers just in time, so the interleaved recv pool does not install",
-    ),
-]
+_NATIVE_JIT_RECEIVES = _native_recv_buffers_are_just_in_time()
+
+# The older prepare-infra layout has no per-direction setup hooks for pooling.
+pytestmark = pytest.mark.skipif(
+    not _NATIVE_JIT_RECEIVES
+    and not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")),
+    reason="Interleaved pooling requires PyTorch per-direction stage setup",
+)
 
 
 class _Block(nn.Module):
@@ -151,6 +146,9 @@ def _run_pipeline(
         observations.append(snapshot)
         for stage in stages:
             assert stage.chunks == num_microbatches
+            if _NATIVE_JIT_RECEIVES:
+                # JIT receives do not use a distinct descriptor for every microbatch.
+                continue
             if not stage.is_first:
                 distinct = len({id(info) for info in stage.args_recv_info.values()})
                 assert distinct < num_microbatches if pooled else distinct == num_microbatches
@@ -244,6 +242,7 @@ def test_interleaved_pooled_receives_preserve_every_gradient_and_update(
     )
 
 
+@pytest.mark.skipif(_NATIVE_JIT_RECEIVES, reason="Unsafe aliasing requires the interleaved receive pool")
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Four CUDA devices required")
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize("virtual,num_microbatches", [(4, 16), (2, 32), (2, 64)])
