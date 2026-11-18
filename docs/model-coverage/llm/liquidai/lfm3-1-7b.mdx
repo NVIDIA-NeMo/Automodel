@@ -57,7 +57,7 @@ Each row holds many documents. Positions restart at every document, and the shor
 
 With context parallelism each GPU holds one contiguous shard of the row, 16,384 tokens here. A layer that needs tokens before the shard fetches only the part of the shard's first document that earlier GPUs hold: 6 tokens for a convolution, up to 255 keys and values for sliding-window attention, and the whole part for full attention.
 
-Packed THD rows work at any `cp_size`, with one row per GPU when `cp_size > 1`. Unpacked batches also run with `cp_size > 1`. Batched (non-THD) packing needs a FlashAttention backend.
+Packed THD rows work at any `cp_size`, with one row per GPU when `cp_size > 1`. Unpacked batches also run with `cp_size > 1`; their padding counts as a document boundary, so real tokens never attend to or convolve over padding. Batched (non-THD) packing needs a FlashAttention backend, and its document indices are honored under context parallelism too.
 
 With `distributed.activation_checkpointing: true` whole decoder layers are recomputed in backward, the convolution layers included. A row of 131,072 tokens then trains at every `cp_size`, down to a whole row on one GPU. Measured with the packed recipe, activation checkpointing and 8 rows per step on 8x H100 80 GB:
 

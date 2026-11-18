@@ -167,6 +167,8 @@ def _parallelize_unsharded_fsdp2(
             if use_hf_native_checkpointing:
                 model.gradient_checkpointing_enable()
             elif parallelizer._use_full_layer_activation_checkpointing(model):
+                # As on the sharded path: a cache the forward fills would be filled again by the replay.
+                detect_kv_sharing_and_maybe_disable_cache(model)
                 apply_full_layer_checkpointing_to_layers(model, layers)
             else:
                 apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))

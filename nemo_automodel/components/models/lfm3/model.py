@@ -358,7 +358,7 @@ class Lfm3Model(Lfm3PreTrainedModel):
             cu_seq_lens_q: Optional int32 Tensor of shape [documents + 1] with the packed-document
                 boundaries of the flattened [batch * sequence] tokens. Attention and
                 convolution then stay inside each document, ``attention_mask`` is not used
-                and no generation cache is created.
+                and no generation cache is created; a supplied ``past_key_values`` is rejected.
             max_length_q: Length of the longest packed document.
             halo: Under context parallelism, how far the first local document reaches into
                 earlier ranks.
@@ -371,6 +371,8 @@ class Lfm3Model(Lfm3PreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if kwargs.get("qkv_format") == "thd":
             raise ValueError("LFM3 takes THD batches through the sharder of `prepare_model_inputs_for_cp`.")
+        if cu_seq_lens_q is not None and past_key_values is not None:
+            raise ValueError("LFM3 packed inputs do not support `past_key_values`.")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if use_cache and past_key_values is None and cu_seq_lens_q is None:
@@ -453,7 +455,16 @@ class Lfm3ForCausalLM(HFCheckpointingMixin, Lfm3PreTrainedModel, GenerationMixin
         return self.lm_head
 
     def prepare_model_inputs_for_cp(self, batch: CPBatch, *, num_chunks: int = 1) -> dict[str, ContextParallelSharder]:
-        """Return the sharder that keeps packed documents apart and splits the sequence across CP ranks."""
+        """Return the sharder that keeps packed documents apart and splits the sequence across CP ranks.
+
+        Args:
+            batch: The recipe batch with token Tensors of shape [batch, sequence]; it is not
+                read or changed here, the sharder reads it when it shards.
+            num_chunks: Unused; LFM3 shards whole rows.
+
+        Returns:
+            Mapping with the ``cp_sharder`` built on :func:`shard_documents`.
+        """
         return prepare_cp_inputs(batch, num_chunks=num_chunks)
 
     def validate_packed_attention_backend(self, attn_implementation: str) -> None:

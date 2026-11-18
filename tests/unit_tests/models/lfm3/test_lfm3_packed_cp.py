@@ -59,6 +59,11 @@ def _model(attn_implementation="sdpa"):
 
 
 def _thd_batch(rows=ROWS):
+    """Build a THD batch: token Tensors of shape [rows, SEQUENCE] whose documents have the given lengths.
+
+    Each row ends with padding (token 0, label -100). ``seq_lens`` and ``seq_lens_padded`` have shape
+    [rows, 5], padded with -1000; the last padded span absorbs the row's padding.
+    """
     generator = torch.Generator().manual_seed(1)
     ids = torch.zeros(len(rows), SEQUENCE, dtype=torch.long)
     positions = torch.zeros_like(ids)
@@ -79,6 +84,7 @@ def _thd_batch(rows=ROWS):
 
 
 def _packed_logits(model, batch, cp_mesh=None):
+    """Shard the batch for this rank and run the model; returns logits [rows, local sequence, vocab] and labels."""
     _, batch, _ = shard_documents(cp_mesh, None, batch)
     labels = batch.pop("labels")
     return model(**batch).logits, labels
@@ -118,6 +124,7 @@ class _ThreadGroup:
 
 
 def _transfer_between_threads(group, sends, receives):
+    """Stand-in for the point-to-point transfer: pieces of shape [batch, channels, tokens, ...] move through queues."""
     for rank, piece in sends:
         group.wires[group.rank.value, rank].put(piece.detach().clone())
     for rank, piece in receives:
@@ -328,3 +335,118 @@ def test_unsupported_packed_inputs_are_rejected():
     short["seq_lens_padded"][0, 4] -= 1
     with pytest.raises(ValueError, match="add up to the sequence length"):
         shard_documents(None, None, short)
+
+
+def test_packed_inputs_reject_a_supplied_cache_and_create_none():
+    model = _model()
+    _, packed, _ = shard_documents(None, None, _thd_batch(ROWS[:1]))
+    packed.pop("labels")
+    with torch.no_grad():
+        cache = model(input_ids=packed["input_ids"][:, :8], use_cache=True).past_key_values
+        assert cache is not None and cache.get_seq_length() == 8
+        with pytest.raises(ValueError, match="past_key_values"):
+            model(**packed, past_key_values=cache)
+        assert cache.get_seq_length() == 8
+        assert model(**packed, use_cache=True).past_key_values is None
+
+
+def _document_id_batch():
+    """Row 0 of ``ROWS`` as a batch packed for FlashAttention consumers: ``_packed_seq_ids`` with 1-based document indices, 0 at padding."""
+    thd = _thd_batch(ROWS[:1])
+    ids = torch.zeros(1, SEQUENCE, dtype=torch.long)
+    for index, (_, start, end) in enumerate(_documents(thd, ROWS[:1]), start=1):
+        ids[0, start:end] = index
+    return {
+        "input_ids": thd["input_ids"],
+        "labels": thd["labels"],
+        "position_ids": thd["position_ids"],
+        "_packed_seq_ids": ids,
+    }
+
+
+def test_document_ids_without_flash_offsets_keep_their_boundaries_on_shards(thread_ranks):
+    thd, batch = _thd_batch(ROWS[:1]), _document_id_batch()
+    # Unlike the THD spans, the document ids keep the padding tail (tokens 126 to 136) as a segment of its own.
+    local_boundaries = [[0, 34], [0, 3, 8, 34], [0, 34], [0, 3, 24, 34]]
+    for rank in range(4):
+        _, expected, _ = shard_documents(_Mesh(4, rank), None, dict(thd))
+        _, shard, _ = shard_documents(_Mesh(4, rank), None, dict(batch))
+        assert shard["cu_seq_lens_q"].tolist() == local_boundaries[rank]
+        assert shard["max_length_q"] == max(b - a for a, b in zip(local_boundaries[rank], local_boundaries[rank][1:]))
+        assert shard["halo"].lengths == expected["halo"].lengths
+        assert "_packed_seq_ids" not in shard
+    # Two documents and a padding tail in one row of eight tokens, over two shards of four.
+    small = {"input_ids": torch.arange(3, 11)[None], "labels": torch.arange(3, 11)[None]}
+    for rank in range(2):
+        _, shard, _ = shard_documents(
+            _Mesh(2, rank), None, {**small, "_packed_seq_ids": torch.tensor([[1, 1, 2, 2, 2, 2, 0, 0]])}
+        )
+        assert shard["cu_seq_lens_q"].tolist() == [0, 2, 4] and shard["halo"].lengths == (0, 2)
+
+    model = _model().train()
+    expected, labels = _packed_logits(model, dict(thd))
+    torch.nn.functional.cross_entropy(expected.flatten(0, 1), labels.flatten(), reduction="sum").backward()
+
+    logits, gradients = _run_ranks(model, batch, 4)
+
+    # Real tokens see the same documents either way; only the unsupervised padding tail is segmented differently.
+    torch.testing.assert_close(logits[:, : sum(ROWS[0])], expected[:, : sum(ROWS[0])], **TOLERANCE)
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(gradients[name], parameter.grad, atol=1e-4, rtol=1e-3)
+
+
+def test_left_padded_row_on_context_parallel_shards_matches_the_row_run_alone(thread_ranks):
+    # Three masked tokens, then 61 real ones that cross the shard boundary at token 32; conv_bias is on.
+    model = _model()
+    generator = torch.Generator().manual_seed(2)
+    real = torch.randint(3, 97, (1, 61), generator=generator)
+    ids = torch.cat([torch.zeros(1, 3, dtype=torch.long), real], dim=1)
+    batch = {
+        "input_ids": ids,
+        "labels": ids.masked_fill(ids == 0, -100),
+        "attention_mask": (ids != 0).long(),
+        "position_ids": torch.cat([torch.arange(3), torch.arange(61)])[None],
+    }
+    reference = copy.deepcopy(model).train()
+    expected = reference(input_ids=real).logits
+    torch.nn.functional.cross_entropy(expected.flatten(0, 1), real.flatten(), reduction="sum").backward()
+
+    logits, gradients = _run_ranks(model.train(), batch, 2)
+    changed = {**batch, "input_ids": ids.clone()}
+    changed["input_ids"][0, :3] = torch.tensor([5, 6, 7])
+    other, _ = _run_ranks(model, changed, 2)
+
+    torch.testing.assert_close(logits[:, 3:], expected, **TOLERANCE)
+    assert torch.equal(other[:, 3:], logits[:, 3:])
+    for name, parameter in reference.named_parameters():
+        torch.testing.assert_close(gradients[name], parameter.grad, atol=1e-4, rtol=1e-3)
+
+
+def test_one_rank_fsdp2_checkpointing_disables_the_cache_and_keeps_plain_gradients():
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from nemo_automodel.components.distributed.config import FSDP2Config
+    from nemo_automodel.components.distributed.mesh import MeshContext
+    from nemo_automodel.components.distributed.model_parallelizer import _parallelize_unsharded_fsdp2
+
+    model = _model().train()
+    assert model.config.use_cache
+    ids = _thd_batch(ROWS[:1])["input_ids"][:, : sum(ROWS[0])]
+    plain = copy.deepcopy(model)
+    expected = plain(input_ids=ids, use_cache=False).logits
+    expected.square().mean().backward()
+
+    # One rank: the parallelizer wraps whole layers without sharding; float32 compute needs no device mesh.
+    strategy = FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32))
+    _parallelize_unsharded_fsdp2(
+        model, MeshContext(strategy_config=strategy, activation_checkpointing=True), parallelizer=model.parallelizer
+    )
+    output = model(input_ids=ids)
+    output.logits.square().mean().backward()
+
+    assert output.past_key_values is None and not model.config.use_cache
+    torch.testing.assert_close(output.logits, expected, **TOLERANCE)
+    gradients = {name.replace("._checkpoint_wrapped_module", ""): p.grad for name, p in model.named_parameters()}
+    for name, parameter in plain.named_parameters():
+        assert torch.isfinite(gradients[name]).all()
+        torch.testing.assert_close(gradients[name], parameter.grad, atol=1e-5, rtol=1e-4)

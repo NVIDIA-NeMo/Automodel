@@ -21,6 +21,10 @@ export CUDA_VISIBLE_DEVICES="0,1"
 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
     tests/functional_tests/context_parallel/run_lfm3_packed_cp.py
 
+# The recipe's composition: FSDP2 over the CP ranks, loss normalization, clipping and one optimizer step
+python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+    tests/functional_tests/context_parallel/run_lfm3_packed_cp.py --fsdp2
+
 # A document that spans several of four shards, through Gloo on CPU
 python -m torch.distributed.run --nproc_per_node=4 --nnodes=1 -m coverage run \
     tests/functional_tests/context_parallel/run_lfm3_packed_cp.py --cpu

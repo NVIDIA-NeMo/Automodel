@@ -39,6 +39,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_batch_contiguous,
 )
+from nemo_automodel.components.models.common.packed_seq import packed_seq_params_from_doc_ids
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,16 @@ def _halo_sources(lengths: tuple[int, ...], shard_length: int, rank: int, limit:
 def _transfer(
     group: dist.ProcessGroup, sends: list[tuple[int, torch.Tensor]], receives: list[tuple[int, torch.Tensor]]
 ) -> None:
-    """Send and receive Tensors between CP ranks in one batch of point-to-point operations."""
+    """Send and receive Tensors between CP ranks in one batch of point-to-point operations.
+
+    Args:
+        group: Context-parallel process group; the ranks below are ranks within it.
+        sends: Pairs of destination rank and the Tensor to send, of shape
+            [batch, channels, piece_tokens, ...]. Each piece is copied before it is sent.
+        receives: Pairs of source rank and the buffer that receives its piece, of shape
+            [batch, channels, piece_tokens, ...] with the sender's dtype, device and trailing
+            dimensions. The buffers are filled in place.
+    """
     operations = [
         dist.P2POp(dist.isend, piece.contiguous(), dist.get_global_rank(group, rank), group) for rank, piece in sends
     ]
@@ -106,6 +116,21 @@ class _HaloExchange(torch.autograd.Function):
         receives: list[tuple[int, int]],
         sends: list[tuple[int, int]],
     ) -> torch.Tensor:
+        """Exchange shard suffixes.
+
+        Args:
+            ctx: Autograd context that records the exchange plan.
+            tensor: This rank's shard, a Tensor of shape [batch, channels, sequence, ...];
+                axis 2 is this rank's contiguous interval of the global sequence.
+            group: Context-parallel process group.
+            receives: Pairs of source rank and token count, in sequence order.
+            sends: Pairs of destination rank and the number of trailing tokens it reads.
+
+        Returns:
+            The received pieces in sequence order, a Tensor of shape
+            [batch, channels, halo_tokens, ...] where ``halo_tokens`` is the sum of the receive
+            counts. It never aliases ``tensor``.
+        """
         ctx.group, ctx.receives, ctx.sends, ctx.shape = group, receives, sends, tensor.shape
         pieces = [tensor.new_empty(*tensor.shape[:2], count, *tensor.shape[3:]) for _, count in receives]
         _transfer(
@@ -117,6 +142,17 @@ class _HaloExchange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: torch.autograd.function.FunctionCtx, grad: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        """Return the halo's gradient to the ranks that own the tokens.
+
+        Args:
+            ctx: Autograd context holding the exchange plan of the forward.
+            grad: Gradient of the halo, a Tensor of shape [batch, channels, halo_tokens, ...].
+
+        Returns:
+            Gradient of the local shard, a Tensor of shape [batch, channels, sequence, ...] that
+            sums the gradients every later reader returns for the shard's trailing tokens, and
+            ``None`` for the three non-tensor arguments.
+        """
         pieces = grad.split([count for _, count in ctx.receives], dim=2)
         returned = [grad.new_empty(*ctx.shape[:2], count, *ctx.shape[3:]) for _, count in ctx.sends]
         _transfer(
@@ -234,7 +270,20 @@ def document_attention_inputs(
 
 
 def _document_boundaries(batch: CPBatch) -> list[int]:
-    """Return document boundaries over the flattened [batch * sequence] tokens and drop the THD entries."""
+    """Return document boundaries over the flattened [batch * sequence] tokens and drop the entries they came from.
+
+    Args:
+        batch: Token Tensors of shape [batch, sequence]. The boundaries come from the first of:
+            ``seq_lens_padded`` [batch, documents] of a THD batch (``qkv_format`` and ``seq_lens``
+            are removed with it); ``cu_seq_lens_q`` [documents + 1] of a batch packed for
+            FlashAttention; ``_packed_seq_ids`` [batch, sequence], 1-based document indices with
+            0 at padding (removed); a 2D ``attention_mask`` [batch, sequence], nonzero at real
+            tokens. Padding runs of the last two become segments of their own, so real tokens
+            never attend to or convolve over padding. Any other batch holds one document per row.
+
+    Returns:
+        Boundaries as ints from 0 to batch * sequence; every row starts a new document.
+    """
     rows, sequence = batch["input_ids"].shape
     if batch.pop("qkv_format", None) == "thd":
         batch.pop("seq_lens")
@@ -247,7 +296,14 @@ def _document_boundaries(batch: CPBatch) -> list[int]:
         return boundaries
     if batch.get("cu_seq_lens_q") is not None:
         return batch["cu_seq_lens_q"].tolist()
-    return list(range(0, rows * sequence + 1, sequence))
+    segments = batch.pop("_packed_seq_ids", None)
+    if segments is None:
+        attention_mask = batch.get("attention_mask")
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+            segments = attention_mask != 0
+    if segments is None:
+        return list(range(0, rows * sequence + 1, sequence))
+    return packed_seq_params_from_doc_ids(segments.to(torch.long)).cu_seqlens.tolist()
 
 
 def shard_documents(
@@ -264,8 +320,10 @@ def shard_documents(
         cp_mesh: CP mesh, or ``None``; every rank of it receives the same batch.
         tp_mesh: Unused TP mesh forwarded to the shared sharder.
         batch: Token Tensors of shape [batch, sequence]. A THD batch carries the document
-            spans of each row in ``seq_lens_padded`` and a batch packed for FlashAttention
-            carries ``cu_seq_lens_q``; any other batch holds one document per row.
+            spans of each row in ``seq_lens_padded``, a batch packed for FlashAttention
+            carries ``cu_seq_lens_q`` or the document indices ``_packed_seq_ids``, and an
+            unpacked batch holds one document per row, split where a 2D ``attention_mask``
+            marks padding (see :func:`_document_boundaries`).
         loss_mask: Optional Tensor of shape [batch, sequence] sharded with the batch.
         padding_token_id: Token used when the sequence is padded to a multiple of the CP size.
 
@@ -302,7 +360,17 @@ def shard_documents(
 
 
 def prepare_cp_inputs(batch: CPBatch, *, num_chunks: int = 1) -> dict[str, ContextParallelSharder]:
-    """Return the sharder for packed THD batches at any CP size and for unpacked batches under CP."""
+    """Return the sharder for packed THD batches at any CP size and for unpacked batches under CP.
+
+    Args:
+        batch: Unused here; the sharder reads the batch, with token Tensors of shape
+            [batch, sequence], when it shards.
+        num_chunks: Unused; LFM3 shards whole rows.
+
+    Returns:
+        Mapping with the ``cp_sharder`` whose ``shard_batch`` is :func:`shard_documents` and
+        whose local token indices are those of the contiguous shard.
+    """
     del batch, num_chunks
     return {
         "cp_sharder": ContextParallelSharder(
