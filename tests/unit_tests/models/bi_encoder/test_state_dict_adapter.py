@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 
@@ -115,3 +116,37 @@ class TestEncoderStateDictAdapter:
         assert set(recovered_hf_state.keys()) == set(original_hf_state.keys())
         for key in original_hf_state:
             assert torch.equal(recovered_hf_state[key], original_hf_state[key])
+
+    def test_peft_module_names_drop_the_wrapper_prefix_once(self, adapter):
+        """PEFT metadata names modules the way to_hf names their tensors.
+
+        A wrapped decoder keeps its own ``model.`` namespace: ``model.model.norm`` is the HF
+        ``model.norm``, not ``norm``.
+        """
+        assert adapter.map_peft_target_module_to_hf("model.classifier") == "classifier"
+        assert adapter.map_peft_target_module_to_hf("model.model.norm") == "model.norm"
+        assert adapter.map_peft_target_module_to_hf("pooler") == "pooler"
+
+    def test_peft_module_names_follow_the_backbone_renames(self):
+        """A wrapped backbone's adapter renames modules after the wrapper prefix is removed, as in to_hf."""
+
+        class _RenamingBackboneAdapter(StateDictAdapter):
+            def to_hf(self, state_dict, **kwargs):
+                """Identity; tensors keep their native layouts."""
+                return state_dict
+
+            def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
+                """Identity; tensors keep their HF layouts."""
+                return hf_state_dict
+
+            def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+                """Identity; ``tensor`` keeps its layout."""
+                return [(fqn, tensor)]
+
+            def map_peft_target_module_to_hf(self, name, *, v4_compatible=False):
+                return f"language_model.{name}" if v4_compatible else name.replace("norm", "norm_f")
+
+        adapter = EncoderStateDictAdapter(_RenamingBackboneAdapter())
+
+        assert adapter.map_peft_target_module_to_hf("model.model.norm") == "model.norm_f"
+        assert adapter.map_peft_target_module_to_hf("model.score", v4_compatible=True) == "language_model.score"

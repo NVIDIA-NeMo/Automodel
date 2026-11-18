@@ -123,6 +123,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             # Preserve the pre-freeze_config behavior for existing PEFT sequence
             # classification recipes; new configs declare this selector directly.
             freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
+            logging.info(
+                "freeze_config is not set: training the classifier in full next to the LoRA adapters "
+                "(unfreeze_modules: [{glob: '*classifier'}]). Keep the classifier out of the PEFT targets."
+            )
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,

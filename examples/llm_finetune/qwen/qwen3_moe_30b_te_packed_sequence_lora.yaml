@@ -132,6 +132,10 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  perf_testing:
+    schedule: nightly
+    # Keep the 30-minute budget of the unpacked recipe this one replaced (default: 600 s).
+    time: "00:30:00"
   nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: hemildesai
