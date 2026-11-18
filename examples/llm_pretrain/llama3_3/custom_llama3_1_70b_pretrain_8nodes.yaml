@@ -66,6 +66,7 @@ rng:
   seed: 42
   ranked: true
 ci:
+  nemo_ci_schedule: skipped
   deprecated: true
   cluster_tag: h100
   nodes: 8

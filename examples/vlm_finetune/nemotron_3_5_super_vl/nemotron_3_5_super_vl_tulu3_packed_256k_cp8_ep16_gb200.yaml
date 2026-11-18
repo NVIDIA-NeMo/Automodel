@@ -156,6 +156,7 @@ wandb:
   name: nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: HuiyingLi
   cluster_tag: gb200
   nodes: 4
