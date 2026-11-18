@@ -922,7 +922,9 @@ def test_synthetic_pretraining_uses_recipe_batch_size(config_path: Path) -> None
     assert batch["labels"].shape == (3, 16)
     torch.testing.assert_close(batch["labels"][:, :-1], batch["input_ids"][:, 1:])
     assert batch["labels"][:, -1].eq(-100).all()
-    assert not batch["padding_mask"].any()
+    # An omitted empty mask and an all-false mask both describe unpadded data.
+    padding_mask = batch.get("padding_mask")
+    assert padding_mask is None or not padding_mask.any()
     assert "position_ids" not in batch
     assert batch["input_ids"].min() >= 0
     assert batch["input_ids"].max() < raw["dataset"]["vocab_size"]

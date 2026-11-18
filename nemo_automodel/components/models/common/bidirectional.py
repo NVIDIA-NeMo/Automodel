@@ -80,6 +80,21 @@ class EncoderStateDictAdapter(StateDictAdapter):
             hf_state_dict = self.backbone_adapter.from_hf(hf_state_dict, device_mesh=device_mesh, **kwargs)
         return {self._add_model_prefix(key): value for key, value in hf_state_dict.items()}
 
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
+        """Name a module the way ``to_hf`` names its tensors: without the wrapper prefix, then backbone renames.
+
+        Args:
+            name: A module name in the wrapped model's native layout.
+            v4_compatible: Whether the export targets the legacy Transformers v4 layout.
+
+        Returns:
+            The module name in the backbone's HF layout.
+        """
+        name = name.removeprefix(self._MODEL_PREFIX)
+        if isinstance(self.backbone_adapter, StateDictAdapter):
+            return self.backbone_adapter.map_peft_target_module_to_hf(name, v4_compatible=v4_compatible)
+        return name
+
     @property
     def checkpoint_key_aliases(self) -> dict[str, str]:
         """Forward backbone aliases, which are already expressed in exported HF names."""
