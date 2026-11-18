@@ -21,6 +21,7 @@ import threading
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.activation_checkpointing import apply_full_layer_checkpointing_to_layers
 from nemo_automodel.components.models.lfm3 import context_parallel
 from nemo_automodel.components.models.lfm3 import model as lfm3_model
 from nemo_automodel.components.models.lfm3.config import Lfm3Config
@@ -226,6 +227,25 @@ def test_context_parallel_shards_match_one_process(thread_ranks, size, attn_impl
     torch.testing.assert_close(logits[:, :SEQUENCE], expected, **TOLERANCE)
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(gradients[name], parameter.grad, atol=1e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("size", [1, 2, 4])
+def test_checkpointed_layers_give_the_gradients_of_plain_layers(thread_ranks, size):
+    model, batch = _model().train(), _thd_batch(ROWS[:1])
+    expected, labels = _packed_logits(model, dict(batch))
+    torch.nn.functional.cross_entropy(expected.flatten(0, 1), labels.flatten(), reduction="sum").backward()
+    checkpointed = copy.deepcopy(model)
+    checkpointed.zero_grad()
+    # What `distributed.activation_checkpointing: true` does for this model: every layer, convolutions included.
+    assert Lfm3ForCausalLM.parallelizer._use_full_layer_activation_checkpointing(checkpointed)
+    apply_full_layer_checkpointing_to_layers(checkpointed, list(checkpointed.model.layers))
+
+    logits, gradients = _run_ranks(checkpointed, batch, size)
+
+    torch.testing.assert_close(logits[:, :SEQUENCE], expected, **TOLERANCE)
+    plain = {name.replace("._checkpoint_wrapped_module", ""): gradient for name, gradient in gradients.items()}
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(plain[name], parameter.grad, atol=1e-4, rtol=1e-3)
 
 
 def test_unpacked_row_on_context_parallel_shards_matches_the_plain_forward(thread_ranks):

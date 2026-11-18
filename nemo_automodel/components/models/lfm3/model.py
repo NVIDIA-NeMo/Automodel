@@ -57,6 +57,7 @@ from nemo_automodel.components.models.lfm3.context_parallel import (
     document_attention_inputs,
     prepare_cp_inputs,
 )
+from nemo_automodel.components.models.lfm3.parallelization import PARALLELIZER
 from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
@@ -413,6 +414,7 @@ class Lfm3ForCausalLM(HFCheckpointingMixin, Lfm3PreTrainedModel, GenerationMixin
 
     _owns_cp_attention = True
     supports_thd = True
+    parallelizer = PARALLELIZER
 
     @dataclass(frozen=True)
     class ModelCapabilities:
