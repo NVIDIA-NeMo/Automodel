@@ -106,10 +106,11 @@ def test_qwen3_packed_single_rank_autocast(tmp_path: Path, checkpointing: bool) 
             reference_name = name.replace("._checkpoint_wrapped_module", "")
             assert parameter.dtype == torch.float32
             assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
-            torch.testing.assert_close(
-                parameter.grad, reference_parameters[reference_name].grad, rtol=0.05, atol=5e-5, msg=name
-            )
             reference_gradient = reference_parameters[reference_name].grad
+            assert reference_gradient is not None, reference_name
+            # Packed TE and per-document SDPA use different BF16 backward reductions.
+            # Compare each full gradient's relative L2 error: elementwise relative
+            # error near zero is unstable across attention kernels and GPU architectures.
             relative_error = (parameter.grad - reference_gradient).norm() / reference_gradient.norm()
             assert relative_error < 0.03, (name, relative_error.item())
         original = model.model.layers[0].self_attn.q_norm.weight.detach().clone()
