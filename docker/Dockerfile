@@ -227,13 +227,22 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
 FROM automodel_dep AS wheel_builder
 
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
+# v0.17.0 names a non-argument in one triton.autotune key, which Triton 3.9 (26.11 base) rejects when
+# torchao.prototype.moe_training is imported; see docker/common/torchao-autotune-key.patch.
 ARG TORCHAO_REF=v0.17.0
+COPY docker/common/torchao-autotune-key.patch /tmp/torchao-autotune-key.patch
 RUN mkdir -p /wheels && \
     git clone --depth 1 --branch ${TORCHAO_REF} --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/ao.git /tmp/torchao && \
+    patch_file=/tmp/torchao-autotune-key.patch && \
+    if git -C /tmp/torchao apply --check "$patch_file" 2>/dev/null; then \
+        git -C /tmp/torchao apply "$patch_file"; \
+    else \
+        git -C /tmp/torchao apply --reverse --check "$patch_file"; \
+    fi && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
-    rm -rf /tmp/torchao
+    rm -rf /tmp/torchao "$patch_file"
 
 # FlashMLA sparse prefill forward used by the GLM-5.2/5.3 cuDNN DSA backend.
 # This is the source revision used for the cuDNN numerical and full-model validation.
