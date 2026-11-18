@@ -29,6 +29,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
+from nemo_automodel.recipes.llm.step_metrics import restore_moe_metrics, write_remote_step_metrics
 from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -383,6 +384,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         dataloader_iter = iter(self.dataloader)
 
         reporter = DeferredStepReporter(device)
+        reducer = self._step_metric_reducer()
         elapsed_steps = []
 
         # Main benchmarking loop
@@ -444,12 +446,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            count = self._reduce_step_metrics(torch.stack(label_counts).sum())
+            count = reducer.reduce(torch.stack(label_counts).sum())
             sample = MetricsSample(
                 step=i,
                 epoch=0,
                 metrics={
-                    "loss": self._step_loss(loss_buffer, normalize_by=count),
+                    "loss": reducer.loss(loss_buffer, normalize_by=count),
                     "num_label_tokens": count,
                     "max_memory_gib": torch.cuda.max_memory_allocated() / 1024**3,
                 },
@@ -484,7 +486,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         return elapsed_steps
 
     def _log_iteration_metrics(self, sample: MetricsSample, *, peak_tflops: float, elapsed: float) -> None:
-        self._restore_moe_metrics(sample)
+        self._moe_layer_loads = restore_moe_metrics(sample)
         mfu = calculate_mfu(self.tflops, self.dist_env.world_size, elapsed, reference_mfu=peak_tflops)
         logger.info(
             "Rank 0 | Iteration %d | num_label_tokens=%d | Max Memory Allocated: %.2f GB | loss=%.4f",
@@ -504,7 +506,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             sinks.append(self.wandb_run.log)
         if self.trackio_logger is not None:
             sinks.append(self.trackio_logger.log_metrics)
-        self._write_remote_step_metrics(step=sample.step, metrics=metrics, sinks=sinks)
+        write_remote_step_metrics(step=sample.step, metrics=metrics, sinks=sinks, moe_metrics=self._compute_moe_metrics)
 
     def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank, *, elapsed_steps: list[float]):
         torch.distributed.barrier()

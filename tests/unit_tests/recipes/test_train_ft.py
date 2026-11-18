@@ -46,7 +46,6 @@ from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_m
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
-from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_domain_mixture_blend,
@@ -2583,8 +2582,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
     @staticmethod
     def _reported_step(recipe, batches):
-        reporter = DeferredStepReporter(recipe.dist_env.device)
-        recipe._throughput_window = None
+        reporter = recipe._training_step_reporter()
         recipe.log_train_metrics = MagicMock()
         start = reporter.mark()
         sample = recipe._run_train_optim_step(batches)

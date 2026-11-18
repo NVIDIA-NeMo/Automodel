@@ -29,8 +29,6 @@ import gc
 import inspect
 import logging
 import pathlib
-import time
-from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -105,7 +103,6 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     clip_grads_for_optimizers,
-    count_tail_padding,
     get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
@@ -114,7 +111,6 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     FreezeConfig,
     _supports_logits_to_keep,
@@ -125,7 +121,13 @@ from nemo_automodel.components.utils.model_utils import (
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
+from nemo_automodel.recipes.llm.step_metrics import (
+    StepMetricReducer,
+    TrainingStepReporter,
+    restore_moe_metrics,
+    snapshot_moe_metrics,
+    write_remote_step_metrics,
+)
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
@@ -1008,17 +1010,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         compute = compute_detailed_metrics if detailed else compute_brief_metrics
         return compute(loads, top_k=config.get("top_k_experts", 0))
 
-    def _write_remote_step_metrics(
-        self, *, step: int, metrics: dict[str, object], sinks: list[Callable[..., None]]
-    ) -> None:
-        if not sinks:
-            return
-        for log in sinks:
-            log(metrics, step=step)
-        if moe_metrics := self._compute_moe_metrics(step):
-            for log in sinks:
-                log(moe_metrics, step=step)
-
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
             return
@@ -1137,8 +1128,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         pbar = self._make_progress_bar()
         train_log_data = None
         last_validation_step = None
-        reporter = DeferredStepReporter(self.dist_env.device)
-        self._throughput_window = None
+        reporter = self._training_step_reporter()
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
@@ -1571,58 +1561,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
-        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        # The supervised count normalizes training; the other counts describe pack utilization.
-        counts = torch.tensor(
-            [
-                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
-            ],
-            dtype=torch.long,
+        reducer = self._step_metric_reducer()
+        counts = reducer.token_counts(
+            batches, ignore_index=_get_loss_ignore_index(getattr(self, "loss_fn", None)), pack_size=self.pack_size or 0
         )
-        num_label_tokens, num_tokens_in_batch, num_packs = self._reduce_step_metrics(counts).unbind()
-
         domain_label_counts = None
         if self.domain_mixture is not None:
-            # This runs between two data-parallel collectives, so a rank-local
-            # raise would leave every peer blocked in all_reduce until the NCCL
-            # watchdog fires. Collect the failure instead and all-reduce a flag so
-            # all ranks abort together, on the same step, with a real traceback.
-            # This also validates every microbatch up front, letting the
-            # per-microbatch weighting skip its bounds-check syncs.
-            ignore_index = getattr(self.loss_fn, "ignore_index", -100)
-            domain_label_counts = torch.zeros(len(self.domain_mixture.names), dtype=torch.long)
-            local_error = ""
-            try:
-                for batch in batches:
-                    dataset_ids = batch.get("dataset_id")
-                    if dataset_ids is None:
-                        raise ValueError(
-                            "domain_mixture requires each training batch to contain dataset_id; "
-                            "use a blended dataset that emits one ID per sample"
-                        )
-                    domain_label_counts += self.domain_mixture.label_counts(
-                        dataset_ids, batch["labels"], ignore_index=ignore_index
-                    ).cpu()
-            except (TypeError, ValueError) as exc:
-                local_error = f"{type(exc).__name__}: {exc}"
-                domain_label_counts.zero_()
-            failed = torch.tensor(int(bool(local_error)), dtype=torch.int32, device="cpu")
-            if self._step_control_group is not None:
-                torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX, group=self._step_control_group)
-            elif torch.distributed.is_initialized():
-                failed = self._dp_allreduce(failed)
-            if failed.item():
-                raise ValueError(
-                    local_error
-                    or "domain_mixture rejected the dataset_id of another data-parallel rank's batch; "
-                    "see that rank's log for the specific error"
-                )
-            domain_label_counts = self._reduce_step_metrics(domain_label_counts)
+            domain_label_counts = reducer.domain_counts(
+                batches, mixture=self.domain_mixture, ignore_index=getattr(self.loss_fn, "ignore_index", -100)
+            )
 
         num_batches = len(batches)
-        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=counts.labels)
 
         loss_buffer = []
 
@@ -1633,7 +1583,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
             self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                i, batch, loss_buffer=loss_buffer, num_label_tokens=counts.labels, num_batches=num_batches
             )
 
             if i == 0:
@@ -1652,7 +1602,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_label_tokens,
+            num_label_tokens=counts.labels,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
             grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
@@ -1690,39 +1640,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
-        step_flops = None
-        mfu_calculator = getattr(self, "mfu_calculator", None)
-        if batches and mfu_calculator is not None:
-            step_flops = 0.0
-            flops_supported = True
-            for batch in batches:
-                input_ids = batch.get("input_ids")
-                if input_ids is None:
-                    flops_supported = False
-                    break
-                batch_flops = mfu_calculator.get_flops(input_ids)
-                if batch_flops is None:
-                    flops_supported = False
-                    break
-                step_flops += float(batch_flops)
-
-            if flops_supported:
-                step_flops = self._reduce_step_metrics(torch.tensor(step_flops, dtype=torch.float64), include_cp=True)
-            else:
-                step_flops = None
-
-        reporting_loss = self._step_loss(loss_buffer, normalize_by=num_label_tokens if self.pp_enabled else None)
+        step_flops = reducer.flops(batches, getattr(self, "mfu_calculator", None))
+        reporting_loss = reducer.loss(loss_buffer, normalize_by=counts.labels if self.pp_enabled else None)
         metrics = {
             "loss": reporting_loss,
             "grad_norm": grad_norm,
             "lr": self.optimizer[0].param_groups[0]["lr"],
             "mem": torch.cuda.max_memory_allocated() / 1024**3,
             "_step_flops": step_flops,
-            "num_tokens_per_step": num_tokens_in_batch,
-            "num_label_tokens": num_label_tokens,
+            "num_tokens_per_step": counts.tokens,
+            "num_label_tokens": counts.labels,
         }
         if self.pack_size:
-            metrics["_num_packs"] = num_packs
+            metrics["_num_packs"] = counts.packs
         if domain_label_counts is not None:
             metrics["_domain_label_counts"] = domain_label_counts
 
@@ -1732,94 +1662,30 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             metrics=metrics,
         )
 
-    def _reduce_step_metrics(self, values: torch.Tensor, *, include_cp: bool = False) -> torch.Tensor:
-        """Reduce a scalar or vector of shape [metrics] on the training device."""
-        if self.dist_env.device.type == "cuda" and not values.is_cuda:
-            values = values.pin_memory().to(self.dist_env.device, non_blocking=True)
-        return self._dp_allreduce(values, include_cp=include_cp, keep_device=True)
+    def _step_metric_reducer(self) -> StepMetricReducer:
+        return StepMetricReducer(
+            device=self.dist_env.device,
+            dp_reduce=self._dp_allreduce,
+            pp_broadcast=self._broadcast_from_last_pp_stage if self.pp_enabled else None,
+            control_group=getattr(self, "_step_control_group", None),
+        )
 
-    def _step_loss(self, losses: list[torch.Tensor], *, normalize_by: torch.Tensor | None) -> torch.Tensor:
-        """Reduce the loss for reporting and broadcast the PP last-stage result.
-
-        Args:
-            losses: Detached scalar loss from each local accumulation batch.
-            normalize_by: Optional scalar token count on the training device.
-
-        Returns:
-            Reduced scalar loss on the training device.
-        """
-        loss = torch.stack(losses).sum()
-        if self.pp_enabled:
-            # PP stages can contribute losses of different dtypes.
-            loss = loss.float()
-        loss = self._reduce_step_metrics(loss, include_cp=True)
-        if normalize_by is not None:
-            loss = loss.float() / normalize_by
-        return self._broadcast_from_last_pp_stage(loss) if self.pp_enabled else loss
-
-    def _set_domain_label_metrics(self, metrics, domain_label_counts: torch.Tensor) -> None:
-        """Add per-domain metrics from CPU counts of shape [domains]."""
-        total_domain_labels = max(int(domain_label_counts.sum().item()), 1)
-        for name, count in zip(self.domain_mixture.names, domain_label_counts.tolist()):
-            metrics[f"domain_mixture/{name}_label_tokens"] = count
-            metrics[f"domain_mixture/{name}_label_fraction"] = count / total_domain_labels
+    def _training_step_reporter(self) -> TrainingStepReporter:
+        return TrainingStepReporter(
+            self.dist_env.device,
+            world_size=self.dist_env.world_size,
+            pack_size=self.pack_size or 0,
+            domain_names=getattr(getattr(self, "domain_mixture", None), "names", ()),
+            reference_mfu=getattr(getattr(self, "mfu_calculator", None), "reference_mfu", None),
+        )
 
     def _snapshot_moe_metrics(self, sample: MetricsSample) -> None:
         self._collect_moe_load_balance()
-        for name, data in (self._moe_layer_loads or {}).items():
-            sample.metrics[f"_moe_load/{name}"] = data["expert_load"]
-            if data["aux_loss"] is not None:
-                sample.metrics[f"_moe_aux/{name}"] = data["aux_loss"].reshape(1)
+        snapshot_moe_metrics(sample, self._moe_layer_loads or {})
 
-    def _restore_moe_metrics(self, sample: MetricsSample) -> None:
-        self._moe_layer_loads = {}
-        for key in tuple(sample.metrics):
-            if key.startswith("_moe_load/"):
-                name = key.removeprefix("_moe_load/")
-                load = sample.metrics.pop(key)
-                self._moe_layer_loads[name] = {
-                    "expert_load": load,
-                    "aux_loss": sample.metrics.pop(f"_moe_aux/{name}", None),
-                    "n_experts": load.numel(),
-                }
-
-    def _emit_train_metrics(self, reporter: DeferredStepReporter, pbar, *, wait: bool) -> None:
-        completed = reporter.poll(wait=wait)
-        if completed:
-            now = time.perf_counter()
-            if self._throughput_window is None:
-                self._throughput_window = (now, 0, 0)
-            else:
-                since, tokens, steps = self._throughput_window
-                tokens += sum(sample.metrics["num_tokens_per_step"] for sample, _, _ in completed)
-                steps += len(completed)
-                if steps >= 20:
-                    completed[-1][0].metrics["end_to_end_tps"] = tokens / (now - since)
-                    self._throughput_window = (now, 0, 0)
-                else:
-                    self._throughput_window = (since, tokens, steps)
-
-        for sample, remote_log, elapsed in completed:
-            tps = sample.metrics["num_tokens_per_step"] / elapsed
-            sample.metrics["tps"] = tps
-            sample.metrics["tps_per_gpu"] = tps / self.dist_env.world_size
-            sample.metrics["step_time_seconds"] = elapsed
-            step_flops = sample.metrics.pop("_step_flops", None)
-            sample.metrics["mfu"] = None
-            if step_flops is not None:
-                sample.metrics["mfu"] = calculate_mfu(
-                    step_flops / 1e12,
-                    self.dist_env.world_size,
-                    elapsed,
-                    reference_mfu=self.mfu_calculator.reference_mfu,
-                )
-            num_packs = sample.metrics.pop("_num_packs", None)
-            if num_packs is not None:
-                sample.metrics["pack_fill"] = sample.metrics["num_tokens_per_step"] / (num_packs * self.pack_size)
-            domain_counts = sample.metrics.pop("_domain_label_counts", None)
-            if domain_counts is not None:
-                self._set_domain_label_metrics(sample.metrics, domain_counts)
-            self._restore_moe_metrics(sample)
+    def _emit_train_metrics(self, reporter: TrainingStepReporter, pbar, *, wait: bool) -> None:
+        for sample, remote_log, _ in reporter.poll(wait=wait):
+            self._moe_layer_loads = restore_moe_metrics(sample)
             self.log_train_metrics(sample, remote_log=remote_log)
             self._update_progress_bar(pbar, sample.metrics)
 
@@ -2078,7 +1944,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 sinks.append(self.comet_logger.log_metrics)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 sinks.append(lambda metrics, step: mlflow.log_metrics(to_float_metrics(metrics), step=step))
-            self._write_remote_step_metrics(step=log_data.step, metrics=log_data.to_dict(), sinks=sinks)
+            write_remote_step_metrics(
+                step=log_data.step, metrics=log_data.to_dict(), sinks=sinks, moe_metrics=self._compute_moe_metrics
+            )
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
