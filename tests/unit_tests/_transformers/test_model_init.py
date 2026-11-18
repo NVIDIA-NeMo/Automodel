@@ -1750,14 +1750,27 @@ def test_streaming_directory_uses_config_snapshot_and_subfolder(hf_config_hub):
     assert result == str(cache / "snapshots" / ("b" * 40) / "nested")
 
 
-def test_model_dir_accepts_snapshot_missing_unread_listed_files(hf_config_hub, cached_tree_listing):
+_SHARDS = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+
+
+@pytest.mark.parametrize(
+    "weight_files",
+    [
+        {"model.safetensors": ""},
+        {"pytorch_model.bin": ""},
+        {"model.safetensors.index.json": json.dumps({"weight_map": dict.fromkeys("ab", _SHARDS[0])}), _SHARDS[0]: ""},
+    ],
+    ids=["safetensors", "bin", "sharded"],
+)
+def test_model_dir_accepts_snapshot_missing_unread_listed_files(hf_config_hub, cached_tree_listing, weight_files):
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import IncompleteSnapshotError
 
     root, cache, _, _ = hf_config_hub
     # A weight-only download fetched config.json and the weights; the listing also names README.md.
-    (cache / "snapshots" / ("b" * 40) / "model.safetensors").write_bytes(b"")
-    cached_tree_listing(cache, "b" * 40, ["config.json", "model.safetensors", "README.md"])
+    for name, text in weight_files.items():
+        (cache / "snapshots" / ("b" * 40) / name).write_text(text)
+    cached_tree_listing(cache, "b" * 40, ["config.json", *weight_files, "README.md"])
     with pytest.raises(IncompleteSnapshotError):
         snapshot_download("test/config-race", revision="b" * 40, cache_dir=str(root), local_files_only=True)
 
@@ -1766,22 +1779,48 @@ def test_model_dir_accepts_snapshot_missing_unread_listed_files(hf_config_hub, c
     assert result == str(cache / "snapshots" / ("b" * 40))
 
 
-@pytest.mark.parametrize("weights", ["missing_shard", "unreadable_index", "no_weight_file"])
-def test_model_dir_keeps_hub_error_for_incomplete_weights(hf_config_hub, cached_tree_listing, weights):
+@pytest.mark.parametrize(
+    "index_text",
+    [
+        json.dumps({"weight_map": dict(zip("ab", _SHARDS))}),
+        "{",
+        "[]",
+        '{"weight_map": null}',
+        '{"weight_map": {}}',
+        None,
+    ],
+    ids=["missing_shard", "invalid_json", "not_a_mapping", "null_weight_map", "empty_weight_map", "no_weight_file"],
+)
+def test_model_dir_keeps_hub_error_for_incomplete_weights(hf_config_hub, cached_tree_listing, index_text):
     from huggingface_hub.errors import IncompleteSnapshotError
 
     root, cache, _, _ = hf_config_hub
     snapshot = cache / "snapshots" / ("b" * 40)
     index = snapshot / "model.safetensors.index.json"
-    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
-    if weights == "missing_shard":
-        index.write_text(json.dumps({"weight_map": {"a": shards[0], "b": shards[1]}}))
-        (snapshot / shards[0]).write_bytes(b"")
-    elif weights == "unreadable_index":
-        index.write_text("{")
-    cached_tree_listing(cache, "b" * 40, ["config.json", index.name, *shards])
+    if index_text is not None:
+        index.write_text(index_text)
+        (snapshot / _SHARDS[0]).write_bytes(b"")
+    cached_tree_listing(cache, "b" * 40, ["config.json", index.name, *_SHARDS])
 
-    with pytest.raises(IncompleteSnapshotError, match=shards[1]):
+    with pytest.raises(IncompleteSnapshotError, match=_SHARDS[1]):
+        _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root))
+
+
+def test_model_dir_keeps_hub_error_for_incomplete_second_format(hf_config_hub, cached_tree_listing):
+    from huggingface_hub.errors import IncompleteSnapshotError
+
+    root, cache, _, _ = hf_config_hub
+    snapshot = cache / "snapshots" / ("b" * 40)
+    bin_shards = ["pytorch_model-00001-of-00002.bin", "pytorch_model-00002-of-00002.bin"]
+    # The safetensors weights are complete, but the checkpoint loader prefers the .bin files.
+    (snapshot / "model.safetensors").write_bytes(b"")
+    (snapshot / "pytorch_model.bin.index.json").write_text(json.dumps({"weight_map": dict(zip("ab", bin_shards))}))
+    (snapshot / bin_shards[0]).write_bytes(b"")
+    cached_tree_listing(
+        cache, "b" * 40, ["config.json", "model.safetensors", "pytorch_model.bin.index.json", *bin_shards]
+    )
+
+    with pytest.raises(IncompleteSnapshotError, match=bin_shards[1]):
         _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root))
 
 

@@ -837,17 +837,23 @@ def _resolve_model_dir(
 
 
 def _has_complete_weights(model_dir: str) -> bool:
-    """Check whether every weight file the checkpoint loader reads is present in a model directory."""
-    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
-        index_path = os.path.join(model_dir, index_name)
+    """Check whether every weight file a checkpoint loader may read is present in a model directory."""
+    found = False
+    # Check both formats: the loaders do not all prefer the same one, and they skip missing shards.
+    for weights_name in ("model.safetensors", "pytorch_model.bin"):
+        index_path = os.path.join(model_dir, f"{weights_name}.index.json")
         if os.path.isfile(index_path):
             try:
                 with open(index_path) as f:
                     shard_names = set(json.load(f)["weight_map"].values())
-            except (OSError, ValueError, KeyError):
+                if not shard_names or not all(os.path.isfile(os.path.join(model_dir, name)) for name in shard_names):
+                    return False
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 return False
-            return all(os.path.isfile(os.path.join(model_dir, name)) for name in shard_names)
-    return any(os.path.isfile(os.path.join(model_dir, name)) for name in ("model.safetensors", "pytorch_model.bin"))
+            found = True
+        elif os.path.isfile(os.path.join(model_dir, weights_name)):
+            found = True
+    return found
 
 
 def _has_safetensors(model_dir: str) -> bool:
