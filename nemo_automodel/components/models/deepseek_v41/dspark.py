@@ -591,7 +591,7 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         confidence_head_stop_gradient: bool = False,
     ) -> None:
         # Like BackendConfig's own default, the experts use grouped GEMMs on CUDA. The per-expert loop
-        # syncs with the host once per expert and runs one small GEMM per expert; keep it for CPU only.
+        # syncs with the host once per expert and runs two small GEMMs per expert; keep it without CUDA.
         backend = backend or BackendConfig(
             attn="sdpa",
             linear="torch",
