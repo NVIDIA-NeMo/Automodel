@@ -165,7 +165,10 @@ def test_hybridep_lora_expert_preserves_situ_and_adapter_math(monkeypatch, num_t
             activated = _situ(gate, up) * weights[token_slice]
             outputs.append(
                 activated
-                @ (experts.down_projs[expert_id] + 2.0 * experts.lora_down_A[expert_id] @ experts.lora_down_B[expert_id])
+                @ (
+                    experts.down_projs[expert_id]
+                    + 2.0 * experts.lora_down_A[expert_id] @ experts.lora_down_B[expert_id]
+                )
             )
         torch.testing.assert_close(output, torch.cat(outputs), rtol=1e-5, atol=1e-5)
         output.sum().backward()
