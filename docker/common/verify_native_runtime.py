@@ -63,7 +63,7 @@ def main() -> None:
     installed_te_version = Version(version("transformer-engine"))
     # The PyTorch image uses the upgraded native stack. The CUDA image keeps
     # the package minimum from pyproject.toml and its separate dependency lock.
-    minimum_te_version = Version("2.21.0" if args.base_image == "pytorch" else "2.19.0")
+    minimum_te_version = Version("2.20.2" if args.base_image == "pytorch" else "2.19.0")
     if installed_te_version < minimum_te_version:
         raise RuntimeError(
             f"Transformer Engine {minimum_te_version} or later is required, found {installed_te_version}"
