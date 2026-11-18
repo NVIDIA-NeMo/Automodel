@@ -94,7 +94,6 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
-from nemo_automodel.components.models.common.mtp import roll_tensor
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
     configure_packing_for_models,
@@ -1357,14 +1356,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     ) -> list[torch.Tensor] | None:
         """Project each gated-MTP depth's hidden state through the sampler, if attached.
 
+        Sequential chaining, matching arXiv:2507.11851 Sec. 2.3 / Fig. 3 (box-2) exactly:
+        "the sampler generates y_{n+1+k} conditioned on both z_{n+k+1} and the previously
+        sampled token y_{n+k}". Depth 1 has no preceding sampler step, so its "previous
+        token" is the ordinary NTP prediction from the frozen base model's own unembedding
+        (box-2's left-most "Unembedding + Argmax"); every later depth chains off the
+        PRECEDING depth's own just-computed argmax, not an independent reference. Because
+        each depth's hidden state is already anchor-aligned (``mtp_per_depth_h[d][:, t]`` is
+        anchor ``t``'s own depth-``d`` mask token), this needs no cross-position shifting.
+
         Shared by the soft-MTP training loss and the eval acceptance metric so both
         score the same sampler-refined logits the model would actually produce.
 
         Args:
             model: The wrapped model; supplies the shared ``lm_head``, input embeddings,
                 and (if present) ``gated_mtp_sampler``.
-            out: The clean-copy forward output; ``out.logits`` seeds the teacher-forced
-                "previous token" (the frozen base model's own greedy prediction).
+            out: The clean-copy forward output; ``out.logits`` seeds depth 1's "previous
+                token" with the frozen base model's own greedy NTP prediction.
             mtp_per_depth_h: Per-depth hidden-state tensors of shape ``[batch, sequence, hidden]``.
 
         Returns:
@@ -1377,12 +1385,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if lm_head is None:
             raise ValueError("lm_head module not found in model")
         embed = model.get_input_embeddings()
-        base_pred_ids = out.logits.argmax(dim=-1).detach()
+        prev_ids = out.logits.argmax(dim=-1).detach()
         head_logits = []
-        for depth, h in enumerate(mtp_per_depth_h, start=1):
-            prev_ids = roll_tensor(base_pred_ids, shifts=-(depth - 1), dim=-1)
+        for h in mtp_per_depth_h:
             prev_emb = embed(prev_ids)
-            head_logits.append(lm_head(sampler(h, prev_emb)))
+            logits = lm_head(sampler(h, prev_emb))
+            head_logits.append(logits)
+            prev_ids = logits.argmax(dim=-1).detach()
         return head_logits
 
     def _forward_backward_step(

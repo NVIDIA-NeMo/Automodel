@@ -147,8 +147,9 @@ def _build_lora_model_with_sampler() -> Qwen3ForCausalLM:
 
 def _reference_lora_and_sampler_grads(input_ids, labels):
     """Soft-MTP loss gradients (LoRA + sampler) from one causal forward per (anchor, depth), with the
-    sampler's "previous token" sourced from the base model's own greedy prediction -- matching the real
-    dense training path's teacher-forcing exactly, not PEFT's default (fully sequential) sampler training."""
+    sampler's "previous token" sequentially chained off the PRECEDING depth's own just-sampled token
+    (arXiv:2507.11851 Sec. 2.3 / Fig. 3, box-2) -- matching the real dense training path exactly. Depth
+    1 has no preceding sampler step, so it starts from the ordinary NTP prediction instead."""
     model = _build_lora_model_with_sampler()
     model.train()
     sampler = model.gated_mtp_sampler
@@ -159,13 +160,14 @@ def _reference_lora_and_sampler_grads(input_ids, labels):
     loss = 0.0
     for b in range(input_ids.shape[0]):
         for t in range(input_ids.shape[1]):
+            prev_id = base_probs[b, t].argmax(-1, keepdim=True).detach()
             for d in range(1, num_depths + 1):
-                if t + d >= labels.shape[1] or labels[b, t + d] == -100:
-                    continue
                 hidden = _sequential_mtp_hidden(model, input_ids[b : b + 1], t, d)
-                prev_id = base_probs[b, t + d - 1].argmax(-1, keepdim=True).detach()
                 prev_emb = model.get_input_embeddings()(prev_id.unsqueeze(0))[:, 0]
                 logits = model.lm_head(sampler(hidden, prev_emb))
+                prev_id = logits.argmax(-1).detach()
+                if t + d >= labels.shape[1] or labels[b, t + d] == -100:
+                    continue
                 term = -(base_probs[b : b + 1, t + d] * logits.float().log_softmax(-1)).sum()
                 loss = loss + _SCALING / num_depths * term / num_label_tokens
     loss.backward()
@@ -176,8 +178,8 @@ def _reference_lora_and_sampler_grads(input_ids, labels):
 
 def test_training_step_routes_soft_mtp_through_the_sampler(monkeypatch):
     """The real dense training step, with a sampler attached, must match an independent reference built
-    from one causal forward per (anchor, depth) -- exercising the exact depth-shift indexing and
-    teacher-forced "previous token" lookup added for the sampler, not just that the code runs."""
+    from one causal forward per (anchor, depth) -- exercising the exact sequential "previous token"
+    chaining added for the sampler, not just that the code runs."""
     model = _build_lora_model_with_sampler()
     model.train()
     recipe = _make_recipe(model, monkeypatch, distillation_mode="soft")
@@ -300,7 +302,9 @@ def test_eval_step_scores_sampler_refined_drafts_against_the_base_model(monkeypa
     """With a sampler attached, the eval acceptance metric must score the SAME sampler-refined
     drafts the model actually produces -- not the raw, un-refined ``lm_head(h)`` projection the
     LoRA was never trained against. Reference built from one causal forward per (anchor, depth),
-    with the sampler applied exactly as ``_gated_mtp_sampler_logits`` does."""
+    with the sampler's "previous token" sequentially chained off the preceding depth's own
+    just-sampled token (arXiv:2507.11851 Sec. 2.3 / Fig. 3, box-2), exactly as
+    ``_gated_mtp_sampler_logits`` does."""
     model = _build_lora_model_with_sampler()
     model.eval()
     sampler = model.gated_mtp_sampler
@@ -321,17 +325,13 @@ def test_eval_step_scores_sampler_refined_drafts_against_the_base_model(monkeypa
         drafts = {}
         for b in range(2):
             for t in range(6):
+                prev_id = verifier[b, t].view(1, 1)
                 for d in (1, 2):
-                    if t + d - 1 >= input_ids.shape[1]:
-                        # Matches roll_tensor's wrap-around at the sequence tail: these positions
-                        # are never in `supervised` below, so the looked-up "previous token" is
-                        # unused padding regardless of its value.
-                        continue
                     hidden = _sequential_mtp_hidden(model, input_ids[b : b + 1], t, d)
-                    prev_id = verifier[b, t + d - 1].view(1, 1)
                     prev_emb = model.get_input_embeddings()(prev_id)[:, 0]
                     logits = model.lm_head(sampler(hidden, prev_emb))
                     drafts[b, t, d] = logits.argmax(-1).item()
+                    prev_id = logits.argmax(-1, keepdim=True)
 
     (metrics,) = recipe._mtp_accept_metrics
     supervised = {(b, t, d) for (b, t, d) in drafts if t + d < 6 and labels[b, t + d] != -100}
