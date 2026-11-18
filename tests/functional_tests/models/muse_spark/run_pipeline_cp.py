@@ -211,6 +211,7 @@ def main() -> None:
                     local_ids,
                     target=local_labels if pipeline.info.has_last_stage else None,
                     losses=losses,
+                    return_outputs=True,
                     **local_batch,
                 )
             if pipeline.info.has_last_stage:

@@ -624,6 +624,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.nccl_ep = orig_module.nccl_ep
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
@@ -734,15 +735,16 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         """Apply additive LoRA without changing dispatch or combine.
 
         Args:
-            x: Local tensor [tokens, hidden], in the compute dtype.
-            token_mask: Local boolean tensor [tokens].
-            weights: Local routing probability tensor [tokens, top_k].
-            indices: Local integer tensor [tokens, top_k], global expert IDs.
-            post_expert_output: Optional transform preserving [routed_tokens, hidden],
-                applied after the down projection and before post-down router weighting.
+            x: Tensor of shape [local_tokens, hidden], in the compute dtype.
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Routing probabilities of shape [local_tokens, top_k].
+            indices: Global expert IDs of shape [local_tokens, top_k].
+            post_expert_output: Optional transform from [routed_tokens, hidden] to the same layout,
+                applied after the down projection and before router weighting when
+                apply_router_weight_after_down is enabled.
 
         Returns:
-            Local tensor [tokens, hidden] on x's device after dispatcher combine.
+            Combined expert output of shape [local_tokens, hidden], with x's dtype/device.
             Post-down routing multiplies in FP32 then casts to the compute dtype
             before combine. Base and adapter parameters may be DTensors sharded
             on expert axis 0; local operands have layout [local_experts, in, out].
@@ -765,9 +767,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if self._has_dispatched_rows(permuted_local_hidden_states, tokens_per_expert):
             lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                 lora_gate_and_up_A, lora_gate_and_up_B
             )

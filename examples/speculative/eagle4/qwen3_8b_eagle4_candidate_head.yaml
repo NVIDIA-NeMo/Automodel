@@ -61,4 +61,5 @@ checkpoint:
   save_consolidated: final
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

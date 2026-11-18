@@ -191,9 +191,11 @@ jobs:
           uv sync --link-mode copy --locked --group linting
 
       - name: Test annotation policy
-        run: python -m unittest discover -s tests/unit_tests/tools -p test_annotation_policy.py
+        run: |
+          source ./venv/bin/activate
+          uv run --active python -m unittest discover -s tests/unit_tests/tools -p test_annotation_policy.py
 
-      - name: Run annotation policy and ty
+      - name: Run annotation policy, signature completeness, and ty
         run: |
           source ./venv/bin/activate
           uv run --active ty --version
@@ -583,10 +585,10 @@ jobs:
             timeout: 60
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          # Leave room for cold compilation in the packed Qwen3.5 CP test.
+          # Main takes 34 minutes; allow headroom for cold compilation and slower runners.
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 40
+            timeout: 60
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval

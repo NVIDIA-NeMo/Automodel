@@ -202,7 +202,6 @@ def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
 
 
 def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
-    
     jsonl = tmp_path / "broken.jsonl"
     jsonl.write_text(
         "\n".join(
@@ -222,6 +221,8 @@ def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
     assert len(rows) == 2
     assert rows[0]["messages"][0]["content"] == "ok-1"
     assert rows[1]["messages"][0]["content"] == "ok-2"
+
+
 def test_load_openai_messages_keeps_rows_with_unicode_line_separators(tmp_path):
     # JSON allows raw U+2028/U+2029/U+0085 inside strings; str.splitlines() would cut these rows in half.
     row = {"messages": [{"role": "user", "content": "a\u2028b\u2029c\u0085d"}, {"role": "assistant", "content": "ok"}]}
@@ -707,3 +708,47 @@ def test_chat_dataset_config_positional_layout_is_unchanged():
         "mask_generation_prompt",
         "chat_template_kwargs",
     ]
+
+
+def _word_level_chat_tokenizer():
+    """In-memory word-level tokenizer whose template renders every assistant turn as
+    ``<s_assistant> <think> {reasoning} </think> {content} <eot>``."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    words = ["<pad>", "<unk>", "<eos>", "<s_user>", "<s_assistant>", "<think>", "</think>", "<eot>"]
+    words += ["hi", "why", "R1", "R2", "R3", "ANS1", "ANS2"]
+    backend = Tokenizer(models.WordLevel(vocab={w: i for i, w in enumerate(words)}, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tok = PreTrainedTokenizerFast(tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>")
+    tok.chat_template = (
+        "{% for m in messages %}<s_{{ m.role }}> "
+        "{% if m.role == 'assistant' %}<think> {{ m.reasoning_content or '' }} </think> {% endif %}"
+        "{{ m.content }} <eot> {% endfor %}"
+    )
+    return tok
+
+
+@pytest.mark.parametrize("unshifted", [False, True])
+def test_mask_history_keeps_final_turn_prefix_before_masked_reasoning(tmp_path, unshifted):
+    # Regression: mask_history used to keep only the last contiguous supervised run of the
+    # finished labels, so the hole left by mask_reasoning_content in the final turn was
+    # taken for a turn boundary and "<s_assistant> <think>" lost its supervision.
+    tok = _word_level_chat_tokenizer()
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ANS1", "reasoning_content": "R1"},
+        {"role": "user", "content": "why"},
+        {"role": "assistant", "content": "ANS2", "reasoning_content": "R2 R3"},
+    ]
+    path = tmp_path / "data.jsonl"
+    path.write_text(json.dumps({"messages": messages}) + "\n")
+
+    ds = tcd.ChatDataset(str(path), tok, mask_history=True, mask_reasoning_content=True, unshifted=unshifted)
+    sample = ds[0]
+
+    if unshifted:
+        supervised_ids = [t for t, m in zip(sample["input_ids"], sample["loss_mask"]) if m]
+    else:
+        supervised_ids = [label for label in sample["labels"] if label != -100]
+    assert tok.convert_ids_to_tokens(supervised_ids) == ["<s_assistant>", "<think>", "</think>", "ANS2", "<eot>"]

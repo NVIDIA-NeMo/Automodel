@@ -129,7 +129,7 @@ class DistributedSignalHandler:
             group: Process group whose ranks participate in signal propagation.
                 Defaults to the global process group.
         """
-        specs = sig if isinstance(sig, (list, tuple)) else [sig]
+        specs: Sequence[SignalLike] = [sig] if isinstance(sig, (int, str)) else sig
         sigs = [resolve_signal(s) for s in specs]
         if len(sigs) == 0:
             raise ValueError("At least one signal must be provided")

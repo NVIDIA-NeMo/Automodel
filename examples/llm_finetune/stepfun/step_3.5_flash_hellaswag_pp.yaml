@@ -23,11 +23,12 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 512
+  global_batch_size: 2048  #PR4637: 512
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 2
+  gc_every_steps: 10
 
 distributed:
   strategy: fsdp2
@@ -35,9 +36,8 @@ distributed:
   cp_size: 1
   pp_size: 2
   ep_size: 32
-
   sequence_parallel: false
-
+  activation_checkpointing: true
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
@@ -46,11 +46,9 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
-
   moe:
     reshard_after_forward: false
     wrap_outer_model: false
-
 dist_env:
   backend: nccl
   timeout_minutes: 10
@@ -63,45 +61,48 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: torch_fp32
-    rope_fusion: true
+    rms_norm: te  #PR4637: torch_fp32
+    rope_fusion: false  # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.  #PR4637: true
     experts: torch_mm
     dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-
 checkpoint:
   enabled: false
 
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
+  padding: false
 packed_sequence:
-  packed_sequence_size: 0
+  # SQuAD yields 795 packs of 4,096 tokens: 6 of the 16 microbatches per rank that
+  # global_batch_size 2048 needs. Each epoch is one partial optimizer step (37.5% of
+  # the global batch); see examples/llm_benchmark/README.md.
+  packed_sequence_size: 4096  #PR4637: 0
 
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 160
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: {_target_: nemo_automodel.components.datasets.utils.default_collater, pad_seq_len_divisible: 160}
   shuffle: true
 
+  drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 160
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: {_target_: nemo_automodel.components.datasets.utils.default_collater, pad_seq_len_divisible: 160}
   shuffle: true
   drop_last: true
 
@@ -115,8 +116,12 @@ optimizer:
   weight_decay: 0
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa  #PR4637: hemildesai
   node_multiplier: true
-  nodes: 16
-  time: "00:30:00"
+  nodes: 8  #PR4637: 16
+  time: "00:40:00"  #PR4637: "00:30:00"
+  perf_testing:
+    fake_balanced_gate: true
+    schedule: nightly

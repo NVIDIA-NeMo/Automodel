@@ -13,20 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minified regression test for FusedLinearCrossEntropy hidden_states shape handling.
+"""Regress tensor-valued hidden-state extraction without invoking CCE on CPU.
 
-This test targets a failure mode observed in distributed pretraining:
-`cut_cross_entropy` asserts that `hidden_states.shape[:-1] == labels.shape`.
-
-Some models return `output.hidden_states` as a single tensor (final hidden state) rather than
-the usual tuple of per-layer hidden states. Code that blindly does `out.hidden_states[-1]`
-will then drop the batch dimension and can trigger:
-
-    assert e.size()[0:-1] == targets.size()
-
-We validate that:
-- the *bad* extraction (`hidden_states[-1]`) reproduces the assertion
-- the shared extractor (`get_final_hidden_states`) returns a `[B, T, H]` tensor and avoids it
+Some models return ``output.hidden_states`` as the final ``[B, T, H]`` tensor
+rather than a tuple of layer outputs. Indexing that tensor with ``[-1]`` drops
+the batch axis. Check extraction directly: the fused loss now accepts flattened
+THD layouts and can restore a missing singleton batch axis, so its old shape
+assertion is no longer a reliable extraction test. Only run the fused forward
+and backward with CUDA operands.
 """
 
 from __future__ import annotations
@@ -89,7 +83,7 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(1234)
 
-    batch_size = 1
+    batch_size = 2
     seq_len = 8
     hidden_size = 32
     vocab_size = 64
@@ -104,27 +98,21 @@ def main() -> int:
 
     out_tensor = _Out(hidden_states=hidden_states)
 
-    # Reproduce the failure mode: indexing a tensor `hidden_states[-1]` drops the batch dim.
+    # A tensor index drops a whole batch row; extraction must preserve all rows.
+    # Do not pass this CPU tensor to CCE: its CUDA-only kernel is not a shape validator.
     bad_hidden_states = out_tensor.hidden_states[-1]
-    try:
-        _ = FusedLinearCrossEntropy(ignore_index=ignore_index, reduction="sum")(
-            hidden_states=bad_hidden_states, labels=labels, lm_weight=lm_weight
-        )
-        if rank == 0:
-            print("FAIL: Expected shape assertion for bad hidden_states extraction", file=sys.stderr)
-        return 1
-    except AssertionError:
-        pass
+    assert tuple(bad_hidden_states.shape) == (seq_len, hidden_size)
+    assert bad_hidden_states.shape[:-1] != labels.shape
 
     # Correct extraction: should always be [B, T, H].
     good_hidden_states = get_final_hidden_states(out_tensor)
-    assert good_hidden_states is not None
+    assert good_hidden_states is hidden_states
     assert tuple(good_hidden_states.shape) == (batch_size, seq_len, hidden_size)
 
     # Also validate tuple/list style outputs.
     out_tuple = _Out(hidden_states=(hidden_states * 0.0, hidden_states * 0.5, hidden_states))
     good_hidden_states_2 = get_final_hidden_states(out_tuple)
-    assert good_hidden_states_2 is not None
+    assert good_hidden_states_2 is hidden_states
     assert tuple(good_hidden_states_2.shape) == (batch_size, seq_len, hidden_size)
 
     # If CUDA is available, run the full fused loss forward/backward.
@@ -134,7 +122,7 @@ def main() -> int:
         return 0
 
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
-    hidden_states_cuda = hidden_states.to(device=device).detach().requires_grad_(True)
+    hidden_states_cuda = good_hidden_states.to(device=device).detach().requires_grad_(True)
     labels_cuda = labels.to(device=device)
     lm_weight_cuda = lm_weight.to(device=device).detach().requires_grad_(True)
 
@@ -147,6 +135,8 @@ def main() -> int:
         return 1
 
     loss.backward()
+    assert hidden_states_cuda.grad is not None and torch.isfinite(hidden_states_cuda.grad).all()
+    assert lm_weight_cuda.grad is not None and torch.isfinite(lm_weight_cuda.grad).all()
 
     if rank == 0:
         print("PASS: FusedLinearCrossEntropy hidden_states extraction is shape-safe")

@@ -1,0 +1,98 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Synthetic pretraining counterpart of examples/llm_benchmark/nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml
+# Fixed-length mock tokens; runtime tuning is canonical. GPU validation is pending.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 2
+  max_steps: 1000
+  num_epochs: null
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  gc_every_steps: 10
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret -- Public Hugging Face model ID.
+    trust_remote_code: true
+  dtype: bfloat16
+  num_nextn_predict_layers: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: te
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 131072
+  seq_len: 8192
+  include_position_ids: false
+  exclude_token_ids: [0]
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+  pin_memory: true
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.0001
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  weight_decay: 0
+  foreach: false
+  param_group_overrides:
+  - pattern: (?:^|\.)experts\.(?:gate_up_linear|down_linear)\.
+    lr_mult: 1
+    wd_mult: 1
+  fused: true
+checkpoint:
+  enabled: false
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  mode: online
+  name: nemotron-super-v3-te-hybridep-8k-ep16-gb200
+ci:
+  nemo_ci_schedule: skipped
+  recipe_owner: HuiyingLi
+  time: 00:15:00
+  nodes: 4
+  cluster_tag: gb200
+  nproc_per_node: 4
+  env_vars:
+    PYTORCH_ALLOC_CONF: expandable_segments:True
+  perf_testing:
+    schedule: nightly
+    fake_balanced_gate: true
