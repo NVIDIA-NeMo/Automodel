@@ -292,7 +292,7 @@ class TestConfigurePacking:
         configure_packing("fa4", model=model)
         configure_packing("fa4", model=model)
         assert len(model._forward_pre_hooks) == 1
-        with pytest.raises(ValueError, match="pre-packed THD"):
+        with pytest.raises(ValueError, match="FA4 THD requires token IDs"):
             model(torch.ones(2, 4, dtype=torch.long), qkv_format="thd")
 
         output = model(
@@ -618,3 +618,138 @@ def test_stage_mask_agreement_is_validated_only_for_batched_setup():
     with pytest.raises(ValueError, match="agree on the batched packed mask layout"):
         configure_packing_for_models(stages)
     assert all(not stage._forward_pre_hooks for stage in stages)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "lengths,padded,expected_indices,expected_offsets",
+    [
+        ([2, 1], [4, 3], [0, 1, 4], [0, 2, 3]),
+        ([2, 1], [2, 4], [0, 1, 2], [0, 2, 3]),
+        ([2, 2], [2, 2], [0, 1, 2, 3], [0, 2, 4]),
+        ([0, 2], [2, 2], [2, 3], [0, 0, 2]),
+        ([0, 0], [2, 3], [], [0, 0, 0]),
+    ],
+)
+def test_fa4_thd_entry_uses_authoritative_layout(
+    lengths: list[int], padded: list[int], expected_indices: list[int], expected_offsets: list[int]
+) -> None:
+    """Real pad-token IDs, gaps, absorbed tails and empty documents retain their layout."""
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    total = sum(padded)
+    batch = {
+        "input_ids": torch.zeros(1, total, dtype=torch.long),
+        "labels": torch.zeros(1, total, dtype=torch.long),
+        "position_ids": torch.arange(total)[None],
+        "seq_lens": torch.tensor([lengths]),
+        "seq_lens_padded": torch.tensor([padded]),
+    }
+    original = process_input_for_thd(batch)
+    original["qkv_format"] = "thd"
+    snapshots = {key: value.clone() for key, value in original.items() if isinstance(value, torch.Tensor)}
+    _, prepared = prepare_packed_metadata(None, (), original)
+    assert prepared["packed_token_indices"].tolist() == expected_indices
+    assert prepared["_fa4_cu_seqlens"].tolist() == expected_offsets
+    assert prepared["_fa4_cu_seqlens"].dtype == torch.int32
+    assert prepare_packed_metadata(None, (), prepared) is None
+    for key, value in snapshots.items():
+        assert prepared[key] is original[key]
+        torch.testing.assert_close(original[key], value, rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tokens,mask,offsets",
+    [
+        (6, [False] * 5, [0, 5]),
+        (5, [False] * 6, [0, 5]),
+        (5, [True, True, True, False, False], [0, 3, 2, 5]),
+        (5, [False] * 5, [1, 5]),
+        (5, [False] * 5, [0, 6]),
+        (4, [False, False, True, False], [0, 2]),
+    ],
+)
+def test_fa4_thd_entry_rejects_malformed_physical_layout(tokens: int, mask: list[bool], offsets: list[int]) -> None:
+    """Invalid layouts fail instead of silently dropping real input tokens."""
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    kwargs = {
+        "qkv_format": "thd",
+        "padding_mask": torch.tensor(mask),
+        "cu_seqlens": torch.tensor(offsets, dtype=torch.int32),
+    }
+    with pytest.raises(ValueError):
+        prepare_packed_metadata(None, (torch.zeros(tokens, dtype=torch.long),), kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("alias", [False, True])
+def test_fa4_thd_entry_preserves_boundary_alias_and_masked_trailing_storage(alias: bool) -> None:
+    """A masked trailing buffer is legal; existing boundary aliases remain intact."""
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    offsets = torch.tensor([0, 2], dtype=torch.int32)
+    kwargs = {
+        "input_ids": torch.zeros(4, dtype=torch.long),
+        "qkv_format": "thd",
+        "padding_mask": torch.tensor([False, False, True, True]),
+        "cu_seqlens": offsets,
+        "cu_seqlens_padded": offsets if alias else None,
+    }
+    _, result = prepare_packed_metadata(None, (), kwargs)
+    assert result["packed_token_indices"].tolist() == [0, 1]
+    assert result["cu_seqlens"] is offsets
+    assert result["cu_seqlens_padded"] is kwargs["cu_seqlens_padded"]
+    assert result["_fa4_cu_seqlens"] is not offsets
+
+
+@pytest.mark.cpu_only
+def test_fa4_thd_entry_rejects_float_boundaries() -> None:
+    """Floating offsets must not be truncated into integer physical indices."""
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    with pytest.raises(ValueError, match="flat sequence boundaries"):
+        prepare_packed_metadata(
+            None,
+            (torch.zeros(2, dtype=torch.long),),
+            {
+                "qkv_format": "thd",
+                "padding_mask": torch.zeros(2, dtype=torch.bool),
+                "cu_seqlens": torch.tensor([0.0, 2.0]),
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "physical,valid,expected",
+    [
+        ([0, 4, 4, 8], [True, True, False, False, True, False, False, False, False], [2, 0, 1]),
+        ([0, 4, 8], [True, False, True, False, True, False, False, False], None),
+        ([0, 4, 8], [False] * 8, None),
+    ],
+)
+def test_native_fa4_physical_prefix_metadata_preserves_public_inputs(
+    physical: list[int], valid: list[bool], expected: list[int] | None
+) -> None:
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    boundaries = torch.tensor(physical, dtype=torch.int32)
+    mask = ~torch.tensor(valid)
+    inputs = torch.arange(len(valid))
+    original = dict(qkv_format="thd", cu_seqlens=boundaries, cu_seqlens_padded=boundaries, padding_mask=mask)
+    before = {name: value.clone() for name, value in original.items() if isinstance(value, torch.Tensor)}
+    args, prepared = prepare_packed_metadata(None, (inputs,), original)
+    assert args[0] is inputs and set(original) == {"qkv_format", "cu_seqlens", "cu_seqlens_padded", "padding_mask"}
+    for name, value in before.items():
+        assert prepared[name] is original[name]
+        assert torch.equal(original[name], value)
+    assert prepared["packed_token_indices"].tolist() == torch.where(torch.tensor(valid))[0].tolist()
+    if expected is None:
+        assert "_fa4_seqused" not in prepared and "_fa4_physical_cu_seqlens" not in prepared
+    else:
+        assert prepared["_fa4_seqused"].tolist() == expected
+        assert prepared["_fa4_physical_cu_seqlens"] is boundaries
+    # A second entry sees the already prepared contract and performs no metadata rebuild.
+    assert prepare_packed_metadata(None, (inputs,), prepared) is None

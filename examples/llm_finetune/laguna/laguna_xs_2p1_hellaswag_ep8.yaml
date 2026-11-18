@@ -143,3 +143,5 @@ ci:
   # pp_size(1) * ep_size(8) = 8 GPUs => 1 node (8 H100/node).
   nodes: 1
   time: "01:00:00"
+  perf_testing:
+    schedule: nightly

@@ -45,6 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
+from nemo_automodel.components.checkpoint.stateful_wrappers import validate_peft_trainable_modules
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedStrategyConfig,
@@ -971,6 +972,11 @@ def apply_model_infrastructure(
                 "The configured trainability policy left no trainable parameters; "
                 "check freeze_config and the PEFT configuration."
             )
+    if peft_config is not None:
+        # Modules freeze_config unfreezes next to LoRA are saved whole with the adapter;
+        # reject layouts the adapter checkpoint cannot restore before training starts.
+        for mp in trainability_models:
+            validate_peft_trainable_modules(mp)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded

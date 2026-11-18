@@ -126,3 +126,5 @@ ci:
   recipe_owner: khazic
   time: "01:00:00"
   nodes: 1
+  perf_testing:
+    schedule: nightly

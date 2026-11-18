@@ -291,7 +291,9 @@ def _run_pp_worker() -> None:
         documents = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2], [7, 7, 7, 9, 9, 9, 9, 9]], device=device)
         upstream = torch.randn(2, 8, 64, generator=generator).to(device=device, dtype=torch.bfloat16)
         losses = [] if pipeline.info.has_last_stage else None
-        actual = pipeline.step(input_ids, target=upstream, losses=losses, _packed_seq_ids=documents)
+        actual = pipeline.step(
+            input_ids, target=upstream, losses=losses, return_outputs=True, _packed_seq_ids=documents
+        )
         expected = reference(input_ids, _packed_seq_ids=documents)
         expected_loss = loss_fn(expected, upstream)
         expected_loss.backward()

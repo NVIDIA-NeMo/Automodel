@@ -72,10 +72,11 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
-# Models build their CP/fp32-gate-aware modules at construction; no load-time
-# runtime patching is registered here. (Qwen3.5 dense/MoE build the native
-# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
-_MODEL_RUNTIME_PATCHES = {}
+# Compatibility adapters for released remote-code models remain model-owned.
+_MODEL_RUNTIME_PATCHES = {
+    "NemotronFlashForCausalLM": ("nemo_automodel.components.models.nemotron_flash.packing", "apply_packing_adapters"),
+    "DeciLMForCausalLM": ("nemo_automodel.components.models.nemotron_nas.packing", "apply_packing_adapters"),
+}
 
 
 def _set_global_sdpa_backends(sdpa_method):
