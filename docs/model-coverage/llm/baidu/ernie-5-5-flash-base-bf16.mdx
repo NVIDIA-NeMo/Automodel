@@ -48,9 +48,19 @@ unpacked documents. [Current Scope](#current-scope) lists what is outside it.
 ## Fine-Tune ERNIE-5.5-Flash-Base-BF16
 
 The recipe runs full-parameter SFT of the 43-layer main decoder on 64 GPUs (16
-nodes with 4 GB200 GPUs per node), so it is not a single-node example. Run it
-from the repository root on each of the 16 nodes, with `NODE_RANK` set from 0
-to 15 and `MASTER_ADDR` set to the first node:
+nodes with 4 GB200 GPUs per node), so it is not a single-node example. It
+loads the model and the tokenizer from revision
+`68d19ee51c032344fa0a8018e7dc21b2668a55c4` of
+`baidu/ERNIE-5.5-Flash-Base-BF16` on the Hugging Face Hub, both with
+`trust_remote_code: false`, and the train and validation splits of
+`rajpurkar/squad`. Every node must be able to read them, and the weights take
+about 534 GiB in the Hub cache. The 64-GPU training runs with HybridEP under
+[Validated Configuration](#validated-configuration) read them from caches on a
+file system shared by the nodes, with `HF_HUB_OFFLINE=1`,
+`TRANSFORMERS_OFFLINE=1`, and `HF_DATASETS_OFFLINE=1`. A download through the
+recipe was not run. Run the recipe from the repository root on each of the 16
+nodes, with `NODE_RANK` set from 0 to 15 and `MASTER_ADDR` set to the first
+node:
 
 ```bash
 uv run torchrun --nnodes=16 --nproc-per-node=4 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
@@ -152,6 +162,11 @@ model built from released layers with the `torch` backends. With HybridEP, the
 layout with experts sharded over several ranks per expert group was saved and
 restored ([Validated Configuration](#validated-configuration)).
 
+A checkpoint load reads into the storage of the model and is not
+transactional. A load that fails can leave the model partly overwritten, and
+the adapter then rejects every later load and save. Discard the model and its
+adapter after a failed load, and do not continue training with them.
+
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 [Installation Guide](/get-started/installation) for setup.
 
@@ -172,9 +187,10 @@ with the nodes placed as the Hardware row says, and with the recipe as it
 ships. The values differ between placements. The recipe without
 `checkpoint.load_metadata_with_gloo`, run for 10 updates on 16 nodes in four
 NVLink domains through the command above, gave the same training loss at the
-first update and 151.3 GiB used on the fullest GPU. By the step records that
-the recipe writes itself (`training.jsonl`: the tokens of an update divided by
-its tokens per second), the median over the updates from the sixth on was
+first update to four digits (0.3458) and 151.3 GiB used on the fullest GPU. By
+the step records that the recipe writes itself (`training.jsonl`: the tokens
+of an update divided by its tokens per second), the median over the updates
+from the sixth on was
 7.0 s in that run, 6.0 s in the 100-update run of the table, whose 5.9 s is
 the timer of the validation script, and 13.5 s with the `torch` backends in
 the placement of the 10-update run. An earlier run of 100 updates with the
@@ -184,8 +200,8 @@ The 100-update run completed without non-finite losses or gradient norms. It
 validates the training mechanics, not model convergence. In the same job, 20
 updates with the `torch` expert and dispatcher backends took a median of 10.0 s
 over the updates from the sixth on, against 6.0 s with HybridEP over the same
-updates, and peaked at 132.8 GiB allocated on rank 0. The training loss at the
-first update was 0.3469.
+updates, and peaked at 132.8 GiB allocated on rank 0. With the `torch`
+backends, the training loss at the first update was 0.3469.
 
 The recipe sets `checkpoint.load_metadata_with_gloo: true`, which plans the
 loading of the weights over a CPU process group instead of NCCL. The run of
@@ -256,8 +272,20 @@ Inputs are single unpacked documents. The model's `forward` accepts one
 unpadded document, `input_ids` of shape `[1, sequence]`, which the recipe
 provides with `step_scheduler.local_batch_size: 1`. `forward` rejects a padded
 batch, and THD sequence packing is refused when the data loader is built.
+`forward` returns the logits only, without a loss or a cache. It rejects
+`input_ids` that contain the configured `pad_token_id`, an `attention_mask` or
+a `padding_mask` that marks padding, and `position_ids` other than 0 to
+`sequence - 1`. It cannot detect several documents that are concatenated into
+one row without such masks or positions, so the data pipeline must supply one
+document per row.
 
 ## Numerical Validation
+
+The comparisons in this section are between losses of forward passes: NeMo
+AutoModel runs in evaluation mode, and the reference values come from the
+forward of a training step with learning rate 0. They are separate from the
+training measurements under [Validated Configuration](#validated-configuration)
+and do not measure convergence.
 
 | Item | Value |
 |---|---|
@@ -361,6 +389,10 @@ on single unpacked documents. The following limits apply:
   document can give different losses. In a three-layer model this was traced,
   with the same backends, to the top-k step, which does not choose the same key
   among keys with equal index scores every time.
+- Training is not bitwise repeatable between runs. On the cuDNN
+  sparse-attention path, no two training runs that were compared gave the same
+  losses after the first update. This includes runs of the released model on
+  documents of at most 256 tokens, where the DSA layers select every key.
 - The example recipe sets `checkpoint.enabled: false` because of the
   checkpoint size (about 3.1 TiB with optimizer state). Saving and resuming
   were run once on the full model and on a three-layer model with 16 and with
