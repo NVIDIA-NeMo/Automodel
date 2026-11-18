@@ -83,7 +83,7 @@ class DeferredStepReporter:
         Args:
             sample: Step metadata and metrics. CUDA values are scalars or vectors
                 such as expert counts. Their storage may be reused after enqueue.
-                Resolved values replace the original tensor entries on completion.
+                CUDA results replace the original tensor entries on completion.
             start: Timing event recorded before step work began.
             end: Timing event ordered after the step's compute and communication.
             remote_log: Whether the step is scheduled for remote logging.
@@ -91,11 +91,12 @@ class DeferredStepReporter:
         """
         by_dtype: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = defaultdict(list)
         for key, value in sample.metrics.items():
-            if isinstance(value, torch.Tensor):
-                if value.is_cuda:
-                    by_dtype[value.dtype].append((key, value.detach()))
-                else:
-                    sample.metrics[key] = value.detach().clone()
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.is_cuda:
+                by_dtype[value.dtype].append((key, value.detach()))
+            else:
+                sample.metrics[key] = value.item() if value.ndim == 0 else value.detach().clone()
 
         readbacks = []
         ready = end if isinstance(end, torch.cuda.Event) else None
@@ -157,15 +158,10 @@ class DeferredStepReporter:
                 work.wait()
 
             for readback in record.readbacks:
-                offset = 0
-                for key, shape in zip(readback.keys, readback.shapes):
-                    value = readback.values.narrow(0, offset, shape.numel()).view(shape)
-                    record.sample.metrics[key] = value.item() if not shape else value.clone()
-                    offset += shape.numel()
+                chunks = readback.values.split([shape.numel() for shape in readback.shapes])
+                for key, shape, chunk in zip(readback.keys, readback.shapes, chunks, strict=True):
+                    record.sample.metrics[key] = chunk.view(shape).clone() if shape else chunk.item()
                 self._buffers[(readback.values.dtype, readback.values.numel())].append(readback.values)
-            for key, value in record.sample.metrics.items():
-                if isinstance(value, torch.Tensor) and value.ndim == 0:
-                    record.sample.metrics[key] = value.item()
             step_elapsed, *phases = elapsed.tolist()
             for name, seconds in zip(tuple(record.spans)[1:], phases, strict=True):
                 record.sample.metrics[f"{name}-time"] = seconds

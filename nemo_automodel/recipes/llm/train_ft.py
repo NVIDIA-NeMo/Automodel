@@ -30,6 +30,7 @@ import inspect
 import logging
 import pathlib
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -990,35 +991,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             all_loads.update(collect_expert_loads(mp, dp_group=dp_group))
         self._moe_layer_loads = all_loads if all_loads else None
 
-    def _log_moe_metrics(self, step: int, wandb_log_fn) -> None:
-        """Log MoE load balance metrics to wandb.
-
-        Call after :meth:`_collect_moe_load_balance`.  Only logs when
-        ``_moe_layer_loads`` is populated and a wandb log function is provided.
-
-        Args:
-            step: Current training/benchmark step for wandb x-axis.
-            wandb_log_fn: Callable like ``wandb.log`` or ``wandb_run.log``.
-        """
-        if not getattr(self, "_moe_layer_loads", None):
-            return
+    def _compute_moe_metrics(self, step: int) -> dict[str, float]:
+        """Build remote load balance metrics for the given step's logging cadence."""
+        loads = getattr(self, "_moe_layer_loads", None)
+        if not loads:
+            return {}
 
         from nemo_automodel.components.moe.load_balance_metrics import (
             compute_brief_metrics,
             compute_detailed_metrics,
         )
 
-        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
-        mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
-        top_k = moe_metrics_cfg.get("top_k_experts", 0) if moe_metrics_cfg else 0
-        if mode == "detailed":
-            detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
-            if detailed_every is None or step % detailed_every == 0:
-                wandb_log_fn(compute_detailed_metrics(self._moe_layer_loads, top_k=top_k), step=step)
-            else:
-                wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
-        else:
-            wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+        config = self.cfg.get("moe_metrics") or {}
+        every = config.get("detailed_every_steps")
+        detailed = config.get("mode") == "detailed" and (every is None or step % every == 0)
+        compute = compute_detailed_metrics if detailed else compute_brief_metrics
+        return compute(loads, top_k=config.get("top_k_experts", 0))
+
+    def _write_remote_step_metrics(
+        self, *, step: int, metrics: dict[str, object], sinks: list[Callable[..., None]]
+    ) -> None:
+        if not sinks:
+            return
+        for log in sinks:
+            log(metrics, step=step)
+        if moe_metrics := self._compute_moe_metrics(step):
+            for log in sinks:
+                log(moe_metrics, step=step)
 
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
@@ -2067,29 +2066,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, Trackio, MLflow, Comet) according to step_scheduler frequency
-        trackio_logger = getattr(self, "trackio_logger", None)
         should_log_remotely = self.step_scheduler.is_remote_logging_step if remote_log is None else remote_log
         if should_log_remotely:
+            sinks = []
+            trackio_logger = getattr(self, "trackio_logger", None)
             if _HAS_WANDB and wandb.run is not None:
-                wandb.log(log_data.to_dict(), step=log_data.step)
+                sinks.append(wandb.log)
             if trackio_logger is not None:
-                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
-            if _HAS_MLFLOW and mlflow.active_run() is not None:
-                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
+                sinks.append(trackio_logger.log_metrics)
             if self.comet_logger is not None:
-                self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
-
-        # Log MoE load balance metrics (already collected/reduced on all ranks)
-        if should_log_remotely:
-            if _HAS_WANDB and wandb.run is not None:
-                self._log_moe_metrics(log_data.step, wandb.log)
-            if trackio_logger is not None:
-                self._log_moe_metrics(log_data.step, trackio_logger.log_metrics)
-            if self.comet_logger is not None:
-                self._log_moe_metrics(log_data.step, lambda m, step: self.comet_logger.log_metrics(m, step=step))
+                sinks.append(self.comet_logger.log_metrics)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
-                self._log_moe_metrics(log_data.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step))
+                sinks.append(lambda metrics, step: mlflow.log_metrics(to_float_metrics(metrics), step=step))
+            self._write_remote_step_metrics(step=log_data.step, metrics=log_data.to_dict(), sinks=sinks)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)

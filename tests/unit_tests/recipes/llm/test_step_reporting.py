@@ -48,6 +48,7 @@ def _reporting_worker(rank: int, rendezvous: str) -> None:
     samples = []
     boundaries = []
     entries = torch.arange(4, device=device, dtype=torch.int64)
+    cpu_step = torch.tensor(7, device="cpu")
     try:
         torch.cuda.set_sync_debug_mode("error")
         assert all_gather_item(rank, torch.int32, group=control_group) == [0, 1]
@@ -56,10 +57,21 @@ def _reporting_worker(rank: int, rendezvous: str) -> None:
             local_loss = (entries + step).float().sum()
             end = reporter.mark()
             boundaries.append((start, end))
-            sample = MetricsSample(step=step, epoch=2, metrics={"loss": local_loss, "experts": entries})
+            sample = MetricsSample(
+                step=step,
+                epoch=2,
+                metrics={
+                    "loss": local_loss,
+                    "experts": entries,
+                    "expert_total": entries.sum(),
+                    "empty": entries[:0],
+                    "cpu_step": cpu_step,
+                },
+            )
             reporter.enqueue(sample, start=start, end=end, remote_log=step == 7, phases={"optimizer": (start, end)})
             # The snapshot owns its values even when the producer reuses storage.
             entries.add_(10)
+            cpu_step.add_(1)
             samples.extend(reporter.poll())
         deadline = time.monotonic() + 20
         while len(samples) != 2 and time.monotonic() < deadline:
@@ -74,6 +86,9 @@ def _reporting_worker(rank: int, rendezvous: str) -> None:
             assert seconds == local_time.item()
             assert sample.metrics["optimizer-time"] == seconds
             assert sample.metrics["loss"] == 34 + 44 * i
+            assert sample.metrics["expert_total"] == 6 + 40 * i
+            assert sample.metrics["cpu_step"] == 7 + i
+            torch.testing.assert_close(sample.metrics["empty"], torch.empty(0, dtype=torch.int64))
             torch.testing.assert_close(sample.metrics["experts"], torch.arange(4) + 10 * i)
     finally:
         torch.cuda.set_sync_debug_mode("default")

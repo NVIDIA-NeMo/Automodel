@@ -499,12 +499,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         iteration = "iteration_warmup" if sample.step < self._bench_warmup_steps else "iteration"
         metrics = {key: value for key, value in sample.metrics.items() if key.endswith("-time")}
         metrics.update({"loss": sample.metrics["loss"], f"{iteration}-time": elapsed})
+        sinks = []
         if self._wandb_enabled and self.wandb_run is not None:
-            self.wandb_run.log(metrics, step=sample.step)
-            self._log_moe_metrics(sample.step, self.wandb_run.log)
+            sinks.append(self.wandb_run.log)
         if self.trackio_logger is not None:
-            self.trackio_logger.log_metrics(metrics, step=sample.step)
-            self._log_moe_metrics(sample.step, self.trackio_logger.log_metrics)
+            sinks.append(self.trackio_logger.log_metrics)
+        self._write_remote_step_metrics(step=sample.step, metrics=metrics, sinks=sinks)
 
     def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank, *, elapsed_steps: list[float]):
         torch.distributed.barrier()
