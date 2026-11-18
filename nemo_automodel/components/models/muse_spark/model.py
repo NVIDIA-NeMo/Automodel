@@ -24,11 +24,12 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import enable_fp32_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, enable_fp32_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.muse_spark.audio import MuseSparkAudioEncoder
 from nemo_automodel.components.models.muse_spark.config import MuseSpark1xOmniConfig
 from nemo_automodel.components.models.muse_spark.configuration_muse_spark import MuseSparkConfig

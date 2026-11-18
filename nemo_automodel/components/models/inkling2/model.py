@@ -33,11 +33,11 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import (
     HFCheckpointingMixin,
 )
+from nemo_automodel.components.models.common.logits import enable_fp32_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import enable_fp32_logits
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str
 

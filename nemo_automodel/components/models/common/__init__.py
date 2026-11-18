@@ -15,6 +15,7 @@
 """Common/shared components for model implementations."""
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import compute_lm_head_logits
 from nemo_automodel.components.models.common.utils import (
     HAVE_DEEP_EP,
     HAVE_TE,
@@ -23,7 +24,6 @@ from nemo_automodel.components.models.common.utils import (
     CudaGraphConfig,
     MoKBackendConfig,
     NcclEpConfig,
-    compute_lm_head_logits,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,

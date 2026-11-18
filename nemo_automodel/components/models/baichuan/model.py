@@ -49,11 +49,11 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import compute_lm_head_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)

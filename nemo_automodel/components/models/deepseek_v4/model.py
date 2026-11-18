@@ -58,16 +58,12 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import compute_lm_head_logits, enable_fp32_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import (
-    _has_dtensor_params,
-    cast_model_to_dtype,
-    compute_lm_head_logits,
-    enable_fp32_logits,
-)
+from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
     build_dsv4_cp_causal_padding_mask,

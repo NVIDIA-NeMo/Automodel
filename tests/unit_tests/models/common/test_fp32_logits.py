@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.models.common.utils import (
+from nemo_automodel.components.models.common.logits import (
     compute_lm_head_logits,
     enable_fp32_logits,
     head_compute_dtype,

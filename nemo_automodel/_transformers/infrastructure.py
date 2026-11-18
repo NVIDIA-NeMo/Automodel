@@ -68,9 +68,9 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.common.logits import enable_fp32_logits
 from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
-    enable_fp32_logits,
     prepare_frozen_parameters_for_sharding,
 )
 from nemo_automodel.components.models.kimi_k3.model import freeze_kimi_k3_indexer_params

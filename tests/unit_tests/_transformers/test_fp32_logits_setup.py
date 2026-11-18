@@ -240,7 +240,8 @@ def test_pipeline_parallelism_is_rejected():
 
 def test_quack_backend_override_preserves_configured_head():
     from nemo_automodel._transformers.model_init import _apply_backend_module_overrides
-    from nemo_automodel.components.models.common.utils import BackendConfig, enable_fp32_logits
+    from nemo_automodel.components.models.common.logits import enable_fp32_logits
+    from nemo_automodel.components.models.common.utils import BackendConfig
 
     model = nn.Module()
     head = enable_fp32_logits(nn.Linear(8, 16, dtype=torch.bfloat16))

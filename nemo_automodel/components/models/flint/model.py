@@ -31,15 +31,12 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_round_robin
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import enable_fp32_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import (
-    cast_model_to_dtype,
-    enable_fp32_logits,
-    generation_config_from_model_config,
-)
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, generation_config_from_model_config
 from nemo_automodel.components.models.flint.config import FlintConfig
 from nemo_automodel.components.models.flint.layers import FlintDecoderLayer
 from nemo_automodel.components.models.flint.magi import FlintMagiBatchPlans
