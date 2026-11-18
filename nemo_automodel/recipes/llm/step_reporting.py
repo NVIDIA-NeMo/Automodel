@@ -48,21 +48,19 @@ class DeferredStepReporter:
     """Read completed step metrics and aggregate rank times on CPU."""
 
     def __init__(self, device: torch.device) -> None:
-        """Create a CPU process group and, on CUDA, a reporting stream.
+        """Set the training device and create a CPU process group when distributed.
 
         Args:
             device: Training device assigned to the calling rank.
         """
         self._device = device
-        self._stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self._group = dist.new_group(backend="gloo") if dist.is_initialized() and dist.get_world_size() > 1 else None
         self._pending: deque[_PendingStep] = deque()
         self._reducing: deque[tuple[_PendingStep, torch.Tensor, dist.Work | None]] = deque()
-        self._buffers: dict[tuple[torch.dtype, int], list[torch.Tensor]] = defaultdict(list)
 
     def mark(self) -> StepMarker:
         """Record a CUDA event or a CPU timestamp on the training device."""
-        if self._stream is None:
+        if self._device.type != "cuda":
             return perf_counter()
         event = torch.cuda.Event(enable_timing=True)
         event.record(torch.cuda.current_stream(self._device))
@@ -100,25 +98,15 @@ class DeferredStepReporter:
 
         readbacks = []
         ready = end if isinstance(end, torch.cuda.Event) else None
-        if by_dtype and self._stream is not None:
-            packed = [
-                (entries, torch.cat([value.reshape(-1) for _, value in entries])) for entries in by_dtype.values()
-            ]
-            self._stream.wait_stream(torch.cuda.current_stream(self._device))
-            with torch.cuda.stream(self._stream):
-                for entries, values in packed:
-                    available = self._buffers[(values.dtype, values.numel())]
-                    host = (
-                        available.pop()
-                        if available
-                        else torch.empty(values.numel(), dtype=values.dtype, device="cpu", pin_memory=True)
-                    )
-                    host.copy_(values, non_blocking=True)
-                    values.record_stream(self._stream)
-                    readbacks.append(
-                        _MetricReadback([key for key, _ in entries], [value.shape for _, value in entries], host)
-                    )
-                ready = self._stream.record_event()
+        if by_dtype and self._device.type == "cuda":
+            for entries in by_dtype.values():
+                values = torch.cat([value.reshape(-1) for _, value in entries])
+                # PyTorch allocates a pinned CPU destination for this copy.
+                host = values.to("cpu", non_blocking=True)
+                readbacks.append(
+                    _MetricReadback([key for key, _ in entries], [value.shape for _, value in entries], host)
+                )
+            ready = torch.cuda.current_stream(self._device).record_event()
         self._pending.append(_PendingStep(sample, {"": (start, end), **(phases or {})}, ready, remote_log, readbacks))
 
     def poll(self, *, wait: bool = False) -> list[tuple[MetricsSample, bool, float]]:
@@ -161,7 +149,6 @@ class DeferredStepReporter:
                 chunks = readback.values.split([shape.numel() for shape in readback.shapes])
                 for key, shape, chunk in zip(readback.keys, readback.shapes, chunks, strict=True):
                     record.sample.metrics[key] = chunk.view(shape).clone() if shape else chunk.item()
-                self._buffers[(readback.values.dtype, readback.values.numel())].append(readback.values)
             step_elapsed, *phases = elapsed.tolist()
             for name, seconds in zip(tuple(record.spans)[1:], phases, strict=True):
                 record.sample.metrics[f"{name}-time"] = seconds
