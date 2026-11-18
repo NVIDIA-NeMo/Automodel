@@ -106,6 +106,10 @@ def test_qwen3_packed_single_rank_autocast(
         logits.backward(upstream)
         expected.backward(upstream)
         reference_parameters = dict(reference.named_parameters())
+        # On Blackwell, TE runs cuDNN's sm100 attention kernel while the reference's SDPA runs cuDNN's sm80
+        # kernel. Both are equally close to FP64, but near-zero embedding-gradient elements then differ by
+        # up to 5.75e-5 on GB200. With SDPA in the packed path, logits and that gradient match bit for bit.
+        gradient_atol = 1e-4 if torch.cuda.get_device_capability()[0] >= 10 else 5e-5
         for name, parameter in model.named_parameters():
             # Activation checkpoint wrappers retain the same underlying parameter names.
             reference_name = name.replace("._checkpoint_wrapped_module", "")
@@ -114,7 +118,11 @@ def test_qwen3_packed_single_rank_autocast(
             reference_gradient = reference_parameters[reference_name].grad
             assert reference_gradient is not None, reference_name
             torch.testing.assert_close(
-                parameter.grad, reference_gradient, rtol=0.05, atol=5e-5, msg=lambda message: f"{name}: {message}"
+                parameter.grad,
+                reference_gradient,
+                rtol=0.05,
+                atol=gradient_atol,
+                msg=lambda message: f"{name}: {message}",
             )
             relative_error = (parameter.grad - reference_gradient).norm() / reference_gradient.norm()
             assert relative_error < 0.03, (name, relative_error.item())
