@@ -136,7 +136,8 @@ def test_hybridep_lora_expert_preserves_situ_and_adapter_math(monkeypatch, num_t
 
     class Dispatcher:
         def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
-            return hidden_states, torch.tensor([num_local_tokens, 0, 0]), token_probs[:, 0]
+            counts = [2, 1, 0] if num_local_tokens else [0, 0, 0]
+            return hidden_states, torch.tensor(counts), token_probs[:, 0]
 
         def token_unpermutation(self, hidden_states):
             return hidden_states
@@ -153,18 +154,33 @@ def test_hybridep_lora_expert_preserves_situ_and_adapter_math(monkeypatch, num_t
     indices = torch.zeros(num_tokens, 1, dtype=torch.long)
     output = experts(x, torch.ones(num_tokens, dtype=torch.bool), weights, indices)
     if num_tokens:
-        gate_up = x @ (
-            experts.gate_and_up_projs[0] + experts.scale * experts.lora_gate_and_up_A[0] @ experts.lora_gate_and_up_B[0]
-        )
-        gate, up = gate_up.chunk(2, dim=-1)
-        activated = _situ(gate, up) * weights
-        expected = activated @ (experts.down_projs[0] + experts.scale * experts.lora_down_A[0] @ experts.lora_down_B[0])
-        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+        assert experts.scale == 2.0
+        outputs = []
+        for expert_id, token_slice in enumerate((slice(0, 2), slice(2, 3))):
+            gate_up = x[token_slice] @ (
+                experts.gate_and_up_projs[expert_id]
+                + 2.0 * experts.lora_gate_and_up_A[expert_id] @ experts.lora_gate_and_up_B[expert_id]
+            )
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = _situ(gate, up) * weights[token_slice]
+            outputs.append(
+                activated
+                @ (experts.down_projs[expert_id] + 2.0 * experts.lora_down_A[expert_id] @ experts.lora_down_B[expert_id])
+            )
+        torch.testing.assert_close(output, torch.cat(outputs), rtol=1e-5, atol=1e-5)
         output.sum().backward()
         assert experts.lora_gate_and_up_B.grad is not None
         assert experts.lora_down_B.grad is not None
+        assert x.grad is not None
+        for expert_id in range(2):
+            assert torch.count_nonzero(experts.lora_gate_and_up_B.grad[expert_id]) > 0
+            assert torch.count_nonzero(experts.lora_down_B.grad[expert_id]) > 0
     else:
         assert output.shape == x.shape
+        output.sum().backward()
+        assert x.grad is not None
+        assert experts.lora_gate_and_up_B.grad is not None
+        assert experts.lora_down_B.grad is not None
 
 
 def test_recipe_patterns_wrap_the_supported_modules_and_nothing_else():

@@ -284,11 +284,10 @@ one of the 8 expert groups of each MoE layer.
 LoRA removes the gradients and the optimizer state of the base weights, which
 is what lets 2 nodes take the place of 16. It does not reduce the weights that
 a GPU holds: every GPU keeps one eighth of the routed experts and its shard of
-the dense weights. In the `torch` backend run these occupied 65.8 GiB after
-loading. A training step still gathers the dense weights and keeps the
-activations of the forward pass for the backward
-pass; in that `torch` run the allocation rose from 65.8 GiB to a peak of
-102.8 GiB.
+the dense weights. In the HybridEP run these occupied 65.8 GiB after loading.
+A training step still gathers the dense weights and keeps the activations of
+the forward pass for the backward pass; the fullest rank reached 102.5 GiB
+allocated during an update.
 
 ### LoRA Targets
 
@@ -603,16 +602,19 @@ FSDP2 on single unpacked documents. The following limits apply:
   at most 256 tokens. With longer documents, the forward pass of the released
   model was run with the `torch` expert and dispatcher backends only. With
   LoRA, an earlier state of the code ran three updates each at 384, 512,
-  768, and 1,024 tokens to measure memory (113 to 161 GiB allocated at the
-  peak); this is not a validation. From position 2,176 of a document on, two
+  768, and 1,024 tokens with the `torch` expert and dispatcher backends to
+  measure memory (113 to 161 GiB allocated at the peak); this is not a
+  validation. From position 2,176 of a document on, two
   forward passes of the same document can give different losses. In a
   three-layer model this was traced, with the `torch` backends, to the top-k
   step, which does not choose the same key among keys with equal index scores
   every time.
-- Full-parameter training is not bitwise repeatable between runs. On the cuDNN
-  sparse-attention path, no two full-parameter runs that were compared gave the
+- Training is not bitwise repeatable between runs. On the cuDNN
+  sparse-attention path, no two training runs that were compared gave the
   same losses after the first update. This includes runs of the released model
   on documents of at most 256 tokens, where the DSA layers select every key.
+  Two LoRA runs had the same first loss (0.3184), then losses of 0.3359 and
+  0.4433 at the second update.
 - The full fine-tuning recipe sets `checkpoint.enabled: false` because of the
   checkpoint size (about 3.1 TiB with optimizer state). Saving and resuming
   full fine-tuning were run once on the full model and on a three-layer model
