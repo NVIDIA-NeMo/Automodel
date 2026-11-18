@@ -39,7 +39,7 @@ def get_device(local_rank: int | None = None, *, group: torch.distributed.Proces
     Raises:
         RuntimeError: If the distributed backend is neither 'nccl' nor 'gloo'.
     """
-    backend = torch.distributed.get_backend(group) if group is not None else torch.distributed.get_backend()
+    backend = torch.distributed.get_backend(group)
     if backend == "nccl":
         if local_rank is None:
             device = torch.device("cuda")
@@ -78,7 +78,7 @@ def all_gather_item(
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return [item]
 
-    device = get_device(local_rank, group=group) if group is not None else get_device(local_rank)
+    device = get_device(local_rank, group=group)
 
     if group is not None:
         group_size = group.size()
