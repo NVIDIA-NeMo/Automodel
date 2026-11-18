@@ -89,7 +89,7 @@ def _make_cfg(recipe_overrides: dict) -> MagicMock:
 def _run_setup_to_draft_build(recipe_overrides: dict) -> LlamaConfig:
     """Drive ``TrainEagle3Recipe.setup()`` through the draft-config assembly
     and return the config object handed to the draft class."""
-    import nemo_automodel.recipes.speculative_decoding.train_eagle3 as mod
+    import nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 as mod
 
     def _draft_cls(config):
         raise _DraftBuilt(config)

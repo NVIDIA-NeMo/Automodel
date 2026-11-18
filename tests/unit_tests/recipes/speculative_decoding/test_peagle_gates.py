@@ -22,7 +22,7 @@ metadata kwargs) must be rejected up front instead of crashing mid-setup.
 
 import pytest
 
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import _validate_peagle_gates
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import _validate_peagle_gates
 
 
 def test_peagle_gate_allows_colocated_nonpacked():

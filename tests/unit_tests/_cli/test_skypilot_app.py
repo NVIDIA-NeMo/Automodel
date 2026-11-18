@@ -65,7 +65,7 @@ def test_parse_gpus_per_node_non_int():
 
 def test_build_command_single_node():
     launcher = SkyPilotLauncher()
-    cmd = launcher._build_command(RECIPE_TARGET, "/tmp/config.yaml", gpus_per_node=4, num_nodes=1)
+    cmd = launcher._build_command("/tmp/config.yaml", gpus_per_node=4, num_nodes=1)
     assert "PYTHONPATH=~/sky_workdir:$PYTHONPATH" in cmd
     assert "torchrun" in cmd
     assert "--nproc_per_node=4" in cmd
@@ -75,7 +75,7 @@ def test_build_command_single_node():
 
 def test_build_command_multi_node():
     launcher = SkyPilotLauncher()
-    cmd = launcher._build_command(RECIPE_TARGET, "/tmp/config.yaml", gpus_per_node=8, num_nodes=2)
+    cmd = launcher._build_command("/tmp/config.yaml", gpus_per_node=8, num_nodes=2)
     assert "--nnodes=$SKYPILOT_NUM_NODES" in cmd
     assert "--node_rank=$SKYPILOT_NODE_RANK" in cmd
     assert "--rdzv_backend=c10d" not in cmd
@@ -117,18 +117,19 @@ def _torchrun_argv_under_bash(cmd, monkeypatch):
 
 def test_build_command_multi_node_master_addr_is_one_argument(monkeypatch, torch_run):
     launcher = SkyPilotLauncher()
-    cmd = launcher._build_command(RECIPE_TARGET, "/tmp/config.yaml", gpus_per_node=8, num_nodes=2)
+    cmd = launcher._build_command("/tmp/config.yaml", gpus_per_node=8, num_nodes=2)
     argv = _torchrun_argv_under_bash(cmd, monkeypatch)
 
     args = torch_run.get_args_parser().parse_args(argv)
     assert args.master_addr == "10.0.0.1"
-    assert args.training_script.endswith("train_ft.py")
-    assert args.training_script_args == ["-c", "/tmp/config.yaml"]
+    assert args.module is True
+    assert args.training_script == "nemo_automodel.cli.app"
+    assert args.training_script_args == ["/tmp/config.yaml"]
 
 
 def test_build_command_multi_node_rendezvous_uses_head_node(monkeypatch, torch_run):
     launcher = SkyPilotLauncher()
-    cmd = launcher._build_command(RECIPE_TARGET, "/tmp/config.yaml", gpus_per_node=8, num_nodes=2)
+    cmd = launcher._build_command("/tmp/config.yaml", gpus_per_node=8, num_nodes=2)
     argv = _torchrun_argv_under_bash(cmd, monkeypatch)
 
     # config_from_args sets OMP_NUM_THREADS when it is unset; keep it scoped to this test.
@@ -142,7 +143,6 @@ def test_build_command_multi_node_rendezvous_uses_head_node(monkeypatch, torch_r
 def test_build_command_extra_args():
     launcher = SkyPilotLauncher()
     cmd = launcher._build_command(
-        RECIPE_TARGET,
         "/tmp/config.yaml",
         gpus_per_node=1,
         num_nodes=1,
@@ -162,7 +162,6 @@ def test_build_command_extra_args_reach_recipe_verbatim(monkeypatch):
     ]
     launcher = SkyPilotLauncher()
     cmd = launcher._build_command(
-        RECIPE_TARGET,
         "/tmp/config.yaml",
         gpus_per_node=1,
         num_nodes=1,

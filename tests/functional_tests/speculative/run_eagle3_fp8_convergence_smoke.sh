@@ -117,10 +117,10 @@ FP8_LOG="$WORK/fp8.log"
 BF16_LOG="$WORK/bf16.log"
 echo "  -- fp8 (real GEMM) ..."
 torchrun --standalone --nproc_per_node=1 \
-  -m nemo_automodel.recipes.speculative_decoding.train_eagle3 -c "$WORK/smoke_fp8.yaml" 2>&1 | tee "$FP8_LOG"
+  -m nemo_automodel.cli.app "$WORK/smoke_fp8.yaml" 2>&1 | tee "$FP8_LOG"
 echo "  -- bf16 baseline ..."
 torchrun --standalone --nproc_per_node=1 \
-  -m nemo_automodel.recipes.speculative_decoding.train_eagle3 -c "$WORK/smoke_bf16.yaml" 2>&1 | tee "$BF16_LOG"
+  -m nemo_automodel.cli.app "$WORK/smoke_bf16.yaml" 2>&1 | tee "$BF16_LOG"
 
 echo "### 5/5  assert: fp8 finite + decreasing, and tracks bf16 within TOL=$TOL"
 python - "$FP8_LOG" "$BF16_LOG" "$TOL" <<'PY'

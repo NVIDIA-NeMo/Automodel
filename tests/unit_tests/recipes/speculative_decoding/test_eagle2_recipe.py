@@ -13,13 +13,12 @@
 # limitations under the License.
 
 from nemo_automodel.cli.utils import resolve_recipe_name
-from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
-from nemo_automodel.recipes.speculative_decoding.train_eagle2 import TrainEagle2Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle import TrainEagle1Recipe, TrainEagle2Recipe
 
 
 def test_eagle2_recipe_resolves_and_inherits_eagle1():
     assert issubclass(TrainEagle2Recipe, TrainEagle1Recipe)
     assert (
         resolve_recipe_name("TrainEagle2Recipe")
-        == "nemo_automodel.recipes.speculative_decoding.train_eagle2.TrainEagle2Recipe"
+        == "nemo_automodel.recipes.speculative_decoding.algorithms.eagle.TrainEagle2Recipe"
     )

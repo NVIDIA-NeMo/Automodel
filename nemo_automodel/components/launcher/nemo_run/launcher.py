@@ -144,15 +144,13 @@ class NemoRunLauncher(Launcher):
         # Set up PatternPackager so the config is shipped to the remote.
         self._setup_packager(executor, local_config_path)
 
-        # Build the Script: use ``python -m <module>`` so the recipe is resolved
-        # from the installed package, not a relative file path.
-        module_path = recipe_target.rsplit(".", 1)[0]
-        args = ["-c", _REMOTE_CONFIG_PATH]
+        # Enter the CLI with the packaged config; torchrun workers run in-process.
+        args = [_REMOTE_CONFIG_PATH]
         if extra_args:
             args.extend(extra_args)
 
         script = run.Script(
-            path=module_path,
+            path="nemo_automodel.cli.app",
             m=True,
             entrypoint="python",
             args=args,

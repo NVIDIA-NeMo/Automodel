@@ -27,14 +27,14 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import (
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import (
     KIMI_K3_MODEL_TYPE,
     TrainEagle3Recipe,
     _build_kimi_k3_target_backend,
     _validate_kimi_k3_gates,
 )
 
-_FROM_CONFIG = "nemo_automodel.recipes.speculative_decoding.train_eagle3.NeMoAutoModelForCausalLM.from_config"
+_FROM_CONFIG = "nemo_automodel.recipes.speculative_decoding.algorithms.eagle3.NeMoAutoModelForCausalLM.from_config"
 
 
 class _Cfg(SimpleNamespace):

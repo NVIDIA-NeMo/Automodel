@@ -104,13 +104,13 @@ def _make_cfg() -> MagicMock:
     "recipe_module, recipe_cls_name, target_wrapper_attr, draft_spec_attr",
     [
         (
-            "nemo_automodel.recipes.speculative_decoding.train_eagle1",
+            "nemo_automodel.recipes.speculative_decoding.algorithms.eagle",
             "TrainEagle1Recipe",
             "HFEagleTargetModel",
             "resolve_eagle1_draft_spec",
         ),
         (
-            "nemo_automodel.recipes.speculative_decoding.train_eagle3",
+            "nemo_automodel.recipes.speculative_decoding.algorithms.eagle3",
             "TrainEagle3Recipe",
             "HFEagle3TargetModel",
             "resolve_eagle3_draft_spec",
@@ -175,8 +175,7 @@ def test_eagle2_inherits_eagle1_fix():
     so the same fix applies. Pin the inheritance and method identity so a
     future override has to consciously re-establish the contract.
     """
-    from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
-    from nemo_automodel.recipes.speculative_decoding.train_eagle2 import TrainEagle2Recipe
+    from nemo_automodel.recipes.speculative_decoding.algorithms.eagle import TrainEagle1Recipe, TrainEagle2Recipe
 
     assert issubclass(TrainEagle2Recipe, TrainEagle1Recipe)
     assert TrainEagle2Recipe.setup is TrainEagle1Recipe.setup

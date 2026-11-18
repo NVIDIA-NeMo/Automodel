@@ -134,7 +134,7 @@ class DSparkTargetModelServer(TargetModelServer):
 class RemoteDSparkTargetModel:
     """DSpark target backend that runs the frozen target on remote servers.
 
-    It exposes the surface ``train_dspark`` calls on :class:`HFDSparkTargetModel`
+    It exposes the surface ``TrainDSparkRecipe`` calls on :class:`HFDSparkTargetModel`
     (``generate_batch``, ``get_input_embeddings``, ``get_output_embeddings``).
     Requests go to the servers round-robin, one at a time per server.
 

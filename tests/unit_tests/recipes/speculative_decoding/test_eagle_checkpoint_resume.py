@@ -46,8 +46,8 @@ import yaml
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, mark_checkpoint_incomplete
 from nemo_automodel.components.config.loader import ConfigNode, translate_value
-from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle import TrainEagle1Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
 
 @dataclass

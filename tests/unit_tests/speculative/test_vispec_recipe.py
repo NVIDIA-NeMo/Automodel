@@ -29,7 +29,7 @@ from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEag
 from nemo_automodel.components.speculative.eagle.vispec_core import VispecTrainerModule
 from nemo_automodel.components.speculative.eagle.vispec_draft import VispecDraftModel
 from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTargetModel
-from nemo_automodel.recipes.speculative_decoding.train_vispec import (
+from nemo_automodel.recipes.speculative_decoding.algorithms.vispec import (
     TrainVispecRecipe,
     TrainVispecStage1Recipe,
     _build_feature_noise_config,
@@ -37,7 +37,7 @@ from nemo_automodel.recipes.speculative_decoding.train_vispec import (
     _seed_draft_initialization,
 )
 
-_MODULE = "nemo_automodel.recipes.speculative_decoding.train_vispec"
+_MODULE = "nemo_automodel.recipes.speculative_decoding.algorithms.vispec"
 HIDDEN = 32
 VOCAB = 64
 IMAGE_TOKEN_ID = 7
@@ -640,64 +640,8 @@ class TestStage1Setup:
 def test_stage1_recipe_name_resolves():
     assert (
         resolve_recipe_name("TrainVispecStage1Recipe")
-        == "nemo_automodel.recipes.speculative_decoding.train_vispec.TrainVispecStage1Recipe"
+        == "nemo_automodel.recipes.speculative_decoding.algorithms.vispec.TrainVispecStage1Recipe"
     )
-
-
-def test_main_requires_a_config(monkeypatch):
-    from nemo_automodel.recipes.speculative_decoding import train_vispec
-
-    monkeypatch.setattr("sys.argv", ["train_vispec"])
-    with pytest.raises(ValueError, match="--config"):
-        train_vispec.main()
-
-
-@pytest.mark.parametrize(
-    ("recipe_name", "expected_class_name"),
-    [
-        ("TrainVispecStage1Recipe", "TrainVispecStage1Recipe"),
-        ("TrainVispecRecipe", "TrainVispecRecipe"),
-    ],
-)
-def test_main_selects_the_recipe_from_config(monkeypatch, recipe_name, expected_class_name):
-    """The stage-1 and stage-2 example YAMLs share one CLI entrypoint."""
-    from nemo_automodel.recipes.speculative_decoding import train_vispec
-
-    events = []
-
-    class _FakeRecipe:
-        def __init__(self, cfg):
-            self.cfg = cfg
-            events.append(("init", type(self).__name__))
-
-        def setup(self):
-            events.append(("setup", type(self).__name__))
-
-        def run_train_validation_loop(self):
-            events.append(("run", type(self).__name__))
-
-    stage1_cls = type("TrainVispecStage1Recipe", (_FakeRecipe,), {})
-    stage2_cls = type("TrainVispecRecipe", (_FakeRecipe,), {})
-    monkeypatch.setattr(train_vispec, "parse_args_and_load_config", lambda _: {"recipe": recipe_name})
-    monkeypatch.setattr(train_vispec, "TrainVispecStage1Recipe", stage1_cls)
-    monkeypatch.setattr(train_vispec, "TrainVispecRecipe", stage2_cls)
-
-    train_vispec.main("test.yaml")
-
-    assert events == [
-        ("init", expected_class_name),
-        ("setup", expected_class_name),
-        ("run", expected_class_name),
-    ]
-
-
-def test_main_rejects_an_unknown_recipe(monkeypatch):
-    from nemo_automodel.recipes.speculative_decoding import train_vispec
-
-    monkeypatch.setattr(train_vispec, "parse_args_and_load_config", lambda _: {"recipe": "TrainEagle1Recipe"})
-
-    with pytest.raises(ValueError, match="Unsupported ViSpec recipe"):
-        train_vispec.main("test.yaml")
 
 
 class TestFeatureNoiseRecipeConfig:

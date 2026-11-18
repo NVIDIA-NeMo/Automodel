@@ -38,10 +38,9 @@ import logging
 
 import torch
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.speculative.dflash.dflash2_core import DFlash2TrainerModule
 from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
 
 logger = logging.getLogger(__name__)
 
@@ -178,15 +177,3 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
                 "val_candidate_recall",
             )
         }
-
-
-def main(config_path: str | None = None):
-    """Entrypoint for ``TrainDFlash2Recipe``."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainDFlash2Recipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()

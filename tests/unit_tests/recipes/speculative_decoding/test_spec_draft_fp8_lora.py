@@ -37,13 +37,13 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     apply_draft_fp8,
     raise_if_peft_configured,
 )
-from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import (
+from nemo_automodel.recipes.speculative_decoding.algorithms.dspark import TrainDSparkRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import (
     _apply_draft_peft_and_fp8,
     _load_draft_weights,
 )
 
-_DSPARK_MODULE = "nemo_automodel.recipes.speculative_decoding.train_dspark"
+_DSPARK_MODULE = "nemo_automodel.recipes.speculative_decoding.algorithms.dspark"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -316,7 +316,7 @@ def _saving_recipe(tmp_path):
     """A TrainEagle3Recipe stub with just enough state to run the real save_checkpoint."""
     from unittest.mock import MagicMock
 
-    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.checkpointer = MagicMock()
@@ -348,7 +348,7 @@ def test_save_checkpoint_without_peft_forwards_none(tmp_path):
 
 def test_merged_lora_state_dict_folds_adapters():
     """Merged weights equal base + (alpha/dim) * B @ A, with lora_* keys dropped."""
-    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import _merged_lora_state_dict
+    from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import _merged_lora_state_dict
 
     model = _TinyDraft()
     base_weight = model.q_proj.weight.detach().clone()
@@ -369,7 +369,7 @@ def test_merged_lora_state_dict_folds_adapters():
 @pytest.mark.parametrize("use_dora", [False, True])
 def test_merged_state_dict_forward_parity(use_dora):
     """The merged weight must be numerically equivalent to the trained adapter forward (LoRA and DoRA)."""
-    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import _merged_lora_state_dict
+    from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import _merged_lora_state_dict
 
     torch.manual_seed(0)
     model = _TinyDraft()
@@ -394,7 +394,9 @@ def test_save_checkpoint_final_lora_exports_merged_draft(tmp_path):
     """The final checkpoint of a LoRA run must leave a serve-ready merged export."""
     recipe = _saving_recipe(tmp_path)
     recipe.peft_config = PeftConfig(target_modules=["q_proj"])
-    with patch("nemo_automodel.recipes.speculative_decoding.train_eagle3._export_merged_lora_draft") as mock_export:
+    with patch(
+        "nemo_automodel.recipes.speculative_decoding.algorithms.eagle3._export_merged_lora_draft"
+    ) as mock_export:
         recipe.save_checkpoint(epoch=0, step=1, is_final_checkpoint=False)
         mock_export.assert_not_called()
         recipe.save_checkpoint(epoch=0, step=2, is_final_checkpoint=True)

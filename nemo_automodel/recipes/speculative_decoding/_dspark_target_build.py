@@ -15,7 +15,7 @@
 """Shared builders for the large expert-parallel / FSDP DSpark targets.
 
 DeepSeek V4, GLM-5.2, and Kimi K3 targets are too large to load on a single 8x80GB
-node, so both the online training recipe (``train_dspark.py``) and the distributed offline
+node, so both the online training recipe (``algorithms/dspark.py``) and the distributed offline
 precompute (``precompute_dspark_dist.py``) load them frozen through the same
 expert-parallel / FSDP distributed path: ``create_distributed_setup_from_config``
 builds the ``device_mesh`` + ``moe_mesh`` from the recipe's ``distributed:`` block
