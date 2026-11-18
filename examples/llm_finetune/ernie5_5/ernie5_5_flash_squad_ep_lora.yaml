@@ -27,9 +27,9 @@
 # of the base weights, which is what lets 2 nodes replace the 16 of
 # ernie5_5_flash_squad_ep.yaml. It does not shrink the weights a rank holds (its expert group
 # and its shard of the dense weights), and a step still keeps the activations of the forward
-# pass for the backward pass. In a 100-update run with the torch expert and dispatcher
-# backends, a GPU held 65.8 GiB after loading and peaked at 102.8 GiB allocated; these
-# measurements do not characterize the HybridEP recipe below.
+# pass for the backward pass. In a 100-update HybridEP run, a GPU held 65.8 GiB after
+# loading and the fullest rank peaked at 102.5 GiB allocated. The run used a measuring
+# wrapper and the recipe's schedule, with only the checkpoint directory changed.
 # HybridEP requires DeepEP with HybridEP support and compiles kernels at the first dispatch.
 # Place both nodes of this 8-rank expert group in one NVLink domain. Leave
 # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset; if the nodes share a home directory, set
@@ -58,7 +58,7 @@
 #     -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml
 # The model, the tokenizer and the SQuAD dataset come from the Hugging Face Hub, the model and
 # the tokenizer at the pinned revision below; the BF16 weights take about 534 GiB in the Hub
-# cache, which every node must be able to read. The validated run read all three from a cache
+# cache, which every node must be able to read. The HybridEP run read all three from a cache
 # shared by the nodes, with HF_HUB_OFFLINE=1 and HF_DATASETS_OFFLINE=1.
 # checkpoint.checkpoint_dir must be on storage that both nodes share: every rank writes its
 # part of the optimizer state there. The recipe writes two checkpoints, about 40 GiB in all.

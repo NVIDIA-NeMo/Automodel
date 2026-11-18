@@ -327,26 +327,28 @@ stay FP32. The recipe loads the model in BF16 and sets the compute dtype to
 
 ### Validated LoRA Configuration
 
-The 100-update measurements below used the `torch` expert and dispatcher
-backends. They do not measure the HybridEP recipe above. On commit
-`9bfb59a219d0a1a8f42f0ad69b0fbee6a0b8ea9d`, the released 43-layer model ran
-on 8 GPUs with HybridEP for 32 updates, saved after 24, and resumed in a new
-process for 8 updates. On all ranks the restored adapter and optimizer state
-matched the save, and the frozen parameters remained unchanged. The run used
-a measuring wrapper and a shortened schedule; the 100-update HybridEP
-schedule and the CLI command above have not been run. It set
-`HYBRID_EP_CACHE_DIR`, `NEMO_HYBRIDEP_JIT_CACHE`, and `TMPDIR` per rank; the
-restore reused cached kernels from the training phase.
+The measurements below use the released 43-layer weights with the HybridEP
+recipe, on two nodes in one NVLink domain. A measuring wrapper ran the recipe
+for 100 updates with both scheduled saves, changing only
+`checkpoint.checkpoint_dir` in the recipe and adding a validation pass before
+training. A new process restored the checkpoint after update 50 and trained
+8 more updates. All ranks held the same adapter and optimizer state as at the
+save. The run set `HYBRID_EP_CACHE_DIR` per node and left
+`NEMO_HYBRIDEP_JIT_CACHE` and `NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` unset.
+
+The CLI module of the command above was also run with HybridEP for 10 updates
+on the same topology, without `uv run` and with checkpoint saving disabled.
 
 | Area | Validated Configuration |
 |---|---|
-| Hardware | 2 nodes with 4 GB200 GPUs each (8 GPUs) |
+| Hardware | 2 nodes with 4 GB200 GPUs each (8 GPUs), in one NVLink domain |
 | Parallelism | FSDP2 with `ep_size: 8`: one rank per expert group; TP1 / PP1 / CP1 |
+| Expert dispatch | HybridEP (`experts: torch_mm`, `dispatcher: hybridep`) |
 | Adapters | Adapter rank 8 (`peft.dim`), alpha 32 on the targets of the recipe: 856 BF16 tensors on 386 modules, 1,790,614,528 parameters (0.64% of all parameters) |
 | Workload | SQuAD, single unpacked documents of at most 256 tokens; local batch size 1, global batch size 8; 100 optimizer updates |
-| GPU memory | 65.8 GiB allocated on every GPU after loading; peak 102.8 GiB allocated (`torch.cuda.max_memory_allocated`, largest of the 8 ranks); 110.4 GiB used on the fullest GPU as sampled with `nvidia-smi` |
-| Step time | 20 s for the first update and 9 s for the second; median 5.5 s over the 98 updates from the third on, with single updates of up to 12.3 s |
-| Loss | Validation loss 0.3101 before training, 0.1351 after 50 updates, and 0.1328 after 100, on 367 label tokens. Training loss 0.3114 at the first update and 0.3207 at the last; an update has 11 to 58 label tokens, and the mean training loss is 0.3015 over the first 10 updates and 0.2141 over the last 10 |
+| GPU memory | 65.8 GiB allocated on every GPU after loading; peak 102.5 GiB allocated (`torch.cuda.max_memory_allocated`, largest of the 8 ranks); 109.9 GiB used on the fullest GPU as sampled with `nvidia-smi` |
+| Step time | 32.4 s for the first update, after the extra initial validation; median 1.95 s over the 98 updates from the third on, with single updates of up to 3.56 s. The first update is not a cold-start measurement because validation had already initialized HybridEP |
+| Loss | Validation loss 0.3104 before training, 0.1351 after 50 updates, and 0.1323 after 100, on 367 label tokens. Training loss 0.3184 at the first update and 0.3044 at the last; an update has 11 to 58 label tokens, and the mean training loss is 0.3066 over the first 10 updates and 0.2171 over the last 10 |
 
 The run completed without non-finite losses or gradient norms. It validates the
 training mechanics, not model convergence. Every rank hashed its local part of
@@ -354,16 +356,21 @@ every tensor before and after training: on all 8 ranks the 1,474 frozen
 parameters and the buffers were unchanged, and all 856 adapter tensors had
 changed. In the first two updates only adapter tensors received a gradient.
 
-The same schedule of updates and validation was also run with a learning rate
-of 1.0e-4: the validation loss was 0.0918 after 50 updates and 0.1014 after
+An earlier run with the `torch` expert and dispatcher backends gave a median
+5.5 s per update from the third on and validation loss 0.3101 before training,
+0.1351 after 50 updates, and 0.1328 after 100. It used a different run and
+placement; these measurements are not a controlled performance comparison.
+
+The same schedule of updates and validation was also run with the `torch`
+backends and a learning rate of 1.0e-4: the validation loss was 0.0918 after 50 updates and 0.1014 after
 100, lower than with 1.0e-5 at both evaluations but rising between them. The
 recipe keeps 1.0e-5, with which the validation loss did not rise. One run of
 100 updates at each rate, evaluated on 367 label tokens, does not select a
 learning rate.
 
-The numbers of this section and of [LoRA Checkpoints](#lora-checkpoints) come
-from runs on one state of the code: the change that added LoRA for this model,
-plus the library change of pull request
+The earlier `torch` comparisons and the comparison in
+[LoRA Checkpoints](#lora-checkpoints) come from runs on one state of the code:
+the change that added LoRA for this model, plus the library change of pull request
 [#4739](https://github.com/NVIDIA-NeMo/Automodel/pull/4739), which was merged
 after these runs. Two runs used the same code without that library change: the
 resume in the row "Without it" of [LoRA Checkpoints](#lora-checkpoints) and
@@ -372,7 +379,8 @@ through a wrapper that adds these measurements; the two runs of 100 updates
 also ran a validation pass before training. The `nemo_automodel.cli.app`
 entry of the command above was run with the `torch` backends on one node with a
 three-layer model built from released layers (4 GPUs, `ep_size: 4`): 8 updates, one validation pass,
-and one adapter checkpoint.
+and one adapter checkpoint. The 100-update HybridEP run above used a later
+state of the code, including the optimizer restore fix.
 
 ### LoRA Checkpoints
 
@@ -387,7 +395,8 @@ base weights:
 | Total | 20.06 GiB |
 
 The recipe writes one checkpoint after 50 updates and one after 100, 40 GiB
-in all. In the `torch` backend run, the two saves took 10.1 and 8.5 s.
+in all. In the HybridEP run above, the two saves took 9.0 and 7.0 s. In the
+earlier `torch` backend run, they took 10.1 and 8.5 s.
 
 A resume loads the released checkpoint first and then the adapter; it was
 validated with the same number of ranks and the same `ep_size`. It restores
