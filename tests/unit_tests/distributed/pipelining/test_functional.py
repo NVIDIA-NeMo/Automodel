@@ -543,19 +543,14 @@ class TestBuildPipelineSchedule:
 
     @pytest.mark.cpu_only
     @pytest.mark.parametrize(
-        ("torch_has_return_outputs", "call_kwargs", "received_kwargs"),
+        ("call_kwargs", "received_kwargs"),
         [
-            (True, {}, {"return_outputs": False}),
-            (True, {"return_outputs": True}, {"return_outputs": True}),
-            # Older PyTorch has no such argument: step() accepts it and drops it.
-            (False, {}, {}),
-            (False, {"return_outputs": True}, {}),
-            (False, {"return_outputs": False}, {}),
+            ({}, {"return_outputs": False}),
+            ({"return_outputs": True}, {"return_outputs": True}),
         ],
     )
     def test_step_return_outputs_default(
         self,
-        torch_has_return_outputs: bool,
         call_kwargs: dict[str, bool],
         received_kwargs: dict[str, bool],
     ) -> None:
@@ -566,7 +561,7 @@ class TestBuildPipelineSchedule:
             ),
             patch(
                 "nemo_automodel.components.distributed.pipelining.functional.is_torch_min_version",
-                return_value=torch_has_return_outputs,
+                return_value=True,
             ),
         ):
             schedule = build_pipeline_schedule(
@@ -581,6 +576,28 @@ class TestBuildPipelineSchedule:
         schedule.step(**call_kwargs)
 
         assert schedule.step_kwargs == [received_kwargs]
+
+    @pytest.mark.cpu_only
+    def test_rejects_unsupported_torch(self) -> None:
+        with (
+            patch(
+                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
+                return_value=_StepRecordingSchedule,
+            ),
+            patch(
+                "nemo_automodel.components.distributed.pipelining.functional.is_torch_min_version",
+                return_value=False,
+            ),
+            pytest.raises(RuntimeError, match=r"PyTorch >= 2\.10\.0"),
+        ):
+            build_pipeline_schedule(
+                pipeline_parallel_schedule_csv=None,
+                pipeline_parallel_schedule="1f1b",
+                microbatch_size=2,
+                local_batch_size=8,
+                stages=[Mock()],
+                loss_fn=Mock(),
+            )
 
     @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
     def test_build_schedule_single(self, mock_get_schedule):

@@ -20,7 +20,7 @@ import math
 import os
 import time
 import types
-from typing import Any, Callable, Protocol
+from typing import Callable, Protocol
 
 import torch
 import torch.nn as nn
@@ -507,45 +507,19 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
 
 
 def _default_return_outputs_to_false(schedule: _PipelineSchedule) -> None:
-    """Make ``schedule.step()`` and ``schedule.eval()`` default to ``return_outputs=False``.
+    """Disable output retention in ``step()`` and ``eval()`` to save memory.
 
-    PyTorch defaults ``return_outputs`` to ``True``. The last stage then keeps every
-    microbatch's output until the next step and concatenates them into a full-batch output
-    for ``step()`` to return. AutoModel reads the loss from the ``losses`` list, so both
-    copies only cost memory. For an LM head each copy holds the logits of the whole local
-    batch: 63 GiB in bf16 for 64 microbatches of 4,096 tokens and a 129,280-token
-    vocabulary. Callers that need the merged output pass ``return_outputs=True``.
-
-    ``eval()`` calls ``self.step()``, so it gets the same default. PyTorch releases before
-    2.10 have no ``return_outputs``. On those releases the replacement ``step()`` accepts the
-    argument and drops it, so callers can pass it on every supported release, and the last
-    stage keeps and returns its outputs as before.
+    Callers can pass ``return_outputs=True`` to request the merged output.
 
     Args:
-        schedule: The schedule whose ``step()`` is replaced in place.
+        schedule: The schedule to update in place.
+
+    Raises:
+        RuntimeError: If PyTorch is older than 2.10.0.
     """
-    step = schedule.step
-    if is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION):
-        schedule.step = functools.partial(step, return_outputs=False)
-        return
-
-    def step_ignoring_return_outputs(*args: Any, return_outputs: bool = False, **kwargs: Any) -> Any:
-        """Run a ``step()`` that always keeps and returns the last stage's outputs.
-
-        Args:
-            *args: Whole-batch positional schedule inputs. Tensor values have arbitrary
-                model-defined layouts.
-            return_outputs: Ignored, because this PyTorch release has no such argument.
-            **kwargs: The other ``step()`` arguments: ``target``, ``losses``, and whole-batch
-                keyword inputs. Tensor values have arbitrary model-defined layouts.
-
-        Returns:
-            The merged last-stage output on the rank that owns the last stage, else ``None``.
-        """
-        del return_outputs
-        return step(*args, **kwargs)
-
-    schedule.step = step_ignoring_return_outputs
+    if not is_torch_min_version(_SCHEDULE_RETURN_OUTPUTS_MIN_TORCH_VERSION):
+        raise RuntimeError("Pipeline schedules require PyTorch >= 2.10.0 for return_outputs support.")
+    schedule.step = functools.partial(schedule.step, return_outputs=False)
 
 
 def reset_pp_stage_shapes(
@@ -907,11 +881,11 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages. Its ``step()`` and
-        ``eval()`` accept ``return_outputs`` and default it to ``False``: they return ``None``,
-        and the last stage keeps no outputs, unless called with ``return_outputs=True``. Read
-        the loss from their ``losses`` list. PyTorch releases before 2.10 ignore the argument
-        and always keep and return the last stage's outputs.
+        A schedule whose ``step()`` and ``eval()`` discard outputs by default.
+        Pass ``return_outputs=True`` to return merged outputs; read losses from ``losses``.
+
+    Raises:
+        RuntimeError: If PyTorch is older than 2.10.0.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 
