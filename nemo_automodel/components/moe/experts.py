@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -28,6 +28,12 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig, NcclEpConfig
+from nemo_automodel.components.moe.expert_padding import (
+    pad_expert_rows,
+    padded_rows_bound,
+    padded_splits,
+    unpad_expert_rows,
+)
 from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_combine_output_cached
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
@@ -47,6 +53,9 @@ from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
+# Row alignment HybridEP gives each expert segment for TE's grouped-tensor GEMMs in capacity mode: the strictest
+# alignment of the built-in recipes (native MXFP8, FP8 block scaling, NVFP4); 16- and 32-row recipes divide it.
+_TE_GROUPED_SEGMENT_ROWS = 128
 # Bound each GPT-OSS-sized FP32 temporary to about 45 MiB while leaving small
 # dispatches on the faster single-operation path.
 _BIAS_CHUNK_ROWS = 4096
@@ -1942,8 +1951,9 @@ class GroupedExpertsTE(nn.Module):
             config: MoE configuration containing expert parameters.
             backend: Backend configuration; reads ``benchmark_static_routing``
                 (cache the per-microbatch split list under forced-balanced routing),
-                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs) and
-                ``dispatcher_equal_token_counts`` (passed to the HybridEP dispatcher).
+                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs),
+                ``dispatcher_equal_token_counts`` and ``dispatcher_capacity_factor`` (passed to the
+                HybridEP dispatcher) and ``te_fp8`` (HybridEP then pads each expert's rows in capacity mode).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
@@ -1951,7 +1961,8 @@ class GroupedExpertsTE(nn.Module):
 
         Raises:
             ValueError: If ``te_grouped_tensor`` is requested with Transformer Engine older than 2.19.0, or if
-                ``dispatcher_capacity_factor`` is set, which these experts cannot use.
+                ``dispatcher_capacity_factor`` is set without ``te_grouped_tensor`` or for experts with
+                ``expert_bias``.
         """
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
@@ -2004,15 +2015,31 @@ class GroupedExpertsTE(nn.Module):
         # BackendConfig.dispatcher_equal_token_counts (HybridEP only): every EP rank dispatches the same row
         # count, so the dispatcher derives its pad size locally instead of all-reducing it on every dispatch.
         self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
-        if backend is not None and backend.dispatcher_capacity_factor is not None:
+        # BackendConfig.dispatcher_capacity_factor (HybridEP only): the dispatcher returns capacity-sized buffers
+        # whose per-expert row counts stay on the device, and forward() keeps them there
+        # (_experts_with_device_splits).
+        self.dispatcher_capacity_factor = backend.dispatcher_capacity_factor if backend is not None else None
+        if self.dispatcher_capacity_factor is not None and not self.use_grouped_tensor:
             # Capacity mode pads the dispatched buffer past the routed rows while tokens_per_expert counts only
-            # those rows. TE's GroupedLinear needs split sizes that cover every input row and reads them on the
-            # host, so the factor would neither run nor remove a sync here.
+            # those rows. The legacy GroupedLinear path needs split sizes that cover every input row and reads
+            # them on the host, so the factor would neither run nor remove a sync there.
             raise ValueError(
-                "dispatcher_capacity_factor is not supported by the TE grouped experts "
-                f"(experts={backend.experts!r} with dispatcher={backend.dispatcher!r}); use experts='torch_mm' "
-                "or leave it at None."
+                "dispatcher_capacity_factor with the TE grouped experts requires te_grouped_tensor=True "
+                f"(got experts={backend.experts!r} with dispatcher={backend.dispatcher!r}); use experts='te' with "
+                "te_grouped_tensor=True, experts='torch_mm', or leave it at None."
             )
+        if self.dispatcher_capacity_factor is not None and self.expert_bias:
+            raise ValueError(
+                "dispatcher_capacity_factor is not supported for experts with expert_bias=True; "
+                "the down-projection bias correction of GroupedExpertsTE reads the split sizes on the host"
+            )
+        # Under FP8 the capacity buffer's expert segments come out of HybridEP's permute already padded to the
+        # strictest TE grouped-GEMM alignment (zero rows, padded counts), so no padding copy is needed.
+        self.dispatch_pad_multiple = (
+            _TE_GROUPED_SEGMENT_ROWS
+            if self.dispatcher_capacity_factor is not None and backend is not None and backend.te_fp8 is not None
+            else None
+        )
         self.dispatcher_hybridep_max_tokens_per_rank = (
             backend.dispatcher_hybridep_max_tokens_per_rank if backend is not None else None
         )
@@ -2328,7 +2355,9 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_hybridep_max_tokens_per_rank=self.dispatcher_hybridep_max_tokens_per_rank,
+            moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
             moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
+            moe_router_expert_pad_multiple=self.dispatch_pad_multiple,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -2406,10 +2435,6 @@ class GroupedExpertsTE(nn.Module):
         if self.config.apply_router_weight_after_down:
             permuted_probs = torch.ones_like(permuted_probs)
 
-        m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
-        if self.static_routing and self._static_m_splits is None:
-            self._static_m_splits = m_splits
-
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
@@ -2426,93 +2451,98 @@ class GroupedExpertsTE(nn.Module):
                         "Set te_grouped_tensor=False to use the legacy TE path."
                     )
                 self._grouped_tensor_signature = signature
-        actual_m_splits = None
-        unpadding = self.fp8_unpadding
-        if recipe is not None:
-            actual_m_splits = m_splits
-            padding = self.fp8_padding
-            if self.use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
-                # Native MXFP8 and FP8 block scaling require 128-row segments;
-                # the legacy MXFP8 padding defaults to 32. Keep separate modules
-                # so external autocast recipe changes do not cache this alignment
-                # into the legacy/current-scaling path.
-                assert self.native_fp8_padding is not None and self.native_fp8_unpadding is not None
-                padding = self.native_fp8_padding
-                unpadding = self.native_fp8_unpadding
-            permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
-            permuted_probs, _ = padding(permuted_probs, actual_m_splits)
-
-        if sum(m_splits) > 0:
-            # The native grouped-tensor API consumes device-side int64 split sizes.
-            # Keep the host list for padding, unpadding, and the legacy TE path.
-            grouped_m_splits = (
-                torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
-                if self.use_grouped_tensor
-                else m_splits
+        if self.dispatcher_capacity_factor is not None:
+            output2 = self._experts_with_device_splits(
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+                recipe=recipe,
+                compute_dtype=compute_dtype,
             )
-            # No FSDP mixed-precision wrapper casts EP-local experts when ep_shard is 1, so
-            # FP32 master weights meet BF16 dispatched tokens here. TE accepts parameters
-            # in another dtype only under torch.autocast, which casts them per GEMM like
-            # GroupedExpertsDeepEP's ``.to(compute_dtype)``. An outer autocast already does.
-            cast_weights = (
-                torch.autocast("cuda", dtype=compute_dtype)
-                if next(self.gate_up_linear.parameters()).dtype != compute_dtype
-                and not torch.is_autocast_enabled("cuda")
-                else nullcontext()
-            )
-            with cast_weights:
-                output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
-            output1 = self.expert_activation(output1, permuted_probs)
-            with cast_weights:
-                output2 = self.down_linear(output1, grouped_m_splits)
-            # The down-projection bias must be weighted by the per-token routing probability
-            # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
-            # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
-            # TE's GroupedLinear adds the down bias UNWEIGHTED inside the GEMM, so each of the
-            # top-k expert contributions carries a full prob-independent bias that is then
-            # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
-            # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
-            # so the net down-bias contribution becomes prob * down_bias. After-down weighting
-            # scales the biased output below, giving (expert_out + down_bias) * prob.
-            if self.expert_bias and not self.config.apply_router_weight_after_down:
-                down_bias = self._get_stacked_bias(self.down_linear)
-                if down_bias is not None:
-                    splits_t = torch.as_tensor(m_splits, device=output2.device)
-                    output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
         else:
-            # Handle edge case: no tokens routed to local experts
-            # Perform dummy computation for gradient flow.  Touching only
-            # ``weight0`` leaves every other local expert with ``grad=None``;
-            # that skips momentum decay, decoupled weight decay, and its
-            # optimizer step.  Grouped GEMM instead produces explicit zero
-            # gradients for all experts, so attach a zero-valued dependency to
-            # every local GroupedLinear parameter.  Indexing one element is
-            # sufficient for autograd to materialize the full zero gradient
-            # without reducing over the (potentially very large) weight.
-            def to_local(tensor):
-                if isinstance(tensor, DTensor):
-                    return tensor.to_local()
-                else:
-                    return tensor
+            m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
+            if self.static_routing and self._static_m_splits is None:
+                self._static_m_splits = m_splits
+            actual_m_splits = None
+            unpadding = self.fp8_unpadding
+            if recipe is not None:
+                actual_m_splits = m_splits
+                padding = self.fp8_padding
+                if self.use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
+                    # Native MXFP8 and FP8 block scaling require 128-row segments;
+                    # the legacy MXFP8 padding defaults to 32. Keep separate modules
+                    # so external autocast recipe changes do not cache this alignment
+                    # into the legacy/current-scaling path.
+                    assert self.native_fp8_padding is not None and self.native_fp8_unpadding is not None
+                    padding = self.native_fp8_padding
+                    unpadding = self.native_fp8_unpadding
+                permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
+                permuted_probs, _ = padding(permuted_probs, actual_m_splits)
 
-            # Empty dispatched rows retain the collective backward edge and also
-            # work when the local input itself has zero rows. Cast like the TE path
-            # above: FP32 master weights meet BF16 tokens here too.
-            output1 = torch.matmul(permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
-            all_expert_dependency = output2.new_zeros(())
-            for grouped_linear in (self.gate_up_linear, self.down_linear):
-                for parameter in grouped_linear.parameters():
-                    local_parameter = to_local(parameter)
-                    if local_parameter.numel() > 0:
-                        all_expert_dependency = (
-                            all_expert_dependency + local_parameter.reshape(-1)[0].to(output2.dtype) * 0
-                        )
-            output2 = output2 + all_expert_dependency
+            if sum(m_splits) > 0:
+                # The native grouped-tensor API consumes device-side int64 split sizes.
+                # Keep the host list for padding, unpadding, and the legacy TE path.
+                grouped_m_splits = (
+                    torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
+                    if self.use_grouped_tensor
+                    else m_splits
+                )
+                cast_weights = self._weight_cast(compute_dtype)
+                with cast_weights:
+                    output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
+                output1 = self.expert_activation(output1, permuted_probs)
+                with cast_weights:
+                    output2 = self.down_linear(output1, grouped_m_splits)
+                # The down-projection bias must be weighted by the per-token routing probability
+                # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
+                # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
+                # TE's GroupedLinear adds the down bias UNWEIGHTED inside the GEMM, so each of the
+                # top-k expert contributions carries a full prob-independent bias that is then
+                # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
+                # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
+                # so the net down-bias contribution becomes prob * down_bias. After-down weighting
+                # scales the biased output below, giving (expert_out + down_bias) * prob.
+                if self.expert_bias and not self.config.apply_router_weight_after_down:
+                    down_bias = self._get_stacked_bias(self.down_linear)
+                    if down_bias is not None:
+                        splits_t = torch.as_tensor(m_splits, device=output2.device)
+                        output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
+            else:
+                # Handle edge case: no tokens routed to local experts
+                # Perform dummy computation for gradient flow.  Touching only
+                # ``weight0`` leaves every other local expert with ``grad=None``;
+                # that skips momentum decay, decoupled weight decay, and its
+                # optimizer step.  Grouped GEMM instead produces explicit zero
+                # gradients for all experts, so attach a zero-valued dependency to
+                # every local GroupedLinear parameter.  Indexing one element is
+                # sufficient for autograd to materialize the full zero gradient
+                # without reducing over the (potentially very large) weight.
+                def to_local(tensor):
+                    if isinstance(tensor, DTensor):
+                        return tensor.to_local()
+                    else:
+                        return tensor
 
-        if fp8_active and actual_m_splits is not None:
-            output2 = unpadding(output2, actual_m_splits)
+                # Empty dispatched rows retain the collective backward edge and also
+                # work when the local input itself has zero rows. Cast like the TE path
+                # above: FP32 master weights meet BF16 tokens here too.
+                output1 = torch.matmul(
+                    permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).to(x.dtype).T
+                )
+                output1_ = self.expert_activation(output1, permuted_probs)
+                output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
+                all_expert_dependency = output2.new_zeros(())
+                for grouped_linear in (self.gate_up_linear, self.down_linear):
+                    for parameter in grouped_linear.parameters():
+                        local_parameter = to_local(parameter)
+                        if local_parameter.numel() > 0:
+                            all_expert_dependency = (
+                                all_expert_dependency + local_parameter.reshape(-1)[0].to(output2.dtype) * 0
+                            )
+                output2 = output2 + all_expert_dependency
+
+            if fp8_active and actual_m_splits is not None:
+                output2 = unpadding(output2, actual_m_splits)
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
@@ -2521,6 +2551,81 @@ class GroupedExpertsTE(nn.Module):
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
+
+    def _weight_cast(self, compute_dtype: torch.dtype) -> AbstractContextManager:
+        """Autocast context that casts parameters stored in another dtype to the activation dtype per GEMM.
+
+        No FSDP mixed-precision wrapper casts EP-local experts when ep_shard is 1, so FP32 master weights meet
+        BF16 dispatched tokens here. TE accepts parameters in another dtype only under torch.autocast, which
+        casts them per GEMM like GroupedExpertsDeepEP's ``.to(compute_dtype)``. An outer autocast already does.
+
+        Args:
+            compute_dtype: Activation dtype of the expert GEMMs.
+
+        Returns:
+            ``torch.autocast("cuda", dtype=compute_dtype)`` when the parameters are stored in another dtype and
+            no CUDA autocast is active, otherwise a no-op context.
+        """
+        if next(self.gate_up_linear.parameters()).dtype != compute_dtype and not torch.is_autocast_enabled("cuda"):
+            return torch.autocast("cuda", dtype=compute_dtype)
+        return nullcontext()
+
+    def _experts_with_device_splits(
+        self,
+        hidden: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        probs: torch.Tensor,
+        *,
+        recipe: "Recipe | None",
+        compute_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Both grouped projections over a HybridEP capacity buffer, without reading the split sizes on the host.
+
+        In capacity mode HybridEP returns ``capacity`` rows grouped by local expert, of which the first
+        ``tokens_per_expert.sum()`` are routed tokens, and keeps the counts on the device. The host-split path
+        would read them with ``tolist()`` and drain the compute stream in every MoE layer. Here TE's
+        grouped-tensor GEMMs take the split sizes as a CUDA int64 tensor. A quantized recipe needs every expert
+        segment aligned: HybridEP already pads the segments (``dispatch_pad_multiple``) whenever FP8 is
+        configured; otherwise the Triton expert padding (``expert_padding``) aligns them, reading the counts on
+        the device as well. No GEMM reads the rows past the routed total, and the HybridEP combine ignores them.
+
+        Args:
+            hidden: ``[capacity, expert_dim]`` dispatched rows grouped by local expert, in ``compute_dtype``.
+            tokens_per_expert: ``[num_local_experts]`` integer tensor of routed rows per local expert, padded
+                by HybridEP to ``dispatch_pad_multiple`` when that is set (a device tensor in capacity mode; the
+                one blocking calibration dispatch may return a host tensor).
+            probs: ``[capacity, 1]`` float32 activation weights aligned with ``hidden``'s rows.
+            recipe: Active TE quantization recipe, or ``None`` outside FP8 autocast.
+            compute_dtype: Activation dtype of the expert GEMMs.
+
+        Returns:
+            ``[capacity, expert_dim]`` down-projection outputs in ``compute_dtype``, aligned with ``hidden``'s
+            rows; rows past the routed total hold unspecified values.
+        """
+        rows = hidden.shape[0]
+        counts = tokens_per_expert.to(device=hidden.device, dtype=torch.int64, non_blocking=True)
+        align = None
+        splits = counts
+        if recipe is not None:
+            from transformer_engine.pytorch.quantization import get_align_size_for_quantization
+
+            # Native MXFP8 and FP8 block scaling need 128-row segments, as on the host-split path.
+            needed = 128 if recipe.mxfp8() or recipe.float8_block_scaling() else get_align_size_for_quantization(recipe)
+            if self.dispatch_pad_multiple is None or self.dispatch_pad_multiple % needed:
+                align = needed
+        if align is not None:
+            padded_rows = padded_rows_bound(rows, num_experts=counts.numel(), align=align)
+            hidden = pad_expert_rows(hidden, counts, align=align, padded_rows=padded_rows)
+            probs = pad_expert_rows(probs, counts, align=align, padded_rows=padded_rows)
+            splits = padded_splits(counts, align=align)
+        with self._weight_cast(compute_dtype):
+            output1 = self.gate_up_linear(hidden, splits)
+        output1 = self.expert_activation(output1, probs)
+        with self._weight_cast(compute_dtype):
+            output2 = self.down_linear(output1, splits)
+        if align is not None:
+            output2 = unpad_expert_rows(output2, counts, align=align, rows=rows)
+        return output2
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         """Initialize weights using reset_parameters()"""

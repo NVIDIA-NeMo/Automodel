@@ -569,9 +569,12 @@ class BackendConfig:
             run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
             taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
             that covers the largest routing skew expected across layers and batches. Not supported
-            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination) or by
-            ``GroupedExpertsTE``, which HybridEP uses for every ``experts`` value other than
-            ``torch_mm``, ``gmm`` and ``torch_mm_mxfp8``.
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` and ``GroupedExpertsTE`` reject
+            the combination). ``GroupedExpertsTE``, which HybridEP uses for every ``experts`` value
+            other than ``torch_mm``, ``gmm`` and ``torch_mm_mxfp8``, accepts the factor only with
+            ``te_grouped_tensor=True``: its grouped-tensor GEMMs then read the per-expert split sizes
+            on the device (no ``tolist()``), and HybridEP pads each expert's rows for the ``te_fp8``
+            recipe.
         dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
@@ -666,7 +669,8 @@ class BackendConfig:
     # Removes the per-dispatch compute-stream drain that HybridEP's blocking mode needs to learn the permuted
     # row count (and the per-layer barrier it implies); an overflow of the capacity trips a device-side assert
     # instead of silently truncating. None = blocking.
-    # Rejected by GroupedExpertsDeepEP for expert_bias experts (the bias add sizes itself from the buffer rows).
+    # Rejected by GroupedExpertsDeepEP and GroupedExpertsTE for expert_bias experts, and by GroupedExpertsTE
+    # without te_grouped_tensor.
     dispatcher_capacity_factor: float | None = None
     # HybridEP only: every EP rank dispatches the same number of rows (fixed-shape batches, which is
     # every batch that is not variable-length / in-batch packed), so the per-dispatch EP-group MAX

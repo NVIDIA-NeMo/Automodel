@@ -2512,14 +2512,49 @@ def test_te_passes_equal_token_counts_to_the_hybridep_manager(
     assert experts.token_dispatcher._comm_manager.equal_token_counts is bool(equal_token_counts)
 
 
-def test_te_rejects_the_hybridep_capacity_factor(moe_config, fake_native_te):
-    """Capacity mode pads the dispatched buffer past the routed rows, which TE's per-expert split sizes cannot
-    describe, so the TE experts refuse the factor instead of silently keeping the blocking dispatch."""
+@pytest.mark.parametrize("experts", ["te", "torch"])
+def test_te_rejects_the_hybridep_capacity_factor_without_grouped_tensor(moe_config, fake_native_te, experts):
+    """Capacity mode pads the dispatched buffer past the routed rows, which the legacy path's host split list cannot
+    describe, so without te_grouped_tensor the TE experts refuse the factor instead of keeping the blocking dispatch."""
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
-    backend = BackendConfig(experts="te", dispatcher="hybridep", dispatcher_capacity_factor=1.5)
-    with pytest.raises(ValueError, match="dispatcher_capacity_factor is not supported by the TE grouped experts"):
+    backend = BackendConfig(experts=experts, dispatcher="hybridep", dispatcher_capacity_factor=1.5)
+    with pytest.raises(ValueError, match="requires te_grouped_tensor=True"):
         GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_te_passes_the_capacity_factor_to_the_hybridep_manager(moe_config, fake_native_te, monkeypatch, fp8):
+    """With te_grouped_tensor the capacity factor reaches the HybridEP manager, with 128-row expert padding under FP8."""
+    import nemo_automodel.components.moe.megatron.token_dispatcher as token_dispatcher
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    # The real dispatcher builds the manager; only the HybridEP kernel entry point is missing on CPU.
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", token_dispatcher.MoEFlexTokenDispatcher
+    )
+    monkeypatch.setattr(token_dispatcher.MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", Mock())
+    backend = BackendConfig(
+        experts="te",
+        dispatcher="hybridep",
+        te_grouped_tensor=True,
+        dispatcher_capacity_factor=1.5,
+        te_fp8={"recipe": "mxfp8"} if fp8 else None,
+    )
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
+    group = Mock()
+    group.size.return_value = 2
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.get_group.return_value = group
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+
+    manager = experts.token_dispatcher._comm_manager
+    assert manager.hybridep_capacity_factor == 1.5
+    assert manager.pad_multiple == (128 if fp8 else None)
 
 
 def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
