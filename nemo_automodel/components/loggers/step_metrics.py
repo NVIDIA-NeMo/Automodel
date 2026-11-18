@@ -20,20 +20,13 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict
+from typing import NotRequired, Protocol, TypedDict
 
 import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.utils import _count_label_tokens
-from nemo_automodel.components.training.utils import count_tail_padding
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
-from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
-
-if TYPE_CHECKING:
-    from nemo_automodel._transformers.mfu import AutoMFU
-    from nemo_automodel.components.training.domain_mixture import DomainMixture
+from nemo_automodel.components.loggers.step_reporting import DeferredStepReporter
 
 
 class MetricBatch(TypedDict):
@@ -48,6 +41,46 @@ class _DataParallelReduce(Protocol):
     def __call__(
         self, tensor: torch.Tensor, /, *, include_cp: bool = False, keep_device: bool = False
     ) -> torch.Tensor: ...
+
+
+# Recipes pass in the implementations below, so loggers imports no other component.
+
+
+class _LabelTokenCounter(Protocol):
+    """Count supervised entries in integer labels, like loss.utils._count_label_tokens."""
+
+    def __call__(self, labels: torch.Tensor, ignore_index: int, /) -> int: ...
+
+
+class _TailPaddingCounter(Protocol):
+    """Count trailing padding in labels [batch, sequence], like training.utils.count_tail_padding."""
+
+    def __call__(self, labels: torch.Tensor, /) -> int: ...
+
+
+class _FlopsEstimator(Protocol):
+    """Estimate model FLOPs for input IDs [batch, sequence], like AutoMFU."""
+
+    def get_flops(self, input_ids: torch.Tensor, /) -> float | None: ...
+
+
+class _DomainLabelCounter(Protocol):
+    """Name the domains and count supervised labels per domain, like DomainMixture."""
+
+    @property
+    def names(self) -> Sequence[str]: ...
+
+    def label_counts(
+        self, dataset_ids: torch.Tensor, labels: torch.Tensor, /, *, ignore_index: int
+    ) -> torch.Tensor: ...
+
+
+class _MFUCalculator(Protocol):
+    """Convert a step's TFLOPs and seconds into MFU percent, like flops_utils.calculate_mfu."""
+
+    def __call__(
+        self, tflops: float, world_size: int, time_seconds: float, /, *, reference_mfu: float | None
+    ) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -65,6 +98,8 @@ class StepMetricReducer:
 
     device: torch.device
     dp_reduce: _DataParallelReduce
+    count_label_tokens: _LabelTokenCounter
+    count_tail_padding: _TailPaddingCounter
     pp_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None
     control_group: dist.ProcessGroup | None = None
 
@@ -96,8 +131,8 @@ class StepMetricReducer:
         labels = [batch["labels"] for batch in batches]
         counts = torch.tensor(
             [
-                sum(_count_label_tokens(target, ignore_index) for target in labels),
-                sum(target.numel() - count_tail_padding(target) for target in labels),
+                sum(self.count_label_tokens(target, ignore_index) for target in labels),
+                sum(target.numel() - self.count_tail_padding(target) for target in labels),
                 sum(target.shape[0] for target in labels) if pack_size else 0,
             ],
             dtype=torch.long,
@@ -106,7 +141,7 @@ class StepMetricReducer:
         return StepTokenCounts(*self.reduce(counts).unbind())
 
     def domain_counts(
-        self, batches: Sequence[MetricBatch], *, mixture: DomainMixture, ignore_index: int
+        self, batches: Sequence[MetricBatch], *, mixture: _DomainLabelCounter, ignore_index: int
     ) -> torch.Tensor:
         """Validate domain IDs and sum supervised counts for each domain.
 
@@ -146,7 +181,7 @@ class StepMetricReducer:
             )
         return self.reduce(counts)
 
-    def flops(self, batches: Sequence[MetricBatch], calculator: AutoMFU | None) -> torch.Tensor | None:
+    def flops(self, batches: Sequence[MetricBatch], calculator: _FlopsEstimator | None) -> torch.Tensor | None:
         """Estimate the optimizer step's total FLOPs from its input shapes.
 
         Args:
@@ -198,6 +233,7 @@ class TrainingStepReporter(DeferredStepReporter):
         pack_size: int,
         domain_names: Sequence[str],
         reference_mfu: float | None,
+        calculate_mfu: _MFUCalculator,
     ) -> None:
         """Configure metric derivation for the lifetime of a training loop."""
         super().__init__(device)
@@ -205,6 +241,7 @@ class TrainingStepReporter(DeferredStepReporter):
         self._pack_size = pack_size
         self._domain_names = domain_names
         self._reference_mfu = reference_mfu
+        self._calculate_mfu = calculate_mfu
         self._throughput_window: tuple[float, int, int] | None = None
 
     def poll(self, *, wait: bool = False) -> list[tuple[MetricsSample, bool, float]]:
@@ -216,7 +253,7 @@ class TrainingStepReporter(DeferredStepReporter):
             tps = metrics["num_tokens_per_step"] / elapsed
             metrics.update(tps=tps, tps_per_gpu=tps / self._world_size, step_time_seconds=elapsed, mfu=None)
             if (step_flops := metrics.pop("_step_flops", None)) is not None:
-                metrics["mfu"] = calculate_mfu(
+                metrics["mfu"] = self._calculate_mfu(
                     step_flops / 1e12, self._world_size, elapsed, reference_mfu=self._reference_mfu
                 )
             if (num_packs := metrics.pop("_num_packs", None)) is not None:

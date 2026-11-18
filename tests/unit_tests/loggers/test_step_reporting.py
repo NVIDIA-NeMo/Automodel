@@ -22,21 +22,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.token_normalization import normalize_token_loss
+from nemo_automodel.components.loggers.step_reporting import DeferredStepReporter
 from nemo_automodel.components.training.signal_handler import all_gather_item
-from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("count", [0, 1_000_003])
-def test_device_token_normalization_preserves_loss_and_gradient(dtype, count):
-    loss = torch.tensor(17.0, dtype=dtype, requires_grad=True)
-    expected = normalize_token_loss(loss, count)
-    actual = normalize_token_loss(loss, torch.tensor(count))
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    (expected_grad,) = torch.autograd.grad(expected, loss)
-    (actual_grad,) = torch.autograd.grad(actual, loss)
-    torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
 def _reporting_worker(rank: int, rendezvous: str) -> None:

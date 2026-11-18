@@ -163,6 +163,8 @@ class DeferredStepReporter:
 
 
 def _elapsed_seconds(start: StepMarker, end: StepMarker) -> float:
-    if isinstance(start, torch.cuda.Event):
+    if isinstance(start, torch.cuda.Event) and isinstance(end, torch.cuda.Event):
         return start.elapsed_time(end) / 1000.0
+    if isinstance(start, torch.cuda.Event) or isinstance(end, torch.cuda.Event):
+        raise TypeError("A span's start and end markers must both be CUDA events or both be CPU timestamps")
     return end - start

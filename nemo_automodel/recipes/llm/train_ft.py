@@ -79,6 +79,13 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     end_mlflow_active_run_as_killed,
     to_float_metrics,
 )
+from nemo_automodel.components.loggers.step_metrics import (
+    StepMetricReducer,
+    TrainingStepReporter,
+    restore_moe_metrics,
+    snapshot_moe_metrics,
+    write_remote_step_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
@@ -103,6 +110,7 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     clip_grads_for_optimizers,
+    count_tail_padding,
     get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
@@ -111,6 +119,7 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     FreezeConfig,
     _supports_logits_to_keep,
@@ -121,13 +130,6 @@ from nemo_automodel.components.utils.model_utils import (
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.step_metrics import (
-    StepMetricReducer,
-    TrainingStepReporter,
-    restore_moe_metrics,
-    snapshot_moe_metrics,
-    write_remote_step_metrics,
-)
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
@@ -1666,6 +1668,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         return StepMetricReducer(
             device=self.dist_env.device,
             dp_reduce=self._dp_allreduce,
+            count_label_tokens=_count_label_tokens,
+            count_tail_padding=count_tail_padding,
             pp_broadcast=self._broadcast_from_last_pp_stage if self.pp_enabled else None,
             control_group=getattr(self, "_step_control_group", None),
         )
@@ -1677,6 +1681,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pack_size=self.pack_size or 0,
             domain_names=getattr(getattr(self, "domain_mixture", None), "names", ()),
             reference_mfu=getattr(getattr(self, "mfu_calculator", None), "reference_mfu", None),
+            calculate_mfu=calculate_mfu,
         )
 
     def _snapshot_moe_metrics(self, sample: MetricsSample) -> None:

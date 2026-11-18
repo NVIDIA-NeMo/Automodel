@@ -22,6 +22,8 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loggers.step_metrics import restore_moe_metrics, write_remote_step_metrics
+from nemo_automodel.components.loggers.step_reporting import DeferredStepReporter
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -29,8 +31,6 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
-from nemo_automodel.recipes.llm.step_metrics import restore_moe_metrics, write_remote_step_metrics
-from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
