@@ -30,7 +30,7 @@ from nemo_automodel.components.models.hy_mt2.model import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
+from nemo_automodel.shared.model_utils import Float32LogitsLinear
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

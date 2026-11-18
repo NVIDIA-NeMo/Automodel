@@ -22,11 +22,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.shared.fp32_logits import (
+from nemo_automodel.shared.model_utils import (
     Float32LogitsConvertible,
     Float32LogitsLinear,
+    compute_lm_head_logits,
     head_compute_dtype,
-    linear_with_fp32_logits,
 )
 
 _DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"))]
@@ -46,7 +46,7 @@ def test_logits_keep_fp32_precision(device):
     hidden, weight, _ = _operands(device)
     reference = hidden.double() @ weight.double().t()
 
-    logits = linear_with_fp32_logits(hidden, weight)
+    logits = compute_lm_head_logits(weight, hidden).logits
 
     assert logits.dtype == torch.float32 and logits.shape == (2, 33, 320)
     fp32_error = (logits.double() - reference).abs().max()
@@ -63,7 +63,7 @@ def test_backward_equals_bf16_head_backward(device):
     fp32_hidden, fp32_weight = hidden.clone().requires_grad_(), weight.clone().requires_grad_()
     bf16_hidden, bf16_weight = hidden.clone().requires_grad_(), weight.clone().requires_grad_()
 
-    linear_with_fp32_logits(fp32_hidden, fp32_weight).backward(upstream.float())
+    compute_lm_head_logits(fp32_weight, fp32_hidden).logits.backward(upstream.float())
     F.linear(bf16_hidden, bf16_weight).backward(upstream)
 
     # The FP32 logits gradient is cast to the operand dtype and fed to the BF16 head's GEMMs.
@@ -76,7 +76,7 @@ def test_frozen_weight_receives_no_gradient():
     hidden, weight, upstream = _operands("cpu")
     hidden.requires_grad_()
 
-    linear_with_fp32_logits(hidden, weight).backward(upstream.float())
+    compute_lm_head_logits(weight, hidden).logits.backward(upstream.float())
 
     assert hidden.grad is not None and weight.grad is None
 
@@ -85,7 +85,7 @@ def test_fp32_weight_projects_in_fp32():
     hidden, weight, _ = _operands("cpu")
     weight = weight.float().requires_grad_()
 
-    logits = linear_with_fp32_logits(hidden, weight)
+    logits = compute_lm_head_logits(weight, hidden).logits
     logits.sum().backward()
 
     torch.testing.assert_close(logits, F.linear(hidden.float(), weight.detach()), rtol=0, atol=0)
@@ -94,10 +94,10 @@ def test_fp32_weight_projects_in_fp32():
 
 def test_autocast_does_not_lower_logits():
     hidden, weight, _ = _operands("cpu")
-    expected = linear_with_fp32_logits(hidden, weight)
+    expected = compute_lm_head_logits(weight, hidden).logits
 
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        logits = linear_with_fp32_logits(hidden.float(), weight)
+        logits = compute_lm_head_logits(weight, hidden.float()).logits
 
     assert logits.dtype == torch.float32
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
@@ -129,7 +129,7 @@ def test_from_head_owns_the_same_parameters(bias):
     assert list(fp32_head.state_dict()) == list(head.state_dict())
     hidden = torch.randn(3, 96, dtype=torch.bfloat16)
     torch.testing.assert_close(
-        fp32_head(hidden), linear_with_fp32_logits(hidden, head.weight, head.bias), rtol=0, atol=0
+        fp32_head(hidden), compute_lm_head_logits(head.weight, hidden, bias=head.bias).logits, rtol=0, atol=0
     )
 
 
@@ -137,11 +137,13 @@ def test_bias_is_added_in_fp32_and_receives_its_gradient():
     hidden, weight, upstream = _operands("cpu")
     bias = (torch.randn(320) * 0.1).to(torch.bfloat16).requires_grad_()
 
-    logits = linear_with_fp32_logits(hidden, weight, bias)
+    logits = compute_lm_head_logits(weight, hidden, bias=bias).logits
     logits.backward(upstream.float())
 
     assert logits.dtype == torch.float32
-    torch.testing.assert_close(logits, linear_with_fp32_logits(hidden, weight) + bias.detach().float(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        logits, compute_lm_head_logits(weight, hidden).logits + bias.detach().float(), rtol=0, atol=0
+    )
     assert bias.grad.dtype == torch.bfloat16
     torch.testing.assert_close(bias.grad, upstream.float().sum((0, 1)).bfloat16(), rtol=0, atol=0)
 

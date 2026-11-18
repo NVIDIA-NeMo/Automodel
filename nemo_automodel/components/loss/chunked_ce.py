@@ -22,10 +22,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.shared.fp32_logits import (
+from nemo_automodel.shared.model_utils import (
     Float32LogitsLinear,
+    compute_lm_head_logits,
     head_compute_dtype,
-    linear_with_fp32_logits,
 )
 
 
@@ -81,7 +81,7 @@ def _linear_cross_entropy(
         FP32 losses shaped [chunk_tokens].
     """
     if projection_dtype == torch.float32:
-        logits = linear_with_fp32_logits(hidden, weight)
+        logits = compute_lm_head_logits(weight, hidden).logits
     else:
         logits = F.linear(hidden.to(weight.dtype), weight)
     if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:

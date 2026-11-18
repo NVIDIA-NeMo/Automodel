@@ -440,14 +440,18 @@ class TestComputeLmHeadLogits:
 
     def test_fp32_logits_head_composes_with_slicing(self):
         """A bf16 Float32LogitsLinear head writes fp32 logits for the kept positions (2D THD input)."""
-        from nemo_automodel.shared.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
+        from nemo_automodel.shared.model_utils import Float32LogitsLinear
 
         lm_head = Float32LogitsLinear.from_head(self._lm_head().to(torch.bfloat16))
         hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
         out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3)
         assert out.logits.shape == (3, self.VOCAB)
         assert out.logits.dtype == torch.float32
-        torch.testing.assert_close(out.logits, linear_with_fp32_logits(hidden[-3:, :], lm_head.weight), rtol=0, atol=0)
+        expected = hidden[-3:].float() @ lm_head.weight.float().t()
+        torch.testing.assert_close(out.logits, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            compute_lm_head_logits(lm_head.weight, hidden, logits_to_keep=3).logits, expected, rtol=0, atol=0
+        )
 
     def test_lm_head_dtype_casts_after_slicing(self):
         lm_head = self._lm_head().to(torch.bfloat16)
@@ -480,7 +484,7 @@ class TestComputeLmHeadLogits:
         lm_head = FakeFSDPHead()
         hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
 
-        with patch("nemo_automodel.shared.fp32_logits.FSDPModule", FakeFSDPHead):
+        with patch("nemo_automodel.shared.model_utils.FSDPModule", FakeFSDPHead):
             out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
 
         assert lm_head.weight.dtype == torch.float32

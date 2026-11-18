@@ -45,8 +45,8 @@ from nemo_automodel.components.models.muse_spark.state_dict_adapter import MuseS
 from nemo_automodel.components.models.muse_spark.vision import MuseSparkVisionModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.model_utils import Float32LogitsLinear
 
 
 def _residual_dtype(config: MuseSpark1xOmniConfig) -> torch.dtype:

@@ -27,7 +27,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
+from nemo_automodel.shared.model_utils import Float32LogitsLinear
 
 from .config import Inkling2TextConfig
 from .context_parallel import convolution_history

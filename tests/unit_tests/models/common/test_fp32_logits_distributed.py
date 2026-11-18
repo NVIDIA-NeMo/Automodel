@@ -36,7 +36,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
+from nemo_automodel.shared.model_utils import Float32LogitsLinear, compute_lm_head_logits
 
 pytestmark = pytest.mark.cpu_only
 
@@ -142,12 +142,12 @@ def _check_vocab_parallel_contract(hidden: torch.Tensor, weight: torch.Tensor, u
     """
     mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("tp",))
     reference_hidden = hidden.clone().requires_grad_()
-    reference_logits = linear_with_fp32_logits(reference_hidden, weight)
+    reference_logits = compute_lm_head_logits(weight, reference_hidden).logits
     reference_logits.backward(upstream)
 
     # A regular tensor is the replicated input; each rank's input gradient is a partial sum.
     local_hidden = hidden.clone().requires_grad_()
-    logits = linear_with_fp32_logits(local_hidden, distribute_tensor(weight, mesh, [Shard(0)]))
+    logits = compute_lm_head_logits(distribute_tensor(weight, mesh, [Shard(0)]), local_hidden).logits
     assert logits.placements == (Shard(logits.ndim - 1),)
     torch.testing.assert_close(logits.full_tensor(), reference_logits, rtol=1e-6, atol=1e-6)
     logits.full_tensor().backward(upstream)
@@ -162,13 +162,15 @@ def _check_vocab_parallel_contract(hidden: torch.Tensor, weight: torch.Tensor, u
     }
     for name, unsupported_weight in unsupported.items():
         try:
-            linear_with_fp32_logits(hidden, unsupported_weight)
+            compute_lm_head_logits(unsupported_weight, hidden).logits
         except NotImplementedError as error:
             assert "vocabulary-sharded" in str(error), (name, error)
         else:
             raise AssertionError(f"FP32 logits accepted a {name} weight")
     try:
-        linear_with_fp32_logits(hidden, distribute_tensor(weight, mesh, [Shard(0)]), torch.zeros(weight.shape[0]))
+        compute_lm_head_logits(
+            distribute_tensor(weight, mesh, [Shard(0)]), hidden, bias=torch.zeros(weight.shape[0])
+        ).logits
     except NotImplementedError as error:
         assert "bias-free" in str(error), error
     else:

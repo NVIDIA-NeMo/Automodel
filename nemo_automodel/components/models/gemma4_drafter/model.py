@@ -32,8 +32,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
+from nemo_automodel.shared.model_utils import Float32LogitsLinear, compute_lm_head_logits
 
 _GEMMA4_ASSISTANT_MSG = "transformers.models.gemma4_assistant is not available."
 _GEMMA4_ASSISTANT_MODELING = "transformers.models.gemma4_assistant.modeling_gemma4_assistant"
@@ -81,7 +81,7 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
                 in FP32 when ``fp32_logits`` is set.
             """
             if self.fp32_logits:
-                return linear_with_fp32_logits(hidden_states, lm_head_weight)
+                return compute_lm_head_logits(lm_head_weight, hidden_states).logits
             return torch.nn.functional.linear(hidden_states, lm_head_weight)
 
     class Gemma4DrafterForCausalLM(HFCheckpointingMixin, HFGemma4AssistantForCausalLM):

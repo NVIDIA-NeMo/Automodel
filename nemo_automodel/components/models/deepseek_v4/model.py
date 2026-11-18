@@ -104,7 +104,7 @@ from nemo_automodel.components.models.deepseek_v4.vision import (
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import Gate, MoE
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
+from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 

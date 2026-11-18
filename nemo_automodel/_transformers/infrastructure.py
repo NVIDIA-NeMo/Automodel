@@ -97,7 +97,7 @@ from nemo_automodel.components.utils.model_utils import (
     parse_freeze_config,
     print_trainable_parameters,
 )
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
+from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str

@@ -30,7 +30,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import unwra
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.flint.config import FlintConfig
 from nemo_automodel.components.models.flint.layers import FlintDecoderLayer
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
+from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 

@@ -43,7 +43,7 @@ from nemo_automodel.components.models.flint.packing import _prepare_inputs_for_c
 from nemo_automodel.components.models.flint.parallelization import FlintModelParallelizer
 from nemo_automodel.components.models.flint.state_dict_adapter import FlintStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.shared.fp32_logits import Float32LogitsLinear
+from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str
 
 

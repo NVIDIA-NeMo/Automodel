@@ -53,12 +53,11 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
-from nemo_automodel.shared.fp32_logits import (
+from nemo_automodel.shared.model_utils import (
     Float32LogitsConvertible,
     Float32LogitsLinear,
-    linear_with_fp32_logits,
+    compute_lm_head_logits,
 )
 
 logger = logging.get_logger(__name__)
@@ -316,7 +315,7 @@ class Float32LogitsNormHead(Float32LogitsLinear):
         Returns:
             FP32 tensor of shape [..., vocab].
         """
-        return linear_with_fp32_logits(input, _normalized_weight(self))
+        return compute_lm_head_logits(_normalized_weight(self), input).logits
 
 
 # ---------------------------------------------------------------------------
