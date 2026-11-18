@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from typing import Any, Dict
 
@@ -684,7 +684,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if is_train
             else nullcontext()
         )
-        with train_ctx(), sync_ctx:
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
+        with train_ctx(), sync_ctx, ExitStack() as student_ctx:
             # No grad for teacher forward.
             if separate_teacher_logits is None:
                 with (
@@ -697,7 +698,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             else:
                 teacher_logits = separate_teacher_logits
 
-            # Student forward.
+            # The student runs under its TE quantization; the full-precision teacher above does not.
+            student_ctx.enter_context(te_ctx)
             student_batch = dict(batch)
             if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
                 student_batch["output_hidden_states"] = True
