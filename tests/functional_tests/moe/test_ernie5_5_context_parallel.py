@@ -276,11 +276,12 @@ def _check_shards(rank: int, mesh, model: Ernie5_5_MoeForCausalLM) -> list[str]:
         dist.all_reduce(gradients[name])
     failures = [] if len(expected) > 100 else [f"only {len(expected)} tensors have a gradient"]
     difference = (row[sharder.shard_layout.input_token_stream_positions[0]] - reference[0].detach()).abs().max()
-    if difference > LOGIT_ATOL:
+    # A NaN compares false with every tolerance, so a non-finite difference is a failure of its own.
+    if not torch.isfinite(difference) or difference > LOGIT_ATOL:
         failures.append(f"logits differ by {difference:.3e}")
     for name, gradient in gradients.items():
         error, scale = (gradient - expected[name]).abs().max(), expected[name].abs().max()
-        if error > GRADIENT_RTOL * scale:
+        if not torch.isfinite(error) or error > GRADIENT_RTOL * scale:
             failures.append(f"gradient of {name} differs by {error:.3e} at scale {scale:.3e}")
     return failures
 
