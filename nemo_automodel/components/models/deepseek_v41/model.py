@@ -65,6 +65,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
+    Float32LogitsLinear,
     _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
@@ -108,7 +109,6 @@ from nemo_automodel.components.models.deepseek_v41.vision import (
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
-from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str
 
 

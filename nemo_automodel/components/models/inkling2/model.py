@@ -37,8 +37,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str
 
 from .attention import AttentionSources, Inkling2Attention

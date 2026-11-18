@@ -35,7 +35,11 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, generation_config_from_model_config
+from nemo_automodel.components.models.common.utils import (
+    Float32LogitsLinear,
+    cast_model_to_dtype,
+    generation_config_from_model_config,
+)
 from nemo_automodel.components.models.flint.config import FlintConfig
 from nemo_automodel.components.models.flint.layers import FlintDecoderLayer
 from nemo_automodel.components.models.flint.magi import FlintMagiBatchPlans
@@ -43,7 +47,6 @@ from nemo_automodel.components.models.flint.packing import _prepare_inputs_for_c
 from nemo_automodel.components.models.flint.parallelization import FlintModelParallelizer
 from nemo_automodel.components.models.flint.state_dict_adapter import FlintStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.utils import dtype_from_str
 
 

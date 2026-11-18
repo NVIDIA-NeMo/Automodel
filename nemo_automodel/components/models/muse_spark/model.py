@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import Float32LogitsLinear, cast_model_to_dtype
 from nemo_automodel.components.models.muse_spark.audio import MuseSparkAudioEncoder
 from nemo_automodel.components.models.muse_spark.config import MuseSpark1xOmniConfig
 from nemo_automodel.components.models.muse_spark.configuration_muse_spark import MuseSparkConfig
@@ -46,7 +46,6 @@ from nemo_automodel.components.models.muse_spark.vision import MuseSparkVisionMo
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.import_utils import safe_import
-from nemo_automodel.shared.model_utils import Float32LogitsLinear
 
 
 def _residual_dtype(config: MuseSpark1xOmniConfig) -> torch.dtype:

@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.shared.model_utils import (
+from nemo_automodel.components.models.common.utils import (
     Float32LogitsConvertible,
     Float32LogitsLinear,
     compute_lm_head_logits,
@@ -55,6 +55,18 @@ def test_logits_keep_fp32_precision(device):
     assert bf16_error > 100 * fp32_error
     # Rounded BF16 logits upcast to FP32 would all be BF16-representable.
     assert (logits == logits.bfloat16().float()).float().mean() < 0.01
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="out_dtype GEMM requires CUDA or ROCm")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_logits_match_vllm_projection(dtype):
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    hidden, weight, bias = [
+        torch.randn(shape, device="cuda", dtype=dtype, generator=generator) for shape in ((2, 7, 64), (31, 64), (31,))
+    ]
+    expected = torch.mm(hidden.flatten(0, 1), weight.t(), out_dtype=torch.float32) + bias.float()
+    logits = compute_lm_head_logits(weight, hidden, bias=bias).logits
+    torch.testing.assert_close(logits, expected.view(2, 7, 31), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device", _DEVICES)

@@ -20,7 +20,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.shared.model_utils import Float32LogitsLinear
+from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 
 _DATASET_IGNORE_INDEX = -100
 

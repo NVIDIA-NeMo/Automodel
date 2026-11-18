@@ -32,8 +32,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import Float32LogitsLinear, compute_lm_head_logits
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
-from nemo_automodel.shared.model_utils import Float32LogitsLinear, compute_lm_head_logits
 
 _GEMMA4_ASSISTANT_MSG = "transformers.models.gemma4_assistant is not available."
 _GEMMA4_ASSISTANT_MODELING = "transformers.models.gemma4_assistant.modeling_gemma4_assistant"

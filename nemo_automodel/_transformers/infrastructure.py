@@ -69,6 +69,7 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import (
+    Float32LogitsLinear,
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
 )
@@ -97,7 +98,6 @@ from nemo_automodel.components.utils.model_utils import (
     parse_freeze_config,
     print_trainable_parameters,
 )
-from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str

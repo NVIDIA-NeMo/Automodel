@@ -53,12 +53,12 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
-from nemo_automodel.shared.model_utils import (
+from nemo_automodel.components.models.common.utils import (
     Float32LogitsConvertible,
     Float32LogitsLinear,
     compute_lm_head_logits,
 )
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)
 

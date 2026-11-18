@@ -28,9 +28,9 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 from nemo_automodel.components.models.flint.config import FlintConfig
 from nemo_automodel.components.models.flint.layers import FlintDecoderLayer
-from nemo_automodel.shared.model_utils import Float32LogitsLinear
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 
