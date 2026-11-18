@@ -422,7 +422,7 @@ def test_left_padded_row_on_context_parallel_shards_matches_the_row_run_alone(th
         torch.testing.assert_close(gradients[name], parameter.grad, atol=1e-4, rtol=1e-3)
 
 
-def test_one_rank_fsdp2_checkpointing_disables_the_cache_and_keeps_plain_gradients():
+def test_one_rank_fsdp2_checkpointing_builds_no_cache_in_training_and_keeps_plain_gradients():
     from torch.distributed.fsdp import MixedPrecisionPolicy
 
     from nemo_automodel.components.distributed.config import FSDP2Config
@@ -444,9 +444,12 @@ def test_one_rank_fsdp2_checkpointing_disables_the_cache_and_keeps_plain_gradien
     output = model(input_ids=ids)
     output.logits.square().mean().backward()
 
-    assert output.past_key_values is None and not model.config.use_cache
+    # The released config keeps `use_cache: true`; training builds no cache, evaluation still does.
+    assert output.past_key_values is None and model.config.use_cache
     torch.testing.assert_close(output.logits, expected, **TOLERANCE)
     gradients = {name.replace("._checkpoint_wrapped_module", ""): p.grad for name, p in model.named_parameters()}
     for name, parameter in plain.named_parameters():
         assert torch.isfinite(gradients[name]).all()
         torch.testing.assert_close(gradients[name], parameter.grad, atol=1e-5, rtol=1e-4)
+    with torch.no_grad():
+        assert model.eval()(input_ids=ids[:, :8]).past_key_values.get_seq_length() == 8

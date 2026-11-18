@@ -354,7 +354,7 @@ class Lfm3Model(Lfm3PreTrainedModel):
                 consecutive positions continuing from the cache.
             past_key_values: Optional generation cache, updated in place.
             inputs_embeds: Tensor of shape [batch, sequence, hidden].
-            use_cache: Whether to create and return a generation cache.
+            use_cache: Whether to create and return a generation cache. Training mode creates none.
             cu_seq_lens_q: Optional int32 Tensor of shape [documents + 1] with the packed-document
                 boundaries of the flattened [batch * sequence] tokens. Attention and
                 convolution then stay inside each document, ``attention_mask`` is not used
@@ -375,7 +375,9 @@ class Lfm3Model(Lfm3PreTrainedModel):
             raise ValueError("LFM3 packed inputs do not support `past_key_values`.")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        if use_cache and past_key_values is None and cu_seq_lens_q is None:
+        # Training builds no cache: whole-layer activation checkpointing replays each layer with the
+        # arguments of the forward, and a cache in them would be appended to a second time.
+        if use_cache and past_key_values is None and cu_seq_lens_q is None and not self.training:
             past_key_values = DynamicCache(config=self.config)
         if position_ids is None:
             seen = past_key_values.get_seq_length() if past_key_values is not None else 0

@@ -23,7 +23,7 @@ class Lfm3ModelParallelizer(ModelParallelizer):
     """Checkpoint whole decoder layers, which recomputes the convolution layers in backward as well."""
 
     def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
-        """A decoder layer takes all its inputs as arguments; the parallelizer disables the generation cache."""
+        """A decoder layer takes all its inputs as arguments and the model builds no cache in training."""
         return True
 
 
