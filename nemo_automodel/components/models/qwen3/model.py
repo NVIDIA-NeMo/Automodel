@@ -87,6 +87,9 @@ class Qwen3Attention(HFQwen3Attention):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run Qwen3 attention over padded BSHD or packed THD states.
 
+        Q/K enter attention and the KV cache in the value projection's compute
+        dtype, including when FP32 norm weights promote their outputs under AMP.
+
         Args:
             hidden_states: Hidden states ``[B, S, H]`` or packed local states
                 ``[T, H]``. ``B`` is batch, ``S`` is sequence, ``T`` is local
@@ -113,9 +116,11 @@ class Qwen3Attention(HFQwen3Attention):
             key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-            # Keep FP32 RoPE arithmetic while restoring Q/K dtypes before attention.
+            # Keep FP32 RoPE arithmetic, then restore the projection compute dtype.
             cos, sin = position_embeddings[:2]
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states = query_states.to(value_states.dtype)
+            key_states = key_states.to(value_states.dtype)
             if past_key_values is not None:
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -165,6 +170,9 @@ class Qwen3Attention(HFQwen3Attention):
                 position_embeddings[1],
             )
 
+        # FP32 Q/K norm weights can promote their outputs under autocast.
+        query_states = query_states.to(value_states.dtype)
+        key_states = key_states.to(value_states.dtype)
         window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
         query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
             query_states,

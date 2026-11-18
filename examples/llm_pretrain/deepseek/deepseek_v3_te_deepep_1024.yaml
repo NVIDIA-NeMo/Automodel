@@ -81,11 +81,12 @@ rng:
   seed: 1234
   ranked: true
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   time: 01:00:00
   nodes: 128
   recipe_owner: akoumpa
   nproc_per_node: 8
   perf_testing:
-    schedule: weekly
+    schedule: nightly
     fake_balanced_gate: true

@@ -150,6 +150,7 @@ wandb:
   dir: result/wandb
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: huiyingl
   nodes: 1
@@ -160,3 +161,5 @@ ci:
     hf_device_map_auto: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+  perf_testing:
+    schedule: nightly

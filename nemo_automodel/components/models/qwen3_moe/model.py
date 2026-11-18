@@ -239,6 +239,7 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _uses_native_fa4: bool = True
     # Skip patch_hf_model_for_pp: this model's own forward already handles
     # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
     # owning stage; hidden states arrive in the input_ids slot) AND context
@@ -324,6 +325,42 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Compute logits while preserving packed document and padding metadata.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or [1, tokens] for
+                pre-packed THD input. Pipeline stages after the first receive
+                hidden states of shape [batch, sequence, hidden] in this slot.
+            position_ids: Optional document-local positions of shape
+                [batch, sequence], or [1, tokens] for THD input.
+            attention_mask: Optional tensor of shape [batch, sequence] holding
+                either a padding mask (nonzero at valid tokens) or packed
+                1-based document IDs with zero at padding, or a dense mask of
+                shape [batch, 1, sequence, sequence] for backends that accept one.
+            padding_mask: Optional boolean tensor of shape [batch, sequence],
+                true at padding. Native FA4 derives its valid-token mask from it
+                when attention_mask is None.
+            logits_to_keep: Number of trailing positions to project, or position
+                indices of shape [selected_tokens].
+            output_hidden_states: Whether to include final hidden states.
+            **attn_kwargs: Backend metadata. Native FA4 packing passes int64
+                packed_token_indices of shape [batch, sequence] (row-local token
+                indices, -1 at padding), int32 cu_seqlens of shape
+                [batch, max_documents + 1] (row-local offsets, -1 at unused
+                entries) and an integer max_seqlen. The model-entry hook flattens
+                them to indices of shape [tokens] into the flattened
+                [batch * sequence] axis and offsets of shape [documents + 1];
+                already flattened metadata passes through unchanged.
+
+        Returns:
+            CausalLMOutputWithPast whose logits have shape [batch, sequence,
+            vocab], or [1, tokens, vocab] for THD input, along the positions
+            selected by logits_to_keep. Pipeline stages without the LM head
+            return their hidden states of shape [batch, sequence, hidden] as
+            logits. When output_hidden_states is true, hidden_states holds the
+            final hidden states with the same leading axes and a trailing
+            hidden axis; otherwise it is None.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -331,6 +368,8 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if self.backend.attn == "fa4" and attention_mask is None and padding_mask is not None:
+            attention_mask = padding_mask.logical_not()
         if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
