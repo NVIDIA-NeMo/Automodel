@@ -860,7 +860,8 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages.
+        A schedule whose ``step()`` and ``eval()`` discard outputs by default.
+        Pass ``return_outputs=True`` to return merged outputs; read losses from ``losses``.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 
@@ -911,6 +912,7 @@ def build_pipeline_schedule(
         )
         schedule._load_csv(pp_schedule_csv)
 
+    schedule.step = functools.partial(schedule.step, return_outputs=False)
     return schedule
 
 
