@@ -25,7 +25,12 @@ from nemo_automodel.components.distributed.activation_checkpointing import apply
 from nemo_automodel.components.models.lfm3 import context_parallel
 from nemo_automodel.components.models.lfm3 import model as lfm3_model
 from nemo_automodel.components.models.lfm3.config import Lfm3Config
-from nemo_automodel.components.models.lfm3.context_parallel import _halo_sources, shard_documents
+from nemo_automodel.components.models.lfm3.context_parallel import (
+    DocumentHalo,
+    _halo_sources,
+    exchange_halo,
+    shard_documents,
+)
 from nemo_automodel.components.models.lfm3.model import Lfm3ForCausalLM
 
 # Document lengths of the two packed rows; each row ends with padding.
@@ -160,6 +165,7 @@ def _run_ranks(model, batch, size):
 def thread_ranks(monkeypatch):
     monkeypatch.setattr(context_parallel, "_transfer", _transfer_between_threads)
     monkeypatch.setattr(context_parallel.dist, "get_rank", lambda group: group.rank.value)
+    monkeypatch.setattr(context_parallel, "_join_group", lambda group, device: None)
 
 
 @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
@@ -322,6 +328,17 @@ def test_halo_comes_from_every_earlier_shard_a_document_spans():
     assert _halo_sources(lengths, 34, rank=4, limit=40) == [(2, 6), (3, 34)]
 
 
+def test_a_rank_with_nothing_to_exchange_joins_the_first_collective_of_its_group(monkeypatch):
+    # Documents of 9, 7, 8 and 8 tokens on four shards of 8: only ranks 0 and 1 exchange a halo.
+    group, joined = object(), []
+    monkeypatch.setattr(context_parallel.dist, "get_rank", lambda group: 2)
+    monkeypatch.setattr(context_parallel.dist, "all_reduce", lambda tensor, group: joined.append(group))
+    halo = DocumentHalo(group, (0, 8, 0, 0))
+    for _ in range(2):
+        assert exchange_halo(torch.zeros(1, 4, 8), halo, 6).shape == (1, 4, 0)
+    assert joined == [group]
+
+
 def test_unsupported_packed_inputs_are_rejected():
     model = _model()
     with pytest.raises(ValueError, match="FlashAttention backend"):
@@ -331,6 +348,8 @@ def test_unsupported_packed_inputs_are_rejected():
         model(**{name: value for name, value in _thd_batch().items() if name != "labels"})
     with pytest.raises(ValueError, match="one row per rank"):
         shard_documents(_Mesh(2, 0), None, _thd_batch())
+    with pytest.raises(ValueError, match="flex_attention"):
+        _packed_logits(_model("flex_attention"), _thd_batch())
     short = _thd_batch(ROWS[:1])
     short["seq_lens_padded"][0, 4] -= 1
     with pytest.raises(ValueError, match="add up to the sequence length"):

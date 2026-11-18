@@ -358,7 +358,8 @@ class Lfm3Model(Lfm3PreTrainedModel):
             cu_seq_lens_q: Optional int32 Tensor of shape [documents + 1] with the packed-document
                 boundaries of the flattened [batch * sequence] tokens. Attention and
                 convolution then stay inside each document, ``attention_mask`` is not used
-                and no generation cache is created; a supplied ``past_key_values`` is rejected.
+                and no generation cache is created; a supplied ``past_key_values`` and the
+                ``flex_attention`` backend are rejected.
             max_length_q: Length of the longest packed document.
             halo: Under context parallelism, how far the first local document reaches into
                 earlier ranks.
@@ -373,6 +374,12 @@ class Lfm3Model(Lfm3PreTrainedModel):
             raise ValueError("LFM3 takes THD batches through the sharder of `prepare_model_inputs_for_cp`.")
         if cu_seq_lens_q is not None and past_key_values is not None:
             raise ValueError("LFM3 packed inputs do not support `past_key_values`.")
+        if cu_seq_lens_q is not None and self.config._attn_implementation == "flex_attention":
+            # Transformers adds a tensor mask to the FlexAttention scores, so the Boolean document mask hides no key.
+            raise ValueError(
+                "LFM3 does not support `flex_attention` with packed inputs or context parallelism; "
+                "use `sdpa` or a FlashAttention backend."
+            )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         # Training builds no cache: whole-layer activation checkpointing replays each layer with the

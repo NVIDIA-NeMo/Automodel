@@ -23,6 +23,7 @@ convolution, the window for sliding attention, the whole document for full atten
 from __future__ import annotations
 
 import contextlib
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
@@ -81,6 +82,17 @@ def _halo_sources(lengths: tuple[int, ...], shard_length: int, rank: int, limit:
         sources.append((rank - len(sources) - 1, min(needed, shard_length)))
         needed -= shard_length
     return sources[::-1]
+
+
+@functools.cache
+def _join_group(group: dist.ProcessGroup, device: torch.device) -> None:
+    """Run one collective on the CP group, once per process.
+
+    A batch of point-to-point operations may be the first operation on a process group only if
+    every rank takes part in it, and a rank whose shard starts at a document boundary can have
+    nothing to send or receive.
+    """
+    dist.all_reduce(torch.zeros(1, device=device), group=group)
 
 
 def _transfer(
@@ -179,6 +191,7 @@ def exchange_halo(tensor: torch.Tensor, halo: DocumentHalo, limit: int | None = 
         to the ranks that own the tokens.
     """
     rank, shard_length = dist.get_rank(halo.group), tensor.shape[2]
+    _join_group(halo.group, tensor.device)
     receives = _halo_sources(halo.lengths, shard_length, rank, limit)
     sends = [
         (later, count)
