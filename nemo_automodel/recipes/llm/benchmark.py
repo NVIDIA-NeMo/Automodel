@@ -15,12 +15,14 @@
 import json
 import logging
 import pathlib
+from contextlib import nullcontext
 
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -28,6 +30,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
+from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
@@ -380,6 +383,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
+        reporter = DeferredStepReporter(device) if self.cfg.get("defer_step_metrics", False) else None
+        self._step_reporter = reporter
+        elapsed_steps = []
+
         # Main benchmarking loop
         for i in range(steps):
             self.step_scheduler.step = i
@@ -400,7 +407,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
-            with self.timers(iter_timer, log_level=1):
+            start = reporter.mark() if reporter is not None else None
+            with self.timers(iter_timer, log_level=1) if reporter is None else nullcontext():
                 # Gradient accumulation loop
                 num_label_tokens = 0
                 loss_buffer = []
@@ -417,7 +425,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     # Accumulate label tokens locally
                     num_label_tokens += (batch["labels"] != -100).sum().item()
 
-                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
+                    timer = (
+                        self.timers(f"forward_backward_{ga_step_idx}", log_level=2)
+                        if reporter is None
+                        else nullcontext()
+                    )
+                    with timer:
                         self._forward_backward_step(
                             ga_step_idx,
                             batch,
@@ -433,11 +446,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         prepare_after_first_microbatch()
 
                 # Optimizer step
-                with self.timers("optimizer", log_level=2):
+                with self.timers("optimizer", log_level=2) if reporter is None else nullcontext():
                     synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
+
+            end = reporter.mark() if reporter is not None else None
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
@@ -445,48 +460,70 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            # Synchronize num_label_tokens across DP ranks
-            num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
-            num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
-            num_label_tokens = num_label_tokens_tensor.item()
-
-            # Calculate loss - following exact train_ft.py:1059-1071 pattern
-            reporting_loss = torch.sum(torch.stack(loss_buffer))
-            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
-
-            if self.pp_enabled:
-                reporting_loss = reporting_loss.to(self.dist_env.device)
-                # Send loss to first rank if pp group rank is 0
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-                if self.dist_env.rank == src_rank:
-                    torch.distributed.send(reporting_loss, dst=0)
-                elif self.dist_env.is_main:
-                    torch.distributed.recv(reporting_loss, src=src_rank)
-
-            reporting_loss = reporting_loss.cpu().item()
-
-            if rank == 0:
-                print(f"num_label_tokens={num_label_tokens} | loss={reporting_loss:.4f}")
-                logger.info(
-                    f"Rank {rank} | Iteration {i} | num_label_tokens={num_label_tokens} | "
-                    f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
-                    f"loss={reporting_loss:.4f}"
+            if reporter is not None:
+                count = self._reduce_step_metrics(torch.tensor(num_label_tokens, dtype=torch.long))
+                loss = torch.stack(loss_buffer).sum()
+                if self.pp_enabled:
+                    loss = loss.float()
+                loss = self._reduce_step_metrics(loss, include_cp=True).float() / count
+                if self.pp_enabled:
+                    loss = self._broadcast_from_last_pp_stage(loss)
+                sample = MetricsSample(
+                    step=i,
+                    epoch=0,
+                    metrics={
+                        "loss": loss,
+                        "num_label_tokens": count,
+                        "max_memory_gib": torch.cuda.max_memory_allocated() / 1024**3,
+                    },
                 )
+                self._collect_moe_load_balance()
+                self._snapshot_moe_metrics(sample)
+                reporter.enqueue(sample, start=start, end=end, remote_log=True)
+                elapsed_steps.extend(self._emit_deferred_benchmark_metrics(reporter, peak_tflops, rank))
+            else:
+                # Synchronize num_label_tokens across DP ranks
+                num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
+                num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
+                num_label_tokens = num_label_tokens_tensor.item()
+
+                # Calculate loss - following exact train_ft.py:1059-1071 pattern
+                reporting_loss = torch.sum(torch.stack(loss_buffer))
+                reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+                reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
+
+                if self.pp_enabled:
+                    reporting_loss = reporting_loss.to(self.dist_env.device)
+                    # Send loss to first rank if pp group rank is 0
+                    src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+                    if self.dist_env.rank == src_rank:
+                        torch.distributed.send(reporting_loss, dst=0)
+                    elif self.dist_env.is_main:
+                        torch.distributed.recv(reporting_loss, src=src_rank)
+
+                reporting_loss = reporting_loss.cpu().item()
+
+                if rank == 0:
+                    print(f"num_label_tokens={num_label_tokens} | loss={reporting_loss:.4f}")
+                    logger.info(
+                        f"Rank {rank} | Iteration {i} | num_label_tokens={num_label_tokens} | "
+                        f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
+                        f"loss={reporting_loss:.4f}"
+                    )
+                    if self._wandb_enabled and self.wandb_run is not None:
+                        self.wandb_run.log({"loss": reporting_loss}, step=i)
+                    if self.trackio_logger is not None:
+                        self.trackio_logger.log_metrics({"loss": reporting_loss}, step=i)
+
+                # Collect and log MoE load balance metrics (inherited from train_ft)
+                self._collect_moe_load_balance()
                 if self._wandb_enabled and self.wandb_run is not None:
-                    self.wandb_run.log({"loss": reporting_loss}, step=i)
+                    self._log_moe_metrics(i, self.wandb_run.log)
                 if self.trackio_logger is not None:
-                    self.trackio_logger.log_metrics({"loss": reporting_loss}, step=i)
+                    self._log_moe_metrics(i, self.trackio_logger.log_metrics)
 
-            # Collect and log MoE load balance metrics (inherited from train_ft)
-            self._collect_moe_load_balance()
-            if self._wandb_enabled and self.wandb_run is not None:
-                self._log_moe_metrics(i, self.wandb_run.log)
-            if self.trackio_logger is not None:
-                self._log_moe_metrics(i, self.trackio_logger.log_metrics)
-
-            # Calculate and log MFU
-            self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
+                # Calculate and log MFU
+                self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
 
             # Stop nsys profiling if configured
             if i == nsys_end and rank in nsys_ranks:
@@ -495,11 +532,49 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             self._maybe_collect_garbage()
 
+        if reporter is not None:
+            elapsed_steps.extend(self._emit_deferred_benchmark_metrics(reporter, peak_tflops, rank, wait=True))
+            reporter.close()
+            self._step_reporter = None
+
         if self.partial_cuda_graph_manager is not None:
             self.partial_cuda_graph_manager.log_stats("benchmark")
 
         # Final summary
-        self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
+        if reporter is None:
+            self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
+        else:
+            self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank, elapsed_steps=elapsed_steps)
+
+    def _emit_deferred_benchmark_metrics(
+        self, reporter: DeferredStepReporter, peak_tflops: float, rank: int, *, wait: bool = False
+    ) -> list[float]:
+        elapsed_steps = []
+        for sample, _, elapsed in reporter.poll(wait=wait):
+            elapsed_steps.append(elapsed)
+            self._restore_moe_metrics(sample)
+            if rank != 0:
+                continue
+            mfu = calculate_mfu(self.tflops, self.dist_env.world_size, elapsed, reference_mfu=peak_tflops)
+            logger.info(
+                "Rank %d | Iteration %d | num_label_tokens=%d | Max Memory Allocated: %.2f GB | loss=%.4f",
+                rank,
+                sample.step,
+                sample.metrics["num_label_tokens"],
+                sample.metrics["max_memory_gib"],
+                sample.metrics["loss"],
+            )
+            logger.info("Max iter time: %.6f seconds", elapsed)
+            logger.info("MFU: %.6f%% | FLOPs scope: %s", mfu, self._bench_flops_scope)
+            if self._wandb_enabled and self.wandb_run is not None:
+                self.wandb_run.log({"loss": sample.metrics["loss"], "iteration": elapsed}, step=sample.step)
+                self._log_moe_metrics(sample.step, self.wandb_run.log)
+            if self.trackio_logger is not None:
+                self.trackio_logger.log_metrics(
+                    {"loss": sample.metrics["loss"], "iteration": elapsed}, step=sample.step
+                )
+                self._log_moe_metrics(sample.step, self.trackio_logger.log_metrics)
+        return elapsed_steps
 
     def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
         max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[
@@ -546,7 +621,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             barrier=True,
         )
 
-    def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank):
+    def _log_benchmark_summary(
+        self, steps, warmup_steps, peak_tflops, rank, *, elapsed_steps: list[float] | None = None
+    ):
         torch.distributed.barrier()
         if rank == 0:
             logger.info(f"{'=' * 60}")
@@ -559,6 +636,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         warmup_time = (
             self.timers._timers["iteration_warmup"].active_time() if "iteration_warmup" in self.timers._timers else 0
         )
+
+        if elapsed_steps:
+            warmup_time = sum(elapsed_steps[:warmup_steps])
+            iter_time = sum(elapsed_steps[warmup_steps:]) if warmup_steps < steps else sum(elapsed_steps)
 
         if rank == 0:
             logger.info(f"Total setup time: {setup_time:.2f} seconds")

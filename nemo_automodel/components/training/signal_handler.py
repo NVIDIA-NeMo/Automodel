@@ -24,13 +24,14 @@ import torch.distributed
 SignalLike = int | str | signal.Signals
 
 
-def get_device(local_rank: int | None = None) -> torch.device:
+def get_device(local_rank: int | None = None, *, group: torch.distributed.ProcessGroup | None = None) -> torch.device:
     """
     Get the appropriate torch device based on the distributed backend.
 
     Args:
         local_rank: The local rank, used to specify the CUDA device index for NCCL.
                     If None, uses the default CUDA device.
+        group: Process group whose backend determines the device.
 
     Returns:
         The torch.device ('cuda' for NCCL, 'cpu' for Gloo).
@@ -38,7 +39,7 @@ def get_device(local_rank: int | None = None) -> torch.device:
     Raises:
         RuntimeError: If the distributed backend is neither 'nccl' nor 'gloo'.
     """
-    backend = torch.distributed.get_backend()
+    backend = torch.distributed.get_backend(group) if group is not None else torch.distributed.get_backend()
     if backend == "nccl":
         if local_rank is None:
             device = torch.device("cuda")
@@ -77,7 +78,7 @@ def all_gather_item(
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return [item]
 
-    device = get_device(local_rank)
+    device = get_device(local_rank, group=group) if group is not None else get_device(local_rank)
 
     if group is not None:
         group_size = group.size()

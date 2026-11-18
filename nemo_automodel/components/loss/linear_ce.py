@@ -70,6 +70,7 @@ import torch.distributed as dist
 from packaging.version import Version
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.loss.token_normalization import normalize_token_loss
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
 try:
@@ -164,7 +165,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
         lm_weight: torch.Tensor,
-        num_label_tokens: int | None = None,
+        num_label_tokens: int | torch.Tensor | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
         loss_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -177,7 +178,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
             labels: Rank-local target token IDs with shape ``[batch, sequence]``.
             lm_weight: LM-head weight with global shape ``[vocab, hidden]``.
                 It may be a regular tensor or an FSDP-sharded DTensor.
-            num_label_tokens: Global number of non-padding target tokens used
+            num_label_tokens: Global count of non-padding targets as an integer or a device scalar used
                 to normalize a sum-reduced loss.
             grad_reduce_group: Group that contributes independent loss shards
                 when ``lm_weight`` is a sharded DTensor.
@@ -258,7 +259,5 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
         if num_label_tokens is not None:
             if self.reduction != "sum":
                 raise ValueError("num_label_tokens is only supported when reduction is 'sum'")
-            if num_label_tokens == 0:
-                return loss * 0.0
-            loss = loss / num_label_tokens
+            loss = normalize_token_loss(loss, num_label_tokens)
         return loss
