@@ -334,7 +334,11 @@ def test_bf16_fused_expert_master_is_stored_3d_and_updated_as_rows():
 def test_backward_leaves_no_cyclic_garbage():
     net, opt = _build()
     _backward(net)
-    gc.collect()
+    # Garbage left by earlier tests can take several collections to drain: a finalizer run by one
+    # collection may drop the last reference to another cycle (e.g. Dynamo tracing state of a
+    # torch.compile test on PyTorch 2.15). Measure only cycles this backward creates.
+    while gc.collect():
+        pass
     gc.disable()
     # Keep what the collector finds so a failure names the leaked types.
     gc.set_debug(gc.DEBUG_SAVEALL)
