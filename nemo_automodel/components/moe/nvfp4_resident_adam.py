@@ -43,6 +43,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe import nvfp4_adam_cuda as sources
 from nemo_automodel.components.moe.quantized_experts import GroupedExpertsTENVFP4
+from nemo_automodel.shared.import_utils import safe_import_from
 
 if TYPE_CHECKING:
     from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
@@ -124,7 +125,14 @@ def _load_extension() -> ModuleType:
 
 
 def _kernels_cover(weight: "NVFP4Tensor") -> bool:
-    """Whether ``weight`` is quantized the way the requantization kernel does: 2D blocks, nearest, both operands."""
+    """Whether the requantization kernel writes ``weight`` the way its own quantizer does.
+
+    Args:
+        weight: NVFP4 weight of logical shape [output_features, input_features].
+
+    Returns:
+        True for 2D block scales, rounding to nearest, and both the row-wise and the column-wise operand.
+    """
     quantizer = weight._quantizer
     return (
         quantizer.with_2d_quantization
@@ -154,7 +162,9 @@ class _FusedAdamStep:
         """Create the hooks.
 
         Args:
-            weights: NVFP4 weights to step in the kernels.
+            weights: NVFP4 weights to step in the kernels, each of logical shape
+                [output_features, input_features]. The kernels rewrite the row-wise and the column-wise
+                operand of every weight in place from its FP32 master weight.
             extension: Built extension with ``adam_requantize``.
         """
         self._weight_ids = {id(weight) for weight in weights}
@@ -260,13 +270,13 @@ def enable_nvfp4_fused_adam_step(model_parts: list[nn.Module], optimizers: list[
             f"The NVFP4 Adam step expected one optimizer per model part, got {len(optimizers)} optimizers "
             f"for {len(model_parts)} parts"
         )
-    from transformer_engine.pytorch.optimizers import FusedAdam
-    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
+    _, fused_adam_cls = safe_import_from("transformer_engine.pytorch.optimizers", "FusedAdam")
+    _, nvfp4_tensor_cls = safe_import_from("transformer_engine.pytorch.tensor.nvfp4_tensor", "NVFP4Tensor")
 
-    steps: list[tuple[FusedAdam, list[NVFP4Tensor]]] = []
+    steps: list[tuple[torch.optim.Optimizer, list["NVFP4Tensor"]]] = []
     for modules, optimizer in zip(expert_modules, optimizers, strict=True):
         if (
-            not isinstance(optimizer, FusedAdam)
+            not isinstance(optimizer, fused_adam_cls)
             or not optimizer.master_weights
             or optimizer.capturable
             or optimizer.use_decoupled_grad
@@ -276,7 +286,7 @@ def enable_nvfp4_fused_adam_step(model_parts: list[nn.Module], optimizers: list[
             parameter
             for module in modules
             for parameter in module.parameters()
-            if isinstance(parameter, NVFP4Tensor) and _kernels_cover(parameter)
+            if isinstance(parameter, nvfp4_tensor_cls) and _kernels_cover(parameter)
         ]
         if weights:
             steps.append((optimizer, weights))

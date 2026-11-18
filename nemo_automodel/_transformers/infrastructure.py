@@ -79,6 +79,7 @@ from nemo_automodel.components.moe.quantized_experts import (
     packed_expert_parameters,
     select_nvfp4_expert_storage_format,
     validate_nvfp4_checkpoint_config,
+    validate_nvfp4_resident_experts,
     validate_packed_expert_topology,
 )
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
@@ -714,6 +715,13 @@ def apply_model_infrastructure(
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+    validate_nvfp4_resident_experts(
+        model,
+        world_size=get_world_size_safe(),
+        ep_size=mesh.ep_size,
+        pp_size=mesh.pp_size,
+        loads_base_checkpoint=bool(pretrained_model_name_or_path and load_base_model),
+    )
     # Experts that hold packed NVFP4 placeholders (te_nvfp4.resident_weights, or the PEFT conversion
     # above) are filled by the base load with the checkpoint packed expert tensors, unchanged.
     select_nvfp4_expert_storage_format(model)

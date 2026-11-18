@@ -358,7 +358,16 @@ void adam_requantize(const TensorList& grads, const TensorList& masters, const T
                   row_data.size() == count && row_scales.size() == count && col_data.size() == count &&
                   col_scales.size() == count && amax_rows.size() == count && amax_cols.size() == count,
               "nvfp4 adam: the tensor lists must be non-empty and have one entry per weight");
-  const c10::cuda::OptionalCUDAGuard guard(masters[0].device());
+  // Both kernels run on the device and stream of the first master weight: every buffer must live there.
+  const auto device = masters[0].device();
+  for (const TensorList* tensors : {&grads, &masters, &exp_avgs, &exp_avg_sqs, &row_data, &row_scales, &col_data,
+                                    &col_scales, &amax_rows, &amax_cols}) {
+    for (const torch::Tensor& tensor : *tensors) {
+      TORCH_CHECK(tensor.is_cuda() && tensor.device() == device, "nvfp4 adam: all buffers must be on ", device,
+                  ", got one on ", tensor.device());
+    }
+  }
+  const c10::cuda::OptionalCUDAGuard guard(device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   // The bias corrections of Transformer Engine's multi_tensor_adam_cuda.

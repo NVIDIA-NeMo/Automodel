@@ -473,6 +473,75 @@ def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
 _INFRA_MODULE = "nemo_automodel._transformers.infrastructure"
 
 
+def _nvfp4_resident_model() -> torch.nn.Module:
+    """A model with ``te_nvfp4.resident_weights`` experts, created without Transformer Engine."""
+    from nemo_automodel.components.moe.quantized_experts import GroupedExpertsTENVFP4
+
+    model = _DummyModel()
+    experts = object.__new__(GroupedExpertsTENVFP4)
+    torch.nn.Module.__init__(experts)
+    model.experts = experts
+    return model
+
+
+@pytest.mark.parametrize(("world_size", "ep_size", "pp_size"), [(1, 1, 1), (2, 2, 1), (4, 2, 2)])
+def test_nvfp4_resident_experts_accept_full_expert_parallelism(world_size: int, ep_size: int, pp_size: int) -> None:
+    from nemo_automodel.components.moe.quantized_experts import validate_nvfp4_resident_experts
+
+    validate_nvfp4_resident_experts(
+        _nvfp4_resident_model(), world_size=world_size, ep_size=ep_size, pp_size=pp_size, loads_base_checkpoint=True
+    )
+
+
+@pytest.mark.parametrize(("ep_size", "match"), [(2, "expert-shard"), (1, "ep_size == 1")])
+def test_nvfp4_resident_experts_reject_layouts_that_shard_them(ep_size: int, match: str) -> None:
+    from nemo_automodel.components.moe.quantized_experts import validate_nvfp4_resident_experts
+
+    with pytest.raises(ValueError, match=match):
+        validate_nvfp4_resident_experts(
+            _nvfp4_resident_model(), world_size=4, ep_size=ep_size, pp_size=1, loads_base_checkpoint=True
+        )
+    # Experts with floating-point weights keep every layout.
+    validate_nvfp4_resident_experts(_DummyModel(), world_size=4, ep_size=ep_size, pp_size=1, loads_base_checkpoint=True)
+
+
+def test_nvfp4_resident_experts_need_the_base_checkpoint() -> None:
+    from nemo_automodel.components.moe.quantized_experts import validate_nvfp4_resident_experts
+
+    with pytest.raises(ValueError, match="load_base_model=True"):
+        validate_nvfp4_resident_experts(
+            _nvfp4_resident_model(), world_size=1, ep_size=1, pp_size=1, loads_base_checkpoint=False
+        )
+    validate_nvfp4_resident_experts(_DummyModel(), world_size=1, ep_size=1, pp_size=1, loads_base_checkpoint=False)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "load_base_model", "match"), [(4, True, "ep_size == 1"), (1, False, "load_base_model=True")]
+)
+def test_unsupported_nvfp4_resident_setups_stop_before_sharding(
+    world_size: int, load_base_model: bool, match: str
+) -> None:
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=world_size),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp") as shard,
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        with pytest.raises(ValueError, match=match):
+            apply_model_infrastructure(
+                model=_nvfp4_resident_model(),
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=load_base_model,
+                pretrained_model_name_or_path="test/model",
+            )
+
+    shard.assert_not_called()
+    MockCheckpointer.return_value.initialize_model_weights.assert_not_called()
+    MockCheckpointer.return_value.load_base_model.assert_not_called()
+
+
 def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wrapper=None):
     """Helper that invokes apply_model_infrastructure with heavy dependencies stubbed out."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
@@ -1241,6 +1310,7 @@ def test_checkpoint_load_order_includes_cp_sharding(dp_shard_size: int, cp_size:
     mesh = SimpleNamespace(
         tp_size=1,
         ep_size=1,
+        pp_size=1,
         cp_size=cp_size,
         dp_shard_size=dp_shard_size,
         process_group=None,

@@ -36,6 +36,14 @@ pytestmark = pytest.mark.skipif(
 EXPERTS, DIM, INTER, ROWS = 4, 64, 32, 128
 # Transformer Engine pads block scales to 128 rows: (64, 32) exercises the padded layout, (128, 64) the exact one.
 SHAPES = [(64, 32), (128, 64)]
+OPERANDS = (
+    "_rowwise_data",
+    "_rowwise_scale_inv",
+    "_columnwise_data",
+    "_columnwise_scale_inv",
+    "_amax_rowwise",
+    "_amax_columnwise",
+)
 
 
 def _backend(resident: bool = True, row_scaled_forward: bool = False) -> BackendConfig:
@@ -98,15 +106,60 @@ def _experts(dim: int = DIM, inter: int = INTER, row_scaled_forward: bool = Fals
 def _loaded(
     state: dict[str, torch.Tensor], dim: int = DIM, inter: int = INTER, row_scaled_forward: bool = False
 ) -> GroupedExpertsTENVFP4:
+    """Experts on the GPU that hold ``state``.
+
+    Args:
+        state: Packed weights as ``_packed_state`` returns them. For ``gate_and_up_projs`` and ``down_projs``:
+            ``<name>_nvfp4``, uint8 codes of shape [EXPERTS, output_features, input_features // 2];
+            ``<name>_scales``, E4M3 block scales of shape [EXPERTS, output_features, input_features // 16];
+            ``<name>_global``, FP32 row scales of shape [EXPERTS, output_features].
+        dim: Expert input width.
+        inter: Expert hidden width.
+        row_scaled_forward: Whether the activations are row-scaled four-over-six.
+
+    Returns:
+        The loaded experts.
+    """
     experts = _experts(dim, inter, row_scaled_forward)
     experts.load_state_dict({key: value.cuda() for key, value in state.items()}, strict=False)
     return experts
 
 
 def _gate_up(experts: GroupedExpertsTENVFP4, x: torch.Tensor) -> torch.Tensor:
+    """Run the gate/up projection under the NVFP4 recipe.
+
+    Args:
+        experts: Loaded experts.
+        x: Tensor of shape [EXPERTS * ROWS, dim], the ROWS rows of each expert in turn.
+
+    Returns:
+        Tensor of shape [EXPERTS * ROWS, 2 * inter].
+    """
     assert experts.te_nvfp4 is not None
     with te.autocast(enabled=True, recipe=experts.te_nvfp4.build_recipe()):
         return experts.gate_up_linear(x, [ROWS] * EXPERTS)
+
+
+def _operands(weight: torch.nn.Parameter) -> dict[str, torch.Tensor]:
+    """Copy the stored tensors of an NVFP4 weight.
+
+    Args:
+        weight: NVFP4 weight of logical shape [output_features, input_features].
+
+    Returns:
+        The row-wise and column-wise codes, block scales and outer scales by attribute name. Row-wise block
+        scales have shape [output_features, input_features // 16] and column-wise ones
+        [input_features, output_features // 16]: the padding Transformer Engine adds is cut off.
+    """
+    rows, cols = weight.shape
+    valid = {"_rowwise_scale_inv": (rows, cols // 16), "_columnwise_scale_inv": (cols, rows // 16)}
+    operands = {}
+    for name in OPERANDS:
+        tensor = getattr(weight, name)
+        if name in valid:
+            tensor = tensor[: valid[name][0], : valid[name][1]]
+        operands[name] = tensor.clone()
+    return operands
 
 
 def test_backend_option_selects_the_class(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -214,6 +267,59 @@ def test_training_step_updates_the_packed_weights_through_fp32_masters(row_scale
     for suffix in ("_nvfp4", "_scales", "_global"):
         key = "down_projs" + suffix
         assert torch.equal(exported[key].view(torch.uint8), state[key].view(torch.uint8))
+
+
+def test_a_checkpoint_loaded_again_keeps_the_weights_the_optimizer_holds() -> None:
+    experts = _loaded(_packed_state())
+    trainable = [param for param in experts.parameters() if param.requires_grad]
+    optimizer = FusedAdam(trainable, lr=1e-2, master_weights=True)
+    x = torch.randn(EXPERTS * ROWS, DIM, device="cuda", dtype=torch.bfloat16)
+
+    def step() -> None:
+        optimizer.zero_grad()
+        _gate_up(experts, x).float().pow(2).mean().backward()
+        optimizer.step()
+
+    step()
+    saved = {key: value.clone() for key, value in experts.state_dict().items()}
+    step()
+    assert any(not torch.equal(value, saved[key]) for key, value in experts.state_dict().items())
+
+    # A training checkpoint restored into the module the optimizer was created on, as a resumed run does.
+    experts.load_state_dict(saved, strict=False)
+
+    reloaded = [param for param in experts.parameters() if param.requires_grad]
+    assert len(reloaded) == len(trainable)
+    assert all(new is old for new, old in zip(reloaded, trainable, strict=True))
+    # The weights hold the checkpoint, the way experts created from it do.
+    rebuilt = _loaded({key: value.cpu() for key, value in saved.items()})
+    for linear, linear_rebuilt in (
+        (experts.gate_up_linear, rebuilt.gate_up_linear),
+        (experts.down_linear, rebuilt.down_linear),
+    ):
+        for index in range(EXPERTS):
+            actual = _operands(getattr(linear, f"weight{index}"))
+            expected = _operands(getattr(linear_rebuilt, f"weight{index}"))
+            for name in OPERANDS:
+                assert torch.equal(actual[name].view(torch.uint8), expected[name].view(torch.uint8)), name
+    # The next step still writes the model weights: they are the optimizer's master weights, re-quantized.
+    weight = experts.gate_up_linear.weight0
+    outer_scale = weight._amax_rowwise.clone()
+    step()
+    master = optimizer.state[weight]["master_param"]
+    assert not torch.equal(weight._amax_rowwise, outer_scale)
+    assert (weight.dequantize(dtype=torch.float32) - master).norm() / master.norm() < 0.15
+
+
+def test_forward_needs_loaded_weights() -> None:
+    experts = _experts()
+    x = torch.zeros(ROWS, DIM, device="cuda", dtype=torch.bfloat16)
+    token_mask = torch.ones(ROWS, dtype=torch.bool, device="cuda")
+    weights = torch.ones(ROWS, 2, device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros(ROWS, 2, dtype=torch.long, device="cuda")
+
+    with pytest.raises(RuntimeError, match="needs an NVFP4 checkpoint"):
+        experts(x, token_mask, weights, indices)
 
 
 def test_freezing_covers_the_weights_and_leaves_the_packed_storage() -> None:

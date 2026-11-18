@@ -60,6 +60,7 @@ from nemo_automodel.components.quantization.nvfp4 import (
     dequantize_nvfp4,
     quantize_nvfp4,
 )
+from nemo_automodel.shared.import_utils import safe_import_from
 
 if TYPE_CHECKING:
     from transformer_engine.pytorch import GroupedLinear
@@ -944,11 +945,11 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
         if not self._packed_storage_ready:
             super()._init_grouped_layers(num_local_experts)
             return
-        import transformer_engine.pytorch as te
+        _, quantized_model_init = safe_import_from("transformer_engine.pytorch", "quantized_model_init")
 
         assert self.te_nvfp4 is not None
         # Inside quantized_model_init the projections expect NVFP4Tensor weights and never quantize them.
-        with te.quantized_model_init(enabled=True, recipe=self.te_nvfp4.build_recipe()):
+        with quantized_model_init(enabled=True, recipe=self.te_nvfp4.build_recipe()):
             super()._init_grouped_layers(num_local_experts)
         for linear in (self.gate_up_linear, self.down_linear):
             for index in range(num_local_experts):
@@ -984,7 +985,11 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
 
     @torch.no_grad()
     def _build_te_weights(self) -> None:
-        """Turn the loaded packed parameters into the NVFP4 weights of the Transformer Engine projections."""
+        """Make the NVFP4 weights of the Transformer Engine projections hold the loaded packed parameters.
+
+        The first call creates the weight parameters. A later call, after a training checkpoint was loaded
+        into the packed parameters, writes into the same parameter objects, so an optimizer keeps them.
+        """
         for name, linear in self._projections():
             packed_name, scales_name, global_name = self.nvfp4_parameter_names(name)
             packed = getattr(self, packed_name).data
@@ -1007,9 +1012,16 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
                 quantizer = linear._get_weight_quantizers()[index]
                 quantizer.set_usage(rowwise=True, columnwise=True)
                 dequantized = dequantize_nvfp4(packed[index], scales[index], row_scale[index], self.config.dtype)
-                parameter = nn.Parameter(quantizer(dequantized), requires_grad=self._weights_trainable)
-                linear.register_parameter(f"weight{index}", parameter)
-                weight = getattr(linear, f"weight{index}")
+                quantized = quantizer(dequantized)
+                if f"weight{index}" in linear._parameters:
+                    weight = getattr(linear, f"weight{index}")
+                    weight._columnwise_data.copy_(quantized._columnwise_data)
+                    weight._columnwise_scale_inv.copy_(quantized._columnwise_scale_inv)
+                    weight._amax_columnwise.copy_(quantized._amax_columnwise)
+                else:
+                    parameter = nn.Parameter(quantized, requires_grad=self._weights_trainable)
+                    linear.register_parameter(f"weight{index}", parameter)
+                    weight = getattr(linear, f"weight{index}")
                 block_scales = scales[index].view(torch.uint8)
                 stored_scales = weight._rowwise_scale_inv
                 rows, blocks = block_scales.shape
@@ -1080,11 +1092,9 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
     ) -> torch.Tensor:
         """Run ``GroupedExpertsTE.forward`` on the NVFP4 weights; the arguments and result are the same."""
         if not self._te_weights_built:
-            # A load that never called load_state_dict on this module (every key written in place).
-            logger.warning(
-                "NVFP4 expert weights are built at the first forward; an optimizer created earlier does not hold them."
+            raise RuntimeError(
+                "The NVFP4 expert weights were not loaded: te_nvfp4.resident_weights needs an NVFP4 checkpoint."
             )
-            self._build_te_weights()
         return super().forward(x, token_mask, weights, indices, post_expert_output)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
@@ -1113,11 +1123,26 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        """Copy packed codes, block scales and row scales into the module storage and build the NVFP4 weights.
+        """Copy the packed expert weights into the module storage and make the NVFP4 weights hold them.
 
-        A checkpoint load that wrote through ``state_dict()`` hands back this very storage; row scales the
-        adapter completed in place may be absent from ``state_dict``. The weights are rebuilt as new
-        parameters, so the checkpoint must be loaded before the optimizer is created.
+        The first load creates the weight parameters, so it must come before the optimizer is created; later
+        loads keep them.
+
+        Args:
+            state_dict: Checkpoint mapping. Under ``prefix`` it holds this rank's experts of
+                ``gate_and_up_projs`` (gate rows before up rows) and ``down_projs``: ``<name>_nvfp4``, uint8
+                codes of shape [local_experts, output_features, input_features // 2] (two 4-bit codes per
+                byte); ``<name>_scales``, E4M3 block scales of shape
+                [local_experts, output_features, input_features // 16]; ``<name>_global``, FP32 row scales of
+                shape [local_experts, output_features]. An EP DTensor is read through its local shard. A
+                tensor that is the module storage itself, filled in place by the checkpoint reader, is not
+                copied and may be absent.
+            prefix: Key prefix of this module.
+            local_metadata: Unused.
+            strict: Unused; missing keys are reported through ``missing_keys``.
+            missing_keys: Receives the packed keys absent from ``state_dict``.
+            unexpected_keys: Unused.
+            error_msgs: Receives one message per tensor of another dtype or shape.
         """
         for name in self.packed_parameter_names():
             key = prefix + name
@@ -1170,6 +1195,37 @@ def select_nvfp4_expert_storage_format(model: nn.Module) -> None:
                 "set_expert_storage_format()."
             )
         set_storage_format("nvfp4")
+
+
+def validate_nvfp4_resident_experts(
+    model: nn.Module, *, world_size: int, ep_size: int, pp_size: int, loads_base_checkpoint: bool
+) -> None:
+    """Reject setups in which ``te_nvfp4.resident_weights`` experts cannot hold their checkpoint weights.
+
+    Args:
+        model: Model before distributed sharding.
+        world_size: Number of ranks.
+        ep_size: Expert-parallel size.
+        pp_size: Pipeline-parallel size.
+        loads_base_checkpoint: Whether the base checkpoint is loaded into the model.
+
+    Raises:
+        ValueError: If no base checkpoint fills the experts, or the layout would shard their packed
+            parameters (see ``validate_packed_expert_topology``).
+    """
+    if not any(isinstance(module, GroupedExpertsTENVFP4) for module in model.modules()):
+        return
+    if not loads_base_checkpoint:
+        raise ValueError(
+            "te_nvfp4.resident_weights holds the expert weights of an NVFP4 checkpoint: it needs a pretrained "
+            "checkpoint and load_base_model=True."
+        )
+    try:
+        validate_packed_expert_topology("nvfp4", world_size=world_size, ep_size=ep_size, pp_size=pp_size)
+    except ValueError as error:
+        raise ValueError(
+            f"te_nvfp4.resident_weights keeps the experts packed (expert_weight_format='nvfp4'). {error}"
+        ) from error
 
 
 def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:

@@ -451,14 +451,14 @@ class TENvfp4Config(TEQuantizationConfig):
         """Build the TE ``NVFP4BlockScaling`` recipe with these options; ``None`` without Transformer Engine."""
         if not HAVE_TE:
             return None
-        try:
-            from transformer_engine.common.recipe import NVFP4BlockScaling
-        except ImportError as e:  # TE too old for NVFP4 (added in v2.7)
+        # Transformer Engine has NVFP4 since v2.7.
+        available, recipe_cls = safe_import_from("transformer_engine.common.recipe", "NVFP4BlockScaling")
+        if not available:
             raise ImportError(
                 "te_nvfp4 requires transformer_engine.common.recipe.NVFP4BlockScaling "
                 "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
-            ) from e
-        return NVFP4BlockScaling(**self.recipe_kwargs())
+            )
+        return recipe_cls(**self.recipe_kwargs())
 
 
 @dataclass(kw_only=True)
