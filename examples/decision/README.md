@@ -115,6 +115,6 @@ Validation selects the published stage (`LOWEST_VAL`): highest accuracy, then lo
 starting checkpoint (step 0) is a saved, selectable stage; full fine-tuning selects among its trained stages (score
 the base with `--mode eval` for the before number). Each run writes `training.jsonl`, `validation.jsonl`, `selected.json`, and
 `metrics_{validation,test}.json` (with per-row probabilities). Stages record a fingerprint of the base checkpoint,
-and `init_from` and the export refuse a stage trained from a different base. The export removes
-`deciffusion_shared_context` from the exported configuration because these runs train single-question reads, not
-shared-context packing.
+and `init_from` and the export refuse a stage trained from a different base. The export copies the base
+configuration unchanged, including `deciffusion_shared_context`, which marks the checkpoint for decision reads when
+served.

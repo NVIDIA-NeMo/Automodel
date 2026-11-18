@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Code provenance: the merge follows the reference fine-tuning merge script (W += (alpha / r) * B @ A in fp32,
-# complete standalone checkpoint, shared-context flag removed). See serving_prompt.py for the provenance note.
+# complete standalone checkpoint). See serving_prompt.py for the provenance note.
 
 """Export a trained Deciffusion stage (merged LoRA adapter or full weights) as a complete, servable checkpoint."""
 
@@ -26,8 +26,6 @@ import shutil
 from pathlib import Path
 
 import safetensors.torch as _st
-
-from nemo_automodel.components.models.deciffusion.scorer import SHARED_CONTEXT_FLAG
 
 # Base-checkpoint files replaced by the export (weights, their index, caches and receipts of an earlier export).
 _NOT_COPIED = ("*.safetensors", "*.safetensors.index.json", ".cache", "merge-receipt.json", "export-receipt.json")
@@ -60,26 +58,6 @@ def checkpoint_fingerprint(checkpoint_dir: str | Path, *, chunk_size: int = 1 <<
             while block := handle.read(chunk_size):
                 digest.update(block)
     return digest.hexdigest()
-
-
-def strip_shared_context(checkpoint_dir: str | Path) -> bool:
-    """Remove ``deciffusion_shared_context`` from ``config.json``.
-
-    Fine-tuning here reads one question per sequence, never shared-context packing; with the flag left in place the
-    server's automatic packing would read the fine-tuned model in a mode it was not trained for.
-
-    Returns:
-        ``True`` when the flag was present and removed.
-    """
-    path = Path(checkpoint_dir) / "config.json"
-    if not path.exists():
-        return False
-    config = json.loads(path.read_text())
-    if SHARED_CONTEXT_FLAG not in config:
-        return False
-    del config[SHARED_CONTEXT_FLAG]
-    path.write_text(json.dumps(config, indent=2) + "\n")
-    return True
 
 
 def merge_lora_checkpoint(base_dir: str | Path, adapter_dir: str | Path, output_dir: str | Path) -> dict:
@@ -135,7 +113,6 @@ def merge_lora_checkpoint(base_dir: str | Path, adapter_dir: str | Path, output_
         str(output_dir / "model.safetensors"),
         metadata={"format": "pt"},
     )
-    strip_shared_context(output_dir)
     receipt = {
         "base": str(base_dir),
         "adapter": str(adapter_dir),
@@ -188,7 +165,6 @@ def export_full_checkpoint(base_dir: str | Path, weights_dir: str | Path, output
         str(output_dir / "model.safetensors"),
         metadata={"format": "pt"},
     )
-    strip_shared_context(output_dir)
     receipt = {"base": str(base_dir), "weights": str(weights_dir), "tensors": len(trained)}
     (output_dir / "export-receipt.json").write_text(json.dumps(receipt))
     return receipt

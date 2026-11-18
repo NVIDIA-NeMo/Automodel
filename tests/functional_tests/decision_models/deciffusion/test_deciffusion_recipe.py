@@ -75,7 +75,7 @@ def _tiny_checkpoint(root: Path, seed: int) -> None:
     model = AutoModel.from_config(AutoConfig.from_pretrained(root, trust_remote_code=True), trust_remote_code=True)
     model.save_pretrained(root, safe_serialization=True)
     saved = json.loads((root / "config.json").read_text())
-    saved["deciffusion_shared_context"] = True  # keep the serving flag the export must remove
+    saved["deciffusion_shared_context"] = True  # serving flag the export must keep
     (root / "config.json").write_text(json.dumps(saved, indent=2))
 
 
@@ -175,7 +175,7 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
         ],
         check=True,
     )
-    assert "deciffusion_shared_context" not in json.loads((out / "config.json").read_text())
+    assert json.loads((out / "config.json").read_text())["deciffusion_shared_context"] is True
     reference = _reference_probabilities(out, root / "data/test.jsonl", torch.device("cuda", 0))
     assert reference.keys() == native.keys()
     for key, probabilities in native.items():

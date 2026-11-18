@@ -28,7 +28,6 @@ from nemo_automodel.components.models.deciffusion.export import (
     checkpoint_fingerprint,
     export_full_checkpoint,
     merge_lora_checkpoint,
-    strip_shared_context,
 )
 from nemo_automodel.components.models.deciffusion.scorer import (
     full_finetune_trainable,
@@ -148,7 +147,7 @@ def _write_adapter(root, rank=2, alpha=4, **extra):
     return a, b
 
 
-def test_lora_merge_reproduces_the_adapted_linear_and_strips_shared_context(tmp_path):
+def test_lora_merge_reproduces_the_adapted_linear_and_keeps_the_base_config(tmp_path):
     base = _write_base(tmp_path / "base")
     a, b = _write_adapter(tmp_path / "adapter")
     receipt = merge_lora_checkpoint(tmp_path / "base", tmp_path / "adapter", tmp_path / "out")
@@ -158,7 +157,9 @@ def test_lora_merge_reproduces_the_adapted_linear_and_strips_shared_context(tmp_
     torch.testing.assert_close(merged[name], expected, atol=0, rtol=0)
     torch.testing.assert_close(merged["diffusion_head.weight"], base["diffusion_head.weight"], atol=0, rtol=0)
     assert receipt["lora_modules"] == 1 and receipt["scale"] == 2.0
-    assert "deciffusion_shared_context" not in json.loads((tmp_path / "out/config.json").read_text())
+    assert json.loads((tmp_path / "out/config.json").read_text()) == json.loads(
+        (tmp_path / "base/config.json").read_text()
+    )
     assert (tmp_path / "out/tokenizer.json").exists()
     # The merged linear computes what the adapted linear computed: x W^T + scale * x A^T B^T.
     x = torch.randn(5, HIDDEN)
@@ -236,7 +237,7 @@ def test_full_export_casts_to_base_dtypes_and_rejects_mismatched_tensors(tmp_pat
     for name, tensor in trained.items():
         assert out[name].dtype == torch.bfloat16
         torch.testing.assert_close(out[name], tensor.to(torch.bfloat16), atol=0, rtol=0)
-    assert not strip_shared_context(tmp_path / "out")  # already removed by the export
+    assert json.loads((tmp_path / "out/config.json").read_text())["deciffusion_shared_context"] is True
     save_file({"diffusion_head.weight": torch.zeros(VOCAB, HIDDEN)}, str(trained_dir / "model.safetensors"))
     with pytest.raises(ValueError, match="do not match"):
         export_full_checkpoint(tmp_path / "base", trained_dir, tmp_path / "out2")

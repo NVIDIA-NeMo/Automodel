@@ -18,8 +18,8 @@
       --stage runs/support/lora/LOWEST_VAL --output exports/support_lora
 
 LoRA stages are merged into the base weights (W += alpha / r * B @ A, in fp32); full fine-tuning stages are written
-from their consolidated weights in the base dtypes. The shared-context flag is removed from the exported config
-because these runs train one question per read. The stage must have been trained on this exact base.
+from their consolidated weights in the base dtypes. The base configuration is copied unchanged. The stage must have
+been trained on this exact base.
 """
 
 import argparse

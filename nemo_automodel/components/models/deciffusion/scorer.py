@@ -22,7 +22,6 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-SHARED_CONTEXT_FLAG = "deciffusion_shared_context"
 ARCHITECTURE = "NemotronLabsDiffusionModel"
 FULL_FINETUNE_PREFIXES = ("encoder.layers.", "encoder.norm.")
 _WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module.", "_orig_mod.")
