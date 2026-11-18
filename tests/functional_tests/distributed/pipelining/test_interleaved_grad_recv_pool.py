@@ -28,14 +28,24 @@ from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import install_interleaved_recv_pool
-
-# The implementation keeps native buffers on the older prepare-infra API.
-# Remove this gate when interleaved pooling supports that allocation layout.
-pytestmark = pytest.mark.skipif(
-    not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")),
-    reason="Interleaved pooling requires PyTorch per-direction stage setup",
+from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
+    _native_recv_buffers_are_just_in_time,
+    install_interleaved_recv_pool,
 )
+
+# The implementation keeps native buffers on the older prepare-infra API, and on
+# PyTorch 2.15, which allocates each receive buffer just in time.
+# Remove the first gate when interleaved pooling supports that allocation layout.
+pytestmark = [
+    pytest.mark.skipif(
+        not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")),
+        reason="Interleaved pooling requires PyTorch per-direction stage setup",
+    ),
+    pytest.mark.skipif(
+        _native_recv_buffers_are_just_in_time(),
+        reason="PyTorch allocates receive buffers just in time, so the interleaved recv pool does not install",
+    ),
+]
 
 
 class _Block(nn.Module):
