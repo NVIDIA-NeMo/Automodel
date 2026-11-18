@@ -106,19 +106,25 @@ Every position in the batch is an anchor: one mask token per depth is appended
 after it, and a LoRA adapter that is active only on the mask tokens learns to
 draft the next tokens from them. All other tokens use the frozen base weights,
 so the model's own next-token distribution is unchanged and the drafts verify
-losslessly against it. The mask tokens' hidden states feed the same MTP loss
-and `val_mtp_tau_sim` metric as a native MTP head above.
+losslessly against it. A small sampler MLP (Sec. 2.3) rides along with the
+LoRA adapter, refining each draft from its hidden state and the previous
+depth's predicted token. The mask tokens' hidden states feed the same MTP
+loss and `val_mtp_tau_sim` metric as a native MTP head above.
 
 `mtp.distillation_mode: soft` distills every depth toward the frozen base
 model's own distribution, which is the actual verifier at decode time and a stable
 target throughout training since the base model never changes:
 
 ```bash
-automodel examples/llm_finetune/mtp_finetune/qwen3_0p6b_gated_lora_mtp.yaml --nproc-per-node 8
+automodel examples/llm_finetune/mtp_finetune/qwen3_0p6b_gated_lora_mtp.yaml --nproc-per-node 1
 ```
 
 The dense layout multiplies the sequence length by `1 + len(mask_token_ids)`
 and needs an attention backend that accepts a custom mask (`flex_attention`,
 preferred at scale, `sdpa`, or `eager`). It supports FSDP2/HSDP and DDP, but
-not yet tensor, context, or pipeline parallelism, packed sequences, DoRA, or
-LoRA on MoE experts.
+not yet tensor, context, or pipeline parallelism, packed sequences, DoRA,
+LoRA on MoE experts, or (with the sampler attached) multi-GPU.
+
+The mask-token ids are just reserved, unused rows of the base embedding
+table -- no resizing. `setup()` randomizes them once and freezes them, so
+only the LoRA adapter and sampler train.
