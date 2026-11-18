@@ -23,7 +23,7 @@ from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.models.common.logits import (
-    compute_lm_head_logits,
+    LogitsProcessor,
     fp32_linear_forward,
     head_compute_dtype,
 )
@@ -63,7 +63,7 @@ def _linear_cross_entropy(
     labels: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype | None,
-    projection_dtype: torch.dtype | None,
+    processor: LogitsProcessor,
 ) -> torch.Tensor:
     """Project one token chunk and compute CE.
 
@@ -73,17 +73,12 @@ def _linear_cross_entropy(
         labels: Target indices shaped [chunk_tokens].
         ignore_index: Ignored target value.
         logits_dtype: Optional model-owned output dtype after projection.
-        projection_dtype: ``torch.float32`` writes FP32 logits from ``weight.dtype``
-            operands, matching a head configured for FP32 logits; None projects in
-            ``weight.dtype``.
+        processor: LM-head projection shared by all chunks.
 
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    if projection_dtype == torch.float32:
-        logits = compute_lm_head_logits(weight, hidden).logits
-    else:
-        logits = F.linear(hidden.to(weight.dtype), weight)
+    logits = processor(weight, hidden)
     if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:
         logits = logits.to(logits_dtype)
         # Materialize the model-owned rounding boundary: Inductor otherwise
@@ -105,9 +100,9 @@ class _ChunkedLinearCE(torch.autograd.Function):
         chunk_len: int,
         ignore_index: int,
         logits_dtype: torch.dtype | None,
-        projection_dtype: torch.dtype | None,
+        processor: LogitsProcessor,
         compute_loss: Callable[
-            [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, torch.dtype | None], torch.Tensor
+            [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, LogitsProcessor], torch.Tensor
         ],
     ) -> torch.Tensor:
         """Compute chunk losses without retaining logits.
@@ -120,7 +115,7 @@ class _ChunkedLinearCE(torch.autograd.Function):
             chunk_len: Maximum token rows per projection.
             ignore_index: Ignored target value.
             logits_dtype: Optional output cast matching the model projection.
-            projection_dtype: Projection GEMM output dtype, None or ``torch.float32``.
+            processor: LM-head projection reused during backward recomputation.
             compute_loss: Eager or compiled per-chunk loss.
 
         Returns:
@@ -130,14 +125,14 @@ class _ChunkedLinearCE(torch.autograd.Function):
         for start in range(0, hidden.shape[0], chunk_len):
             end = start + chunk_len
             losses[start:end] = compute_loss(
-                hidden[start:end], weight, labels[start:end], ignore_index, logits_dtype, projection_dtype
+                hidden[start:end], weight, labels[start:end], ignore_index, logits_dtype, processor
             )
         ctx.save_for_backward(hidden, weight, labels)
         ctx.chunk_len = chunk_len
         ctx.ignore_index = ignore_index
         ctx.compute_loss = compute_loss
         ctx.logits_dtype = logits_dtype
-        ctx.projection_dtype = projection_dtype
+        ctx.processor = processor
         return losses
 
     @staticmethod
@@ -175,7 +170,7 @@ class _ChunkedLinearCE(torch.autograd.Function):
                     labels[start:end],
                     ctx.ignore_index,
                     ctx.logits_dtype,
-                    ctx.projection_dtype,
+                    ctx.processor,
                 )
                 grads = torch.autograd.grad(loss, inputs, grad_out[start:end])
                 if need_hidden:
@@ -220,8 +215,10 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         self.compile = compile
         self.ignore_index = ignore_index
         self.reduction = reduction
+        self.logits_processor = LogitsProcessor()
+        self.fp32_logits_processor = LogitsProcessor(head_dtype=torch.float32)
         self._compute_loss: Callable[
-            [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, torch.dtype | None], torch.Tensor
+            [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, LogitsProcessor], torch.Tensor
         ] = torch.compile(_linear_cross_entropy, dynamic=True) if compile else _linear_cross_entropy
 
     @staticmethod
@@ -343,6 +340,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             raise ValueError("loss_weights.shape must match labels.shape")
         if projection_dtype not in (None, torch.float32):
             raise ValueError(f"projection_dtype must be None or torch.float32; got {projection_dtype}.")
+        processor = self.fp32_logits_processor if projection_dtype == torch.float32 else self.logits_processor
         weight = self.materialize_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
         losses = _ChunkedLinearCE.apply(
             hidden_states.reshape(-1, hidden_states.shape[-1]),
@@ -351,7 +349,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             self.chunk_len,
             self.ignore_index,
             logits_dtype,
-            projection_dtype,
+            processor,
             self._compute_loss,
         ).reshape(labels.shape)
         if loss_weights is not None:

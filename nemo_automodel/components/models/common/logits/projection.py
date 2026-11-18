@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LM-head projection, FP32 output, and its training backward."""
+"""LM-head configuration and causal model output packaging."""
 
-import math
 import sys
 from collections.abc import Callable
 from functools import partial
@@ -22,8 +21,11 @@ from functools import partial
 import torch
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from nemo_automodel.components.models.common.logits.logits_processor import LogitsProcessor
+
+_fp32_processor = LogitsProcessor(head_dtype=torch.float32)
 
 
 def compute_lm_head_logits(
@@ -101,14 +103,8 @@ def compute_lm_head_logits(
                 sliced = hidden_states[slice_indices, :]
             else:
                 sliced = hidden_states[:, slice_indices, :]
-        if isinstance(lm_head, DTensor):
-            if bias is not None:
-                raise NotImplementedError("FP32 logits with tensor parallelism need a bias-free LM head.")
-            logits = _vocab_parallel_fp32_logits(sliced, lm_head)
-        elif isinstance(lm_head, torch.Tensor):
-            logits = _fp32_logits(sliced.to(lm_head.dtype), lm_head)
-            if bias is not None:
-                logits = logits + bias.float()
+        if isinstance(lm_head, torch.Tensor):
+            logits = _fp32_processor(lm_head, sliced, bias)
         else:
             logits = lm_head(sliced.to(head_compute_dtype(lm_head)))
     if is_thd and logits.dim() == 2:
@@ -121,89 +117,9 @@ def compute_lm_head_logits(
     return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
 
 
-def _fp32_logits_forward(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Project local hidden states using the vLLM FP32-output GEMM.
-
-    Args:
-        input: Tensor of shape [..., hidden] in the head's compute dtype.
-        weight: Tensor of shape [vocab, hidden] in the same dtype.
-
-    Returns:
-        FP32 logits of shape [..., vocab].
-    """
-    flat = input.reshape(-1, input.shape[-1])
-    with torch.autocast(device_type=flat.device.type, enabled=False):
-        if flat.is_cuda and flat.dtype in (torch.float16, torch.bfloat16):
-            logits = torch.mm(flat, weight.t(), out_dtype=torch.float32)
-        else:
-            logits = torch.nn.functional.linear(flat.float(), weight.float())
-    return logits.view(*input.shape[:-1], weight.shape[0])
-
-
-# PyTorch 2.10 has no derivative for aten::mm.dtype. Register it on our own
-# projection so the forward uses the same single GEMM during training and rollout.
-_fp32_logits = torch.library.custom_op("nemo_automodel::fp32_logits", _fp32_logits_forward, mutates_args=())
-_fp32_logits.register_fake(_fp32_logits_forward)
-
-
-def _save_projection_inputs(ctx, inputs, output):
-    ctx.save_for_backward(*inputs)
-
-
-def _fp32_logits_backward(ctx, grad_logits):
-    """Project [..., vocab] gradients back to [..., hidden] and [vocab, hidden]."""
-    input, weight = ctx.saved_tensors
-    grad = grad_logits.reshape(-1, weight.shape[0]).to(weight.dtype)
-    with torch.autocast(device_type=weight.device.type, enabled=False):
-        grad_input = (grad @ weight).view_as(input) if ctx.needs_input_grad[0] else None
-        grad_weight = grad.t() @ input.reshape(-1, input.shape[-1]) if ctx.needs_input_grad[1] else None
-    return grad_input, grad_weight
-
-
-_fp32_logits.register_autograd(_fp32_logits_backward, setup_context=_save_projection_inputs)
-
-
-def _vocab_parallel_fp32_logits(input: torch.Tensor, weight: DTensor) -> DTensor:
-    """Project through a column-parallel head whose weight is sharded over the vocabulary.
-
-    Args:
-        input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
-            A DTensor on ``weight``'s mesh with any placement is redistributed to
-            ``Replicate``; a regular tensor is taken as the replicated value.
-        weight: DTensor of global shape [vocab, hidden] with placements
-            ``(Shard(0),)`` on a 1-D tensor-parallel mesh; each rank holds a
-            [local_vocab, hidden] slice.
-
-    Returns:
-        FP32 DTensor of global shape [..., vocab] with placement ``Shard(-1)``;
-        each rank's local tensor is [..., local_vocab].
-    """
-    mesh = weight.device_mesh
-    if mesh.ndim != 1 or weight.placements != (Shard(0),):
-        raise NotImplementedError(
-            "FP32 logits support a vocabulary-sharded (column-parallel) LM head, whose weight has placements "
-            f"(Shard(0),) on a 1-D tensor-parallel mesh; got {weight.placements} on a {mesh.ndim}-D mesh."
-        )
-    if not isinstance(input, DTensor):
-        input = DTensor.from_local(input, mesh, [Replicate()], run_check=False)
-    input = input.redistribute(mesh, [Replicate()])
-    # Every rank holds a vocabulary slice of the weight, so its input gradient is a
-    # partial sum; ``Partial`` makes DTensor autograd reduce it, as it does for aten.mm.
-    local_logits = _fp32_logits(
-        input.to_local(grad_placements=[Partial()]).to(weight.dtype),
-        weight.to_local(grad_placements=[Shard(0)]),
-    )
-    # Pass the global shape so a vocabulary that the mesh does not divide evenly is kept exact.
-    shape = (*input.shape[:-1], weight.shape[0])
-    stride = tuple(math.prod(shape[dim + 1 :]) for dim in range(len(shape)))
-    return DTensor.from_local(
-        local_logits, mesh, [Shard(local_logits.ndim - 1)], run_check=False, shape=shape, stride=stride
-    )
-
-
 def fp32_linear_forward(head: nn.Linear, input: torch.Tensor) -> torch.Tensor:
     """Project with the head's current parameters so FSDP and tied weights are respected."""
-    return compute_lm_head_logits(head.weight, input, bias=head.bias).logits
+    return _fp32_processor(head.weight, input, head.bias)
 
 
 def enable_fp32_logits(

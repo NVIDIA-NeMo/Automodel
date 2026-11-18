@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.components.models.common.logits import (
+    LogitsProcessor,
     compute_lm_head_logits,
     enable_fp32_logits,
     head_compute_dtype,
@@ -54,6 +55,16 @@ def test_logits_keep_fp32_precision(device):
     assert bf16_error > 100 * fp32_error
     # Rounded BF16 logits upcast to FP32 would all be BF16-representable.
     assert (logits == logits.bfloat16().float()).float().mean() < 0.01
+
+
+def test_logits_processor_default_and_fp32_output():
+    hidden, weight, _ = _operands("cpu")
+    bias = weight[:, 0].contiguous()
+    native = LogitsProcessor()(weight, hidden, bias)
+    fp32 = LogitsProcessor(head_dtype=torch.float32)(weight, hidden, bias)
+
+    torch.testing.assert_close(native, F.linear(hidden, weight, bias), rtol=0, atol=0)
+    torch.testing.assert_close(fp32, F.linear(hidden.float(), weight.float()) + bias.float(), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="out_dtype GEMM requires CUDA or ROCm")
