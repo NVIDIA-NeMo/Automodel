@@ -113,6 +113,14 @@ def test_qwen3_packed_single_rank_autocast(tmp_path: Path, checkpointing: bool) 
             # error near zero is unstable across attention kernels and GPU architectures.
             relative_error = (parameter.grad - reference_gradient).norm() / reference_gradient.norm()
             assert relative_error < 0.03, (name, relative_error.item())
+            if reference_name == "model.embed_tokens.weight":
+                # Each row sums one token's input gradients. A whole-tensor norm dilutes an
+                # error at a few packed positions, such as a document boundary.
+                used = reference_gradient.norm(dim=1) > 0
+                assert not parameter.grad[~used].any(), name
+                row_norm = reference_gradient[used].norm(dim=1)
+                row_error = (parameter.grad - reference_gradient)[used].norm(dim=1) / row_norm
+                assert row_error.max() < 0.05, (name, row_error.max().item())
         original = model.model.layers[0].self_attn.q_norm.weight.detach().clone()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         optimizer.step()
