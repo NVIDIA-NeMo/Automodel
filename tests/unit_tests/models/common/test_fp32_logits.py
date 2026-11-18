@@ -23,8 +23,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsLinear,
     compute_lm_head_logits,
+    enable_fp32_logits,
     head_compute_dtype,
 )
 
@@ -116,7 +116,7 @@ def test_autocast_does_not_lower_logits():
 
 def test_fp32_head_backward_keeps_fp32_under_autocast():
     generator = torch.Generator().manual_seed(17)
-    head = Float32LogitsLinear(5, 7, bias=False, dtype=torch.float32)
+    head = enable_fp32_logits(nn.Linear(5, 7, bias=False, dtype=torch.float32))
     hidden = torch.randn(3, 5, generator=generator, requires_grad=True)
     upstream = torch.randn(3, 7, generator=generator)
     expected = torch.autograd.grad(head(hidden), (hidden, head.weight), upstream)
@@ -129,19 +129,26 @@ def test_fp32_head_backward_keeps_fp32_under_autocast():
 
 
 @pytest.mark.parametrize("bias", [False, True])
-def test_from_head_owns_the_same_parameters(bias):
+def test_plain_head_keeps_its_parameters_and_hooks(bias):
     head = nn.Linear(96, 320, bias=bias).eval()
 
-    fp32_head = Float32LogitsLinear.from_head(head)
+    weight, original_bias = head.weight, head.bias
+    keys = list(head.state_dict())
+    observed = []
+    head.register_forward_hook(lambda module, args, output: observed.append(output.dtype))
 
-    assert fp32_head.weight is head.weight
-    assert fp32_head.bias is head.bias
+    fp32_head = enable_fp32_logits(head)
+
+    assert fp32_head is head
+    assert fp32_head.weight is weight
+    assert fp32_head.bias is original_bias
     assert not fp32_head.training
-    assert list(fp32_head.state_dict()) == list(head.state_dict())
+    assert list(fp32_head.state_dict()) == keys
     hidden = torch.randn(3, 96, dtype=torch.bfloat16)
     torch.testing.assert_close(
         fp32_head(hidden), compute_lm_head_logits(head.weight, hidden, bias=head.bias).logits, rtol=0, atol=0
     )
+    assert observed == [torch.float32]
 
 
 def test_bias_is_added_in_fp32_and_receives_its_gradient():
@@ -160,9 +167,9 @@ def test_bias_is_added_in_fp32_and_receives_its_gradient():
 
 
 def test_fp32_logits_heads_are_returned_unchanged():
-    head = Float32LogitsLinear(96, 320, bias=False)
+    head = enable_fp32_logits(nn.Linear(96, 320, bias=False))
 
-    assert Float32LogitsLinear.from_head(head) is head
+    assert enable_fp32_logits(head) is head
 
 
 class _BackendLinear(nn.Module):
@@ -188,8 +195,8 @@ def test_linear_kernel_backend_heads_convert(monkeypatch):
     monkeypatch.setitem(sys.modules, "quack.linear", quack_linear)
 
     for head in (_BackendLinear(96, 320), _QuackLinear(96, 320, bias=True)):
-        fp32_head = Float32LogitsLinear.from_head(head)
-        assert type(fp32_head) is Float32LogitsLinear
+        fp32_head = enable_fp32_logits(head)
+        assert type(fp32_head) is nn.Linear
         assert fp32_head.weight is head.weight
         assert fp32_head.bias is (head.bias if isinstance(head.bias, nn.Parameter) else None)
 
@@ -199,7 +206,7 @@ def test_baichuan_head_keeps_its_normalized_projection():
 
     head = NormHead(8, 13)
     hidden = torch.randn(2, 8)
-    fp32_head = Float32LogitsLinear.from_head(head)
+    fp32_head = enable_fp32_logits(head)
 
     assert fp32_head.weight is head.weight
     torch.testing.assert_close(fp32_head(hidden), F.linear(hidden, F.normalize(head.weight)))
@@ -210,13 +217,13 @@ class _LinearSubclass(nn.Linear):
 
 
 @pytest.mark.parametrize("head", [_LinearSubclass(4, 8, bias=False), nn.Embedding(8, 4)])
-def test_from_head_rejects_heads_with_their_own_projection(head):
+def test_rejects_heads_with_their_own_projection(head):
     with pytest.raises(ValueError, match="linear kernel backend"):
-        Float32LogitsLinear.from_head(head)
+        enable_fp32_logits(head)
 
 
 def test_head_compute_dtype_follows_the_weight():
-    fp32_logits_head = Float32LogitsLinear.from_head(nn.Linear(4, 8, bias=False, dtype=torch.bfloat16))
+    fp32_logits_head = enable_fp32_logits(nn.Linear(4, 8, bias=False, dtype=torch.bfloat16))
 
     assert head_compute_dtype(fp32_logits_head) is torch.bfloat16
     assert head_compute_dtype(nn.Identity()) is None

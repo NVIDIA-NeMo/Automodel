@@ -53,10 +53,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import (
-    Float32LogitsLinear,
-    compute_lm_head_logits,
-)
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)
@@ -259,28 +256,6 @@ class DecoderLayer(nn.Module):
         return outputs
 
 
-def _normalized_weight(head: NormHead | Float32LogitsNormHead) -> torch.Tensor:
-    """Return the head weight with unit-norm rows, as Baichuan's head projects with.
-
-    Training normalizes on every call; evaluation normalizes the stored weight once,
-    in place, and then reuses it.
-
-    Args:
-        head: Baichuan head whose ``weight`` has shape [vocab, hidden].
-
-    Returns:
-        Tensor of shape [vocab, hidden] with unit-norm rows.
-    """
-    if head.training:
-        head.first_flag = True
-        return F.normalize(head.weight)
-    if head.first_flag:
-        head.first_flag = False
-        with torch.no_grad():
-            head.weight.copy_(F.normalize(head.weight))
-    return head.weight
-
-
 class NormHead(nn.Module):
     def __init__(self, hidden_size, vocab_size, bias=False):
         super().__init__()
@@ -288,33 +263,21 @@ class NormHead(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.first_flag = True
 
+    fp32_logits = False
+
     def forward(self, hidden_states):
-        return F.linear(hidden_states, _normalized_weight(self))
-
-    def to_fp32_logits(self) -> Float32LogitsNormHead:
-        """Return the FP32-logits head that owns this head's weight."""
-        head = Float32LogitsNormHead(self.weight.shape[1], self.weight.shape[0], bias=False, device="meta")
-        head.weight = self.weight
-        head.first_flag = self.first_flag
-        head.train(self.training)
-        return head
-
-
-class Float32LogitsNormHead(Float32LogitsLinear):
-    """``NormHead`` whose GEMM writes FP32 logits."""
-
-    first_flag: bool
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Project hidden states with the row-normalized weight into FP32 logits.
-
-        Args:
-            input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
-
-        Returns:
-            FP32 tensor of shape [..., vocab].
-        """
-        return compute_lm_head_logits(_normalized_weight(self), input).logits
+        if self.training:
+            self.first_flag = True
+            weight = F.normalize(self.weight)
+        else:
+            if self.first_flag:
+                self.first_flag = False
+                with torch.no_grad():
+                    self.weight.copy_(F.normalize(self.weight))
+            weight = self.weight
+        if self.fp32_logits:
+            return compute_lm_head_logits(weight, hidden_states).logits
+        return F.linear(hidden_states, weight)
 
 
 # ---------------------------------------------------------------------------

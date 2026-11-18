@@ -36,8 +36,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsLinear,
     cast_model_to_dtype,
+    enable_fp32_logits,
     generation_config_from_model_config,
 )
 from nemo_automodel.components.models.flint.config import FlintConfig
@@ -201,7 +201,9 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         )
         self.cp_mesh: DeviceMesh | None = None
         self.model = FlintModel(config, self.backend)
-        self.lm_head = Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
+        self.lm_head = enable_fp32_logits(
+            nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
+        )
         # Seeded from the model config like PreTrainedModel does for generating
         # models, so bos/eos/pad are set; the loader then restores the checkpoint's
         # generation_config.json and the consolidated export writes it back out.
@@ -385,7 +387,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             )
         self.model.embed_tokens = value
 
-    def get_output_embeddings(self) -> Float32LogitsLinear:
+    def get_output_embeddings(self) -> nn.Linear:
         """Return the separate FP32 vocabulary projection module.
 
         Returns:
@@ -398,7 +400,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
 
         Args:
             value: Bias-free linear module with FP32 weight [vocab, hidden]; it is
-                installed as a ``Float32LogitsLinear`` owning the same weight.
+                configured to write FP32 logits.
         """
         if (
             value.weight.shape != (self.config.vocab_size, self.config.hidden_size)
@@ -416,7 +418,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             raise ValueError(
                 "Flint output embeddings require an untied, bias-free FP32 linear module with fixed vocabulary"
             )
-        self.lm_head = Float32LogitsLinear.from_head(value)
+        self.lm_head = enable_fp32_logits(value)
 
     def resize_token_embeddings(
         self,

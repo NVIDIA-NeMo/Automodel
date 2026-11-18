@@ -65,10 +65,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsLinear,
     _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
+    enable_fp32_logits,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
@@ -638,7 +638,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             config, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
         )
         # DeepSeek-V4.1 keeps an FP32 head and returns its FP32 logits.
-        self.lm_head = Float32LogitsLinear(text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32)
+        self.lm_head = enable_fp32_logits(nn.Linear(text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32))
         self.moe_config = moe_config
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepseekV41StateDictAdapter(config, moe_config, self.backend, dtype=dtype)

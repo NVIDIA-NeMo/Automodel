@@ -23,8 +23,8 @@ from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsLinear,
     compute_lm_head_logits,
+    fp32_linear_forward,
     head_compute_dtype,
 )
 
@@ -74,7 +74,7 @@ def _linear_cross_entropy(
         ignore_index: Ignored target value.
         logits_dtype: Optional model-owned output dtype after projection.
         projection_dtype: ``torch.float32`` writes FP32 logits from ``weight.dtype``
-            operands, matching a ``Float32LogitsLinear`` head; None projects in
+            operands, matching a head configured for FP32 logits; None projects in
             ``weight.dtype``.
 
     Returns:
@@ -248,13 +248,17 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
                 )
         # FSDP dynamically subclasses the head but retains its forward method, which
         # defines the projection each chunk must reproduce.
+        forward = getattr(lm_head, "forward", None)
         if (
             not isinstance(lm_head, nn.Linear)
-            or type(lm_head).forward not in (nn.Linear.forward, Float32LogitsLinear.forward)
+            or (
+                getattr(forward, "__func__", None) is not nn.Linear.forward
+                and getattr(forward, "func", None) is not fp32_linear_forward
+            )
             or lm_head.bias is not None
         ):
             raise ValueError(
-                "ChunkedCrossEntropy requires a plain bias-free nn.Linear or Float32LogitsLinear output head; "
+                "ChunkedCrossEntropy requires a plain bias-free nn.Linear output head; "
                 f"got {type(lm_head).__name__}. Use MaskedCrossEntropy for transformed or biased heads"
             )
         return lm_head
@@ -314,7 +318,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
                 owning model. Projection uses lm_weight.dtype; mixed-dtype
                 hidden states are converted per chunk, never the full weight.
             projection_dtype: ``torch.float32`` writes FP32 logits from ``lm_weight.dtype``
-                operands, reproducing a ``Float32LogitsLinear`` head; None keeps the
+                operands, reproducing a head configured for FP32 logits; None keeps the
                 projection in ``lm_weight.dtype``. ``calculate_loss`` picks it from
                 the model's head.
 

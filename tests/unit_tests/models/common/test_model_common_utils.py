@@ -439,10 +439,10 @@ class TestComputeLmHeadLogits:
         torch.testing.assert_close(out.logits, lm_head(hidden.float()), rtol=0, atol=0)
 
     def test_fp32_logits_head_composes_with_slicing(self):
-        """A bf16 Float32LogitsLinear head writes fp32 logits for the kept positions (2D THD input)."""
-        from nemo_automodel.components.models.common.utils import Float32LogitsLinear
+        """A bf16 head configured for FP32 logits writes fp32 logits for the kept positions (2D THD input)."""
+        from nemo_automodel.components.models.common.utils import enable_fp32_logits
 
-        lm_head = Float32LogitsLinear.from_head(self._lm_head().to(torch.bfloat16))
+        lm_head = enable_fp32_logits(self._lm_head().to(torch.bfloat16))
         hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
         out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3)
         assert out.logits.shape == (3, self.VOCAB)

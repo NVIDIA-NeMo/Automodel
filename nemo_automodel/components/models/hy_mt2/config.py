@@ -74,7 +74,7 @@ class HyMT2Config(PretrainedConfig):
         attention_bias: bool = False,
         hidden_act: str = "silu",
         # FP32 upcast hints (mirroring HF config). ``enable_lm_head_fp32`` makes
-        # ``HyMT2ForCausalLM`` build a ``Float32LogitsLinear`` head (FP32 logits).
+        # ``HyMT2ForCausalLM`` configure the LM head to write FP32 logits.
         enable_lm_head_fp32: bool = True,
         enable_attention_fp32_softmax: bool = False,
         enable_moe_fp32_combine: bool = False,

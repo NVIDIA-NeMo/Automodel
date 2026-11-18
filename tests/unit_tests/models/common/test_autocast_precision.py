@@ -202,10 +202,10 @@ def test_long_position_rope_matches_fp32_under_autocast(device, family, fused):
 
 
 def test_fp32_logits_head_output_and_gradients_survive_autocast(device):
-    from nemo_automodel.components.models.common.utils import Float32LogitsLinear, compute_lm_head_logits
+    from nemo_automodel.components.models.common.utils import compute_lm_head_logits, enable_fp32_logits
 
     torch.manual_seed(42)
-    head = Float32LogitsLinear(64, 32, bias=False, device=device)
+    head = enable_fp32_logits(torch.nn.Linear(64, 32, bias=False, device=device))
     x = torch.randn(2, 4, 64, device=device, requires_grad=True)
     expected = compute_lm_head_logits(head, x).logits
     gradients = torch.autograd.grad(expected.square().sum(), (x, head.weight))

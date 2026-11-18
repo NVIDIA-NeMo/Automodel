@@ -263,7 +263,7 @@ Some models compute fp32 logits by design and return them without `logits_dtype`
 
 | Configuration | Status |
 | --- | --- |
-| NeMo AutoModel or Hugging Face model that calls its replaceable language-model head, including `force_hf` | Supported for PyTorch, Transformer Engine and quack linear heads, and native heads with a custom conversion. Models without an output head are rejected at setup. |
+| NeMo AutoModel or Hugging Face model that calls its replaceable language-model head, including `force_hf` | Supported for PyTorch, Transformer Engine and quack linear heads, and native heads that implement FP32 projection. Models without an output head are rejected at setup. |
 | FSDP2, including a tied input embedding and head | Supported. Use an outer FSDP `mp_policy.output_dtype` of `null` or `float32` to keep the FP32 logits at the model boundary. |
 | Tensor parallelism with a column-parallel head, with or without sequence parallelism | Supported for bias-free heads |
 | HSDP, context parallelism, and FSDP2 combined with tensor parallelism | Not yet validated |

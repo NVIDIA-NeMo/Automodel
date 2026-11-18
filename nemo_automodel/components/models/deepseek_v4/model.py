@@ -63,10 +63,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsLinear,
     _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
+    enable_fp32_logits,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
@@ -1278,7 +1278,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         # DeepSeek-V4 keeps an FP32 head and returns its FP32 logits.
-        self.lm_head = Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
+        self.lm_head = enable_fp32_logits(
+            nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,
@@ -1378,7 +1380,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            # The Float32LogitsLinear head writes FP32 logits.
+            # The vocabulary projection writes FP32 logits.
             output_meta = torch.empty(
                 microbatch_size, seq_len, self.config.vocab_size, device="meta", dtype=torch.float32
             )

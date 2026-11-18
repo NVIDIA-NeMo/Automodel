@@ -19,9 +19,10 @@ import os
 import sys
 import types
 import warnings
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Literal, Protocol
 
 import torch
@@ -1577,7 +1578,7 @@ def compute_lm_head_logits(
       dtype. The projection goes through the ``lm_head`` module (DTensor-aware
       under FSDP2) rather than ``F.linear`` so its FSDP hooks and DTensor
       redistribution run, and its output is returned uncast: a
-      ``Float32LogitsLinear`` head (``logits_dtype=float32``, or a head that is
+      head configured for FP32 logits (``logits_dtype=float32``, or a head that is
       FP32 by design) writes FP32 logits, any other head its compute dtype.
     - A bare weight tensor is projected in its compute dtype with FP32 logits.
       This path is used by callers that already own or have materialized the weight.
@@ -1714,61 +1715,38 @@ def _vocab_parallel_fp32_logits(input: torch.Tensor, weight: DTensor) -> DTensor
     )
 
 
-class Float32LogitsLinear(nn.Linear):
-    """LM head whose GEMM writes FP32 logits from operands in its weight's compute dtype.
+def fp32_linear_forward(head: nn.Linear, input: torch.Tensor) -> torch.Tensor:
+    """Project with the head's current parameters so FSDP and tied weights are respected."""
+    return compute_lm_head_logits(head.weight, input, bias=head.bias).logits
 
-    Models whose head is FP32 by design construct it directly; :meth:`from_head`
-    wraps another head's parameters for ``logits_dtype: float32``. Only the
-    projection's output dtype differs from ``nn.Linear``.
+
+def enable_fp32_logits(
+    head: nn.Module, *, forward: Callable[[nn.Linear, torch.Tensor], torch.Tensor] = fp32_linear_forward
+) -> nn.Module:
+    """Configure the head to write FP32 logits while retaining its parameters.
+
+    Native heads with a dedicated projection expose the ``fp32_logits`` switch.
+    Plain linears run ``forward(head, input)`` through their existing module hooks.
     """
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Project hidden states into FP32 logits.
-
-        Args:
-            input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
-
-        Returns:
-            FP32 tensor of shape [..., vocab], sharded over the vocabulary under TP.
-        """
-        return compute_lm_head_logits(self.weight, input, bias=self.bias).logits
-
-    @classmethod
-    def from_head(cls, head: nn.Module) -> "Float32LogitsLinear":
-        """Reuse the parameters and training mode of a supported output head.
-
-        Args:
-            head: Plain torch, Transformer Engine or quack linear, or a model-owned
-                head implementing ``to_fp32_logits()``.
-
-        Returns:
-            An FP32-logits head sharing the original weight and optional bias.
-
-        Raises:
-            ValueError: For a transformed head without a model-owned conversion.
-        """
-        if isinstance(head, Float32LogitsLinear):
-            return head
-        convert = getattr(head, "to_fp32_logits", None)
-        if callable(convert):
-            return convert()
-        # Exact types exclude subclasses that change the projection (LoRA, QAT).
+    if hasattr(head, "fp32_logits"):
+        # Baichuan normalizes its weight and Inkling2 computes in FP32 itself.
+        head.fp32_logits = True
+        return head
+    if type(head) is not nn.Linear:
+        # Backend linears may have extra state or an empty tensor for a disabled bias.
         if type(head) not in (
-            nn.Linear,
             getattr(sys.modules.get("transformer_engine.pytorch.module.linear"), "Linear", None),
             getattr(sys.modules.get("quack.linear"), "Linear", None),
         ):
-            raise ValueError(
-                "FP32 logits require a plain linear kernel backend or a head implementing to_fp32_logits(); "
-                f"got {type(head).__name__}."
-            )
-        fp32_head = cls(head.in_features, head.out_features, bias=False, device="meta")
-        fp32_head.weight = head.weight
-        # Transformer Engine keeps an empty, unregistered tensor for a disabled bias.
+            raise ValueError(f"FP32 logits require a plain linear kernel backend; got {type(head).__name__}.")
+        linear = nn.Linear(head.in_features, head.out_features, bias=False, device="meta")
+        linear.weight = head.weight
         if isinstance(head.bias, nn.Parameter):
-            fp32_head.bias = head.bias
-        fp32_head.train(head.training)
-        return fp32_head
+            linear.bias = head.bias
+        head = linear.train(head.training)
+    head.forward = partial(forward, head)
+    head.fp32_logits = True
+    return head
 
 
 def head_compute_dtype(head: nn.Module) -> torch.dtype | None:

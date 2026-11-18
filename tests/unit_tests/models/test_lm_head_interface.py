@@ -14,10 +14,8 @@
 
 """Every registered model class keeps the LM-head interface that FP32 logits rely on.
 
-``logits_dtype: float32`` replaces the head that ``get_output_embeddings()`` returns
-through ``set_output_embeddings()``. Each registered class with a vocabulary head is
-built on the meta device and must expose a head that ``Float32LogitsLinear.from_head``
-converts, owning the same weight, and a setter that installs it.
+Each registered model with a vocabulary head is built on the meta device.
+Enabling FP32 logits must preserve the weight returned by ``get_output_embeddings()``.
 """
 
 import importlib
@@ -34,7 +32,6 @@ from transformers import Glm4MoeLiteConfig, MiniMaxM2Config, Mistral3Config, Nem
 from nemo_automodel._transformers.infrastructure import _use_fp32_logits
 from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 from nemo_automodel.components.models.hy_mt2.config import HyMT2Config
 
 # Registered classes without a vocabulary head: embedding, decision and policy models.
@@ -174,5 +171,5 @@ def test_registered_lm_head_converts_to_fp32_logits(name, monkeypatch):
     _use_fp32_logits(model, torch.float32, pipelined=False)
 
     fp32_head = model.get_output_embeddings()
-    assert isinstance(fp32_head, Float32LogitsLinear)
+    assert fp32_head.fp32_logits
     assert fp32_head.weight is head.weight

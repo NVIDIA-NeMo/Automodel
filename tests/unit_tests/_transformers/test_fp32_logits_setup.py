@@ -25,7 +25,6 @@ from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.infrastructure import _use_fp32_logits
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 
 _VOCAB = 128
 
@@ -64,7 +63,7 @@ def test_from_config_installs_an_fp32_logits_head(config_cls, tied):
     model = _build(_config(config_cls, tied=tied), logits_dtype="float32")
 
     assert type(model).__name__ == type(baseline).__name__
-    assert isinstance(model.lm_head, Float32LogitsLinear)
+    assert model.lm_head.fp32_logits
     assert (model.lm_head.weight is model.get_input_embeddings().weight) is tied
     assert list(model.state_dict()) == list(baseline.state_dict())
     assert model.lm_head.weight.dtype == torch.bfloat16
@@ -83,7 +82,7 @@ def test_from_config_installs_an_fp32_logits_head(config_cls, tied):
 
 @pytest.mark.parametrize("tied", [False, True])
 def test_checkpoint_loads_into_the_fp32_logits_head(tmp_path, tied):
-    # Custom models initialize on the meta device: the head is swapped before the
+    # Custom models initialize on the meta device: the head is configured before the
     # checkpoint loads, so loading and re-tying must reach the FP32-logits head.
     torch.manual_seed(3)
     checkpoint = HFLlamaForCausalLM(_config(LlamaConfig, tied=tied)).to(torch.bfloat16)
@@ -93,7 +92,7 @@ def test_checkpoint_loads_into_the_fp32_logits_head(tmp_path, tied):
 
     model = _build(config, logits_dtype="float32", load_base_model=True)
 
-    assert isinstance(model.lm_head, Float32LogitsLinear)
+    assert model.lm_head.fp32_logits
     assert (model.lm_head.weight is model.get_input_embeddings().weight) is tied
     torch.testing.assert_close(model.lm_head.weight, checkpoint.lm_head.weight, rtol=0, atol=0)
     torch.testing.assert_close(
@@ -114,7 +113,7 @@ def test_logits_dtype_survives_the_build_retry():
         model = _build(_config(Qwen3Config, tied=False), logits_dtype="float32", sdpa_method=[SDPBackend.MATH])
 
     assert patch_attention.call_count == 1
-    assert isinstance(model.lm_head, Float32LogitsLinear)
+    assert model.lm_head.fp32_logits
     input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
     assert model(input_ids=input_ids).logits.dtype == torch.float32
 
@@ -151,7 +150,7 @@ def test_hugging_face_implementations_install_an_fp32_logits_head(config):
     )
 
     head = model.get_output_embeddings()
-    assert isinstance(head, Float32LogitsLinear)
+    assert head.fp32_logits
     input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
     output = model(input_ids=input_ids, output_hidden_states=True)
     reference = output.hidden_states[-1].double() @ head.weight.double().t()
@@ -193,10 +192,12 @@ class _TiedLM(nn.Module):
 def test_use_fp32_logits_installs_the_head_and_keeps_the_tie():
     model = _TiedLM()
 
+    original = model.lm_head
     _use_fp32_logits(model, "float32", pipelined=False)
     installed = model.lm_head
 
-    assert isinstance(installed, Float32LogitsLinear)
+    assert installed is original and type(installed) is nn.Linear
+    assert installed.fp32_logits
     assert model.lm_head.weight is model.embed.weight
     assert model(torch.tensor([[1, 2, 3]])).dtype == torch.float32
     _use_fp32_logits(model, "float32", pipelined=False)
@@ -216,12 +217,12 @@ def test_use_fp32_logits_rejects_models_without_a_head():
 
 
 def test_use_fp32_logits_rejects_a_setter_that_does_not_install_the_head():
-    class _IgnoringSetter(_TiedLM):
+    class _ReplacingSetter(_TiedLM):
         def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-            pass
+            self.lm_head = nn.Linear(96, 320, bias=False)
 
     with pytest.raises(RuntimeError, match="did not install"):
-        _use_fp32_logits(_IgnoringSetter(), torch.float32, pipelined=False)
+        _use_fp32_logits(_ReplacingSetter(), torch.float32, pipelined=False)
 
 
 def test_only_float32_logits_are_accepted():
@@ -235,3 +236,16 @@ def test_pipeline_parallelism_is_rejected():
     with pytest.raises(NotImplementedError, match="pipeline parallelism"):
         _use_fp32_logits(model, torch.float32, pipelined=True)
     assert type(model.lm_head) is torch.nn.Linear
+
+
+def test_quack_backend_override_preserves_configured_head():
+    from nemo_automodel._transformers.model_init import _apply_backend_module_overrides
+    from nemo_automodel.components.models.common.utils import BackendConfig, enable_fp32_logits
+
+    model = nn.Module()
+    head = enable_fp32_logits(nn.Linear(8, 16, dtype=torch.bfloat16))
+    model.lm_head = head
+    _apply_backend_module_overrides(model, BackendConfig(linear="quack"))
+
+    assert model.lm_head is head
+    assert head(torch.ones(1, 8, dtype=torch.bfloat16)).dtype == torch.float32

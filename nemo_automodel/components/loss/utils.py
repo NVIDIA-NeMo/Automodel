@@ -20,7 +20,6 @@ import torch.nn as nn
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 
 _DATASET_IGNORE_INDEX = -100
 
@@ -206,9 +205,8 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             loss_fn_kwargs["logits_dtype"] = kwargs.pop(
                 "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
             )
-            # Project like the model's head: a Float32LogitsLinear head writes FP32 logits.
             unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-            fp32_head = isinstance(_get_lm_head_module(unwrapped), Float32LogitsLinear)
+            fp32_head = getattr(_get_lm_head_module(unwrapped), "fp32_logits", False)
             loss_fn_kwargs["projection_dtype"] = torch.float32 if fp32_head else None
         loss_fn_kwargs.update(
             {

@@ -36,7 +36,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits, enable_fp32_logits
 
 pytestmark = pytest.mark.cpu_only
 
@@ -68,7 +68,7 @@ def _head(fp32_logits: bool, weight: torch.Tensor) -> nn.Linear:
     """Build a bias-free head owning a copy of ``weight``.
 
     Args:
-        fp32_logits: Return a ``Float32LogitsLinear`` instead of an ``nn.Linear``.
+        fp32_logits: Configure the linear head for FP32 logits.
         weight: Tensor of shape [vocab, hidden]; its dtype becomes the parameter dtype.
 
     Returns:
@@ -77,7 +77,7 @@ def _head(fp32_logits: bool, weight: torch.Tensor) -> nn.Linear:
     head = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype)
     with torch.no_grad():
         head.weight.copy_(weight)
-    return Float32LogitsLinear.from_head(head) if fp32_logits else head
+    return enable_fp32_logits(head) if fp32_logits else head
 
 
 def _check_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:

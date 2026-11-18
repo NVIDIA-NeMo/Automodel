@@ -104,10 +104,16 @@ def test_output_projection_runs_module_hooks_and_preserves_fp32(dtype: torch.dty
     torch.testing.assert_close(output.logits[..., :37], expected[..., :37], rtol=0, atol=0)
 
 
-def test_bf16_head_preserves_fp32_projection_and_gradients() -> None:
+@pytest.mark.parametrize("replace_head", [False, True])
+def test_bf16_head_preserves_fp32_projection_and_gradients(replace_head: bool) -> None:
     model = Inkling2ForCausalLM(tiny_config(dtype="bfloat16"))
     head = model.get_output_embeddings()
     assert head is not None
+    if replace_head:
+        replacement = torch.nn.Linear(head.in_features, head.out_features, bias=False, dtype=torch.bfloat16)
+        model.set_output_embeddings(replacement)
+        head = model.get_output_embeddings()
+        assert head is replacement
     assert head.weight.dtype == torch.bfloat16
     generator = torch.Generator().manual_seed(13)
     hidden = torch.randn(2, 3, head.in_features, generator=generator, requires_grad=True)

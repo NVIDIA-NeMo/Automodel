@@ -20,7 +20,6 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 from nemo_automodel.components.models.hy_mt2.config import HyMT2Config
 from nemo_automodel.components.models.hy_mt2.model import (
     Block,
@@ -220,7 +219,7 @@ class TestHyMT2ForCausalLM:
         assert hasattr(model, "model")
         assert hasattr(model, "lm_head")
         assert model.config is config
-        assert isinstance(model.lm_head, Float32LogitsLinear)
+        assert model.lm_head.fp32_logits
 
     def test_enable_lm_head_fp32_default_false_without_config_flag(self, backend_config):
         # When the config does not declare the flag, default to False.
@@ -253,7 +252,7 @@ class TestHyMT2ForCausalLM:
             moe_router_use_sigmoid = True
 
         model = HyMT2ForCausalLM(_Cfg(), backend=backend_config)
-        assert not isinstance(model.lm_head, Float32LogitsLinear)
+        assert not getattr(model.lm_head, "fp32_logits", False)
 
     def test_promoted_fp32_head_weight_projects_in_fp32(self, config, backend_config, device):
         """An fp32 head weight (the ``distributed.moe.lm_head_precision: float32``

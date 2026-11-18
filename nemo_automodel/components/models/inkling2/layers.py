@@ -24,7 +24,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
@@ -149,8 +148,10 @@ class Inkling2MoE(MoE):
             cast(GroupedExperts, self.experts).expert_activation_grouped = activation
 
 
-class Inkling2LMHead(Float32LogitsLinear):
+class Inkling2LMHead(nn.Linear):
     """Bias-free output projection with FP32 arithmetic and ordinary FSDP hooks."""
+
+    fp32_logits = True
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Project through the module boundary so FSDP gathers its weight.

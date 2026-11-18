@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, enable_fp32_logits
 from nemo_automodel.components.models.muse_spark.audio import MuseSparkAudioEncoder
 from nemo_automodel.components.models.muse_spark.config import MuseSpark1xOmniConfig
 from nemo_automodel.components.models.muse_spark.configuration_muse_spark import MuseSparkConfig
@@ -344,7 +344,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         )
         # ``use_fp32_for_output`` returns FP32 logits (see get_pipeline_stage_metas).
         self.lm_head = (
-            Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+            enable_fp32_logits(nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype))
             if config.use_fp32_for_output
             else initialize_linear_module(
                 self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype

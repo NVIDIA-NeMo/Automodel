@@ -69,8 +69,8 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsLinear,
     cast_frozen_modules_to_compute_dtype,
+    enable_fp32_logits,
     prepare_frozen_parameters_for_sharding,
 )
 from nemo_automodel.components.models.kimi_k3.model import freeze_kimi_k3_indexer_params
@@ -455,11 +455,8 @@ def instantiate_infrastructure(
 def _use_fp32_logits(model: torch.nn.Module, logits_dtype: torch.dtype | str, *, pipelined: bool) -> None:
     """Make the model's LM head write FP32 logits, or reject a configuration that cannot.
 
-    The head that ``get_output_embeddings()`` returns is replaced through
-    ``set_output_embeddings()`` by :meth:`Float32LogitsLinear.from_head`, which keeps its
-    parameters, so parameter names, tied embeddings and checkpoints are unchanged. Every
-    forward that projects through that head module (the Hugging Face ``lm_head``
-    convention) then returns FP32 logits.
+    Configure the output embedding's projection while keeping its parameters and ties.
+    The embedding setter also updates models with a separate consumer of the head weight.
 
     Args:
         model: Unsharded model after PEFT and lower-precision conversion.
@@ -487,11 +484,10 @@ def _use_fp32_logits(model: torch.nn.Module, logits_dtype: torch.dtype | str, *,
             f"logits_dtype=float32 needs an LM head, but {type(model).__name__} has none "
             "(get_output_embeddings() is missing or returned None)."
         )
-    fp32_head = Float32LogitsLinear.from_head(head)
-    if fp32_head is not head:
-        model.set_output_embeddings(fp32_head)
-        if model.get_output_embeddings() is not fp32_head:
-            raise RuntimeError(f"{type(model).__name__}.set_output_embeddings() did not install the FP32-logits head.")
+    fp32_head = enable_fp32_logits(head)
+    model.set_output_embeddings(fp32_head)
+    if model.get_output_embeddings() is not fp32_head:
+        raise RuntimeError(f"{type(model).__name__}.set_output_embeddings() did not install the FP32-logits head.")
 
 
 def _uses_te_attention(model) -> bool:

@@ -32,7 +32,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import Float32LogitsLinear, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 
 _GEMMA4_ASSISTANT_MSG = "transformers.models.gemma4_assistant is not available."
@@ -65,8 +65,7 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
         head.
         """
 
-        # Set by ``Gemma4DrafterForCausalLM.set_output_embeddings``: project like a
-        # ``Float32LogitsLinear`` head, whose weight the HF forward passes in.
+        # Follow the projection of the head whose weight the HF forward passes in.
         fp32_logits: bool = False
 
         def forward(self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor) -> torch.Tensor:
@@ -119,7 +118,7 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
             """Replace the tied head; the full-vocabulary embedder projects like it."""
             self.lm_head = new_embeddings
             if isinstance(self.masked_embedding, Gemma4DrafterFullVocabEmbedder):
-                self.masked_embedding.fp32_logits = isinstance(new_embeddings, Float32LogitsLinear)
+                self.masked_embedding.fp32_logits = getattr(new_embeddings, "fp32_logits", False)
 
         @dataclass(frozen=True)
         class ModelCapabilities:
