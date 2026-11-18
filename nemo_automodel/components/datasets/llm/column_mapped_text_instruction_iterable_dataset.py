@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Union
 
 from datasets import IterableDataset as HFIterableDataset
-from datasets.distributed import split_dataset_by_node
+from datasets import concatenate_datasets
 from torch.utils.data import IterableDataset
 
 if TYPE_CHECKING:
@@ -32,6 +33,11 @@ from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_datas
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_rank_row(row: dict, row_idx: int, *, rank: int, world_size: int) -> bool:
+    """Return whether ``rank`` owns the ``row_idx``-th row of a file, keeping one row in ``world_size``."""
+    return row_idx % world_size == rank
 
 
 def _load_streaming_dataset(
@@ -309,11 +315,16 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
             self.dataset.set_epoch(epoch)
 
     def shard(self, num_shards: int, index: int):
-        if isinstance(self.dataset, HFIterableDataset):
-            # HF ``IterableDataset.shard`` splits by source file, so a stream with fewer files
-            # than ranks gives every example to rank 0 and fails on the others. Split by node
-            # instead, which falls back to per-example assignment in that case.
-            self.dataset = split_dataset_by_node(self.dataset, rank=index, world_size=num_shards)
+        if isinstance(self.dataset, HFIterableDataset) and self.dataset.num_shards < num_shards:
+            # HF ``IterableDataset.shard`` splits by source file, so with fewer files than ranks
+            # some ranks get no data. Give each rank every ``num_shards``-th row of each file instead.
+            # Rows are picked within each file and before any shuffle, so file order, epoch and
+            # dataloader workers cannot move a row to another rank.
+            keep_rank_rows = partial(_is_rank_row, rank=index, world_size=num_shards)
+            num_files = self.dataset.num_shards
+            self.dataset = concatenate_datasets(
+                [self.dataset.shard(num_files, i).filter(keep_rank_rows, with_indices=True) for i in range(num_files)]
+            )
         elif self.dataset is not None and callable(getattr(self.dataset, "shard", None)):
             self.dataset = self.dataset.shard(num_shards, index)
         return self

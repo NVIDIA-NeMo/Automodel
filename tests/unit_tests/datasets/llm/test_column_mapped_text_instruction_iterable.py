@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from itertools import combinations, islice
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ import pytest
 from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
     ColumnMappedTextInstructionIterableDataset,
 )
+from nemo_automodel.components.datasets.loader import ParallelAwareDataloader
 
 
 class _DummyTokenizer:  # noqa: D401
@@ -132,6 +134,63 @@ def test_iterable_dataset_shard_splits_single_file_stream_by_example(tmp_path: P
 
     assert all(len(rank_rows) == len(rows) // world_size for rank_rows in seen)
     assert sorted(q for rank_rows in seen for q in rank_rows) == sorted(row["q"] for row in rows)
+
+
+class _RowIdTokenizer:
+    """Tokenizer stub whose ids are the integer words of the text, so each sample names its row."""
+
+    pad_token = "<pad>"
+    pad_token_id = 0
+    eos_token_id = 1
+
+    def __call__(self, text: str, add_special_tokens: bool = True, padding=None, truncation=None, max_length=None):
+        return {"input_ids": [int(word) for word in text.split()]}
+
+
+@pytest.mark.parametrize("file_sizes", [[16] * 6, [16] * 4, [16], [10, 22]])
+def test_iterable_dataset_ranks_keep_disjoint_rows_across_repeats_and_restore(tmp_path: Path, file_sizes):
+    # Regression: each rank repeats the stream on its own, so ranks reach a new epoch at different
+    # steps. Every rank must own the same rows at every epoch, or two ranks train on the same rows.
+    # Run the native loader over several repeats and a save/restore for each simulated rank.
+    world_size = 3
+    paths, row_ids = [], []
+    for file_idx, size in enumerate(file_sizes):
+        ids = range(1000 + len(row_ids), 1000 + len(row_ids) + size)
+        path = tmp_path / f"part{file_idx}.jsonl"
+        _write_jsonl(path, [{"q": str(row_id), "a": str(row_id)} for row_id in ids])
+        paths.append(str(path))
+        row_ids.extend(ids)
+
+    def make_loader(rank: int) -> ParallelAwareDataloader:
+        ds = ColumnMappedTextInstructionIterableDataset(
+            path_or_dataset_id=paths,
+            column_mapping={"question": "q", "answer": "a"},
+            tokenizer=_RowIdTokenizer(),
+            answer_only_loss_mask=False,
+        )
+        return ParallelAwareDataloader(
+            ds,
+            dp_rank=rank,
+            dp_world_size=world_size,
+            batch_size=1,
+            collate_fn=lambda batch: batch[0]["input_ids"][0],
+            shuffle=True,
+            seed=4812,
+            shuffle_buffer_size=7,
+        )
+
+    seen = []
+    for rank in range(world_size):
+        loader = make_loader(rank)
+        rows = list(islice(loader, 32))
+        restored = make_loader(rank)
+        restored.load_state_dict(loader.state_dict())
+        rows += islice(restored, 32)
+        seen.append(set(rows))
+
+    for rank_a, rank_b in combinations(range(world_size), 2):
+        assert not seen[rank_a] & seen[rank_b], f"ranks {rank_a} and {rank_b} share rows"
+    assert set().union(*seen) == set(row_ids)
 
 
 def test_iterable_dataset_pad_token_fallback_with_eos(tmp_path: Path):
