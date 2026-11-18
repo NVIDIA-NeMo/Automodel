@@ -59,6 +59,17 @@ With context parallelism each GPU holds one contiguous shard of the row, 16,384 
 
 Packed THD rows work at any `cp_size`, with one row per GPU when `cp_size > 1`. Unpacked batches also run with `cp_size > 1`. Batched (non-THD) packing needs a FlashAttention backend.
 
+With `distributed.activation_checkpointing: true` whole decoder layers are recomputed in backward, the convolution layers included. A row of 131,072 tokens then trains at every `cp_size`, down to a whole row on one GPU. Measured with the packed recipe, activation checkpointing and 8 rows per step on 8x H100 80 GB:
+
+| `cp_size` | Tokens per GPU | Peak memory per GPU | Throughput |
+| --- | --- | --- | --- |
+| 1 | 131,072 | 39 GiB | 155K tokens/s |
+| 2 | 65,536 | 28 GiB | 152K tokens/s |
+| 4 | 32,768 | 19 GiB | 142K tokens/s |
+| 8 | 16,384 | 15 GiB | 128K tokens/s |
+
+The four layouts give the same training loss on the same rows: over 100 steps it differs by 2.5e-5 on average between `cp_size` values, as between two runs of one layout.
+
 ## Model Reference
 
 ### Model Architecture
