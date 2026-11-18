@@ -39,18 +39,21 @@ from torch import nn
 
 from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
 from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.stateful_wrappers import _has_expert_parallelism
 from nemo_automodel.components.distributed import model_parallelizer
 from nemo_automodel.components.distributed.model_parallelizer import parallelize_model
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4GroupedLinear
 from nemo_automodel.components.models.ernie5_5.config import Ernie5_5Config
 from nemo_automodel.components.models.ernie5_5.model import Ernie5_5_MoeForCausalLM
+from nemo_automodel.components.models.ernie5_5.moe import Ernie5_5MoE
 from nemo_automodel.components.models.ernie5_5.parallelization import PARALLELIZER
+from nemo_automodel.components.moe import layers as shared_moe_layers
 from tests.unit_tests.models.ernie5_5.conftest import checkpoint_style_config
 from tests.unit_tests.models.ernie5_5.test_model import _tiny_model, _tokens
-from tests.unit_tests.models.ernie5_5.test_moe import _situ
+from tests.unit_tests.models.ernie5_5.test_moe import _moe_config, _situ
 from tests.unit_tests.models.ernie5_5.test_parallelization import (
     _assert_untouched,
     _backend,
@@ -115,6 +118,56 @@ def _randomize_second_factors(model: nn.Module) -> None:
         for name in _adapter_names(model):
             if name.endswith(("lora_B.weight", "_B")):
                 model.get_parameter(name).normal_(std=0.5)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 3])
+def test_hybridep_lora_expert_preserves_situ_and_adapter_math(monkeypatch, num_tokens):
+    """Compare dispatched LoRA experts with explicit SiTU, including an empty receive."""
+    monkeypatch.setattr(shared_moe_layers, "get_world_size_safe", lambda: 2)
+    model = Ernie5_5MoE(_moe_config(), BackendConfig(experts="torch_mm", dispatcher="hybridep", linear="torch"))
+    torch.manual_seed(5593)
+    with torch.no_grad():
+        model.experts.gate_and_up_projs.normal_(std=0.5)
+        model.experts.down_projs.normal_(std=0.5)
+    _install_lora(model, PeftConfig(target_modules=["experts"], dim=2, alpha=4))
+    experts = model.experts
+    assert isinstance(experts, GroupedExpertsDeepEPLoRA)
+    _randomize_second_factors(model)
+
+    class Dispatcher:
+        def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
+            return hidden_states, torch.tensor([num_local_tokens, 0, 0]), token_probs[:, 0]
+
+        def token_unpermutation(self, hidden_states):
+            return hidden_states
+
+    experts.token_dispatcher = Dispatcher()
+
+    def grouped_mm(x, weights, *, offs):
+        starts = [0, *offs.tolist()[:-1]]
+        return torch.cat([x[start:end] @ weight for start, end, weight in zip(starts, offs.tolist(), weights)])
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm)
+    x = torch.randn(num_tokens, experts.config.expert_dim, requires_grad=True)
+    weights = torch.full((num_tokens, 1), 0.75)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    output = experts(x, torch.ones(num_tokens, dtype=torch.bool), weights, indices)
+    if num_tokens:
+        gate_up = x @ (
+            experts.gate_and_up_projs[0]
+            + experts.scale * experts.lora_gate_and_up_A[0] @ experts.lora_gate_and_up_B[0]
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        activated = _situ(gate, up) * weights
+        expected = activated @ (
+            experts.down_projs[0] + experts.scale * experts.lora_down_A[0] @ experts.lora_down_B[0]
+        )
+        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+        output.sum().backward()
+        assert experts.lora_gate_and_up_B.grad is not None
+        assert experts.lora_down_B.grad is not None
+    else:
+        assert output.shape == x.shape
 
 
 def test_recipe_patterns_wrap_the_supported_modules_and_nothing_else():
