@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsConvertible,
     Float32LogitsLinear,
     compute_lm_head_logits,
     head_compute_dtype,
@@ -195,25 +194,15 @@ def test_linear_kernel_backend_heads_convert(monkeypatch):
         assert fp32_head.bias is (head.bias if isinstance(head.bias, nn.Parameter) else None)
 
 
-class _NormalizedHead(nn.Module, Float32LogitsConvertible):
-    """A model-owned head with its own projection, like Baichuan's NormHead."""
+def test_baichuan_head_keeps_its_normalized_projection():
+    from nemo_automodel.components.models.baichuan.model import NormHead
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(320, 96))
-
-    def to_fp32_logits(self) -> Float32LogitsLinear:
-        head = Float32LogitsLinear(96, 320, bias=False, device="meta")
-        head.weight = self.weight
-        return head
-
-
-def test_convertible_heads_convert_themselves():
-    head = _NormalizedHead()
-
+    head = NormHead(8, 13)
+    hidden = torch.randn(2, 8)
     fp32_head = Float32LogitsLinear.from_head(head)
 
-    assert isinstance(fp32_head, Float32LogitsLinear) and fp32_head.weight is head.weight
+    assert fp32_head.weight is head.weight
+    torch.testing.assert_close(fp32_head(hidden), F.linear(hidden, F.normalize(head.weight)))
 
 
 class _LinearSubclass(nn.Linear):

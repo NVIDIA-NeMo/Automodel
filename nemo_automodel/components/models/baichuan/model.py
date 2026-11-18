@@ -54,7 +54,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    Float32LogitsConvertible,
     Float32LogitsLinear,
     compute_lm_head_logits,
 )
@@ -282,7 +281,7 @@ def _normalized_weight(head: NormHead | Float32LogitsNormHead) -> torch.Tensor:
     return head.weight
 
 
-class NormHead(nn.Module, Float32LogitsConvertible):
+class NormHead(nn.Module):
     def __init__(self, hidden_size, vocab_size, bias=False):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((vocab_size, hidden_size)))
