@@ -1,6 +1,6 @@
 ---
 title: "ERNIE-5.5-Flash-Base-BF16"
-description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: SFT and LoRA of the 43-layer decoder with expert parallelism, and full fine-tuning and LoRA on packed rows with context parallelism."
+description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: SFT and LoRA of the 43-layer decoder with expert parallelism, also on packed rows with context parallelism."
 slug: model-coverage/large-language-models/baidu/ERNIE-5.5-Flash-Base-BF16
 ---
 
@@ -543,8 +543,8 @@ other rows.
 
 | Training | Rows | Compared runs | Updates | First update | Mean | Maximum |
 |---|---|---|---|---|---|---|
-| Full fine-tuning, 64 GPUs | 16,384 tokens, 64 per update | `cp_size: 2` against `cp_size: 1` | 16 | 1.3e-6 | 3.1e-4 | 7.9e-4 |
-| Full fine-tuning, 64 GPUs | 16,384 tokens, 64 per update | `cp_size: 1`, repeat | 16 | 3.6e-6 | 2.0e-4 | 8.3e-4 |
+| Full fine-tuning, 64 GPUs | 16,384 tokens, 64 per update | `cp_size: 2` against `cp_size: 1` | 100 | 7.1e-6 | 2.1e-4 | 8.6e-4 |
+| Full fine-tuning, 64 GPUs | 16,384 tokens, 64 per update | `cp_size: 1`, repeat | 30 | 7.7e-7 | 2.1e-4 | 9.4e-4 |
 | LoRA, 8 GPUs | 16,384 tokens, 8 per update | `cp_size: 2` against `cp_size: 1` | 30 | 1.7e-5 | 1.1e-4 | 4.0e-4 |
 | LoRA, 8 GPUs | 16,384 tokens, 8 per update | `cp_size: 1`, repeat | 30 | 0 | 1.1e-4 | 2.8e-4 |
 | LoRA, 8 GPUs | 65,536 tokens, 2 per update | `cp_size: 8` against `cp_size: 4` | 30 | 1.1e-5 | 1.7e-4 | 3.3e-4 |
@@ -553,13 +553,13 @@ other rows.
 
 `cp_size: 1` holds a whole row on one GPU, which limits training to rows of
 16,384 tokens; rows of 131,072 tokens were trained with `cp_size: 8` only.
-The full fine-tuning run with `cp_size: 2` ran 16 updates. It accumulates
-the gradients of two passes per update with
-`distributed.defer_fsdp_grad_sync: false`, where `cp_size: 1` takes one
-pass. From the fifth update on its loss is above that of `cp_size: 1` in
-every update, by 0.5e-4 to 7.9e-4; the two `cp_size: 1` runs differ by up
-to 8.3e-4, in both directions. With LoRA the sign of the difference
-between `cp_size` 2 and 1 changes from update to update.
+The full fine-tuning run with `cp_size: 2` accumulates the gradients of two
+passes per update with `distributed.defer_fsdp_grad_sync: false`, where
+`cp_size: 1` takes one pass. Its loss is above that of `cp_size: 1` in 64
+of the 100 updates, by 6.2e-5 on average; three runs with `cp_size: 1`
+differ from each other by up to 1.2e-3 on single updates, in both
+directions. With LoRA the sign of the difference between `cp_size` 2 and 1
+changes from update to update.
 The differences between `cp_size` values have the size of the differences
 between two runs of one configuration, so the training loss is the measure of
 agreement here. The forward pass repeats exactly while the DSA layers keep
@@ -567,10 +567,11 @@ every key; where they discard keys the top-k step does not choose the same
 key among keys with equal index scores every time (see
 [Current Scope](#current-scope)), and from the second update on the runs also
 differ because the backward pass of the cuDNN kernels does not repeat bit for
-bit. The gradient norms of the first update agree within 1e-3: 918.38 and
-918.47 for full fine-tuning with `cp_size` 1 and 2 (917.47 in the repeat),
-and within 1e-4 for LoRA. Later they differ by 9 to 21% on average for LoRA
-and by 32 to 54% for full fine-tuning, between two `cp_size` values and
+bit. The gradient norms of the first update of full fine-tuning are 917.2
+to 918.4 in the three runs with `cp_size: 1` and 918.5 and 920.1 in the two
+runs with `cp_size: 2`, and they agree within 1e-4 for LoRA. Later they
+differ by 9 to 21% on average for LoRA and by 34 to 51% for full
+fine-tuning, between two `cp_size` values and
 between two runs of one configuration alike.
 
 ### Forward Pass on Rows of 131,072 Tokens
@@ -599,15 +600,23 @@ loss of a row and the losses of single tokens.
   first 512 tokens of a row shows where this starts: the embeddings are
   identical, and the first output that differs is the FP32 hyper-connection
   of layer 0, by at most 8.4e-6, before any attention layer has run. Its
-  arithmetic depends on the number of tokens the rank holds. The next
-  normalization then rounds a few hundred of 2 million BF16 values the other
-  way, and the 43 layers spread that to every token.
-- A rank that holds 65,536 tokens gives a higher loss than the other
-  layouts: by 2.8e-4 on rows of 131,072 tokens with `cp_size: 2` (all 16
-  rows), and by 2.7e-4 on rows of 65,536 tokens with `cp_size: 1`, without
-  CP (29 of 32 rows), while `cp_size` 2 and 4 agree on those rows within
-  3.5e-5 in the mean. The difference is spread evenly over the row. It was
-  not traced further. The recipes hold 16,384 tokens per rank.
+  FP32 matrix products run in TF32, and their rounding depends on the number
+  of rows in the call (the error against an exact product is 3e-4 of the
+  value at every row count). The next normalization then rounds a few
+  hundred of 2 million BF16 values the other way, and the 43 layers spread
+  that to every token.
+- A rank that holds about 65,000 tokens gives a loss about 2.7e-4 above
+  that of the other layouts: on rows of 131,072 tokens with `cp_size: 2`
+  (all 16 rows), and on rows of 65,280, 65,536, and 65,792 tokens with
+  `cp_size: 1`, without CP (29 or 30 of 32 rows each), while
+  `cp_size` 2 and 4 agree on rows of 65,536 tokens within 3.5e-5 in the
+  mean. The difference is spread evenly over the row, is largest for the
+  first 128 tokens of a document (5.5e-4) and vanishes from position 2,048
+  on. Its cause was not found: the cuDNN sparse attention and the BF16
+  projections give the same output for a token at every token count of a
+  call, and a small model with random weights gives the same token losses
+  at `cp_size` 1, 2, and 4 on these rows. The recipes hold 16,384 tokens
+  per rank.
 
 Small models were compared in FP32 on the eager attention path. A packed row
 gives the logits of its documents run one by one, and 2 and 4 CP ranks give
