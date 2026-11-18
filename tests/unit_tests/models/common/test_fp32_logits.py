@@ -21,8 +21,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from nemo_automodel.components.models.common.logits import (
+    Float32LogitsLinear,
     LogitsProcessor,
     compute_lm_head_logits,
     enable_fp32_logits,
@@ -65,6 +67,31 @@ def test_logits_processor_default_and_fp32_output():
 
     torch.testing.assert_close(native, F.linear(hidden, weight, bias), rtol=0, atol=0)
     torch.testing.assert_close(fp32, F.linear(hidden.float(), weight.float()) + bias.float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("out_dtype", [None, torch.float32])
+def test_processor_output_selects_kernel_and_keeps_packed_positions(out_dtype):
+    class CountProjection(TorchDispatchMode):
+        calls = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func is torch.ops.nemo_automodel.fp32_logits.default:
+                self.calls += 1
+            return func(*args, **(kwargs or {}))
+
+    head = nn.Linear(8, 12, dtype=torch.bfloat16)
+    hidden = torch.randn(5, 8, dtype=torch.bfloat16)
+    processor = LogitsProcessor(out_dtype=out_dtype)
+    with CountProjection() as trace:
+        output = processor.compute_lm_head_logits(
+            head, hidden, logits_to_keep=2, is_thd=True, output_hidden_states=True
+        )
+
+    assert trace.calls == int(out_dtype is torch.float32)
+    expected = processor(head.weight, hidden[-2:], head.bias)
+    torch.testing.assert_close(output.logits, expected.unsqueeze(0), rtol=0, atol=0)
+    torch.testing.assert_close(output.hidden_states, hidden.unsqueeze(0))
+    assert type(head) is nn.Linear
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="out_dtype GEMM requires CUDA or ROCm")
@@ -207,7 +234,7 @@ def test_linear_kernel_backend_heads_convert(monkeypatch):
 
     for head in (_BackendLinear(96, 320), _QuackLinear(96, 320, bias=True)):
         fp32_head = enable_fp32_logits(head)
-        assert type(fp32_head) is nn.Linear
+        assert isinstance(fp32_head, Float32LogitsLinear)
         assert fp32_head.weight is head.weight
         assert fp32_head.bias is (head.bias if isinstance(head.bias, nn.Parameter) else None)
 

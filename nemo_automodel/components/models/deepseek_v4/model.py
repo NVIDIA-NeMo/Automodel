@@ -58,7 +58,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.logits import compute_lm_head_logits, enable_fp32_logits
+from nemo_automodel.components.models.common.logits import (
+    Float32LogitsLinear,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -1274,9 +1277,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         # DeepSeek-V4 keeps an FP32 head and returns its FP32 logits.
-        self.lm_head = enable_fp32_logits(
-            nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
-        )
+        self.lm_head = Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,

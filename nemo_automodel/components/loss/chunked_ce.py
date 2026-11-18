@@ -23,6 +23,7 @@ from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.models.common.logits import (
+    Float32LogitsLinear,
     LogitsProcessor,
     fp32_linear_forward,
     head_compute_dtype,
@@ -216,7 +217,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         self.ignore_index = ignore_index
         self.reduction = reduction
         self.logits_processor = LogitsProcessor()
-        self.fp32_logits_processor = LogitsProcessor(head_dtype=torch.float32)
+        self.fp32_logits_processor = LogitsProcessor(out_dtype=torch.float32)
         self._compute_loss: Callable[
             [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, LogitsProcessor], torch.Tensor
         ] = torch.compile(_linear_cross_entropy, dynamic=True) if compile else _linear_cross_entropy
@@ -249,7 +250,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         if (
             not isinstance(lm_head, nn.Linear)
             or (
-                getattr(forward, "__func__", None) is not nn.Linear.forward
+                getattr(forward, "__func__", None) not in (nn.Linear.forward, Float32LogitsLinear.forward)
                 and getattr(forward, "func", None) is not fp32_linear_forward
             )
             or lm_head.bias is not None

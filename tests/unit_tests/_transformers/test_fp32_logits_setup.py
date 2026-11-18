@@ -25,6 +25,7 @@ from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.infrastructure import _use_fp32_logits
+from nemo_automodel.components.models.common.logits import Float32LogitsLinear
 
 _VOCAB = 128
 
@@ -196,7 +197,7 @@ def test_use_fp32_logits_installs_the_head_and_keeps_the_tie():
     _use_fp32_logits(model, "float32", pipelined=False)
     installed = model.lm_head
 
-    assert installed is original and type(installed) is nn.Linear
+    assert installed is original and isinstance(installed, Float32LogitsLinear)
     assert installed.fp32_logits
     assert model.lm_head.weight is model.embed.weight
     assert model(torch.tensor([[1, 2, 3]])).dtype == torch.float32

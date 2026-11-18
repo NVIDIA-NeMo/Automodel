@@ -24,6 +24,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.logits import compute_lm_head_logits
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
@@ -163,8 +164,7 @@ class Inkling2LMHead(nn.Linear):
             FP32 tensor of shape [..., vocab]. Weight storage may be FP32 or BF16.
             The caller applies softcapping and unused-vocabulary masking.
         """
-        with torch.autocast(device_type=input.device.type, enabled=False):
-            return F.linear(input.float(), self.weight.float(), self.bias.float() if self.bias is not None else None)
+        return compute_lm_head_logits(self.weight.float(), input.float(), bias=self.bias).logits
 
 
 class ShortConvolution(nn.Module):

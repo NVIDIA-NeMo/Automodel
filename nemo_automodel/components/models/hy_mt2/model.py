@@ -49,7 +49,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.logits import compute_lm_head_logits, enable_fp32_logits
+from nemo_automodel.components.models.common.logits import (
+    Float32LogitsLinear,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -337,7 +340,7 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.model = HyMT2Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         # The HF reference computes FP32 logits when ``enable_lm_head_fp32`` is set.
         self.lm_head = (
-            enable_fp32_logits(nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.bfloat16))
+            Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.bfloat16)
             if getattr(config, "enable_lm_head_fp32", False)
             else initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         )

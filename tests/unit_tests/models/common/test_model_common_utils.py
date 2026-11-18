@@ -484,7 +484,7 @@ class TestComputeLmHeadLogits:
         lm_head = FakeFSDPHead()
         hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
 
-        with patch("nemo_automodel.components.models.common.logits.projection.FSDPModule", FakeFSDPHead):
+        with patch("nemo_automodel.components.models.common.logits.logits_processor.FSDPModule", FakeFSDPHead):
             out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
 
         assert lm_head.weight.dtype == torch.float32

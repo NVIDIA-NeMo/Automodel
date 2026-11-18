@@ -16,6 +16,7 @@
 
 from nemo_automodel.components.models.common.logits.logits_processor import LogitsProcessor
 from nemo_automodel.components.models.common.logits.projection import (
+    Float32LogitsLinear,
     compute_lm_head_logits,
     enable_fp32_logits,
     fp32_linear_forward,
@@ -23,6 +24,7 @@ from nemo_automodel.components.models.common.logits.projection import (
 )
 
 __all__ = [
+    "Float32LogitsLinear",
     "LogitsProcessor",
     "compute_lm_head_logits",
     "enable_fp32_logits",
