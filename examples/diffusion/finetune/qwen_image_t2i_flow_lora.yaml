@@ -102,6 +102,7 @@ checkpoint:
   restore_from: null
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: pthombre
   time: "00:30:00"

@@ -79,7 +79,7 @@ dependencies = [
     "ninja",
     "pyyaml",
     "tiktoken",
-    "torch>=2.8.0",
+    "torch>=2.10.0",
     "torchdata",
     # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
     # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
@@ -366,7 +366,7 @@ constraint-dependencies = [
     "filelock>=4.2.1",
     "graphql-core>=3.2.12",
     "oauthlib>=4.0.1",
-    "opentelemetry-api>=1.45.1",
+    "opentelemetry-api>=1.45.2",
 ]
 override-dependencies = [
     # Override Trackio's Pillow<13 cap to enforce the security update.

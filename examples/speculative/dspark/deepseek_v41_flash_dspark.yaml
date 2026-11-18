@@ -132,4 +132,5 @@ checkpoint:
   # restore_from: LATEST
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100
