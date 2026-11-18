@@ -57,7 +57,7 @@ def _reporting_worker(rank: int, rendezvous: str) -> None:
             end = reporter.mark()
             boundaries.append((start, end))
             sample = MetricsSample(step=step, epoch=2, metrics={"loss": local_loss, "experts": entries})
-            reporter.enqueue(sample, start=start, end=end, remote_log=step == 7)
+            reporter.enqueue(sample, start=start, end=end, remote_log=step == 7, phases={"optimizer": (start, end)})
             # The snapshot owns its values even when the producer reuses storage.
             entries.add_(10)
             samples.extend(reporter.poll())
@@ -72,6 +72,7 @@ def _reporting_worker(rank: int, rendezvous: str) -> None:
             local_time = torch.tensor(start.elapsed_time(end) / 1000, dtype=torch.float64)
             dist.all_reduce(local_time, group=control_group, op=dist.ReduceOp.MAX)
             assert seconds == local_time.item()
+            assert sample.metrics["optimizer-time"] == seconds
             assert sample.metrics["loss"] == 34 + 44 * i
             torch.testing.assert_close(sample.metrics["experts"], torch.arange(4) + 10 * i)
     finally:

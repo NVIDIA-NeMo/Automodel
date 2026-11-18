@@ -40,11 +40,13 @@ from nemo_automodel.components.datasets.loader import (
 )
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
+from nemo_automodel.recipes.llm.step_reporting import DeferredStepReporter
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_domain_mixture_blend,
@@ -1356,14 +1358,20 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             yield ["dummy-batch"]
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneStepScheduler()
+    trainer.step_scheduler.is_remote_logging_step = False
     trainer.dataloader = []
     trainer.max_grad_norm = 1.0
     trainer.partial_cuda_graph_manager = None
     trainer._partial_cuda_graph_capture_pending = False
     trainer._enable_qat_if_delayed = MagicMock()
-    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer._run_train_optim_step = MagicMock(
+        return_value=MetricsSample(
+            step=trainer.step_scheduler.step, epoch=0, metrics={"loss": 1.0, "num_tokens_per_step": 4}
+        )
+    )
     trainer._maybe_collect_garbage = MagicMock()
     trainer._collect_moe_load_balance = MagicMock()
     trainer.log_train_metrics = MagicMock()
@@ -1399,14 +1407,20 @@ def test_run_train_validation_loop_reports_weighted_domain_validation():
             yield ["dummy-batch"]
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneValidationStep()
+    trainer.step_scheduler.is_remote_logging_step = False
     trainer.dataloader = []
     trainer.max_grad_norm = 1.0
     trainer.partial_cuda_graph_manager = None
     trainer._partial_cuda_graph_capture_pending = False
     trainer._enable_qat_if_delayed = MagicMock()
-    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer._run_train_optim_step = MagicMock(
+        return_value=MetricsSample(
+            step=trainer.step_scheduler.step, epoch=0, metrics={"loss": 1.0, "num_tokens_per_step": 4}
+        )
+    )
     trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 1.0e-4}])]
     trainer._collect_moe_load_balance = MagicMock()
     trainer._maybe_collect_garbage = MagicMock()
@@ -2372,7 +2386,9 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr(
             recipe,
             "_dp_allreduce",
-            lambda val, include_cp=False: val if isinstance(val, torch.Tensor) else torch.tensor(val),
+            lambda val, include_cp=False, keep_device=False: (
+                val if isinstance(val, torch.Tensor) else torch.tensor(val)
+            ),
         )
         monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: dp_group_size)
         monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: cp_group_size)
@@ -2390,7 +2406,6 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.prepare_after_first_microbatch", lambda *a, **k: None)
         object.__setattr__(recipe, "checkpointer", SimpleNamespace(maybe_wait_for_staging=lambda: None))
         object.__setattr__(recipe, "lr_scheduler", None)
-        object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
 
     @pytest.mark.parametrize("backend", [None, "triton", "te"])
@@ -2434,7 +2449,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert len(broadcast_inputs) == 1
         torch.testing.assert_close(broadcast_inputs[0], expected_loss if has_last_stage else torch.tensor(0.0))
-        assert sample.metrics["loss"] == pytest.approx(expected_loss.item())
+        torch.testing.assert_close(sample.metrics["loss"], expected_loss)
         assert ce.dtype == torch.bfloat16
 
     @pytest.mark.parametrize("pp_enabled", [False, True])
@@ -2585,6 +2600,18 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
 
+    @staticmethod
+    def _reported_step(recipe, batches):
+        reporter = DeferredStepReporter(recipe.dist_env.device)
+        recipe._throughput_window = None
+        recipe.log_train_metrics = MagicMock()
+        start = reporter.mark()
+        sample = recipe._run_train_optim_step(batches)
+        reporter.enqueue(sample, start=start, end=reporter.mark(), remote_log=False)
+        recipe._emit_train_metrics(reporter, None, wait=True)
+        reporter.close()
+        return recipe.log_train_metrics.call_args.args[0]
+
     def test_tps_per_gpu_divides_global_tps_by_world_size(self, monkeypatch):
         """Under pp>1 the per-GPU divisor must be the full world size, not dp*cp.
 
@@ -2604,7 +2631,7 @@ class TestRunTrainOptimStepSetsMoEScale:
             {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])},
         ]
 
-        metrics = recipe._run_train_optim_step(batches)
+        metrics = self._reported_step(recipe, batches)
 
         tps = metrics.metrics["tps"]
         assert tps > 0
@@ -2620,14 +2647,14 @@ class TestRunTrainOptimStepSetsMoEScale:
             {"labels": torch.tensor([[6, 7, 8, 9]])},
         ]
 
-        metrics = recipe._run_train_optim_step(batches)
+        metrics = self._reported_step(recipe, batches)
 
         assert metrics.metrics["pack_fill"] == pytest.approx((3 + 2 + 4) / (3 * 4))
 
     def test_pack_fill_is_absent_without_packing(self, monkeypatch):
         recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=1)
 
-        metrics = recipe._run_train_optim_step([{"labels": torch.tensor([[1, 2, 3, -100]])}])
+        metrics = self._reported_step(recipe, [{"labels": torch.tensor([[1, 2, 3, -100]])}])
 
         assert "pack_fill" not in metrics.metrics
 
@@ -4426,8 +4453,16 @@ def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
     recipe.best_metric_key = "default"
     recipe._make_progress_bar = MagicMock(return_value=None)
     recipe._enable_qat_if_delayed = MagicMock()
-    recipe._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 0.25}))
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
+    recipe._run_train_optim_step = MagicMock(
+        side_effect=lambda *_args: MetricsSample(
+            step=recipe.step_scheduler.step,
+            epoch=recipe.step_scheduler.epoch,
+            metrics={"loss": torch.tensor(0.25), "num_tokens_per_step": 4},
+        )
+    )
     recipe._collect_moe_load_balance = MagicMock()
+    recipe._moe_layer_loads = None
     recipe.log_train_metrics = MagicMock()
     recipe._update_progress_bar = MagicMock()
     recipe._maybe_collect_garbage = MagicMock()
@@ -4436,6 +4471,7 @@ def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
 
     def record_checkpoint(epoch, step, train_loss, val_loss, best_metric_key):
         assert not loader.closed
+        assert isinstance(train_loss, float) and train_loss == 0.25
         saved.append((epoch, step, recipe.step_scheduler.state_dict(), recipe.step_scheduler.is_last_step))
 
     recipe.save_checkpoint = record_checkpoint

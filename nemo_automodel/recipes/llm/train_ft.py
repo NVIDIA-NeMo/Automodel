@@ -892,7 +892,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Keep preemption and streaming availability checks off the CUDA stream.
         scheduler_group = getattr(self, "_training_process_group", None)
         self._step_control_group = None
-        if self.cfg.get("defer_step_metrics", False) and torch.distributed.is_initialized() and scheduler_group is None:
+        if torch.distributed.is_initialized() and scheduler_group is None and self.dist_env.device.type == "cuda":
             self._step_control_group = torch.distributed.new_group(backend="gloo")
             scheduler_group = self._step_control_group
 
@@ -1134,17 +1134,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         for mp in self.model_parts:
             mp.train()
-        self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
         train_log_data = None
         last_validation_step = None
-        reporter = (
-            DeferredStepReporter(self.dist_env.device)
-            if getattr(self, "cfg", {}).get("defer_step_metrics", False)
-            else None
-        )
-        self._step_reporter = reporter
+        reporter = DeferredStepReporter(self.dist_env.device)
         self._throughput_window = None
         try:
             for epoch in self.step_scheduler.epochs:
@@ -1155,30 +1149,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 for batches in self.step_scheduler:
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
-                    start = reporter.mark() if reporter is not None else None
+                    start = reporter.mark()
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                    end = reporter.mark() if reporter is not None else None
+                    end = reporter.mark()
                     # Capture outside the microbatch loop and only after the
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
                     if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
                         self.partial_cuda_graph_manager.capture()
                         self._partial_cuda_graph_capture_pending = False
-                    if reporter is not None:
-                        remote_log = self.step_scheduler.is_remote_logging_step
-                        if remote_log:
-                            self._collect_moe_load_balance()
-                            self._snapshot_moe_metrics(train_log_data)
-                        reporter.enqueue(train_log_data, start=start, end=end, remote_log=remote_log)
-                        if self.dist_env.is_main:
-                            torch.cuda.reset_peak_memory_stats()
-                        self._emit_deferred_train_metrics(
-                            reporter, pbar, wait=self.step_scheduler.is_val_step or self.step_scheduler.is_ckpt_step
-                        )
-                    else:
-                        self._collect_moe_load_balance()
-                        self.log_train_metrics(train_log_data)
-                        self._update_progress_bar(pbar, train_log_data.metrics)
+                    remote_log = self.step_scheduler.is_remote_logging_step
+                    if remote_log:
+                        self._snapshot_moe_metrics(train_log_data)
+                    reporter.enqueue(train_log_data, start=start, end=end, remote_log=remote_log)
+                    if self.dist_env.is_main and self.dist_env.device.type == "cuda":
+                        torch.cuda.reset_peak_memory_stats()
+                    self._emit_train_metrics(
+                        reporter, pbar, wait=self.step_scheduler.is_val_step or self.step_scheduler.is_ckpt_step
+                    )
 
                     # Run validation every val_every_steps
                     val_losses = {}
@@ -1196,9 +1184,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
-            if reporter is not None:
-                self._emit_deferred_train_metrics(reporter, pbar, wait=True)
-                reporter.close()
+            self._emit_train_metrics(reporter, pbar, wait=True)
             if self.step_scheduler.stream_exhausted and train_log_data is not None:
                 completed_step = self.step_scheduler.step - 1
                 if last_validation_step != completed_step:
@@ -1213,7 +1199,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     best_metric_key=self.best_metric_key,
                 )
         finally:
-            self._step_reporter = None
+            reporter.close()
             close_dataloader(self.dataloader)
             for loader in self.val_dataloaders.values():
                 close_dataloader(loader)
@@ -1587,11 +1573,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
 
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        deferred = getattr(self, "_step_reporter", None) is not None
-        local_label_tokens = sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches)
-        num_label_tokens = self._reduce_step_metrics(torch.tensor(local_label_tokens, dtype=torch.long))
-        if not deferred:
-            num_label_tokens = num_label_tokens.item()
+        # The supervised count normalizes training; the other counts describe pack utilization.
+        counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
+            ],
+            dtype=torch.long,
+        )
+        num_label_tokens, num_tokens_in_batch, num_packs = self._reduce_step_metrics(counts).unbind()
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1618,14 +1609,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             except (TypeError, ValueError) as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
                 domain_label_counts.zero_()
-            if deferred:
-                failed = torch.tensor(bool(local_error), dtype=torch.int32)
-                if self._step_control_group is not None:
-                    torch.distributed.all_reduce(
-                        failed, op=torch.distributed.ReduceOp.MAX, group=self._step_control_group
-                    )
-            else:
-                failed = self._dp_allreduce(torch.tensor(int(bool(local_error)), dtype=torch.long))
+            failed = torch.tensor(int(bool(local_error)), dtype=torch.int32, device="cpu")
+            if self._step_control_group is not None:
+                torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX, group=self._step_control_group)
+            elif torch.distributed.is_initialized():
+                failed = self._dp_allreduce(failed)
             if failed.item():
                 raise ValueError(
                     local_error
@@ -1638,17 +1626,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
-
-        # Number of tokens in the batch, excluding any tail padding, and of packs (one per row) when packing.
-        token_counts = torch.tensor(
-            [
-                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
-            ],
-            dtype=torch.long,
-        )
-        token_counts = self._reduce_step_metrics(token_counts)
-        num_tokens_in_batch, num_packs = token_counts.unbind() if deferred else token_counts.tolist()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
@@ -1714,14 +1691,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
-        time_delta = None
-        if not deferred:
-            t = time.perf_counter()
-            time_delta = t - self.timestamp
-            self.timestamp = t
-
         step_flops = None
-        mfu = None
         mfu_calculator = getattr(self, "mfu_calculator", None)
         if batches and mfu_calculator is not None:
             step_flops = 0.0
@@ -1739,52 +1709,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             if flops_supported:
                 step_flops = self._reduce_step_metrics(torch.tensor(step_flops, dtype=torch.float64), include_cp=True)
-                if not deferred:
-                    mfu = calculate_mfu(
-                        step_flops.item() / 1e12,
-                        self.dist_env.world_size,
-                        time_delta,
-                        reference_mfu=mfu_calculator.reference_mfu,
-                    )
             else:
                 step_flops = None
 
-        reporting_loss = torch.sum(torch.stack(loss_buffer))
-        if self.pp_enabled:
-            # The last stage's CE may be bf16, while other stages contribute
-            # fp32 zeros. Every PP broadcast participant needs the same dtype.
-            reporting_loss = reporting_loss.float()
-        reporting_loss = self._reduce_step_metrics(reporting_loss, include_cp=True)
-        if self.pp_enabled:
-            reporting_loss = reporting_loss / num_label_tokens
-            reporting_loss = reporting_loss.to(self.dist_env.device)
-            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
-
-        if not deferred:
-            reporting_loss = reporting_loss.cpu().item()
-
+        reporting_loss = self._step_loss(loss_buffer, normalize_by=num_label_tokens if self.pp_enabled else None)
         metrics = {
             "loss": reporting_loss,
             "grad_norm": grad_norm,
             "lr": self.optimizer[0].param_groups[0]["lr"],
             "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            "mfu": mfu,
+            "_step_flops": step_flops,
             "num_tokens_per_step": num_tokens_in_batch,
             "num_label_tokens": num_label_tokens,
         }
-        if deferred:
-            metrics["_step_flops"] = step_flops
-            if self.pack_size:
-                metrics["_num_packs"] = num_packs
-            if domain_label_counts is not None:
-                metrics["_domain_label_counts"] = domain_label_counts
-        else:
-            self._set_throughput_metrics(metrics, time_delta)
-            if self.pack_size:
-                metrics["pack_fill"] = num_tokens_in_batch / (num_packs * self.pack_size)
-
-        if domain_label_counts is not None and not deferred:
-            self._set_domain_label_metrics(metrics, domain_label_counts)
+        if self.pack_size:
+            metrics["_num_packs"] = num_packs
+        if domain_label_counts is not None:
+            metrics["_domain_label_counts"] = domain_label_counts
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -1793,18 +1734,29 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     def _reduce_step_metrics(self, values: torch.Tensor, *, include_cp: bool = False) -> torch.Tensor:
-        """Reduce a scalar or vector of shape [metrics] using the step's reporting mode."""
-        if getattr(self, "_step_reporter", None) is None:
-            return self._dp_allreduce(values, include_cp=include_cp)
-        if not values.is_cuda:
+        """Reduce a scalar or vector of shape [metrics] on the training device."""
+        if self.dist_env.device.type == "cuda" and not values.is_cuda:
             values = values.pin_memory().to(self.dist_env.device, non_blocking=True)
         return self._dp_allreduce(values, include_cp=include_cp, keep_device=True)
 
-    def _set_throughput_metrics(self, metrics, elapsed: float) -> None:
-        # The token count is global across DP replicas and TPS per GPU uses the full world size.
-        tps = metrics["num_tokens_per_step"] / elapsed
-        metrics["tps"] = tps
-        metrics["tps_per_gpu"] = tps / max(self.dist_env.world_size, 1)
+    def _step_loss(self, losses: list[torch.Tensor], *, normalize_by: torch.Tensor | None) -> torch.Tensor:
+        """Reduce the loss for reporting and broadcast the PP last-stage result.
+
+        Args:
+            losses: Detached scalar loss from each local accumulation batch.
+            normalize_by: Optional scalar token count on the training device.
+
+        Returns:
+            Reduced scalar loss on the training device.
+        """
+        loss = torch.stack(losses).sum()
+        if self.pp_enabled:
+            # PP stages can contribute losses of different dtypes.
+            loss = loss.float()
+        loss = self._reduce_step_metrics(loss, include_cp=True)
+        if normalize_by is not None:
+            loss = loss.float() / normalize_by
+        return self._broadcast_from_last_pp_stage(loss) if self.pp_enabled else loss
 
     def _set_domain_label_metrics(self, metrics, domain_label_counts: torch.Tensor) -> None:
         """Add per-domain metrics from CPU counts of shape [domains]."""
@@ -1814,6 +1766,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             metrics[f"domain_mixture/{name}_label_fraction"] = count / total_domain_labels
 
     def _snapshot_moe_metrics(self, sample: MetricsSample) -> None:
+        self._collect_moe_load_balance()
         for name, data in (self._moe_layer_loads or {}).items():
             sample.metrics[f"_moe_load/{name}"] = data["expert_load"]
             if data["aux_loss"] is not None:
@@ -1831,7 +1784,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "n_experts": load.numel(),
                 }
 
-    def _emit_deferred_train_metrics(self, reporter: DeferredStepReporter, pbar, *, wait: bool) -> None:
+    def _emit_train_metrics(self, reporter: DeferredStepReporter, pbar, *, wait: bool) -> None:
         completed = reporter.poll(wait=wait)
         if completed:
             now = time.perf_counter()
@@ -1848,9 +1801,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._throughput_window = (since, tokens, steps)
 
         for sample, remote_log, elapsed in completed:
-            self._set_throughput_metrics(sample.metrics, elapsed)
+            tps = sample.metrics["num_tokens_per_step"] / elapsed
+            sample.metrics["tps"] = tps
+            sample.metrics["tps_per_gpu"] = tps / self.dist_env.world_size
             sample.metrics["step_time_seconds"] = elapsed
             step_flops = sample.metrics.pop("_step_flops", None)
+            sample.metrics["mfu"] = None
             if step_flops is not None:
                 sample.metrics["mfu"] = calculate_mfu(
                     step_flops / 1e12,
@@ -2154,8 +2110,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["mfu"],
             )
         )
-        if remote_log is None:
-            torch.cuda.reset_peak_memory_stats()
 
 
 # ---------------------------------------------------------------------------

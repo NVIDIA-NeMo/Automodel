@@ -16,12 +16,16 @@
 """CUDA step timing and deferred host metrics for language-model recipes."""
 
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
+from time import perf_counter
 
 import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+StepMarker = torch.cuda.Event | float
 
 
 @dataclass
@@ -34,35 +38,32 @@ class _MetricReadback:
 @dataclass
 class _PendingStep:
     sample: MetricsSample
-    start: torch.cuda.Event
-    end: torch.cuda.Event
-    ready: torch.cuda.Event
+    spans: dict[str, tuple[StepMarker, StepMarker]]
+    ready: torch.cuda.Event | None
     remote_log: bool
     readbacks: list[_MetricReadback]
-    elapsed: torch.Tensor = field(default_factory=lambda: torch.empty((), dtype=torch.float64))
-    timing_work: dist.Work | None = None
 
 
 class DeferredStepReporter:
-    """Read CUDA metrics after completion and aggregate rank times on CPU."""
+    """Read completed step metrics and aggregate rank times on CPU."""
 
     def __init__(self, device: torch.device) -> None:
-        """Create a reporting stream and a CPU process group in rank order.
+        """Create a CPU process group and, on CUDA, a reporting stream.
 
         Args:
-            device: CUDA device assigned to the calling rank.
+            device: Training device assigned to the calling rank.
         """
-        if device.type != "cuda":
-            raise ValueError("defer_step_metrics requires a CUDA training device")
         self._device = device
-        self._stream = torch.cuda.Stream(device=device)
+        self._stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self._group = dist.new_group(backend="gloo") if dist.is_initialized() and dist.get_world_size() > 1 else None
         self._pending: deque[_PendingStep] = deque()
-        self._reducing: deque[_PendingStep] = deque()
+        self._reducing: deque[tuple[_PendingStep, torch.Tensor, dist.Work | None]] = deque()
         self._buffers: dict[tuple[torch.dtype, int], list[torch.Tensor]] = defaultdict(list)
 
-    def mark(self) -> torch.cuda.Event:
-        """Record a timing marker on the current stream of the training device."""
+    def mark(self) -> StepMarker:
+        """Record a CUDA event or a CPU timestamp on the training device."""
+        if self._stream is None:
+            return perf_counter()
         event = torch.cuda.Event(enable_timing=True)
         event.record(torch.cuda.current_stream(self._device))
         return event
@@ -72,9 +73,10 @@ class DeferredStepReporter:
         self,
         sample: MetricsSample,
         *,
-        start: torch.cuda.Event,
-        end: torch.cuda.Event,
+        start: StepMarker,
+        end: StepMarker,
         remote_log: bool,
+        phases: Mapping[str, tuple[StepMarker, StepMarker]] | None = None,
     ) -> None:
         """Queue a detached metrics snapshot for the step identified by sample.
 
@@ -85,6 +87,7 @@ class DeferredStepReporter:
             start: Timing event recorded before step work began.
             end: Timing event ordered after the step's compute and communication.
             remote_log: Whether the step is scheduled for remote logging.
+            phases: Additional named start and end markers from this step.
         """
         by_dtype: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = defaultdict(list)
         for key, value in sample.metrics.items():
@@ -94,27 +97,28 @@ class DeferredStepReporter:
                 else:
                     sample.metrics[key] = value.detach().clone()
 
-        packed = [(entries, torch.cat([value.reshape(-1) for _, value in entries])) for entries in by_dtype.values()]
-        produced = torch.cuda.Event()
-        produced.record(torch.cuda.current_stream(self._device))
-        ready = torch.cuda.Event()
         readbacks = []
-        with torch.cuda.stream(self._stream):
-            self._stream.wait_event(produced)
-            for entries, values in packed:
-                available = self._buffers[(values.dtype, values.numel())]
-                host = (
-                    available.pop()
-                    if available
-                    else torch.empty(values.numel(), dtype=values.dtype, device="cpu", pin_memory=True)
-                )
-                host.copy_(values, non_blocking=True)
-                values.record_stream(self._stream)
-                readbacks.append(
-                    _MetricReadback([key for key, _ in entries], [value.shape for _, value in entries], host)
-                )
-            ready.record(self._stream)
-        self._pending.append(_PendingStep(sample, start, end, ready, remote_log, readbacks))
+        ready = end if isinstance(end, torch.cuda.Event) else None
+        if by_dtype and self._stream is not None:
+            packed = [
+                (entries, torch.cat([value.reshape(-1) for _, value in entries])) for entries in by_dtype.values()
+            ]
+            self._stream.wait_stream(torch.cuda.current_stream(self._device))
+            with torch.cuda.stream(self._stream):
+                for entries, values in packed:
+                    available = self._buffers[(values.dtype, values.numel())]
+                    host = (
+                        available.pop()
+                        if available
+                        else torch.empty(values.numel(), dtype=values.dtype, device="cpu", pin_memory=True)
+                    )
+                    host.copy_(values, non_blocking=True)
+                    values.record_stream(self._stream)
+                    readbacks.append(
+                        _MetricReadback([key for key, _ in entries], [value.shape for _, value in entries], host)
+                    )
+                ready = self._stream.record_event()
+        self._pending.append(_PendingStep(sample, {"": (start, end), **(phases or {})}, ready, remote_log, readbacks))
 
     def poll(self, *, wait: bool = False) -> list[tuple[MetricsSample, bool, float]]:
         """Return completed samples in order, with their logging flag and max rank seconds.
@@ -129,23 +133,28 @@ class DeferredStepReporter:
         completed = []
         while self._pending:
             record = self._pending[0]
-            if not record.ready.query():
+            if record.ready is not None and not record.ready.query():
                 if not wait:
                     break
                 record.ready.synchronize()
-            record.elapsed.fill_(record.start.elapsed_time(record.end) / 1000.0)
-            if self._group is not None:
-                record.timing_work = dist.all_reduce(
-                    record.elapsed, op=dist.ReduceOp.MAX, group=self._group, async_op=True
-                )
-            self._reducing.append(self._pending.popleft())
+            elapsed = torch.tensor(
+                [_elapsed_seconds(start, end) for start, end in record.spans.values()],
+                dtype=torch.float64,
+                device="cpu",
+            )
+            work = (
+                dist.all_reduce(elapsed, op=dist.ReduceOp.MAX, group=self._group, async_op=True)
+                if self._group is not None
+                else None
+            )
+            self._reducing.append((self._pending.popleft(), elapsed, work))
 
         while self._reducing:
-            record = self._reducing[0]
-            if record.timing_work is not None:
-                if not wait and not record.timing_work.is_completed():
+            record, elapsed, work = self._reducing[0]
+            if work is not None:
+                if not wait and not work.is_completed():
                     break
-                record.timing_work.wait()
+                work.wait()
 
             for readback in record.readbacks:
                 offset = 0
@@ -157,7 +166,10 @@ class DeferredStepReporter:
             for key, value in record.sample.metrics.items():
                 if isinstance(value, torch.Tensor) and value.ndim == 0:
                     record.sample.metrics[key] = value.item()
-            completed.append((record.sample, record.remote_log, record.elapsed.item()))
+            step_elapsed, *phases = elapsed.tolist()
+            for name, seconds in zip(tuple(record.spans)[1:], phases, strict=True):
+                record.sample.metrics[f"{name}-time"] = seconds
+            completed.append((record.sample, record.remote_log, step_elapsed))
             self._reducing.popleft()
         return completed
 
@@ -165,3 +177,9 @@ class DeferredStepReporter:
         """Release the reporting process group after the caller drains pending samples."""
         if self._group is not None:
             dist.destroy_process_group(self._group)
+
+
+def _elapsed_seconds(start: StepMarker, end: StepMarker) -> float:
+    if isinstance(start, torch.cuda.Event):
+        return start.elapsed_time(end) / 1000.0
+    return end - start

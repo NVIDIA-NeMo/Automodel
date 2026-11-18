@@ -858,7 +858,7 @@ class BaseRecipe:
             tensor: Scalar or vector of shape [metrics] to reduce in place.
             op: Distributed reduction operator.
             include_cp: Include context-parallel contributions in the group.
-            keep_device: Return the reduced tensor on its communication device.
+            keep_device: Reduce and return the tensor on its current device.
 
         Returns:
             Reduced tensor, aliasing the input when it needs no device transfer.
@@ -867,7 +867,7 @@ class BaseRecipe:
         if getattr(self, "device_mesh", None) and dp_group is None:
             return tensor
         if dp_group is not None or dist.is_initialized():
-            if not tensor.is_cuda and torch.cuda.is_available():
+            if not keep_device and not tensor.is_cuda and torch.cuda.is_available():
                 tensor = tensor.pin_memory().to(
                     device=torch.device("cuda", torch.cuda.current_device()), non_blocking=True
                 )
