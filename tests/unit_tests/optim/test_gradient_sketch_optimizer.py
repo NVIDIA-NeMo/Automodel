@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import copy
 import gc
 
@@ -335,13 +336,18 @@ def test_backward_leaves_no_cyclic_garbage():
     _backward(net)
     gc.collect()
     gc.disable()
+    # Keep what the collector finds so a failure names the leaked types.
+    gc.set_debug(gc.DEBUG_SAVEALL)
     try:
         for _ in range(3):
             _backward(net)
         unreachable = gc.collect()
+        leaked = collections.Counter(f"{type(obj).__module__}.{type(obj).__qualname__}" for obj in gc.garbage)
     finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
         gc.enable()
-    assert unreachable == 0
+    assert unreachable == 0, leaked.most_common(20)
 
 
 @pytest.mark.parametrize("placements", ["replicate", "two_shards"])
