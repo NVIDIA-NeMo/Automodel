@@ -24,7 +24,7 @@ from tools.docs.build.coverage_tables import (
     _iter_pretrained_model_ids,
     _read_documented_recipe,
 )
-from tools.docs.cards import _model_card_aliases, _model_card_paths
+from tools.docs.cards import _family_checkpoints, _model_card_aliases, _model_card_paths
 
 
 def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
@@ -40,7 +40,13 @@ def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
     metadata = yaml.safe_load(document.split("---", 2)[1])
     title = metadata["title"]
-    if recipe_ids:
+    family_ids = _family_checkpoints(card)
+    if family_ids:
+        if not recipe_ids.issubset(family_ids):
+            raise ValueError(
+                f"{card}: linked recipe checkpoints must belong to the declared family: {sorted(recipe_ids - family_ids)}"
+            )
+    elif recipe_ids:
         names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
         if title not in names:
             raise ValueError(f"{card}: title {title!r} must match a linked recipe model ID: {sorted(recipe_ids)}")
@@ -58,7 +64,7 @@ def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         raise ValueError(
             f"{card}: add an explicit frontmatter slug for checkpoint {title!r}; keep the existing MDX filename"
         )
-    matching_ids = {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
+    matching_ids = family_ids or {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
     if not any((f"https://huggingface.co/{model_id}" in document for model_id in matching_ids)):
         raise ValueError(f"{card}: link the exact Hugging Face checkpoint from the recipe")
 
