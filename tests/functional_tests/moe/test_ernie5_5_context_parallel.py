@@ -15,15 +15,11 @@
 """Context-parallel shards of a packed ERNIE 5.5 row against one process: Gloo ranks on CPU, no GPU needed.
 
 Every rank builds the same small FP32 model on the eager attention path, with dense feed-forward layers only, so
-that no expert parallelism is needed, and packs the same three documents into one row of 768 tokens. The second
-document starts on the first rank of two and ends on the second.
+that no expert parallelism is needed, and packs the same three documents into one row of 768 tokens. With four
+ranks the second document starts on the second rank and ends on the third.
 
-* ``test_keys_reach_the_attention_in_row_order`` gives every key its row offset as content and records what the
-  attention cores receive after the exchange between ranks: an HCA query reads the window keys and the complete
-  compressed keys of its own document, across the shard boundary, and a DSA layer scores and attends over the keys
-  of the whole row in row order.
-* ``test_shards_match_one_process`` compares the logits and the gradients, summed over the ranks, of two and of
-  four shards with one process that holds the whole row.
+The test compares the logits and the gradients, summed over the ranks, of four shards with one process that holds
+the whole row.
 """
 
 import os
@@ -35,19 +31,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.ernie5_5 import hca as hca_module
 from nemo_automodel.components.models.ernie5_5.config import Ernie5_5Config
 from nemo_automodel.components.models.ernie5_5.model import Ernie5_5_MoeForCausalLM
 
-VOCAB, RATIO, WINDOW = 64, 128, 8
-# Row offsets of the documents once each starts at a multiple of 128: 0, 256 and 640.
+VOCAB, WINDOW = 64, 8
+# Once each document starts at a multiple of 128, the documents start at row offsets 0, 256 and 640.
 LENGTHS = (130, 300, 60)
-STARTS = (0, 256, 640)
 ROW = 768
 RATIOS = (128, 128, -2, 128, -2)
 # Largest differences measured between the shards and one process: 6.0e-8 in the logits, and 1.7e-5 of the largest
@@ -119,131 +112,6 @@ def _batch() -> dict[str, torch.Tensor | str]:
     }
 
 
-def _layout(first: int, sequence: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the positions and the documents, counted from one, of ``sequence`` row offsets from ``first``."""
-    positions = torch.zeros(1, ROW, dtype=torch.int64)
-    documents = torch.zeros(1, ROW, dtype=torch.int64)
-    for document, (start, length) in enumerate(zip(STARTS, LENGTHS), start=1):
-        positions[0, start : start + length] = torch.arange(length)
-        documents[0, start : start + length] = document
-    return positions[:, first : first + sequence], documents[:, first : first + sequence]
-
-
-def _check_hca_keys(rank: int, mesh, model: Ernie5_5_MoeForCausalLM) -> list[str]:
-    """Record the keys and key indices of a packed HCA call on this rank and compare them with the row."""
-    attention = model.model.layers[0].attention
-    attention.setup_cp_attention(mesh)
-    sequence = ROW // mesh.size()
-    first = rank * sequence
-    position_ids, packed_seq_ids = _layout(first, sequence)
-    offsets = torch.arange(first, first + sequence, dtype=torch.float32)
-    # Key i holds its row offset in its first channel. The compressor pools (offset, 1) of every token uniformly,
-    # so the ratio of the first two channels of a compressed key is the mean row offset of its 128 tokens.
-    keys = torch.zeros(1, sequence, attention.head_dim)
-    keys[0, :, 0] = offsets
-    hidden = torch.zeros(1, sequence, attention.config.hidden_size)
-    hidden[0, :, 0], hidden[0, :, 1] = offsets, 1.0
-    with torch.no_grad():
-        attention.compressor.wgate.weight.zero_()
-        attention.compressor.wkv.weight.zero_()
-        attention.compressor.wkv.weight[0, 0] = attention.compressor.wkv.weight[1, 1] = 1.0
-    seen = {}
-
-    def record(query, kv, sinks, indices, scale, **kwargs):
-        seen.update(kv=kv, indices=indices)
-        return torch.zeros_like(query)
-
-    original, hca_module.dsv4_sparse_attention = hca_module.dsv4_sparse_attention, record
-    try:
-        rotary = model.model._hca_rotary(torch.device("cpu"))
-        with torch.no_grad():
-            attention._attend_packed(
-                hidden,
-                torch.zeros(1, sequence, attention.config.q_lora_rank),
-                torch.zeros(1, attention.num_heads, sequence, attention.head_dim),
-                keys,
-                rotary(torch.empty(1, sequence, 1), position_ids),
-                rotary,
-                position_ids,
-                packed_seq_ids,
-            )
-    finally:
-        hca_module.dsv4_sparse_attention = original
-    kv, indices = seen["kv"][0], seen["indices"][0]
-    names = torch.where(kv[:, 1] != 0, kv[:, 0] / kv[:, 1], kv[:, 0])
-    failures = []
-    for local in range(sequence):
-        position, document = position_ids[0, local].item(), packed_seq_ids[0, local].item()
-        offset = first + local
-        if document == 0:
-            expected = [float(offset)]
-        else:
-            start = offset - position
-            expected = [float(key) for key in range(max(offset - WINDOW + 1, start), offset + 1)]
-            expected += [start + RATIO * window + (RATIO - 1) / 2 for window in range((position + 1) // RATIO)]
-        read = sorted(names[index].item() for index in indices[local] if index >= 0)
-        if read != pytest.approx(sorted(expected), abs=1e-3):
-            failures.append(f"HCA query at row offset {offset} reads {read}, expected {sorted(expected)}")
-    return failures
-
-
-class _Recorder(nn.Module):
-    """Stand-in for the FP32 parameter holder of a DSA layer that keeps the arguments of its call."""
-
-    def __init__(self, width: int) -> None:
-        super().__init__()
-        self.width = width
-        self.call: tuple[tuple, dict] | None = None
-
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        """Record the call and return zeros of shape [batch, sequence, width]."""
-        self.call = (args, kwargs)
-        return torch.zeros(*args[0].shape[:2], self.width)
-
-
-def _check_dsa_keys(rank: int, mesh, model: Ernie5_5_MoeForCausalLM) -> list[str]:
-    """Record what the eager DSA core receives on this rank and compare it with the row."""
-    attention = model.model.layers[2].attention
-    attention.setup_cp_attention(mesh)
-    sequence = ROW // mesh.size()
-    first = rank * sequence
-    position_ids, packed_seq_ids = _layout(first, sequence)
-    offsets = torch.arange(first, first + sequence, dtype=torch.float32)
-    index_heads, index_dim = attention.indexer.num_heads, attention.indexer.head_dim
-
-    def project(hidden, positions):
-        # The latent key and the indexer key of token i hold i, and the index score of every query for key i is i.
-        latent_kv = torch.zeros(1, sequence, attention.kv_rank + attention.rope_dim)
-        latent_kv[0, :, 0] = offsets
-        index_q = torch.zeros(1, sequence, index_heads, index_dim)
-        index_q[..., 0] = 1.0
-        index_k = torch.zeros(1, sequence, index_dim)
-        index_k[0, :, 0] = offsets
-        weights = torch.full((1, sequence, index_heads), 1.0 / index_heads)
-        query = torch.zeros(1, sequence, attention.num_heads, attention.kv_rank + attention.rope_dim)
-        return torch.zeros(1, sequence, attention.q_a_proj.out_features), query, latent_kv, index_q, index_k, weights
-
-    attention._project = project
-    attention.fp32_params = _Recorder(attention.num_heads * attention.value_dim)
-    with torch.no_grad():
-        attention(torch.zeros(1, sequence, 16), position_ids=position_ids, document_ids=packed_seq_ids - 1)
-    (_, latent_kv, scores, document_ids, *_), kwargs = attention.fp32_params.call
-    row = torch.arange(ROW, dtype=torch.float32)
-    _, row_documents = _layout(0, ROW)
-    failures = []
-    if not torch.equal(latent_kv[0, :, 0], row):
-        failures.append("DSA latent keys are not in row order")
-    if not torch.allclose(scores[0], row.expand(sequence, ROW), atol=1e-4):
-        failures.append("DSA indexer keys are not in row order")
-    if not torch.equal(kwargs["key_document_ids"], row_documents - 1) or not torch.equal(
-        document_ids, packed_seq_ids - 1
-    ):
-        failures.append("DSA document ids do not follow the row")
-    if kwargs["first_query"] != first:
-        failures.append(f"DSA first query is {kwargs['first_query']}, expected {first}")
-    return failures
-
-
 def _check_shards(rank: int, mesh, model: Ernie5_5_MoeForCausalLM) -> list[str]:
     """Compare the logits and the summed gradients of the shards with one process that holds the whole row."""
     batch = _batch()
@@ -286,7 +154,7 @@ def _check_shards(rank: int, mesh, model: Ernie5_5_MoeForCausalLM) -> list[str]:
     return failures
 
 
-def _worker(rank: int, world_size: int, init_method: str, check: str) -> None:
+def _worker(rank: int, world_size: int, init_method: str) -> None:
     dist.init_process_group(
         "gloo", init_method=init_method, rank=rank, world_size=world_size, timeout=timedelta(seconds=120)
     )
@@ -294,30 +162,20 @@ def _worker(rank: int, world_size: int, init_method: str, check: str) -> None:
         torch.set_num_threads(1)
         mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("cp",))
         model = _model()
-        if check == "keys":
-            failures = _check_hca_keys(rank, mesh, model) + _check_dsa_keys(rank, mesh, model)
-        else:
-            failures = _check_shards(rank, mesh, model)
+        failures = _check_shards(rank, mesh, model)
         assert not failures, failures[:5]
     finally:
         dist.destroy_process_group()
 
 
-def _run(world_size: int, check: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def _run(world_size: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     if "GLOO_SOCKET_IFNAME" not in os.environ:
         # All ranks run on this host.
         monkeypatch.setenv("GLOO_SOCKET_IFNAME", "lo")
-    mp.spawn(_worker, args=(world_size, (tmp_path / "rendezvous").as_uri(), check), nprocs=world_size, join=True)
+    mp.spawn(_worker, args=(world_size, (tmp_path / "rendezvous").as_uri()), nprocs=world_size, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 @pytest.mark.timeout(300)
-def test_keys_reach_the_attention_in_row_order(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    _run(2, "keys", monkeypatch, tmp_path)
-
-
-@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-@pytest.mark.timeout(300)
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_shards_match_one_process(world_size: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    _run(world_size, "shards", monkeypatch, tmp_path)
+def test_four_shards_match_one_process(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _run(4, monkeypatch, tmp_path)

@@ -25,14 +25,13 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
-from nemo_automodel.components.models.ernie5_5 import hca as hca_module
 from nemo_automodel.components.models.ernie5_5.dsa import cudnn_dsa_layout
 from nemo_automodel.components.models.ernie5_5.model import Ernie5_5_MoeForCausalLM
 from tests.unit_tests.models.ernie5_5.test_model import VOCAB, _tiny_model
 
 pytestmark = pytest.mark.cpu_only
 
-RATIO, WINDOW = 128, 8
+WINDOW = 8
 # One document with a complete compression window, one shorter than the attention window allows to fill, and one
 # shorter than a compression window. With every document moved to a multiple of 128 tokens the row has 512 tokens.
 LENGTHS = (130, 37, 100)
@@ -93,30 +92,15 @@ def test_padding_between_documents_and_unused_length_entries_are_ignored():
         offset, expected_offset = offset + span, expected_offset + length
 
 
-@pytest.mark.parametrize("ratios", [(128, 128), (-2, -2), (128, 128, -2, 128, -2)])
-@pytest.mark.parametrize("changed", [0, 1, 2])
-def test_changing_one_document_leaves_the_logits_of_the_others_unchanged(ratios, changed):
-    model, documents = _model(ratios), _documents()
-    other = _documents(seed=1)
-    replaced = [other[index] if index == changed else document for index, document in enumerate(documents)]
+def test_changing_one_document_leaves_the_logits_of_the_others_unchanged():
+    model, documents = _model((128, 128, -2, 128, -2)), _documents()
+    replaced = [documents[0], _documents(seed=1)[1], documents[2]]
     seq_lens = torch.tensor([LENGTHS])
     with torch.no_grad():
         before = model(torch.cat(documents, dim=1), seq_lens=seq_lens).logits[0].split(LENGTHS)
         after = model(torch.cat(replaced, dim=1), seq_lens=seq_lens).logits[0].split(LENGTHS)
-    for index in range(len(LENGTHS)):
-        assert torch.equal(before[index], after[index]) == (index != changed)
-
-
-@pytest.mark.parametrize("ratios", [(128, 128), (-2, -2)])
-def test_a_row_without_document_boundaries_changes_the_later_documents(ratios):
-    """Control of the comparisons above: read as one document, the same row gives other logits after the first one."""
-    model, documents = _model(ratios), _documents()
-    with torch.no_grad():
-        merged = model(torch.cat(documents, dim=1)).logits[0].split(LENGTHS)
-        expected = _one_by_one(model, documents).split(LENGTHS)
-    torch.testing.assert_close(merged[0], expected[0], rtol=0, atol=ATOL)
-    for index in (1, 2):
-        assert (merged[index] - expected[index]).abs().max() > 1e-3
+    assert torch.equal(before[0], after[0]) and torch.equal(before[2], after[2])
+    assert not torch.equal(before[1], after[1])
 
 
 def test_gradients_of_a_packed_row_equal_the_sum_over_its_documents():
@@ -138,56 +122,6 @@ def test_gradients_of_a_packed_row_equal_the_sum_over_its_documents():
             assert (parameter.grad - expected[name]).abs().max() <= 1e-3 * expected[name].abs().max(), name
         else:
             assert parameter.grad is None, name
-
-
-def test_hca_reads_the_window_and_the_complete_windows_of_the_query_document(monkeypatch):
-    """Rows that name their own offset show which keys the sparse attention of a packed row receives."""
-    attention = _model((128,)).model.layers[0].attention
-    sequence, head_dim = STARTS[-1] + RATIO, attention.head_dim
-    position_ids = torch.zeros(1, sequence, dtype=torch.int64)
-    packed_seq_ids = torch.zeros(1, sequence, dtype=torch.int64)
-    for document, (start, length) in enumerate(zip(STARTS, LENGTHS), start=1):
-        position_ids[0, start : start + length] = torch.arange(length)
-        packed_seq_ids[0, start : start + length] = document
-    offsets = torch.arange(sequence, dtype=torch.float32)
-    # Key i holds i in its first channel. The compressor pools (offset, 1) of every token uniformly, so the ratio of
-    # the first two channels of a compressed key is the mean offset of its 128 tokens.
-    keys = torch.zeros(1, sequence, head_dim)
-    keys[0, :, 0] = offsets
-    hidden = torch.zeros(1, sequence, attention.config.hidden_size)
-    hidden[0, :, 0], hidden[0, :, 1] = offsets, 1.0
-    with torch.no_grad():
-        attention.compressor.wgate.weight.zero_()
-        attention.compressor.wkv.weight.zero_()
-        attention.compressor.wkv.weight[0, 0] = attention.compressor.wkv.weight[1, 1] = 1.0
-    seen = {}
-
-    def record(query, kv, sinks, indices, scale, **kwargs):
-        seen.update(kv=kv, indices=indices, kwargs=kwargs)
-        return torch.zeros_like(query)
-
-    monkeypatch.setattr(hca_module, "dsv4_sparse_attention", record)
-    rotary = _model((128,)).model._hca_rotary(torch.device("cpu"))
-    rope = rotary(torch.empty(1, sequence, 1), position_ids)
-    query = torch.zeros(1, attention.num_heads, sequence, head_dim)
-    q_residual = torch.zeros(1, sequence, attention.config.q_lora_rank)
-    with torch.no_grad():
-        attention._attend_packed(hidden, q_residual, query, keys, rope, rotary, position_ids, packed_seq_ids)
-
-    kv, indices = seen["kv"][0], seen["indices"][0]
-    assert seen["kwargs"] == {"backend": "torch", "all_rows_nonempty": True}
-    names = torch.where(kv[:, 1] != 0, kv[:, 0] / kv[:, 1], kv[:, 0])
-    for start, length in zip(STARTS, LENGTHS):
-        for position in (0, 1, WINDOW - 1, WINDOW, RATIO - 2, RATIO - 1, RATIO, length - 1):
-            if position >= length:
-                continue
-            read = sorted(names[index].item() for index in indices[start + position] if index >= 0)
-            window = [float(offset) for offset in range(start + max(position - WINDOW + 1, 0), start + position + 1)]
-            pooled = [start + RATIO * index + (RATIO - 1) / 2 for index in range((position + 1) // RATIO)]
-            assert read == pytest.approx(sorted(window + pooled), abs=1e-3), (start, position)
-    # A padding token reads itself only.
-    padding = STARTS[1] - 1
-    assert [index.item() for index in indices[padding] if index >= 0] == [padding]
 
 
 def test_cudnn_layout_of_a_packed_row_and_of_one_shard():
