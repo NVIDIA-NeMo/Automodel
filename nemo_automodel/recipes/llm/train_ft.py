@@ -735,16 +735,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # damaged (embedding_row_repair wouldn't touch them), just duplicated copies of one
             # placeholder vector in the base checkpoint, so every depth needs its own random row.
             randomize_embedding_rows(model, list(self.cfg.gated_mtp.mask_token_ids), seed=self.cfg.get("seed", 42))
-            # The sampler (arXiv:2507.11851 Sec. 2.3) is attached here, before sharding: it's a
-            # new submodule (not a structural replacement like a wrapped embedding would be), so
-            # it needs to exist before optimizer.build() collects trainable parameters below, and
-            # multi-GPU FSDP2 sharding of a late-attached module is unsupported, hence the guard.
-            if self.dist_env.world_size > 1:
-                raise NotImplementedError("gated_mtp's sampler does not support multi-GPU yet (world_size > 1).")
-            model.gated_mtp_sampler = GatedMTPSampler(
-                hidden_size=model.config.hidden_size,
-                num_depths=len(self.cfg.gated_mtp.mask_token_ids),
-            ).to(device=next(model.parameters()).device, dtype=next(model.parameters()).dtype)
+            # The sampler (arXiv:2507.11851 Sec. 2.3) is only ever read in distillation_mode="soft"
+            # (see the `distillation_mode == "soft"` gate around _gated_mtp_sampler_logits below);
+            # hard mode's CE loss never touches it. Only attach it when it's actually needed, so
+            # hard-mode (the original, non-distillation gated-MTP loss) training isn't blocked by a
+            # restriction that exists solely for the sampler.
+            if getattr(self.cfg.mtp, "distillation_mode", "hard") == "soft":
+                # Attached here, after `build_model()` has already applied FSDP2 sharding (for
+                # NeMoAutoModel targets, infra runs inside `from_pretrained`/`from_config`): it's a
+                # new submodule (not a structural replacement like a wrapped embedding would be), so
+                # it needs to exist before optimizer.build() collects trainable parameters below, and
+                # multi-GPU FSDP2 sharding of a late-attached module is unsupported, hence the guard.
+                if self.dist_env.world_size > 1:
+                    raise NotImplementedError("gated_mtp's sampler does not support multi-GPU yet (world_size > 1).")
+                model.gated_mtp_sampler = GatedMTPSampler(
+                    hidden_size=model.config.hidden_size,
+                    num_depths=len(self.cfg.gated_mtp.mask_token_ids),
+                ).to(device=next(model.parameters()).device, dtype=next(model.parameters()).dtype)
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
