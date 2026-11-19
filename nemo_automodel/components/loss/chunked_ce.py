@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -23,7 +24,13 @@ from torch import nn
 from torch.distributed.fsdp import FSDPModule
 from transformers import PretrainedConfig
 
-from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import (
+    LinearCrossEntropy,
+    ShardedLMHeadWeight,
+    TorchVocabChunkKernel,
+    _chunk_logits,
+    sharded_linear_cross_entropy,
+)
 from nemo_automodel.components.models.common.lm_head import LMHead, LogitsProjection
 
 
@@ -76,17 +83,7 @@ def _linear_cross_entropy(
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    logits = F.linear(hidden.to(weight.dtype), weight) if projection is None else projection(hidden, weight)
-    if projection is not None and projection.logits_dtype in (torch.float16, torch.bfloat16):
-        # The head rounds its FP32 GEMM output to logits_dtype: keep that boundary too.
-        torch._dynamo.graph_break()
-    if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:
-        logits = logits.to(logits_dtype)
-        # Materialize the model-owned rounding boundary: Inductor otherwise
-        # elides the lowp -> FP32 round-trip into CE, changing loss and grads.
-        torch._dynamo.graph_break()
-    elif logits_dtype is not None:
-        logits = logits.to(logits_dtype)
+    logits = _chunk_logits(hidden, weight, None, logits_dtype, projection)
     return compute_cross_entropy(logits, labels, ignore_index, "none")
 
 
@@ -250,8 +247,8 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         *,
         model_config: PretrainedConfig | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
-    ) -> torch.Tensor:
-        """Materialize one head in its effective projection dtype for all losses.
+    ) -> torch.Tensor | ShardedLMHeadWeight:
+        """Resolve one head in its effective projection dtype for all losses.
 
         Args:
             lm_head: Plain linear head with weight of global shape [vocab, hidden].
@@ -260,22 +257,25 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             grad_reduce_group: Group contributing independent token losses.
 
         Returns:
-            Dense [vocab, hidden] weight under ``materialize_lm_weight``'s
-            gradient contract. Share this tensor across main and MTP losses;
-            a dtype conversion allocates once and remains differentiable.
+            The ``resolve_lm_weight`` result in the compute dtype. A dense
+            [vocab, hidden] weight is converted once and stays differentiable,
+            so share it across main and MTP losses. A sharded head records the
+            dtype and casts each streamed chunk instead.
         """
         lm_head = self.validate_lm_head(lm_head, model_config=model_config)
         compute_dtype = lm_head.weight.dtype
         if isinstance(lm_head, FSDPModule):
             compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype or compute_dtype
-        weight = self.materialize_lm_weight(lm_head.weight, grad_reduce_group=grad_reduce_group)
+        weight = self.resolve_lm_weight(lm_head.weight, grad_reduce_group=grad_reduce_group)
+        if isinstance(weight, ShardedLMHeadWeight):
+            return dataclasses.replace(weight, dtype=compute_dtype)
         return weight.to(compute_dtype)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
-        lm_weight: torch.Tensor,
+        lm_weight: torch.Tensor | ShardedLMHeadWeight,
         num_label_tokens: int | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
         loss_weights: torch.Tensor | None = None,
@@ -291,9 +291,11 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
                 leading token dimensions, including packed [tokens, hidden].
             labels: Target indices shaped [...] matching the token dimensions,
                 or [tokens] for packed hidden states shaped [1, tokens, hidden].
-            lm_weight: Weight shaped [vocab, hidden]; FSDP DTensors use the
-                LinearCrossEntropy.materialize_lm_weight contract. TP-sharded
-                vocabulary/hidden states are not supported by this loss.
+            lm_weight: Weight shaped [vocab, hidden]: a dense tensor, an
+                FSDP/HSDP DTensor sharded on the vocabulary axis, or its
+                ShardedLMHeadWeight. A sharded weight is streamed in vocabulary
+                chunks and never gathered whole. TP-sharded vocabulary/hidden
+                states are not supported by this loss.
             num_label_tokens: Global count normalizing a sum-reduced loss.
             grad_reduce_group: DP/CP group contributing independent token losses.
             loss_weights: Optional constant multipliers shaped [...], sum only.
@@ -311,7 +313,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             hidden_states = hidden_states.squeeze(0)
         if hidden_states.shape[:-1] != labels.shape:
             raise ValueError("hidden_states token dimensions must match labels.shape")
-        if lm_weight.ndim != 2 or hidden_states.shape[-1] != lm_weight.shape[-1]:
+        if len(lm_weight.shape) != 2 or hidden_states.shape[-1] != lm_weight.shape[-1]:
             raise ValueError("lm_weight must have shape [vocab, hidden] matching hidden_states")
         if (num_label_tokens is not None or loss_weights is not None) and self.reduction != "sum":
             raise ValueError("num_label_tokens and loss_weights are only supported when reduction is 'sum'")
@@ -322,16 +324,35 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             labels = labels.masked_fill(mask.to(labels.device) == 0, self.ignore_index)
         if loss_weights is not None and loss_weights.shape != labels.shape:
             raise ValueError("loss_weights.shape must match labels.shape")
-        weight = self.materialize_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
-        losses = _ChunkedLinearCE.apply(
-            hidden_states.reshape(-1, hidden_states.shape[-1]),
-            weight,
-            labels.reshape(-1),
-            self.chunk_len,
-            self.ignore_index,
-            logits_dtype,
-            partial(self._compute_loss, projection=projection),
-        ).reshape(labels.shape)
+        weight = self.resolve_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
+        if isinstance(weight, ShardedLMHeadWeight):
+            # Trim the global vocabulary before gathering. Chunk-local row numbers cannot identify padded tokens.
+            if projection is not None and projection.unpadded_vocab_size is not None:
+                weight = dataclasses.replace(weight, vocab_size=min(weight.shape[0], projection.unpadded_vocab_size))
+                projection = dataclasses.replace(projection, unpadded_vocab_size=None)
+            losses = sharded_linear_cross_entropy(
+                hidden_states.reshape(-1, hidden_states.shape[-1]),
+                labels.reshape(-1),
+                weight,
+                kernel=TorchVocabChunkKernel(
+                    token_block=self.chunk_len,
+                    softcap=None,
+                    logits_dtype=logits_dtype,
+                    compile=self.compile,
+                    projection=projection,
+                ),
+                ignore_index=self.ignore_index,
+            ).reshape(labels.shape)
+        else:
+            losses = _ChunkedLinearCE.apply(
+                hidden_states.reshape(-1, hidden_states.shape[-1]),
+                weight,
+                labels.reshape(-1),
+                self.chunk_len,
+                self.ignore_index,
+                logits_dtype,
+                partial(self._compute_loss, projection=projection),
+            ).reshape(labels.shape)
         if loss_weights is not None:
             losses = losses * loss_weights.to(device=losses.device, dtype=torch.float32)
         if self.reduction == "none":

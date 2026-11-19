@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the MTP-loss LM-head gather-once optimization.
+"""Tests that ``calculate_mtp_loss`` prepares the LM head once for every depth.
 
 ``calculate_mtp_loss`` dispatches each MTP depth through ``calculate_loss``.
-On the ``FusedLinearCrossEntropy`` path, ``calculate_loss`` materializes the LM
-head via ``DTensor.full_tensor()`` (an all-gather) because cut_cross_entropy
-needs the dense ``[vocab, hidden]`` weight. Re-gathering it for the main loss
-*and* every MTP depth left ``1 + D`` gathered copies retained for backward,
-which accumulate on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra,
-256k vocab; eos job 344476745). The fix gathers the head ONCE and threads it
-through the main loss and all depths via the new ``lm_weight`` argument.
+On the linear CE path the head is prepared once with ``prepare_lm_weight`` and
+threaded through the main loss and all depths via the ``lm_weight`` argument:
+a dense head is converted once and shared, and a sharded DTensor head is
+streamed in vocabulary chunks by each depth instead of being gathered (covered
+across real ranks by ``test_linear_ce_streamed.py``). Before that threading,
+each depth gathered its own copy, and ``1 + D`` copies retained for backward
+OOMed large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab; eos job 344476745).
 
-These tests assert the change is (a) numerically identical to gathering per
-depth, (b) gathers the head exactly once, (c) is a no-op gather when the weight
-is supplied, (d) preserves gradients, and (e) still works for the sharded
-DTensor LM head where the OOM occurred.
+These tests assert the threading is (a) numerically identical to resolving the
+head per depth, (b) looks the head up exactly once, (c) skips the lookup when
+the weight is supplied, and (d) preserves gradients.
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ IGN, SF, NLT = -100, 0.1, 20
 def ref_cce(monkeypatch):
     """Run the FusedLinearCrossEntropy path on CPU with a reference torch CE.
 
-    We are validating the LM-head gather threading, not the cut_cross_entropy
+    We are validating the LM-head threading, not the cut_cross_entropy
     kernel, so a dense reference matmul+CE (matching cut_cross_entropy's
     sum-reduction / shift=False contract) is the right oracle and keeps the
     test CPU-only.
@@ -119,7 +118,7 @@ def _inputs(requires_grad=False, seed=0):
 
 
 def _count_gathers():
-    """Count weight retrievals at the shared materialization boundary."""
+    """Count weight retrievals at the shared preparation boundary."""
     n = {"c": 0}
     real = _lutils._get_lm_head_weight
 
@@ -201,7 +200,7 @@ def test_lm_head_gathered_once(ref_cce):
             num_label_tokens=NLT,
             ignore_index=IGN,
         )
-    assert n["c"] == 1, f"expected exactly 1 LM-head gather, got {n['c']} (pre-fix == 1+D up the stack)"
+    assert n["c"] == 1, f"expected exactly 1 LM-head lookup, got {n['c']} (pre-fix == 1+D up the stack)"
 
 
 def test_lm_weight_passthrough_skips_gather(ref_cce):
@@ -220,7 +219,7 @@ def test_lm_weight_passthrough_skips_gather(ref_cce):
             ignore_index=IGN,
             lm_weight=m.lm_head.weight.detach(),
         )
-    assert n["c"] == 0, f"caller-supplied lm_weight must avoid any gather, got {n['c']}"
+    assert n["c"] == 0, f"caller-supplied lm_weight must avoid any lookup, got {n['c']}"
 
 
 def test_mtp_loss_grads_match_reference(ref_cce):
@@ -285,7 +284,7 @@ def test_pipeline_loss_fused_ce_with_mtp_tuple_raises():
 
 
 def test_non_fused_path_does_not_gather_lm_head():
-    """Logit-based losses (non-Fused) must not trigger the LM-head weight gather."""
+    """Logit-based losses (non-Fused) must not look up the LM-head weight."""
     hs, labels = _inputs()
 
     def fake_calc(loss_fn, **kw):  # avoid invoking a real loss
@@ -298,7 +297,7 @@ def test_non_fused_path_does_not_gather_lm_head():
     with (
         mock.patch.object(_mtp, "calculate_loss", side_effect=fake_calc),
         mock.patch.object(
-            _lutils, "_get_lm_head_weight", side_effect=AssertionError("non-fused path must not gather the LM head")
+            _lutils, "_get_lm_head_weight", side_effect=AssertionError("non-fused path must not look up the LM head")
         ),
     ):
         calculate_mtp_loss(
@@ -309,52 +308,3 @@ def test_non_fused_path_does_not_gather_lm_head():
             scaling_factor=SF,
             ignore_index=IGN,
         )
-
-
-def test_sharded_lm_head_gathers_once_and_matches(ref_cce):
-    """Sharded DTensor LM head (the OOM scenario): exactly one all-gather, and
-    loss + grads match the unsharded reference."""
-    from torch.distributed import Backend
-
-    if "threaded" not in getattr(Backend, "backend_type_map", {}):
-        pytest.skip("threaded c10d backend unavailable in this torch build")
-    try:
-        from tests.unit_tests.distributed.test_grad_utils import spawn_threads_and_init_comms
-    except Exception as e:  # pragma: no cover
-        pytest.skip(f"threaded dist harness unavailable: {e}")
-
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Shard, distribute_tensor
-
-    @spawn_threads_and_init_comms(world_size=2)
-    def _body(self=None):
-        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
-        torch.manual_seed(0)
-        W_full = torch.randn(V, H)
-        hs = [torch.randn(B, S, H, requires_grad=True) for _ in range(D)]
-        labels = torch.randint(0, V, (B, S))
-        m = _TinyModel(weight=distribute_tensor(W_full.clone(), mesh, [Shard(0)]))
-
-        n, patch_weight = _count_gathers()
-        with patch_weight:
-            loss = calculate_mtp_loss(
-                FusedLinearCrossEntropy(reduction="sum"),
-                mtp_per_depth_h=hs,
-                labels=labels,
-                model=m,
-                scaling_factor=SF,
-                num_label_tokens=NLT,
-                ignore_index=IGN,
-            )
-        loss.backward()
-        assert n["c"] == 1, f"sharded head must gather once, got {n['c']}"
-
-        W2 = W_full.clone().requires_grad_(True)
-        hs2 = [h.detach().clone().requires_grad_(True) for h in hs]
-        _reference_mtp_loss(hs2, labels, W2).backward()
-        torch.testing.assert_close(
-            loss, _reference_mtp_loss([h.detach() for h in hs], labels, W_full), rtol=1e-5, atol=1e-6
-        )
-        torch.testing.assert_close(m.lm_head.weight.grad.full_tensor(), W2.grad, rtol=1e-4, atol=1e-6)
-
-    _body()

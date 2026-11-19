@@ -495,6 +495,35 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
     assert materialized == [(None, 2)]
 
 
+def test_llm_teacher_pp_returns_none_off_the_transport_rank(monkeypatch):
+    monkeypatch.setattr(
+        llm_kd,
+        "ContextParallelSharder",
+        lambda model, mesh, batch, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+    )
+    # Ranks other than the transport rank only send their shards and receive nothing back.
+    monkeypatch.setattr(llm_kd, "materialize_teacher_logits", lambda logits, **kwargs: None)
+    teacher_model = SimpleNamespace(_teacher_logits_capture=[[torch.ones(1, 3, 4), torch.ones(1, 3, 4)]])
+    teacher_pp = SimpleNamespace(
+        info=SimpleNamespace(
+            has_first_stage=True, has_last_stage=True, schedule=SimpleNamespace(eval=lambda *a, **k: None)
+        ),
+        update_seq_len=lambda sequence_length: None,
+    )
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
+    recipe.device_mesh = None
+    recipe.teacher_model = teacher_model
+    recipe.teacher_pp = teacher_pp
+    recipe.pp_enabled = True
+
+    logits = recipe._teacher_forward_separate(
+        {"input_ids": torch.ones(1, 3, dtype=torch.long), "labels": torch.ones(1, 3, dtype=torch.long)}
+    )
+
+    assert logits is None
+
+
 def test_llm_teacher_pp_updates_stage_shapes_for_variable_length_waves(monkeypatch):
     monkeypatch.setattr(
         llm_kd,

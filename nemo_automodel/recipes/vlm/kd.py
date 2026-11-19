@@ -282,8 +282,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         return teacher_logits
 
     @torch.no_grad()
-    def _teacher_forward_separate(self, batch: dict[str, Any]) -> torch.Tensor:
-        """Run one teacher VLM batch and materialize full logits.
+    def _teacher_forward_separate(self, batch: dict[str, Any]) -> torch.Tensor | None:
+        """Run one teacher VLM batch and materialize full logits on the transport rank.
 
         Args:
             batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
@@ -293,7 +293,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
         Returns:
             Detached tensor of shape ``[batch, sequence, vocab]`` containing
-            full teacher logits with CP padding removed.
+            full teacher logits with CP padding removed on the teacher replica's
+            transport rank; None on the other TP/CP ranks, which only send
+            their shards.
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]

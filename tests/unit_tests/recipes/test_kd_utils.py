@@ -159,7 +159,8 @@ def test_loss_comparator_rejects_mismatched_kd_settings():
         _compare_pair("teacher_tp2", [baseline], [candidate], 0.01, 0.01)
 
 
-def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch):
+@pytest.mark.parametrize("is_first_cp_rank", [True, False])
+def test_materialize_teacher_logits_gathers_cp_and_removes_padding(monkeypatch, is_first_cp_rank):
     cp_mesh = SimpleNamespace(size=lambda: 2)
 
     class Mesh:
@@ -171,8 +172,8 @@ def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch)
 
     local = torch.tensor([[[1.0], [2.0]]])
 
-    def unshard(mesh, tensor, *, seq_dim):
-        """Expand local logits to the full sequence.
+    def gather(mesh, tensor, *, seq_dim):
+        """Assemble local logits on the first CP rank.
 
         Args:
             mesh: Mock context-parallel mesh.
@@ -182,18 +183,21 @@ def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch)
 
         Returns:
             Tensor of shape ``[batch=1, sequence=4, vocab=1]`` containing full
-            logits.
+            logits on the first CP rank, otherwise None.
         """
         assert mesh is cp_mesh
-        assert tensor is local
+        assert torch.equal(tensor, local)
         assert seq_dim == 1
-        return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]])
+        return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]]) if is_first_cp_rank else None
 
-    monkeypatch.setattr(kd_utils, "unshard_context_parallel_tensor", unshard)
+    monkeypatch.setattr(kd_utils, "gather_context_parallel_tensor", gather)
 
     result = kd_utils.materialize_teacher_logits(local, device_mesh=Mesh(), sequence_length=3)
 
-    assert torch.equal(result, torch.tensor([[[1.0], [2.0], [3.0]]]))
+    if is_first_cp_rank:
+        assert torch.equal(result, torch.tensor([[[1.0], [2.0], [3.0]]]))
+    else:
+        assert result is None
 
 
 def test_shared_kd_setup_keeps_existing_world(monkeypatch):
@@ -382,28 +386,6 @@ def test_kd_mesh_bridge_command_sync_and_non_dtensor_vocab(monkeypatch):
     assert bridge.match_student_vocab_shard(torch.randn(1, 2, 3), teacher_logits) is teacher_logits
     assert broadcasts[0][1] == {"src": 0, "group": bridge.control_group}
     assert barriers == [{"group": bridge.control_group}]
-
-
-def test_match_student_vocab_shard_selects_local_dtensor_chunk(monkeypatch):
-    class FakeShard:
-        def __init__(self, dim):
-            self.dim = dim
-
-    class FakeDTensor:
-        ndim = 3
-        placements = (FakeShard(-1),)
-        device_mesh = SimpleNamespace(get_group=lambda mesh_dim: f"group-{mesh_dim}")
-
-    monkeypatch.setattr(kd_utils, "DTensor", FakeDTensor)
-    monkeypatch.setattr(kd_utils, "Shard", FakeShard)
-    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group: 1)
-    teacher_logits = torch.arange(8).reshape(1, 2, 4)
-
-    result = kd_utils.KDMeshBridge.match_student_vocab_shard(FakeDTensor(), teacher_logits)
-
-    assert torch.equal(result, teacher_logits[..., 2:])
-    assert result.is_contiguous()
 
 
 def test_broadcast_tree_covers_source_receiver_and_nonmember(monkeypatch):
