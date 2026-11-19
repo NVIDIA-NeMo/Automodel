@@ -102,6 +102,23 @@ from nemo_automodel.shared.utils import dtype_from_str
 _VHA_RANK = 16
 
 
+def _require_labels_within_documents(
+    seq_lens: torch.Tensor, seq_lens_padded: torch.Tensor | None, labels: torch.Tensor
+) -> None:
+    """Reject supervised labels in the padding of a packed row: the layout drops them after they were counted."""
+    lengths = seq_lens.clamp_min(0)
+    spans = lengths if seq_lens_padded is None else seq_lens_padded.clamp_min(0)
+    starts = spans.cumsum(dim=-1) - spans
+    positions = torch.arange(labels.shape[-1], device=labels.device)
+    real = ((positions >= starts.unsqueeze(-1)) & (positions < (starts + lengths).unsqueeze(-1))).any(dim=-2)
+    dropped = (labels != -100) & ~real.to(labels.device)
+    if bool(dropped.any()):
+        raise ValueError(
+            f"{int(dropped.sum())} supervised labels of a packed row lie in document padding, which the packed "
+            "layout drops after the loss has counted them: set them to -100"
+        )
+
+
 def _require_full_row_spans(seq_lens: torch.Tensor, seq_lens_padded: torch.Tensor | None, row_length: int) -> None:
     """Reject packed rows whose document spans do not add up to the row length."""
     spans = seq_lens if seq_lens_padded is None else seq_lens_padded
@@ -871,14 +888,20 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             The sharder, under the key ``cp_sharder``.
 
         Raises:
-            ValueError: If the document spans of a packed row do not add up to its length.
+            ValueError: If the document spans of a packed row do not add up to its length, or a supervised
+                label lies in the padding of a document.
         """
         del num_chunks
         seq_lens = batch.get("seq_lens")
         if seq_lens is not None:
-            # The shared sharder accepts spans that cover only a prefix of the row and drops the uncovered
-            # labels after the recipe has counted them, so the check of ``forward`` also runs here.
-            _require_full_row_spans(seq_lens, batch.get("seq_lens_padded"), batch["input_ids"].shape[1])
+            # The shared sharder accepts spans that cover only a prefix of the row, and drops the labels of
+            # uncovered positions and of document padding after the recipe has counted them, so both checks
+            # run here.
+            seq_lens_padded = batch.get("seq_lens_padded")
+            _require_full_row_spans(seq_lens, seq_lens_padded, batch["input_ids"].shape[1])
+            labels = batch.get("labels")
+            if labels is not None:
+                _require_labels_within_documents(seq_lens, seq_lens_padded, labels)
         return {
             "cp_sharder": ContextParallelSharder(
                 shard_batch=partial(

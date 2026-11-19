@@ -255,7 +255,9 @@ def test_moe_meta_initialization_and_fp32_guard():
 
 
 def test_moe_ignores_a_context_parallel_mesh_and_rejects_unsharded_distributed_execution(monkeypatch):
+    torch.manual_seed(5571)
     model = _moe_model()
+    model.init_weights(torch.device("cpu"))
     inputs = torch.zeros(2, 4)
     model.cp_mesh = object()
     assert torch.equal(model(inputs, cp_mesh=object()), model(inputs))

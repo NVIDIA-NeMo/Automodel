@@ -246,6 +246,37 @@ def test_sharder_hook_rejects_document_spans_that_do_not_cover_the_row():
         model.prepare_model_inputs_for_cp(batch)
 
 
+def test_sharder_hook_rejects_supervised_labels_in_document_padding():
+    """Labels in the padding of a document would be counted by the loss and then dropped by the layout."""
+    model = _model((128,))
+    row = torch.randint(1, VOCAB, (1, 256), generator=torch.Generator().manual_seed(3))
+    batch = {
+        "input_ids": row,
+        "labels": row.clone(),
+        "seq_lens": torch.tensor([[128]]),
+        "seq_lens_padded": torch.tensor([[256]]),
+        "qkv_format": "thd",
+    }
+    with pytest.raises(ValueError, match="128 supervised labels .* document padding"):
+        model.prepare_model_inputs_for_cp(batch)
+    batch["labels"][:, 128:] = -100
+    assert "cp_sharder" in model.prepare_model_inputs_for_cp(batch)
+    # Padding between documents counts as well: documents of 130 and 100 tokens in spans of 136 and 120.
+    two = {
+        "input_ids": row,
+        "labels": row.clone(),
+        "seq_lens": torch.tensor([[130, 100]]),
+        "seq_lens_padded": torch.tensor([[136, 120]]),
+        "qkv_format": "thd",
+    }
+    two["labels"][:, 130:136] = -100
+    two["labels"][:, 236:] = -100
+    assert "cp_sharder" in model.prepare_model_inputs_for_cp(two)
+    two["labels"][0, 133] = 7
+    with pytest.raises(ValueError, match="1 supervised labels .* document padding"):
+        model.prepare_model_inputs_for_cp(two)
+
+
 def test_positions_that_do_not_restart_in_every_aligned_document_are_rejected():
     model, documents = _model((128, -2)), _documents()
     row = torch.cat((documents[0], documents[0].new_zeros(1, 126), documents[1], documents[0].new_zeros(1, 91)), dim=1)
