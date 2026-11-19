@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import sys
 import types
 from contextlib import nullcontext
@@ -424,7 +425,7 @@ class _TensorModel(torch.nn.Module):
 def test_run_train_step_supports_tensor_outputs(monkeypatch: pytest.MonkeyPatch, grad_norm_backend: str | None) -> None:
     """Check tensor outputs and norm backend selection through a native optimizer step."""
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.dist_env = SimpleNamespace(device="cpu", world_size=1)
     recipe.device_mesh = None
     recipe.moe_mesh = None
     recipe.loss_fn = object()
@@ -576,7 +577,7 @@ def test_forward_backward_step_rejects_mrope_thd_with_context_parallelism():
 def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.dist_env = SimpleNamespace(device="cpu", rank=0, is_main=False)
+    recipe.dist_env = SimpleNamespace(device="cpu", rank=0, is_main=False, world_size=2)
     # No "pp" in dim_names -> src_rank = mesh.reshape(-1)[-1].item(). With rank != src_rank
     # and is_main=False, neither distributed send nor recv branch fires.
     recipe.device_mesh = SimpleNamespace(mesh=torch.tensor([1]), mesh_dim_names=("dp",))
@@ -670,6 +671,49 @@ def test_run_train_step_clears_first_microbatch_after_first_batch(monkeypatch):
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("dp_size", "cp_size", "pp_size", "tp_size", "expected_tps_per_gpu"),
+    [
+        pytest.param(1, 1, 1, 1, 2.0, id="single-rank"),
+        pytest.param(4, 2, 1, 1, 1.0, id="dp-cp"),
+        pytest.param(4, 2, 2, 1, 0.5, id="dp-cp-pp"),
+        pytest.param(4, 2, 1, 2, 0.5, id="dp-cp-tp"),
+        pytest.param(4, 2, 2, 2, 0.25, id="dp-cp-pp-tp"),
+        pytest.param(1, 32, 2, 1, 0.03125, id="cp32-pp2"),
+    ],
+)
+def test_run_train_step_tps_per_gpu_counts_all_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+    dp_size: int,
+    cp_size: int,
+    pp_size: int,
+    tp_size: int,
+    expected_tps_per_gpu: float,
+) -> None:
+    """Global throughput must account for every physical rank, including PP and TP."""
+    recipe, batches = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=4)
+    recipe.pp_enabled = pp_size > 1
+    recipe.dist_env.world_size = dp_size * cp_size * pp_size * tp_size
+    recipe._get_dp_group_size = lambda include_cp=False: dp_size * (cp_size if include_cp else 1)
+    recipe._get_cp_group_size = lambda: cp_size
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor * dp_size
+    recipe._forward_backward_step = MagicMock(
+        side_effect=lambda *args, **kwargs: kwargs["loss_buffer"].append(torch.tensor(1.0))
+    )
+    _patch_pp_optim_step_dependencies(monkeypatch)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.time.perf_counter", lambda: 2.0)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    # Each DP replica contributes four tokens over two seconds. CP, PP and TP
+    # cooperate on those tokens; they do not contribute additional examples.
+    assert metrics.metrics["num_tokens_per_step"] == 4 * dp_size
+    assert metrics.metrics["tps"] == pytest.approx(2.0 * dp_size)
+    assert metrics.metrics["tps_per_gpu"] == pytest.approx(expected_tps_per_gpu)
+
+
 @pytest.mark.cuda(False)
 def test_run_train_step_pp_zero_label_tokens_no_nan(monkeypatch):
     """Regression for PR #1985: PP reporting loss must be 0.0 (not NaN) when num_label_tokens=0.
@@ -714,6 +758,53 @@ def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
     assert metrics.metrics["num_label_tokens"] == 4
     assert metrics.metrics["loss"] == pytest.approx(8.0 / 4)
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
+
+
+@pytest.mark.cuda(False)
+@pytest.mark.parametrize(("pack_size", "expected"), [(8, pytest.approx((6 + 4) / (2 * 8))), (None, None)])
+def test_run_train_step_reports_pack_fill_against_pack_size(monkeypatch, pack_size, expected):
+    """Packs are collated only to the longest pack, so pack_fill divides by pack_size, not the padded width."""
+    recipe, _ = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=0)
+    recipe.pack_size = pack_size
+    # Two packs padded to the longer one's 6 tokens. Trailing -100 labels are padding; the
+    # interior -100s are masked prompt tokens, which still fill their pack.
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100, 2, 3, 4, 5], [6, -100, 7, 8, -100, -100]]),
+            "input_ids": torch.ones(2, 6, dtype=torch.long),
+        }
+    ]
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        loss_buffer.append(torch.tensor(1.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert metrics.metrics.get("pack_fill") == expected
+
+
+@pytest.mark.cuda(False)
+@pytest.mark.parametrize(
+    ("pack_fill", "expected"),
+    [(0.625, "loss 1.2500 | pack_fill 0.625 | grad_norm 0.5000"), (None, "loss 1.2500 | grad_norm 0.5000")],
+)
+def test_log_train_metrics_shows_pack_fill_next_to_loss(monkeypatch, caplog, pack_fill, expected):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.step_scheduler = SimpleNamespace(step=7, is_remote_logging_step=False)
+    recipe.metric_logger_train = SimpleNamespace(log=lambda log_data: None)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)  # CPU-only test
+    metrics = {"loss": 1.25, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
+    if pack_fill is not None:
+        metrics["pack_fill"] = pack_fill
+
+    with caplog.at_level(logging.INFO):
+        recipe.log_train_metrics(MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8}))
+
+    assert expected in caplog.text
 
 
 # -----------------------------------------------------------------------------

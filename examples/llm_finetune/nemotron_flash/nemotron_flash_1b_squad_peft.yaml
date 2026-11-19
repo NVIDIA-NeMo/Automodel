@@ -76,13 +76,16 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  padding: false
 
 packed_sequence:
-  packed_sequence_size: 0
+  # local_batch_size counts packed rows, not individual documents.
+  packed_sequence_size: 9216
+  packing_strategy: neat
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: false
 
 validation_dataset:
@@ -90,10 +93,13 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  padding: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 1
+
 
 optimizer:
   _target_: torch.optim.Adam
@@ -108,6 +114,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   vllm_deploy: true
   vllm_deploy_known_issue_id: DEP-596
@@ -134,3 +141,5 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+  perf_testing:
+    schedule: nightly

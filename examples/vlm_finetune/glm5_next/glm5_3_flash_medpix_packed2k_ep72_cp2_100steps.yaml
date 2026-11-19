@@ -150,8 +150,11 @@ wandb:
   dir: logs/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps/wandb
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 9
   time: "01:00:00"
   max_steps: 5
+  perf_testing:
+    schedule: nightly

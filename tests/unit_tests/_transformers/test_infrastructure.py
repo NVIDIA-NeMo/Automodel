@@ -380,6 +380,20 @@ def test_peft_freeze_config_survives_name_changing_parameter_replacement(
     assert not model.trainability_at_wrapper_construction["parallel_parameter"]
 
 
+def test_peft_rejects_training_a_lora_adapted_module_in_full():
+    """A module that holds LoRA adapters cannot also be trained in full.
+
+    The adapter checkpoint cannot restore both, so the configuration fails when the model is
+    built instead of at the first checkpoint save.
+    """
+    model = _TinyTrainabilityModel()
+    model.extension.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(1)))
+    peft_config = SimpleNamespace(lora_A_init=None, use_triton=False)
+
+    with pytest.raises(ValueError, match="module also holds LoRA adapters"):
+        _run_trainability_infrastructure(model, {"unfreeze_modules": [{"path": "extension"}]}, peft_config=peft_config)
+
+
 def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetuning():
     """Under full fine-tuning, selectors re-resolve on the post-surgery module hierarchy."""
     freeze_config = {

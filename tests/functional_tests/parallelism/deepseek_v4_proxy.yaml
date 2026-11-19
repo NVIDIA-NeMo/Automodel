@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Randomly-initialized proxy for DeepSeek-V4 Flash, shaped like
-# `examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml` but small
+# `examples/llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml` but small
 # enough for the 2-GPU PR runners.
 #
 # Shrunk from the real config. These fields are deliberately NOT scaled down,

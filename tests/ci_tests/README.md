@@ -7,8 +7,6 @@ Configuration, scripts, and utilities for AutoModel's CI recipe validation pipel
 ```
 ci_tests/
   configs/{test_folder}/
-    nightly_recipes.yml         # Recipes included in nightly scope
-    release_recipes.yml         # Explicit release list for non-auto-discovered folders
     convergence_recipes.yml     # Recipes included in convergence scope (2x time)
     override_recipes.yml        # Exemptions, known issues
   scripts/
@@ -22,13 +20,26 @@ ci_tests/
 
 ## Pipeline Generation
 
-`generate_ci_tests.py` reads recipe lists from `configs/{test_folder}/` for the given scope, reads each recipe's `ci:` section from the YAML under `examples/`, and outputs a CI pipeline YAML with one job per recipe.
+`generate_ci_tests.py` selects the recipes for the given scope and test folder, reads each recipe's `ci:` section from the YAML under `examples/`, and outputs a CI pipeline YAML with one job per recipe.
 
 **Scopes:**
-- **nightly** -- Recipes listed in `nightly_recipes.yml`
+- **nightly** -- Recipes whose `ci.nemo_ci_schedule` is `nightly` or `nightly,release`
+- **release** -- Recipes whose `ci.nemo_ci_schedule` is `release` or `nightly,release`
 - **convergence** -- Recipes in `convergence_recipes.yml`, time automatically doubled
-- **release** -- All recipe YAMLs in auto-discovered folders, or recipes listed
-  in `release_recipes.yml` for explicitly managed folders such as `llm_pretrain`
+- **performance** -- Every recipe YAML under `examples/llm_benchmark/` and `examples/vlm_benchmark/`
+
+Any other scope generates an empty pipeline. The nightly and release scopes cover these
+test folders, listed in `NEMO_CI_SCHEDULE_FOLDERS`:
+
+| Test folder | Recipes |
+|-------------|---------|
+| `llm_finetune` | `examples/llm_finetune/` |
+| `llm_pretrain` | `examples/llm_pretrain/` |
+| `vlm_finetune` | `examples/vlm_finetune/` |
+| `diffusion_finetune` | `examples/diffusion/finetune/` |
+| `dllm_sft` | `examples/dllm_sft/` |
+| `retrieval_bi_encoder` | `examples/retrieval/bi_encoder/` |
+| `retrieval_cross_encoder` | `examples/retrieval/cross_encoder/` |
 
 **Stage assignment** is based on recipe type and configuration:
 
@@ -43,8 +54,8 @@ SFT vs PEFT is determined by whether `peft` appears in the recipe filename.
 
 ## Recipe CI Configuration
 
-Every recipe YAML under `examples/` must declare a nonempty `ci.cluster_tag`
-or boolean `ci.deprecated: true` (enforced by `tools/lint_example_yamls.py`).
+Every recipe YAML under `examples/` must declare `ci.nemo_ci_schedule` and either a nonempty
+`ci.cluster_tag` or boolean `ci.deprecated: true` (enforced by `tools/lint_example_yamls.py`).
 Deprecated configurations remain available as examples, but generate no training,
 checkpoint, deployment, or evaluation jobs in any CI scope. This applies even
 when a recipe also sets `allow_failure`, a hardware tag, or optional variants.
@@ -52,12 +63,27 @@ An entirely excluded nonempty scope gets a lightweight completion job.
 Utility configs excluded by the linter are exempt. The tag selects GPU hardware,
 such as `h100`, `gb200`, or `gb10`, rather than a specific cluster.
 
-Newly added CI recipes must also declare `recipe_owner`, `time`, and `nodes`
-(enforced by `validate_new_recipe_ci.py`); pre-existing recipes are grandfathered
-for these three fields:
+`ci.nemo_ci_schedule` selects the NeMo-CI scopes that run the recipe. It must be exactly one of:
+
+| Value | Runs in |
+|-------|---------|
+| `nightly,release` | nightly and release |
+| `nightly` | nightly only |
+| `release` | release only |
+| `skipped` | neither |
+
+Deprecated recipes and recipes outside these test folders must use `skipped`. To keep a recipe
+out of the nightly and release runs only, set `skipped` rather than adding an `override_recipes.yml` exemption:
+exemptions also apply to performance runs from `ci.perf_testing`. The `ci.nightly` and `ci.release`
+mappings only override recipe settings when the recipe runs in that scope; they do not select it.
+
+Newly added recipes that CI runs (a `ci.nemo_ci_schedule` other than `skipped`, a performance benchmark, or a
+convergence list entry) must also declare `recipe_owner`, `time`, and `nodes` (enforced by
+`validate_new_recipe_ci.py`); pre-existing recipes are grandfathered for these three fields:
 
 ```yaml
 ci:
+  nemo_ci_schedule: nightly,release     # Required. nightly, release, nightly,release, or skipped
   cluster_tag: h100               # Required unless ci.deprecated is true. GPU hardware selector
   recipe_owner: username          # Required. Maintainer's handle
   time: "00:25:00"                # Required. SLURM wall time (HH:MM:SS)
@@ -80,7 +106,28 @@ ci:
     hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
     # See checkpoint robustness section for all options
+  perf_testing:                   # Optional. Performance measurements run automatically from this section
+                                  # Without it, none run. ci.deprecated: true also disables them.
+    schedule: weekly              # Required. nightly, weekly, or disabled (keeps the settings, pauses the runs)
+    time: "00:40:00"              # Optional. Wall time of the performance run (HH:MM:SS, same format as ci.time)
+    fake_balanced_gate: false     # Optional boolean. Omit to use the recipe's own MoE routing setting
+    validation: false            # Optional boolean. Default false; true uses the recipe's validation cadence
 ```
+
+Performance runs use the training recipe as their single source of truth: the same recipe class, dataset,
+sequence packing, batch sizes, model/backend settings, precision, optimizer, and parallelism. Change those
+settings in the recipe itself when changing the workload users should run. Generic `config_overrides` are
+not supported in `ci.perf_testing`.
+
+The only optional model change is `fake_balanced_gate`, which maps to `model.backend.fake_balanced_gate`.
+Omitting it preserves the recipe's setting. Results with a fake gate must be identified as balanced-routing
+measurements, not presented as the throughput of real routing. Performance runs skip validation by default:
+omitting `validation` or setting it to `false` disables both periodic and checkpoint-triggered validation.
+Set `validation: true` to use the recipe's `step_scheduler.val_every_steps` and
+`step_scheduler.validate_on_checkpoint` settings. This option applies only to performance CI;
+ordinary training and other CI phases keep their validation behavior. The runner still disables checkpoint
+saving and bounds measurement duration; these controls do not change batching or parallelism.
+Synthetic `llm_benchmark` results are a separate workload and are not performance targets for real-data recipes.
 
 ## Checkpoint Robustness
 
@@ -326,11 +373,11 @@ separate fresh baseline.
 
 ## How To
 
-### Add a New Recipe to Nightly
+### Run a Recipe in the Nightly or Release Scope
 
 1. Create recipe YAML under `examples/{test_folder}/{model_family}/`
-2. Add `ci:` section with `cluster_tag`, `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
-3. Add the path to `configs/{test_folder}/nightly_recipes.yml`
+2. Add `ci:` section with `nemo_ci_schedule`, `cluster_tag`, `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
+3. Set `nemo_ci_schedule: nightly,release` to run it in both scopes, or `nightly` or `release` for one
 
 ### Enable Checkpoint Robustness
 
@@ -347,14 +394,16 @@ separate fresh baseline.
 ### Add a New Test Folder
 
 1. Create `examples/{new_folder}/` with recipe YAMLs
-2. Create `configs/{new_folder}/` with `nightly_recipes.yml`, `convergence_recipes.yml`, `override_recipes.yml`
-3. Create `golden_values/{new_folder}/`
-4. Add a CI job template for the new folder in the CI template file
-5. Verify with `generate_ci_tests.py --test-folder {new_folder} --scope nightly`
+2. Create `configs/{new_folder}/override_recipes.yml`, plus `convergence_recipes.yml` for convergence recipes
+3. For the nightly and release scopes, add the folder and its `examples/` path to `NEMO_CI_SCHEDULE_FOLDERS` in `utils/generate_ci_tests.py`
+4. Create `golden_values/{new_folder}/`
+5. Add a CI job template for the new folder in the CI template file
+6. Verify with `generate_ci_tests.py --test-folder {new_folder} --scope nightly`
 
 ### Exempt a Recipe
 
-Edit `configs/{test_folder}/override_recipes.yml`:
+To keep a recipe out of the nightly and release runs only, set `ci.nemo_ci_schedule: skipped`. Exemptions also apply to
+performance runs from `ci.perf_testing`. To exempt a recipe, edit `configs/{test_folder}/override_recipes.yml`:
 
 ```yaml
 exempt_models:
