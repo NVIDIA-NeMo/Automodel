@@ -32,9 +32,8 @@ Limitations:
     * No quantized checkpoints, no ``v4_compatible`` metadata export and no streaming export of single tensors.
       LoRA supports only the native linear and grouped-expert tensor names used by the tested ERNIE configuration;
       DoRA is rejected, and interoperability with external PEFT implementations is not established.
-    * A LoRA restore requires the receiving model's exact adapter key set, tensor shapes and dtypes. Cross-layout
-      restores were exercised through the checkpointer on a small CPU model; full-model restore was validated with
-      the same rank count and expert-parallel size.
+    * A LoRA restore requires the receiving model's exact adapter key set, tensor shapes and dtypes. On the full
+      model it is validated with the same rank count and expert-parallel size.
     * If a LoRA reader fails after opening a session, the session remains open: framework save, load and key
       planning refuse further work. Discard the model and adapter after any load failure.
     * A sharded load or save needs the layouts listed in ``checkpoint_io``. All ranks must make the same calls
