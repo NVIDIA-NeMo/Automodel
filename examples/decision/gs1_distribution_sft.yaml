@@ -31,7 +31,6 @@ model:
   use_liger_kernel: false
   use_sdpa_patching: false
   dtype: float32
-  attn_implementation: sdpa
 
 distributed:
   strategy: ddp

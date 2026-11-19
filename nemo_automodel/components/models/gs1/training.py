@@ -115,7 +115,23 @@ def ensure_gs1_transformers_compat() -> None:
             def __init__(self, config: PreTrainedConfig) -> None:
                 super().__init__(config=config)
 
+            @property
+            def conv_states(self):
+                return {index: layer.conv_states[0] for index, layer in enumerate(self.layers)}
+
+            @property
+            def recurrent_states(self):
+                return {index: layer.recurrent_states[0] for index, layer in enumerate(self.layers)}
+
         modeling_qwen3_5.Qwen3_5DynamicCache = Qwen3_5DynamicCache
+        rotary_forward = modeling_qwen3_5.Qwen3_5TextRotaryEmbedding.forward
+
+        def rotary_compat(self, x, position_ids):
+            if position_ids.ndim == 2:
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            return rotary_forward(self, x, position_ids)
+
+        modeling_qwen3_5.Qwen3_5TextRotaryEmbedding.forward = rotary_compat
 
 
 @dataclass(frozen=True)

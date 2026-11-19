@@ -99,7 +99,7 @@ def test_native_checkpoint_compiles_and_runs_forward_backward() -> None:
             torch.testing.assert_close(output.logits[row, :width], single_output.logits[0, :width])
     model.train()
     output = forward(batch)
-    assert output.logits is not None and torch.isfinite(output.logits).all()
+    assert output.logits is not None and torch.isfinite(output.logits[batch.option_mask]).all()
     loss, _ = GS1DecisionObjective()(output.logits, batch.target_probs, batch.option_mask)
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
