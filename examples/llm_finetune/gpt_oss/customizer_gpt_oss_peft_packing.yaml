@@ -9,7 +9,7 @@ rng:
   ranked: true
 model:
   pretrained_model_name_or_path: openai/gpt-oss-20b
-  torch_dtype: auto
+  torch_dtype: bf16
   trust_remote_code: false
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   attn_implementation: sdpa
@@ -91,6 +91,10 @@ parallelizer:
   activation_checkpointing: false
 
 ci:
+  perf_testing:
+    schedule: nightly
+    # Balanced routing keeps MoE throughput comparable between nightly runs.
+    fake_balanced_gate: true
   nemo_ci_schedule: release
   cluster_tag: h100
   time: "00:30:00"

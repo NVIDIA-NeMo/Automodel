@@ -18,3 +18,9 @@ set -xeuo pipefail
 TRANSFORMERS_OFFLINE=1 coverage run \
 examples/llm_seq_cls/seq_cls.py \
   --config tests/functional_tests/llm_pretrain_and_kd/llm_seq_cls/seq_cls_bert_lora_fp32.yaml
+
+# The classifier trains in full next to LoRA; check the adapter checkpoint stores it,
+# loads it in HF PEFT, and restores it when the recipe resumes.
+TRANSFORMERS_OFFLINE=1 coverage run \
+tests/functional_tests/llm_pretrain_and_kd/llm_seq_cls/check_lora_classifier_checkpoint.py \
+  --config tests/functional_tests/llm_pretrain_and_kd/llm_seq_cls/seq_cls_bert_lora_fp32.yaml

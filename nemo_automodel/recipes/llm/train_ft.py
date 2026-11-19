@@ -64,7 +64,13 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
-from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule, close_dataloader
+from nemo_automodel.components.datasets.loader import (
+    DataloaderConfig,
+    DatasetBuildSchedule,
+    NeatPackingConfig,
+    close_dataloader,
+)
+from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -156,6 +162,12 @@ def _should_pack_validation(
     if validation_dataloader.packing is None:
         return False
     if replace(validation_dataloader, packing=None).output_format == "thd":
+        return True
+    # The NEAT collater consumes packed rows only; unpacked examples lack their position IDs.
+    if (
+        isinstance(validation_dataloader.packing, NeatPackingConfig)
+        and validation_dataloader.collate_fn is neat_packed_collater
+    ):
         return True
     if training_dataloader is None or training_dataloader.output_format != "thd":
         return False
