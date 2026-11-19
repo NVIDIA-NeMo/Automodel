@@ -326,8 +326,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         *,
         tokenizer: PreTrainedTokenizerFast | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
+        moe_overrides: dict | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         super().__init__(config)
         text = config.text_config
         self.backend = backend or BackendConfig(
@@ -338,7 +341,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             engram_process_group = dist.group.WORLD
         if tokenizer is None and any(i < text.num_hidden_layers for i in text.engram_layer_ids):
             tokenizer = config.build_tokenizer()
-        moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=text.hidden_size,
             inter_dim=text.moe_intermediate_size,
             moe_inter_dim=text.moe_intermediate_size,
@@ -359,6 +362,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             swiglu_limit=text.swiglu_limit,
             dtype=dtype,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        moe_config = moe_config or MoEConfig(**moe_defaults)
         self.model = DeepseekV41Model(
             text, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
         )

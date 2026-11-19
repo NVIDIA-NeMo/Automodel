@@ -163,6 +163,16 @@ def test_default_policy_is_explicit_and_routing_correction_is_fixed() -> None:
     assert model.moe_config.gate_bias_update_factor == 0
 
 
+def test_moe_overrides_enable_router_replay_on_every_gate() -> None:
+    config = _model().config
+    with torch.device("meta"):
+        model = DeepseekV41ForCausalLM(config, moe_overrides={"enable_routing_replay": True})
+    gates = [module.ffn.gate for module in model.model.layers.values()]
+    assert gates and all(gate.router_replay is not None for gate in gates)
+    with pytest.raises(ValueError, match="moe_config and moe_overrides"):
+        DeepseekV41ForCausalLM(config, moe_config=model.moe_config, moe_overrides={})
+
+
 def test_bf16_backbone_returns_unrounded_fp32_logits():
     torch.manual_seed(31)
     model = _model("bfloat16")
