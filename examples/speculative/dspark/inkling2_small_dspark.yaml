@@ -109,7 +109,6 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: final
   load_metadata_with_gloo: true
-  dequantize_base_checkpoint: true
 
 ci:
   nemo_ci_schedule: skipped

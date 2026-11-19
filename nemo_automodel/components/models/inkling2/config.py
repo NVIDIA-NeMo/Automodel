@@ -481,6 +481,9 @@ class Inkling2Config(PretrainedConfig):
         compute_dtype: "torch.dtype",
         distributed_setup: "DistributedSetup",
         load_metadata_with_gloo: bool,
+        attn_backend: str | None = None,
+        experts: str | None = None,
+        dispatcher: str | None = None,
     ) -> "nn.Module":
         """Load the frozen DSpark target on the recipe's expert-parallel / FSDP mesh.
 
@@ -491,11 +494,19 @@ class Inkling2Config(PretrainedConfig):
             compute_dtype: Precision used to load and run the frozen target.
             distributed_setup: Runtime parallelism configuration composed by the recipe.
             load_metadata_with_gloo: Read checkpoint metadata over Gloo.
+            attn_backend: Target attention backend; ``None`` keeps ``Inkling2DSparkTargetConfig``'s default.
+            experts: Target expert backend; ``None`` keeps the default.
+            dispatcher: Target MoE dispatcher; ``None`` keeps the default.
 
         Returns:
             The pretrained target, frozen and in eval mode.
         """
-        return Inkling2DSparkTargetConfig(target_path=target_path, trust_remote_code=trust_remote_code).build(
+        overrides = {"attn_backend": attn_backend, "experts": experts, "dispatcher": dispatcher}
+        return Inkling2DSparkTargetConfig(
+            target_path=target_path,
+            trust_remote_code=trust_remote_code,
+            **{name: value for name, value in overrides.items() if value is not None},
+        ).build(
             device=device,
             compute_dtype=compute_dtype,
             distributed_setup=distributed_setup,

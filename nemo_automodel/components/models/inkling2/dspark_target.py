@@ -42,13 +42,21 @@ if TYPE_CHECKING:
 class Inkling2DSparkTargetConfig:
     """Construction settings of the frozen Inkling 2 DSpark target.
 
+    The backend defaults are the ones the Inkling 2 fine-tuning recipes train with.
+
     Attributes:
         target_path: Hub id or local directory of the target checkpoint.
         trust_remote_code: Forwarded to the checkpoint loaders.
+        attn_backend: Target attention backend (``BackendConfig.attn``).
+        experts: Target expert backend (``BackendConfig.experts``).
+        dispatcher: Target MoE dispatcher (``BackendConfig.dispatcher``).
     """
 
     target_path: str
     trust_remote_code: bool = False
+    attn_backend: str = "flex"
+    experts: str = "torch_mm"
+    dispatcher: str = "hybridep"
 
     def build(
         self,
@@ -60,8 +68,8 @@ class Inkling2DSparkTargetConfig:
     ) -> nn.Module:
         """Load the pretrained target through the supplied EP/FSDP infrastructure.
 
-        The backend is the one the Inkling 2 fine-tuning recipes train with: FlexAttention,
-        Torch linear and norm layers, and ``torch_mm`` experts behind the HybridEP dispatcher.
+        Linear and norm layers run in Torch; attention, experts and the dispatcher come from
+        this config.
 
         Args:
             device: Resolved execution device; the sharded target requires CUDA.
@@ -92,11 +100,11 @@ class Inkling2DSparkTargetConfig:
             use_liger_kernel=False,
             use_sdpa_patching=False,
             backend=BackendConfig(
-                attn="flex",
+                attn=self.attn_backend,
                 linear="torch",
                 rms_norm="torch",
-                experts="torch_mm",
-                dispatcher="hybridep",
+                experts=self.experts,
+                dispatcher=self.dispatcher,
                 enable_hf_state_dict_adapter=True,
                 enable_fsdp_optimizations=True,
             ),

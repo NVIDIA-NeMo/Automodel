@@ -211,20 +211,54 @@ class _CfgNode(dict):
         return dict(self)
 
 
-def test_recipe_trains_the_released_draft_against_the_native_target(monkeypatch, tmp_path):
-    target = _target(multimodal=True)
-    built = {}
+def test_target_backend_defaults_and_overrides(monkeypatch):
+    """The target loads with the fine-tuning recipes' backend unless the config overrides it."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    loaded = {}
+
+    def from_pretrained(path, **kwargs):
+        loaded[path] = kwargs["backend"]
+        return torch.nn.Linear(1, 1)
+
+    monkeypatch.setattr(NeMoAutoModelForImageTextToText, "from_pretrained", from_pretrained)
+    cuda = torch.device("cuda")
+    Inkling2DSparkTargetConfig(target_path="default").build(
+        device=cuda, compute_dtype=torch.bfloat16, distributed_setup=None
+    )
+    Inkling2DSparkTargetConfig(target_path="override", attn_backend="eager", experts="torch", dispatcher="torch").build(
+        device=cuda, compute_dtype=torch.bfloat16, distributed_setup=None
+    )
+    assert (loaded["default"].attn, loaded["default"].experts, loaded["default"].dispatcher) == (
+        "flex",
+        "torch_mm",
+        "hybridep",
+    )
+    assert (loaded["override"].attn, loaded["override"].experts, loaded["override"].dispatcher) == (
+        "eager",
+        "torch",
+        "torch",
+    )
+
+
+def _patch_recipe(monkeypatch, target, built, batch):
+    """Run the recipe on CPU with ``target`` as the frozen Inkling 2 target.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        target: Tiny native Inkling 2 model returned by the patched target build.
+        built: Dict that records the target build's path, mesh and backend.
+        batch: The single training batch the patched dataloader yields; tensors of shape [1, sequence].
+    """
 
     def build_target(self, *, device, compute_dtype, distributed_setup, load_metadata_with_gloo=False):
-        built.update(path=self.target_path, distributed_setup=distributed_setup)
+        built.update(
+            path=self.target_path,
+            distributed_setup=distributed_setup,
+            backend=(self.attn_backend, self.experts, self.dispatcher),
+        )
         return target
 
-    input_ids = _input_ids()
-    batch = {
-        "input_ids": input_ids,
-        "attention_mask": torch.ones_like(input_ids),
-        "loss_mask": torch.cat((torch.zeros(1, 3), torch.ones(1, _SEQ - 3)), dim=1).long(),
-    }
     monkeypatch.setattr(
         train_dspark_module,
         "initialize_distributed",
@@ -246,6 +280,8 @@ def test_recipe_trains_the_released_draft_against_the_native_target(monkeypatch,
     monkeypatch.setattr(TrainDSparkRecipe, "_build_checkpointer", lambda self, _target_path: None)
     monkeypatch.setattr(TrainDSparkRecipe, "load_checkpoint", lambda self, restore_from=None: None)
 
+
+def _recipe_cfg(tmp_path, **recipe_overrides):
     recipe_args = _CfgNode(
         target_model_name_or_path="tiny-inkling2",
         train_data_path="unused.jsonl",
@@ -262,17 +298,52 @@ def test_recipe_trains_the_released_draft_against_the_native_target(monkeypatch,
         markov_head_type="rnn_hidden",
         confidence_head_alpha=0.0,
         trust_remote_code=False,
+        **recipe_overrides,
     )
-    cfg = _CfgNode(
+    return _CfgNode(
         recipe_args=recipe_args,
         optimizer=_CfgNode(lr=1e-3, warmup_ratio=0.0, min_lr_ratio=0.1),
         checkpoint=_CfgNode(enabled=False),
         raw_config={},
     )
+
+
+def _batch():
+    input_ids = _input_ids()
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "loss_mask": torch.cat((torch.zeros(1, 3), torch.ones(1, _SEQ - 3)), dim=1).long(),
+    }
+
+
+def test_recipe_rejects_context_parallelism_for_the_native_target(monkeypatch, tmp_path):
+    built = {}
+    _patch_recipe(monkeypatch, _target(multimodal=True), built, _batch())
+    monkeypatch.setattr(
+        train_dspark_module,
+        "create_distributed_setup_from_config",
+        lambda *_a, **_k: SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=None)),
+    )
+    monkeypatch.setattr(train_dspark_module, "get_flat_mesh", lambda *_args, **_kwargs: None)
+    cfg = _recipe_cfg(tmp_path, target_force_hf=True, target_attn_implementation="sdpa")
+    cfg["distributed.cp_size"] = 2
+    recipe = TrainDSparkRecipe(cfg)
+    with pytest.raises(NotImplementedError, match="Inkling2Config DSpark target"):
+        recipe.setup()
+    assert built == {}
+
+
+def test_recipe_trains_the_released_draft_against_the_native_target(monkeypatch, tmp_path):
+    target = _target(multimodal=True)
+    built = {}
+    batch = _batch()
+    _patch_recipe(monkeypatch, target, built, batch)
+    cfg = _recipe_cfg(tmp_path, target_experts="torch")
     recipe = TrainDSparkRecipe(cfg)
     recipe.setup()
 
-    assert built == {"path": "tiny-inkling2", "distributed_setup": "mesh"}
+    assert built == {"path": "tiny-inkling2", "distributed_setup": "mesh", "backend": ("flex", "torch", "hybridep")}
     draft = recipe.draft_model
     assert isinstance(draft, Inkling2DSparkModel)
     assert "embed_tokens.weight" not in draft.state_dict()

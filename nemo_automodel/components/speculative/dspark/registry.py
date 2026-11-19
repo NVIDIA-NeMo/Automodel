@@ -81,8 +81,15 @@ class ModelOwnedDSparkTargetProvider(Protocol):
         compute_dtype: torch.dtype,
         distributed_setup: DistributedSetup,
         load_metadata_with_gloo: bool,
+        attn_backend: str | None = None,
+        experts: str | None = None,
+        dispatcher: str | None = None,
     ) -> nn.Module:
-        """Load the pretrained, frozen target whose hidden states feed the draft."""
+        """Load the pretrained, frozen target whose hidden states feed the draft.
+
+        ``attn_backend``, ``experts`` and ``dispatcher`` carry the recipe's ``target_attn_backend``,
+        ``target_experts`` and ``target_dispatcher`` overrides; ``None`` keeps the model's default.
+        """
 
 
 # Qwen3-style dense (and MoE) targets: the draft only consumes the target's

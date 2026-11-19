@@ -840,6 +840,12 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             if load_target and isinstance(target_config, ModelOwnedDSparkTargetProvider):
                 # A target config that owns its frozen-target construction (an expert-parallel
                 # MoE target) loads on the mesh of the recipe's distributed: block.
+                if cp_size > 1:
+                    raise NotImplementedError(
+                        f"Context parallelism (cp_size>1) is not supported for the {type(target_config).__name__} "
+                        "DSpark target: it loads on its own expert-parallel / FSDP mesh and does not run the HF "
+                        "SDPA path the CP K/V-gather hook needs. Set cp_size=1."
+                    )
                 self.distributed_setup = create_distributed_setup_from_config(
                     self.cfg, world_size=self.dist_env.world_size
                 )
@@ -850,6 +856,9 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                     compute_dtype=self.compute_dtype,
                     distributed_setup=self.distributed_setup,
                     load_metadata_with_gloo=load_metadata_with_gloo,
+                    attn_backend=recipe_cfg.get("target_attn_backend", None),
+                    experts=recipe_cfg.get("target_experts", None),
+                    dispatcher=recipe_cfg.get("target_dispatcher", None),
                 )
             elif load_target:
                 target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)

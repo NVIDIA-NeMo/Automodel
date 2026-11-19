@@ -135,6 +135,7 @@ def _inputs(seed: int = 1) -> dict[str, torch.Tensor]:
 @pytest.fixture
 def fixed_anchors(monkeypatch):
     def _sample(*, seq_len, loss_mask, num_anchors, device, doc_remaining=None):
+        """Return the fixed anchors; ``loss_mask`` is an integer tensor of shape [batch, sequence]."""
         return _ANCHORS.clone(), _KEEP.clone()
 
     monkeypatch.setattr(inkling2_dspark, "sample_anchor_positions", _sample)
@@ -183,6 +184,7 @@ def _oracle_block(p: dict[str, torch.Tensor], ids: torch.Tensor, captured: torch
     taps = captured[:, 1:]
 
     def mix(consumer: int, rows: torch.Tensor) -> torch.Tensor:
+        """Mix the features at ``rows``, an integer tensor of shape [positions], into [positions, hidden]."""
         return (alpha[consumer][None, :, None] * taps[rows]).sum(1)
 
     x = torch.stack([captured[anchor, 0]] + [p["mask_embed"]] * (slots - 1))
@@ -195,6 +197,7 @@ def _oracle_block(p: dict[str, torch.Tensor], ids: torch.Tensor, captured: torch
         h = _oracle_rms(x, p[pre + "input_layernorm.weight"], eps)
 
         def heads(t, n):
+            """Split ``t`` of shape [rows, n * head_dim] into [rows, n, head_dim]."""
             return t.view(t.shape[0], n, hd)
 
         q = _oracle_rope(
@@ -495,6 +498,49 @@ def test_export_writes_the_mtp_config(tmp_path):
     exporter = model._get_consolidated_hf_metadata_exporter(tokenizer=None, original_model_path=None)
     exporter.save(hf_metadata_dir=str(tmp_path), tokenizer=None, original_model_path=None, v4_compatible=False)
     assert json.loads((tmp_path / "config.json").read_text()) == {"mtp_config": _MTP_CONFIG}
+
+
+def test_checkpointer_saves_the_released_layout_and_reloads(tmp_path):
+    from safetensors import safe_open
+
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+
+    model = _build()
+    released = model.state_dict_adapter.to_hf(model.state_dict())
+    expected = {key: value.detach().clone() for key, value in model.state_dict().items()}
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            save_consolidated=True,
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/inkling2-dspark",
+            model_state_dict_keys=list(model.state_dict()),
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+    )
+    try:
+        checkpointer.save_model(model, str(tmp_path / "trained"))
+        checkpointer.async_wait()
+
+        consolidated = tmp_path / "trained" / "model" / "consolidated"
+        assert json.loads((consolidated / "config.json").read_text()) == {"mtp_config": _MTP_CONFIG}
+        index = json.loads((consolidated / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"]) == set(released) and "lm_head.weight" not in index["weight_map"]
+        for key, filename in index["weight_map"].items():
+            with safe_open(consolidated / filename, "pt") as f:
+                torch.testing.assert_close(f.get_tensor(key), released[key], rtol=0, atol=0)
+
+        for key, parameter in model.named_parameters():
+            if key != "lm_head.weight":
+                parameter.detach().zero_()
+        checkpointer.load_model(model, str(tmp_path / "trained" / "model"))
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+    finally:
+        checkpointer.close()
 
 
 # --------------------------------------------------------------------------- contract
