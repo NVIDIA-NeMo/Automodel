@@ -438,9 +438,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             return hidden
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden)
-        out = LMHead.output(
-            self.lm_head, hidden, logits_to_keep, is_thd=False, output_hidden_states=output_hidden_states
-        )
+        out = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
         if labels is not None:
             if self.cp_mesh is not None and self.cp_mesh.size() > 1:
                 raise ValueError("Use the native recipe's globally shifted loss with CP")

@@ -572,7 +572,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             by ``get_pipeline_stage_metas``.
         """
         if not self._pp_return_hidden_states:
-            return LMHead.output(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+            return LMHead.output(self.lm_head, hidden, logits_to_keep).logits
         # The linear CE loss projects from the hidden states itself, so no full logits tensor is
         # kept per in-flight microbatch. Restore the leading batch dim like LMHead.output.
         if is_thd and hidden.dim() == 2:
@@ -706,9 +706,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden = hidden + (carry_in.float() * 0.0).sum().to(hidden.dtype)  # dense zero grad(carry_in)
             return hidden, carry_out
 
-        return LMHead.output(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     @torch.no_grad()
     def initialize_weights(

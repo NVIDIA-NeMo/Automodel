@@ -497,7 +497,7 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
             cache_position=cache_position,
             **kwargs,
         )
-        logits = LMHead.output(self.lm_head, outputs.last_hidden_state, logits_to_keep, is_thd=is_thd).logits
+        logits = LMHead.output(self.lm_head, outputs.last_hidden_state, logits_to_keep).logits
 
         loss = None
         if labels is not None:

@@ -902,12 +902,7 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        projected = LMHead.output(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-        )
+        projected = LMHead.output(self.lm_head, hidden_states, logits_to_keep)
         logits = projected.logits
         output_multiplier = float(self.config.output_multiplier)
         soft_cap = self.config.output_soft_cap_temp

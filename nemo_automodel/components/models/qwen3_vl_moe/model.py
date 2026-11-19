@@ -633,8 +633,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 of shape [media_items, 3], including when media_items is one.
 
         Returns:
-            Model output with logits of shape [batch, sequence, vocab] or
-            [tokens, vocab] for THD, or hidden states with the same leading
+            Model output with logits of shape [batch, sequence, vocab], with a
+            batch of one for THD, or hidden states with the same leading
             axes and final dimension ``hidden`` when requested. Intermediate
             pipeline stages return the hidden-state tensor directly.
         """

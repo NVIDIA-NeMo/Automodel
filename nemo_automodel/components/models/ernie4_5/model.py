@@ -519,9 +519,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             **attn_kwargs,
         )
 
-        return LMHead.output(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
 
 class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -663,9 +661,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             **attn_kwargs,
         )
 
-        return LMHead.output(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
 
 ModelClass = Ernie4_5_MoeForCausalLM

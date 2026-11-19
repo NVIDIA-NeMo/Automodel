@@ -1359,13 +1359,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        output = LMHead.output(
-            self.lm_head,
-            hidden,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
+        output = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
         if (
             is_thd
             and output.hidden_states is not None

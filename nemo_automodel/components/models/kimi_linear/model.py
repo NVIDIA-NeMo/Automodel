@@ -1375,13 +1375,7 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        return LMHead.output(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
+        return LMHead.output(self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states)
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Hand the recipe Kimi Linear's own context-parallel batch sharding.

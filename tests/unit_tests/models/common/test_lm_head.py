@@ -105,7 +105,7 @@ def test_head_uses_the_fp32_kernel_only_to_widen_and_keeps_packed_positions(logi
     head = LMHead(8, 12, bias=True, logits_dtype=logits_dtype, dtype=torch.bfloat16)
     hidden = torch.randn(5, 8, dtype=torch.bfloat16)
     with CountProjection() as trace:
-        output = LMHead.output(head, hidden, logits_to_keep=2, is_thd=True, output_hidden_states=True)
+        output = LMHead.output(head, hidden, logits_to_keep=2, output_hidden_states=True)
 
     assert trace.calls == int(logits_dtype is torch.float32)
     expected = LMHead.linear(hidden[-2:], head.weight, head.bias, logits_dtype=logits_dtype)
@@ -286,14 +286,6 @@ class TestLMHeadOutput:
         assert out.logits.shape == (2, 5, self.VOCAB)
         torch.testing.assert_close(out.logits, lm_head(hidden))
 
-    def test_keep_zero_projects_all_positions_2d(self):
-        """logits_to_keep == 0 with a 2D [T, H] (THD/packed) hidden state."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        out = LMHead.output(lm_head, hidden, logits_to_keep=0)
-        assert out.logits.shape == (7, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden))
-
     def test_keep_int_slices_last_n_3d(self):
         """A positive int keeps only the last N positions (BSHD)."""
         lm_head = self._lm_head()
@@ -301,14 +293,6 @@ class TestLMHeadOutput:
         out = LMHead.output(lm_head, hidden, logits_to_keep=2)
         assert out.logits.shape == (2, 2, self.VOCAB)
         torch.testing.assert_close(out.logits, lm_head(hidden[:, -2:, :]))
-
-    def test_keep_int_slices_last_n_2d(self):
-        """A positive int keeps only the last N positions (THD/packed)."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        out = LMHead.output(lm_head, hidden, logits_to_keep=3)
-        assert out.logits.shape == (3, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden[-3:, :]))
 
     def test_keep_tensor_indices_3d(self):
         """A tensor of indices selects those positions (BSHD)."""
@@ -325,36 +309,29 @@ class TestLMHeadOutput:
         hidden = torch.randn(7, self.HIDDEN)
         idx = torch.tensor([1, 3, 5])
         out = LMHead.output(lm_head, hidden, logits_to_keep=idx)
-        assert out.logits.shape == (3, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden[idx, :]))
+        assert out.logits.shape == (1, 3, self.VOCAB)
+        torch.testing.assert_close(out.logits, lm_head(hidden[idx, :]).unsqueeze(0))
 
-    def test_is_thd_restores_batch_dim_on_2d_logits(self):
+    def test_2d_logits_regain_a_batch_dim(self):
         """THD/packed input -> 2D [T, V] logits get a leading batch dim restored."""
         lm_head = self._lm_head()
         hidden = torch.randn(7, self.HIDDEN)
-        out = LMHead.output(lm_head, hidden, logits_to_keep=0, is_thd=True)
+        out = LMHead.output(lm_head, hidden, logits_to_keep=0)
         assert out.logits.shape == (1, 7, self.VOCAB)
         torch.testing.assert_close(out.logits, lm_head(hidden).unsqueeze(0))
 
-    def test_is_thd_with_logits_to_keep(self):
-        """is_thd composes with slicing: last-N 2D logits become [1, N, V]."""
+    def test_2d_logits_regain_a_batch_dim_after_slicing(self):
+        """The batch dim composes with slicing: last-N 2D logits become [1, N, V]."""
         lm_head = self._lm_head()
         hidden = torch.randn(7, self.HIDDEN)
-        out = LMHead.output(lm_head, hidden, logits_to_keep=2, is_thd=True)
+        out = LMHead.output(lm_head, hidden, logits_to_keep=2)
         assert out.logits.shape == (1, 2, self.VOCAB)
         torch.testing.assert_close(out.logits, lm_head(hidden[-2:, :]).unsqueeze(0))
 
-    def test_is_thd_noop_when_logits_already_3d(self):
-        """A 3D logits result (BSHD path) is left untouched, never made 4D."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(2, 5, self.HIDDEN)
-        out = LMHead.output(lm_head, hidden, logits_to_keep=0, is_thd=True)
-        assert out.logits.shape == (2, 5, self.VOCAB)
-
-    def test_is_thd_none_lm_head_unsqueezes_passthrough(self):
+    def test_none_lm_head_passthrough_regains_a_batch_dim(self):
         """With lm_head=None, the 2D passthrough hidden states also get the batch dim."""
         hidden = torch.randn(7, self.HIDDEN)
-        out = LMHead.output(None, hidden, logits_to_keep=0, is_thd=True)
+        out = LMHead.output(None, hidden, logits_to_keep=0)
         assert out.logits.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.logits, hidden.unsqueeze(0))
 
@@ -373,10 +350,10 @@ class TestLMHeadOutput:
         lm_head = LMHead.from_linear(self._lm_head().to(torch.bfloat16), logits_dtype=torch.float32)
         hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
         out = LMHead.output(lm_head, hidden, logits_to_keep=3)
-        assert out.logits.shape == (3, self.VOCAB)
+        assert out.logits.shape == (1, 3, self.VOCAB)
         assert out.logits.dtype == torch.float32
         expected = hidden[-3:].float() @ lm_head.weight.float().t()
-        torch.testing.assert_close(out.logits, expected, rtol=0, atol=0)
+        torch.testing.assert_close(out.logits, expected.unsqueeze(0), rtol=0, atol=0)
 
     def test_lm_head_dtype_casts_after_slicing(self):
         lm_head = self._lm_head().to(torch.bfloat16)
@@ -426,10 +403,10 @@ class TestLMHeadOutput:
         assert out.hidden_states is hidden
 
     def test_output_hidden_states_thd_restores_batch_dim(self):
-        """With is_thd, a 2D hidden state gets a leading batch dim in the hidden_states field."""
+        """A 2D (THD) hidden state gets a leading batch dim in the hidden_states field."""
         lm_head = self._lm_head()
         hidden = torch.randn(7, self.HIDDEN)
-        out = LMHead.output(lm_head, hidden, logits_to_keep=0, is_thd=True, output_hidden_states=True)
+        out = LMHead.output(lm_head, hidden, logits_to_keep=0, output_hidden_states=True)
         assert out.hidden_states.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.hidden_states, hidden.unsqueeze(0))
 

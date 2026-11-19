@@ -1020,7 +1020,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 loss_hidden_states = loss_hidden_states.unsqueeze(0)
             return loss_hidden_states
 
-        projected = LMHead.output(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd)
+        projected = LMHead.output(self.lm_head, hidden_states, logits_to_keep)
         if self.lm_head is None:
             # No output scaling or soft cap may touch the residual stream
             # passed between non-final PP stages.

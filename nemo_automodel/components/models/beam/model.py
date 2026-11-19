@@ -369,9 +369,7 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        out = LMHead.output(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        out = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
         # Final-logit soft cap, as in HF: cap * tanh(logits / cap), computed in fp32. Only the stage
         # that owns the head has logits (on other PP stages ``lm_head`` is None and the hidden
         # states pass through in the logits slot).

@@ -199,7 +199,7 @@ def test_glm_packing_to_loss(reduction):
     model = torch.nn.Module()
     model.lm_head = torch.nn.Linear(7, 13, bias=False)
     hidden = torch.randn(4, 7, requires_grad=True)
-    out = LMHead.output(model.lm_head, hidden, is_thd=True, output_hidden_states=True)
+    out = LMHead.output(model.lm_head, hidden, output_hidden_states=True)
     assert out.hidden_states.shape == (1, 4, 7)
     actual = calculate_loss(
         ChunkedCrossEntropy(3, compile=False, reduction=reduction),

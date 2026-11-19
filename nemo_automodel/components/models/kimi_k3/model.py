@@ -2632,13 +2632,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             return hidden_states
         if getattr(self, "_pp_return_hidden_states", False) is True:
             return hidden_states
-        return LMHead.output(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
+        return LMHead.output(self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states)
 
     def prepare_model_inputs_for_cp(
         self,

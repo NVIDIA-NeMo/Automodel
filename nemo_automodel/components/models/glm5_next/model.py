@@ -366,7 +366,6 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         del position_ids
         if pixel_values_videos is not None:
             raise NotImplementedError("GLM-5.3 AutoModel onboarding currently supports images, not video training")
-        is_thd = kwargs.get("qkv_format") == "thd"
         if input_ids is not None and input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
         if inputs_embeds is not None and inputs_embeds.ndim == 2:
@@ -417,13 +416,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             if output_hidden_states is not None
             else bool(getattr(self.config.text_config, "output_hidden_states", False))
         )
-        return LMHead.output(
-            self.lm_head,
-            hidden,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Install GLM's contiguous packed sharder while leaving media and ids global."""

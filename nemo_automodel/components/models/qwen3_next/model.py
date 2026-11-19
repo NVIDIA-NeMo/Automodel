@@ -401,9 +401,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        return LMHead.output(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     @torch.no_grad()
     def initialize_weights(

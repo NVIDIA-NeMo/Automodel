@@ -708,7 +708,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
 
-        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd).logits
+        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:
