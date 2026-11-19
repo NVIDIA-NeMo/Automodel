@@ -26,7 +26,7 @@ import struct
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, BinaryIO
 
 import torch
 from torch import distributed as dist
@@ -65,6 +65,7 @@ _DTYPE_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {dtype: key for key, dtype
 _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu}
 _QUANTIZED_DTYPE_WARNING_LIMIT = 5
 _MISSING_FQN_WARNING_LIMIT = 5
+_CAST_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 def resolve_dtype_cast(dtype_name: str | None) -> torch.dtype | None:
@@ -461,30 +462,17 @@ def _process_output_file(
             if tensor_fqn_data.source_dtype_str == tensor_fqn_data.dtype_str:
                 output_stream.write(full_tensor_mv)
             else:
-                output_stream.write(
-                    _cast_tensor_bytes(
-                        full_tensor_mv,
-                        tensor_fqn_data.shape_in_file,
-                        tensor_fqn_data.source_dtype_str,
-                        tensor_fqn_data.dtype_str,
-                    )
-                )
+                _write_cast_tensor(output_stream, full_tensor_mv, tensor_fqn_data)
 
 
-def _cast_tensor_bytes(
-    tensor_bytes: memoryview,
-    tensor_shape: list[int],
-    source_dtype_str: str,
-    cast_dtype_str: str,
-) -> bytes:
-    """Cast a contiguous tensor byte buffer from its source dtype to the cast dtype."""
-    source_dtype = _get_known_dtype(source_dtype_str)
-    cast_dtype = _get_known_dtype(cast_dtype_str)
-    tensor = torch.frombuffer(tensor_bytes, dtype=source_dtype)
-    if tensor_shape:
-        tensor = tensor.reshape(tensor_shape)
-    cast_tensor = tensor.to(dtype=cast_dtype).contiguous()
-    return cast_tensor.view(torch.uint8).numpy().tobytes()
+def _write_cast_tensor(output_stream: BinaryIO, tensor_bytes: memoryview, tensor_data: _FqnData) -> None:
+    """Write at most _CAST_CHUNK_BYTES of converted tensor data at a time."""
+    source_dtype = _get_known_dtype(tensor_data.source_dtype_str)
+    cast_dtype = _get_known_dtype(tensor_data.dtype_str)
+    source_chunk_bytes = (_CAST_CHUNK_BYTES // tensor_data.dtype_size) * tensor_data.source_dtype_size
+    for start in range(0, len(tensor_bytes), source_chunk_bytes):
+        chunk = torch.frombuffer(tensor_bytes[start : start + source_chunk_bytes], dtype=source_dtype)
+        output_stream.write(memoryview(chunk.to(cast_dtype).view(torch.uint8).numpy()))
 
 
 def _write_data(
