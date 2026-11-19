@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -52,6 +53,26 @@ class _TinyDecisionModel(nn.Module):
         return CausalLMOutput(logits=features * self.logit_scale[:width])
 
 
+class _Checkpointer:
+    def __init__(self, output: Path, rank: int) -> None:
+        self.config = SimpleNamespace(enabled=True)
+        self.output = output
+        self.rank = rank
+        self.saved = []
+        self.lifecycle = SimpleNamespace(reserve=lambda path: None, publish=lambda *args, **kwargs: None)
+
+    def save_model(self, model, path, **kwargs):
+        assert not isinstance(model, torch.nn.parallel.DistributedDataParallel)
+        self.saved.append(model)
+        (self.output / f"unwrapped{self.rank}").touch()
+
+    def async_wait(self):
+        pass
+
+    def finalize(self):
+        pass
+
+
 def _examples() -> list[GS1DecisionExample]:
     specs = [(2, (0.8, 0.2)), (4, (0.3, 0.7)), (3, (0.2, 0.5, 0.3)), (5, (0.6, 0.4)), (1, (0.1, 0.2, 0.7))]
     examples = []
@@ -73,6 +94,7 @@ def _recipe(output: Path, rank: int, world: int) -> TrainGS1DecisionRecipe:
     recipe.objective = GS1DecisionObjective()
     recipe.pad_token_id = 0
     recipe.device = torch.device("cpu")
+    recipe.tokenizer = None
     recipe.seed = 17
     recipe.local_batch_size = 2
     recipe.epochs = 1
@@ -82,10 +104,9 @@ def _recipe(output: Path, rank: int, world: int) -> TrainGS1DecisionRecipe:
     recipe.dist_env = SimpleNamespace(is_main=rank == 0)
     recipe.output_dir = output
     recipe.cfg = SimpleNamespace(get=lambda key, default=None: default)
-    recipe.checkpointer = SimpleNamespace(finalize=lambda: None)
+    recipe.checkpointer = _Checkpointer(output, rank)
     recipe._get_dp_rank = lambda: rank
     recipe._get_dp_group_size = lambda: world
-    recipe._save_final_checkpoint = lambda: None
     return recipe
 
 
@@ -146,7 +167,24 @@ def test_two_rank_optimizer_loop_matches_padded_fp32_reference(tmp_path: Path) -
     for name, value in expected.items():
         torch.testing.assert_close(rank0[name], value, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(rank1[name], value, atol=1e-6, rtol=1e-6)
+    assert (output / "unwrapped0").exists() and (output / "unwrapped1").exists()
     actual = [json.loads(line) for line in (output / "training_log.jsonl").read_text().splitlines()]
     assert len(actual) == len(norms) == 2
     for row, norm in zip(actual, norms, strict=True):
         assert math.isclose(row["grad_norm"], norm, rel_tol=1e-5, abs_tol=1e-6)
+
+
+def test_disabled_checkpoint_is_a_noop(tmp_path: Path) -> None:
+    recipe = TrainGS1DecisionRecipe.__new__(TrainGS1DecisionRecipe)
+    recipe.checkpointer = SimpleNamespace(
+        config=SimpleNamespace(enabled=False),
+        lifecycle=SimpleNamespace(reserve=Mock(), publish=Mock()),
+        save_model=Mock(),
+        async_wait=Mock(),
+    )
+    recipe.output_dir = tmp_path
+    recipe._save_final_checkpoint()
+    assert not (tmp_path / "final").exists()
+    recipe.checkpointer.lifecycle.reserve.assert_not_called()
+    recipe.checkpointer.save_model.assert_not_called()
+    recipe.checkpointer.lifecycle.publish.assert_not_called()
