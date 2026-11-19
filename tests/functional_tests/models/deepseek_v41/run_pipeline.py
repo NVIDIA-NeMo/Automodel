@@ -187,7 +187,11 @@ def main() -> None:
             losses = [] if pipeline.info.has_last_stage else None
             with stage_vlm_media_for_pp(pipeline, pipeline.parts, batch):
                 output = pipeline.step(
-                    ids, target=labels if pipeline.info.has_last_stage else None, losses=losses, **batch
+                    ids,
+                    target=labels if pipeline.info.has_last_stage else None,
+                    losses=losses,
+                    return_outputs=pipeline.info.has_last_stage,
+                    **batch,
                 )
             logit_error = torch.zeros((), device=device)
             if pipeline.info.has_last_stage:

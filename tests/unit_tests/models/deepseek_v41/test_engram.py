@@ -556,7 +556,7 @@ def test_empty_requester_takes_the_peers_validation_path(tmp_path: Path) -> None
 
 
 def _materialized_owner_worker(rank: int, rendezvous: str) -> None:
-    """Keep owner normalization after native PP skips random initialization."""
+    """Keep owner-mean gradients after native PP skips random initialization."""
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
     try:
@@ -572,11 +572,6 @@ def _materialized_owner_worker(rank: int, rendezvous: str) -> None:
             with torch.no_grad():
                 for name, parameter in module.named_parameters():
                     parameter.copy_(saved[name])
-            assert not hasattr(module.embed.weight, "_nemo_model_owned_grad_divisor")
-            hidden = torch.randn(1, 3, module.hc_mult, module.hidden_size)
-            ids = torch.zeros(1, 3, module.hash_heads, dtype=torch.long)
-            module(hidden, ids)
-            assert module.embed.weight._nemo_model_owned_grad_divisor == 2.0
             for empty in (False, True):
                 module.zero_grad(set_to_none=True)
                 _owner_gradient_case(model, layer_id, empty_requester=empty)

@@ -437,10 +437,6 @@ class DeepseekV41Engram(nn.Module):
             Tensor of shape [batch, sequence, hc_mult, hidden] in the input
             dtype. The output neither aliases nor mutates hidden_states.
         """
-        # Native pretrained PP loading skips initialize_weights(); parameter-only
-        # materialization can therefore discard the owner-gradient divisor.
-        # Restore it on the actual weight before this forward produces gradients.
-        self.embed.mark_sharding_contract()
         if hidden_states.ndim != 4 or hidden_states.shape[-2:] != (self.hc_mult, self.hidden_size):
             raise ValueError("Engram hidden_states must have shape [batch, sequence, hc_mult, hidden_size]")
         if hash_ids.shape != (*hidden_states.shape[:2], self.hash_heads):
