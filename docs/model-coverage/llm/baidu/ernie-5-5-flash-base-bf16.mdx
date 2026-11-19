@@ -304,25 +304,24 @@ selects all of them.
 | `moe.experts` | 42 MoE layers | Supported; 98% of the adapter parameters |
 | `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj` | Layer 0 | Supported |
 | `moe.shared_experts.gate_proj`, `moe.shared_experts.up_proj`, `moe.shared_experts.down_proj` | 42 MoE layers | Supported |
-| `attention.wo_a` | 37 HCA layers | Rejected: a grouped projection with its own forward |
-| `moe.fc1_latent_proj`, `moe.fc2_latent_proj` | 42 MoE layers | Rejected: FP32 projections with their own forward |
-| `attention.indexer.wq_b`, `attention.indexer.wk`, `attention.indexer.weights_proj` | 6 DSA layers | Rejected: the indexers are frozen |
-| `attention.compressor.wkv`, `attention.compressor.wgate` | 37 HCA layers | Rejected: not validated |
+| `attention.wo_a` | 37 HCA layers | Not supported: a grouped projection with its own forward |
+| `moe.fc1_latent_proj`, `moe.fc2_latent_proj` | 42 MoE layers | Not supported: FP32 projections with their own forward |
+| `attention.indexer.wq_b`, `attention.indexer.wk`, `attention.indexer.weights_proj` | 6 DSA layers | Not supported: the indexers are frozen |
+| `attention.compressor.wkv`, `attention.compressor.wgate` | 37 HCA layers | Not validated |
 | `attention.k_b_proj`, `attention.v_b_proj`, `moe.gate`, the mHC parameters, the norms | | Cannot be selected: parameters without a linear module of their own |
 
-The output head `model.lm_head` is rejected as not validated. An adapter on a
-rejected module is an error when the model is parallelized, before it is
-sharded and before any weight is read. Without `peft.target_modules`, the
-default pattern of the LoRA configuration, `*_proj`, selects rejected
-projections, so list the targets as the recipe does. DoRA (`peft.use_dora`) is
-rejected on every target when the model is built. An adapter in another dtype
-than the weight it adapts is rejected when the model is parallelized. There
-are two ways to get one: `peft.lora_dtype` set to another dtype, and a model
-loaded in FP32 under a BF16 FSDP compute dtype
-(`distributed.mp_policy.param_dtype`, BF16 when no policy is given), because
-the frozen weights of a LoRA run are then stored in BF16 while the adapters
-stay FP32. The recipe loads the model in BF16 and sets the compute dtype to
-`null`.
+The output head `model.lm_head` is not validated. An adapter on `attention.wo_a`
+or on a latent projection of the MoE fails in the first forward, and an adapter
+on an indexer is an error at the first training step. Without
+`peft.target_modules`, the default pattern of the LoRA configuration, `*_proj`,
+selects unsupported projections, so list the targets as the recipe does. DoRA
+(`peft.use_dora`) is not validated. An adapter in another dtype than the weight
+it adapts is not validated either. There are two ways to get one:
+`peft.lora_dtype` set to another dtype, and a model loaded in FP32 under a BF16
+FSDP compute dtype (`distributed.mp_policy.param_dtype`, BF16 when no policy is
+given), because the frozen weights of a LoRA run are then stored in BF16 while
+the adapters stay FP32. The recipe loads the model in BF16 and sets the compute
+dtype to `null`.
 
 ### Validated LoRA Configuration
 
@@ -562,8 +561,8 @@ FSDP2 on single unpacked documents. The following limits apply:
   `model.num_nextn_predict_layers: 0`.
 - The parameters of the DSA indexers are frozen, and a `freeze_config` unfreeze
   selector that covers a DSA indexer is an error at the first training step.
-  A LoRA adapter on an indexer projection is rejected when the model is
-  parallelized.
+  A LoRA adapter on an indexer projection is an error at the first training
+  step as well.
   The router correction bias is a fixed buffer, not a parameter. No indexer
   loss is computed. The reference training recipe trains the indexers with a KL
   term against the attention distribution, which this implementation does not.
@@ -584,11 +583,9 @@ FSDP2 on single unpacked documents. The following limits apply:
   true.
 - LoRA is validated with the targets, adapter rank 8 (`peft.dim`), and alpha
   32 of the LoRA recipe, with one rank per expert group, and with documents of
-  at most 256 tokens. The modules that [LoRA Targets](#lora-targets) lists as
-  rejected raise an error when the model is parallelized. DoRA
-  (`peft.use_dora`) is rejected on every target when the model is built, and
-  an adapter in another dtype than the weight it adapts when the model is
-  parallelized (see [LoRA Targets](#lora-targets)). `peft.dropout` is not
+  at most 256 tokens. Adapters on other modules, DoRA
+  (`peft.use_dora`), and an adapter in another dtype than the weight it adapts
+  are not supported or not validated (see [LoRA Targets](#lora-targets)). `peft.dropout` is not
   applied to the adapters of the routed experts, which hold 98% of the adapter
   parameters, and dropout on the linear projections was not validated. Not
   validated: `peft.moe_rank_scaling`, the full model with more ranks than

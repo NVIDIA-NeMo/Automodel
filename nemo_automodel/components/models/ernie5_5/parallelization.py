@@ -29,11 +29,8 @@ that flow builds the FSDP units:
 No other trainable parameter of the model is used by some ranks and not by others, so the sidecar does not enable
 FSDP's reduction of unused parameters.
 
-The sidecar also holds the two rules that LoRA needs. Before the shared dispatcher runs, it rejects an adapter that
-the model does not support: on a module without LoRA support, of another kind than plain LoRA, or in another dtype
-than the weight it adapts (``_reject_unsupported_lora_adapters``). After the shared flow has sharded the routed
-experts, it records the expert-parallel size on them: a PEFT checkpoint save reads that attribute to decide whether
-every rank collects the adapter tensors itself.
+After the shared flow has sharded the routed experts, the sidecar records the expert-parallel size on them: a PEFT
+checkpoint save reads that attribute to decide whether every rank collects the adapter tensors itself.
 """
 
 import logging
@@ -58,17 +55,6 @@ logger = logging.getLogger(__name__)
 _HYPER_HEAD_FP32_NAMES = ("hc_fn", "hc_base", "hc_scale")
 # Compute dtypes that the model implements; an FSDP policy may also leave the storage dtype in place (None).
 _COMPUTE_DTYPES = (None, torch.float32, torch.bfloat16)
-# Plain linear projections that may carry a LoRA adapter, named relative to the attention module of an HCA layer,
-# to the attention module of a DSA layer, and to a dense FFN or a shared expert. The routed experts of a MoE layer
-# are the fourth supported target. A LoRA wrapper leaves each of them numerically unchanged at initialization.
-_HCA_LORA_TARGETS = ("wq_a", "wq_b", "wkv", "wo_b", "gate_proj")
-_DSA_LORA_TARGETS = ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "gate_proj", "o_proj")
-_FFN_LORA_TARGETS = ("gate_proj", "up_proj", "down_proj")
-# Adapter tensors of the two supported wrappers, named relative to the module that owns them: the two factors of a
-# LoRA linear layer and the four grouped factors of the routed experts. These are the names that the checkpoint
-# adapter saves and restores. A DoRA wrapper registers ``lora_magnitude`` as well; it is not supported.
-_LINEAR_LORA_TENSORS = ("lora_A.weight", "lora_B.weight")
-_EXPERT_LORA_TENSORS = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
 
 
 class _FullyShardKwargs(TypedDict, total=False):
@@ -101,152 +87,6 @@ def _is_pipeline_stage(model: nn.Module) -> bool:
     return any(module is None for module in modules) or len(inner.layers) != model.config.num_hidden_layers
 
 
-def _lora_tensors(model: nn.Module) -> dict[str, dict[str, nn.Parameter]]:
-    """Return the LoRA adapter tensors of a model, grouped by the module that owns them.
-
-    An adapter tensor is a parameter with a name component that starts with ``lora_``, as the LoRA wrappers of
-    linear layers (``lora_A``, ``lora_B``, and ``lora_magnitude`` with DoRA) and of grouped experts
-    (``lora_gate_and_up_A`` and three more) register them. The module that owns it is named by the components
-    before that one.
-
-    Args:
-        model: Model whose parameters are inspected.
-
-    Returns:
-        For every owning module, in the order of ``named_parameters``, its adapter tensors of any shape keyed by
-        their name relative to the module, for example ``lora_A.weight``.
-    """
-    owners: dict[str, dict[str, nn.Parameter]] = {}
-    for name, parameter in model.named_parameters():
-        parts = name.split(".")
-        for position, part in enumerate(parts):
-            if part.startswith("lora_"):
-                owners.setdefault(".".join(parts[:position]), {})[".".join(parts[position:])] = parameter
-                break
-    return owners
-
-
-def _supported_lora_modules(model: nn.Module) -> set[str]:
-    """Return the names of the modules of an ERNIE 5.5 model that support a LoRA adapter.
-
-    Args:
-        model: The ``Ernie5_5_MoeForCausalLM`` handed to the sidecar, with all its decoder layers.
-
-    Returns:
-        For every decoder layer, the plain linear projections that its attention module owns directly (not those
-        of its indexer or compressor), and the three projections of its dense FFN or the routed experts and the
-        three projections of the shared expert of its MoE.
-    """
-    names: set[str] = set()
-    for index, layer in enumerate(model.model.layers):
-        prefix = f"model.layers.{index}"
-        attention = _DSA_LORA_TARGETS if layer.is_dsa else _HCA_LORA_TARGETS
-        names.update(f"{prefix}.attention.{target}" for target in attention)
-        if layer.is_moe:
-            names.add(f"{prefix}.moe.experts")
-            names.update(f"{prefix}.moe.shared_experts.{target}" for target in _FFN_LORA_TARGETS)
-        else:
-            names.update(f"{prefix}.mlp.{target}" for target in _FFN_LORA_TARGETS)
-    return names
-
-
-def _lora_rejection_reason(name: str) -> str:
-    """Say why a module of an ERNIE 5.5 model does not support a LoRA adapter.
-
-    Args:
-        name: Name of a module outside the supported targets.
-
-    Returns:
-        The reason, as the middle part of the error message.
-    """
-    if ".attention.indexer." in name:
-        return "the DSA indexer only selects keys and is not trained"
-    if name.endswith(".attention.wo_a"):
-        return "wo_a is a grouped projection, and a LoRA wrapper would replace its grouped forward"
-    if name.endswith((".moe.fc1_latent_proj", ".moe.fc2_latent_proj")):
-        return (
-            "the latent projections of the MoE cast their FP32 weight in a forward of their own, which a LoRA "
-            "wrapper would replace"
-        )
-    return "LoRA has not been validated on this module"
-
-
-def _reject_unsupported_lora_adapters(model: nn.Module) -> None:
-    """Reject every LoRA adapter that an ERNIE 5.5 model does not support.
-
-    The module is checked first. The supported targets are the plain linear projections that an attention module
-    owns directly, the routed experts, and the projections of the dense FFN and of the shared expert. The LoRA code
-    also wraps other linear layers when a pattern covers them, and its default pattern does. Three of them are
-    known to fail later: the FP32 latent projections of the MoE while the shared flow shards the model, and the
-    grouped projection ``wo_a`` of an HCA layer and the projections of a DSA indexer in the first training
-    forward. Every other module, such as the FP32 projections of the HCA compressor or the output head, has not
-    been validated with an adapter. A pattern that names a parameter that is not a module of its own (the key and
-    value projections of a DSA layer, the router) or a module that is neither a linear layer nor the routed
-    experts adds no adapter and is not seen here.
-
-    On a supported module the adapter tensors are checked. Only the two factors of a LoRA linear layer and the four
-    grouped factors of the routed experts are admitted: these are the tensors that the checkpoint adapter saves
-    and restores. DoRA adds a magnitude vector to a linear layer and is rejected. A model that the framework
-    builds with its checkpoint adapter attached is rejected for that vector even earlier, when the adapter plans
-    the checkpoint keys of the unsharded model, and with the routed experts among the targets the LoRA installer
-    rejects DoRA before that.
-
-    Every admitted factor must have the dtype of the weight it adapts. With ``peft.lora_dtype`` set to another
-    dtype and an FSDP policy without a compute dtype, the shared flow cannot group the parameters of a decoder
-    block by dtype and fails while it shards the model, with a message about the frozen weights.
-
-    The factors also differ from the weight when ``peft.lora_dtype`` is unset, the model dtype is FP32 and the FSDP
-    policy computes in BF16, which is the default of ``FSDP2Config``: before it calls the sidecar, the framework
-    stores the frozen weights of a PEFT model in the compute dtype, and the trainable factors keep FP32. That
-    layout has not been validated with this model; the message names the policy as well.
-
-    Args:
-        model: The ``Ernie5_5_MoeForCausalLM`` handed to the sidecar, with or without LoRA adapters.
-
-    Raises:
-        ValueError: If a module outside the supported targets owns a LoRA adapter tensor; if a supported module
-            owns an adapter tensor other than the LoRA factors, such as the magnitude vector of DoRA; or if a
-            factor has another dtype than the weight it adapts.
-    """
-    adapters = _lora_tensors(model)
-    supported = _supported_lora_modules(model)
-    unsupported = [name for name in adapters if name not in supported]
-    if unsupported:
-        first = unsupported[0]
-        count = f" (the first of {len(unsupported)} such modules)" if len(unsupported) > 1 else ""
-        hca, dsa, ffn = (", ".join(targets) for targets in (_HCA_LORA_TARGETS, _DSA_LORA_TARGETS, _FFN_LORA_TARGETS))
-        raise ValueError(
-            f"ERNIE 5.5 does not support LoRA on {first}{count}: {_lora_rejection_reason(first)}. Set "
-            "peft.target_modules to patterns that select supported modules only. Under model.layers.<index> these "
-            f"are attention.<name> with <name> in ({hca}) for an HCA layer and in ({dsa}) for a DSA layer, "
-            f"moe.experts, and moe.shared_experts.<name> and mlp.<name> with <name> in ({ffn})"
-        )
-    for owner, tensors in adapters.items():
-        experts = owner.endswith(".moe.experts")
-        factors = _EXPERT_LORA_TENSORS if experts else _LINEAR_LORA_TENSORS
-        others = [name for name in tensors if name not in factors]
-        if "lora_magnitude" in others:
-            raise ValueError(
-                f"ERNIE 5.5 does not support DoRA: {owner} carries the magnitude vector lora_magnitude. Disable "
-                "peft.use_dora"
-            )
-        if others:
-            raise ValueError(
-                f"ERNIE 5.5 does not support the adapter tensor {owner}.{others[0]}: only the two factors of a "
-                "LoRA linear layer and the four grouped factors of the routed experts are supported"
-            )
-        module = model.get_submodule(owner)
-        weight = module.gate_and_up_projs if experts else module.weight
-        for name, tensor in tensors.items():
-            if tensor.dtype != weight.dtype:
-                raise ValueError(
-                    f"ERNIE 5.5 requires LoRA factors in the dtype of the weight they adapt: {owner}.{name} is "
-                    f"{tensor.dtype} and {owner} is {weight.dtype}. Leave peft.lora_dtype unset. If it is unset, the "
-                    "frozen weights were stored in the FSDP compute dtype: set distributed.mp_policy.param_dtype to "
-                    "null or to the model dtype"
-                )
-
-
 class Ernie5_5ModelParallelizer(ModelParallelizer):
     """Distribute ERNIE 5.5 with FSDP2 and expert parallelism, and reject every other topology.
 
@@ -262,33 +102,24 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
     one matrix with the rows of each attention head together, and the checkpoint adapter loads and saves that
     matrix only when every rank holds the rows of whole heads. With 64 heads the supported jobs have 2, 4, 8, 16,
     32 or 64 ranks.
-
-    A model with LoRA adapters is admitted when every adapter sits on a supported target (a plain linear
-    projection that an attention module owns directly, the routed experts, or a projection of the dense FFN or of
-    the shared expert), consists of the LoRA factors only, and has the dtype of the weight it adapts. DoRA is not
-    supported.
     """
 
     _customizes_moe_fsdp = True
 
     def _prepare_model(self, model: nn.Module, mesh_context: MeshContext) -> None:
-        """Reject every unsupported topology and LoRA adapter before an executor changes the model.
+        """Reject every unsupported topology before an executor changes the model.
 
         The shared dispatcher has not run when this hook is called, so a rejected model keeps its parameters, its
         modules and its synchronization groups as they were handed to the hook. The hook runs for every strategy,
         including DDP and Megatron-FSDP. Under pipeline parallelism the framework has already copied the model
         and cut the copies into stages when it calls the hook, once per stage; the hook rejects the stage.
 
-        The framework installs LoRA adapters on the unsharded model before it calls the hook, and loads the base
-        weights after sharding, so an unsupported adapter is rejected before the model is sharded and before a
-        weight is read.
-
         One condition is not decided here. The mesh over which the FSDP units are sharded is derived inside the
         shared expert-parallel flow, so ``_fully_shard_module`` checks its number of dimensions as a
         post-condition.
 
         Args:
-            model: The ``Ernie5_5_MoeForCausalLM`` to distribute, with or without LoRA adapters.
+            model: The ``Ernie5_5_MoeForCausalLM`` to distribute.
             mesh_context: Meshes, parallelism sizes, strategy, precision policies and activation-checkpointing
                 mode of the run.
 
@@ -297,10 +128,8 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                 replicate size is not one; if ``model`` is a pipeline stage; if expert parallelism is off; if
                 activation checkpointing is on; if an FSDP compute dtype is neither FP32 nor BF16; if the model
                 was built with the HybridEP dispatcher and its dtype or an FSDP compute dtype is FP32; if the
-                data-parallel mesh does not cover all ranks of the job; if the model has a DSA layer and the
-                number of ranks does not divide its number of DSA attention heads; or if a LoRA adapter sits on a
-                module that does not support one, holds a tensor other than the LoRA factors, or has another
-                dtype than the weight it adapts.
+                data-parallel mesh does not cover all ranks of the job; or if the model has a DSA layer and the
+                number of ranks does not divide its number of DSA attention heads.
         """
         strategy = mesh_context.strategy_config
         if not isinstance(strategy, FSDP2Config):
@@ -384,7 +213,6 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                     f"hybrid_mla_num_attention_heads={heads}, so that every rank holds whole attention heads when "
                     f"a checkpoint is loaded or saved; got a job of {ranks} ranks"
                 )
-        _reject_unsupported_lora_adapters(model)
 
     def _apply_moe(self, model: nn.Module, mesh_context: MeshContext) -> nn.Module:
         """Run the shared expert-parallel flow, verify it, and record the expert-parallel size on the experts.
