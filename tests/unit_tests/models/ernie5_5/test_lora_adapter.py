@@ -133,8 +133,8 @@ def test_checkpointer_saves_twice_and_restores_adapter(tmp_path, ep):
         checkpointer.close()
 
 
-@pytest.mark.parametrize("mode", ["valid", "missing", "extra", "bad_shape", "one_expert"])
-def test_checkpointer_restores_only_an_adapter_checkpoint_with_the_keys_and_shapes_of_the_model(tmp_path, mode):
+@pytest.mark.parametrize("mode", ["valid", "missing", "extra", "bad_shape", "bad_dtype", "one_expert"])
+def test_checkpointer_restores_only_an_adapter_checkpoint_with_the_keys_shapes_and_dtypes_of_the_model(tmp_path, mode):
     """The expert-parallel install path copies adapter tensors without a check of its own."""
     model = _lora_model("model.layers.1.moe.experts" if mode == "one_expert" else "model.layers.0.attention.wq_a")
     native = {name: value for name, value in model.named_parameters() if ".lora_" in name}
@@ -147,6 +147,9 @@ def test_checkpointer_restores_only_an_adapter_checkpoint_with_the_keys_and_shap
         values["base_model.model.model.layers.0.attention.fake.lora_A.weight"] = torch.ones(1)
     elif mode == "bad_shape":
         values[last] = torch.ones(1)
+    elif mode == "bad_dtype":
+        # The install would round a tensor of another precision into the adapter.
+        values[last] = values[last].double()
     elif mode == "one_expert":
         # One expert would broadcast into the adapter slots of all experts.
         values[last] = values[last][:1].clone()
