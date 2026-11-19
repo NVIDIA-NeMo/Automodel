@@ -208,7 +208,7 @@ def test_flop_counter_counts_the_fp32_gemm():
     assert counts[torch.float32] == counts[None] == 2 * 2 * 33 * 96 * 320
 
 
-def test_forward_applies_the_softcap_and_takes_a_gathered_weight():
+def test_projection_applies_the_softcap_and_takes_a_gathered_weight():
     hidden, weight, _ = _operands("cpu")
     head = LMHead(96, 320, logits_dtype=torch.float32, logit_softcapping=2.0, dtype=torch.bfloat16)
     with torch.no_grad():
@@ -218,8 +218,9 @@ def test_forward_applies_the_softcap_and_takes_a_gathered_weight():
 
     expected = 2.0 * torch.tanh(LMHead.linear(hidden, weight, logits_dtype=torch.float32) / 2.0)
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+    # A loss that gathers the weight itself applies the same settings to that copy.
     gathered = (-weight).requires_grad_()
-    overridden = head(hidden, weight=gathered)
+    overridden = head.projection(hidden, gathered)
     torch.testing.assert_close(overridden, -logits, rtol=0, atol=0)
     overridden.sum().backward()
     assert gathered.grad is not None

@@ -428,7 +428,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         local_hidden = dense_hidden[rank].detach().requires_grad_()
 
         def train() -> torch.Tensor:
-            loss = chunked(local_hidden, labels[rank], head.weight, normalizer, world, lm_head=head)
+            loss = chunked(local_hidden, labels[rank], head.weight, normalizer, world, projection=head.projection)
             (loss * _WORLD_SIZE).backward()
             return loss.detach()
 

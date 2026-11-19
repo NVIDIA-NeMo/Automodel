@@ -34,7 +34,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.loss.vocab_parallel import validate_targets
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LogitsProjection
 
 # Size budget for one gathered vocabulary chunk, in bytes. Backward holds about four
 # chunk-sized buffers at once: the current chunk, the prefetched next chunk, the
@@ -515,14 +515,14 @@ def _chunk_logits(
     weight: torch.Tensor,
     softcap: float | None,
     logits_dtype: torch.dtype | None,
-    lm_head: LMHead | None = None,
+    projection: LogitsProjection | None = None,
 ) -> torch.Tensor:
     """Project one token block onto one vocabulary chunk.
 
     Args:
         hidden: Tensor of shape [tokens, hidden]; cast to ``weight.dtype``.
         weight: Tensor of shape [chunk_vocab, hidden].
-        lm_head: Optional model head to project with the explicit chunk weight.
+        projection: Optional parameter-free settings for projecting a vocabulary chunk.
         softcap: Optional logit softcapping value.
         logits_dtype: Optional dtype that rounds the projection output, matching
             the owning model's logits.
@@ -531,8 +531,8 @@ def _chunk_logits(
         FP32 logits of shape [tokens, chunk_vocab], preserving the projection's
         autocast and explicit rounding boundaries before any softcapping.
     """
-    logits = F.linear(hidden.to(weight.dtype), weight) if lm_head is None else lm_head.forward(hidden, weight=weight)
-    if lm_head is not None and lm_head.logits_dtype in (torch.float16, torch.bfloat16):
+    logits = F.linear(hidden.to(weight.dtype), weight) if projection is None else projection(hidden, weight)
+    if projection is not None and projection.logits_dtype in (torch.float16, torch.bfloat16):
         torch._dynamo.graph_break()
     if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:
         logits = logits.to(logits_dtype)
@@ -552,7 +552,7 @@ def _chunk_lse_and_target(
     targets: torch.Tensor,
     softcap: float | None,
     logits_dtype: torch.dtype | None,
-    lm_head: LMHead | None = None,
+    projection: LogitsProjection | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Project a token block and reduce its logits.
 
@@ -561,7 +561,7 @@ def _chunk_lse_and_target(
         weight: Tensor of shape [chunk_vocab, hidden].
         targets: Int64 tensor of shape [tokens], with a local target row or -1
             when the target belongs to another chunk.
-        lm_head: Optional model head to project with the explicit chunk weight.
+        projection: Optional parameter-free settings for projecting a vocabulary chunk.
         softcap: Optional logit softcapping value.
         logits_dtype: Optional dtype that rounds the projection output.
 
@@ -569,7 +569,7 @@ def _chunk_lse_and_target(
         Two FP32 tensors of shape [tokens]: the chunk log-sum-exp and target
         logit, zero where ``targets`` is -1.
     """
-    logits = _chunk_logits(hidden, weight, softcap, logits_dtype, lm_head)
+    logits = _chunk_logits(hidden, weight, softcap, logits_dtype, projection)
     target_logit = logits.gather(-1, targets.clamp(min=0).unsqueeze(-1)).squeeze(-1)
     return torch.logsumexp(logits, dim=-1), torch.where(targets >= 0, target_logit, 0.0)
 
@@ -588,19 +588,19 @@ class TorchVocabChunkKernel:
         softcap: float | None,
         logits_dtype: torch.dtype | None,
         compile: bool,
-        lm_head: LMHead | None = None,
+        projection: LogitsProjection | None = None,
     ) -> None:
         """Configure the per-chunk math.
 
         Args:
             token_block: Maximum tokens projected at once; None projects all of
                 them, so memory grows as tokens x chunk_vocab.
-            lm_head: Optional model head to project with the explicit chunk weight.
+            projection: Optional parameter-free settings for projecting a vocabulary chunk.
             softcap: Optional logit softcapping value.
             logits_dtype: Optional dtype that rounds the projection output.
             compile: Run the projection and reduction through ``torch.compile``.
         """
-        self.lm_head = lm_head
+        self.projection = projection
         self.token_block = token_block
         self.softcap = softcap
         self.logits_dtype = logits_dtype
@@ -622,7 +622,7 @@ class TorchVocabChunkKernel:
         for start in range(0, hidden.shape[0], block):
             end = start + block
             lse[start:end], target_logit[start:end] = self._compute(
-                hidden[start:end], weight, targets[start:end], self.softcap, self.logits_dtype, self.lm_head
+                hidden[start:end], weight, targets[start:end], self.softcap, self.logits_dtype, self.projection
             )
         return lse, target_logit
 
@@ -653,7 +653,7 @@ class TorchVocabChunkKernel:
             for start in range(0, hidden.shape[0], block):
                 end = start + block
                 local_hidden = hidden[start:end].detach().requires_grad_(need_hidden)
-                logits = self._project(local_hidden, local_weight, self.softcap, self.logits_dtype, self.lm_head)
+                logits = self._project(local_hidden, local_weight, self.softcap, self.logits_dtype, self.projection)
                 with torch.no_grad():
                     grad_logits = torch.exp(logits - lse[start:end].unsqueeze(-1))
                     block_targets = targets[start:end]
