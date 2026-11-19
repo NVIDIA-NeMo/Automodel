@@ -437,7 +437,12 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     not been validated with this model.
 
     The DSA indexers only select keys and are not trained. The constructor freezes their parameters, and a
-    forward in training mode raises if a freeze configuration enabled gradients on them again.
+    forward in training mode raises if an indexer holds a trainable parameter: one that a freeze configuration
+    enabled again, or an adapter tensor of a LoRA adapter on an indexer projection.
+
+    LoRA is validated on the plain linear projections that an attention module owns directly (not those of its
+    indexer or compressor), on the routed experts, and on the projections of the dense FFN and of the shared
+    expert.
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -671,8 +676,9 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
 
         The loss gives the indexers no gradient, and an optimizer entry that never receives one has no state to
         restore when a run resumes. The constructor therefore freezes them, and nothing in the model enables
-        them again. A freeze configuration whose unfreeze selectors cover an indexer does; it is rejected here
-        at the first training step.
+        them again. A freeze configuration whose unfreeze selectors cover an indexer does, and a LoRA adapter on
+        an indexer projection adds trainable tensors of its own to the indexer. Both are rejected here at the
+        first training step.
 
         Raises:
             ValueError: If a parameter of a DSA indexer requires gradients.
@@ -681,7 +687,8 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             if layer.is_dsa and any(parameter.requires_grad for parameter in layer.attention.indexer.parameters()):
                 raise ValueError(
                     f"model.layers.{index}.attention.indexer has trainable parameters. The DSA indexer only "
-                    "selects keys and is not trained: remove it from the unfreeze selectors of freeze_config"
+                    "selects keys and is not trained: remove it from the unfreeze selectors of freeze_config and "
+                    "from the modules that peft.target_modules selects"
                 )
 
     def forward(

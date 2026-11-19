@@ -28,6 +28,9 @@ that flow builds the FSDP units:
 
 No other trainable parameter of the model is used by some ranks and not by others, so the sidecar does not enable
 FSDP's reduction of unused parameters.
+
+After the shared flow has sharded the routed experts, the sidecar records the expert-parallel size on them: a PEFT
+checkpoint save reads that attribute to decide whether every rank collects the adapter tensors itself.
 """
 
 import logging
@@ -212,14 +215,22 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                 )
 
     def _apply_moe(self, model: nn.Module, mesh_context: MeshContext) -> nn.Module:
-        """Run the shared expert-parallel flow and verify that it sharded the model through this sidecar.
+        """Run the shared expert-parallel flow, verify it, and record the expert-parallel size on the experts.
+
+        For this model, which has neither pipeline stages nor quantized modules, a PEFT checkpoint save lets every
+        rank collect the adapter tensors itself only when a module carries an ``ep_size`` attribute greater than
+        one; otherwise only rank 0 receives them and the other ranks hand an empty state to the checkpoint
+        adapter. Expert modules with a token dispatcher set the attribute when the shared flow initializes the
+        dispatcher. The torch experts of this model have no dispatcher, so the sidecar sets it once the shared
+        flow has sharded them and its post-condition holds. A save without PEFT does not read the attribute.
 
         Args:
             model: The ``Ernie5_5_MoeForCausalLM`` to distribute, admitted by ``_prepare_model``.
             mesh_context: Meshes, parallelism sizes and strategy of the run.
 
         Returns:
-            The model, with its parameters sharded by the shared expert-parallel flow.
+            The model, with its parameters sharded by the shared expert-parallel flow and ``ep_size`` set on the
+            routed experts of every MoE layer.
 
         Raises:
             RuntimeError: If the shared flow returned without making the hyper-head an FSDP unit.
@@ -231,6 +242,9 @@ class Ernie5_5ModelParallelizer(ModelParallelizer):
                 "The expert-parallel flow did not shard ERNIE 5.5 through its sidecar: the hyper-head is not an "
                 "FSDP unit, so its FP32 boundary and the HCA synchronization groups are missing"
             )
+        for layer in model.model.layers:
+            if layer.is_moe:
+                layer.moe.experts.ep_size = mesh_context.ep_size
         return model
 
     def _fully_shard_module(self, module: nn.Module, **kwargs: Unpack[_FullyShardKwargs]) -> nn.Module:
