@@ -15,18 +15,18 @@
 #!/usr/bin/env python3
 """Validate that a newly added CI recipe declares a complete ``ci:`` section.
 
-A recipe YAML placed under a CI-enabled ``examples/`` folder is run by the
-nightly/release/performance pipelines. Auto-discovery scopes (see
-``AUTO_DISCOVER_SCOPES`` in ``generate_ci_tests.py``) enroll *every* YAML under
-their folder simply by its presence on disk, so a new file silently becomes a
-CI test. This check enforces, on newly added recipes only, that the recipe
-declares who owns it, how long it should run, and how many nodes it needs -- so
-the generated job is accountable and correctly sized rather than falling back to
-opaque defaults.
+A recipe YAML runs in CI when its ``ci.nemo_ci_schedule`` selects the nightly or
+release scope, when a scope auto-discovers its folder (``AUTO_DISCOVER_SCOPES``
+in ``generate_ci_tests.py`` runs every YAML under the performance benchmark
+folders), or when a recipe list names it. This check enforces, on newly added
+recipes only, that a CI recipe declares who owns it, how long it should run, and
+how many nodes it needs -- so the generated job is accountable and correctly
+sized rather than falling back to opaque defaults.
 
 The set of CI-enabled recipes is derived entirely from configuration already in
-this repo (no nemo-ci dependency): the auto-discover subpaths plus every recipe
-referenced by a ``tests/ci_tests/configs/<folder>/*_recipes.yml`` list.
+this repo (no nemo-ci dependency): each recipe's ``ci.nemo_ci_schedule``, the
+auto-discover subpaths, and every recipe referenced by a
+``tests/ci_tests/configs/<folder>/*_recipes.yml`` list.
 
 Existing recipes are grandfathered: the caller passes only the files added in
 the change (``git diff --diff-filter=A``), so this never retroactively fails
@@ -48,7 +48,7 @@ UTILS_DIR = Path(__file__).resolve().parent
 if str(UTILS_DIR) not in sys.path:
     sys.path.insert(0, str(UTILS_DIR))
 
-from generate_ci_tests import AUTO_DISCOVER_SCOPES  # noqa: E402
+from generate_ci_tests import AUTO_DISCOVER_SCOPES, nemo_ci_schedule_folder, nemo_ci_schedule_scopes  # noqa: E402
 
 # ci: keys every newly added CI recipe must declare.
 REQUIRED_CI_FIELDS = ("recipe_owner", "time", "nodes")
@@ -90,11 +90,20 @@ def listed_recipe_paths(automodel_dir: Path) -> set[Path]:
     return paths
 
 
-def is_ci_enabled(rel_path: Path, subpaths: set[str], listed: set[Path]) -> bool:
-    """Whether ``rel_path`` (relative to the repo root) is a recipe CI will run."""
+def is_ci_enabled(rel_path: Path, recipe: object, subpaths: set[str], listed: set[Path]) -> bool:
+    """Whether ``rel_path`` (relative to the repo root), parsed as ``recipe``, is a recipe CI will run."""
     if rel_path in listed:
         return True
-    return any(_is_relative_to(rel_path, Path("examples") / subpath) for subpath in subpaths)
+    if any(_is_relative_to(rel_path, Path("examples") / subpath) for subpath in subpaths):
+        return True
+    ci_block = recipe.get("ci") if isinstance(recipe, dict) else None
+    if not isinstance(ci_block, dict) or nemo_ci_schedule_folder(rel_path) is None:
+        return False
+    try:
+        return bool(nemo_ci_schedule_scopes(ci_block))
+    except ValueError:
+        # tools/lint_example_yamls.py reports a missing or invalid `ci.nemo_ci_schedule`.
+        return False
 
 
 def validate_recipe(path: Path, automodel_dir: Path) -> list[CiError]:
@@ -144,8 +153,8 @@ def format_errors(errors: list[CiError], automodel_dir: Path) -> str:
         path = _relative_path(error.path, automodel_dir)
         lines.append(f"  {path}:{error.line}: {error.message}")
     lines.append(
-        "\nEvery recipe added under a CI-enabled examples/ folder must declare a `ci:` "
-        "section with `recipe_owner`, `time`, and `nodes`. See tests/ci_tests/README.md."
+        "\nEvery newly added recipe that CI runs must declare a `ci:` section with "
+        "`recipe_owner`, `time`, and `nodes`. See tests/ci_tests/README.md."
     )
     return "\n".join(lines)
 
@@ -196,9 +205,14 @@ def main(argv: list[str] | None = None) -> int:
             continue
         abs_path = path if path.is_absolute() else (automodel_dir / path)
         rel_path = _relative_path(abs_path, automodel_dir)
-        if not is_ci_enabled(rel_path, subpaths, listed):
-            continue
         if not abs_path.is_file():
+            continue
+        try:
+            recipe = yaml.safe_load(abs_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            # validate_recipe reports the syntax error when the path alone enrolls the recipe.
+            recipe = None
+        if not is_ci_enabled(rel_path, recipe, subpaths, listed):
             continue
         checked += 1
         errors.extend(validate_recipe(abs_path, automodel_dir))

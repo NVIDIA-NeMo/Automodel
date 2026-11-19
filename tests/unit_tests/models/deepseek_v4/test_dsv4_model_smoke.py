@@ -23,10 +23,14 @@ Or as a standalone script:
         tests/unit_tests/models/deepseek_v4/test_dsv4_model_smoke.py
 """
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.mtp import MTPConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -34,6 +38,7 @@ from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+from nemo_automodel.recipes._typed_config import RecipeConfig
 
 # Over the default 5s budget on purpose: CUDA model forward and backward initialize compiled kernels.
 # Reduce cold compiler startup before lowering this further.
@@ -1012,3 +1017,37 @@ def test_grouped_compressor_guard_rejects_inputs_with_optional_parameter_partici
         with pytest.raises(ValueError, match="complete local window"):
             model.model(input_ids=torch.ones(1, length, dtype=torch.long), position_ids=positions, **kwargs)
         assert not called
+
+
+def test_optimized_pretrain_collation_preserves_grouped_compressor_input_contract() -> None:
+    """The production recipe must emit implicit unpadded inputs, retaining real padding exclusions."""
+    path = Path(__file__).resolve().parents[4] / "examples/llm_pretrain/deepseek/deepseek_v4_flash_h100_optimized.yaml"
+    raw = yaml.safe_load(path.read_text())
+    # Resolve the production input sections without requiring its GPU-only optimizer.
+    recipe = RecipeConfig(ConfigNode({key: raw[key] for key in ("dataset", "dataloader", "step_scheduler")}))
+    loader = recipe.dataloader
+    dataset = loader.dataset_config.build()
+    samples = iter(dataset)
+    batch = loader.collate_fn([next(samples) for _ in range(loader.batch_size)])
+    assert batch["input_ids"].shape == (16, 4096)
+    assert set(batch) == {"input_ids", "labels"}
+    assert torch.equal(batch["labels"][:, :-1], batch["input_ids"][:, 1:])
+    assert (batch["labels"][:, -1] == -100).all()
+
+    config = _tiny_config(vocab_size=dataset.vocab_size, num_hidden_layers=0, num_hash_layers=0, compress_ratios=[])
+    model = _make_model(config)
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.model.backend.attn = "cudnn"
+    model.model.hc_head = None
+    model.model.norm = None
+    config.group_compressor_fsdp_units = True
+    config.compress_ratios = [128]
+    # Exercise the guarded model entry with one PP microbatch from the actual recipe collator.
+    model.model(input_ids=batch["input_ids"][:1])
+
+    padded = next(samples)
+    padded["input_ids"][0, -1] = 0
+    padded_batch = loader.collate_fn([padded])
+    assert padded_batch["padding_mask"][0, -1]
+    with pytest.raises(ValueError, match="complete local window"):
+        model.model(input_ids=padded_batch["input_ids"], padding_mask=padded_batch["padding_mask"])

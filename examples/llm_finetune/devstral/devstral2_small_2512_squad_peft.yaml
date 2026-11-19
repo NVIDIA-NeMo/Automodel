@@ -118,6 +118,7 @@ wandb:
   dir: logs/wandb
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: akoumpa
   time: "00:30:00"
   nproc_per_node: 1
