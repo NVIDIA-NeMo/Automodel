@@ -27,9 +27,11 @@ from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, Ro
 from torch.distributed.tensor.placement_types import Shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.activation_checkpointing import is_selective_activation_checkpointing
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.moe.parallelizer import apply_ac
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
         **kwargs,
     ) -> nn.Module:
         """Apply every requested parallelism to a Nemotron-H model."""
+        activation_checkpointing_scope = kwargs.get("activation_checkpointing_scope", "all")
         del tp_shard_plan, kwargs
         if sequence_parallel:
             raise ValueError("Sequence parallelism is not supported for NemotronHForCausalLM")
@@ -121,12 +124,21 @@ class NemotronHModelParallelizer(ModelParallelizer):
                         )
 
         if activation_checkpointing:
-            block_items = (
-                block_container.items() if isinstance(block_container, nn.ModuleDict) else enumerate(block_container)
-            )
-            for key, layer in list(block_items):
-                if getattr(layer, "block_type", None) in ("mlp", "mamba"):
-                    block_container[key] = checkpoint_wrapper(layer)
+            if hasattr(model, "backbone"):
+                # HF NemotronH layout: only mlp and mamba blocks are checkpointed.
+                for key, layer in list(enumerate(block_container)):
+                    if getattr(layer, "block_type", None) in ("mlp", "mamba"):
+                        block_container[key] = checkpoint_wrapper(layer)
+            else:
+                # Native Nemotron-V3 layout: checkpoint every decoder block (mamba, attention,
+                # mlp, moe) and the MTP blocks the same way the expert-parallel path does.
+                # apply_ac pins the MoE routing across the recompute and keeps the gate's
+                # expert-load accounting from counting it twice.
+                apply_ac(
+                    model,
+                    selective=is_selective_activation_checkpointing(activation_checkpointing),
+                    activation_checkpointing_scope=activation_checkpointing_scope,
+                )
             _, layers = _decoder_blocks(model)
 
         if reapply_trainability is not None:

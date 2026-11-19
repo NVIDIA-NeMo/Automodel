@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
@@ -943,6 +944,32 @@ class TestNemotronHModelParallelizer:
         # Should apply checkpoint wrapper to both MLP and Mamba layers
         expected_checkpoint_calls = 3  # 2 MLP (from MockNemotronHModel) + 1 Mamba layer
         assert mock_checkpoint.call_count == expected_checkpoint_calls
+
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
+    def test_activation_checkpointing_native_layout_wraps_every_block(
+        self,
+        mock_fully_shard_by_dtype,
+        mock_fully_shard,
+        strategy,
+        mock_device_mesh,
+    ):
+        """Without EP, native Nemotron-V3 checkpoints attention and MoE blocks too, like the EP path."""
+        mesh, _, _, _ = mock_device_mesh
+        mock_fully_shard.side_effect = lambda model, **kwargs: model
+        mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+        block_types = ["mamba", "moe", "attention", "mlp"]
+        model = MockNemotronV3Model(num_layers=len(block_types))
+        for layer, block_type in zip(model.model.layers.values(), block_types):
+            setattr(layer, "block_type", block_type)
+        model.config = SimpleNamespace(hidden_size=8)
+        model.model.moe_config = SimpleNamespace(n_routed_experts=4)
+
+        strategy._apply(model=model, device_mesh=mesh, activation_checkpointing=True)
+
+        blocks = list(model.model.layers.values())
+        assert all(isinstance(block, CheckpointWrapper) for block in blocks)
+        assert [block._checkpoint_wrapped_module.block_type for block in blocks] == block_types
 
 
 class _MockQwen35Model(nn.Module):
