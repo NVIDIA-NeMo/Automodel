@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
@@ -39,6 +40,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
 )
 from nemo_automodel.components.models.glm_moe_dsa.cp import (
     gather_order,
+    glm_dsa_cp_enabled,
     glm_dsa_gather_replay,
     shard_glm_dsa_packed_cp_batch,
     validate_query_rows,
@@ -292,7 +294,11 @@ class GlmMoeDsaModel(nn.Module):
             order = gather_order(layout, cp_size, h.shape[0] * cp_size, h.device)
             query_indices = attn_kwargs.get("glm_dsa_cp_query_indices")
             if query_indices is not None:
-                validate_query_rows(layout, int(attn_kwargs["cp_rank"]), cp_size, h.shape[0], query_indices)
+                # The CP process group determines this rank; cp_rank serves callers that pass the metadata
+                # without a group.
+                cp_group = attn_kwargs.get("_glm_dsa_cp_group")
+                cp_rank = dist.get_rank(group=cp_group) if glm_dsa_cp_enabled(cp_group) else int(attn_kwargs["cp_rank"])
+                validate_query_rows(layout, cp_rank, cp_size, h.shape[0], query_indices)
             elif order is not None:
                 raise ValueError(
                     "cp_query_layout='head_tail' requires glm_dsa_cp_query_indices in the packed CP batch."

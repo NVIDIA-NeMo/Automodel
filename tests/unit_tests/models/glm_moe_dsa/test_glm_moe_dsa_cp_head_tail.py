@@ -23,6 +23,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm_moe_dsa import cp as glm_cp
+from nemo_automodel.components.models.glm_moe_dsa import model as glm_model
 from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import is_cudnn_dsa_available
 from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
@@ -161,6 +162,24 @@ def test_contiguous_model_rejects_head_tail_query_rows_before_the_gather():
             cp_rank=1,
             cu_seqlens=torch.tensor([0, 8], dtype=torch.int32),
             glm_dsa_cp_query_indices=torch.tensor([2, 3, 4, 5], dtype=torch.int32),
+        )
+
+
+def test_pre_sharded_rows_take_their_rank_from_the_cp_group(monkeypatch):
+    """With a CP group in the batch the rank comes from the group; cp_rank is not required."""
+    model = _model()
+    monkeypatch.setattr(glm_model, "glm_dsa_cp_enabled", lambda group: group == "cp-group", raising=False)
+    monkeypatch.setattr(glm_model.dist, "get_rank", lambda group=None: 1)
+    with pytest.raises(ValueError, match="cp_query_layout"):
+        # Rank 1 of 2 owns rows 4..7 under the contiguous layout; these are its head/tail rows.
+        model.model(
+            torch.zeros(4, dtype=torch.long),
+            position_ids=torch.tensor([2, 3, 4, 5]),
+            qkv_format="thd",
+            cp_size=2,
+            cu_seqlens=torch.tensor([0, 8], dtype=torch.int32),
+            glm_dsa_cp_query_indices=torch.tensor([2, 3, 4, 5], dtype=torch.int32),
+            _glm_dsa_cp_group="cp-group",
         )
 
 
