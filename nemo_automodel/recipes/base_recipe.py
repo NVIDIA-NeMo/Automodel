@@ -881,8 +881,11 @@ class BaseRecipe:
                 return tps, None
             step_flops += float(batch_flops)
 
+        # Sum over DP ranks only, like the token count. Every CP rank of a DP replica holds
+        # the same unsharded batches (CP shards a copy inside the step), so including CP
+        # would count each sequence's FLOPs cp_size times.
         step_flops = self._dp_allreduce(
-            torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
+            torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device)
         ).item()
         mfu = calculate_mfu(
             step_flops / 1e12,
