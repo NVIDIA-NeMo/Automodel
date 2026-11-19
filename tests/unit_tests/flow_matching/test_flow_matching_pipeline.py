@@ -569,6 +569,22 @@ class TestLossComputation:
                 loss_weighting_scheme="invalid_scheme",
             )
 
+    def test_compute_loss_rejects_mutated_unknown_scheme(self, simple_adapter):
+        """Test runtime validation after a loss weighting scheme is mutated."""
+        pipeline = FlowMatchingPipeline(model_adapter=simple_adapter, device=torch.device("cpu"))
+        pipeline.loss_weighting_scheme = "invalid_scheme"
+        model_pred = torch.zeros(2, 1)
+        target = torch.ones_like(model_pred)
+        sigma = torch.tensor([0.3, 0.7])
+
+        with pytest.raises(ValueError, match="Unknown loss_weighting_scheme: 'invalid_scheme'"):
+            pipeline.compute_loss(model_pred, target, sigma)
+
+        pipeline.use_loss_weighting = False
+        weighted_loss, _, unweighted_loss, _, loss_weight, _ = pipeline.compute_loss(model_pred, target, sigma)
+        torch.testing.assert_close(loss_weight, torch.ones(2, 1))
+        torch.testing.assert_close(weighted_loss, unweighted_loss)
+
 
 class TestFullTrainingStep:
     """Test the complete training step."""

@@ -101,7 +101,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -120,6 +120,7 @@ lr_scheduler:
   min_lr: 1.0e-5
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   # ep_size(8) = 8 GPUs => 1 node (8 H100/node).
   recipe_owner: adil-a

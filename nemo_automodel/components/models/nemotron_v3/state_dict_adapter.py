@@ -133,31 +133,46 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         key = _strip_mamba_fp32_holder_key(key)
         # Base checkpoints may still use the remote-code backbone namespace.
         # Default PEFT exports target the built-in Transformers v5 model, whose
-        # modules live under model regardless of the base checkpoint's keys.
-        hf_prefix = "model." if ".lora_" in key and not v4_compatible else self._hf_prefix
+        # modules live under model regardless of the base checkpoint's keys. That
+        # holds for every tensor of a PEFT export (keys under base_model.model.):
+        # the LoRA weights and the modules it stores in full (modules_to_save).
+        is_peft_key = ".lora_" in key or key.startswith("base_model.model.")
+        hf_prefix = "model." if is_peft_key and not v4_compatible else self._hf_prefix
         key = re.sub(
             r"^(?P<outer>base_model\.model\.)?model\.",
             lambda match: f"{match.group('outer') or ''}{hf_prefix}",
             key,
         )
-        hf_root = re.escape(self._hf_prefix.rstrip("."))
-        key = re.sub(rf"^{hf_root}\.norm\.weight$", f"{self._hf_prefix}norm_f.weight", key)
-        key = re.sub(rf"^{hf_root}\.embed_tokens\.weight$", f"{self._hf_prefix}embeddings.weight", key)
+        hf_root = re.escape(hf_prefix.rstrip("."))
+        key = re.sub(
+            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.norm\.weight$",
+            lambda match: f"{match.group('outer') or ''}{hf_prefix}norm_f.weight",
+            key,
+        )
+        key = re.sub(
+            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.embed_tokens\.weight$",
+            lambda match: f"{match.group('outer') or ''}{hf_prefix}embeddings.weight",
+            key,
+        )
         return key
 
     def map_peft_target_module_to_hf(self, module_name: str, *, v4_compatible: bool = False) -> str:
-        """Map PEFT targets to the same namespace as the exported adapter weights.
+        """Map a PEFT module name to the module its exported weights belong to.
+
+        The module is named where its ``weight`` lands in a PEFT export, so
+        ``target_modules`` and ``modules_to_save`` agree with the adapter tensors,
+        including the ``norm`` -> ``norm_f`` and ``embed_tokens`` -> ``embeddings``
+        renames.
 
         Args:
-            module_name: A target-module name in native layout.
+            module_name: A module name in native layout.
             v4_compatible: Preserve the source checkpoint's legacy namespace.
 
         Returns:
-            Target-module name for the selected HF export format.
+            Module name for the selected HF export format.
         """
-        if v4_compatible:
-            return self._native_key_to_hf(module_name, v4_compatible=True)
-        return _strip_mamba_fp32_holder_key(module_name)
+        weight_key = self._native_key_to_hf(f"base_model.model.{module_name}.weight", v4_compatible=v4_compatible)
+        return weight_key.removeprefix("base_model.model.").removesuffix(".weight")
 
     def _hf_key_to_native(self, key: str) -> str:
         """Normalize a public HF Nemotron V3 key to its native namespace."""
@@ -254,16 +269,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # Detect whether the source checkpoint uses the remote-code ``backbone``
         # namespace or Transformers v5's native ``model`` namespace. MTP keys
         # never carry either prefix. Adapter-only restores must not change the
-        # base checkpoint's export namespace: legacy PEFT keys can use native
+        # base checkpoint's export namespace: PEFT exports name their tensors,
+        # LoRA weights and the modules they store in full alike, in native
         # ``model`` names even when the base checkpoint uses ``backbone``.
         for key in backbone_state_dict.keys():
-            if any(part.startswith("lora_") for part in key.split(".")):
+            if key.startswith("base_model.model.") or any(part.startswith("lora_") for part in key.split(".")):
                 continue
-            bare_key = key.removeprefix("base_model.model.")
-            if bare_key.startswith("backbone."):
+            if key.startswith("backbone."):
                 self._uses_model_prefix = False
                 break
-            if bare_key.startswith("model."):
+            if key.startswith("model."):
                 self._uses_model_prefix = True
                 break
 

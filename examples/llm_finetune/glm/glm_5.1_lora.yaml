@@ -93,7 +93,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -111,6 +111,7 @@ optimizer:
   weight_decay: 0.0
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai
@@ -122,7 +123,7 @@ ci:
     step_scheduler.max_steps: 2
     step_scheduler.ckpt_every_steps: 2
     step_scheduler.val_every_steps: 1000
-    dataset.num_samples_limit: 4096
+    dataset.limit_dataset_samples: 4096
   checkpoint_robustness:
     # Native adapter/optimizer restart coverage; HF consumer coverage is tracked in #3867.
     skip_source_load_parity: true
@@ -133,5 +134,5 @@ ci:
     step_scheduler.val_every_steps: 1000
     step_scheduler.global_batch_size: 512
     step_scheduler.local_batch_size: 8
-    dataset.num_samples_limit: 4096
+    dataset.limit_dataset_samples: 4096
     peft.use_triton: true

@@ -67,6 +67,8 @@ eager, not bitwise-identical (the 12-layer mini benchmark reproduced the eager
 loss to four decimals). The cores are specialized per shape: a new sequence
 length (or grad mode) compiles them again, so keep them off for runs with many
 distinct packed lengths.
+The packed 32K CP8 recipes and the MedPix 4K recipe set `compile_hc: true`:
+every rank there sees 4,096 tokens of one fixed shape.
 The Sinkhorn normalization keeps its TileKernels or torch backend. Both knobs are
 backend fields: they select kernels and are not written to `config.json`.
 TileLang and TileKernels are the optional dependencies also used by DeepSeek V4.
@@ -160,6 +162,8 @@ repository at `e2c47c5b` (torch 2.13, NCCL 2.30.5).
 | [HellaSwag LoRA, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) | 8 x 8 H100; EP32, ep_shard2, owner64; GBS 64, LBS 1, one microbatch | None | 43.9 GiB; train 2.2655, validation 2.5737 |
 | [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) | 32 x 8 H100; EP64, ep_shard4, CP8; GBS 64, LBS 1, two microbatches | `defer_fsdp_grad_sync: false`, `moe.reshard_after_forward: false` | 65.7 GiB; validation 0.5541 / 0.5444 (CP1 reference at 16 nodes, GBS 128: 0.5477 / 0.5384) |
 | [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) | 64 x 8 H100; EP64, ep_shard8, CP8; GBS 64, LBS 1, one microbatch | `moe.reshard_after_forward: false` | 62.5 GiB; validation 0.5853 / 0.5778; one checkpoint about 8.2 TB |
+
+The packed CP8 32k row was measured before the recipe set `compile_hc: true`.
 
 The Tulu3 variants load `allenai/tulu-3-sft-mixture` from the Hugging Face Hub
 through `ChatDataset` with `tulu3_chat_template.jinja`. The CP8 recipe uses

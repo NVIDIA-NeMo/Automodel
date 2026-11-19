@@ -32,6 +32,7 @@ from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
@@ -505,9 +506,12 @@ class BackendConfig:
             For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
-            CUDA BF16; "cudnn" selects cuDNN Frontend indexed QSA on SM100/SM103
-            with compression ratio four and CP=1, preserving the existing indexer.
-            CPU execution retains the PyTorch numerical oracle.
+            CUDA BF16, "fa4" selects FlashAttention 4 sparse GQA (SM90 BF16), and "cudnn"
+            selects cuDNN Frontend indexed QSA on SM100/SM103 with compression ratio four
+            and CP=1, preserving the existing indexer. CPU execution retains the PyTorch
+            numerical oracle. For Kimi K3, "fa4" runs MLA through FlashAttention 4 (varlen,
+            with and without context parallelism). "fa4" requires the optional
+            flash_attn.cute package; models without an FA4 path reject it.
         sparse_attn: Sparse-attention backend. "generic" preserves each model's
             existing sparse mask plus ``attn`` path; "msa" selects the optional
             SM100 MSA kernels a model provides for its sparse layers only.
@@ -529,10 +533,13 @@ class BackendConfig:
             Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            "nccl_ep" uses Transformer Engine NCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        nccl_ep: NCCL-EP settings; ``max_tokens_per_rank`` is required when selecting
+            "nccl_ep". NCCL-EP sizes its own kernels and ignores ``dispatcher_num_sms``.
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
-            manager instance across MoE layers.
+            manager instance across MoE layers. NCCL-EP always keeps routing state layer-local.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
         dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
@@ -562,7 +569,9 @@ class BackendConfig:
             run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
             taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
             that covers the largest routing skew expected across layers and batches. Not supported
-            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination) or by
+            ``GroupedExpertsTE``, which HybridEP uses for every ``experts`` value other than
+            ``torch_mm``, ``gmm`` and ``torch_mm_mxfp8``.
         dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
@@ -593,6 +602,9 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+            Qwen3-MoE also supports attn="fa4": only the padded projections, Q/K
+            normalization and RoPE are compiled; packed varlen attention runs between
+            those fixed-shape graphs with its document metadata preserved.
         compile_situ: torch.compile the SiTU expert activation of models that opt in
             (currently Kimi K3): the weighted-SiTU forward and backward run as one fused
             whole-tensor kernel each (low-precision in/out, fp32 math inside, no chunk loop),
@@ -636,13 +648,14 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
     te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
@@ -757,6 +770,16 @@ class BackendConfig:
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
+        if isinstance(self.nccl_ep, dict):
+            self.nccl_ep = NcclEpConfig(**self.nccl_ep)
+        elif not isinstance(self.nccl_ep, NcclEpConfig):
+            raise TypeError("nccl_ep must be an NcclEpConfig or mapping")
+        if self.dispatcher == "nccl_ep":
+            if self.nccl_ep.max_tokens_per_rank is None:
+                raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
+            if self.dispatcher_async_dispatch:
+                raise ValueError("dispatcher_async_dispatch is not supported by NCCL-EP")
+
         if isinstance(self.mok, dict):
             self.mok = MoKBackendConfig(**self.mok)
         elif not isinstance(self.mok, MoKBackendConfig):
@@ -796,7 +819,7 @@ class BackendConfig:
 
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():

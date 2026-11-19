@@ -210,3 +210,36 @@ def test_prepare_qat_model_with_fake_torchao(monkeypatch):
     model2 = SimpleMLP()
     m2, mode2 = qat.prepare_qat_model(model2, fake.Int4WeightOnlyQATQuantizer())
     assert m2 is model2 and mode2 == "4w-qat" and getattr(model2, "quantizer_applied") == "4w"
+
+
+def test_qat_config_create_quantizer_defaults():
+    config = qat.QATConfig()
+    quantizer = config.create_quantizer()
+
+    assert isinstance(quantizer, qat.Int8DynActInt4WeightQATQuantizer)
+    assert quantizer.groupsize == 256
+    assert quantizer.padding_allowed is False
+    assert quantizer.precision == torch.bfloat16
+    assert quantizer.scales_precision == torch.bfloat16
+
+
+def test_qat_config_create_quantizer_overrides():
+    config = qat.QATConfig(quantizer_type="int4_weight_only", groupsize=64, inner_k_tiles=4)
+    quantizer = config.create_quantizer()
+
+    assert isinstance(quantizer, qat.Int4WeightOnlyQATQuantizer)
+    assert quantizer.groupsize == 64
+    assert quantizer.inner_k_tiles == 4
+    assert config.to_dict() == {"quantizer_type": "int4_weight_only", "groupsize": 64, "inner_k_tiles": 4}
+
+
+def test_qat_config_rejects_inapplicable_kwargs():
+    with pytest.raises(ValueError, match="inner_k_tiles"):
+        qat.QATConfig(quantizer_type="int8_dynact_int4weight", inner_k_tiles=4).create_quantizer()
+    with pytest.raises(ValueError, match="padding_allowed"):
+        qat.QATConfig(quantizer_type="int4_weight_only", padding_allowed=True).create_quantizer()
+
+
+def test_qat_config_rejects_unknown_kwargs():
+    with pytest.raises(ValueError, match="Unknown QAT quantizer kwargs"):
+        qat.QATConfig(unknown_kwarg=True).create_quantizer()
