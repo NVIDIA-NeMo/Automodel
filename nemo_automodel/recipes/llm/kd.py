@@ -916,10 +916,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
@@ -929,6 +925,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # Clear buffers for next step.
         self._ce_loss_buffer.clear()
         self._kd_loss_buffer.clear()
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -1020,11 +1020,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
-
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         reporting_loss = reporting_loss / num_label_tokens
@@ -1072,6 +1067,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.item()
         grad_norm = float(grad_norm)
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
 
         return MetricsSample(
             step=self.step_scheduler.step,

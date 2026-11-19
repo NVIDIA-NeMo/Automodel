@@ -84,3 +84,7 @@ optimizer:
 checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/runtime_tflops
+
+ci:
+  cluster_tag: h100
+  nemo_ci_schedule: skipped

@@ -586,6 +586,11 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
+        total_loss = torch.sum(torch.stack(loss_buffer))
+        total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()
+
+        dllm_loss = self._dp_allreduce(torch.stack(self._dllm_loss_buffer).sum(), include_cp=True).item()
+        self._dllm_loss_buffer.clear()
         t = time.perf_counter()
         time_delta = t - self.timestamp
         self.timestamp = t
@@ -617,12 +622,6 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                     time_delta,
                     reference_mfu=mfu_calculator.reference_mfu,
                 )
-
-        total_loss = torch.sum(torch.stack(loss_buffer))
-        total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()
-
-        dllm_loss = self._dp_allreduce(torch.stack(self._dllm_loss_buffer).sum(), include_cp=True).item()
-        self._dllm_loss_buffer.clear()
 
         # DFlash draft top-1 accuracy. Per-rank raw (correct, count) per block
         # offset are summed over grad-accum microbatches, SUM-allreduced across

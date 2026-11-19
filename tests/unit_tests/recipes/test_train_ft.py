@@ -2667,7 +2667,6 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert "pack_fill" not in metrics.metrics
 
-
     @pytest.mark.parametrize("dp_size,cp_size,world_size", [(1, 1, 1), (2, 1, 2), (2, 2, 8)])
     @pytest.mark.parametrize("elapsed", [1.0, 2.0])
     def test_runtime_tflops_accumulate_shapes_without_recounting_cp(
@@ -2679,18 +2678,26 @@ class TestRunTrainOptimStepSetsMoEScale:
         from nemo_automodel._transformers.mfu import AutoMFU
 
         recipe = self._make_recipe(
-            monkeypatch, pp_enabled=False, dp_group_size=dp_size,
-            cp_group_size=cp_size, world_size=world_size,
+            monkeypatch,
+            pp_enabled=False,
+            dp_group_size=dp_size,
+            cp_group_size=cp_size,
+            world_size=world_size,
         )
         recipe.mfu_calculator = AutoMFU(
             LlamaConfig(
-                hidden_size=4, intermediate_size=8, num_hidden_layers=1,
-                num_attention_heads=2, num_key_value_heads=1, vocab_size=16,
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                vocab_size=16,
             ),
             peak_tflops=1000.0,
         )
         monkeypatch.setattr(
-            recipe, "_dp_allreduce",
+            recipe,
+            "_dp_allreduce",
             lambda value, include_cp=False: value * dp_size * (cp_size if include_cp else 1),
         )
         recipe.timestamp = 10.0
@@ -2726,6 +2733,7 @@ class TestRunTrainOptimStepSetsMoEScale:
             is_val_step = True
             is_ckpt_step = True
             sigterm_flag = False
+            stream_exhausted = False
 
             def set_epoch(self, epoch):
                 self.epoch = epoch
@@ -2734,8 +2742,9 @@ class TestRunTrainOptimStepSetsMoEScale:
                 for step in (1, 2):
                     self.step = step
                     advance(2.0)  # Fetch data before entering the optimizer step.
-                    yield [{"input_ids": torch.ones(1, 4, dtype=torch.long),
-                            "labels": torch.ones(1, 4, dtype=torch.long)}]
+                    yield [
+                        {"input_ids": torch.ones(1, 4, dtype=torch.long), "labels": torch.ones(1, 4, dtype=torch.long)}
+                    ]
 
         def reduce(value, include_cp=False):
             if value.dtype.is_floating_point:
@@ -2766,6 +2775,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         recipe.metric_logger_train = SimpleNamespace(close=lambda: None)
         recipe.metric_logger_valid = {"val": SimpleNamespace(close=lambda: None)}
         recipe._finalize_and_close_checkpointer = MagicMock()
+        recipe.dataloader = None
         samples = []
 
         def log(sample):
@@ -2782,6 +2792,60 @@ class TestRunTrainOptimStepSetsMoEScale:
             assert sample.metrics["step_time"] == pytest.approx(7.0)
             assert sample.metrics["tflops_per_sec"] == pytest.approx(1.0)
             assert sample.metrics["tflops_per_sec_per_gpu"] == pytest.approx(1.0)
+
+    def test_inherited_kd_step_times_its_own_loss_readbacks(self, monkeypatch):
+        """The KD override closes its step window after its CE/KD readbacks, as the base recipe does after its loss readback."""
+        from nemo_automodel.recipes.llm.kd import KnowledgeDistillationRecipeForNextTokenPrediction
+
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        def reduce(value, include_cp=False):
+            if value.dtype.is_floating_point:
+                advance(1.0)  # Queued GPU work completes during each loss readback.
+            return value
+
+        recipe = object.__new__(KnowledgeDistillationRecipeForNextTokenPrediction)
+        recipe.pp_enabled = False
+        recipe.loss_fn = SimpleNamespace(ignore_index=-100)
+        recipe.kd_loss_fn = SimpleNamespace(temperature=1.0)
+        recipe.kd_ratio = 0.5
+        recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True, world_size=1)
+        recipe.device_mesh = None
+        recipe.moe_mesh = None
+        recipe.model_parts = [nn.Linear(2, 2)]
+        recipe._ce_loss_buffer = []
+        recipe._kd_loss_buffer = []
+        recipe._dp_allreduce = reduce
+        recipe._get_dp_group_size = lambda include_cp=False: 1
+        recipe._set_moe_aux_loss_backward_scale = MagicMock()
+        recipe._forward_backward_step = lambda i, batch, **kwargs: (
+            torch.tensor(1.0),
+            torch.tensor(0.5),
+            torch.tensor(0.5),
+        )
+        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+        recipe.optimizer = [
+            SimpleNamespace(step=lambda: advance(3.0), zero_grad=lambda: None, param_groups=[{"lr": 0.1}])
+        ]
+        recipe.lr_scheduler = None
+        recipe.cfg = SimpleNamespace(get=lambda key, default=None: default)
+        recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+        recipe.timestamp = 0.0
+        monkeypatch.setattr("nemo_automodel.recipes.llm.kd.synchronize_tp_replica_gradients", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.kd.scale_grads_and_clip_grad_norm", lambda *a, **k: torch.tensor(1.0)
+        )
+        monkeypatch.setattr("nemo_automodel.recipes.llm.kd.get_expert_tp_replication_factor", lambda *a, **k: 1)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.kd.time.perf_counter", lambda: clock[0])
+        monkeypatch.setattr("torch.cuda.max_memory_allocated", lambda: 0)
+
+        sample = recipe._run_train_optim_step([{"labels": torch.ones(1, 4, dtype=torch.long)}])
+
+        # 3 s optimizer step plus the reporting, CE and KD readbacks (1 s each) for 4 tokens.
+        assert sample.metrics["tps"] == pytest.approx(4 / 6.0)
 
     @pytest.mark.parametrize("unsupported", ["formula", "input"])
     def test_runtime_tflops_unavailable_for_incomplete_flops(self, monkeypatch, unsupported):
@@ -2825,10 +2889,18 @@ class TestRunTrainOptimStepSetsMoEScale:
         recipe.metric_logger_train = MagicMock()
         monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
         sample = MetricsSample(
-            step=1, epoch=0,
+            step=1,
+            epoch=0,
             metrics={
-                "loss": 1.0, "grad_norm": 1.0, "lr": 0.01, "mem": 0.0,
-                "tps": 100.0, "tps_per_gpu": 50.0, "num_label_tokens": 10,
+                "loss": 1.0,
+                "grad_norm": 1.0,
+                "lr": 0.01,
+                "mem": 0.0,
+                "tps": 100.0,
+                "tps_per_gpu": 50.0,
+                "num_label_tokens": 10,
+                "num_tokens_per_step": 20,
+                "mfu": None,
                 "tflops_per_sec": 240.0 if supported else None,
                 "tflops_per_sec_per_gpu": 120.0 if supported else None,
             },
