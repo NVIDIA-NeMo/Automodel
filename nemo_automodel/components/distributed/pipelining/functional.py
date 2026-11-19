@@ -630,10 +630,10 @@ def _stage_layer_ids(module_names: list[str], layers_prefix: str, num_layers: in
     names = set(module_names)
     if names & ancestors:
         return list(range(num_layers))
-    # The splitter matches ModuleDict keys by exact string, so only the canonical decimal form of an index
-    # retains a layer: ``layers.04`` retains nothing.
-    pattern = re.compile(rf"^{re.escape(container)}\.(0|[1-9][0-9]*)$")
-    return sorted({int(m.group(1)) for name in names if (m := pattern.match(name))})
+    # The splitter matches ModuleDict keys by exact string, so only the canonical decimal form of an index,
+    # and nothing around it, retains a layer: neither ``layers.04`` nor ``layers.4`` with a trailing newline.
+    pattern = re.compile(rf"{re.escape(container)}\.(0|[1-9][0-9]*)")
+    return sorted({int(m.group(1)) for name in names if (m := pattern.fullmatch(name))})
 
 
 def _check_partition_lists_every_layer_once(
