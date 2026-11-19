@@ -33,12 +33,13 @@ from __future__ import annotations
 
 import gc
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, Dict, List, cast
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
 import torch
+import torch.nn as nn
 
 from nemo_automodel.components.datasets.llm.agent_chat import (
     make_agent_chat_eval_samples,
@@ -49,38 +50,6 @@ from nemo_automodel.components.eval.tool_call_parser import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class _LogitsOutput(Protocol):
-    """Forward result exposing logits of shape [batch, sequence, vocab]."""
-
-    @property
-    def logits(self) -> torch.Tensor: ...
-
-
-class _ForwardModel(Protocol):
-    """Model contract used by the no-cache greedy decoding fallback."""
-
-    def __call__(
-        self, *, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> _LogitsOutput | torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]:
-        """Run a full-prefix forward pass.
-
-        Args:
-            input_ids: Integer token IDs of shape [batch, sequence].
-            attention_mask: Mask of shape [batch, sequence] on the same device.
-
-        Returns:
-            Logits of shape [batch, sequence, vocab], directly, in a ``logits``
-            attribute, or as the first element of a tuple/list.
-        """
-        ...
-
-
-class _GenerationKwargs(TypedDict):
-    max_new_tokens: int
-    do_sample: bool
-    pad_token_id: int | None
 
 
 class ToolCallAccuracyEvaluator:
@@ -181,7 +150,7 @@ class ToolCallAccuracyEvaluator:
 
     def _greedy_generate_manual(
         self,
-        model: _ForwardModel,
+        model: nn.Module,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         max_new_tokens: int,
@@ -325,7 +294,7 @@ class ToolCallAccuracyEvaluator:
         return list(ids)
 
     @torch.inference_mode()
-    def evaluate(self, model, tokenizer) -> Dict[str, float]:
+    def evaluate(self, model: nn.Module, tokenizer: PreTrainedTokenizerBase) -> Dict[str, float]:
         """Run generation-based tool-call evaluation against ``model``.
 
         Caller is expected to have placed the model in eval mode and on
@@ -367,19 +336,17 @@ class ToolCallAccuracyEvaluator:
             input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids)
 
-            gen_kwargs: _GenerationKwargs = {
-                "max_new_tokens": self._max_new_tokens,
-                "do_sample": self._do_sample,
-                "pad_token_id": (
-                    tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-                ),
-            }
+            generate = getattr(model, "generate", None)
             try:
-                if hasattr(model, "generate"):
-                    output = model.generate(
+                if callable(generate):
+                    output = generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        **gen_kwargs,
+                        max_new_tokens=self._max_new_tokens,
+                        do_sample=self._do_sample,
+                        pad_token_id=(
+                            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                        ),
                     )
                 else:
                     # Custom model classes without GenerationMixin (e.g. the
@@ -432,7 +399,8 @@ class ToolCallAccuracyEvaluator:
                 continue
 
             new_tokens = output[0, input_ids.shape[1] :].tolist()
-            decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
+            # one sequence in, so decode returns a single string
+            decoded = cast(str, tokenizer.decode(new_tokens, skip_special_tokens=False))
             pred_calls = parse_tool_calls(decoded)
             metrics = compute_sample_metrics(pred_calls, sample["gt_tool_calls"])
             for k in self.METRIC_KEYS:
