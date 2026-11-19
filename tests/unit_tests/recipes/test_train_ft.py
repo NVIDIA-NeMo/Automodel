@@ -4599,7 +4599,7 @@ def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[l
         info=SimpleNamespace(has_first_stage=True, has_last_stage=False, schedule=SimpleNamespace(step=run_schedule)),
     )
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.model_parts = [model]
     recipe.loss_fn = MaskedCrossEntropy()
