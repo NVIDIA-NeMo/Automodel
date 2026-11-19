@@ -368,6 +368,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         config: Step3p7Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -382,11 +384,11 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
-            bias=False,
+            dtype=torch.bfloat16,
+            logits_dtype=logits_dtype,
         )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = getattr(config.text_config, "pad_token_id", None)
@@ -482,7 +484,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
         primary_shape = vocab_shape if self.lm_head is not None else hidden_shape
         mtp_shape = vocab_shape if self.lm_head is not None else hidden_shape
-        outputs_meta = (meta(primary_shape), *(meta(mtp_shape) for _ in range(mtp_depth)))
+        out_dtype = (self.lm_head.logits_dtype or dtype) if self.lm_head is not None else dtype
+        outputs_meta = (meta(primary_shape).to(out_dtype), *(meta(mtp_shape).to(out_dtype) for _ in range(mtp_depth)))
         return inputs_meta, outputs_meta
 
     def _is_pipeline_parallel_stage(self) -> bool:

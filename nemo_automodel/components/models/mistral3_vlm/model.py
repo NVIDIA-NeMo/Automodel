@@ -142,7 +142,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, *, logits_dtype: torch.dtype | None = None):
         reject_unsupported_tie_word_embeddings(type(self), config)
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
@@ -165,6 +165,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         apply_pixtral_forward_backport(self.model.vision_tower)
         self.tie_weights()
         self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)

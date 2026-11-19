@@ -174,6 +174,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         *,
         backend: BackendConfig | None = None,
         revision: str | None = None,
+        logits_dtype: torch.dtype | None = torch.float32,
     ) -> None:
         """Build the text decoder from a text or a released image/text configuration.
 
@@ -183,6 +184,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 path carries over so the loader finds the weights, and no vision tower is built.
             backend: Kernel selection; None selects the eager Torch reference.
             revision: Resolved Hub revision of the checkpoint, for the sidecar read.
+            logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
         """
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -245,7 +247,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.norm: nn.Module | None = initialize_rms_norm_module(
             "torch", config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.lm_head: Inkling2LMHead | None = Inkling2LMHead(config, dtype)
+        self.lm_head: Inkling2LMHead | None = Inkling2LMHead(config, dtype, logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Inkling2StateDictAdapter(config)
         Inkling2ForCausalLM.initialize_weights(self)
@@ -380,7 +382,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     seq_len,
                     width,
                     device="meta",
-                    dtype=dtype if self._pp_return_hidden_states else torch.float32,
+                    dtype=dtype if self._pp_return_hidden_states else self.lm_head.logits_dtype,
                 ),
             )
         return inputs, outputs

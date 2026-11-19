@@ -18,7 +18,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -264,6 +264,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         config: Glm5NextConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -287,13 +289,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             getattr(text_config, "torch_dtype", getattr(text_config, "dtype", None)),
             torch.bfloat16,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            text_config.hidden_size,
-            text_config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(text_config.hidden_size, text_config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.vocab_size = text_config.vocab_size
         if self.backend.enable_hf_state_dict_adapter:
             from nemo_automodel.components.models.glm5_next.state_dict_adapter import Glm5NextStateDictAdapter

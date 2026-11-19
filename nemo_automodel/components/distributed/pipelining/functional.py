@@ -381,8 +381,11 @@ def _precompute_stage_shapes(
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         emits_hidden_states = getattr(stage.submod, "_pp_return_hidden_states", False) is True
         if has_lm_head and not emits_hidden_states:
-            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype)
+            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size], in the head's logits_dtype
+            # when it sets one (an LMHead); any other head returns the model dtype.
+            head_dtype = getattr(stage.submod.lm_head, "logits_dtype", None)
+            logits_dtype = head_dtype if isinstance(head_dtype, torch.dtype) else model_dtype
+            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=logits_dtype)
         else:
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)

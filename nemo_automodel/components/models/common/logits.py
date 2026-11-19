@@ -15,17 +15,18 @@
 """LM head whose logits dtype is independent of its weight dtype."""
 
 import math
-import sys
 from typing import Self
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from torch.utils.flop_counter import register_flop_formula
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from nemo_automodel.shared.tp_linear import tp_linear_forward
 
 
 # aten::mm.dtype has no derivative in PyTorch 2.10, and an opaque op keeps compilers off the GEMM.
@@ -76,8 +77,9 @@ class LMHead(nn.Linear):
     With ``logits_dtype`` set, the GEMM reads the input in the weight's dtype, accumulates in FP32 and
     writes FP32 logits (vLLM's ``head_dtype=float32``), unaffected by autocast, then casts them; the
     backward casts the gradient to the weight's dtype. ``forward`` calls ``project``, which losses that
-    gather the weight call too, so subclasses that change the logits override ``project``. Model forwards
-    call ``LMHead.output(self.lm_head, hidden_states, ...)``, which also takes a stage without a head.
+    gather the weight call too, so subclasses that change the logits override ``project``. Repo models
+    take ``logits_dtype`` as a constructor argument and build their head with it; their forwards call
+    ``LMHead.output(self.lm_head, hidden_states, ...)``, which also takes a stage without a head.
     """
 
     def __init__(
@@ -124,28 +126,25 @@ class LMHead(nn.Linear):
         """
         input = input.to(weight.dtype)
         if logits_dtype is None:
+            if isinstance(weight, DTensor):  # tensor-parallel weight: compile-safe like TPLinear
+                return tp_linear_forward(input, weight, bias, mm_for_2d_compile=True)
             return F.linear(input, weight, bias)
         logits = _fp32_logits(input, weight)
         return (logits if bias is None else logits + bias.float()).to(logits_dtype)
 
     @classmethod
-    def from_linear(cls, head: nn.Module, *, logits_dtype: torch.dtype | None) -> Self:
-        """Wrap a plain, Transformer Engine or quack linear head's weight and bias, keeping ties and checkpoint keys.
+    def from_linear(cls, head: nn.Linear, *, logits_dtype: torch.dtype | None) -> Self:
+        """Wrap the plain linear head a Hugging Face parent class built, sharing its weight and bias.
+
+        Ties, optimizer identity and checkpoint keys are unchanged.
 
         Raises:
-            ValueError: If ``head`` has its own projection, such as a LoRA or quantized head.
+            ValueError: If ``head`` is not a plain ``nn.Linear``, so it has its own projection.
         """
-        backends = (
-            getattr(sys.modules.get("transformer_engine.pytorch.module.linear"), "Linear", None),
-            getattr(sys.modules.get("quack.linear"), "Linear", None),
-        )
-        if not (type(head) is nn.Linear and "forward" not in vars(head)) and type(head) not in backends:
-            raise ValueError(f"logits_dtype needs a plain linear LM head; got {type(head).__name__}.")
-        weight = head.get_parameter("weight")
-        new_head = cls(weight.shape[1], weight.shape[0], logits_dtype=logits_dtype, device="meta")
-        new_head.weight = weight
-        if isinstance(bias := getattr(head, "bias", None), nn.Parameter):
-            new_head.bias = bias
+        if type(head) is not nn.Linear or "forward" in vars(head):
+            raise ValueError(f"An LMHead wraps a plain nn.Linear head; got {type(head).__name__}.")
+        new_head = cls(head.in_features, head.out_features, logits_dtype=logits_dtype, device="meta")
+        new_head.weight, new_head.bias = head.weight, head.bias
         return new_head.train(head.training)
 
     @staticmethod

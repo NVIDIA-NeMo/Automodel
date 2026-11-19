@@ -527,7 +527,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         supports_pp: bool = True
         supports_ep: bool = False
 
-    def __init__(self, config: Ministral3Config):
+    def __init__(self, config: Ministral3Config, *, logits_dtype: torch.dtype | None = None):
         quantization_config = getattr(config, "quantization_config", None)
         quant_method = (
             quantization_config.get("quant_method")
@@ -549,7 +549,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         super().__init__(config)
         self.model = Ministral3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         if quant_method == "fp8":
             self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_causal_lm(config)

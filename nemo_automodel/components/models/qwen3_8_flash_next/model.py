@@ -42,7 +42,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -569,6 +569,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
         engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -592,12 +593,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             engram_table_config=engram_table_config,
         )
         dtype = _resolve_model_dtype(config.text_config)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.text_config.hidden_size,
-            config.text_config.vocab_size,
-            bias=False,
-            dtype=dtype,
+        self.lm_head = LMHead(
+            config.text_config.hidden_size, config.text_config.vocab_size, dtype=dtype, logits_dtype=logits_dtype
         )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.text_config.pad_token_id if config.text_config.pad_token_id is not None else -1
@@ -744,7 +741,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             inputs_meta = (torch.empty(microbatch_size, seq_len, hc_width, device="meta", dtype=dtype),)
 
         output_width = text_config.vocab_size if self.lm_head is not None else hc_width
-        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=dtype),)
+        output_dtype = (self.lm_head.logits_dtype or dtype) if self.lm_head is not None else dtype
+        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=output_dtype),)
         return inputs_meta, outputs_meta
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:

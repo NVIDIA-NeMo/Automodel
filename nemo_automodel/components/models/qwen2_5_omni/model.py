@@ -104,6 +104,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         self,
         config: Qwen2_5OmniConfig | Qwen2_5OmniThinkerConfig,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         # Check the controlling top-level flag on the original config before
@@ -111,6 +113,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         reject_unsupported_tie_word_embeddings(type(self), config)
         thinker_config = _resolve_thinker_config(config)
         super().__init__(thinker_config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
 
         # HF Qwen2.5-Omni declares ``audio_tower.audio_bos_eos_token`` as an
         # ``nn.Embedding(2, output_dim)`` (modeling_qwen2_5_omni.py:751) but it

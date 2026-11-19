@@ -37,9 +37,9 @@ from nemo_automodel.components.distributed.pipelining.media import next_vlm_medi
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
-    initialize_linear_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -333,6 +333,8 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         config: Any,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -340,7 +342,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = copy(backend) if backend is not None else BackendConfig()
         self.model = MiniMaxM3TextModel(config, backend=self.backend, moe_config=moe_config)
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.bfloat16, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MiniMaxM3StateDictAdapter(
                 self.config,
@@ -496,6 +498,8 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         config: Any,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -504,8 +508,8 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         text_config = config.text_config
         self.backend = copy(backend) if backend is not None else BackendConfig()
         self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=torch.bfloat16, logits_dtype=logits_dtype
         )
         self.vision_tower = MiniMaxM3VisionModel(
             config.vision_config,
@@ -544,10 +548,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
     def get_output_embeddings(self):
         return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-        """Replace the language-model head inside the multimodal wrapper."""
-        self.lm_head = new_embeddings
 
     def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
         """Return modules whose inputs are the DSpark target features of ``layer_ids``.
@@ -677,7 +677,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             # Logits follow lm_head's own param dtype, which may diverge from the
             # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
             # deriving it here keeps the schedule's output buffer correctly sized.
-            head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
+            head_dtype = self.lm_head.logits_dtype or self.lm_head.weight.dtype
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=head_dtype),)
         else:
             outputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)

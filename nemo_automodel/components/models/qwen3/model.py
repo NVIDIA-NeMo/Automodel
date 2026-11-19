@@ -384,12 +384,14 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
         supports_pp: bool = True
         supports_ep: bool = False
 
-    def __init__(self, config: Qwen3Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self, config: Qwen3Config, backend: BackendConfig | None = None, *, logits_dtype: torch.dtype | None = None
+    ) -> None:
         super().__init__(config)
         self.backend = backend or BackendConfig()
         self.model = Qwen3Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         if config.dtype is not None:
             cast_model_to_dtype(self, config.dtype)

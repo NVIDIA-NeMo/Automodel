@@ -33,7 +33,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -264,6 +263,8 @@ class HYV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: Any,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -272,7 +273,7 @@ class HYV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = HYV3Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.bfloat16, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = HYV3StateDictAdapter(
                 self.config,

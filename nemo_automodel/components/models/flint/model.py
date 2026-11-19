@@ -172,12 +172,19 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         supports_ep: bool = True
         supports_thd: bool = True
 
-    def __init__(self, config: FlintConfig, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: FlintConfig,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = torch.float32,
+    ) -> None:
         """Build the source architecture with an explicit CE-only objective.
 
         Args:
             config: Original local config; the tying guard runs before use.
             backend: Kernel choices, defaulting to the verified torch path.
+            logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
         """
         reject_unsupported_tie_word_embeddings(type(self), config)
         if config.router_aux_loss_coef != 0:
@@ -198,7 +205,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         )
         self.cp_mesh: DeviceMesh | None = None
         self.model = FlintModel(config, self.backend)
-        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.float32, logits_dtype=torch.float32)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         # Seeded from the model config like PreTrainedModel does for generating
         # models, so bos/eos/pad are set; the loader then restores the checkpoint's
         # generation_config.json and the consolidated export writes it back out.
@@ -339,16 +346,10 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         )
         inputs = (torch.empty(*input_shape, dtype=torch.long if is_first else residual_dtype, device="meta"),)
         final = self.lm_head is not None
-        width = (
-            self.config.hidden_size
-            if not final or getattr(self, "_pp_return_hidden_states", False)
-            else self.vocab_size
-        )
-        outputs = (
-            torch.empty(
-                microbatch_size, local_length, width, dtype=torch.float32 if final else residual_dtype, device="meta"
-            ),
-        )
+        logits = final and not getattr(self, "_pp_return_hidden_states", False)
+        width = self.vocab_size if logits else self.config.hidden_size
+        out_dtype = self.lm_head.logits_dtype if logits else (torch.float32 if final else residual_dtype)
+        outputs = (torch.empty(microbatch_size, local_length, width, dtype=out_dtype, device="meta"),)
         return inputs, outputs
 
     def get_input_embeddings(self) -> nn.Embedding:

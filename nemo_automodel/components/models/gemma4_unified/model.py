@@ -65,9 +65,10 @@ class Gemma4UnifiedForConditionalGeneration(
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         self.state_dict_adapter = Gemma4UnifiedStateDictAdapter()
         apply_gemma4_cp_attention_backend_policy(self, Gemma4UnifiedTextAttention)
 

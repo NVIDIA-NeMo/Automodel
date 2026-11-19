@@ -894,6 +894,8 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: LagunaConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -903,13 +905,7 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = LagunaModel(config, self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = LagunaStateDictAdapter(self.config, self.model.moe_config, self.backend, dtype)
 

@@ -1204,6 +1204,8 @@ class Gemma4ForConditionalGeneration(
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         text_config: dict | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         if not _GEMMA4_HF_AVAILABLE:
@@ -1241,6 +1243,7 @@ class Gemma4ForConditionalGeneration(
 
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
 
         self.backend = backend
 

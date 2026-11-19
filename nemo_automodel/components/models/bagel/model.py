@@ -153,13 +153,15 @@ class BagelModel(nn.Module):
     ``BagelForUnifiedMultimodal.forward``.
     """
 
-    def __init__(self, config: BagelConfig, backend: BagelBackendConfig | None = None) -> None:
+    def __init__(
+        self, config: BagelConfig, backend: BagelBackendConfig | None = None, *, logits_dtype: torch.dtype | None = None
+    ) -> None:
         super().__init__()
         self.config = config
         self.backend = resolve_bagel_backend(backend)
 
         # Text backbone - always present.
-        self.language_model = Qwen2ForCausalLM(config.text_config, backend=self.backend)
+        self.language_model = Qwen2ForCausalLM(config.text_config, backend=self.backend, logits_dtype=logits_dtype)
 
         # Understanding-side vision path. Built whenever the BAGEL config keeps
         # visual understanding enabled.
@@ -237,7 +239,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BagelConfig, backend: BagelBackendConfig | None = None) -> None:
+    def __init__(
+        self, config: BagelConfig, backend: BagelBackendConfig | None = None, *, logits_dtype: torch.dtype | None = None
+    ) -> None:
         super().__init__()
         # Also covers the build_bagel_from_hf_backbones registry-bypass path, which
         # constructs this class directly. Reads the nested text_config tie flag via
@@ -252,7 +256,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
                 self.backend.linear,
                 self.backend.rms_norm,
             )
-        self.model = BagelModel(config, backend=self.backend)
+        self.model = BagelModel(config, backend=self.backend, logits_dtype=logits_dtype)
         _convert_patch_embedding_for_packed_vit(self.model, config)
 
         # Light state-dict adapter hook used by HFCheckpointingMixin /
@@ -387,10 +391,6 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
 
     def get_output_embeddings(self) -> nn.Module:
         return self.model.language_model.get_output_embeddings()
-
-    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-        """Replace the language-model head inside the multimodal wrapper."""
-        self.model.language_model.set_output_embeddings(new_embeddings)
 
     # ------------------------------------------------------------------
     # Forward (understanding + optional generation).

@@ -378,7 +378,6 @@ def build_model(
                 load_base_model=False,
                 load_metadata_with_gloo=load_metadata_with_gloo,
                 cache_dir=hf_constants.HF_HUB_CACHE,
-                logits_dtype=cfg_model.get("logits_dtype", None),
             )
 
     return model

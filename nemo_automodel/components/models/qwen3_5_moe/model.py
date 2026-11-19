@@ -935,6 +935,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         if not _QWEN3_5_MOE_HF_AVAILABLE:
@@ -955,13 +957,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.vocab_size = config.vocab_size
         self.pad_token_id = config.pad_token_id if config.pad_token_id is not None else -1
 
@@ -1272,6 +1268,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         backend: BackendConfig | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         if not _QWEN3_5_MOE_HF_AVAILABLE:
@@ -1308,12 +1306,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         # Replace lm_head with NeMo backend linear
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             text_config.hidden_size,
             text_config.vocab_size,
-            bias=False,
             dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
+            logits_dtype=logits_dtype,
         )
 
         dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
@@ -1646,7 +1643,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         has_lm_head = getattr(self, "lm_head", None) is not None
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
         if has_lm_head and not emits_hidden_states:
-            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=dtype),)
+            logits_dtype = self.lm_head.logits_dtype or dtype
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=logits_dtype),)
         else:
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
         return inputs_meta, outputs_meta

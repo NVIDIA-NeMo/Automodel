@@ -37,7 +37,7 @@ from nemo_automodel.components.attention.utils import (
     preprocess_args_and_kwargs_for_attn,
 )
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.logits import LMHead
@@ -2390,6 +2390,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         num_hidden_layers: int | None = None,
         kda_mode: str | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -2436,12 +2438,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            text_config.hidden_size,
-            text_config.vocab_size,
-            bias=False,
-            dtype=model_dtype,
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype
         )
         self.vocab_size = text_config.vocab_size
         if self.backend.enable_hf_state_dict_adapter:
@@ -2548,7 +2546,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
         if self.lm_head is not None and not emits_hidden_states:
-            head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
+            head_dtype = self.lm_head.logits_dtype or self.lm_head.weight.dtype
             outputs_meta = (meta(microbatch_size, seq_len, text_config.vocab_size, tensor_dtype=head_dtype),)
         elif self.model.norm is not None or block_size is None:
             outputs_meta = (meta(microbatch_size, seq_len, hidden_size),)

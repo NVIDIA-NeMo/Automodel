@@ -35,7 +35,6 @@ from nemo_automodel.components.models.beam.parallelization import PARALLELIZER
 from nemo_automodel.components.models.beam.state_dict_adapter import BeamStateDictAdapter
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -282,6 +281,8 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: BeamConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -291,9 +292,7 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = BeamModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         self.final_logit_softcapping = getattr(config, "final_logit_softcapping", None)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = BeamStateDictAdapter(

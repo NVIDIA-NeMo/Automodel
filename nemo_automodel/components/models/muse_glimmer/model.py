@@ -702,14 +702,20 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         del kwargs
         return cls(config, backend=backend)
 
-    def __init__(self, config: MuseGlimmerConfig, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: MuseGlimmerConfig,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()
         self.model = MuseGlimmerModel(config, self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MuseGlimmerStateDictAdapter(config)

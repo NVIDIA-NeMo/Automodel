@@ -975,6 +975,19 @@ class TestPrecomputeStageShapes:
         assert out_call[0].shape == (2, 16, 128)
         assert out_call[0].dtype == torch.bfloat16
 
+    def test_last_stage_declares_the_head_logits_dtype(self):
+        """An LMHead with a logits_dtype returns logits in it, so the stage must declare that dtype."""
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
+        stage.submod.lm_head.logits_dtype = torch.float32
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        assert stage.inputs_meta[0].dtype == torch.bfloat16
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (2, 16, 128)
+        assert out_call[0].dtype == torch.float32
+
     def test_last_stage_without_lm_head(self):
         """Last stage without lm_head should output [mb, seq_len, hidden]."""
         stage = self._make_stage(is_first=False, is_last=True, has_lm_head=False)

@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.step3p7 import model as step3p7_model
 from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
 from nemo_automodel.components.models.step3p7.model import Step3p7ForConditionalGeneration, Step3p7Model
@@ -322,6 +323,7 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
 
     wrapper, _ = _wrapper_with_fake_inner()
     hidden = wrapper.config.text_config.hidden_size
+    wrapper.lm_head = LMHead(hidden, wrapper.config.text_config.vocab_size)
     mtp_depth = int(getattr(wrapper.mtp_config, "num_layers", 0) or 0)
 
     # cp_size == 1: symmetric (regression against the pre-CP behavior).

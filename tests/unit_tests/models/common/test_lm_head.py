@@ -14,8 +14,6 @@
 
 """LMHead: logits dtype against FP64, backward contract, FLOP accounting and head conversion."""
 
-import sys
-import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -245,35 +243,6 @@ def test_from_linear_shares_the_parameters(bias):
     )
 
 
-class _BackendLinear(nn.Module):
-    """Mimics Transformer Engine's Linear: same weight layout, an empty unregistered tensor for no bias."""
-
-    def __init__(self, in_features: int, out_features: int) -> None:
-        super().__init__()
-        self.in_features, self.out_features = in_features, out_features
-        self.weight = nn.Parameter(torch.randn(out_features, in_features))
-        self.bias = torch.Tensor()
-
-
-class _QuackLinear(nn.Linear):
-    """Mimics quack's Linear: an nn.Linear subclass with its own kernel."""
-
-
-def test_linear_kernel_backend_heads_convert(monkeypatch):
-    te_linear = types.ModuleType("transformer_engine.pytorch.module.linear")
-    te_linear.Linear = _BackendLinear
-    quack_linear = types.ModuleType("quack.linear")
-    quack_linear.Linear = _QuackLinear
-    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.linear", te_linear)
-    monkeypatch.setitem(sys.modules, "quack.linear", quack_linear)
-
-    for linear in (_BackendLinear(96, 320), _QuackLinear(96, 320, bias=True)):
-        head = LMHead.from_linear(linear, logits_dtype=torch.float32)
-        assert isinstance(head, LMHead)
-        assert head.weight is linear.weight
-        assert head.bias is (linear.bias if isinstance(linear.bias, nn.Parameter) else None)
-
-
 class _LinearSubclass(nn.Linear):
     """Stands in for LoRA, FP8 and quantized heads, which subclass nn.Linear and own their projection."""
 
@@ -286,15 +255,10 @@ def _linear_with_instance_forward() -> nn.Linear:
 
 
 @pytest.mark.parametrize(
-    "linear,match",
-    [
-        (_LinearSubclass(4, 8, bias=False), "plain linear LM head"),
-        (nn.Embedding(8, 4), "plain linear LM head"),
-        (_linear_with_instance_forward(), "plain linear LM head"),
-    ],
+    "linear", [_LinearSubclass(4, 8, bias=False), nn.Embedding(8, 4), _linear_with_instance_forward()]
 )
-def test_from_linear_rejects_heads_with_their_own_projection(linear, match):
-    with pytest.raises(ValueError, match=match):
+def test_from_linear_rejects_heads_with_their_own_projection(linear):
+    with pytest.raises(ValueError, match="plain nn.Linear head"):
         LMHead.from_linear(linear, logits_dtype=torch.float32)
 
 
@@ -468,3 +432,13 @@ class TestLMHeadOutput:
         out = LMHead.output(lm_head, hidden, logits_to_keep=0, is_thd=True, output_hidden_states=True)
         assert out.hidden_states.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.hidden_states, hidden.unsqueeze(0))
+
+
+def test_lora_rejects_a_head_with_a_logits_dtype():
+    from nemo_automodel.components._peft.lora import LinearLoRA, patch_linear_module
+
+    # The adapter would replace the head's projection and silently drop its logits dtype.
+    with pytest.raises(ValueError, match="logits_dtype"):
+        patch_linear_module(LMHead(8, 16, logits_dtype=torch.float32), dim=4, use_triton=False)
+    plain = patch_linear_module(LMHead(8, 16), dim=4, use_triton=False)
+    assert isinstance(plain, LinearLoRA) and isinstance(plain, LMHead)

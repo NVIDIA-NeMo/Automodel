@@ -114,6 +114,7 @@ def _make_dummy_init_super():
         nn.Module.__init__(self)
         self.model = nn.Module()
         self.model.vision_tower = nn.Module()
+        self.lm_head = nn.Linear(4, 8, bias=False)
 
     return _init, captured
 
@@ -186,6 +187,7 @@ class TestInitRegistersRotaryHooks:
             nn.Module.__init__(self)
             self.model = nn.Module()
             self.model.vision_tower = nn.Module()
+            self.lm_head = nn.Linear(4, 8, bias=False)
             self.text_rotary = nn.Module()
             self.text_rotary.register_buffer("inv_freq", torch.zeros(4), persistent=False)
             self.vision_rotary = nn.Module()

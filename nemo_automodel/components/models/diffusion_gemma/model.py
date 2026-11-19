@@ -54,6 +54,7 @@ from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -377,6 +378,8 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         canvas_length: int | None = None,
         self_conditioning: bool | None = None,
         freeze_router: bool | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ):
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -413,7 +416,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         self.vocab_size = text_config.vocab_size
 
         self.model = DiffusionGemmaBackbone(text_config, self.backend, moe_config=moe_config)
-        self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
+        self.lm_head = LMHead(text_config.hidden_size, text_config.vocab_size, logits_dtype=logits_dtype)
         self.tie_weights()
 
         # Expose moe_config for the MoE parallelizer assertion path.

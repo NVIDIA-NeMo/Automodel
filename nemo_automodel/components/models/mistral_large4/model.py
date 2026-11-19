@@ -488,7 +488,13 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         supports_ep: bool = True
         supports_thd: bool = True
 
-    def __init__(self, config: MistralLarge4Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: MistralLarge4Config,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         config.validate_architecture()
         super().__init__(config)
@@ -527,7 +533,7 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         self.model = MistralLarge4Model(config, self.backend, dtype=dtype)
         self.moe_config = next((block.moe_config for block in self.model.layers if block.moe_config is not None), None)
         self.cp_mesh: DeviceMesh | None = None
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MistralLarge4StateDictAdapter(
                 dtype=dtype,

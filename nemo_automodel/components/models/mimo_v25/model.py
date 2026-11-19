@@ -642,6 +642,8 @@ class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: MiMoV2Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -678,13 +680,7 @@ class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         resolved_moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.model = MiMoV2Model(config, resolved_moe_config, self.backend)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
 
         if self.backend.enable_hf_state_dict_adapter:
             from nemo_automodel.components.models.mimo_v25.state_dict_adapter import MiMoV2StateDictAdapter

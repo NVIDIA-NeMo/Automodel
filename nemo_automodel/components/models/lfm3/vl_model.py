@@ -438,11 +438,11 @@ class Lfm3VlForConditionalGeneration(HFCheckpointingMixin, Lfm3VlPreTrainedModel
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: Lfm3VlConfig) -> None:
+    def __init__(self, config: Lfm3VlConfig, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = Lfm3VlModel(config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.text_config.hidden_size, config.text_config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         self.tie_weights()
 

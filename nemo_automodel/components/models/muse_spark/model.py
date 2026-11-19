@@ -318,6 +318,8 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         config: MuseSpark1xOmniConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -343,7 +345,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             if config.use_audio_perception
             else None
         )
-        logits_dtype = torch.float32 if config.use_fp32_for_output else None  # see get_pipeline_stage_metas
+        logits_dtype = logits_dtype or (torch.float32 if config.use_fp32_for_output else None)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
@@ -451,9 +453,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             already-local activations. No per-batch mode is needed to size them.
         """
         residual_dtype = _residual_dtype(self.config)
-        output_dtype = (
-            residual_dtype if self.lm_head is None else (torch.float32 if self.config.use_fp32_for_output else dtype)
-        )
+        output_dtype = residual_dtype if self.lm_head is None else (self.lm_head.logits_dtype or dtype)
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         local_seq_len = seq_len
         if cp_size > 1:

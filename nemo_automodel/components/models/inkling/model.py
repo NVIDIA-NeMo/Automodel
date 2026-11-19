@@ -26,6 +26,7 @@ from transformers.utils import ModelOutput
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -118,6 +119,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         config: InklingConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -139,7 +142,9 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         self.model.moe_config = self.moe_config
 
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype)
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype
+        )
         self.vocab_size = text_config.vocab_size
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = InklingStateDictAdapter(
@@ -210,7 +215,13 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             outputs_meta = (torch.empty(*hidden_shape, device="meta", dtype=dtype),)
         else:
             outputs_meta = (
-                torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=self.lm_head.weight.dtype),
+                torch.empty(
+                    microbatch_size,
+                    seq_len,
+                    vocab_size,
+                    device="meta",
+                    dtype=self.lm_head.logits_dtype or self.lm_head.weight.dtype,
+                ),
             )
         return inputs_meta, outputs_meta
 

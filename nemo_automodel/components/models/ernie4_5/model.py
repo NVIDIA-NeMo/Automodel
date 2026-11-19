@@ -453,6 +453,8 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self,
         config: Ernie4_5Config,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -461,12 +463,8 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.backend = backend or BackendConfig()
         self.model = Ernie4_5Model(config, self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=_config_dtype(config),
+        self.lm_head = LMHead(
+            config.hidden_size, config.vocab_size, dtype=_config_dtype(config), logits_dtype=logits_dtype
         )
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -583,6 +581,8 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         config: Ernie4_5_MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -597,12 +597,12 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             moe_overrides=moe_overrides,
         )
         self.vocab_size = config.vocab_size
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             config.hidden_size,
             config.vocab_size,
             bias=config.use_bias,
             dtype=_config_dtype(config),
+            logits_dtype=logits_dtype,
         )
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight

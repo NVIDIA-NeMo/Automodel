@@ -257,14 +257,15 @@ model:
   logits_dtype: float32
 ```
 
+`logits_dtype` is a constructor argument of every NeMo AutoModel model class that has a language-model head, and the model builds its head with it. Hugging Face model classes have no such argument, so with `force_hf`, or for an architecture without a NeMo AutoModel implementation, the setting is ignored with a warning.
+
 The head's GEMM reads the hidden states and the weight in the head's compute dtype (bf16 by default), accumulates in fp32 and writes fp32 logits, so no logit is rounded to bf16; `mp_policy.output_dtype: float32` instead upcasts logits already rounded to bf16. The backward casts the logits gradient to the compute dtype. Parameters, optimizer state, checkpoints and tied embeddings are unchanged, and fp32 logits take twice the memory of bf16 logits. DeepSeek-V4, DeepSeek-V4.1, Flint, Inkling2, and Muse Spark with `use_fp32_for_output` return fp32 logits by default; HY-MT2 needs `logits_dtype: float32`.
 
 | Configuration | Status |
 | --- | --- |
-| PyTorch, Transformer Engine and quack linear heads, native or `force_hf` | Supported. Models without an output head, or with a model-specific projection such as Baichuan's, are rejected at setup. |
-| FSDP2, including tied embeddings; tensor parallelism, with or without sequence parallelism | Supported. Keep an outer FSDP `mp_policy.output_dtype` of `null` or `float32`. |
-| HSDP, context parallelism, and FSDP2 combined with tensor parallelism | Not yet validated |
-| Pipeline parallelism; LoRA, quantized or QAT heads | Rejected at setup |
+| FSDP2, including tied embeddings; tensor parallelism, with or without sequence parallelism; pipeline parallelism | Supported. Keep an outer FSDP `mp_policy.output_dtype` of `null` or `float32`; pipeline stages declare the head's logits dtype. |
+| HSDP, context parallelism, FSDP2 combined with tensor parallelism, and QAT | Not yet validated |
+| LoRA on the language-model head | Rejected at setup, because the adapter replaces the head's projection; leave the head out with `exclude_modules: ['*.lm_head']`. |
 | `MaskedCrossEntropy` and `ChunkedCrossEntropy` | Supported. Each chunk calls the head's own projection, including Inkling2's softcap and vocabulary mask. |
 | `FusedLinearCrossEntropy` | `impl: cce` computes fp32 logits from bf16 or fp16 operands; `impl: torch_compile` rounds logits to the compute dtype. |
 

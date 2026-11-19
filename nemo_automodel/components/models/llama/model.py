@@ -566,6 +566,8 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self,
         config: LlamaConfig,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ):
         reject_unsupported_tie_word_embeddings(type(self), config)
         warn_deprecated_model_class("LlamaForCausalLM")
@@ -574,7 +576,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.backend = backend or BackendConfig()
         self.model = LlamaModel(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
 
         # Initialize weights and apply final processing
         self.post_init()

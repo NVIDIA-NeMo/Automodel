@@ -492,7 +492,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
+    def __init__(self, config: NemotronParseConfig, loss_fn=None, *, logits_dtype: torch.dtype | None = None, **kwargs):
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.loss_fn = loss_fn
@@ -504,7 +504,9 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         self.decoder = NemotronParseDecoder(config.decoder)
         self.decoder = self.decoder.to(torch.bfloat16)
 
-        self.lm_head = nn.Linear(config.decoder.d_model, config.decoder.vocab_size, bias=False, dtype=torch.bfloat16)
+        self.lm_head = LMHead(
+            config.decoder.d_model, config.decoder.vocab_size, dtype=torch.bfloat16, logits_dtype=logits_dtype
+        )
 
         num_extra_heads = getattr(config, "num_extra_heads", 0)
         self.decoder.extra_heads = nn.ModuleList(

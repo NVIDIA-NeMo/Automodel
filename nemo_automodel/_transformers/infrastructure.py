@@ -68,7 +68,6 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
@@ -452,30 +451,6 @@ def instantiate_infrastructure(
     return resolved_mesh_context, autopipeline, parallelize_fn, qat_quantizer
 
 
-def _set_logits_dtype(model: torch.nn.Module, logits_dtype: torch.dtype | str, *, pipelined: bool) -> None:
-    """Make the unsharded model's LM head return ``logits_dtype`` logits.
-
-    An ``LMHead`` is configured in place; a plain, Transformer Engine or quack linear head is replaced
-    through ``set_output_embeddings`` by an ``LMHead`` sharing its parameters. Pipeline parallelism,
-    whose stage outputs keep the model dtype, and models without such a head are rejected.
-    """
-    if pipelined:
-        raise NotImplementedError("logits_dtype does not support pipeline parallelism.")
-    logits_dtype = dtype_from_str(logits_dtype) if isinstance(logits_dtype, str) else logits_dtype
-    # Embedding, reward and policy models have no output-embedding head.
-    get_output_embeddings = getattr(model, "get_output_embeddings", None)
-    head = get_output_embeddings() if get_output_embeddings is not None else None
-    if head is None:
-        raise ValueError(f"logits_dtype needs an LM head, but {type(model).__name__} has none.")
-    if isinstance(head, LMHead):
-        head.logits_dtype = logits_dtype
-        return
-    head = LMHead.from_linear(head, logits_dtype=logits_dtype)
-    model.set_output_embeddings(head)
-    if model.get_output_embeddings() is not head:
-        raise RuntimeError(f"{type(model).__name__}.set_output_embeddings() did not install the LMHead.")
-
-
 def _uses_te_attention(model) -> bool:
     """Return True if any self_attn module uses TE's DotProductAttention."""
     try:
@@ -639,7 +614,6 @@ def apply_model_infrastructure(
     weights_already_loaded=False,
     inject_te_attention: bool = False,
     load_metadata_with_gloo: bool = False,
-    logits_dtype: torch.dtype | str | None = None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -679,8 +653,6 @@ def apply_model_infrastructure(
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
         load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
-        logits_dtype: Dtype of the LM head's logits, or its name; ``float32`` writes FP32 logits
-            from the head's compute-dtype GEMM. Default: None (the model's own head).
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -750,10 +722,6 @@ def apply_model_infrastructure(
         from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
 
         _inject_te(model)
-
-    # After PEFT and FP8 so the head is final, and before sharding so TP and FSDP wrap it.
-    if logits_dtype is not None:
-        _set_logits_dtype(model, logits_dtype, pipelined=autopipeline is not None)
 
     # Resolve exact parameter names while the complete, unwrapped model is still present.
     # Storage must be prepared before either loading branch can copy checkpoint values.

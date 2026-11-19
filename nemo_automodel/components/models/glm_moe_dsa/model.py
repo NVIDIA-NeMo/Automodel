@@ -375,6 +375,8 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: GlmMoeDsaConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -396,7 +398,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # Plain torch Linear on purpose: the GLM-5.3 checkpoint keeps lm_head in bf16
         # (``modules_to_not_convert``) and so do the RL trainer and SGLang, so it must stay out of
         # the TE FP8 autocast that ``backend.linear='te'`` + ``te_fp8`` would otherwise apply to it.
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GlmMoeDsaStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -535,7 +537,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
             # The last stage emits logits; LMHead.output restores [1, T, V] under THD.
-            outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
+            outputs_meta = (meta((microbatch_size, seq_len, vocab_size), self.lm_head.logits_dtype or dtype),)
         elif self.lm_head is not None:
             # Linear CE owns the projection: the last stage emits the final hidden states in the
             # same batch-restored layout as the logits ([1, T, H] under THD) and no top-k carry.

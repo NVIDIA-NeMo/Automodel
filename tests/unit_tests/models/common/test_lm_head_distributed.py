@@ -68,16 +68,15 @@ def _head(fp32_logits: bool, weight: torch.Tensor) -> nn.Linear:
     """Build a bias-free head owning a copy of ``weight``.
 
     Args:
-        fp32_logits: Build an ``LMHead`` with FP32 logits instead of a plain ``nn.Linear``.
+        fp32_logits: Give the ``LMHead`` FP32 logits instead of logits in its weight dtype.
         weight: Tensor of shape [vocab, hidden]; its dtype becomes the parameter dtype.
 
     Returns:
         Head with weight of shape [vocab, hidden].
     """
-    if fp32_logits:
-        head = LMHead(weight.shape[1], weight.shape[0], logits_dtype=torch.float32, dtype=weight.dtype)
-    else:
-        head = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype)
+    # The plain head is an LMHead too: tensor parallelism does not swap its class to TPLinear.
+    logits_dtype = torch.float32 if fp32_logits else None
+    head = LMHead(weight.shape[1], weight.shape[0], logits_dtype=logits_dtype, dtype=weight.dtype)
     with torch.no_grad():
         head.weight.copy_(weight)
     return head

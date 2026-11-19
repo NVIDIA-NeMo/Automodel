@@ -31,7 +31,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 )
 
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -524,6 +524,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         config: Qwen3VLMoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         backend = backend or BackendConfig()
@@ -553,8 +555,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype
         )
         self.model.moe_config = self.model.language_model.moe_config
 

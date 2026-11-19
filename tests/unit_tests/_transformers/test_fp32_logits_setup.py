@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``logits_dtype=float32`` through ``NeMoAutoModelForCausalLM.from_config``."""
+"""``logits_dtype`` through ``NeMoAutoModelForCausalLM``: a constructor argument of repo models."""
 
+import logging
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch import nn
 from torch.nn.attention import SDPBackend
-from transformers import Gemma2Config, LlamaConfig, MistralConfig, PhiConfig, PretrainedConfig, Qwen2Config, Qwen3Config
+from transformers import LlamaConfig, PhiConfig, PretrainedConfig, Qwen2Config, Qwen3Config
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel._transformers.infrastructure import _set_logits_dtype
 from nemo_automodel.components.models.common.logits import LMHead
 
 _VOCAB = 128
@@ -142,117 +142,26 @@ def _hf_config(config_cls: type[PretrainedConfig], **overrides) -> PretrainedCon
     "config",
     [
         pytest.param(_hf_config(LlamaConfig, head_dim=8), id="llama-force-hf"),
-        pytest.param(_hf_config(MistralConfig, head_dim=8), id="mistral"),
-        # Phi's head has a bias, added in fp32.
-        pytest.param(_hf_config(PhiConfig), id="phi-biased-head"),
-        # Gemma 2 ties its head and softcaps the logits after it.
-        pytest.param(_hf_config(Gemma2Config, head_dim=8, final_logit_softcapping=30.0), id="gemma2-tied-softcap"),
+        # Phi has no repo implementation, so the loader falls back to the Hugging Face class.
+        pytest.param(_hf_config(PhiConfig), id="phi"),
     ],
 )
-def test_hugging_face_implementations_install_an_fp32_logits_head(config):
+def test_hugging_face_models_ignore_logits_dtype_with_a_warning(config, caplog):
     torch.manual_seed(0)
-    model = NeMoAutoModelForCausalLM.from_config(
-        # Liger kernels would replace the HF norms with Triton kernels that cannot run on CPU.
-        config,
-        force_hf=True,
-        torch_dtype=torch.bfloat16,
-        logits_dtype="float32",
-        use_liger_kernel=False,
-    )
+    with caplog.at_level(logging.WARNING):
+        model = NeMoAutoModelForCausalLM.from_config(
+            # Liger kernels would replace the HF norms with Triton kernels that cannot run on CPU.
+            config,
+            force_hf=True,
+            torch_dtype=torch.bfloat16,
+            logits_dtype="float32",
+            use_liger_kernel=False,
+        )
 
-    head = model.get_output_embeddings()
-    assert _is_fp32_logits_head(head)
+    assert "logits_dtype is ignored" in caplog.text
+    assert type(model.get_output_embeddings()) is nn.Linear
     input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
-    output = model(input_ids=input_ids, output_hidden_states=True)
-    reference = output.hidden_states[-1].double() @ head.weight.double().t()
-    if head.bias is not None:
-        reference = reference + head.bias.double()
-    if cap := getattr(config, "final_logit_softcapping", None):
-        reference = torch.tanh(reference / cap) * cap
-    assert output.logits.dtype == torch.float32
-    torch.testing.assert_close(output.logits.double(), reference, rtol=0, atol=1e-5)
-
-
-class _TiedLM(nn.Module):
-    """Minimal model exposing the Hugging Face output-embedding accessors, with a tied head."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.embed = nn.Embedding(320, 96)
-        self.lm_head = nn.Linear(96, 320, bias=False)
-        self.lm_head.weight = self.embed.weight
-
-    def get_output_embeddings(self) -> nn.Module:
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-        self.lm_head = new_embeddings
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Project embedded ids through the head.
-
-        Args:
-            input_ids: Tensor of shape [batch, sequence].
-
-        Returns:
-            Logits of shape [batch, sequence, vocab].
-        """
-        return self.lm_head(self.embed(input_ids).bfloat16())
-
-
-def test_set_logits_dtype_installs_the_head_and_keeps_the_tie():
-    model = _TiedLM()
-
-    original = model.lm_head
-    _set_logits_dtype(model, "float32", pipelined=False)
-    installed = model.lm_head
-
-    # A plain linear head is replaced by an LMHead that shares its Parameter.
-    assert installed is not original and _is_fp32_logits_head(installed)
-    assert installed.weight is original.weight is model.embed.weight
-    assert model(torch.tensor([[1, 2, 3]])).dtype == torch.float32
-    # An LMHead is configured in place.
-    _set_logits_dtype(model, "float32", pipelined=False)
-    assert model.lm_head is installed
-
-
-def test_set_logits_dtype_configures_an_lm_head_in_place():
-    class _LMHeadModel(_TiedLM):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=None)
-
-        def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-            raise AssertionError("an LMHead is configured in place")
-
-    model = _LMHeadModel()
-    head = model.lm_head
-
-    _set_logits_dtype(model, torch.bfloat16, pipelined=False)
-
-    assert model.lm_head is head and head.logits_dtype == torch.bfloat16
-    assert model(torch.tensor([[1, 2, 3]])).dtype == torch.bfloat16
-
-
-def test_set_logits_dtype_rejects_models_without_a_head():
-    with pytest.raises(ValueError, match="needs an LM head"):
-        _set_logits_dtype(nn.Linear(4, 4), torch.float32, pipelined=False)
-
-    class _NoHead(_TiedLM):
-        def get_output_embeddings(self) -> None:
-            return None
-
-    with pytest.raises(ValueError, match="needs an LM head"):
-        _set_logits_dtype(_NoHead(), torch.float32, pipelined=False)
-
-
-def test_set_logits_dtype_rejects_a_setter_that_does_not_install_the_head():
-    class _ReplacingSetter(_TiedLM):
-        def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-            self.lm_head = nn.Linear(96, 320, bias=False)
-
-    with pytest.raises(RuntimeError, match="did not install"):
-        _set_logits_dtype(_ReplacingSetter(), torch.float32, pipelined=False)
+    assert model(input_ids=input_ids).logits.dtype == torch.bfloat16
 
 
 def test_any_logits_dtype_is_applied():
@@ -261,11 +170,3 @@ def test_any_logits_dtype_is_applied():
     assert isinstance(model.lm_head, LMHead) and model.lm_head.logits_dtype == torch.bfloat16
     input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
     assert model(input_ids=input_ids).logits.dtype == torch.bfloat16
-
-
-def test_pipeline_parallelism_is_rejected():
-    model = _build(_config(Qwen3Config, tied=False))
-
-    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
-        _set_logits_dtype(model, torch.float32, pipelined=True)
-    assert type(model.lm_head) is torch.nn.Linear

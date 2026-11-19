@@ -1158,6 +1158,8 @@ def __init_model(
     # Default ``True`` keeps existing behavior for every recipe that doesn't set
     # it. Pop here so the flag never reaches HF's ``from_pretrained``.
     restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
+    # A constructor argument of every repo model with an LM head; Hugging Face classes have no such argument.
+    logits_dtype = kwargs.pop("logits_dtype", None)
     process_group = kwargs.pop("_process_group", None)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
@@ -1336,6 +1338,9 @@ def __init_model(
                 kwargs["backend"] = BackendConfig(attn="fa4")
             resolved_backend = kwargs.get("backend")
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+            if logits_dtype is not None:
+                # Passed past the filter so a model without the argument fails; unset keeps the model's default.
+                kwargs["logits_dtype"] = dtype_from_str(logits_dtype)
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 model = model_cls(hf_config, *model_args, **kwargs)
             if is_pretrained_init:
@@ -1559,6 +1564,8 @@ def _init_model(
         *model_args,
         **kwargs,
     )
+    if not is_custom_model and kwargs.get("logits_dtype") is not None:
+        logger.warning("logits_dtype is ignored: %s is a Hugging Face model class.", type(model).__name__)
     if is_custom_model and isinstance(resolved_backend, BackendConfig):
         model_backend = getattr(model, "backend", None)
         if isinstance(model_backend, BackendConfig):

@@ -594,6 +594,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         tokenizer: PreTrainedTokenizerFast | None = None,
         revision: str | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
+        logits_dtype: torch.dtype | None = torch.float32,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
@@ -636,7 +637,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         self.model = DeepseekV41Model(
             config, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
         )
-        self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=torch.float32, logits_dtype=torch.float32)
+        self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         self.moe_config = moe_config
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepseekV41StateDictAdapter(config, moe_config, self.backend, dtype=dtype)

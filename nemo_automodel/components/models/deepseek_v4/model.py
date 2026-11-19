@@ -1246,6 +1246,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: DeepseekV4Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = torch.float32,
         **kwargs,
     ):
         super().__init__()
@@ -1276,7 +1278,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.float32, logits_dtype=torch.float32)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,
@@ -1376,7 +1378,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size)).float()
+            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size)).to(
+                self.lm_head.logits_dtype or dtype
+            )
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)
         else:

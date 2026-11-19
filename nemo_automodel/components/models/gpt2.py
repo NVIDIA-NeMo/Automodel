@@ -58,6 +58,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.shared.utils import dtype_from_str
+
 __all__ = ["build_gpt2_model"]
 
 
@@ -147,6 +150,7 @@ class GPT2LMHeadModel(nn.Module):
         n_layer: int,
         n_head: int,
         dropout: float = 0.1,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
 
@@ -158,7 +162,7 @@ class GPT2LMHeadModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
 
         # Language model head (weights tied to token embedding matrix)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.lm_head = LMHead(n_embd, vocab_size, logits_dtype=logits_dtype)
         self.lm_head.weight = self.wte.weight  # weight tying
 
         # Initialize parameters following GPT-2 scheme
@@ -166,14 +170,6 @@ class GPT2LMHeadModel(nn.Module):
 
     def initialize_weights(self):
         self._init_weights()
-
-    def get_output_embeddings(self) -> nn.Module:
-        """Return the language-model output head."""
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-        """Replace the language-model output head."""
-        self.lm_head = new_embeddings
 
     def forward(self, input_ids: torch.LongTensor, **kwargs) -> torch.Tensor:  # (B, T) → (B, T, V)
         batch_size, seq_len = input_ids.shape
@@ -217,6 +213,7 @@ def build_gpt2_model(
     bos_token_id: int = 50256,  # kept for API backward-compat (unused)
     eos_token_id: int = 50256,  # kept for API backward-compat (unused)
     attn_implementation: str = "flash_attention_2",  # retained but ignored
+    logits_dtype: torch.dtype | str | None = None,
     **extra_cfg: Any,  # ignored to preserve call-sites that used to pass config tweaks
 ) -> nn.Module:
     """Instantiate and return a *pure-PyTorch* GPT-2 language model.
@@ -244,4 +241,6 @@ def build_gpt2_model(
         n_embd=n_embd,
         n_layer=n_layer,
         n_head=n_head,
+        # dtype_from_str(None) is bfloat16, while None here means the head's weight dtype.
+        logits_dtype=None if logits_dtype is None else dtype_from_str(logits_dtype),
     )

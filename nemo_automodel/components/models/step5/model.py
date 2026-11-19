@@ -31,7 +31,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_batch_contiguous,
 )
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -191,6 +191,8 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         config: Step5Config | Step5VLConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
@@ -235,9 +237,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         if not moe_config.swiglu_clamp_after_activation:
             raise ValueError("Step5 requires post-SiLU clamping in its MoEConfig")
         self.model = Step5TextModel(text, self.backend, moe_config, dtype=dtype)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text.hidden_size, text.vocab_size, bias=False, dtype=dtype
-        )
+        self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.state_dict_adapter = Step5StateDictAdapter(text, moe_config, self.backend, dtype)
         self.init_weights()
         # Establish FP32 norm storage even under Transformers' BF16 default dtype,
@@ -329,7 +329,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             width, output_dtype = hidden, torch.float32
         else:
             width = hidden if self._pp_return_hidden_states else self.config.vocab_size
-            output_dtype = dtype
+            output_dtype = dtype if self._pp_return_hidden_states else (self.lm_head.logits_dtype or dtype)
         outputs = (torch.empty(microbatch_size, seq_len, width, device="meta", dtype=output_dtype),)
         return inputs, outputs
 
@@ -466,9 +466,14 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
         supports_pp: bool = False
 
     def __init__(
-        self, config: Step5VLConfig, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None
+        self,
+        config: Step5VLConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__(config, moe_config, backend)
+        super().__init__(config, moe_config, backend, logits_dtype=logits_dtype)
         self.vision_model = Step5VisionEncoder(config.vision_config)
         self.vit_large_projector = nn.Linear(
             config.vision_config.width * 4, config.hidden_size, bias=config.projector_bias

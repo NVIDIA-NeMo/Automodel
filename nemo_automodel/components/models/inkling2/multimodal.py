@@ -50,7 +50,12 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
         supports_ep: bool = True
 
     def __init__(
-        self, config: Inkling2Config, *, backend: BackendConfig | None = None, revision: str | None = None
+        self,
+        config: Inkling2Config,
+        *,
+        backend: BackendConfig | None = None,
+        revision: str | None = None,
+        logits_dtype: torch.dtype | None = torch.float32,
     ) -> None:
         """Build the decoder and vision encoder from the released configuration.
 
@@ -59,9 +64,10 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
                 on it before the text decoder is built from its text configuration.
             backend: Kernel selection shared with the text decoder.
             revision: Resolved Hub revision of the checkpoint, for the sidecar read.
+            logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
         """
         resolve_quantization_config(config, revision=revision)
-        super().__init__(config.text_config, backend=backend)
+        super().__init__(config.text_config, backend=backend, logits_dtype=logits_dtype)
         self.config = config
         assert self.embed_tokens is not None
         self.visual = Inkling2VisionEncoder(

@@ -152,9 +152,9 @@ class Inkling2MoE(MoE):
 class Inkling2LMHead(LMHead):
     """Bias-free FP32 output projection that owns the logit softcap and padded-vocabulary mask."""
 
-    def __init__(self, config: Inkling2TextConfig, dtype: torch.dtype) -> None:
+    def __init__(self, config: Inkling2TextConfig, dtype: torch.dtype, logits_dtype: torch.dtype | None) -> None:
         """Create the [vocab, hidden] head with ``config``'s softcap and usable vocabulary."""
-        super().__init__(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=torch.float32)
+        super().__init__(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.logit_softcapping, self.unpadded_vocab_size = config.final_logit_softcapping, config.unpadded_vocab_size
 
     def project(self, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:

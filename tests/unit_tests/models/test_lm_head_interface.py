@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Every registered model class keeps the LM-head interface that FP32 logits rely on.
+"""Every registered model class with a vocabulary head takes ``logits_dtype`` and gives it to its head.
 
-Each registered model with a vocabulary head is built on the meta device.
-Enabling FP32 logits must install an ``LMHead`` that keeps the weight returned by
-``get_output_embeddings()``, or reject a model-specific head at setup.
+The loader passes ``model.logits_dtype`` to the constructor of repo models without checking for the
+argument, so each class is built on the meta device with it.
 """
 
 import importlib
@@ -30,10 +29,8 @@ import torch
 from torch import nn
 from transformers import Glm4MoeLiteConfig, MiniMaxM2Config, Mistral3Config, NemotronHConfig, PretrainedConfig
 
-from nemo_automodel._transformers.infrastructure import _set_logits_dtype
 from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.hy_mt2.config import HyMT2Config
 
 # Registered classes without a vocabulary head: embedding, decision and policy models.
@@ -47,9 +44,6 @@ _NO_LM_HEAD = {
     "Mistral3VLBidirectionalForSequenceClassification",
     "PraxisPolicy",
 }
-
-# Heads with a model-specific projection that an LMHead cannot reproduce.
-_REJECTED_HEAD = {"BaichuanForCausalLM"}  # normalizes its weight
 
 # Construction needs an optional module.
 _NEEDS_MODULE = {
@@ -155,7 +149,7 @@ _LM_CLASSES = sorted({entry[1] for entry in MODEL_ARCH_MAPPING.values()} - _NO_L
 
 
 @pytest.mark.parametrize("name", _LM_CLASSES)
-def test_registered_lm_head_converts_to_fp32_logits(name, monkeypatch):
+def test_registered_lm_class_takes_logits_dtype(name, monkeypatch):
     # Some constructors record the current CUDA device for their rotary embedding.
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     if name in _NEEDS_MODULE:
@@ -166,19 +160,8 @@ def test_registered_lm_head_converts_to_fp32_logits(name, monkeypatch):
     config = _CONFIGS[name]() if name in _CONFIGS else _default_config(model_cls)
     kwargs = _BUILD_KWARGS[name]() if name in _BUILD_KWARGS else {}
     with torch.device("meta"):
-        model = (
-            model_cls.from_config(config, **kwargs)
-            if hasattr(model_cls, "from_config")
-            else model_cls(config, **kwargs)
-        )
-    head = model.get_output_embeddings()
+        # The loader passes logits_dtype to the constructor. FP64 is no model's default,
+        # so the head reports it only if the argument reached it.
+        model = model_cls(config, logits_dtype=torch.float64, **kwargs)
 
-    if name in _REJECTED_HEAD:
-        with pytest.raises(ValueError, match="plain linear LM head"):
-            _set_logits_dtype(model, torch.float32, pipelined=False)
-        return
-    _set_logits_dtype(model, torch.float32, pipelined=False)
-
-    fp32_head = model.get_output_embeddings()
-    assert isinstance(fp32_head, LMHead) and fp32_head.logits_dtype == torch.float32
-    assert fp32_head.weight is head.weight
+    assert model.get_output_embeddings().logits_dtype == torch.float64

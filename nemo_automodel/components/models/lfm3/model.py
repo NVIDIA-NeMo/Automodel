@@ -379,11 +379,11 @@ class Lfm3ForCausalLM(HFCheckpointingMixin, Lfm3PreTrainedModel, GenerationMixin
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: Lfm3Config) -> None:
+    def __init__(self, config: Lfm3Config, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = Lfm3Model(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         self.tie_weights()
 

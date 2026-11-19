@@ -150,7 +150,7 @@ class KimiK25VLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.models.common import BackendConfig, LMHead, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -959,7 +959,15 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         LOGGER.info(f"Model created with dtype={torch_dtype}. Weights loaded by DCP via adapter.")
         return model
 
-    def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
+    def __init__(
+        self,
+        config,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        **kwargs,
+    ):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -968,8 +976,11 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         self.model = KimiK25VLModel(config, moe_config=moe_config, backend=self.backend)
         self.moe_config = self.model.moe_config
 
-        self.model.language_model.lm_head = initialize_linear_module(
-            self.backend.linear, config.text_config.hidden_size, config.text_config.vocab_size, bias=False
+        self.model.language_model.lm_head = LMHead(
+            config.text_config.hidden_size,
+            config.text_config.vocab_size,
+            dtype=torch.bfloat16,
+            logits_dtype=logits_dtype,
         )
 
         self.vocab_size = config.text_config.vocab_size

@@ -315,6 +315,8 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         self,
         config,
         attn_implementation: str | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -323,7 +325,9 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         if attn_implementation is None:
             attn_implementation = getattr(config, "_attn_implementation", None) or "eager"
         self.model = LLaVAOneVision1_5_Model(config, attn_implementation=attn_implementation)
-        self.lm_head = nn.Linear(self.model.text_config.hidden_size, self.model.text_config.vocab_size, bias=False)
+        self.lm_head = LMHead(
+            self.model.text_config.hidden_size, self.model.text_config.vocab_size, logits_dtype=logits_dtype
+        )
         self.vocab_size = self.model.text_config.vocab_size
         self.image_token_id = getattr(config, "image_token_id", 151655)
         self.video_token_id = getattr(config, "video_token_id", 151656)
