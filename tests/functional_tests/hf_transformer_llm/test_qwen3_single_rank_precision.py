@@ -32,8 +32,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_qwen3_packed_single_rank_autocast(tmp_path: Path, checkpointing: bool) -> None:
+def test_qwen3_packed_single_rank_autocast(
+    tmp_path: Path, checkpointing: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Checkpoint-loaded FP32 Qwen3 must train packed documents with BF16 TE Q/K/V."""
+    # Packed tokens and per-document references run GEMMs of different shapes. For some shapes
+    # cuBLAS splits the reduction and rounds partial sums to BF16; keep them in FP32 instead.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False)
     torch.manual_seed(42)
     config = Qwen3Config(
         vocab_size=256,
@@ -101,15 +106,24 @@ def test_qwen3_packed_single_rank_autocast(tmp_path: Path, checkpointing: bool) 
         logits.backward(upstream)
         expected.backward(upstream)
         reference_parameters = dict(reference.named_parameters())
+        # On Blackwell, TE runs cuDNN's sm100 attention kernel while the reference's SDPA runs cuDNN's sm80
+        # kernel. Both are equally close to FP64, but near-zero embedding-gradient elements then differ by
+        # up to 5.75e-5 on GB200. With SDPA in the packed path, logits and that gradient match bit for bit.
+        gradient_atol = 1e-4 if torch.cuda.get_device_capability()[0] >= 10 else 5e-5
         for name, parameter in model.named_parameters():
             # Activation checkpoint wrappers retain the same underlying parameter names.
             reference_name = name.replace("._checkpoint_wrapped_module", "")
             assert parameter.dtype == torch.float32
             assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
-            torch.testing.assert_close(
-                parameter.grad, reference_parameters[reference_name].grad, rtol=0.05, atol=5e-5, msg=name
-            )
             reference_gradient = reference_parameters[reference_name].grad
+            assert reference_gradient is not None, reference_name
+            torch.testing.assert_close(
+                parameter.grad,
+                reference_gradient,
+                rtol=0.05,
+                atol=gradient_atol,
+                msg=lambda message: f"{name}: {message}",
+            )
             relative_error = (parameter.grad - reference_gradient).norm() / reference_gradient.norm()
             assert relative_error < 0.03, (name, relative_error.item())
         original = model.model.layers[0].self_attn.q_norm.weight.detach().clone()
