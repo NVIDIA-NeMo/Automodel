@@ -185,7 +185,7 @@ def _build_param_groups(
 
 def _trainable_params_or_groups(
     part: torch.nn.Module, overrides: list[ParamGroupOverride]
-) -> list[torch.nn.Parameter] | list[_InitialParamGroup]:
+) -> list[torch.Tensor] | list[_InitialParamGroup]:
     """Return one model part's trainable params, grouped by ``overrides`` when set.
 
     Without overrides this is the flat trainable-parameter list (unchanged
@@ -197,7 +197,8 @@ def _trainable_params_or_groups(
         raise ValueError("optimizer received no trainable parameters")
     if overrides:
         return _build_param_groups(named_params, overrides)
-    return [p for _, p in named_params]
+    params: list[torch.Tensor] = [p for _, p in named_params]
+    return params
 
 
 @dataclass
