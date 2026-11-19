@@ -58,6 +58,7 @@ if HAS_TE:
 
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
+    ValueType,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -72,6 +73,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
     unwrap_ddp_model,
 )
+from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
@@ -524,6 +526,41 @@ def _has_expert_parallelism(model: torch.nn.Module) -> bool:
     sharded across EP ranks and DCP's state_dict APIs cannot handle them.
     """
     return any(getattr(m, "ep_size", 1) > 1 for m in model.modules())
+
+
+def _global_expert_fqns(model_parts: list[torch.nn.Module]) -> dict[str, str]:
+    """Map the FQN of every rank-local expert parameter to its FQN with the global expert index.
+
+    Transformer Engine grouped experts name the weights of a rank's experts the same on every expert-parallel
+    rank, and their optimizer state is not sharded over that axis, so DCP would keep one rank's entry per name.
+    """
+    fqns = {}
+    for part in model_parts:
+        for path, module in unwrap_ddp_model(part).named_modules():
+            if isinstance(module, GroupedExpertsTE):
+                path = _dcp_module_path(path)
+                for local, name in module.global_expert_parameter_names().items():
+                    fqns[f"{path}.{local}"] = f"{path}.{name}"
+    return fqns
+
+
+def _rename_flat_optimizer_state(state: dict[str, ValueType], fqns: dict[str, str]) -> dict[str, ValueType]:
+    """Replace parameter FQNs in the keys of a flattened optimizer state dict.
+
+    Args:
+        state: Entries ``state.<fqn>.<name>`` and ``param_groups.<fqn>.<name>``. Tensor values have the shape
+            of their parameter, or are scalars; they are passed through, not copied.
+        fqns: New FQN of each parameter to rename; other entries keep their key.
+
+    Returns:
+        The same values under the new keys, in the same order.
+    """
+    renamed = {}
+    for key, value in state.items():
+        section, _, rest = key.partition(".")
+        fqn, _, name = rest.rpartition(".")
+        renamed[f"{section}.{fqns[fqn]}.{name}" if fqn in fqns else key] = value
+    return renamed
 
 
 def _zeros_like_optimizer_param(param: torch.Tensor) -> torch.Tensor:
@@ -1257,6 +1294,8 @@ class OptimizerState:
                 options=StateDictOptions(flatten_optimizer_state_dict=True, cpu_offload=self.cpu_offload),
             )
             optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
+            # Each expert-parallel rank saves the state of its own experts.
+            optimizer_state_dict = _rename_flat_optimizer_state(optimizer_state_dict, _global_expert_fqns(self.model))
 
         state_dict = {
             "optim": optimizer_state_dict,
@@ -1303,9 +1342,10 @@ class OptimizerState:
                     optimizer.load_state_dict(optimizer_parts[part_key])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
+            local_fqns = {name: local for local, name in _global_expert_fqns(self.model).items()}
             func = partial(
                 set_optimizer_state_dict,
-                optim_state_dict=state_dict["optim"],
+                optim_state_dict=_rename_flat_optimizer_state(state_dict["optim"], local_fqns),
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
             )
             list(map(func, self.model, self.optimizer))
