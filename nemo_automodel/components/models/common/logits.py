@@ -21,9 +21,11 @@ from typing import Self
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from torch.utils.flop_counter import register_flop_formula
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 # aten::mm.dtype has no derivative in PyTorch 2.10, and an opaque op keeps compilers off the GEMM.
@@ -74,7 +76,8 @@ class LMHead(nn.Linear):
     With ``logits_dtype`` set, the GEMM reads the input in the weight's dtype, accumulates in FP32 and
     writes FP32 logits (vLLM's ``head_dtype=float32``), unaffected by autocast, then casts them; the
     backward casts the gradient to the weight's dtype. ``forward`` calls ``project``, which losses that
-    gather the weight call too, so subclasses that change the logits override ``project``.
+    gather the weight call too, so subclasses that change the logits override ``project``. Model forwards
+    call ``LMHead.output(self.lm_head, hidden_states, ...)``, which also takes a stage without a head.
     """
 
     def __init__(
@@ -144,3 +147,57 @@ class LMHead(nn.Linear):
         if isinstance(bias := getattr(head, "bias", None), nn.Parameter):
             new_head.bias = bias
         return new_head.train(head.training)
+
+    @staticmethod
+    def output(
+        lm_head: nn.Module | None,
+        hidden_states: torch.Tensor,
+        logits_to_keep: int | torch.Tensor = 0,
+        is_thd: bool = False,
+        output_hidden_states: bool = False,
+    ) -> CausalLMOutputWithPast:
+        """Project hidden states through ``lm_head`` and wrap the result, for every custom causal LM ``forward()``.
+
+        ``lm_head`` is the model's head: an ``LMHead``, or whatever replaced it, such as a backend, LoRA or
+        quantized linear.
+
+        ``logits_to_keep=0`` projects every position without slicing, since ``slice(0, None)`` on a DTensor
+        raises under sequence parallelism. The input is cast to the head's compute dtype: a standalone FSDP2
+        head's ``param_dtype``, because its sharded weight may still expose the storage dtype, else its weight
+        dtype. The head decides the logits dtype, e.g. an ``LMHead``'s ``logits_dtype``.
+
+        Args:
+            lm_head: Head module, or ``None`` on a pipeline stage without it, which passes ``hidden_states`` on.
+            hidden_states: Final hidden states of shape [tokens, hidden] (THD) or [batch, sequence, hidden].
+            logits_to_keep: ``0`` for every position, a positive int for the last ``N``, or a tensor of indices.
+            is_thd: Restore a leading batch dim of 1 on 2D (THD) logits and hidden states.
+            output_hidden_states: Attach the full-sequence final hidden states, e.g. for linear losses.
+
+        Returns:
+            ``CausalLMOutputWithPast`` with logits of shape [..., vocab] (or the passed-through hidden states)
+            and, if requested, the final hidden states.
+        """
+        if lm_head is None:
+            logits = hidden_states
+        else:
+            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+                sliced = hidden_states
+            else:
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                sliced = hidden_states[..., slice_indices, :]
+            compute_dtype = None
+            if isinstance(lm_head, FSDPModule):
+                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
+            lm_head_weight = getattr(lm_head, "weight", None)
+            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
+                compute_dtype = lm_head_weight.dtype
+            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
+            logits = lm_head(projection_input)
+        if is_thd and logits.dim() == 2:
+            logits = logits.unsqueeze(0)
+
+        hidden_out = None
+        if output_hidden_states:
+            hidden_out = hidden_states.unsqueeze(0) if is_thd and hidden_states.dim() == 2 else hidden_states
+
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)

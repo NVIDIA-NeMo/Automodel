@@ -52,7 +52,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -706,7 +706,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd).logits
+        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd).logits
 
         loss = None
         if labels is not None:

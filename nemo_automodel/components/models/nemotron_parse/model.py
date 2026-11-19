@@ -40,11 +40,11 @@ from transformers.models.mbart.modeling_mbart import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 logger = logging.getLogger(__name__)
 
@@ -604,7 +604,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # Final decoder hidden states feeding the lm_head.
         final_hidden_states = decoder_outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, final_hidden_states, logits_to_keep).logits
+        logits = LMHead.output(self.lm_head, final_hidden_states, logits_to_keep).logits
 
         if not return_dict:
             return decoder_outputs + encoder_outputs

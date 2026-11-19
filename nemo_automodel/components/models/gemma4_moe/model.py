@@ -92,7 +92,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_sequence_for_cp_contiguous,
 )
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -1598,7 +1598,7 @@ class Gemma4ForConditionalGeneration(
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(
+        logits = LMHead.output(
             self.lm_head,
             hidden_states,
             logits_to_keep,
@@ -1642,7 +1642,7 @@ class Gemma4ForConditionalGeneration(
             # The tied vocabulary shard is invoked through F.linear rather than
             # lm_head.forward (the latter still owns pre-TP module hooks). Match
             # the shared weight's effective dtype explicitly, mirroring the
-            # dtype boundary enforced by compute_lm_head_logits for other heads.
+            # dtype boundary enforced by LMHead.output for other heads.
             selected_hidden_states = selected_hidden_states.to(self.lm_head.weight.dtype)
             replicated_hidden_states = DTensor.from_local(
                 selected_hidden_states,
@@ -1651,7 +1651,7 @@ class Gemma4ForConditionalGeneration(
                 run_check=False,
             )
             return F.linear(replicated_hidden_states, self.lm_head.weight)
-        return compute_lm_head_logits(
+        return LMHead.output(
             self.lm_head,
             hidden_states,
             logits_to_keep,

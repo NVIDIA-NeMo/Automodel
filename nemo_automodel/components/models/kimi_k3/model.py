@@ -40,6 +40,7 @@ from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
     is_indexed_packed_mask,
@@ -48,7 +49,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
     CudnnDsaPackedMetadata,
     cudnn_indexer_topk,
@@ -2611,7 +2612,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             attention_mask = None
             # THD packing drops the placeholder batch axis, but every Kimi layer
             # works in [batch, sequence, ...]. Restore it and let ``cu_seqlens``
-            # carry the document boundaries; ``compute_lm_head_logits`` leaves the
+            # carry the document boundaries; ``LMHead.output`` leaves the
             # already-batched [1, tokens, hidden] result untouched.
             if input_ids is not None and input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
@@ -2633,7 +2634,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             return hidden_states
         if getattr(self, "_pp_return_hidden_states", False) is True:
             return hidden_states
-        return compute_lm_head_logits(
+        return LMHead.output(
             self.lm_head,
             hidden_states,
             logits_to_keep,

@@ -66,7 +66,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
-    compute_lm_head_logits,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
@@ -951,7 +950,7 @@ class DeepseekV4Model(nn.Module):
             # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
             # Restore the leading batch dim so the hc_mult expand below sees the
             # expected ``[B, S, dim]`` rank, mirroring the output-side THD
-            # ``unsqueeze(0)`` in ``compute_lm_head_logits(is_thd=True)``.
+            # ``unsqueeze(0)`` in ``LMHead.output(is_thd=True)``.
             if inputs_embeds.dim() == 2:
                 inputs_embeds = inputs_embeds.unsqueeze(0)
             # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
@@ -1551,7 +1550,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if self._pp_return_hidden_states:
             logits = hidden_states
         else:
-            logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode).logits
+            logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode).logits
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

@@ -41,7 +41,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -495,7 +495,7 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
             cache_position=cache_position,
             **kwargs,
         )
-        logits = compute_lm_head_logits(self.lm_head, outputs.last_hidden_state, logits_to_keep, is_thd=is_thd).logits
+        logits = LMHead.output(self.lm_head, outputs.last_hidden_state, logits_to_keep, is_thd=is_thd).logits
 
         loss = None
         if labels is not None:

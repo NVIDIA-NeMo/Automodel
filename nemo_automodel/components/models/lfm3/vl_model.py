@@ -37,7 +37,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.vision_utils import get_vision_position_ids
 
-from nemo_automodel.components.models.common import compute_lm_head_logits
+from nemo_automodel.components.models.common import LMHead
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -522,7 +522,7 @@ class Lfm3VlForConditionalGeneration(HFCheckpointingMixin, Lfm3VlPreTrainedModel
             mm_encoder_outputs=mm_encoder_outputs,
             **kwargs,
         )
-        logits = compute_lm_head_logits(self.lm_head, outputs.last_hidden_state, logits_to_keep).logits
+        logits = LMHead.output(self.lm_head, outputs.last_hidden_state, logits_to_keep).logits
         loss = None
         if labels is not None:
             loss = self.loss_function(

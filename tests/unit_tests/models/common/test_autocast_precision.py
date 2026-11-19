@@ -203,15 +203,14 @@ def test_long_position_rope_matches_fp32_under_autocast(device, family, fused):
 
 def test_fp32_lm_head_output_and_gradients_survive_autocast(device):
     from nemo_automodel.components.models.common.logits import LMHead
-    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
     torch.manual_seed(42)
     head = LMHead(64, 32, bias=False, logits_dtype=torch.float32, device=device)
     x = torch.randn(2, 4, 64, device=device, requires_grad=True)
-    expected = compute_lm_head_logits(head, x).logits
+    expected = LMHead.output(head, x).logits
     gradients = torch.autograd.grad(expected.square().sum(), (x, head.weight))
     with torch.autocast(device.type, dtype=torch.bfloat16):
-        actual = compute_lm_head_logits(head, x).logits
+        actual = LMHead.output(head, x).logits
     actual_gradients = torch.autograd.grad(actual.square().sum(), (x, head.weight))
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_gradients, gradients):

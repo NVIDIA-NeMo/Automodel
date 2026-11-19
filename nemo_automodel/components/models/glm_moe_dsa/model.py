@@ -22,7 +22,7 @@ from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaC
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -534,7 +534,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = (hidden_meta,)
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            # The last stage emits logits; compute_lm_head_logits restores [1, T, V] under THD.
+            # The last stage emits logits; LMHead.output restores [1, T, V] under THD.
             outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
         elif self.lm_head is not None:
             # Linear CE owns the projection: the last stage emits the final hidden states in the
@@ -570,9 +570,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             by ``get_pipeline_stage_metas``.
         """
         if not self._pp_return_hidden_states:
-            return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+            return LMHead.output(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
         # The linear CE loss projects from the hidden states itself, so no full logits tensor is
-        # kept per in-flight microbatch. Restore the leading batch dim like compute_lm_head_logits.
+        # kept per in-flight microbatch. Restore the leading batch dim like LMHead.output.
         if is_thd and hidden.dim() == 2:
             return hidden.unsqueeze(0)
         return hidden
@@ -704,7 +704,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden = hidden + (carry_in.float() * 0.0).sum().to(hidden.dtype)  # dense zero grad(carry_in)
             return hidden, carry_out
 
-        return compute_lm_head_logits(
+        return LMHead.output(
             self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
         )
 

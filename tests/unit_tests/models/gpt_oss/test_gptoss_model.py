@@ -863,7 +863,7 @@ def test_fa4_thd_outer_normalizes_implicit_layout(monkeypatch: pytest.MonkeyPatc
     # Capture at the child boundary; this check exercises the actual outer forward.
     with patch.object(model.model, "forward", return_value=torch.zeros(2, 4)) as capture:
         model.lm_head = torch.nn.Identity()
-        monkeypatch.setattr(model_module, "compute_lm_head_logits", lambda module, hidden, *args, **kwargs: hidden)
+        monkeypatch.setattr(model_module.LMHead, "output", staticmethod(lambda module, hidden, *args, **kwargs: hidden))
         model(
             torch.zeros(1, 2, dtype=torch.long),
             position_ids=torch.arange(2)[None],
@@ -931,7 +931,7 @@ def test_fa4_canonical_raw_thd_sharder_to_model_matches_te(monkeypatch: pytest.M
     converted = {}
     outputs = {}
     monkeypatch.setattr(model_module, "position_ids_to_freqs_cis", lambda *args, **kwargs: torch.ones(32768, 4))
-    monkeypatch.setattr(model_module, "compute_lm_head_logits", lambda module, hidden, *args, **kwargs: hidden)
+    monkeypatch.setattr(model_module.LMHead, "output", staticmethod(lambda module, hidden, *args, **kwargs: hidden))
     for backend in ("te", "fa4"):
         model = GptOssForCausalLM.__new__(GptOssForCausalLM)
         torch.nn.Module.__init__(model)

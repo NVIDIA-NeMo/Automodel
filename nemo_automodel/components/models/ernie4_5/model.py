@@ -31,7 +31,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -521,7 +521,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
+        return LMHead.output(
             self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
         )
 
@@ -663,7 +663,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
+        return LMHead.output(
             self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
         )
 

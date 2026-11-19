@@ -178,7 +178,7 @@ def test_glm_packing_to_loss(reduction):
     from types import SimpleNamespace
 
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
-    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+    from nemo_automodel.components.models.common.logits import LMHead
     from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
 
     batch = packed_sequence_thd_collater(
@@ -199,7 +199,7 @@ def test_glm_packing_to_loss(reduction):
     model = torch.nn.Module()
     model.lm_head = torch.nn.Linear(7, 13, bias=False)
     hidden = torch.randn(4, 7, requires_grad=True)
-    out = compute_lm_head_logits(model.lm_head, hidden, is_thd=True, output_hidden_states=True)
+    out = LMHead.output(model.lm_head, hidden, is_thd=True, output_hidden_states=True)
     assert out.hidden_states.shape == (1, 4, 7)
     actual = calculate_loss(
         ChunkedCrossEntropy(3, compile=False, reduction=reduction),
@@ -232,7 +232,6 @@ def test_glm_packing_to_loss(reduction):
 @pytest.mark.parametrize("rounding", [None, "model_output", "head"])
 def test_fp32_head_bf16_hidden_matches_model_projection(rounding, compiled):
     from nemo_automodel.components.models.common.logits import LMHead
-    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
     torch.manual_seed(67)
     model = torch.nn.Module()
@@ -243,7 +242,7 @@ def test_fp32_head_bf16_hidden_matches_model_projection(rounding, compiled):
         model.lm_head = torch.nn.Linear(19, 37, bias=False)
     hidden = torch.randn(2, 9, 19, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(37, (2, 9))
-    logits = compute_lm_head_logits(model.lm_head, hidden).logits
+    logits = LMHead.output(model.lm_head, hidden).logits
     # ... or the model may round them at its output (for example an FSDP output_dtype).
     logits = logits.to(hidden.dtype) if rounding == "model_output" else logits
     actual = calculate_loss(
