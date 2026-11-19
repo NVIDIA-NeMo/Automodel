@@ -192,3 +192,5 @@ ci:
   # Training plus the full validation set takes ~29 minutes, before container
   # startup/teardown. Leave headroom without reducing either validation or steps.
   time: "01:00:00"
+  perf_testing:
+    schedule: nightly
