@@ -102,20 +102,26 @@ from nemo_automodel.shared.utils import dtype_from_str
 _VHA_RANK = 16
 
 
-def _require_labels_within_documents(
-    seq_lens: torch.Tensor, seq_lens_padded: torch.Tensor | None, labels: torch.Tensor
+def _require_supervision_within_documents(
+    seq_lens: torch.Tensor, seq_lens_padded: torch.Tensor | None, supervised: torch.Tensor
 ) -> None:
-    """Reject supervised labels in the padding of a packed row: the layout drops them after they were counted."""
+    """Reject supervised positions in the padding of a packed row: the layout drops them after they were counted.
+
+    Args:
+        seq_lens: Real document lengths of shape [batch, documents]; negative entries are unused.
+        seq_lens_padded: Optional physical spans of the same shape.
+        supervised: Boolean tensor of shape [batch, sequence], True where the loss counts a target.
+    """
     lengths = seq_lens.clamp_min(0)
     spans = lengths if seq_lens_padded is None else seq_lens_padded.clamp_min(0)
     starts = spans.cumsum(dim=-1) - spans
-    positions = torch.arange(labels.shape[-1], device=labels.device)
+    positions = torch.arange(supervised.shape[-1], device=supervised.device)
     real = ((positions >= starts.unsqueeze(-1)) & (positions < (starts + lengths).unsqueeze(-1))).any(dim=-2)
-    dropped = (labels != -100) & ~real.to(labels.device)
+    dropped = supervised & ~real.to(supervised.device)
     if bool(dropped.any()):
         raise ValueError(
             f"{int(dropped.sum())} supervised labels of a packed row lie in document padding, which the packed "
-            "layout drops after the loss has counted them: set them to -100"
+            "layout drops after the loss has counted them: give them the loss's ignore index"
         )
 
 
@@ -901,7 +907,12 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             _require_full_row_spans(seq_lens, seq_lens_padded, batch["input_ids"].shape[1])
             labels = batch.get("labels")
             if labels is not None:
-                _require_labels_within_documents(seq_lens, seq_lens_padded, labels)
+                # The recipe's supervision mask when the collator provides one; otherwise the labels that
+                # are token IDs. Token IDs are non-negative, while -100 and a loss's configured
+                # ignore_index are negative sentinels.
+                loss_mask = batch.get("loss_mask")
+                supervised = loss_mask.bool() if loss_mask is not None else labels >= 0
+                _require_supervision_within_documents(seq_lens, seq_lens_padded, supervised)
         return {
             "cp_sharder": ContextParallelSharder(
                 shard_batch=partial(

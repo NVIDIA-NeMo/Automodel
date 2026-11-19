@@ -275,6 +275,17 @@ def test_sharder_hook_rejects_supervised_labels_in_document_padding():
     two["labels"][0, 133] = 7
     with pytest.raises(ValueError, match="1 supervised labels .* document padding"):
         model.prepare_model_inputs_for_cp(two)
+    # A loss's configured ignore index is another negative sentinel; the collator's loss_mask, when present,
+    # is the supervision mask.
+    two["labels"][0, 133] = -101
+    assert "cp_sharder" in model.prepare_model_inputs_for_cp(two)
+    two["labels"][0, 133] = 7
+    two["loss_mask"] = two["labels"] >= 0
+    two["loss_mask"][0, 133] = False
+    assert "cp_sharder" in model.prepare_model_inputs_for_cp(two)
+    two["loss_mask"][0, 134] = True
+    with pytest.raises(ValueError, match="1 supervised labels .* document padding"):
+        model.prepare_model_inputs_for_cp(two)
 
 
 def test_positions_that_do_not_restart_in_every_aligned_document_are_rejected():
