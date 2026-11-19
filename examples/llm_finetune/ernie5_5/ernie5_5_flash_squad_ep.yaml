@@ -1,0 +1,217 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter SFT of the 43-layer main decoder of ERNIE-5.5-Flash-Base-BF16 on SQuAD:
+# single unpacked documents of at most 256 tokens, 100 updates, validation after 50 and 100.
+# Target topology: 16 nodes x 4 GB200 GPUs, WORLD=64, EP=8, TP=PP=CP=1. Dense parameters use
+# FSDP2 over all 64 ranks. The 512 routed experts of each MoE layer are split into 8 groups
+# along the EP axis, and each group is FSDP-sharded over 8 ranks (ep_shard = WORLD / EP).
+# GBS=64/LBS=1 gives one document per rank and no accumulation.
+#
+# Hardware: the six sparse-attention (DSA) layers run on the cuDNN path, which requires
+# nvidia-cudnn-frontend[cutedsl] and FlashMLA; validated on SM100-class GPUs (GB200) only. The
+# other values of backend.attn (eager, torch, sdpa) select an eager DSA path that accepts at most
+# 512 tokens per document; multi-GPU training of the released model has been validated with the
+# cuDNN path only. The HCA layers run on the eager PyTorch path with every value.
+#
+# The routed experts exchange tokens through HybridEP (backend.dispatcher: hybridep), which
+# requires DeepEP with HybridEP in the environment and compiles its kernels at the first dispatch
+# of every process: in the validation runs the first update took 64 to 90 s and later updates
+# a median of 6 to 7 s. HybridEP writes the kernels to a directory named after the process id
+# under HYBRID_EP_CACHE_DIR, or under the home directory when that variable is unset; give every
+# node its own HYBRID_EP_CACHE_DIR if the nodes share the home directory.
+# Leave NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset: HybridEP detects which ranks of an expert
+# group share an NVLink domain. An expert group is 8 consecutive ranks, that is the two nodes with
+# NODE_RANK 2k and 2k+1. On GB200 an NVLink domain can span several four-GPU nodes; this recipe
+# was validated with the two nodes of every expert group in one domain, and an expert group split
+# over two domains has not been run.
+#
+# Not supported: tensor, context and pipeline parallelism, activation checkpointing, packed
+# sequences and padded batches. LoRA has not been validated. The multi-token prediction (MTP)
+# block of the released checkpoint is not loaded or trained. The parameters of the DSA indexers
+# are frozen. The router correction bias is a fixed buffer, not a parameter.
+# Checkpoint saving is disabled in this recipe because of its size: one checkpoint of the full
+# model and optimizer is about 3.1 TiB (523 GiB of weights, 2.5 TiB of optimizer state).
+#
+# To run this recipe, from the repository root, on each of the 16 nodes with 4 GPUs, with
+# NODE_RANK set from 0 to 15 and MASTER_ADDR set to the first node:
+#   uv run torchrun --nnodes=16 --nproc-per-node=4 --node-rank=$NODE_RANK \
+#     --master-addr=$MASTER_ADDR --master-port=29500 \
+#     -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep.yaml
+# The model and tokenizer come from the Hugging Face Hub at the pinned revision below; the BF16
+# weights take about 534 GiB in the Hub cache, which every node must be able to read.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  # One unpadded document per rank and microbatch: padded input is not supported.
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  save_checkpoint_every_epoch: false
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+  revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+  trust_remote_code: false
+  dtype: bfloat16
+  # The released config declares one MTP block (num_nextn_predict_layers: 1) that this model
+  # does not construct; loading it unchanged is rejected. This override selects the 43
+  # decoder layers, and the MTP keys of the checkpoint are not loaded.
+  num_nextn_predict_layers: 0
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # cuDNN sparse attention for the DSA layers: requires nvidia-cudnn-frontend[cutedsl] and
+    # FlashMLA; validated on SM100-class GPUs (GB200) only.
+    attn: cudnn
+    # linear must be torch. experts and dispatcher must be torch_mm and hybridep, the values this
+    # recipe was validated with (HybridEP token dispatch, BF16 compute only), or torch and torch
+    # (all-gather and all-reduce over the EP group). Every other BackendConfig field except
+    # enable_hf_state_dict_adapter must keep its default.
+    linear: torch
+    experts: torch_mm
+    dispatcher: hybridep
+
+distributed:
+  strategy: fsdp2
+  # FSDP2 with expert parallelism only: TP, PP, CP and dp_replicate_size must stay 1, and
+  # ep_size must be greater than 1.
+  tp_size: 1
+  pp_size: 1
+  cp_size: 1
+  ep_size: 8
+  # Not supported: the model's parallelizer rejects activation checkpointing.
+  activation_checkpointing: false
+  # No compute cast: every parameter is used in its storage dtype (BF16, and FP32 where the
+  # model keeps FP32 parameters). Gradients are reduced in FP32.
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: null
+    reduce_dtype: float32
+    output_dtype: null
+    cast_forward_inputs: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+checkpoint:
+  # Disabled because of size: one checkpoint of the full model and optimizer is about 3.1 TiB.
+  # Metrics are still written to checkpoint_dir. To save, set enabled: true and
+  # save_consolidated: false. The validated save of the full model, run with the torch experts
+  # and dispatcher, wrote one checkpoint, with step_scheduler.ckpt_every_steps: 100 and
+  # dist_env.timeout_minutes: 180.
+  enabled: false
+  checkpoint_dir: checkpoints/ernie5_5_flash_squad_ep/
+  # Plan the loading of the released weights, and of a resume, over a CPU (Gloo) process group
+  # instead of NCCL. With NCCL, rank 0 can keep point-to-point buffers for other ranks for the
+  # whole run; how much depends on the placement of the ranks (see the model card). The switch
+  # covers loads only; a save still plans over NCCL. The validated run used this value.
+  load_metadata_with_gloo: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  # Truncate, never pad. Longer documents need more GPU memory; 256 tokens is the length
+  # this topology has been run with. The answer is at the end of a row, so about 11% of
+  # the training rows lose it to truncation and contribute no loss. 384 tokens keep 99% of
+  # them; an earlier state of this code ran 40 steps at 384 tokens on this topology with the
+  # torch experts and dispatcher, with 2.5% of the device memory left. The full model has not been
+  # trained with longer documents. From
+  # position 2,176 of a document on, the DSA layers discard keys; the model card reports what
+  # was run at 4,096 tokens.
+  seq_length: 256
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+    revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
+
+packed_sequence:
+  # Packed sequences are not supported.
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  # No pad_seq_len_divisible: the collator must not pad.
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 128
+  seq_length: 256
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+    revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  # BF16 parameters with FP32 master weights, stored as 16-bit remainders, and BF16 moments.
+  # Updates at this learning rate are mostly below BF16 resolution, so they accumulate in the
+  # master weights instead of being rounded away on the BF16 parameters.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 1.0e-6
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: gb200
+  # EP=8 over WORLD=64: 16 nodes x 4 GPUs. The cuDNN DSA path is validated on SM100-class GPUs
+  # (GB200) only.
+  recipe_owner: linmuchuiyang
+  nodes: 16
+  time: "01:00:00"
+  nproc_per_node: 4

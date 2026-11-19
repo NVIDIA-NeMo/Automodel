@@ -15,6 +15,7 @@
 """CPU coverage for the existing qat_config boundary and preparation ordering."""
 
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import replace
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -635,14 +636,23 @@ def test_qat_safe_trainability_policy_preserves_adapters(infrastructure, kind, f
 
 
 @pytest.mark.parametrize("qat_enabled", [False, True])
-def test_unfreeze_untargeted_modules_and_adapter_only_remains_supported(infrastructure, qat_enabled):
+@pytest.mark.parametrize("adapt_unquantized", [False, True])
+def test_unfreeze_untargeted_modules_and_adapter_only_remains_supported(
+    infrastructure, qat_enabled: bool, adapt_unquantized: bool
+) -> None:
     model = _model()
     model.add_module("ordinary", nn.LayerNorm(32))
     model.add_module("unquantized", nn.Linear(32, 32))
-    with patch.object(infrastructure, "Checkpointer"):
+    targets = ["projection", "unquantized"] if adapt_unquantized else ["projection"]
+    expected = (
+        pytest.raises(ValueError, match="PEFT checkpoints cannot store trainable parameters.*LoRA adapters")
+        if adapt_unquantized else nullcontext()
+    )
+    with patch.object(infrastructure, "Checkpointer"), expected:
         infrastructure.apply_model_infrastructure(
             model, is_meta_device=False, device=torch.device("cpu"),
-            peft_config=_peft_config(), qat_quantizer=QAT(_qat_config()) if qat_enabled else None,
+            peft_config=PeftConfig(target_modules=targets, dim=4, alpha=8, use_memory_efficient_lora=False),
+            qat_quantizer=QAT(_qat_config()) if qat_enabled else None,
             freeze_config={
                 "freeze_modules": [{"path": "projection"}],
                 "unfreeze_modules": [
@@ -655,8 +665,11 @@ def test_unfreeze_untargeted_modules_and_adapter_only_remains_supported(infrastr
     assert not model.projection.lora_A.weight.requires_grad
     assert model.projection.lora_B.weight.requires_grad
     assert all(p.requires_grad for p in model.ordinary.parameters())
-    assert isinstance(model.unquantized, LinearLoRA)
-    assert model.unquantized.weight_fake_quantizer is None
+    if adapt_unquantized:
+        assert isinstance(model.unquantized, LinearLoRA)
+        assert model.unquantized.weight_fake_quantizer is None
+    else:
+        assert type(model.unquantized) is nn.Linear
     assert all(p.requires_grad for p in model.unquantized.parameters())
 
 
