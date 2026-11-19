@@ -1,6 +1,10 @@
 override-dependencies = [
     # Override Trackio's Pillow<13 cap to enforce the security update.
     "pillow==13.0.0",
+    # ffpa-attn (<=0.2.5) pins nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4. 4.6.2 lacks sm_107
+    # (VR200), where PyTorch 2.15's CuTe-DSL RMSNorm override then fails; move the stack to 4.8.0.
+    "nvidia-cutlass-dsl[cu13]==4.8.0; sys_platform == 'linux'",
+    "quack-kernels==0.6.5; sys_platform == 'linux'",
     # The 26.11 base registers platformdirs.pytest_plugin; an older venv copy
     # shadows its module while pytest still discovers the system entry point.
     # Update this pin with the base image; remove once the regular lock is aligned.
