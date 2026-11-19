@@ -102,6 +102,16 @@ from nemo_automodel.shared.utils import dtype_from_str
 _VHA_RANK = 16
 
 
+def _require_full_row_spans(seq_lens: torch.Tensor, seq_lens_padded: torch.Tensor | None, row_length: int) -> None:
+    """Reject packed rows whose document spans do not add up to the row length."""
+    spans = seq_lens if seq_lens_padded is None else seq_lens_padded
+    if bool((spans.clamp_min(0).sum(dim=-1) != row_length).any()):
+        raise ValueError(
+            "The document spans of a packed row (seq_lens_padded, or seq_lens without it) must add up to "
+            f"the row length {row_length}"
+        )
+
+
 def _hca_attention_config(config: Ernie5_5Config, dtype: torch.dtype) -> DeepseekV4Config:
     """Describe the HCA layers in the configuration type of their DeepSeek V4 base class.
 
@@ -853,13 +863,22 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
 
         Args:
             batch: Full rows: ``input_ids`` and ``labels`` of shape [batch, sequence], and ``seq_lens`` of shape
-                [batch, documents] for packed rows. The hook leaves it unchanged.
+                [batch, documents] for packed rows, with optional ``seq_lens_padded``. The hook checks the
+                spans of packed rows and leaves the batch unchanged.
             num_chunks: Chunk count of the framework; this model uses one chunk.
 
         Returns:
             The sharder, under the key ``cp_sharder``.
+
+        Raises:
+            ValueError: If the document spans of a packed row do not add up to its length.
         """
-        del batch, num_chunks
+        del num_chunks
+        seq_lens = batch.get("seq_lens")
+        if seq_lens is not None:
+            # The shared sharder accepts spans that cover only a prefix of the row and drops the uncovered
+            # labels after the recipe has counted them, so the check of ``forward`` also runs here.
+            _require_full_row_spans(seq_lens, batch.get("seq_lens_padded"), batch["input_ids"].shape[1])
         return {
             "cp_sharder": ContextParallelSharder(
                 shard_batch=partial(
@@ -937,12 +956,7 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
                     "seq_lens describes a whole packed row: under context parallelism the row must pass through "
                     "the sharder of prepare_model_inputs_for_cp, which replaces seq_lens by packed_seq_ids"
                 )
-            spans = seq_lens if seq_lens_padded is None else seq_lens_padded
-            if bool((spans.clamp_min(0).sum(dim=-1) != input_ids.shape[1]).any()):
-                raise ValueError(
-                    "The document spans of a packed row (seq_lens_padded, or seq_lens without it) must add up to "
-                    f"the row length {input_ids.shape[1]}"
-                )
+            _require_full_row_spans(seq_lens, seq_lens_padded, input_ids.shape[1])
             layout = packed_layout(
                 seq_lens,
                 seq_lens_padded=seq_lens_padded,

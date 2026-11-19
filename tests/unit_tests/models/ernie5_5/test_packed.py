@@ -234,6 +234,18 @@ def test_document_spans_that_do_not_cover_the_row_are_rejected():
         model(padded, seq_lens=torch.tensor([[130, 37]]), seq_lens_padded=torch.tensor([[256, 30]]))
 
 
+def test_sharder_hook_rejects_document_spans_that_do_not_cover_the_row():
+    """A prepacked row fails at the sharder boundary, before the sharder could drop uncovered labels."""
+    model, documents = _model((128,)), _documents()
+    row = torch.cat(documents, dim=1)
+    batch = {"input_ids": row, "labels": row.clone(), "seq_lens": torch.tensor([[130, 37]]), "qkv_format": "thd"}
+    with pytest.raises(ValueError, match="must add up to the row length 267"):
+        model.prepare_model_inputs_for_cp(batch)
+    batch["seq_lens_padded"] = torch.tensor([[256, 30]])
+    with pytest.raises(ValueError, match="must add up to the row length 267"):
+        model.prepare_model_inputs_for_cp(batch)
+
+
 def test_positions_that_do_not_restart_in_every_aligned_document_are_rejected():
     model, documents = _model((128, -2)), _documents()
     row = torch.cat((documents[0], documents[0].new_zeros(1, 126), documents[1], documents[0].new_zeros(1, 91)), dim=1)

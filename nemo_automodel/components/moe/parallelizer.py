@@ -58,6 +58,7 @@ from nemo_automodel.components.moe.layers import (
 )
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
@@ -1235,7 +1236,10 @@ def apply_fsdp(
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
     """Configure context parallelism for attention and MoE layers."""
 
-    from transformer_engine.pytorch.attention import DotProductAttention
+    # Transformer Engine is an optional extra; without it only model-owned CP attention is set up here.
+    have_te_attention, DotProductAttention = safe_import_from(
+        "transformer_engine.pytorch.attention", "DotProductAttention"
+    )
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
@@ -1269,7 +1273,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         if layer_type in ("full_attention", "sliding_attention"):
             self_attn = block.self_attn
             attn_module = getattr(self_attn, "attn_module", None)
-            if isinstance(attn_module, DotProductAttention):
+            if have_te_attention and isinstance(attn_module, DotProductAttention):
                 attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
                 attn_module.set_context_parallel_group(
                     cp_mesh.get_group(),
