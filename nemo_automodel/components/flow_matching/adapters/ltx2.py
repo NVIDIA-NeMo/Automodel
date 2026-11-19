@@ -114,7 +114,7 @@ class LTX2Adapter(ModelAdapter):
         fps: Video frame rate the model was trained at (LTX-2 uses 24).
     """
 
-    def __init__(self, audio_loss_weight: float = 1.0, fps: float = 24.0):
+    def __init__(self, audio_loss_weight: float = 1.0, fps: float = 24.0) -> None:
         self.audio_loss_weight = audio_loss_weight
         self.fps = fps
 

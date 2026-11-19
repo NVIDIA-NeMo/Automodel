@@ -50,7 +50,7 @@ class EMAManager:
 
     use_distributed_checkpointing = True
 
-    def __init__(self, model: nn.Module, decay: float = 0.9999):
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         if not 0.0 <= decay <= 1.0:
             raise ValueError(f"decay must be in [0, 1], got {decay}")
         self.decay = float(decay)
@@ -104,7 +104,7 @@ class ShardedModelEMAManager:
 
     use_distributed_checkpointing = True
 
-    def __init__(self, ema_model: nn.Module, train_model: nn.Module, decay: float = 0.9999):
+    def __init__(self, ema_model: nn.Module, train_model: nn.Module, decay: float = 0.9999) -> None:
         if not 0.0 <= decay <= 1.0:
             raise ValueError(f"decay must be in [0, 1], got {decay}")
         self.decay = float(decay)

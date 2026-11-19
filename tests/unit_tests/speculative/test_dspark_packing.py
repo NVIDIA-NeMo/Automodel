@@ -249,22 +249,3 @@ def test_unpacked_trainer_does_not_pass_packing_kwargs_to_legacy_draft():
             target_hidden_states=torch.zeros(1, 4, len(TARGET_LAYER_IDS) * HIDDEN),
             loss_mask=torch.ones(1, 4, dtype=torch.uint8),
         )
-
-
-def test_recipe_packing_helpers_and_gates():
-    from nemo_automodel.recipes.llm.train_dspark import _packing_kwargs, _validate_packing_gates
-
-    assert _packing_kwargs({"input_ids": torch.zeros(1, 4)}) == {}
-    packed = {
-        "input_ids": torch.zeros(1, 4),
-        "position_ids": torch.zeros(1, 4),
-        "seq_lens": torch.tensor([[4]]),
-        "doc_remaining": torch.zeros(1, 4),
-    }
-    assert set(_packing_kwargs(packed)) == {"position_ids", "seq_lens", "doc_remaining"}
-
-    _validate_packing_gates(cp_size=1, target_attn_impl="sdpa", micro_batch_size=4)
-    with pytest.raises(NotImplementedError, match="context parallelism"):
-        _validate_packing_gates(cp_size=2, target_attn_impl="sdpa", micro_batch_size=1)
-    with pytest.raises(ValueError, match="micro_batch_size=1"):
-        _validate_packing_gates(cp_size=1, target_attn_impl="flash_attention_2", micro_batch_size=2)

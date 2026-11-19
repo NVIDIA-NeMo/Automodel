@@ -23,7 +23,11 @@ from nemo_automodel.components.models.qwen3_8_flash_next import cudnn_qsa
 from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import gathered_qsa_gqa_attention, qsa_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
+    gathered_qsa_gqa_attention,
+    qsa_gqa_attention,
+    select_qsa_cuda_kernel,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -33,7 +37,7 @@ def test_cpu_dispatch_preserves_oracle_and_gradients(monkeypatch: pytest.MonkeyP
     torch.manual_seed(17)
     inputs = [torch.randn(2, 7, h, 4, requires_grad=True) for h in (4, 2, 2)]
     routes = torch.randint(-1, 7, (2, 7, 9))
-    actual = qsa_gqa_attention(*inputs, routes, backend="cudnn")
+    actual = qsa_gqa_attention(*inputs, routes, cuda_kernel=select_qsa_cuda_kernel("cudnn"))
     expected = gathered_qsa_gqa_attention(*inputs, routes)
     dy = torch.randn_like(actual)
     for a, b in zip(

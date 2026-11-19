@@ -108,7 +108,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: tencent/Hy3-preview
@@ -134,6 +134,7 @@ optimizer:
 #   name: hy3_preview_deepep
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
   # Verified on cw (H100-80GB): trains at ~42 GiB/GPU. Note pp4*ep8=32 (4 nodes) OOMs

@@ -139,6 +139,7 @@ def _validate_provider_sections(repo_root: Path) -> None:
         "diffusion": "diffusion",
         "embedding-models": "embedding",
         "reranking-models": "reranker",
+        "wam": "wam",
     }
     offenders: list[str] = []
     navigated_model_pages: list[Path] = []

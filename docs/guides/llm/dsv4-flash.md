@@ -16,7 +16,7 @@ We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsen
 
 - **Train / validation splits** taken directly from the HuggingFace dataset.
 - **Tokenizer**: shared with the base model (`AutoTokenizer.from_pretrained` on the DeepSeek-V4 Flash checkpoint).
-- **Padding**: `pad_seq_len_divisible=64` via the default collater.
+- **Packing**: 1,024-token packed sequences with the THD collater.
 
 For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
 
@@ -48,7 +48,7 @@ A new in-tree `HuggingFaceStorageReader` recognizes `F8_E8M0` and `F8_E5M2` dtyp
 
 ## Launch Training
 
-A ready-to-use recipe ships at [`examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml). The yaml header documents how to scale `num_hidden_layers` and `ep_size` for the full 43-layer multi-node run.
+A ready-to-use recipe ships at [`examples/llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml). The packed recipe uses pipeline parallelism across 16 nodes (128 GPUs).
 
 NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
 
@@ -66,7 +66,7 @@ srun --output=output.out \
      --error=output.err \
      --container-image /your/path/to/automodel.image.sqsh --no-container-mount-home bash -c "
   CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
-  examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml \
+  examples/llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml \
   --nproc-per-node=8 \
   --model.config.pretrained_model_name_or_path=/your/local/dsv4-flash \
   --model.config.name_or_path=/your/local/dsv4-flash "
@@ -76,7 +76,7 @@ srun --output=output.out \
 - Hugging Face applies rate limits on downloads. We recommend cloning the model repository to your local filesystem beforehand.
 - Ensure your Hugging Face cache (`HF_HOME`) is configured and that the dataset is already cached locally.
 - To enable Weights & Biases logging, set your `WANDB_API_KEY` and configure the `wandb` section in the YAML file.
-- For the full 43-layer schedule, increase `ep_size` (and add `pp_size`) per the cluster you are running on; see the yaml header for guidance.
+- Allocate 16 nodes with eight GPUs per node for the packed recipe's `pp_size: 4` and `ep_size: 32` topology.
 
 ## Layer-Parity Validation
 
