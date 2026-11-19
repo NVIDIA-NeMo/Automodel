@@ -552,7 +552,6 @@ def test_indexer_weights_proj_stays_plain_linear_with_fp32_matmul_under_fp8_reci
         config.index_head_dim,
     ]
     assert type(indexer.weights_proj) is torch.nn.Linear
-    assert indexer.fp32_head_projection is True
 
     indexer.weights_proj.to(torch.bfloat16)  # bf16 compute weight, as under the FSDP2 mixed-precision policy
     x = torch.randn(6, config.hidden_size).to(torch.bfloat16)
@@ -562,31 +561,34 @@ def test_indexer_weights_proj_stays_plain_linear_with_fp32_matmul_under_fp8_reci
 
 
 @pytest.mark.parametrize("ndim", [2, 3])
-def test_head_weights_keep_reference_rounding_without_fp8_recipe(config, sdpa_backend, ndim):
-    # Without ``te_fp8`` the head must round exactly as the resident bf16 module did before the FP8
-    # recipes existed (and as HF does): a bf16 projection lifted to fp32. An fp32 GEMM instead moves
-    # the near-tied keys that the existing BF16 GLM configurations select.
+def test_head_weights_are_an_fp32_gemm_without_fp8_recipe_too(config, sdpa_backend, ndim):
+    # The head follows the RL trainer / SGLang in every configuration: an fp32 GEMM on the bf16 weight,
+    # not the bf16 projection lifted to fp32 that a bf16 HF model computes. Inputs are chosen so the
+    # two differ, which keeps the policy observable.
     torch.manual_seed(11)
     indexer = GlmMoeDsaIndexer(config, sdpa_backend)
     indexer.weights_proj.to(torch.bfloat16)
     shape = (64, config.hidden_size) if ndim == 2 else (2, 32, config.hidden_size)
     x = torch.randn(shape).to(torch.bfloat16)
-    reference = torch.nn.functional.linear(x, indexer.weights_proj.weight).float()  # the module's own bf16 GEMM
+    bf16_rounding = torch.nn.functional.linear(x, indexer.weights_proj.weight).float()  # HF bf16 behaviour
     fp32_gemm = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
-    assert not torch.equal(reference, fp32_gemm)  # these inputs make the rounding visible
+    assert not torch.equal(bf16_rounding, fp32_gemm)  # these inputs make the rounding visible
 
     weights = indexer._head_weights(x)
     assert weights.dtype == torch.float32
-    torch.testing.assert_close(weights, reference, rtol=0, atol=0)
-    assert indexer.fp32_head_projection is False
+    torch.testing.assert_close(weights, fp32_gemm, rtol=0, atol=0)
+    assert not torch.equal(weights, bf16_rounding)
 
 
+@pytest.mark.parametrize("fp8_recipe", [False, True])
 @pytest.mark.parametrize("autocast_enabled", [False, True])
 @pytest.mark.parametrize("ndim", [2, 3])
-def test_head_weights_stay_fp32_under_bf16_autocast(config, fp8_backend, autocast_enabled, ndim):
-    # The single-rank FSDP2 path wraps the model forward in a bf16 autocast; under an FP8 recipe the
-    # head projection must still be an fp32 GEMM, not a bf16 GEMM whose result is cast afterwards.
-    indexer = _indexer_without_te(config, fp8_backend)
+def test_head_weights_stay_fp32_under_bf16_autocast(
+    config, sdpa_backend, fp8_backend, fp8_recipe, autocast_enabled, ndim
+):
+    # The single-rank FSDP2 path wraps the model forward in a bf16 autocast; the head projection must
+    # still be an fp32 GEMM, not a bf16 GEMM whose result is cast afterwards, with or without FP8.
+    indexer = _indexer_without_te(config, fp8_backend if fp8_recipe else sdpa_backend)
     indexer.weights_proj.to(torch.bfloat16)
     shape = (6, config.hidden_size) if ndim == 2 else (2, 3, config.hidden_size)
     x = torch.randn(shape).to(torch.bfloat16)
@@ -652,14 +654,8 @@ def test_head_weights_keep_installed_lora_adapter(config, sdpa_backend, fp8_back
         indexer._head_weights(x), torch.full((6, config.index_n_heads), 2.0 * config.hidden_size)
     )
 
-    # Unadapted control: the fp32 GEMM on the stored weight under the FP8 recipe, the module's own
-    # projection lifted to fp32 otherwise.
-    expected_control = (
-        x @ control.weights_proj.weight.float().T
-        if fp8_recipe
-        else torch.nn.functional.linear(x, control.weights_proj.weight).float()
-    )
-    torch.testing.assert_close(control._head_weights(x), expected_control)
+    # Unadapted control: the fp32 GEMM on the stored weight, with or without the FP8 recipe.
+    torch.testing.assert_close(control._head_weights(x), x @ control.weights_proj.weight.float().T)
 
     # The adapted dense indexer still runs end to end.
     batch, seq_len = 2, 5
