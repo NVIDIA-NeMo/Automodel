@@ -2065,6 +2065,22 @@ class GroupedExpertsTE(nn.Module):
         dtensor = create_dtensor_from_local(tensor, device_mesh, self.ep_rank if device_mesh is not None else None)
         return dtensor
 
+    def global_expert_parameter_names(self) -> dict[str, str]:
+        """Map the parameter names of this rank's experts to names that carry the global expert index.
+
+        Every expert-parallel rank names the weights of its experts ``weight0``, ``weight1``, and so on. State
+        that a checkpoint keeps per parameter name, such as optimizer state, needs names that differ between
+        ranks.
+        """
+        first = self.ep_rank * self.num_local_experts
+        kinds = ("weight", "bias") if self.expert_bias else ("weight",)
+        return {
+            f"{linear}.{kind}{index}": f"{linear}.{kind}{first + index}"
+            for linear in ("gate_up_linear", "down_linear")
+            for kind in kinds
+            for index in range(self.num_local_experts)
+        }
+
     def _normalize_moe_mesh(self, moe_mesh: DeviceMesh | None) -> DeviceMesh | None:
         if moe_mesh is None:
             return None
