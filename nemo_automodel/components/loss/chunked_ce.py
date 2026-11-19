@@ -14,7 +14,6 @@
 
 from collections.abc import Callable
 from functools import partial
-from inspect import signature
 from typing import Any
 
 import torch
@@ -72,12 +71,12 @@ def _linear_cross_entropy(
         labels: Target indices shaped [chunk_tokens].
         ignore_index: Ignored target value.
         logits_dtype: Optional model-owned output dtype after projection.
-        lm_head: The model's ``LMHead``, whose forward accepts the materialized weight; None for a plain head.
+        lm_head: The model's ``LMHead``, whose ``project`` gives the logits; None for a plain head.
 
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    logits = F.linear(hidden.to(weight.dtype), weight) if lm_head is None else lm_head.forward(hidden, weight=weight)
+    logits = F.linear(hidden.to(weight.dtype), weight) if lm_head is None else lm_head.project(hidden, weight)
     if lm_head is not None and lm_head.logits_dtype in (torch.float16, torch.bfloat16):
         # The head rounds its FP32 GEMM output to logits_dtype: keep that boundary too.
         torch._dynamo.graph_break()
@@ -216,7 +215,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         A linear module alone does not rule out post-projection transformations.
         Read the text configuration through the HF config contract, including
         multimodal models whose output settings live in a nested text config.
-        Each chunk calls an ``LMHead``'s forward, so only a softcap outside the head is rejected.
+        Each chunk calls an ``LMHead``'s ``project``, so only a softcap outside the head is rejected.
 
         Args:
             lm_head: Output head with weight of global shape [vocab, hidden].
@@ -236,10 +235,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         # FSDP dynamically subclasses Linear but retains its forward method.
         if (
             not isinstance(lm_head, nn.Linear)
-            or (
-                type(lm_head).forward not in (nn.Linear.forward, LMHead.forward)
-                and (not isinstance(lm_head, LMHead) or "weight" not in signature(lm_head.forward).parameters)
-            )
+            or type(lm_head).forward not in (nn.Linear.forward, LMHead.forward)
             or lm_head.bias is not None
         ):
             raise ValueError(
@@ -305,7 +301,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             logits_dtype: Optional output cast after projection, matching the
                 owning model. Projection uses lm_weight.dtype; mixed-dtype
                 hidden states are converted per chunk, never the full weight.
-            lm_head: The model's ``LMHead``, whose forward each chunk calls with the
+            lm_head: The model's ``LMHead``, whose ``project`` each chunk calls with the
                 materialized weight; None projects like a plain bias-free linear head.
 
         Returns:

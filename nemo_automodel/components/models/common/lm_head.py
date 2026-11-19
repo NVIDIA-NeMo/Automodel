@@ -81,7 +81,8 @@ class LMHead(nn.Linear):
 
     With ``logits_dtype`` set, the GEMM reads the input in the weight's dtype, accumulates in FP32 and
     writes FP32 logits (vLLM's ``head_dtype=float32``), unaffected by autocast, then casts them; the
-    backward casts the gradient to the weight's dtype. Chunked losses pass their materialized weight to ``forward``.
+    backward casts the gradient to the weight's dtype. Chunked losses, which gather the weight themselves, call
+    ``project``, so subclasses that change the logits override it.
     Repo models take ``logits_dtype`` as a constructor argument and build their head with it; their forwards call
     ``LMHead.output(self.lm_head, hidden_states, ...)``, which also takes a stage without a head.
     """
@@ -103,9 +104,12 @@ class LMHead(nn.Linear):
         self.logits_dtype = logits_dtype
         self.logit_softcapping = logit_softcapping
 
-    def forward(self, input: torch.Tensor, *, weight: torch.Tensor | None = None) -> torch.Tensor:
-        """Project hidden states [..., hidden] with the head weight or an explicit [vocab, hidden] weight."""
-        weight = self.weight if weight is None else weight
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Project hidden states [..., hidden] to logits [..., vocab] with the head's own weight."""
+        return self.project(input, self.weight)
+
+    def project(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Project input [..., hidden] to logits [..., vocab] with ``weight`` [vocab, hidden]."""
         logits = self.linear(input, weight, self.bias, logits_dtype=self.logits_dtype)
         if self.logit_softcapping is not None:
             logits = self.logit_softcapping * torch.tanh(logits / self.logit_softcapping)
