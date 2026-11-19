@@ -14,6 +14,7 @@
 
 """Contract tests for the ERNIE 5.5 Flash LoRA recipe."""
 
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ernie5_5 import parallelization
 from nemo_automodel.components.models.ernie5_5.model import Ernie5_5_MoeForCausalLM
+from nemo_automodel.components.models.ernie5_5.moe import _routed_situ
 from nemo_automodel.components.models.ernie5_5.parallelization import PARALLELIZER
 from nemo_automodel.components.moe import layers as shared_moe_layers
 from nemo_automodel.recipes._dist_utils import parse_distributed_section
@@ -117,6 +119,12 @@ def test_lora_recipe_targets_select_supported_modules_of_the_released_layer_sche
         )
     assert apply_lora_to_linear_modules(model, peft, skip_freeze=True) == (37 + 6) * 5 + 42 * (1 + 3) + 3
     assert isinstance(model.model.layers[1].moe.experts, GroupedExpertsDeepEPLoRA)
+    activation = model.model.layers[1].moe.experts.expert_activation
+    assert isinstance(activation, partial) and activation.func is _routed_situ
+    assert activation.keywords == {
+        "beta": model.config.activation_situ_beta,
+        "linear_beta": model.config.activation_situ_linear_beta,
+    }
     _apply_trainability_policy(model, peft_enabled=True, freeze_config=None, strict=True)
 
     adapters = {name: parameter for name, parameter in model.named_parameters() if "lora_" in name}

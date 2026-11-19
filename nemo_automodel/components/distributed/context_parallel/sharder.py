@@ -53,11 +53,26 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
+
+
+@runtime_checkable
+class THDBatchConsumer(Protocol):
+    """Consumer requesting the shared CP1 raw-packed-batch conversion.
+
+    The sharder owns flattening input IDs, labels and positions together and
+    deriving logical/physical offsets and masks. This contract does not enable
+    context or pipeline parallelism, or replace model-owned custom sharders.
+    """
+
+    @property
+    def requires_thd_batch_preparation(self) -> bool:
+        """Whether the active backend needs shared raw THD normalization."""
+        ...
 
 
 def _cp_rank(cp_mesh) -> int:

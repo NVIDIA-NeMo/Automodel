@@ -30,6 +30,7 @@
 # The DSA layer runs on eager PyTorch attention (at most 512 tokens per document), which works
 # on any CUDA GPU. The proxy generates its own synthetic token sequences, so this test stages
 # no tokenizer or dataset.
+# ERNIE5_5_DISPATCHER selects torch (default) or hybridep, as in the base EP2 test.
 
 set -xeuo pipefail
 
@@ -44,6 +45,20 @@ RUN_DIR=$(mktemp -d)
 cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
 
+BACKEND_ARGS=()
+case "${ERNIE5_5_DISPATCHER:-torch}" in
+    torch) ;;
+    hybridep)
+        BACKEND_ARGS+=(--model.backend.experts torch_mm --model.backend.dispatcher hybridep)
+        export HYBRID_EP_CACHE_DIR="${HYBRID_EP_CACHE_DIR:-$RUN_DIR/hybrid_ep}"
+        mkdir -p "$HYBRID_EP_CACHE_DIR"
+        ;;
+    *)
+        echo "Unknown ERNIE5_5_DISPATCHER: $ERNIE5_5_DISPATCHER (expected torch or hybridep)" >&2
+        exit 2
+        ;;
+esac
+
 # Every epoch of the proxy is one batch, so the number of epochs bounds the number of updates.
 # A run takes about two minutes. A rank that fails inside the checkpoint save does not exit, and
 # the other rank waits for it, so the run does not end by itself. The time limit then stops the
@@ -53,6 +68,7 @@ TRANSFORMERS_OFFLINE=1 timeout 600 \
     tests/functional_tests/moe/run_ernie5_5_lora_training.py \
     --config tests/functional_tests/moe/ernie5_5_proxy.yaml \
     --model.backend.attn eager \
+    "${BACKEND_ARGS[@]}" \
     --step_scheduler.max_steps "$MAX_STEPS" \
     --step_scheduler.num_epochs "$MAX_STEPS" \
     --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
