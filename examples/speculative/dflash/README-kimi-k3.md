@@ -1,4 +1,4 @@
-# Training a Kimi K3 DFlash drafter
+# Train a Kimi K3 DFlash Drafter
 
 This recipe trains a dense Kimi K3 MLA drafter against the frozen Kimi K3 text
 model. The draft preserves the target's MLA projections (Q-LoRA, compressed KV
@@ -6,7 +6,7 @@ latent), output gate, fp32-variance RMSNorm, and SiTU MLP; KDA linear attention,
 routed and shared experts, MTP, and the learned attention-residual mixer stay in
 the target only. `kimi_k3_dflash.yaml` is the reference configuration.
 
-## What differs from the Qwen3 DFlash configs
+## What Differs from the Qwen3 DFlash Configs
 
 - `attention_backend: sdpa` is required. The draft's MLA attends over the dense
   additive DFlash mask; it has no FlexAttention path, so the draft spec declares
@@ -31,7 +31,7 @@ the target only. `kimi_k3_dflash.yaml` is the reference configuration.
 
 The target has 896 routed experts, so shard it with expert parallelism and pick
 an `ep_size` that divides 896. The provided configuration uses `ep_size: 64`,
-i.e. 64 ranks across eight 8-GPU nodes; lower it to fit a smaller allocation.
+that is, 64 ranks across eight 8-GPU nodes; lower it to fit a smaller allocation.
 
 ## Data
 
@@ -46,5 +46,5 @@ Run the same command on every node, varying only `--node-rank`. Node 0 provides
 the rendezvous address.
 
 ```bash
-torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_dflash -c examples/speculative/dflash/kimi_k3_dflash.yaml
+torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_dflash -c examples/speculative/dflash/kimi_k3_dflash.yaml
 ```

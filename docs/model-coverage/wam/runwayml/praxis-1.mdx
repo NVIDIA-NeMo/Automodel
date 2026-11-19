@@ -1,0 +1,66 @@
+---
+title: "praxis-1-droid"
+description: "Fine-tune Runway's praxis-1-droid world-action model with NeMo AutoModel: an expert-parallel recipe, its LoRA variant and a LIBERO before / after tutorial."
+slug: model-coverage/wam/runwayml/praxis-1-droid
+---
+
+[Praxis-1](https://huggingface.co/runwayml/praxis-1-droid) is Runway's 27B world-action model: a sparse mixture-of-experts video
+diffusion transformer (about 3B active parameters) that predicts the next frames of the robot's cameras, and an action expert that
+reads those predictions and outputs the next chunk of end-effector actions. NeMo AutoModel has a checked-in recipe that fine-tunes
+all of its weights on one node, and a tutorial that takes the single-arm checkpoint from 0 to 90 % success on a LIBERO task suite.
+
+## Fine-Tune Praxis-1
+
+Follow the [installation instructions](/get-started/installation) from a source checkout. The recipe also needs the reference
+`praxis` package of the model builder on the Python path: it provides the Wan2.2 VAE and the Qwen3.5 text encoder that the policy
+is trained with, and the closed-loop simulation client the tutorial evaluates with.
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune all weights on one 8-GPU node | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/wam/praxis/praxis_1_libero.yaml). |
+| Convert LIBERO demonstrations, train, and evaluate before / after | Follow the [LIBERO tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/praxis-1-libero/README.md). |
+| Train adapters instead of all weights | Use the [LoRA configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/wam/praxis/praxis_1_libero_lora.yaml); `python -m nemo_automodel.components.models.praxis.lora_export` merges the adapters into a checkpoint. |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 x H100 80 GB (one node) |
+| Strategy | FSDP2 with expert parallelism; ep_size=8, tp_size=1, pp_size=1, cp_size=1 |
+| Nodes | 1 |
+| Features | Checkpointing (consolidated checkpoint at every save), Activation checkpointing, Transformer Engine grouped experts with HybridEP token dispatch, fp32 optimizer state |
+| Advanced | param_dtype=bfloat16, reduce_dtype=float32, dispatcher=hybridep |
+
+### Results
+
+The tutorial fine-tunes the single-arm checkpoint on the LIBERO-Spatial demonstrations and evaluates it with the standard LIBERO
+protocol, 500 paired episodes per checkpoint.
+
+| Checkpoint | LIBERO-Spatial success |
+| --- | --- |
+| `runwayml/praxis-1-droid`, zero-shot | 0/500 |
+| full fine-tune, 600 steps x 48 windows | 451/500 (90.2 %) |
+| LoRA, 600 steps x 48 windows | 457/500 (91.4 %) |
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Robot policy (video prediction and action generation) |
+| Architecture | `PraxisPolicy` |
+
+### Available Models
+
+- [`runwayml/praxis-1-droid`](https://huggingface.co/runwayml/praxis-1-droid): the single-arm checkpoint; the recipe reads its `config.json` for the cameras, the action space and the normalization.
+
+The recipe supports the single-arm embodiment; the bimanual checkpoint has a different action space and camera layout.
+
+## Related Resources
+
+- [LIBERO before / after tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/praxis-1-libero/README.md)
+- [Praxis-1 on Hugging Face](https://huggingface.co/runwayml/praxis-1-droid)

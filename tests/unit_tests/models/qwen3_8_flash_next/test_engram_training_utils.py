@@ -64,7 +64,6 @@ def _engram_scale_and_norm_worker(rank: int, world_size: int, store_path: str) -
         assert isinstance(model.table.weight, DTensor)
         assert tuple(model.table.weight.shape) == (6, 2)
         assert tuple(model.table.weight.placements) == (Shard(0),)
-        assert model.table.weight._nemo_model_owned_grad_divisor == float(world_size)
         model.table.weight.grad = torch.full_like(model.table.weight, float(rank + 1))
 
         total_norm = scale_grads_and_clip_grad_norm(
@@ -73,19 +72,22 @@ def _engram_scale_and_norm_worker(rank: int, world_size: int, store_path: str) -
             foreach=True,
         )
 
-        expected_grad = torch.full_like(model.table.weight.to_local(), float(rank + 1) / world_size)
+        # The table's own backward already averages over the owner group, so the
+        # training utility leaves the owner shard's gradient untouched and only
+        # the norm spans the group.
+        expected_grad = torch.full_like(model.table.weight.to_local(), float(rank + 1))
         assert isinstance(model.table.weight.grad, DTensor)
         torch.testing.assert_close(model.table.weight.grad.to_local(), expected_grad, rtol=0, atol=0)
-        # Six local values across two ranks: rank 0 contributes 6*(1/2)^2,
-        # rank 1 contributes 6*(2/2)^2.
-        expected_norm = torch.tensor(7.5, dtype=torch.float64).sqrt()
+        # Six local values across two ranks: rank 0 contributes 6*1^2,
+        # rank 1 contributes 6*2^2.
+        expected_norm = torch.tensor(30.0, dtype=torch.float64).sqrt()
         torch.testing.assert_close(total_norm.cpu(), expected_norm, rtol=1e-7, atol=1e-7)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
-def test_engram_grad_scaling_and_global_norm_use_owner_group(tmp_path: Path) -> None:
+def test_engram_global_norm_spans_owner_group_without_rescaling(tmp_path: Path) -> None:
     mp.spawn(
         _engram_scale_and_norm_worker,
         args=(2, str(tmp_path / "engram-training-utils-pg")),

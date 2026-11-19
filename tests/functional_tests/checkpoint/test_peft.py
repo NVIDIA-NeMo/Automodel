@@ -34,6 +34,7 @@ from transformers import AutoModelForCausalLM
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -233,13 +234,16 @@ def get_test_hf_peft_checkpoint_expected_keys():
 
 
 @pytest.mark.parametrize(
-    "force_hf,use_triton",
+    "force_hf,use_triton,unfreeze_norm",
     [
-        pytest.param(True, False, id="force_hf-no_use_triton"),
-        pytest.param(False, False, id="no_force_hf-no_use_triton"),
+        pytest.param(True, False, False, id="force_hf-no_use_triton"),
+        # LoRA plus a module trained in full through freeze_config.unfreeze_modules: the
+        # adapter must store the norm, list it in modules_to_save, restore it on resume,
+        # and hand it to HF PEFT.
+        pytest.param(False, False, True, id="no_force_hf-no_use_triton-unfreeze_norm"),
     ],
 )
-def test_hf_peft_checkpoint(force_hf, use_triton):
+def test_hf_peft_checkpoint(force_hf, use_triton, unfreeze_norm):
     """
     Tests HF PEFT checkpoint
     """
@@ -286,6 +290,13 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
     # Limit training to the minimum steps needed for a checkpoint
     cfg.step_scheduler.max_steps = 10
     cfg.model.force_hf = force_hf
+    if unfreeze_norm:
+        cfg.freeze_config = ConfigNode({"unfreeze_modules": [{"path": "model.norm"}]})
+        expected_model_keys["base_model.model.model.norm.weight"] = ([512], torch.bfloat16, "cpu")
+        expected_optim_keys["optim.state.model.norm.weight.step"] = ([], torch.float32, "cpu")
+        expected_optim_keys["optim.state.model.norm.weight.exp_avg"] = ([256], torch.bfloat16, "cpu")
+        expected_optim_keys["optim.state.model.norm.weight.exp_avg_sq"] = ([256], torch.bfloat16, "cpu")
+        expected_config["modules_to_save"] = ["model.norm"]
 
     try:
         # Clean up any leftover checkpoints from previous runs to avoid
@@ -547,6 +558,16 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                         assert torch.allclose(source_param, peft_model_param.cpu()), (
                             "Parameter values are different when they should be the same"
                         )
+            # Modules trained in full come back as PEFT's modules_to_save copies, not as base weights.
+            peft_parameters = dict(peft_model.named_parameters())
+            for source_key, source_param in model_state_dict.items():
+                if "lora_" in source_key:
+                    continue
+                module_name, _, parameter_name = source_key.rpartition(".")
+                restored_param = peft_parameters[f"{module_name}.modules_to_save.default.{parameter_name}"]
+                assert torch.equal(source_param, restored_param.cpu()), (
+                    f"HF PEFT did not restore the trained {source_key}"
+                )
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()

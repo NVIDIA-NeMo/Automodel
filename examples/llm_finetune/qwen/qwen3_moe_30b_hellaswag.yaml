@@ -1,4 +1,3 @@
-
 # ------------------------------------------------------------------------------------------------
 # WARNING: HARDWARE REQUIREMENTS
 # ------------------------------------------------------------------------------------------------
@@ -6,16 +5,20 @@
 # It requires at least 8 GPUs (e.g., 8x A100 80GB or 8x H100 80GB) to run,
 # but you can potentially run it on less GPUs by reducing the local batch size.
 # ------------------------------------------------------------------------------------------------
+# Runtime tuning is migrated from examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml, so this
+# recipe uses the PyTorch attention, dispatcher and expert backends. For TE and DeepEP, use
+# examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 1024
-  local_batch_size: 64
+  global_batch_size: 256  #PR4637: 1024
+  local_batch_size: 4  #PR4637: 64
   ckpt_every_steps: 100
   val_every_steps: 50
   num_epochs: 2
   max_steps: 1000
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -32,16 +35,15 @@ model:
   trust_remote_code: true
   torch_dtype: bfloat16
   backend:
+    #PR4637: removed model.backend.enable_fsdp_optimizations: true
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: sdpa  #PR4637: te
     linear: torch
-    rms_norm: torch_fp32
-    experts: torch_mm
-    dispatcher: deepep
+    rms_norm: torch  #PR4637: torch_fp32
+    experts: torch  #PR4637: torch_mm
+    dispatcher: torch  #PR4637: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
-    enable_fsdp_optimizations: true
-
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_sft
@@ -54,33 +56,46 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
-  activation_checkpointing: true
-
   sequence_parallel: false
-
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    ignore_router_for_ac: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
+  padding: false
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
   num_workers: 4
 
+  drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
 
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   num_workers: 4
 
 optimizer:
@@ -90,15 +105,23 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1e-8
 
+packed_sequence:
+  packed_sequence_size: 4096
+  packing_strategy: neat
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
-  recipe_owner: hemildesai
-  time: "00:25:00"
+  recipe_owner: akoumpa  #PR4637: hemildesai
+  time: "01:00:00"  #PR4637: "00:25:00"
   known_issue_id: AM-648
   allow_failure: true
   checkpoint_robustness:
     tokenizer_name: Qwen/Qwen3-30B-A3B
     trust_remote_code: true
     hf_device_map_auto: true
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
+  perf_testing:
+    fake_balanced_gate: true
+    schedule: nightly
+  nodes: 1
