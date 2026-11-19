@@ -24,7 +24,7 @@ from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import FlopCounterMode
 
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 _DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"))]
 
@@ -368,7 +368,7 @@ class TestLMHeadOutput:
 
     def test_fp32_logits_head_composes_with_slicing(self):
         """A bf16 LMHead with FP32 logits writes fp32 logits for the kept positions (2D THD input)."""
-        from nemo_automodel.components.models.common.logits import LMHead
+        from nemo_automodel.components.models.common.lm_head import LMHead
 
         lm_head = LMHead.from_linear(self._lm_head().to(torch.bfloat16), logits_dtype=torch.float32)
         hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
@@ -409,7 +409,7 @@ class TestLMHeadOutput:
         lm_head = FakeFSDPHead()
         hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
 
-        with patch("nemo_automodel.components.models.common.logits.FSDPModule", FakeFSDPHead):
+        with patch("nemo_automodel.components.models.common.lm_head.FSDPModule", FakeFSDPHead):
             out = LMHead.output(lm_head, hidden, logits_to_keep=2)
 
         assert lm_head.weight.dtype == torch.float32

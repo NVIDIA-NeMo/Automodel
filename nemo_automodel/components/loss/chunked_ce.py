@@ -24,7 +24,7 @@ from torch.distributed.fsdp import FSDPModule
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 
 def _validate_chunk_len(chunk_len: int) -> int:

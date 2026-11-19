@@ -62,7 +62,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.utils import can_return_tuple, logging
 
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_tie_word_embeddings_flip,

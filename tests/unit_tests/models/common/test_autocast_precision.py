@@ -202,7 +202,7 @@ def test_long_position_rope_matches_fp32_under_autocast(device, family, fused):
 
 
 def test_fp32_lm_head_output_and_gradients_survive_autocast(device):
-    from nemo_automodel.components.models.common.logits import LMHead
+    from nemo_automodel.components.models.common.lm_head import LMHead
 
     torch.manual_seed(42)
     head = LMHead(64, 32, bias=False, logits_dtype=torch.float32, device=device)

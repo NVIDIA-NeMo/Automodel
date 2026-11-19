@@ -42,7 +42,7 @@ from nemo_automodel._transformers.model_init import (
     get_hf_config,
 )
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.utils import BackendConfig, generation_config_from_model_config
 
 

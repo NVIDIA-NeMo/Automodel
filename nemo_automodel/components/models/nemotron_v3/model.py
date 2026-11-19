@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common import (
     HFCheckpointingMixin,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.mtp import (
     MTPContextParallelInputs,
     prepare_mtp_context_parallel_inputs,

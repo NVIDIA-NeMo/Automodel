@@ -20,7 +20,7 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.qwen3_5_moe.model import (
     Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeModel,

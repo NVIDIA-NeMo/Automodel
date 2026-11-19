@@ -25,7 +25,7 @@ from transformers import LlamaConfig, PhiConfig, PretrainedConfig, Qwen2Config, 
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 _VOCAB = 128
 

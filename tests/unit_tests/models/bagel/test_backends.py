@@ -12,7 +12,7 @@ from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
     Qwen2ForCausalLM,
     _apply_qk_norm,
 )
-from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 
 def _config() -> Qwen2Config:
