@@ -114,8 +114,7 @@ class LMHead(nn.Linear):
         ``logits_dtype`` None runs a plain linear in the weight's dtype that autocast may lower.
         """
         # The weight sets the compute dtype: inside forward, FSDP2 has already unsharded it to its param_dtype.
-        if weight.element_size() > input.element_size():
-            input = input.to(weight.dtype)
+        input = input.to(weight.dtype)
         if logits_dtype is None:
             if isinstance(weight, DTensor):  # tensor-parallel weight: compile-safe like TPLinear
                 return tp_linear_forward(input, weight, bias, mm_for_2d_compile=True)
