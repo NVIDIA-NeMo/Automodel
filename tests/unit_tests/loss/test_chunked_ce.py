@@ -224,7 +224,7 @@ def test_glm_packing_to_loss(reduction):
         pytest.param(
             True,
             marks=pytest.mark.runtime_budget(
-                60, hard_timeout=120, reason="Cold Inductor compilation of mixed-dtype projection and backward"
+                30, hard_timeout=120, reason="Cold Inductor compilation of mixed-dtype projection and backward"
             ),
         ),
     ],
