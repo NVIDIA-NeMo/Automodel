@@ -36,6 +36,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.ernie5_5 import dsa as dsa_module
 from nemo_automodel.components.models.ernie5_5 import model as model_module
 from nemo_automodel.components.models.ernie5_5.config import Ernie5_5Config, main_rope_theta
 from nemo_automodel.components.models.ernie5_5.dsa import Ernie5_5DSAAttention
@@ -49,6 +50,7 @@ from nemo_automodel.components.models.ernie5_5.model import (
 from nemo_automodel.components.moe import layers as shared_moe_layers
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.moe.parallelizer import apply_ac
 from nemo_automodel.components.utils import model_utils
 from tests.unit_tests.models.ernie5_5.conftest import checkpoint_config, checkpoint_style_config
 
@@ -583,7 +585,7 @@ def test_block_registers_the_feed_forward_under_its_native_name(layer_index, chi
     # A module installed in place of the child, as activation checkpointing does, is used by the next forward.
     class _Zero(nn.Module):
         def forward(self, hidden: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-            """Return zeros with the shape [batch, sequence, hidden] of the input."""
+            """Return zeros of the shape [batch, sequence, hidden] of ``hidden``; the mask is not read."""
             return torch.zeros_like(hidden)
 
     tokens = _tokens(5)
@@ -979,3 +981,41 @@ def test_initialize_weights_overwrites_poisoned_values_and_depends_on_the_seed()
     assert not torch.equal(
         other["model.layers.1.moe.experts.gate_and_up_projs"], first["model.layers.1.moe.experts.gate_and_up_projs"]
     )
+
+
+def test_recomputation_of_a_checkpointed_dsa_layer_reuses_the_key_selection(monkeypatch):
+    """The selector drops the remote keys on every second call, as equal scores at the cutoff can change them."""
+    select, calls = dsa_module.select_window_and_remote, []
+
+    def changing(scores: torch.Tensor, document_ids: torch.Tensor, **kwargs: torch.Tensor | int | None) -> torch.Tensor:
+        """Select from ``scores`` of shape [batch, queries, keys] as the real selector does, on odd calls only."""
+        calls.append(kwargs["remote_topk"])
+        return select(scores, document_ids, **{**kwargs, "remote_topk": kwargs["remote_topk"] * (len(calls) % 2)})
+
+    monkeypatch.setattr(dsa_module, "select_window_and_remote", changing)
+
+    def gradients(saved_routing: bool | None) -> dict[str, torch.Tensor]:
+        """Return the gradients without checkpointing (None), or with it and with or without saved top-k outputs."""
+        calls.clear()
+        model, tokens = _tiny_model(sliding_window=4), _tokens(24)
+        if saved_routing is not None:
+            apply_ac(model, ignore_router=saved_routing)
+        F.cross_entropy(model(tokens).logits[0], tokens[0], reduction="sum").backward()
+        return {
+            name.replace("._checkpoint_wrapped_module", ""): parameter.grad
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+
+    expected = gradients(None)
+    assert len(calls) == 1
+    for saved_routing in (True, False):
+        replayed = gradients(saved_routing)
+        assert len(calls) == 1 and replayed.keys() == expected.keys()
+        for name, gradient in expected.items():
+            torch.testing.assert_close(replayed[name], gradient, msg=name)
+    # Without the hook of the block the recomputation selects again and returns other gradients.
+    monkeypatch.setattr(Ernie5_5Block, "nemo_checkpoint_context_fn", lambda self, context_fn: context_fn)
+    recomputed = gradients(False)
+    assert len(calls) == 2
+    assert any(not torch.allclose(recomputed[name], gradient) for name, gradient in expected.items())

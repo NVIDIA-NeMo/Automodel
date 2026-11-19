@@ -37,6 +37,8 @@ does not load the MTP weights. The DSA indexers only select keys, receive no gra
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 
@@ -75,6 +77,7 @@ from nemo_automodel.components.models.ernie5_5.config import (
 from nemo_automodel.components.models.ernie5_5.dsa import (
     Ernie5_5DSAAttention,
     cudnn_dsa_layout,
+    dsa_selection_replay,
     freeze_ernie5_5_indexer_params,
 )
 from nemo_automodel.components.models.ernie5_5.hca import Ernie5_5HCAAttention
@@ -255,6 +258,19 @@ class Ernie5_5Block(nn.Module):
     def self_attn(self) -> nn.Module:
         """The attention layer, under the name that the shared context-parallel setup looks up."""
         return self.attention
+
+    def nemo_checkpoint_context_fn(
+        self, context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Make the recomputation of a checkpointed DSA layer call reuse the key selection of its forward.
+
+        Args:
+            context_fn: Factory of the forward and recomputation contexts of activation checkpointing, or None.
+
+        Returns:
+            The factory with the selection record of one call bound for a DSA layer, otherwise ``context_fn``.
+        """
+        return dsa_selection_replay.checkpoint_context_fn(context_fn) if self.is_dsa else context_fn
 
     def _attend(self, hidden_states: torch.Tensor, inputs: Ernie5_5AttentionInputs) -> torch.Tensor:
         """Run the attention layer with the inputs of its kind.

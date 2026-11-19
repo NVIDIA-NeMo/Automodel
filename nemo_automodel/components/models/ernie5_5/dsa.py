@@ -84,6 +84,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention, plan_sparse_indices
@@ -95,6 +96,7 @@ from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
     prepare_cudnn_dsa_packed_metadata,
 )
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 
 # Optional CUDA kernel of the Hadamard transform. Without it the same arithmetic runs in PyTorch.
 _HAS_FAST_HADAMARD, _fast_hadamard_transform = safe_import("fast_hadamard_transform")
@@ -341,6 +343,38 @@ def ernie5_5_index_scores(q: torch.Tensor, k: torch.Tensor, weights: torch.Tenso
         return (dot * (weights * scale).float().unsqueeze(-1)).sum(dim=2) / scale
 
 
+dsa_selection_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("ERNIE 5.5 DSA key selection")
+
+
+def _selection_of_this_call(select: Callable[[], torch.Tensor]) -> torch.Tensor:
+    """Return the key selection of ``select``, or the one that the forward of this checkpointed layer call recorded.
+
+    Two calls can select different keys among equal index scores, so the recomputation of a checkpointed decoder
+    layer reuses the selection of its forward. ``Ernie5_5Block.nemo_checkpoint_context_fn`` binds the record of one
+    call; outside a checkpointed call ``select`` runs unchanged.
+
+    Args:
+        select: Computes the selection without gradient tracking: a boolean tensor of shape [batch, queries, keys]
+            on the eager path, or int32 row offsets of shape [queries, remote_topk] on the cuDNN path.
+
+    Returns:
+        The selection of the forward of this call.
+    """
+    replay = dsa_selection_replay.current()
+    if replay is None:
+        return select()
+    recorder, mode = replay
+    recorded = recorder.take() if mode == "replay" else None
+    if recorded is not None:
+        return recorded
+    # The recomputation skips the selection, so selective checkpointing must not record its operations.
+    with _disable_current_modes(), torch.no_grad():
+        selected = select()
+    if mode == "record":
+        recorder.record(selected)
+    return selected
+
+
 @torch.no_grad()
 def select_window_and_remote(
     scores: torch.Tensor,
@@ -466,13 +500,15 @@ def latent_mqa_core(
     value_dim, latent = value_up.shape[1:]
     if latent > qdim or gate_logits.shape != (batch, sequence, heads * value_dim):
         raise ValueError("Invalid latent width or output gate dimensions")
-    selected = select_window_and_remote(
-        scores,
-        document_ids,
-        window=window,
-        remote_topk=remote_topk,
-        key_document_ids=key_document_ids,
-        first_query=first_query,
+    selected = _selection_of_this_call(
+        lambda: select_window_and_remote(
+            scores,
+            document_ids,
+            window=window,
+            remote_topk=remote_topk,
+            key_document_ids=key_document_ids,
+            first_query=first_query,
+        )
     )
     if selected.shape != (batch, sequence, keys):
         raise ValueError("Index scores and document IDs must match query batch and sequence")
@@ -634,14 +670,16 @@ def cudnn_dsa_core(
             )
         metadata = prepare_cudnn_dsa_packed_metadata(cu_seqlens, tokens, max_seqlen=max_seqlen)
     remote_metadata = replace(metadata, causal_lengths=(metadata.causal_lengths - window).clamp_min(0))
-    remote = cudnn_indexer_topk(
-        index_q.detach(),
-        index_k.detach(),
-        index_weights.detach() * (index_q.shape[-1] ** 0.5),
-        cu_seqlens,
-        remote_topk,
-        packed_metadata=remote_metadata,
-    ).squeeze(1)
+    remote = _selection_of_this_call(
+        lambda: cudnn_indexer_topk(
+            index_q.detach(),
+            index_k.detach(),
+            index_weights.detach() * (index_q.shape[-1] ** 0.5),
+            cu_seqlens,
+            remote_topk,
+            packed_metadata=remote_metadata,
+        ).squeeze(1)
+    )
     union, _ = merge_remote_and_window(
         remote,
         metadata.starts,
@@ -739,8 +777,9 @@ class Ernie5_5DSAFP32Parameters(nn.Module):
         inputs and raises ``ValueError`` for shapes that disagree.
 
         Args:
-            query: Tensor of shape [batch, sequence, heads, latent + rope].
-            latent_kv: Tensor of shape [batch, sequence, latent + rope] shared by all heads.
+            query: Tensor of shape [batch, sequence, heads, latent + rope], the queries of this rank.
+            latent_kv: Tensor of shape [batch, keys, latent + rope] shared by all heads: the keys of the
+                whole row in row order. ``keys`` equals ``sequence`` without context parallelism.
             scores: Finite index scores of shape [batch, sequence, keys], indexed [batch, query, key].
             document_ids: Integer tensor of shape [batch, sequence]; negative ids are padding.
             value_up: Value up-projection of shape [heads, value_dim, latent].
@@ -803,13 +842,14 @@ class Ernie5_5DSASparseFP32Parameters(Ernie5_5DSAFP32Parameters):
         """Run ``cudnn_dsa_core`` with the parameters of this module.
 
         ``cudnn_dsa_core`` validates the inputs: it raises ``ValueError`` for shapes that disagree and
-        ``NotImplementedError`` for a row that holds several documents.
+        ``NotImplementedError`` for a row that holds several documents without ``metadata``.
 
         Args:
-            query: BF16 tensor of shape [tokens, heads, latent + rope].
-            latent_kv: BF16 tensor of shape [tokens, latent + rope] shared by all heads.
+            query: BF16 tensor of shape [tokens, heads, latent + rope], the queries of this rank.
+            latent_kv: BF16 tensor of shape [keys, latent + rope] shared by all heads: the keys of the whole
+                row in row order. ``keys`` equals ``tokens`` without context parallelism.
             index_q: BF16 indexer query of shape [tokens, index_heads, index_dim].
-            index_k: BF16 indexer key of shape [tokens, index_dim].
+            index_k: BF16 indexer key of shape [keys, index_dim], in the order of ``latent_kv``.
             index_weights: Indexer head weights of shape [tokens, index_heads].
             value_up: Value up-projection of shape [heads, value_dim, latent].
             gate_logits: Tensor of shape [tokens, heads * value_dim].

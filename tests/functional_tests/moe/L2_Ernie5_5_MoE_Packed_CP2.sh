@@ -18,8 +18,9 @@
 # The proxy of ernie5_5_proxy.yaml, with HCA heads of 512 channels (the width of the
 # sparse-attention kernels), trains on rows of 512 tokens that pack synthetic documents of
 # varying length. It runs twice with expert parallelism over both ranks: with cp_size 1,
-# one row per rank, and with cp_size 2, every row split over both ranks and two rows per
-# update. Both runs see the same rows in every update, and the log check compares them.
+# one row per rank, and with cp_size 2, every row split over both ranks, two rows per
+# update and activation checkpointing of the decoder layers, as in the packed recipes.
+# Both runs see the same rows in every update, and the log check compares them.
 #
 # ERNIE5_5_DSA_BACKEND selects the attention backend:
 #   eager (default)  PyTorch attention in the HCA and DSA layers; any CUDA GPU.
@@ -42,12 +43,14 @@ cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
 
 for CP_SIZE in 1 2; do
+    if [ "$CP_SIZE" = 2 ]; then CHECKPOINTING=true; else CHECKPOINTING=false; fi
     TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
         examples/llm_finetune/finetune.py \
         --config tests/functional_tests/moe/ernie5_5_proxy.yaml \
         --model.backend.attn "$ATTN_BACKEND" \
         --model.config.head_dim 512 \
         --distributed.cp_size "$CP_SIZE" \
+        --distributed.activation_checkpointing "$CHECKPOINTING" \
         --step_scheduler.max_steps "$MAX_STEPS" \
         --step_scheduler.num_epochs 1 \
         --dataset.num_sentences 64 \
