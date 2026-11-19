@@ -22,9 +22,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     get_rope_config,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -392,6 +391,8 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -410,9 +411,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Mistral4StateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -462,9 +461,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states)
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
@@ -539,6 +536,7 @@ if _HF_MISTRAL3_AVAILABLE:
             *,
             moe_config: MoEConfig | None = None,
             moe_overrides: dict | None = None,
+            logits_dtype: torch.dtype | None = None,
         ):
             super().__init__()
             if moe_config is not None and moe_overrides is not None:
@@ -552,12 +550,11 @@ if _HF_MISTRAL3_AVAILABLE:
             self.moe_config = self.model.moe_config
             # lm_head lives inside language_model (like KimiVLLanguageModelBackend)
             # so the parallelizer wraps it as part of _model, matching the Kimi pattern.
-            self.lm_head = initialize_linear_module(
-                backend.linear,
+            self.lm_head = LMHead(
                 config.hidden_size,
                 config.vocab_size,
-                bias=False,
                 dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+                logits_dtype=logits_dtype,
             )
 
         @property
@@ -773,6 +770,8 @@ if _HF_MISTRAL3_AVAILABLE:
             config,
             moe_config: MoEConfig | None = None,
             backend: BackendConfig | None = None,
+            *,
+            logits_dtype: torch.dtype | None = None,
             **kwargs,
         ):
             super().__init__()
@@ -810,6 +809,7 @@ if _HF_MISTRAL3_AVAILABLE:
                 backend=backend,
                 moe_config=moe_config,
                 moe_overrides=moe_overrides,
+                logits_dtype=logits_dtype,
             )
 
             self.model = Mistral3Model(

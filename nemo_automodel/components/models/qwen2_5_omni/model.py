@@ -44,7 +44,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration as HFQwen2_5OmniThinkerForConditionalGeneration,
 )
 
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -104,6 +104,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         self,
         config: Qwen2_5OmniConfig | Qwen2_5OmniThinkerConfig,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         # Check the controlling top-level flag on the original config before
@@ -111,6 +113,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         reject_unsupported_tie_word_embeddings(type(self), config)
         thinker_config = _resolve_thinker_config(config)
         super().__init__(thinker_config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
 
         # HF Qwen2.5-Omni declares ``audio_tower.audio_bos_eos_token`` as an
         # ``nn.Embedding(2, output_dim)`` (modeling_qwen2_5_omni.py:751) but it
@@ -269,7 +272,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         hidden_states = outputs[0]
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

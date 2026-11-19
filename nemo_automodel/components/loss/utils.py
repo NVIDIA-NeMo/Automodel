@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy, ShardedLMHeadWeight
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 _DATASET_IGNORE_INDEX = -100
 
@@ -180,7 +181,8 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             shape ``[batch, sequence, vocab]`` and labels.
         **kwargs: Loss inputs. Rank-local tensors keep their existing layout;
             ``grad_reduce_group`` describes the ranks contributing independent
-            linear-loss shards. The caller's mapping and tensors are not mutated.
+            linear-loss shards. Chunked CE projects like the model's head. The
+            caller's mapping and tensors are not mutated.
 
     Returns:
         Scalar loss tensor that does not alias an input.
@@ -204,6 +206,9 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             loss_fn_kwargs["logits_dtype"] = kwargs.pop(
                 "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
             )
+            unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+            head = _get_lm_head_module(unwrapped)
+            loss_fn_kwargs["lm_head"] = head if isinstance(head, LMHead) else None
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),

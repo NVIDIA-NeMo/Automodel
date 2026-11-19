@@ -41,7 +41,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -87,6 +87,9 @@ class Qwen3Attention(HFQwen3Attention):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run Qwen3 attention over padded BSHD or packed THD states.
 
+        Q/K enter attention and the KV cache in the value projection's compute
+        dtype, including when FP32 norm weights promote their outputs under AMP.
+
         Args:
             hidden_states: Hidden states ``[B, S, H]`` or packed local states
                 ``[T, H]``. ``B`` is batch, ``S`` is sequence, ``T`` is local
@@ -113,9 +116,11 @@ class Qwen3Attention(HFQwen3Attention):
             key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-            # Keep FP32 RoPE arithmetic while restoring Q/K dtypes before attention.
+            # Keep FP32 RoPE arithmetic, then restore the projection compute dtype.
             cos, sin = position_embeddings[:2]
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states = query_states.to(value_states.dtype)
+            key_states = key_states.to(value_states.dtype)
             if past_key_values is not None:
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -165,6 +170,9 @@ class Qwen3Attention(HFQwen3Attention):
                 position_embeddings[1],
             )
 
+        # FP32 Q/K norm weights can promote their outputs under autocast.
+        query_states = query_states.to(value_states.dtype)
+        key_states = key_states.to(value_states.dtype)
         window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
         query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
             query_states,
@@ -376,12 +384,14 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
         supports_pp: bool = True
         supports_ep: bool = False
 
-    def __init__(self, config: Qwen3Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self, config: Qwen3Config, backend: BackendConfig | None = None, *, logits_dtype: torch.dtype | None = None
+    ) -> None:
         super().__init__(config)
         self.backend = backend or BackendConfig()
         self.model = Qwen3Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         if config.dtype is not None:
             cast_model_to_dtype(self, config.dtype)
@@ -487,7 +497,7 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
             cache_position=cache_position,
             **kwargs,
         )
-        logits = compute_lm_head_logits(self.lm_head, outputs.last_hidden_state, logits_to_keep, is_thd=is_thd).logits
+        logits = LMHead.output(self.lm_head, outputs.last_hidden_state, logits_to_keep).logits
 
         loss = None
         if labels is not None:

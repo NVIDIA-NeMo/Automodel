@@ -30,7 +30,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
-    compute_lm_head_logits,
+    LMHead,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -281,7 +281,7 @@ class MistralLarge4PipelineMixin:
         if self.lm_head is not None:
             if self._pp_return_hidden_states:
                 return hidden
-            logits = compute_lm_head_logits(self.lm_head, hidden).logits
+            logits = LMHead.output(self.lm_head, hidden).logits
             cap = self.config.final_logit_softcapping
             return cap * torch.tanh(logits.float() / cap)
         boundary = self._pipeline_layer_ids()[-1] + 1
@@ -488,7 +488,13 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         supports_ep: bool = True
         supports_thd: bool = True
 
-    def __init__(self, config: MistralLarge4Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: MistralLarge4Config,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         config.validate_architecture()
         super().__init__(config)
@@ -527,7 +533,7 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         self.model = MistralLarge4Model(config, self.backend, dtype=dtype)
         self.moe_config = next((block.moe_config for block in self.model.layers if block.moe_config is not None), None)
         self.cp_mesh: DeviceMesh | None = None
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MistralLarge4StateDictAdapter(
                 dtype=dtype,
@@ -775,7 +781,7 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
             raise ValueError("logits_to_keep must be nonnegative")
         if labels is not None and (not isinstance(logits_to_keep, int) or logits_to_keep != 0):
             raise ValueError("Labels require logits for all positions")
-        output = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
+        output = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
         cap = self.config.final_logit_softcapping
         output.logits = cap * torch.tanh(output.logits.float() / cap)
         if labels is not None:

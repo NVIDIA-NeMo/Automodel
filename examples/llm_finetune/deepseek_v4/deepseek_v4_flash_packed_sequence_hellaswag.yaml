@@ -125,6 +125,10 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  perf_testing:
+    schedule: nightly
+    # Balanced routing keeps MoE throughput comparable between nightly runs.
+    fake_balanced_gate: true
   nemo_ci_schedule: release
   cluster_tag: h100
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).

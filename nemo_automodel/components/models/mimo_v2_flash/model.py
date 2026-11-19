@@ -34,6 +34,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -41,7 +42,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
-    compute_lm_head_logits,
 )
 from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config, MiMoV2FlashConfig
 from nemo_automodel.components.models.mimo_v2_flash.cp import (
@@ -1109,6 +1109,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         revision: str | None = None,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ) -> None:
         """Construct the model and bind checkpoint metadata reads to ``revision``."""
@@ -1123,12 +1124,11 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             config.hidden_size,
             config.vocab_size,
-            bias=False,
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            logits_dtype=logits_dtype,
         )
         self.visual = None
         if config.vision_config is not None:
@@ -1359,13 +1359,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        output = compute_lm_head_logits(
-            self.lm_head,
-            hidden,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
+        output = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
         if (
             is_thd
             and output.hidden_states is not None
@@ -1396,8 +1390,10 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         has_lm_head = self.lm_head is not None
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
-        output_width = vocab_size if has_lm_head and not emits_hidden_states else hidden_size
-        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=dtype),)
+        emits_logits = has_lm_head and not emits_hidden_states
+        output_width = vocab_size if emits_logits else hidden_size
+        output_dtype = (self.lm_head.logits_dtype or dtype) if emits_logits else dtype
+        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=output_dtype),)
         return inputs_meta, outputs_meta
 
     def customize_pipeline_stage_modules(

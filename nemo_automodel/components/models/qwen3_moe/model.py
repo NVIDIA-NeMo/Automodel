@@ -24,15 +24,15 @@ from nemo_automodel.components.distributed.activation_checkpointing import unwra
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
@@ -239,6 +239,7 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _uses_native_fa4: bool = True
     # Skip patch_hf_model_for_pp: this model's own forward already handles
     # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
     # owning stage; hidden states arrive in the input_ids slot) AND context
@@ -284,6 +285,8 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: Qwen3MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -293,9 +296,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3MoeStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -324,6 +325,42 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Compute logits while preserving packed document and padding metadata.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or [1, tokens] for
+                pre-packed THD input. Pipeline stages after the first receive
+                hidden states of shape [batch, sequence, hidden] in this slot.
+            position_ids: Optional document-local positions of shape
+                [batch, sequence], or [1, tokens] for THD input.
+            attention_mask: Optional tensor of shape [batch, sequence] holding
+                either a padding mask (nonzero at valid tokens) or packed
+                1-based document IDs with zero at padding, or a dense mask of
+                shape [batch, 1, sequence, sequence] for backends that accept one.
+            padding_mask: Optional boolean tensor of shape [batch, sequence],
+                true at padding. Native FA4 derives its valid-token mask from it
+                when attention_mask is None.
+            logits_to_keep: Number of trailing positions to project, or position
+                indices of shape [selected_tokens].
+            output_hidden_states: Whether to include final hidden states.
+            **attn_kwargs: Backend metadata. Native FA4 packing passes int64
+                packed_token_indices of shape [batch, sequence] (row-local token
+                indices, -1 at padding), int32 cu_seqlens of shape
+                [batch, max_documents + 1] (row-local offsets, -1 at unused
+                entries) and an integer max_seqlen. The model-entry hook flattens
+                them to indices of shape [tokens] into the flattened
+                [batch * sequence] axis and offsets of shape [documents + 1];
+                already flattened metadata passes through unchanged.
+
+        Returns:
+            CausalLMOutputWithPast whose logits have shape [batch, sequence,
+            vocab], or [1, tokens, vocab] for THD input, along the positions
+            selected by logits_to_keep. Pipeline stages without the LM head
+            return their hidden states of shape [batch, sequence, hidden] as
+            logits. When output_hidden_states is true, hidden_states holds the
+            final hidden states with the same leading axes and a trailing
+            hidden axis; otherwise it is None.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -331,6 +368,8 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if self.backend.attn == "fa4" and attention_mask is None and padding_mask is not None:
+            attention_mask = padding_mask.logical_not()
         if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
@@ -345,9 +384,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     @torch.no_grad()
     def initialize_weights(

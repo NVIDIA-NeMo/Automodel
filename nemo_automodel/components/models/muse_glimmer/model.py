@@ -47,7 +47,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -702,14 +702,20 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         del kwargs
         return cls(config, backend=backend)
 
-    def __init__(self, config: MuseGlimmerConfig, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: MuseGlimmerConfig,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()
         self.model = MuseGlimmerModel(config, self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MuseGlimmerStateDictAdapter(config)
@@ -896,12 +902,7 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        projected = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-        )
+        projected = LMHead.output(self.lm_head, hidden_states, logits_to_keep)
         logits = projected.logits
         output_multiplier = float(self.config.output_multiplier)
         soft_cap = self.config.output_soft_cap_temp

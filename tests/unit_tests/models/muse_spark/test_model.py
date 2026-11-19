@@ -407,8 +407,12 @@ def test_pipeline_residual_preserves_fp32_values_and_gradients(qkv_format, compu
 @pytest.mark.parametrize("fp32_output", [False, True])
 def test_pipeline_final_stage_receives_fp32_residual_with_separate_output_dtype(fused_head, fp32_output) -> None:
     """The final stage receives the residual dtype even when its head uses BF16."""
-    model = tiny_muse_spark_model()
-    model.config.use_fp32_for_output = fp32_output
+    from nemo_automodel.components.models.muse_spark.model import MuseSpark1xOmniForCausalLM
+    from tests.unit_tests.models.muse_spark.conftest import tiny_backend, tiny_muse_spark_config
+
+    config = tiny_muse_spark_config()
+    config.use_fp32_for_output = fp32_output
+    model = MuseSpark1xOmniForCausalLM(config, backend=tiny_backend())
     model._pp_return_hidden_states = fused_head
     inputs, outputs = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=4, dtype=torch.bfloat16)
     assert inputs[0].dtype == torch.float32

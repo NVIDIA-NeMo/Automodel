@@ -43,11 +43,11 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
@@ -142,7 +142,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, *, logits_dtype: torch.dtype | None = None):
         reject_unsupported_tie_word_embeddings(type(self), config)
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
@@ -165,6 +165,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         apply_pixtral_forward_backport(self.model.vision_tower)
         self.tie_weights()
         self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
@@ -266,7 +267,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # Final hidden states fed to lm_head (single [B, S, H] tensor).
         hidden_states = outputs[0]
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

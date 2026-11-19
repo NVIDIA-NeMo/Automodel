@@ -24,15 +24,16 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.packing import prepare_packed_metadata
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention, _has_thd_metadata
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
@@ -169,6 +170,24 @@ class GptOssModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run decoder layers, preparing private FA4 metadata once per model call.
+
+        Args:
+            input_ids: Token IDs [batch, sequence] or physical THD IDs [tokens].
+            position_ids: Optional positions with the same token layout.
+            attention_mask: Optional BSHD padding mask [batch, sequence].
+            padding_mask: Optional bool [tokens] mask, True at physical THD padding.
+            **attn_kwargs: Original THD offsets [documents + 1], maxima and layout;
+                private FA4 offsets index compact valid tokens. Inputs are not mutated.
+
+        Returns:
+            Hidden states [batch, sequence, hidden] or [physical_tokens, hidden].
+        """
+        if self.backend.attn == "fa4" and attn_kwargs.get("qkv_format") == "thd":
+            prepared = prepare_packed_metadata(self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask})
+            if prepared is not None:
+                _, attn_kwargs = prepared
+                attn_kwargs.pop("padding_mask")
         if position_ids is None:
             if input_ids.ndim == 1:
                 position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
@@ -220,6 +239,7 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _packed_cp_attn_backends = ("te",)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -229,6 +249,21 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = False
         supports_pp: bool = False
         supports_ep: bool = True
+        supports_thd: bool = True
+
+    @property
+    def _owns_packed_attention(self) -> bool:
+        """Declare only this model's bounded FA4 THD input path."""
+        return self.backend.attn == "fa4"
+
+    @property
+    def requires_thd_batch_preparation(self) -> bool:
+        """Request framework-owned raw token/label flattening for the FA4 path.
+
+        This requests CP1 batch conversion only, not context or pipeline
+        parallelism. TE retains its existing backend-owned preparation.
+        """
+        return self.backend.attn == "fa4"
 
     @classmethod
     def from_config(
@@ -255,6 +290,8 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: GptOssConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -264,9 +301,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GPTOSSStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -346,9 +381,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     @torch.no_grad()
     def initialize_weights(

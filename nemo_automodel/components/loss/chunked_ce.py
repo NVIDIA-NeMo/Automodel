@@ -14,6 +14,8 @@
 
 import dataclasses
 from collections.abc import Callable
+from functools import partial
+from inspect import signature
 from typing import Any
 
 import torch
@@ -27,8 +29,10 @@ from nemo_automodel.components.loss.linear_ce_base import (
     LinearCrossEntropy,
     ShardedLMHeadWeight,
     TorchVocabChunkKernel,
+    _chunk_logits,
     sharded_linear_cross_entropy,
 )
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 
 def _validate_chunk_len(chunk_len: int) -> int:
@@ -65,6 +69,7 @@ def _linear_cross_entropy(
     labels: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype | None,
+    lm_head: LMHead | None = None,
 ) -> torch.Tensor:
     """Project one token chunk and compute CE.
 
@@ -74,18 +79,12 @@ def _linear_cross_entropy(
         labels: Target indices shaped [chunk_tokens].
         ignore_index: Ignored target value.
         logits_dtype: Optional model-owned output dtype after projection.
+        lm_head: The model's ``LMHead``, whose forward accepts the materialized weight; None for a plain head.
 
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    logits = F.linear(hidden.to(weight.dtype), weight)
-    if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:
-        logits = logits.to(logits_dtype)
-        # Materialize the model-owned rounding boundary: Inductor otherwise
-        # elides the lowp -> FP32 round-trip into CE, changing loss and grads.
-        torch._dynamo.graph_break()
-    elif logits_dtype is not None:
-        logits = logits.to(logits_dtype)
+    logits = _chunk_logits(hidden, weight, None, logits_dtype, lm_head)
     return compute_cross_entropy(logits, labels, ignore_index, "none")
 
 
@@ -214,6 +213,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         A linear module alone does not rule out post-projection transformations.
         Read the text configuration through the HF config contract, including
         multimodal models whose output settings live in a nested text config.
+        Each chunk calls an ``LMHead``'s forward, so only a softcap outside the head is rejected.
 
         Args:
             lm_head: Output head with weight of global shape [vocab, hidden].
@@ -223,16 +223,20 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             The validated linear head, unchanged.
         """
         if model_config is not None:
-            text_config = model_config.get_text_config()
-            if getattr(text_config, "final_logit_softcapping", None) is not None:
+            softcap = getattr(model_config.get_text_config(), "final_logit_softcapping", None)
+            head_softcap = lm_head.logit_softcapping if isinstance(lm_head, LMHead) else None
+            if softcap is not None and softcap != head_softcap:
                 raise ValueError(
-                    "ChunkedCrossEntropy does not support final_logit_softcapping; "
+                    "ChunkedCrossEntropy does not support final_logit_softcapping applied outside the LM head; "
                     "use MaskedCrossEntropy to preserve the model's post-projection transformation"
                 )
         # FSDP dynamically subclasses Linear but retains its forward method.
         if (
             not isinstance(lm_head, nn.Linear)
-            or type(lm_head).forward is not nn.Linear.forward
+            or (
+                type(lm_head).forward not in (nn.Linear.forward, LMHead.forward)
+                and (not isinstance(lm_head, LMHead) or "weight" not in signature(lm_head.forward).parameters)
+            )
             or lm_head.bias is not None
         ):
             raise ValueError(
@@ -282,6 +286,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         *,
         mask: torch.Tensor | None = None,
         logits_dtype: torch.dtype | None = None,
+        lm_head: LMHead | None = None,
     ) -> torch.Tensor:
         """Compute CE directly from hidden states, with no full-logit allocation.
 
@@ -302,6 +307,8 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             logits_dtype: Optional output cast after projection, matching the
                 owning model. Projection uses lm_weight.dtype; mixed-dtype
                 hidden states are converted per chunk, never the full weight.
+            lm_head: The model's ``LMHead``, whose forward each chunk calls with the
+                materialized weight; None projects like a plain bias-free linear head.
 
         Returns:
             FP32 scalar, or losses shaped [...] for reduction="none". Inputs
@@ -324,12 +331,19 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             raise ValueError("loss_weights.shape must match labels.shape")
         weight = self.resolve_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
         if isinstance(weight, ShardedLMHeadWeight):
+            # Trim the global vocabulary before gathering. Chunk-local row numbers cannot identify padded tokens.
+            if lm_head is not None and lm_head.unpadded_vocab_size is not None:
+                weight = dataclasses.replace(weight, vocab_size=min(weight.shape[0], lm_head.unpadded_vocab_size))
             losses = sharded_linear_cross_entropy(
                 hidden_states.reshape(-1, hidden_states.shape[-1]),
                 labels.reshape(-1),
                 weight,
                 kernel=TorchVocabChunkKernel(
-                    token_block=self.chunk_len, softcap=None, logits_dtype=logits_dtype, compile=self.compile
+                    token_block=self.chunk_len,
+                    softcap=None,
+                    logits_dtype=logits_dtype,
+                    compile=self.compile,
+                    lm_head=lm_head,
                 ),
                 ignore_index=self.ignore_index,
             ).reshape(labels.shape)
@@ -341,7 +355,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
                 self.chunk_len,
                 self.ignore_index,
                 logits_dtype,
-                self._compute_loss,
+                partial(self._compute_loss, lm_head=lm_head),
             ).reshape(labels.shape)
         if loss_weights is not None:
             losses = losses * loss_weights.to(device=losses.device, dtype=torch.float32)

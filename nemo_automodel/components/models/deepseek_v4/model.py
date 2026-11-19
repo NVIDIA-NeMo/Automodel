@@ -55,10 +55,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -66,7 +66,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
-    compute_lm_head_logits,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
@@ -897,45 +896,61 @@ class DeepseekV4Model(nn.Module):
         if on_first_stage:
             if input_ids is None and inputs_embeds is None:
                 raise ValueError("First PP stage requires input_ids or inputs_embeds")
-            if vision_token_types is None and input_ids is not None:
-                vision_token_types = torch.where(
-                    input_ids >= int(self.config.vocab_size),
-                    input_ids - int(self.config.vocab_size),
-                    torch.full_like(input_ids, -1),
+            capturing_text = (
+                not self.vision_enabled
+                and input_ids is not None
+                and input_ids.is_cuda
+                and torch.cuda.is_current_stream_capturing()
+            )
+            if capturing_text:
+                if vision_token_types is not None or pixel_values is not None or image_grid_hws is not None:
+                    raise ValueError("Text-only CUDA graphs require no visual inputs or pseudo-token metadata")
+                torch._assert_async(
+                    ((input_ids >= 0) & (input_ids < int(self.config.vocab_size))).all(),
+                    "Text-only DeepSeek-V4 CUDA graph input_ids must be within the text vocabulary",
                 )
-            if vision_token_types is not None and vision_token_types.dim() == 1:
-                vision_token_types = vision_token_types.unsqueeze(0)
-            has_visual_tokens = vision_token_types is not None and bool((vision_token_types >= 0).any().item())
-            if not has_visual_tokens:
-                vision_token_types = None
-            if inputs_embeds is None:
-                if (input_ids < 0).any():
-                    raise ValueError("DeepSeek-V4 input_ids cannot be negative")
-                safe_input_ids = torch.where(
-                    input_ids < int(self.config.vocab_size), input_ids, torch.zeros_like(input_ids)
-                )
-                inputs_embeds = self.embed_tokens(safe_input_ids)
-            if has_visual_tokens:
-                if not self.vision_enabled:
-                    raise ValueError("Visual pseudo tokens require a DeepSeek-V4 vision checkpoint")
-                if pixel_values is None or image_grid_hws is None:
-                    raise ValueError("Visual pseudo tokens require pixel_values and image_grid_hws")
-                if inputs_embeds.dim() != 3:
-                    raise ValueError("DeepSeek-V4 visual inputs do not support packed THD embeddings")
-                inputs_embeds = self.merge_image_embeddings(
-                    inputs_embeds,
-                    pixel_values=pixel_values,
-                    image_grid_hws=image_grid_hws,
-                    vision_token_types=vision_token_types,
-                    n_images_per_sample=n_images_per_sample,
-                )
-            elif pixel_values is not None or image_grid_hws is not None:
-                raise ValueError("Image tensors were provided without visual pseudo tokens")
+                if inputs_embeds is None:
+                    inputs_embeds = self.embed_tokens(input_ids)
+            else:
+                if vision_token_types is None and input_ids is not None:
+                    vision_token_types = torch.where(
+                        input_ids >= int(self.config.vocab_size),
+                        input_ids - int(self.config.vocab_size),
+                        torch.full_like(input_ids, -1),
+                    )
+                if vision_token_types is not None and vision_token_types.dim() == 1:
+                    vision_token_types = vision_token_types.unsqueeze(0)
+                has_visual_tokens = vision_token_types is not None and bool((vision_token_types >= 0).any().item())
+                if not has_visual_tokens:
+                    vision_token_types = None
+                if inputs_embeds is None:
+                    if (input_ids < 0).any():
+                        raise ValueError("DeepSeek-V4 input_ids cannot be negative")
+                    safe_input_ids = torch.where(
+                        input_ids < int(self.config.vocab_size), input_ids, torch.zeros_like(input_ids)
+                    )
+                    inputs_embeds = self.embed_tokens(safe_input_ids)
+                if has_visual_tokens:
+                    if not self.vision_enabled:
+                        raise ValueError("Visual pseudo tokens require a DeepSeek-V4 vision checkpoint")
+                    if pixel_values is None or image_grid_hws is None:
+                        raise ValueError("Visual pseudo tokens require pixel_values and image_grid_hws")
+                    if inputs_embeds.dim() != 3:
+                        raise ValueError("DeepSeek-V4 visual inputs do not support packed THD embeddings")
+                    inputs_embeds = self.merge_image_embeddings(
+                        inputs_embeds,
+                        pixel_values=pixel_values,
+                        image_grid_hws=image_grid_hws,
+                        vision_token_types=vision_token_types,
+                        n_images_per_sample=n_images_per_sample,
+                    )
+                elif pixel_values is not None or image_grid_hws is not None:
+                    raise ValueError("Image tensors were provided without visual pseudo tokens")
             # Packed-sequence (THD) inputs arrive with the batch axis collapsed
             # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
             # Restore the leading batch dim so the hc_mult expand below sees the
             # expected ``[B, S, dim]`` rank, mirroring the output-side THD
-            # ``unsqueeze(0)`` in ``compute_lm_head_logits(is_thd=True)``.
+            # ``unsqueeze(0)`` in ``LMHead.output``.
             if inputs_embeds.dim() == 2:
                 inputs_embeds = inputs_embeds.unsqueeze(0)
             # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
@@ -1231,6 +1246,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: DeepseekV4Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = torch.float32,
         **kwargs,
     ):
         super().__init__()
@@ -1261,13 +1278,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=torch.float32,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,
@@ -1367,7 +1378,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
+            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size)).to(
+                self.lm_head.logits_dtype or dtype
+            )
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)
         else:
@@ -1535,17 +1548,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # path can recompute logits over every position.
         final_hidden_states = hidden_states
 
-        # deepseek runs the lm_head in fp32: project in fp32 and cast the logits
-        # back to the hidden dtype via the shared helper.
         # Linear CE owns the final projection in PP, avoiding a full logits
         # allocation for every in-flight microbatch. MTP still carries its
         # per-depth hidden states through the existing tuple contract.
         if self._pp_return_hidden_states:
             logits = hidden_states
         else:
-            logits = compute_lm_head_logits(
-                self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True
-            ).logits
+            logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

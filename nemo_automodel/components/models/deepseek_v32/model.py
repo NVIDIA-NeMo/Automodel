@@ -28,7 +28,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     get_rope_config,
     initialize_rms_norm_module,
 )
@@ -211,12 +211,12 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         config: DeepseekV32Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         # Call grandparent __init__ to skip DeepseekV3ForCausalLM's __init__
         nn.Module.__init__(self)
-
-        from nemo_automodel.components.models.common import initialize_linear_module
 
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -239,9 +239,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             # Use V3.2 adapter instead of V3 adapter
             self.state_dict_adapter = DeepSeekV32StateDictAdapter(
@@ -316,9 +314,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states)
 
 
 ModelClass = DeepseekV32ForCausalLM

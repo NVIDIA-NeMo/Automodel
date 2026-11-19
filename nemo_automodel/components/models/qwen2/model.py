@@ -50,7 +50,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -537,6 +537,8 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         self,
         config: Qwen2Config,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ):
         reject_unsupported_tie_word_embeddings(type(self), config)
         warn_deprecated_model_class("Qwen2ForCausalLM")
@@ -544,7 +546,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         self.backend = backend or BackendConfig()
         self.model = Qwen2Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -670,7 +672,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd).logits
+        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

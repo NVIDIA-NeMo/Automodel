@@ -381,8 +381,11 @@ def _precompute_stage_shapes(
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         emits_hidden_states = getattr(stage.submod, "_pp_return_hidden_states", False) is True
         if has_lm_head and not emits_hidden_states:
-            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype)
+            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size], in the head's logits_dtype
+            # when it sets one (an LMHead); any other head returns the model dtype.
+            head_dtype = getattr(stage.submod.lm_head, "logits_dtype", None)
+            logits_dtype = head_dtype if isinstance(head_dtype, torch.dtype) else model_dtype
+            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=logits_dtype)
         else:
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)
@@ -577,7 +580,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
 
     Custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` models now return a
     ``CausalLMOutputWithPast`` from ``forward`` (fused-linear cross-entropy
-    support, ``compute_lm_head_logits``). ``torch.distributed.pipelining``
+    support, ``LMHead.output``). ``torch.distributed.pipelining``
     requires every stage to emit a tensor (or tuple/list of tensors):
     ``PipelineStage._validate_fwd_outputs`` and the inter-stage P2P send/recv
     treat the output as tensor leaves and read ``.shape`` on each, which raises
@@ -588,7 +591,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
     ``patch_causal_lm_model=False`` so only the inner model is patched. In both
     cases the kept outer ``forward`` returns a ``ModelOutput``. This wraps it so
     the return is unwrapped to its ``.logits`` tensor:
-    ``compute_lm_head_logits`` puts the projected logits there on the final stage
+    ``LMHead.output`` puts the projected logits there on the final stage
     and the pass-through ``hidden_states`` on non-final stages (``lm_head is
     None``) -- exactly the tensor each stage must forward, and the logits the
     last-stage loss (``PipelineCausalLMLoss`` / ``MaskedCrossEntropy``) consumes.
@@ -860,7 +863,8 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages.
+        A schedule whose ``step()`` and ``eval()`` discard outputs by default.
+        Pass ``return_outputs=True`` to return merged outputs; read losses from ``losses``.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 
@@ -911,6 +915,7 @@ def build_pipeline_schedule(
         )
         schedule._load_csv(pp_schedule_csv)
 
+    schedule.step = functools.partial(schedule.step, return_outputs=False)
     return schedule
 
 

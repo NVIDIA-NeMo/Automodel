@@ -1276,7 +1276,7 @@ class TestConditionalGenerationStateDictAdapterWiring:
             patch.object(qwen3_5_moe_model.HFQwen3_5MoeForConditionalGeneration, "__init__", fake_hf_init),
             patch.object(qwen3_5_moe_model, "Qwen3_5MoeModel", DummyParentModel),
             patch.object(qwen3_5_moe_model, "Qwen3_5MoeTextModelBackend", DummyTextBackend),
-            patch.object(qwen3_5_moe_model, "initialize_linear_module", Mock(return_value=Mock())),
+            patch.object(qwen3_5_moe_model, "LMHead", Mock(return_value=Mock())),
             patch.object(qwen3_5_moe_model, "build_mtp_config_from_hf", Mock(return_value=DummyMTPConfig())),
             patch.object(qwen3_5_moe_model, "Qwen3_5MoeStateDictAdapter", DummyAdapter),
             patch.object(

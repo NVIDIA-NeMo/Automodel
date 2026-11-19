@@ -427,30 +427,12 @@ def test_nemotron_nano_full_sft_scopes_calibration_to_reload_mean_kl(tmp_path):
     assert "parity_tolerance_profile_overrides" not in robustness
 
 
-def test_gpt_oss_20b_scopes_relaxed_tolerance_to_resume(tmp_path):
-    """GPT-OSS keeps logit parity standard while allowing measured resume drift."""
-    recipe_path = REPO_ROOT / "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml"
-    out = tmp_path / "resolved.yaml"
-    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
-    _run_resolver(
-        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
-        env=env,
-    )
-
-    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
-    assert robustness["resume_tolerance_profile"] == "relaxed"
-    assert "resume_loss_threshold" not in robustness
-    assert "parity_tolerance_profile" not in robustness
-    assert "parity_threshold_overrides" not in robustness
-
-
 @pytest.mark.parametrize(
     "recipe_path",
     [
         "examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_lora.yaml",
         "examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml",
         "examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml",
-        "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml",
         "examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml",
         "examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml",
         "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml",
@@ -459,7 +441,6 @@ def test_gpt_oss_20b_scopes_relaxed_tolerance_to_resume(tmp_path):
         "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
         "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml",
         "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
-        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
         "examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml",
         "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
         "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",

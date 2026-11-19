@@ -29,6 +29,7 @@ import socket
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -52,6 +53,7 @@ _SCENARIOS = (
     "mtp_depths_share_one_resolution",
     "autocast_recompute",
     "padded_vocab_adapter",
+    "inkling_chunked_head",
     "negative_infinity_chunk",
     "target_validation",
 )
@@ -247,7 +249,6 @@ def _run_scenarios(rank: int) -> dict[str, str]:
             chunked(hidden[rank], labels[rank], resolved, grad_reduce_group=world)
 
     def mtp_depths_share_one_resolution() -> None:
-        import nemo_automodel.components.loss.utils as loss_utils
         from nemo_automodel.components.loss.mtp import calculate_mtp_loss
         from nemo_automodel.components.loss.utils import calculate_loss, prepare_lm_weight
 
@@ -312,21 +313,11 @@ def _run_scenarios(rank: int) -> dict[str, str]:
 
         sharded = head(distribute_tensor(weight, flat, [Shard(0)]))
         local_states = [states[rank].clone().requires_grad_() for states in depth_hidden]
-        lookups = []
-        real_lookup = loss_utils._get_lm_head_module
-
-        def counting_lookup(model: torch.nn.Module) -> torch.nn.Module | None:
-            lookups.append(model)
-            return real_lookup(model)
-
-        loss_utils._get_lm_head_module = counting_lookup
-        try:
+        with patch.object(chunked, "prepare_lm_weight", wraps=chunked.prepare_lm_weight) as prepare:
             loss = _forbid_gather_and_full_saves(37, lambda: main_plus_mtp(sharded, local_states, labels[rank], world))
-        finally:
-            loss_utils._get_lm_head_module = real_lookup
         (loss * _WORLD_SIZE).backward()
-        # The recipe prepares the head once for the main loss and calculate_mtp_loss once for all depths.
-        assert len(lookups) == 2, len(lookups)
+        # One weight preparation for the main loss and one shared across both MTP depths.
+        assert prepare.call_count == 2
         total = loss.detach().clone()
         dist.all_reduce(total)
         torch.testing.assert_close(total, reference.detach(), rtol=1e-5, atol=1e-6)
@@ -417,6 +408,38 @@ def _run_scenarios(rank: int) -> dict[str, str]:
                     model.lm_head.weight.full_tensor(), weight - 0.1 * dense_weight.grad, rtol=2e-2, atol=1e-3
                 )
 
+    def inkling_chunked_head() -> None:
+        """Compare streamed BF16 head gradients against dense softcapped FP32 logits with padding."""
+        from nemo_automodel.components.models.inkling2.layers import Inkling2LMHead
+        from tests.unit_tests.models.inkling2.test_reference import tiny_config
+
+        weight, hidden, labels = _data(43)
+        config = tiny_config(dtype="bfloat16")
+        config.hidden_size, config.vocab_size, config.unpadded_vocab_size = _HIDDEN, 43, 37
+        head = Inkling2LMHead(config, torch.bfloat16, torch.float32)
+        head.weight = torch.nn.Parameter(weight.bfloat16())
+        labels = torch.where(labels == -100, labels, labels % config.unpadded_vocab_size)
+        dense_hidden = hidden.bfloat16().requires_grad_()
+        normalizer = int((labels != -100).sum())
+        reference = F.cross_entropy(head(dense_hidden).flatten(0, 2), labels.flatten(), reduction="sum") / normalizer
+        reference.backward()
+        expected_grad = head.weight.grad
+        head.weight = torch.nn.Parameter(distribute_tensor(head.weight.detach(), flat, [Shard(0)]))
+        local_hidden = dense_hidden[rank].detach().requires_grad_()
+
+        def train() -> torch.Tensor:
+            loss = chunked(local_hidden, labels[rank], head.weight, normalizer, world, lm_head=head)
+            (loss * _WORLD_SIZE).backward()
+            return loss.detach()
+
+        loss = _forbid_gather_and_full_saves(43, train)
+        dist.all_reduce(loss)
+        torch.testing.assert_close(loss, reference, rtol=1e-5, atol=1e-6)
+        grad = head.weight.grad.full_tensor()
+        torch.testing.assert_close(grad, expected_grad, rtol=2e-2, atol=1e-3)
+        assert grad[config.unpadded_vocab_size :].count_nonzero() == 0
+        torch.testing.assert_close(local_hidden.grad / _WORLD_SIZE, dense_hidden.grad[rank], rtol=2e-2, atol=1e-3)
+
     def negative_infinity_chunk() -> None:
         """A chunk with only -inf logits has finite dense-equivalent gradients."""
         old_budget = linear_ce_base._STREAM_CHUNK_BYTES
@@ -492,6 +515,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "mtp_depths_share_one_resolution": mtp_depths_share_one_resolution,
         "autocast_recompute": autocast_recompute,
         "padded_vocab_adapter": padded_vocab_adapter,
+        "inkling_chunked_head": inkling_chunked_head,
         "negative_infinity_chunk": negative_infinity_chunk,
         "target_validation": target_validation,
     }

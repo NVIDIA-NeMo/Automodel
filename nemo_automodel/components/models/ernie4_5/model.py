@@ -31,7 +31,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -453,6 +453,8 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self,
         config: Ernie4_5Config,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -461,12 +463,8 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.backend = backend or BackendConfig()
         self.model = Ernie4_5Model(config, self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=_config_dtype(config),
+        self.lm_head = LMHead(
+            config.hidden_size, config.vocab_size, dtype=_config_dtype(config), logits_dtype=logits_dtype
         )
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -521,9 +519,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
 
 class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -583,6 +579,8 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         config: Ernie4_5_MoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -597,12 +595,12 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             moe_overrides=moe_overrides,
         )
         self.vocab_size = config.vocab_size
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             config.hidden_size,
             config.vocab_size,
             bias=config.use_bias,
             dtype=_config_dtype(config),
+            logits_dtype=logits_dtype,
         )
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -663,9 +661,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
 
 ModelClass = Ernie4_5_MoeForCausalLM

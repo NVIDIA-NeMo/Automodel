@@ -219,46 +219,11 @@ class TestHyMT2ForCausalLM:
         assert hasattr(model, "model")
         assert hasattr(model, "lm_head")
         assert model.config is config
-        assert model._enable_lm_head_fp32 is True
-
-    def test_enable_lm_head_fp32_default_false_without_config_flag(self, backend_config):
-        # When the config does not declare the flag, default to False.
-        class _Cfg:
-            vocab_size = 32
-            hidden_size = HIDDEN
-            intermediate_size = INTER
-            moe_intermediate_size = MOE_INTER
-            num_hidden_layers = 1
-            num_attention_heads = N_HEADS
-            num_key_value_heads = N_KV
-            head_dim = HEAD_DIM
-            num_experts = N_EXPERTS
-            num_experts_per_tok = 2
-            num_shared_experts = 1
-            first_k_dense_replace = 1
-            max_position_embeddings = 128
-            rope_theta = 10000.0
-            # PretrainedConfig populates ``rope_parameters`` from ``rope_theta``
-            # in its ``__init__``; this bare mock skips that, so declare it
-            # explicitly to match what ``get_rope_config`` reads.
-            rope_parameters = {"rope_theta": 10000.0, "rope_type": "default"}
-            rms_norm_eps = 1e-5
-            torch_dtype = "bfloat16"
-            attention_bias = False
-            qk_norm = True
-            route_norm = False
-            router_scaling_factor = 1.0
-            moe_router_enable_expert_bias = False
-            moe_router_use_sigmoid = True
-
-        model = HyMT2ForCausalLM(_Cfg(), backend=backend_config)
-        assert model._enable_lm_head_fp32 is False
 
     def test_lm_head_fp32_upcast_when_weight_promoted(self, config, backend_config, device):
         """When the parallelizer has promoted lm_head.weight to fp32 (the
-        ``distributed.moe.lm_head_precision: float32`` path), the in-model
-        fallback feeds the bf16 hidden state up to fp32, runs lm_head, and
-        casts logits back to bf16."""
+        ``distributed.moe.lm_head_precision: float32`` path), the bf16 hidden
+        state is projected in fp32 and the head's fp32 logits are returned."""
         model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
         # Simulate the parallelizer's promotion of lm_head.weight to fp32.
         model.lm_head = model.lm_head.to(torch.float32)
@@ -266,8 +231,8 @@ class TestHyMT2ForCausalLM:
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
             logits = model(input_ids).logits
-        # Output dtype must be the input dtype (bf16), not fp32.
-        assert logits.dtype == torch.bfloat16
+        assert logits.dtype == torch.float32
+        torch.testing.assert_close(logits, bf16_hidden.float() @ model.lm_head.weight.t())
 
     def test_lm_head_no_upcast_when_weight_is_bf16(self, config, backend_config, device):
         """If the parallelizer did NOT promote lm_head.weight, the model must
@@ -275,10 +240,9 @@ class TestHyMT2ForCausalLM:
         to avoid the dtype mismatch (fp32 input vs bf16 weight) and the
         ``F.linear`` DTensor mixing crash that the prior implementation hit."""
         model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
-        # lm_head.weight is bf16 (no promotion). Even though enable_lm_head_fp32
-        # is True on the config, the in-model path must NOT activate.
+        # enable_lm_head_fp32 is not wired: FP32 logits come from ``logits_dtype``.
         assert model.lm_head.weight.dtype == torch.bfloat16
-        assert model._enable_lm_head_fp32 is True
+        assert config.enable_lm_head_fp32 is True
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)

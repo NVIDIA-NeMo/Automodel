@@ -24,6 +24,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
@@ -148,21 +149,21 @@ class Inkling2MoE(MoE):
             cast(GroupedExperts, self.experts).expert_activation_grouped = activation
 
 
-class Inkling2LMHead(nn.Linear):
-    """Bias-free output projection with FP32 arithmetic and ordinary FSDP hooks."""
+class Inkling2LMHead(LMHead):
+    """Bias-free FP32 output projection that owns the logit softcap and padded-vocabulary mask."""
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Project through the module boundary so FSDP gathers its weight.
+    def __init__(self, config: Inkling2TextConfig, dtype: torch.dtype, logits_dtype: torch.dtype | None) -> None:
+        """Create the [vocab, hidden] head with ``config``'s softcap and usable vocabulary."""
+        super().__init__(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
+        self.logit_softcapping, self.unpadded_vocab_size = config.final_logit_softcapping, config.unpadded_vocab_size
 
-        Args:
-            input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
-
-        Returns:
-            FP32 tensor of shape [..., vocab]. Weight storage may be FP32 or BF16.
-            The caller applies softcapping and unused-vocabulary masking.
-        """
-        with torch.autocast(device_type=input.device.type, enabled=False):
-            return F.linear(input.float(), self.weight.float(), self.bias.float() if self.bias is not None else None)
+    def forward(self, input: torch.Tensor, *, weight: torch.Tensor | None = None) -> torch.Tensor:
+        """Project FP32 copies of input [..., hidden] and weight [vocab, hidden] to softcapped logits
+        [..., vocab]; the padded vocabulary rows from ``unpadded_vocab_size`` on are negative infinity."""
+        weight = self.weight if weight is None else weight
+        logits = super().forward(input.float(), weight=weight.float())
+        padded = torch.arange(logits.shape[-1], device=logits.device) >= self.unpadded_vocab_size
+        return logits.masked_fill(padded, float("-inf"))
 
 
 class ShortConvolution(nn.Module):

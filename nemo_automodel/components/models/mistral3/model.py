@@ -38,11 +38,11 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 
 logger = logging.get_logger(__name__)
@@ -527,7 +527,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         supports_pp: bool = True
         supports_ep: bool = False
 
-    def __init__(self, config: Ministral3Config):
+    def __init__(self, config: Ministral3Config, *, logits_dtype: torch.dtype | None = None):
         quantization_config = getattr(config, "quantization_config", None)
         quant_method = (
             quantization_config.get("quant_method")
@@ -549,7 +549,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         super().__init__(config)
         self.model = Ministral3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         if quant_method == "fp8":
             self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_causal_lm(config)
@@ -599,7 +599,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         )
 
         hidden_states = outputs.last_hidden_state
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

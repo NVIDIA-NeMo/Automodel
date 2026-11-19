@@ -137,3 +137,5 @@ ci:
     step_scheduler.local_batch_size: 1
     tokenizer_name: Qwen/Qwen3.8-27B
     hf_device_map_auto: true
+  perf_testing:
+    schedule: nightly

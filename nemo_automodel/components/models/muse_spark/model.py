@@ -22,8 +22,9 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -317,6 +318,8 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         config: MuseSpark1xOmniConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -342,9 +345,8 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             if config.use_audio_perception
             else None
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype
-        )
+        logits_dtype = logits_dtype or (torch.float32 if config.use_fp32_for_output else None)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
             adapter_cls = (
@@ -451,9 +453,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             already-local activations. No per-batch mode is needed to size them.
         """
         residual_dtype = _residual_dtype(self.config)
-        output_dtype = (
-            residual_dtype if self.lm_head is None else (torch.float32 if self.config.use_fp32_for_output else dtype)
-        )
+        output_dtype = residual_dtype if self.lm_head is None else (self.lm_head.logits_dtype or dtype)
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         local_seq_len = seq_len
         if cp_size > 1:
@@ -1020,13 +1020,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 loss_hidden_states = loss_hidden_states.unsqueeze(0)
             return loss_hidden_states
 
-        projected = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-            fp32_lm_head=self.config.use_fp32_for_output,
-        )
+        projected = LMHead.output(self.lm_head, hidden_states, logits_to_keep)
         if self.lm_head is None:
             # No output scaling or soft cap may touch the residual stream
             # passed between non-final PP stages.

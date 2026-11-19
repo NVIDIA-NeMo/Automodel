@@ -27,7 +27,7 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import (
 )
 
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_contiguous
-from nemo_automodel.components.models.common import compute_lm_head_logits
+from nemo_automodel.components.models.common import LMHead
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -65,9 +65,10 @@ class Gemma4UnifiedForConditionalGeneration(
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         self.state_dict_adapter = Gemma4UnifiedStateDictAdapter()
         apply_gemma4_cp_attention_backend_policy(self, Gemma4UnifiedTextAttention)
 
@@ -257,7 +258,7 @@ class Gemma4UnifiedForConditionalGeneration(
             use_cache=False,
             **kwargs,
         )
-        logits = compute_lm_head_logits(self.lm_head, text_outputs.last_hidden_state, logits_to_keep).logits
+        logits = LMHead.output(self.lm_head, text_outputs.last_hidden_state, logits_to_keep).logits
         if (final_logit_softcapping := text_config.final_logit_softcapping) is not None:
             logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
         return Gemma4UnifiedCausalLMOutputWithPast(logits=logits, hidden_states=text_outputs.hidden_states)

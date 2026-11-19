@@ -58,8 +58,9 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -67,7 +68,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
-    compute_lm_head_logits,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
@@ -594,6 +594,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         tokenizer: PreTrainedTokenizerFast | None = None,
         revision: str | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
+        logits_dtype: torch.dtype | None = torch.float32,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
@@ -636,9 +637,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         self.model = DeepseekV41Model(
             config, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32
-        )
+        self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         self.moe_config = moe_config
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepseekV41StateDictAdapter(config, moe_config, self.backend, dtype=dtype)
@@ -833,9 +832,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if layout is not None:
             hidden = layout.restore(hidden)
             captured = None if captured is None else tuple(layout.restore(values) for values in captured)
-        projected = compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states
-        )
+        projected = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
         loss = None
         if labels is not None:
             if projected.logits is None or projected.logits.shape[:2] != labels.shape:
@@ -891,9 +888,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         # Casting again here would round strict FP32 DTensor storage.
         if not _has_dtensor_params(self):
             cast_model_to_dtype(self, dtype)
-        for layer in self.model.layers.values():
-            if layer.engram is not None:
-                layer.engram.embed.mark_sharding_contract()
 
 
 DeepseekV41ForCausalLM.parallelizer = PARALLELIZER

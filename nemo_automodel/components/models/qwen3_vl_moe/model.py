@@ -31,13 +31,14 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 )
 
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -523,6 +524,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         config: Qwen3VLMoeConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         backend = backend or BackendConfig()
@@ -552,8 +555,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype
         )
         self.model.moe_config = self.model.language_model.moe_config
 
@@ -630,8 +633,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 of shape [media_items, 3], including when media_items is one.
 
         Returns:
-            Model output with logits of shape [batch, sequence, vocab] or
-            [tokens, vocab] for THD, or hidden states with the same leading
+            Model output with logits of shape [batch, sequence, vocab], with a
+            batch of one for THD, or hidden states with the same leading
             axes and final dimension ``hidden`` when requested. Intermediate
             pipeline stages return the hidden-state tensor directly.
         """
@@ -705,9 +708,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         if self.lm_head is None:
             return hidden_states
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
-        )
+        return LMHead.output(self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states)
 
     @torch.no_grad()
     def initialize_weights(

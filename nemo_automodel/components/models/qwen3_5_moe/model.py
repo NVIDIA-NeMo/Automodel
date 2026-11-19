@@ -76,6 +76,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -87,7 +88,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
@@ -934,6 +935,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         if not _QWEN3_5_MOE_HF_AVAILABLE:
@@ -954,13 +957,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.vocab_size = config.vocab_size
         self.pad_token_id = config.pad_token_id if config.pad_token_id is not None else -1
 
@@ -1098,7 +1095,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        lm_output = compute_lm_head_logits(
+        lm_output = LMHead.output(
             self.lm_head,
             hidden_states,
             logits_to_keep,
@@ -1271,6 +1268,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         backend: BackendConfig | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         if not _QWEN3_5_MOE_HF_AVAILABLE:
@@ -1307,12 +1306,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         # Replace lm_head with NeMo backend linear
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             text_config.hidden_size,
             text_config.vocab_size,
-            bias=False,
             dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
+            logits_dtype=logits_dtype,
         )
 
         dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
@@ -1645,7 +1643,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         has_lm_head = getattr(self, "lm_head", None) is not None
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
         if has_lm_head and not emits_hidden_states:
-            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=dtype),)
+            logits_dtype = self.lm_head.logits_dtype or dtype
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=logits_dtype),)
         else:
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
         return inputs_meta, outputs_meta
@@ -1833,7 +1832,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        lm_output = compute_lm_head_logits(
+        lm_output = LMHead.output(
             self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
         )
 

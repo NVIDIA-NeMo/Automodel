@@ -18,15 +18,15 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
-    compute_lm_head_logits,
     generation_config_from_model_config,
     restore_pretrained_generation_config,
 )
@@ -264,6 +264,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         config: Glm5NextConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -287,13 +289,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             getattr(text_config, "torch_dtype", getattr(text_config, "dtype", None)),
             torch.bfloat16,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            text_config.hidden_size,
-            text_config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(text_config.hidden_size, text_config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.vocab_size = text_config.vocab_size
         if self.backend.enable_hf_state_dict_adapter:
             from nemo_automodel.components.models.glm5_next.state_dict_adapter import Glm5NextStateDictAdapter
@@ -370,7 +366,6 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         del position_ids
         if pixel_values_videos is not None:
             raise NotImplementedError("GLM-5.3 AutoModel onboarding currently supports images, not video training")
-        is_thd = kwargs.get("qkv_format") == "thd"
         if input_ids is not None and input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
         if inputs_embeds is not None and inputs_embeds.ndim == 2:
@@ -421,13 +416,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             if output_hidden_states is not None
             else bool(getattr(self.config.text_config, "output_hidden_states", False))
         )
-        return compute_lm_head_logits(
-            self.lm_head,
-            hidden,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
+        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Install GLM's contiguous packed sharder while leaving media and ids global."""

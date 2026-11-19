@@ -154,3 +154,5 @@ ci:
   nodes: 8
   time: "01:00:00"
   max_steps: 5
+  perf_testing:
+    schedule: nightly

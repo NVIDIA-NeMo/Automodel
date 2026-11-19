@@ -25,13 +25,12 @@ from typing import Any, Literal, Protocol
 
 import torch
 from torch import nn
-from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
@@ -532,10 +531,13 @@ class BackendConfig:
             Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            "nccl_ep" uses Transformer Engine NCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        nccl_ep: NCCL-EP settings; ``max_tokens_per_rank`` is required when selecting
+            "nccl_ep". NCCL-EP sizes its own kernels and ignores ``dispatcher_num_sms``.
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
-            manager instance across MoE layers.
+            manager instance across MoE layers. NCCL-EP always keeps routing state layer-local.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
         dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
@@ -565,7 +567,9 @@ class BackendConfig:
             run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
             taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
             that covers the largest routing skew expected across layers and batches. Not supported
-            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination) or by
+            ``GroupedExpertsTE``, which HybridEP uses for every ``experts`` value other than
+            ``torch_mm``, ``gmm`` and ``torch_mm_mxfp8``.
         dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
@@ -596,6 +600,9 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+            Qwen3-MoE also supports attn="fa4": only the padded projections, Q/K
+            normalization and RoPE are compiled; packed varlen attention runs between
+            those fixed-shape graphs with its document metadata preserved.
         compile_situ: torch.compile the SiTU expert activation of models that opt in
             (currently Kimi K3): the weighted-SiTU forward and backward run as one fused
             whole-tensor kernel each (low-precision in/out, fp32 math inside, no chunk loop),
@@ -639,13 +646,14 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
     te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
@@ -760,6 +768,16 @@ class BackendConfig:
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
+        if isinstance(self.nccl_ep, dict):
+            self.nccl_ep = NcclEpConfig(**self.nccl_ep)
+        elif not isinstance(self.nccl_ep, NcclEpConfig):
+            raise TypeError("nccl_ep must be an NcclEpConfig or mapping")
+        if self.dispatcher == "nccl_ep":
+            if self.nccl_ep.max_tokens_per_rank is None:
+                raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
+            if self.dispatcher_async_dispatch:
+                raise ValueError("dispatcher_async_dispatch is not supported by NCCL-EP")
+
         if isinstance(self.mok, dict):
             self.mok = MoKBackendConfig(**self.mok)
         elif not isinstance(self.mok, MoKBackendConfig):
@@ -799,7 +817,7 @@ class BackendConfig:
 
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -1518,103 +1536,6 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
             module._buffers[buffer_name] = buf.to(torch.float32)
 
 
-def compute_lm_head_logits(
-    lm_head: nn.Module | None,
-    hidden_states: torch.Tensor,
-    logits_to_keep: int | torch.Tensor = 0,
-    is_thd: bool = False,
-    fp32_lm_head: bool = False,
-    output_hidden_states: bool = False,
-) -> CausalLMOutputWithPast:
-    """Project hidden states through ``lm_head`` and wrap the result.
-
-    Centralizes the lm_head projection and output packaging shared by every
-    custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` ``forward()``. The
-    returned ``CausalLMOutputWithPast`` carries the projected ``logits`` and,
-    when requested, the final ``hidden_states``; callers that also need ``loss``,
-    ``past_key_values``, etc. read ``.logits`` and build their own output.
-
-    - ``lm_head is None`` (e.g. a non-final pipeline-parallel stage that does not
-      own the head): ``hidden_states`` is passed through as ``logits`` so the
-      next stage receives it.
-    - ``logits_to_keep == 0`` (training default): every position is projected.
-      The full range is deliberately *not* sliced, because ``slice(0, None)`` on
-      a DTensor is unsupported (it raises on the ``aten.alias`` op under tensor
-      parallel with sequence parallelism).
-    - ``logits_to_keep`` as a positive int or a tensor of indices: only the
-      requested positions are projected. Both 2D ``[T, H]`` (THD/packed) and 3D
-      ``[B, S, H]`` (BSHD) hidden states are handled.
-    - ``is_thd``: THD/packed inputs yield 2D ``[T, V]`` logits; the leading batch
-      dim is restored (``unsqueeze(0)`` -> ``[1, T, V]``) so downstream code sees
-      a uniform ``[B, S, V]`` layout. The same restoration is applied to the
-      ``hidden_states`` field. Only applied while the tensor is still 2D, so an
-      ``inputs_embeds`` path that already produced ``[1, T, *]`` is left
-      untouched.
-    - ``fp32_lm_head``: run the projection in fp32 and cast the logits back to
-      the input dtype. Used by models whose ``lm_head.weight`` has been promoted
-      to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
-      through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
-      ``F.linear`` so DTensor redistribution is preserved.
-    - Otherwise, cast the sliced input to the head's effective compute dtype.
-      For a standalone FSDP2 head this comes from its mixed-precision policy,
-      since its sharded weight may still expose the master-copy dtype before the
-      forward pre-hook runs. Other heads use their materialized weight dtype.
-    - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
-      ``hidden_states`` are attached to the output so the fused cross-entropy
-      path can recompute logits over every position; otherwise the field is
-      ``None``.
-
-    Args:
-        lm_head: The language-model head module, or ``None`` on a pipeline stage
-            that does not own it.
-        hidden_states: Final hidden states, shaped ``[T, H]`` or ``[B, S, H]``.
-        logits_to_keep: ``0`` to project every position; a positive int to keep
-            the last ``N`` positions; or a tensor of position indices.
-        is_thd: Whether the inputs were THD/packed; if so, a 2D logits (and
-            hidden-states) result is unsqueezed back to a leading batch dim of 1.
-        fp32_lm_head: Project in fp32 and cast the result back to the input
-            dtype. Ignored when ``lm_head`` is ``None``.
-        output_hidden_states: Attach the final hidden states to the output.
-
-    Returns:
-        A ``CausalLMOutputWithPast`` whose ``logits`` are the projected logits
-        (or ``hidden_states`` unchanged when ``lm_head`` is ``None``) and whose
-        ``hidden_states`` are the final hidden states when ``output_hidden_states``
-        is set, else ``None``.
-    """
-    if lm_head is None:
-        logits = hidden_states
-    else:
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            sliced = hidden_states
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                sliced = hidden_states[slice_indices, :]
-            else:
-                sliced = hidden_states[:, slice_indices, :]
-        if fp32_lm_head:
-            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-                logits = lm_head(sliced.float()).to(hidden_states.dtype)
-        else:
-            compute_dtype = None
-            if isinstance(lm_head, FSDPModule):
-                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
-            lm_head_weight = getattr(lm_head, "weight", None)
-            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
-                compute_dtype = lm_head_weight.dtype
-            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
-            logits = lm_head(projection_input)
-    if is_thd and logits.dim() == 2:
-        logits = logits.unsqueeze(0)
-
-    hidden_out = None
-    if output_hidden_states:
-        hidden_out = hidden_states.unsqueeze(0) if is_thd and hidden_states.dim() == 2 else hidden_states
-
-    return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
-
-
 def prepare_frozen_parameters_for_sharding(
     model: nn.Module,
     compute_dtype: torch.dtype | None,
@@ -1818,7 +1739,6 @@ __all__ = [
     "TEFp8Config",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
-    "compute_lm_head_logits",
     "get_is_first_microbatch",
     "get_is_optim_step",
     "get_rope_config",
