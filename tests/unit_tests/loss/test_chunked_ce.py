@@ -376,7 +376,7 @@ def test_fp32_projection_reproduces_the_fp32_logits_head(chunk_len):
 
 
 def test_compiled_chunks_keep_the_fp32_projection():
-    from nemo_automodel.components.models.common.lm_head import LogitsProjection
+    from nemo_automodel.components.models.common.lm_head import LMHead
 
     # ChunkedCrossEntropy compiles its per-chunk loss by default.
     torch.manual_seed(71)
@@ -384,10 +384,11 @@ def test_compiled_chunks_keep_the_fp32_projection():
     hidden = torch.randn(2, 9, 24, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(53, (2, 9))
     labels[0, 3] = -100
-    projection = LogitsProjection(logits_dtype=torch.float32)
+    # Chunks project with the gathered weight, so the head's own parameters stay on meta.
+    head = LMHead(24, 53, logits_dtype=torch.float32, device="meta")
     results = {}
     for use_compile in (False, True):
-        loss = ChunkedCrossEntropy(4, compile=use_compile)(hidden, labels, weight, projection=projection)
+        loss = ChunkedCrossEntropy(4, compile=use_compile)(hidden, labels, weight, lm_head=head)
         results[use_compile] = (loss, *torch.autograd.grad(loss, (hidden, weight)))
 
     for compiled, eager in zip(results[True], results[False]):

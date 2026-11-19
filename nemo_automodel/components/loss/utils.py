@@ -198,9 +198,9 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         # depth (see calculate_mtp_loss). Re-gathering the (vocab x hidden) head
         # per call leaves a copy retained for backward each time; they accumulate
         # on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab).
-        lm_weight = kwargs.pop("lm_weight", None)
-        if lm_weight is None:
-            lm_weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
+        lm_head = kwargs.pop("lm_weight", None)
+        if lm_head is None:
+            lm_head = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
         if isinstance(loss_fn, ChunkedCrossEntropy):
             logits = kwargs.get("logits")
             loss_fn_kwargs["logits_dtype"] = kwargs.pop(
@@ -208,12 +208,12 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             )
             unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
             head = _get_lm_head_module(unwrapped)
-            loss_fn_kwargs["projection"] = head.projection if isinstance(head, LMHead) else None
+            loss_fn_kwargs["lm_head"] = head if isinstance(head, LMHead) else None
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),
                 "labels": labels,
-                "lm_weight": lm_weight,
+                "lm_weight": lm_head,
                 "grad_reduce_group": kwargs.pop("grad_reduce_group", None),
             }
         )
