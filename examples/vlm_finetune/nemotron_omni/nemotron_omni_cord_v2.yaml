@@ -108,4 +108,5 @@ optimizer:
   master_weight_dtype: torch.float32
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100

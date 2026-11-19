@@ -44,7 +44,7 @@ model:
 `ConfigNode` can also resolve callables from these sources:
 
 - **Dotted paths**: `pkg.module.symbol`
-- **Local file paths**: `/abs/path/to/file.py:symbol`
+- **Local file paths**: `/abs/path/to/file.py:symbol`. A file outside the installed `nemo_automodel` package requires the opt-in described in [Target Resolution and Code Execution](#target-resolution-and-code-execution).
 
 ### Load a Hugging Face Model Configuration
 
@@ -78,14 +78,20 @@ use the shared-cache fix.
 
 ### Target Resolution and Code Execution
 
-Target resolution is intentionally permissive and should be treated as code execution:
+Target resolution imports and runs Python code, so treat a configuration file as code:
 
-- A dotted target can import any package discoverable through Python's `sys.path` or reuse a package already present in `sys.modules`. It is not limited to a safe-prefix allowlist.
-- An existing `file.py:symbol` target loads that file directly without requiring an environment-variable opt-in. Loading either target form executes the top-level code of the imported module.
-- For `file.py:symbol`, private or dunder symbols (names beginning with `_` or containing `__`) are rejected. For dotted targets, private attribute traversal is rejected by default and can be enabled with `NEMO_ENABLE_USER_MODULES=1` or `set_enable_user_modules(True)`.
+- A dotted target can import any package discoverable through Python's `sys.path` or reuse a package already present in `sys.modules`. It is not limited to a safe-prefix allowlist. Importing a module runs its top-level code.
+- A `file.py:symbol` target runs the file. A file inside the installed `nemo_automodel` package loads directly. A file anywhere else, such as a file next to your configuration, loads only after you opt in with `NEMO_ENABLE_USER_MODULES=1` or `set_enable_user_modules(True)`. Symbolic links and `..` segments are resolved before this check.
+- For `file.py:symbol`, private or dunder symbols (names beginning with `_` or containing `__`) are rejected before the file runs. For dotted targets, private attribute traversal is rejected by default and can be enabled with the same opt-in.
+
+To load your own Python file, set the opt-in in the environment that runs training:
+
+```bash
+NEMO_ENABLE_USER_MODULES=1 automodel my_config.yaml
+```
 
 <Warning>
-Only load configuration files and `_target_` values from trusted sources. A YAML file that names an importable package or Python file can execute arbitrary Python code during target resolution.
+Only load configuration files and `_target_` values from trusted sources. The opt-in prevents a configuration from running a Python file that you did not choose to trust. It does not make an untrusted configuration safe, because a dotted target can call any importable function.
 
 </Warning>
 
@@ -165,6 +171,8 @@ Each selector is a mapping with exactly one key. `path` matches one module by it
 
 Trainability is resolved in a fixed order. Full fine-tuning preserves the model's existing `requires_grad` state, including intentionally frozen model-owned parameters. PEFT establishes a LoRA-trainable, base-frozen baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap. This makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor/expert parallel and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
 
+With PEFT, every module that `freeze_config` makes trainable next to the LoRA adapters is trained in full and saved whole in the adapter checkpoint, together with its persistent buffers. `adapter_config.json` lists these modules in `modules_to_save`, so resuming training and loading or merging the adapter with Hugging Face PEFT restore the trained weights. Hugging Face PEFT cannot wrap a `ModuleList` or `ModuleDict`, so a trained container such as `model.layers` is listed through its blocks (`model.layers.0`, `model.layers.1`, and so on) unless an enclosing module trains in full too. A selection that Hugging Face PEFT cannot restore raises an error before training starts. This includes a module that holds LoRA adapters or contains one, a module that trains only some of its parameters (which `unfreeze_parameters` or `freeze_parameters` can select), a parameter of the root module, a parameter registered under several names, such as tied input and output embeddings, and a parameter of a `ParameterList` or `ParameterDict` whose enclosing module does not train in full. Serving stacks that cannot load `modules_to_save` adapters need the merged checkpoint that `tools/merge_lora.py` writes.
+
 The modality-specific booleans `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` remain supported and keep their established attribute and substring matching, applied before `unfreeze_modules`:
 
 ```yaml
@@ -190,6 +198,8 @@ prewarm:
 ```
 
 All prewarm options default to `false`. For the four initialization options below, enable only the warmup associated with an observed first-step failure. To reduce pipeline-parallel startup time without a first-step failure, see [Reduce Pipeline-Parallel Startup Time](#reduce-pipeline-parallel-startup-time).
+
+Each initialization option works as follows:
 
 - `cublas_backward` initializes cuBLAS backward workspaces during setup.
 - `fla_gdn_autotune` autotunes flash-linear-attention gated-delta-net Triton kernels during setup.

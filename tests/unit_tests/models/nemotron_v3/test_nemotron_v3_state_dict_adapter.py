@@ -221,7 +221,9 @@ class TestNemotronV3AdapterDense:
         assert not any(k.endswith("norm_f.weight") for k in native)
         assert adapter._uses_model_prefix is False
 
-    @pytest.mark.parametrize("embed_key", ["backbone.embedding.weight", "backbone.embeddings.weight", "model.embedding.weight"])
+    @pytest.mark.parametrize(
+        "embed_key", ["backbone.embedding.weight", "backbone.embeddings.weight", "model.embedding.weight"]
+    )
     def test_from_hf_accepts_singular_or_plural_embedding(self, adapter, embed_key):
         """RL#4211: transformers save_pretrained may emit singular ``embedding``."""
         tensor = torch.randn(100, 256)
@@ -278,6 +280,40 @@ class TestNemotronV3AdapterDense:
         assert list(restored) == [native_key]
         torch.testing.assert_close(restored[native_key], tensor)
 
+    @pytest.mark.parametrize("v4_compatible", [False, True])
+    def test_peft_full_weights_share_the_lora_namespace(self, adapter, v4_compatible):
+        """Modules a PEFT export stores whole are named like their LoRA neighbours.
+
+        freeze_config.unfreeze_modules can train the embeddings and the final norm next to
+        LoRA. Their tensors and their modules_to_save entries must both use the export's
+        namespace and the norm_f/embeddings renames, or PEFT loads the base weights.
+        """
+        prefix = "backbone" if v4_compatible else "model"
+        native = {
+            "base_model.model.model.embed_tokens.weight": torch.randn(16, 8),
+            "base_model.model.model.norm.weight": torch.randn(8),
+            "base_model.model.lm_head.weight": torch.randn(16, 8),
+            "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight": torch.randn(2, 8),
+        }
+
+        exported = adapter.to_hf(dict(native), v4_compatible=v4_compatible)
+
+        assert set(exported) == {
+            f"base_model.model.{prefix}.embeddings.weight",
+            f"base_model.model.{prefix}.norm_f.weight",
+            "base_model.model.lm_head.weight",
+            f"base_model.model.{prefix}.layers.0.mixer.in_proj.lora_A.weight",
+        }
+        assert adapter.map_peft_target_module_to_hf("model.embed_tokens", v4_compatible=v4_compatible) == (
+            f"{prefix}.embeddings"
+        )
+        assert adapter.map_peft_target_module_to_hf("model.norm", v4_compatible=v4_compatible) == f"{prefix}.norm_f"
+        assert adapter.map_peft_target_module_to_hf("lm_head", v4_compatible=v4_compatible) == "lm_head"
+        restored = adapter.from_hf(dict(exported))
+        assert set(restored) == set(native)
+        for key, value in native.items():
+            torch.testing.assert_close(restored[key], value, rtol=0, atol=0)
+
     def test_legacy_peft_adapter_loads_and_reexports_for_v5(self, adapter):
         """A saved backbone adapter remains loadable and can be exported to built-in HF."""
         old_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
@@ -293,19 +329,30 @@ class TestNemotronV3AdapterDense:
     @pytest.mark.parametrize("base_prefix", ["backbone", "model"])
     @pytest.mark.parametrize("adapter_prefix", ["backbone", "model"])
     def test_adapter_restore_preserves_base_checkpoint_namespace(self, adapter, base_prefix, adapter_prefix):
-        """Legacy LoRA names must not rename frozen embeddings in the merged export."""
+        """Adapter tensors must not rename frozen embeddings in the merged export.
+
+        Neither the LoRA weights nor the modules the adapter stores in full (``modules_to_save``,
+        here the final norm and the embeddings) say which namespace the base checkpoint uses.
+        """
         base_state = {
             f"{base_prefix}.embeddings.weight": torch.randn(16, 8),
             f"{base_prefix}.norm_f.weight": torch.randn(8),
         }
         native_base = adapter.from_hf(dict(base_state))
-        lora_tensor = torch.randn(2, 8)
-        native_lora = adapter.from_hf(
-            {f"base_model.model.{adapter_prefix}.layers.0.mixer.in_proj.lora_A.weight": lora_tensor}
-        )
-        native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
-        assert set(native_lora) == {native_key}
-        torch.testing.assert_close(native_lora[native_key], lora_tensor, rtol=0, atol=0)
+        uses_model_prefix = adapter._uses_model_prefix
+        native_names = {
+            f"base_model.model.{adapter_prefix}.norm_f.weight": "base_model.model.model.norm.weight",
+            f"base_model.model.{adapter_prefix}.embeddings.weight": "base_model.model.model.embed_tokens.weight",
+            f"base_model.model.{adapter_prefix}.layers.0.mixer.in_proj.lora_A.weight": (
+                "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
+            ),
+        }
+        adapter_state = {key: torch.randn(8) for key in native_names}
+        native_adapter = adapter.from_hf(dict(adapter_state))
+        assert adapter._uses_model_prefix is uses_model_prefix
+        assert set(native_adapter) == set(native_names.values())
+        for hf_key, native_key in native_names.items():
+            torch.testing.assert_close(native_adapter[native_key], adapter_state[hf_key], rtol=0, atol=0)
 
         exported = adapter.to_hf(dict(native_base))
         assert set(exported) == set(base_state)

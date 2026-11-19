@@ -573,19 +573,17 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         # Keep empty/fully masked ranks attached without indexing nonexistent tokens.
         if active_local_experts == 0:
-            y = (
-                y
-                + (
-                    x.sum(dtype=torch.float32)
-                    + weights.sum(dtype=torch.float32)
-                    + gate_and_up_projs.sum(dtype=torch.float32)
-                    + down_projs.sum(dtype=torch.float32)
-                    + lora_gate_and_up_A.sum(dtype=torch.float32)
-                    + lora_gate_and_up_B.sum(dtype=torch.float32)
-                    + lora_down_A.sum(dtype=torch.float32)
-                    + lora_down_B.sum(dtype=torch.float32)
-                )
-                * 0.0
+            # Save the zero output for backward so checkpoint replays the EP gather
+            # before its backward collectives, even when this rank owns no routes.
+            y = y * (
+                x.sum(dtype=torch.float32)
+                + weights.sum(dtype=torch.float32)
+                + gate_and_up_projs.sum(dtype=torch.float32)
+                + down_projs.sum(dtype=torch.float32)
+                + lora_gate_and_up_A.sum(dtype=torch.float32)
+                + lora_gate_and_up_B.sum(dtype=torch.float32)
+                + lora_down_A.sum(dtype=torch.float32)
+                + lora_down_B.sum(dtype=torch.float32)
             )
             if post_expert_output is not None:
                 y = y + post_expert_output(x.new_zeros((1, x.size(1)))).sum(dtype=torch.float32) * 0.0
@@ -697,20 +695,17 @@ class GroupedExpertsLoRA(GroupedExperts):
                 scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
                 y.scatter_add_(0, scatter_ids, output2.float())
         else:
-            # Preserve the output layout and all gradients even for zero tokens.
-            y = (
-                y
-                + (
-                    x.sum(dtype=torch.float32)
-                    + weights.sum(dtype=torch.float32)
-                    + gate_and_up_projs.sum(dtype=torch.float32)
-                    + down_projs.sum(dtype=torch.float32)
-                    + lora_gate_and_up_A.sum(dtype=torch.float32)
-                    + lora_gate_and_up_B.sum(dtype=torch.float32)
-                    + lora_down_A.sum(dtype=torch.float32)
-                    + lora_down_B.sum(dtype=torch.float32)
-                )
-                * 0.0
+            # Multiplication saves y even when empty, keeping checkpoint gather
+            # replay ordered with the ranks that executed the grouped GEMMs.
+            y = y * (
+                x.sum(dtype=torch.float32)
+                + weights.sum(dtype=torch.float32)
+                + gate_and_up_projs.sum(dtype=torch.float32)
+                + down_projs.sum(dtype=torch.float32)
+                + lora_gate_and_up_A.sum(dtype=torch.float32)
+                + lora_gate_and_up_B.sum(dtype=torch.float32)
+                + lora_down_A.sum(dtype=torch.float32)
+                + lora_down_B.sum(dtype=torch.float32)
             )
             if post_expert_output is not None:
                 y = y + post_expert_output(x.new_zeros((1, x.size(1)))).sum(dtype=torch.float32) * 0.0
@@ -764,6 +759,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.nccl_ep = orig_module.nccl_ep
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
@@ -881,17 +877,20 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         non-QAT keeps the adapter projections additive.
 
         Args:
-            x: Local tensor [tokens, hidden], in the compute dtype. QAT requires
+            x: Tensor of shape [local_tokens, hidden], in the compute dtype. QAT requires
                 original local base/A/B storage dtypes to match, with CPU and
                 CUDA autocast disabled. Dispatch must preserve this dtype.
-            token_mask: Local boolean tensor [tokens].
-            weights: Local routing probability tensor [tokens, top_k].
-            indices: Local integer tensor [tokens, top_k], global expert IDs.
-            post_expert_output: Optional transform preserving [routed_tokens, hidden],
-                applied after the down projection and before post-down router weighting.
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Routing probabilities of shape [local_tokens, top_k].
+            indices: Global expert IDs of shape [local_tokens, top_k].
+            post_expert_output: Optional transform from [routed_tokens, hidden] to the same layout,
+                applied after the down projection and before router weighting when
+                apply_router_weight_after_down is enabled.
 
         Returns:
-            Local tensor [tokens, hidden] on x's device after dispatcher combine.
+            Combined expert output of shape [local_tokens, hidden], with x's dtype/device.
+            Post-down routing multiplies in FP32 then casts to the compute dtype
+            before combine. Inputs are not mutated.
             Base and adapter parameters may be DTensors sharded on expert axis 0;
             QAT operates only on local [local_experts, in, out] shards, converting
             them to canonical [local_experts, out, in] for the quantizer.
@@ -937,9 +936,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 down_projs, lora_down_A, lora_down_B, self.scale, self.weight_fake_quantizer
             )
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if self._has_dispatched_rows(permuted_local_hidden_states, tokens_per_expert):
             if self.weight_fake_quantizer is None:
                 lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                     lora_gate_and_up_A, lora_gate_and_up_B

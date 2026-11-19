@@ -793,7 +793,6 @@ class DataloaderConfig:
         is_training: bool = True,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
-        collate_wrapper: Callable[[CollateFn], CollateFn] | None = None,
         ignore_index: int = -100,
     ) -> Iterable[object]:
         """Build the configured dataset, packing, sampler, collator, and stateful dataloader.
@@ -817,7 +816,6 @@ class DataloaderConfig:
             packing_contract: Structural model contract used by NEAT packing.
                 Native mask/Flash collation requires a model-derived contract supplying
                 the attention conversion; recipes provide it automatically.
-            collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
             ignore_index: Stream-backend label exclusion value. Native collators retain
                 their own configured supervision policy and do not consume this value.
 
@@ -881,7 +879,7 @@ class DataloaderConfig:
                     self.packing.packed_sequence_size,
                 )
 
-            # Collate: packing override -> custom collate_fn -> shared default; then the optional PP wrapper.
+            # Collate: packing override -> custom collate_fn -> shared default.
             collate_fn = collate_override or self.collate_fn
             if isinstance(collate_fn, CollatorConfig):
                 if tokenizer is None:
@@ -896,8 +894,6 @@ class DataloaderConfig:
                     from nemo_automodel.components.datasets.utils import default_collater
 
                     collate_fn = default_collater
-            if collate_wrapper is not None:
-                collate_fn = collate_wrapper(collate_fn)
 
             batch_sampler = None
             if self.batch_sampler_config is not None:
