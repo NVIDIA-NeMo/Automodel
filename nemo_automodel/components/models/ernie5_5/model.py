@@ -551,12 +551,9 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     forward in training mode raises if an indexer holds a trainable parameter: one that a freeze configuration
     enabled again, or an adapter tensor of a LoRA adapter on an indexer projection.
 
-    LoRA is supported on the plain linear projections that an attention module owns directly (not those of its
+    LoRA is validated on the plain linear projections that an attention module owns directly (not those of its
     indexer or compressor), on the routed experts, and on the projections of the dense FFN and of the shared
-    expert. The parallelizer rejects an adapter on any other module, and an adapter in another dtype than the
-    weight it adapts, before it shards the model. DoRA is not supported: a model with a DoRA adapter is rejected
-    when it is built, by the checkpoint adapter when it plans the checkpoint keys or else by the parallelizer;
-    with the routed experts among the targets the LoRA installer rejects DoRA first.
+    expert.
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -832,8 +829,7 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         restore when a run resumes. The constructor therefore freezes them, and nothing in the model enables
         them again. A freeze configuration whose unfreeze selectors cover an indexer does, and a LoRA adapter on
         an indexer projection adds trainable tensors of its own to the indexer. Both are rejected here at the
-        first training step; for a model that goes through the parallelizer, the adapter is rejected earlier,
-        before the model is sharded.
+        first training step.
 
         Raises:
             ValueError: If a parameter of a DSA indexer requires gradients.

@@ -41,13 +41,14 @@
 #
 # Not used by this recipe: context parallelism, activation checkpointing and packed sequences,
 # which ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml enables. Not supported: tensor and
-# pipeline parallelism and padded batches. LoRA on any module that peft.target_modules below does not
-# list: the grouped HCA projection wo_a, the FP32 projections of the HCA compressor and of the
-# latent MoE, the DSA indexers and the output head are rejected before the model is sharded;
-# k_b_proj and v_b_proj of a DSA layer, the router and the hyper-connections are parameters
-# without a linear module of their own and cannot be selected. DoRA (peft.use_dora) is
-# rejected when the model is built, and an adapter in another dtype than the weight it adapts
-# (peft.lora_dtype, or an FP32 model under a BF16 compute dtype) before the model is sharded.
+# pipeline parallelism and padded batches. LoRA on the grouped HCA projection wo_a and on the
+# FP32 projections of the latent MoE, which fail in the first forward with an adapter, and on
+# the DSA indexers, which the model rejects at the first training step. k_b_proj and v_b_proj
+# of a DSA layer, the router and the hyper-connections are parameters without a linear module
+# of their own and cannot be selected. Not validated: LoRA on any other module that
+# peft.target_modules below does not list, DoRA (peft.use_dora), and an adapter in another
+# dtype than the weight it adapts (peft.lora_dtype, or an FP32 model under a BF16 compute
+# dtype).
 # The multi-token prediction (MTP) block of the released checkpoint is not loaded or trained.
 #
 # To run this recipe, from the repository root, on each of the 2 nodes with 4 GPUs, with
@@ -103,9 +104,8 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  # Every pattern must select supported modules only; the model's parallelizer rejects an
-  # adapter on any other module. Without target_modules the default pattern also selects
-  # unsupported projections.
+  # The patterns select the supported modules only. Without target_modules the default pattern
+  # also selects unsupported projections.
   target_modules:
     # HCA attention (37 layers): the plain linear projections. wo_a is a grouped projection
     # and is not supported.
