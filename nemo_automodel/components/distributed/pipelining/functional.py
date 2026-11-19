@@ -617,24 +617,48 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
     stage_model.forward = _pp_tensor_forward
 
 
+def _stage_layer_ids(module_names: list[str], layers_prefix: str, num_layers: int) -> list[int]:
+    """Return the decoder layers a stage retains under the splitter's rules.
+
+    The splitter keeps a module whole when its FQN is listed, so a listed ancestor of the layer container
+    (``model.layers`` or ``model``) retains every layer; otherwise a layer is retained when its own FQN is
+    listed.
+    """
+    container = f"{layers_prefix}layers"
+    parts = container.split(".")
+    ancestors = {".".join(parts[:k]) for k in range(1, len(parts) + 1)}
+    names = set(module_names)
+    if names & ancestors:
+        return list(range(num_layers))
+    pattern = re.compile(rf"^{re.escape(container)}\.(\d+)$")
+    return sorted({int(m.group(1)) for name in names if (m := pattern.match(name))})
+
+
 def _check_partition_lists_every_layer_once(
     module_names_per_stage: list[list[str]], layers_prefix: str, num_layers: int
 ) -> None:
-    """Reject an explicit partition that omits, repeats or invents a decoder layer.
+    """Reject an explicit partition that omits, repeats, invents or reorders a decoder layer.
 
-    A trimmed stage sees only its own modules, so a layer that no stage lists runs zero times and a layer that
-    two stages list runs twice, and the stages' wire contracts still match.
+    A trimmed stage sees only its own modules, so a layer that no stage retains runs zero times, a layer that
+    two stages retain runs twice, and layers assigned to stages out of order run out of order, while the stages'
+    wire contracts still match.
     """
-    pattern = re.compile(rf"^{re.escape(layers_prefix)}layers\.(\d+)$")
-    listed = [int(m.group(1)) for names in module_names_per_stage for name in names if (m := pattern.match(name))]
+    per_stage = [_stage_layer_ids(names, layers_prefix, num_layers) for names in module_names_per_stage]
+    listed = [i for ids in per_stage for i in ids]
     counts = collections.Counter(listed)
     missing = [i for i in range(num_layers) if i not in counts]
     repeated = sorted(i for i, count in counts.items() if count > 1)
     unknown = sorted(i for i in counts if i >= num_layers)
     if missing or repeated or unknown:
         raise ValueError(
-            "module_fqns_per_model_part must list every decoder layer exactly once: "
+            "module_fqns_per_model_part must retain every decoder layer exactly once: "
             f"missing {missing}, repeated {repeated}, beyond the model {unknown}"
+        )
+    if listed != sorted(listed):
+        ranges = [(ids[0], ids[-1]) if ids else None for ids in per_stage]
+        raise ValueError(
+            "module_fqns_per_model_part must assign decoder layers to stages in increasing order; "
+            f"the stages retain the layer ranges {ranges}"
         )
 
 

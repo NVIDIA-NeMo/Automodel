@@ -2033,3 +2033,24 @@ def test_explicit_partition_must_list_every_decoder_layer_once():
         )
     with pytest.raises(ValueError, match=r"beyond the model \[3\]"):
         _check_partition_lists_every_layer_once([[f"model.layers.{i}" for i in range(4)]], "model.", 3)
+    # A listed ancestor retains the whole container, as the splitter does.
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.rotary_emb", "model.layers"], ["model.norm", "lm_head"]], "model.", 3
+    )
+    _check_partition_lists_every_layer_once([["model"], ["lm_head"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[0, 1, 2\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers"], ["model.layers.0", "model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    # Stages must own increasing layer ranges: [0,4), [5,6), [4,5), [6,8) covers every layer once but reorders.
+    with pytest.raises(ValueError, match=r"increasing order.*\(0, 3\), \(5, 5\), \(4, 4\), \(6, 7\)"):
+        _check_partition_lists_every_layer_once(
+            [
+                [f"model.layers.{i}" for i in range(0, 4)],
+                ["model.layers.5"],
+                ["model.layers.4"],
+                [f"model.layers.{i}" for i in range(6, 8)],
+            ],
+            "model.",
+            8,
+        )
