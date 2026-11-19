@@ -168,7 +168,8 @@ class ToolCallAccuracyEvaluator:
         for the small eval budgets used here (default 256 tokens).
 
         Args:
-            model: Forward-only model satisfying the logits contract above.
+            model: Forward-only model. It returns logits directly, in a
+                ``logits`` attribute, or as the first element of a tuple/list.
             input_ids: Integer token IDs of shape [batch, prompt].
             attention_mask: Mask of shape [batch, prompt] on the same device.
             max_new_tokens: Maximum number of decoding steps.
