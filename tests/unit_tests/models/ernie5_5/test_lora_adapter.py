@@ -21,7 +21,7 @@ from safetensors.torch import load_file, save_file
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
-from nemo_automodel.components.models.ernie5_5.state_dict_adapter import _is_lora_key
+from nemo_automodel.components.models.ernie5_5.state_dict_adapter import _is_peft_key
 from tests.unit_tests.models.ernie5_5.test_lora import _recipe_targets
 from tests.unit_tests.models.ernie5_5.test_state_dict_adapter import _tiny_model
 
@@ -42,8 +42,10 @@ def test_recipe_adapter_names_are_recognized_and_base_names_are_not():
     lora = [name for name in state if ".lora_" in name]
     base = [name for name in state if ".lora_" not in name]
     assert lora and base
-    assert all(_is_lora_key(name) and _is_lora_key("base_model.model." + name) for name in lora)
-    assert not any(_is_lora_key(name) for name in base)
+    assert all(_is_peft_key(name) and _is_peft_key("base_model.model." + name) for name in lora)
+    assert not any(_is_peft_key(name) for name in base)
+    # A module stored whole by a PEFT export carries the PEFT prefix.
+    assert all(_is_peft_key("base_model.model." + name) for name in base)
 
 
 def test_adapter_tensors_pass_through_a_save_and_a_load_without_a_session():
@@ -133,8 +135,38 @@ def test_checkpointer_saves_twice_and_restores_adapter(tmp_path, ep):
         checkpointer.close()
 
 
-@pytest.mark.parametrize("mode", ["valid", "missing", "extra", "bad_shape", "one_expert"])
-def test_checkpointer_restores_only_an_adapter_checkpoint_with_the_keys_and_shapes_of_the_model(tmp_path, mode):
+def test_checkpointer_saves_and_restores_an_unfrozen_module_with_the_adapter(tmp_path):
+    """A module trained in full next to LoRA (freeze_config unfreeze) travels with the adapter checkpoint."""
+    source, target = _lora_model(), _lora_model()
+    for model in (source, target):
+        model.model.lm_head.weight.requires_grad_(True)
+    with torch.no_grad():
+        for parameter in source.parameters():
+            if parameter.requires_grad:
+                parameter.fill_(3)
+        for parameter in target.parameters():
+            if parameter.requires_grad:
+                parameter.zero_()
+    expected = {name: value.detach().clone() for name, value in source.named_parameters() if value.requires_grad}
+    assert "model.lm_head.weight" in expected and any(".lora_" in name for name in expected)
+    frozen = {name: value.detach().clone() for name, value in target.state_dict().items() if name not in expected}
+    config = PeftConfig(target_modules=["model.layers.0.attention.wq_a"], dim=2, alpha=4)
+    checkpointer = Checkpointer(
+        CheckpointingConfig(is_peft=True, save_consolidated=False, checkpoint_dir=str(tmp_path / "run")), 0, 0, 0
+    )
+    try:
+        checkpointer.save_model(source, str(tmp_path / "first"), peft_config=config)
+        stored = load_file(str(tmp_path / "first" / "model" / "adapter_model.safetensors"))
+        assert stored.keys() == {f"base_model.model.{key}" for key in expected}
+        checkpointer.load_model(target, str(tmp_path / "first" / "model"), is_init_step=False)
+    finally:
+        checkpointer.close()
+    assert all(torch.equal(target.get_parameter(name), value) for name, value in expected.items())
+    assert all(torch.equal(target.state_dict()[name], value) for name, value in frozen.items())
+
+
+@pytest.mark.parametrize("mode", ["valid", "missing", "extra", "bad_shape", "bad_dtype", "one_expert"])
+def test_checkpointer_restores_only_an_adapter_checkpoint_with_the_keys_shapes_and_dtypes_of_the_model(tmp_path, mode):
     """The expert-parallel install path copies adapter tensors without a check of its own."""
     model = _lora_model("model.layers.1.moe.experts" if mode == "one_expert" else "model.layers.0.attention.wq_a")
     native = {name: value for name, value in model.named_parameters() if ".lora_" in name}
@@ -147,6 +179,9 @@ def test_checkpointer_restores_only_an_adapter_checkpoint_with_the_keys_and_shap
         values["base_model.model.model.layers.0.attention.fake.lora_A.weight"] = torch.ones(1)
     elif mode == "bad_shape":
         values[last] = torch.ones(1)
+    elif mode == "bad_dtype":
+        # The install would round a tensor of another precision into the adapter.
+        values[last] = values[last].double()
     elif mode == "one_expert":
         # One expert would broadcast into the adapter slots of all experts.
         values[last] = values[last][:1].clone()
@@ -160,7 +195,7 @@ def test_checkpointer_restores_only_an_adapter_checkpoint_with_the_keys_and_shap
         if mode == "valid":
             checkpointer.load_model(model, str(model_path), is_init_step=False)
         else:
-            with pytest.raises(ValueError, match="LoRA checkpoint and model differ"):
+            with pytest.raises(ValueError, match="PEFT checkpoint and model differ"):
                 checkpointer.load_model(model, str(model_path), is_init_step=False)
     finally:
         checkpointer.close()

@@ -23,10 +23,12 @@ that the reader fills, and ``from_hf`` receives the same mapping back, installs 
 and returns the native state. The adapter keeps one session at a time and fails closed: after a session that was
 abandoned, replaced or failed, every later load or save raises, because the model may be partially overwritten.
 
-The tensors of a LoRA adapter keep their native names. ``to_hf`` and ``from_hf`` return a state of adapter
-tensors alone as it is, without a session, and ``to_hf`` appends the adapter tensors of a state that also holds
-base tensors to the converted base tensors. In a load, ``from_hf`` raises ``ValueError`` unless the tensors it
-receives have the keys and shapes of the adapter tensors that ``to_hf(..., for_checkpoint_load=True)`` was given.
+The tensors of a PEFT export keep their names: the LoRA adapter tensors, and the modules that the export stores
+whole under the ``base_model.model.`` prefix (``modules_to_save``, such as an unfrozen output head). ``to_hf``
+and ``from_hf`` return a state of such tensors alone as it is, without a session, and ``to_hf`` appends them to
+the converted base tensors of a state that also holds base tensors. In a load, ``from_hf`` raises ``ValueError``
+unless the tensors it receives have the keys, shapes and dtypes of the PEFT tensors that
+``to_hf(..., for_checkpoint_load=True)`` was given.
 
 Limitations:
     * Decoder-only: the configuration must have ``num_nextn_predict_layers == 0`` and untied embedding and
@@ -71,9 +73,10 @@ from nemo_automodel.components.models.ernie5_5.config import Ernie5_5Config, Ern
 _MODEL_PREFIX = "model."
 
 
-def _is_lora_key(name: str) -> bool:
-    """Return whether a state key names a tensor of a LoRA adapter."""
-    return ".lora_" in name
+def _is_peft_key(name: str) -> bool:
+    """Return whether a state key names a tensor of a PEFT export: a LoRA adapter tensor, or a tensor of a module
+    that the export stores whole under the ``base_model.model.`` prefix."""
+    return ".lora_" in name or name.startswith("base_model.model.")
 
 
 class _SessionToken:
@@ -147,8 +150,8 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
         self._active: weakref.ReferenceType[_LoadDestinations] | None = None
         self._token: _SessionToken | None = None
         self._poisoned = False
-        # Shapes of the adapter tensors of the model, between the two calls of a LoRA load.
-        self._lora_shapes: dict[str, torch.Size] | None = None
+        # Shapes and dtypes of the PEFT tensors of the model, between the two calls of a PEFT load.
+        self._peft_expected: dict[str, tuple[torch.Size, torch.dtype]] | None = None
         # Tensors that the adapter created as destinations of sessions that have ended.
         self._ended: list[weakref.ReferenceType[torch.Tensor]] = []
 
@@ -171,7 +174,7 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
         duplicate._active = None
         duplicate._token = None
         duplicate._poisoned = self._poisoned or self._token is not None
-        duplicate._lora_shapes = None
+        duplicate._peft_expected = None
         duplicate._ended = list(self._ended)
         return duplicate
 
@@ -432,15 +435,15 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
             raise NotImplementedError("Quantization and v4 metadata export are unsupported")
         if self.config.num_nextn_predict_layers != 0 or self.config.tie_word_embeddings:
             raise NotImplementedError("Only untied decoder-only export is supported")
-        adapters = {name: value for name, value in state_dict.items() if _is_lora_key(name)}
-        if adapters and len(adapters) == len(state_dict):
-            shapes = {name: value.shape for name, value in adapters.items()}
-            self._lora_shapes = shapes if for_checkpoint_load else None
+        peft = {name: value for name, value in state_dict.items() if _is_peft_key(name)}
+        if peft and len(peft) == len(state_dict):
+            expected = {name: (value.shape, value.dtype) for name, value in peft.items()}
+            self._peft_expected = expected if for_checkpoint_load else None
             return dict(state_dict)
-        if adapters and not for_checkpoint_load:
-            base = {name: value for name, value in state_dict.items() if name not in adapters}
+        if peft and not for_checkpoint_load:
+            base = {name: value for name, value in state_dict.items() if name not in peft}
             converted = self.to_hf(base, quantization=quantization, v4_compatible=v4_compatible, **kwargs)
-            converted.update(adapters)
+            converted.update(peft)
             return converted
         tensors = [value for value in state_dict.values() if isinstance(value, torch.Tensor)]
         sharded = [isinstance(value, DTensor) for value in tensors]
@@ -514,17 +517,17 @@ class Ernie5_5StateDictAdapter(StateDictAdapter):
             ValueError: If the keys or tensors of the destinations were exchanged, a device mesh is given for
                 an unsharded conversion, or a conversion rejects its tensors.
         """
-        if hf_state_dict and all(_is_lora_key(name) for name in hf_state_dict):
-            # The framework copies the adapter tensors of an expert-parallel model into its parameters without
-            # comparing them, so a tensor that is missing or broadcasts would be installed silently.
-            expected, self._lora_shapes = self._lora_shapes, None
-            found = {name: value.shape for name, value in hf_state_dict.items()}
+        if hf_state_dict and all(_is_peft_key(name) for name in hf_state_dict):
+            # The framework copies the PEFT tensors of an expert-parallel model into its parameters without
+            # comparing them, so a tensor that is missing, broadcasts or has another dtype would be installed silently.
+            expected, self._peft_expected = self._peft_expected, None
+            found = {name: (value.shape, value.dtype) for name, value in hf_state_dict.items()}
             if expected is not None and found != expected:
                 names = sorted(expected.keys() ^ found.keys()) or sorted(
                     name for name in expected if found[name] != expected[name]
                 )
                 raise ValueError(
-                    f"LoRA checkpoint and model differ in the keys or shapes of {len(names)} adapter tensors, "
+                    f"PEFT checkpoint and model differ in the keys, shapes or dtypes of {len(names)} tensors, "
                     f"the first is {names[0]}"
                 )
             return dict(hf_state_dict)
