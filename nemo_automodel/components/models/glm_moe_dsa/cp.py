@@ -132,22 +132,27 @@ def gather_order(layout: QueryLayout, cp_size: int, total_tokens: int, device: t
     return from_global, to_global
 
 
-def validate_gather_order(order: GatherOrder, cp_rank: int, local_tokens: int, query_indices: torch.Tensor) -> None:
-    """Check that ``order`` describes the shard this rank actually received.
+def validate_query_rows(
+    layout: QueryLayout, cp_rank: int, cp_size: int, local_tokens: int, query_indices: torch.Tensor
+) -> None:
+    """Check that the batch's query rows are the rows ``layout`` assigns to this rank.
+
+    The K/V gather and every kernel after it assume the configured layout, so rows sliced with another layout
+    would make the kernels read wrong keys. This holds for the contiguous layout too: its gather keeps rank
+    order, which is global order only for contiguous shards.
 
     Args:
-        order: Result of :func:`gather_order` for the model's configured layout.
+        layout: The model's configured query layout (``BackendConfig.cp_query_layout``).
         cp_rank: This rank's index in the context-parallel group.
+        cp_size: Context-parallel world size.
         local_tokens: Number of local query rows.
         query_indices: The batch's ``glm_dsa_cp_query_indices`` (global positions of the local rows).
 
     Raises:
-        ValueError: If the batch was sliced with a different layout than the model's gather order
-            assumes, which would feed the kernels wrong key rows.
+        ValueError: If the batch was sliced with a different layout than the configured one.
     """
-    from_global, _ = order
-    expected = from_global[cp_rank * local_tokens : (cp_rank + 1) * local_tokens]
-    actual = query_indices.flatten().to(device=expected.device, dtype=expected.dtype)
+    expected = layout_indices_for_rank(layout, cp_rank, cp_size, local_tokens * cp_size, query_indices.device)
+    actual = query_indices.flatten().to(dtype=expected.dtype)
     if actual.numel() != local_tokens or not torch.equal(expected, actual):
         raise ValueError(
             "glm_dsa_cp_query_indices do not match BackendConfig.cp_query_layout: the batch was sliced with "

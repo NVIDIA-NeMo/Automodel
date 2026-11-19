@@ -41,7 +41,7 @@ from nemo_automodel.components.models.glm_moe_dsa.cp import (
     gather_order,
     glm_dsa_gather_replay,
     shard_glm_dsa_packed_cp_batch,
-    validate_gather_order,
+    validate_query_rows,
 )
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA, glm_dsa_indexer_replay
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
@@ -286,15 +286,17 @@ class GlmMoeDsaModel(nn.Module):
             # The layers all-gather the indexer keys and the latent K/V in rank order. Every kernel then
             # reads those rows by global token coordinate, so a layout whose rank order is not global
             # order (head/tail) needs the gather permuted back; the order is derived once per forward
-            # from the configured layout and checked against the slice this rank actually received.
-            order = gather_order(self.backend.cp_query_layout, cp_size, h.shape[0] * cp_size, h.device)
-            if order is not None:
-                query_indices = attn_kwargs.get("glm_dsa_cp_query_indices")
-                if query_indices is None:
-                    raise ValueError(
-                        "cp_query_layout='head_tail' requires glm_dsa_cp_query_indices in the packed CP batch."
-                    )
-                validate_gather_order(order, int(attn_kwargs["cp_rank"]), h.shape[0], query_indices)
+            # from the configured layout. The query rows this rank received are checked against that
+            # layout for both layouts: a contiguous gather of head/tail rows is out of order as well.
+            layout = self.backend.cp_query_layout
+            order = gather_order(layout, cp_size, h.shape[0] * cp_size, h.device)
+            query_indices = attn_kwargs.get("glm_dsa_cp_query_indices")
+            if query_indices is not None:
+                validate_query_rows(layout, int(attn_kwargs["cp_rank"]), cp_size, h.shape[0], query_indices)
+            elif order is not None:
+                raise ValueError(
+                    "cp_query_layout='head_tail' requires glm_dsa_cp_query_indices in the packed CP batch."
+                )
             attn_kwargs = dict(attn_kwargs)
             attn_kwargs["_glm_dsa_cp_gather_order"] = order
 

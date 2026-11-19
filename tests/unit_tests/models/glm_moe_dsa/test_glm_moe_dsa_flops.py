@@ -17,6 +17,7 @@
 import pytest
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+from nemo_automodel.components.models.glm_moe_dsa.config import GlmMoeDsaConfig as AutomodelGlmMoeDsaConfig
 from nemo_automodel.components.models.glm_moe_dsa.flops import model_flops
 from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config, mla_moe_flops
 
@@ -130,8 +131,11 @@ def test_rejects_non_positive_sizes(kwargs):
 
 
 def test_registry_selects_the_model_formula_and_generic_formula_overcounts():
+    # AutoConfig resolves "glm_moe_dsa" to Automodel's config class, which supplies the formula.
+    registered = AutomodelGlmMoeDsaConfig()
+    assert get_flops_formula_for_hf_config(registered) is model_flops
+    assert "flops_formula" not in registered.to_dict()
     config = _config()
-    assert get_flops_formula_for_hf_config(config) is model_flops
     # The generic MLA+MoE formula counts an indexer on every layer (including MTP) at 6 FLOPs/MAC
     # over a full square score matrix, an MTP layer the model does not run, and S x topk pairs.
     assert mla_moe_flops(config, gbs=1, seq_len=12) > model_flops(config, gbs=1, seq_len=12)

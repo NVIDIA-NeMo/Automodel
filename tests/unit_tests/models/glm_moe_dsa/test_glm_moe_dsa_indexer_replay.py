@@ -21,6 +21,7 @@ import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
@@ -153,3 +154,45 @@ def test_shared_layer_hook_binds_no_indexer_replay():
     with forward_ctx:
         assert glm_dsa_indexer_replay.current() is not None
     assert glm_dsa_indexer_replay.current() is None and glm_dsa_gather_replay.current() is None
+
+
+def test_lora_dropout_in_the_indexer_runs_it_in_the_recompute_and_keeps_gradients_exact():
+    """LoRA dropout on an indexer projection draws random numbers that the recompute must draw again."""
+    model = _model()
+    block = model.model.layers["0"]
+    peft = PeftConfig(
+        target_modules=["self_attn.indexer.weights_proj", "self_attn.q_b_proj"],
+        dim=4,
+        alpha=8,
+        dropout=0.1,
+        use_memory_efficient_lora=False,
+    )
+    apply_lora_to_linear_modules(block, peft)
+    torch.manual_seed(7)
+    batch, seq_len = 2, 12
+    x = torch.randn(batch, seq_len, model.config.hidden_size)
+    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch, -1)
+    freqs_cis = freqs_cis_from_position_ids(position_ids, model.model.freqs, qkv_format="bshd", for_fused_rope=False)
+
+    reference = copy.deepcopy(block)
+    torch.manual_seed(11)
+    ref_out, ref_idx, ref_x_grad, ref_grads = _run(reference, x, freqs_cis)
+
+    checkpointed = copy.deepcopy(block)
+    calls = _count_indexer_calls(checkpointed)
+    wrapped = checkpoint_wrapper(
+        checkpointed,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        context_fn=checkpointed.nemo_checkpoint_context_fn(None),
+    )
+    torch.manual_seed(11)
+    out, topk_indices, x_grad, grads = _run(wrapped, x, freqs_cis)
+
+    assert len(calls) == 2, "with active indexer dropout the recompute runs the indexer instead of replaying"
+    assert torch.equal(topk_indices, ref_idx)
+    torch.testing.assert_close(out, ref_out)
+    torch.testing.assert_close(x_grad, ref_x_grad)
+    assert "self_attn.q_b_proj.lora_B.weight" in grads
+    assert grads.keys() == ref_grads.keys()
+    for name, grad in grads.items():
+        torch.testing.assert_close(grad, ref_grads[name], msg=lambda m, n=name: f"{n}: {m}")

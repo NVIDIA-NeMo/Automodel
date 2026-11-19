@@ -26,6 +26,7 @@ from nemo_automodel.components.models.glm_moe_dsa import cp as glm_cp
 from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import is_cudnn_dsa_available
 from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
+from tests.unit_tests.models.glm_moe_dsa.test_glm_moe_dsa_indexer_replay import _model
 
 _CPU = torch.device("cpu")
 
@@ -133,15 +134,34 @@ def test_gather_order_is_identity_for_contiguous_and_single_rank():
         glm_cp.gather_order("head_tail", 2, 6, _CPU)
 
 
-def test_validate_gather_order_rejects_a_batch_sliced_with_another_layout():
-    order = glm_cp.gather_order("head_tail", 2, 8, _CPU)
-    glm_cp.validate_gather_order(order, 0, 4, torch.tensor([0, 1, 6, 7], dtype=torch.int32))
-    glm_cp.validate_gather_order(order, 1, 4, torch.tensor([2, 3, 4, 5], dtype=torch.int32))
+def test_validate_query_rows_rejects_a_batch_sliced_with_another_layout():
+    glm_cp.validate_query_rows("head_tail", 0, 2, 4, torch.tensor([0, 1, 6, 7], dtype=torch.int32))
+    glm_cp.validate_query_rows("head_tail", 1, 2, 4, torch.tensor([2, 3, 4, 5], dtype=torch.int32))
+    glm_cp.validate_query_rows("contiguous", 1, 2, 4, torch.tensor([4, 5, 6, 7], dtype=torch.int32))
     with pytest.raises(ValueError, match="cp_query_layout"):
         # A contiguous slice handed to a head/tail model.
-        glm_cp.validate_gather_order(order, 1, 4, torch.tensor([4, 5, 6, 7], dtype=torch.int32))
+        glm_cp.validate_query_rows("head_tail", 1, 2, 4, torch.tensor([4, 5, 6, 7], dtype=torch.int32))
     with pytest.raises(ValueError, match="cp_query_layout"):
-        glm_cp.validate_gather_order(order, 0, 4, torch.tensor([0, 1, 6], dtype=torch.int32))
+        # A head/tail slice handed to a contiguous model.
+        glm_cp.validate_query_rows("contiguous", 1, 2, 4, torch.tensor([2, 3, 4, 5], dtype=torch.int32))
+    with pytest.raises(ValueError, match="cp_query_layout"):
+        glm_cp.validate_query_rows("head_tail", 0, 2, 4, torch.tensor([0, 1, 6], dtype=torch.int32))
+
+
+def test_contiguous_model_rejects_head_tail_query_rows_before_the_gather():
+    model = _model()
+    assert model.model.backend.cp_query_layout == "contiguous"
+    with pytest.raises(ValueError, match="cp_query_layout"):
+        # Rank 1 of 2 owns rows 4..7 under the contiguous layout and rows 2..5 under head/tail.
+        model.model(
+            torch.zeros(4, dtype=torch.long),
+            position_ids=torch.tensor([2, 3, 4, 5]),
+            qkv_format="thd",
+            cp_size=2,
+            cp_rank=1,
+            cu_seqlens=torch.tensor([0, 8], dtype=torch.int32),
+            glm_dsa_cp_query_indices=torch.tensor([2, 3, 4, 5], dtype=torch.int32),
+        )
 
 
 # Three packed documents whose real lengths differ from their padded storage: pad rows at 7, 18, 19 and 23.

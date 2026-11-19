@@ -61,6 +61,7 @@ except ImportError:
 
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -647,6 +648,12 @@ class GlmMoeDsaMLA(nn.Module):
         # reuse the previous full layer's top-k indices passed in via `prev_topk_indices`.
         self.indexer = None if skip_topk else GlmMoeDsaIndexer(config, backend)
 
+    def _indexer_draws_random_numbers(self) -> bool:
+        """Return whether the indexer forward draws random numbers: LoRA dropout on one of its projections."""
+        return self.training and any(
+            isinstance(module, LinearLoRA) and module.dropout_p > 0.0 for module in self.indexer.modules()
+        )
+
     def _select_topk(
         self,
         x: torch.Tensor,
@@ -662,7 +669,9 @@ class GlmMoeDsaMLA(nn.Module):
         so a checkpointed block records the indices in its forward and hands them back in the recompute
         instead of re-running the score GEMM, the top-k and the index canonicalization. Outside a replay
         scope (no activation checkpointing, or a block wrapped without ``Block.nemo_checkpoint_context_fn``)
-        the indexer runs as before.
+        the indexer runs as before. It also runs in both passes while LoRA dropout is active on an indexer
+        projection: that forward draws random numbers, and the recompute must draw the same ones so that
+        the dropout masks after the indexer match the forward.
 
         Args:
             x: Hidden states of shape ``[batch, sequence, hidden]`` or packed ``[tokens, hidden]``.
@@ -675,7 +684,7 @@ class GlmMoeDsaMLA(nn.Module):
             Top-k index tensor in the layout documented by :meth:`GlmMoeDsaIndexer.forward`.
         """
         replay = glm_dsa_indexer_replay.current()
-        if replay is None:
+        if replay is None or self._indexer_draws_random_numbers():
             return self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
         recorder, mode = replay
         if mode == "replay":
