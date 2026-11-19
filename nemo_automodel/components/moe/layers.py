@@ -854,6 +854,16 @@ class MoE(nn.Module):
             # Default to torch experts
             self.experts = GroupedExperts(config, backend=backend)
 
+        if (
+            backend.te_nvfp4 is not None
+            and backend.te_nvfp4.resident_weights
+            and not isinstance(self.experts, GroupedExpertsTENVFP4)
+        ):
+            raise ValueError(
+                "te_nvfp4.resident_weights needs Transformer Engine experts (backend.experts='te') with the deepep, "
+                f"hybridep or uccl_ep dispatcher on more than one rank; this setup builds {type(self.experts).__name__}."
+            )
+
         if config.n_shared_experts > 0:
             self.shared_experts = MLP(
                 config.dim,

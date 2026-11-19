@@ -717,7 +717,7 @@ def apply_model_infrastructure(
         )
     validate_nvfp4_resident_experts(
         model,
-        world_size=get_world_size_safe(),
+        device_mesh=mesh.device_mesh,
         ep_size=mesh.ep_size,
         pp_size=mesh.pp_size,
         loads_base_checkpoint=bool(pretrained_model_name_or_path and load_base_model),

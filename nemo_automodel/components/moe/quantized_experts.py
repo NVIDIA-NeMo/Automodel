@@ -36,8 +36,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
@@ -1198,13 +1200,14 @@ def select_nvfp4_expert_storage_format(model: nn.Module) -> None:
 
 
 def validate_nvfp4_resident_experts(
-    model: nn.Module, *, world_size: int, ep_size: int, pp_size: int, loads_base_checkpoint: bool
+    model: nn.Module, *, device_mesh: DeviceMesh | None, ep_size: int, pp_size: int, loads_base_checkpoint: bool
 ) -> None:
     """Reject setups in which ``te_nvfp4.resident_weights`` experts cannot hold their checkpoint weights.
 
     Args:
         model: Model before distributed sharding.
-        world_size: Number of ranks.
+        device_mesh: Mesh of the ranks that run this model, which can be a part of the job; ``None`` when the
+            model has no mesh and runs on every rank.
         ep_size: Expert-parallel size.
         pp_size: Pipeline-parallel size.
         loads_base_checkpoint: Whether the base checkpoint is loaded into the model.
@@ -1220,6 +1223,7 @@ def validate_nvfp4_resident_experts(
             "te_nvfp4.resident_weights holds the expert weights of an NVFP4 checkpoint: it needs a pretrained "
             "checkpoint and load_base_model=True."
         )
+    world_size = device_mesh.size() if device_mesh is not None else get_world_size_safe()
     try:
         validate_packed_expert_topology("nvfp4", world_size=world_size, ep_size=ep_size, pp_size=pp_size)
     except ValueError as error:

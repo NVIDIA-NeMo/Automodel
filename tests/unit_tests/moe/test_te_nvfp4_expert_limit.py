@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Transformer Engine experts under NVFP4: at most 64 experts per rank."""
+"""Transformer Engine experts under NVFP4: at most 64 experts per rank, and resident weights need those experts."""
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -23,6 +23,7 @@ import torch
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
+from nemo_automodel.components.moe.layers import MoE
 
 
 class _FakeGroupedLinear(torch.nn.Module):
@@ -117,3 +118,27 @@ def test_only_nvfp4_limits_the_experts_per_rank(fake_te, quantization, n_experts
     experts.init_token_dispatcher(_FakeMesh(ep_size))
     assert experts.gate_up_linear.num_gemms == n_experts // ep_size
     assert experts.token_dispatcher.num_local_experts == n_experts // ep_size
+
+
+@pytest.mark.parametrize(
+    ("linear", "experts", "dispatcher", "world_size", "built"),
+    [
+        ("te", "torch_mm", "hybridep", 2, "GroupedExpertsDeepEP"),
+        ("torch", "te", "hybridep", 1, "GroupedExperts"),
+        ("te", "te", "torch", 2, "GroupedExperts"),
+    ],
+    ids=["torch experts", "one rank", "torch dispatcher"],
+)
+@pytest.mark.filterwarnings("ignore:.*dispatcher is enabled in config, but world size is 1")
+def test_resident_weights_are_rejected_where_floating_point_experts_are_built(
+    monkeypatch, linear, experts, dispatcher, world_size, built
+):
+    monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: world_size)
+    choice = {"linear": linear, "experts": experts, "dispatcher": dispatcher}
+    backend = BackendConfig(**choice, te_nvfp4={"resident_weights": True})
+
+    with pytest.raises(ValueError, match=f"te_nvfp4.resident_weights needs .* this setup builds {built}\\."):
+        MoE(_moe_config(8), backend)
+
+    # The same setup without resident weights builds those experts.
+    assert type(MoE(_moe_config(8), BackendConfig(**choice, te_nvfp4={})).experts).__name__ == built
