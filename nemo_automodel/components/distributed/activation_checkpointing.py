@@ -30,6 +30,7 @@ import logging
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from types import ModuleType
 from typing import List
 
 import torch
@@ -52,6 +53,7 @@ __all__ = [
     "apply_submodule_checkpointing",
     "detect_kv_sharing_and_maybe_disable_cache",
     "ensure_fsdp_ops_sac_ignored",
+    "ensure_moe_recompute_cache_ops_sac_ignored",
     "ensure_profiler_ops_sac_ignored",
     "ignore_sac_ops",
     "is_selective_activation_checkpointing",
@@ -85,7 +87,7 @@ def _resolve_torch_op(dotted_path: str):
     return _resolve_op_attr(torch.ops, dotted_path)
 
 
-def _resolve_op_attr(root: object, dotted_path: str):
+def _resolve_op_attr(root: ModuleType, dotted_path: str):
     """Resolve a dotted attribute path from ``root``, or ``None`` if any part is absent.
 
     Used for ops that live outside ``torch.ops`` (higher-order ops, optional
@@ -226,7 +228,7 @@ _SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_save_ops()
 _SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten._to_copy")
 
 
-def is_selective_activation_checkpointing(activation_checkpointing: object) -> bool:
+def is_selective_activation_checkpointing(activation_checkpointing: bool | str | None) -> bool:
     """Return whether the config value selects selective activation checkpointing.
 
     Args:
@@ -290,7 +292,7 @@ def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, 
     logger.info("[selective-ac] %s -> %s", key, verdict)
 
 
-def ignore_sac_ops(ops: list[object | None]) -> None:
+def ignore_sac_ops(ops: list[torch._ops.OpOverload | torch._ops.HigherOrderOperator | None]) -> None:
     """Add available operators to PyTorch's selective-AC ignore set.
 
     Args:

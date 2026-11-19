@@ -1,13 +1,13 @@
 ---
 title: "LLM Pre-Training with NeMo AutoModel"
-description: ""
+description: "Prepare FineWeb data, define a NanoGPT-style model, and launch a NeMo AutoModel pre-training run."
 position: 9
 ---
 This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo AutoModel pre‑training run.
 
 ## Set Up Your Environment
 
-In this guide, we will use an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use our bi-monthly Docker container (see the [Installation Guide](/get-started/installation)).
+This guide uses an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use the bi-monthly Docker container (see the [Installation Guide](/get-started/installation)).
 
 ```bash
 # clone / install AutoModel (editable for local hacks)
@@ -18,7 +18,7 @@ uv sync --locked --all-groups --extra all
 ```
 
 <Note>
-For this guide, we will use a single machine equipped with 8xH100 NVIDIA GPUs.
+This guide uses a single machine equipped with 8 H100 NVIDIA GPUs.
 
 </Note>
 
@@ -31,19 +31,19 @@ To run this guide on a single GPU, use the single-GPU command in the **Launch Tr
 
 <Warning>
 **File Size Limitation**: The `nanogpt_data_processor.py` script has a **4GB file size limit** (~2^32 bytes) due to 32-bit position tracking in the BOS index. This translates to:
-- **~2 billion tokens** when using uint16 (vocabularies &lt; 65,536 tokens, e.g., GPT-2)
-- **~1 billion tokens** when using uint32 (larger vocabularies)
+- **~2 billion tokens** when using uint16 (vocabularies &lt; 65,536 tokens, for example, GPT-2).
+- **~1 billion tokens** when using uint32 (larger vocabularies).
 
-Always use the `--max-tokens` flag to stay within these limits (e.g., `--max-tokens 2B` or `--max-tokens 1.5B`).
+Always use the `--max-tokens` flag to stay within these limits (for example, `--max-tokens 2B` or `--max-tokens 1.5B`).
 
-For larger datasets, please see [pretraining.md](/recipes-e2e-examples/pretraining) which supports sharded preprocessing without these constraints.
+For larger datasets, see [pretraining.md](/recipes-e2e-examples/pretraining), which supports sharded preprocessing without these constraints.
 
 </Warning>
 
 ### Quick Introduction to the FineWeb Dataset
-The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). For this guide, we use the **`sample-10BT` subset** (10 billion tokens), from which we extract a smaller sample (e.g., 500M tokens) that fits within the preprocessing tool's limits.
+The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). This guide uses the **`sample-10BT` subset** (10 billion tokens) and extracts a smaller sample (for example, 500M tokens) that fits within the preprocessing tool's limits.
 
-Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages using fastText language scoring, applying multiple quality filters (e.g., Gopher repetition/quality checks, C4-style rules, and custom heuristics for list-like or repeated/poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (e.g., anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
+Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages using fastText language scoring, applying multiple quality filters (for example, Gopher repetition and quality checks, C4-style rules, and custom heuristics for list-like or repeated and poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (for example, anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
 
 <Tip>
 To train on more than 2B tokens from FineWeb, see [pretraining.md](/recipes-e2e-examples/pretraining) which uses Megatron Core's sharded dataset format without file size constraints.
@@ -52,7 +52,7 @@ To train on more than 2B tokens from FineWeb, see [pretraining.md](/recipes-e2e-
 
 ### Preprocessing and Tokenization
 
-For the purposes of this guide, we provide a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes using Hugging Face's `transformers.AutoTokenizer` (default: GPT-2), and writes the output in **memory-mapped binary shards** to files. During training, we use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class that can stream efficiently at training time.
+This guide includes a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes using Hugging Face's `transformers.AutoTokenizer` (default: GPT-2), and writes the output in **memory-mapped binary shards** to files. During training, use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class, which can stream efficiently at training time.
 
 ```bash
 # Step into repo root
@@ -68,11 +68,11 @@ python tools/nanogpt_data_processor.py \
 #    dataset.bin (single binary file with all tokens)
 ```
 
-**How the preprocessor works:** The script streams data iteratively from the Hugging Face Hub (avoiding loading the entire dataset into memory), uses a multiprocessing pipeline with separate reader and writer processes, and parallelizes tokenization across multiple CPU cores using `ProcessPoolExecutor`. This design enables efficient processing of very large datasets while maintaining low memory overhead. By default, uses the `gpt2` tokenizer, but can support other tokenizers using the `--tokenizer` option.
+**How the preprocessor works:** The script streams data iteratively from the Hugging Face Hub (avoiding loading the entire dataset into memory), uses a multiprocessing pipeline with separate reader and writer processes, and parallelizes tokenization across multiple CPU cores using `ProcessPoolExecutor`. This design enables efficient processing of very large datasets while maintaining low memory overhead. By default, the script uses the `gpt2` tokenizer, and it can use other tokenizers with the `--tokenizer` option.
 
 Consider the following options:
 1. Adjust `--max-tokens` to control how many tokens to process (must stay within the 4GB file size limit mentioned above).
-2. Adjust `--chunk-size` for processing batch size.
+2. Adjust `--chunk-size` for the processing batch size.
 3. Use `--num-workers` to control parallelization.
 4. Specify `--output-dir` to change the output location.
 
@@ -80,16 +80,16 @@ Consider the following options:
 
 NeMo AutoModel follows a simple but powerful flow for training:
 
-1. The installed `automodel` CLI (`nemo_automodel.cli.app`) is the entry point. It reads the recipe selected by the YAML configuration and wires up the training components. Any configuration option can be overridden using CLI arguments (e.g., `--model.n_layer 6`).
+1. The installed `automodel` CLI (`nemo_automodel.cli.app`) is the entry point. It reads the recipe selected by the YAML configuration and wires up the training components. Any configuration option can be overridden using CLI arguments (for example, `--model.n_layer 6`).
 2. The YAML file describes each component of the training job (such as `model`, `dataset`, `optimizer`, `distributed`, `checkpoint`, and optional `wandb`).
 3. Each component is constructed from its `_target_`, which points to a Python callable (function or class constructor) to instantiate. The remaining keys in that YAML block become keyword arguments for that callable.
 
 How `_target_` is resolved:
 - Import path to a Python object (for example, `my_pkg.models.build_model`).
-- Local Python file path plus object name (for example, `/abs/path/to/my_model.py:build_model`).
+- Local Python file path plus object name (for example, `/abs/path/to/my_model.py:build_model`). A file outside the installed `nemo_automodel` package requires `NEMO_ENABLE_USER_MODULES=1`.
 - Library callables such as Hugging Face `transformers.AutoModelForCausalLM.from_config`.
 
-Nested objects can also specify their own `_target_` (common when building Hugging Face `config` objects first and passing them into a `from_config` method). Any YAML key can be overridden at launch time from the CLI, making it easy to tweak hyperparameters without editing files.
+Nested objects can also specify their own `_target_` (common when building Hugging Face `config` objects first and passing them into a `from_config` method). Any YAML key can be overridden at launch time from the CLI, making it easy to adjust hyperparameters without editing files.
 
 With this context, let’s define a model using `_target_`, then point the dataset at your preprocessed shards, and finally review the full YAML.
 
@@ -105,10 +105,10 @@ Below are examples for each pattern.
 
 ### NanoGPT Source and File-Path `_target_`
 
-Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gpt2.py) used for this NanoGPT‑style pretraining flow.
+Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gpt2.py) used for this NanoGPT-style pre-training flow.
 It is a pure‑PyTorch model with tied embeddings and standard transformer blocks:
 
-```
+```python
 """
 Self-contained GPT-2 (Causal LM) implementation.
 
@@ -302,7 +302,7 @@ def build_gpt2_model(
     )
 ```
 
-In short, `build_gpt2_model(...)` constructs a compact GPT‑2 with configurable depth/width/heads and returns an `nn.Module` that outputs logits over the vocabulary. It’s intentionally lean (no KV‑cache or generation helpers) but perfectly suited for forward/backward passes and next‑token prediction.
+In short, `build_gpt2_model(...)` constructs a compact GPT-2 with configurable depth, width, and heads and returns an `nn.Module` that outputs logits over the vocabulary. It is intentionally lean (no KV-cache or generation helpers) and suited for forward and backward passes and next-token prediction.
 
 To use this exact implementation directly from a file path, point `_target_` to the file and object name (`path.py:object`). Absolute paths are recommended:
 
@@ -317,6 +317,8 @@ model:
 ```
 
 This loads the file on disk and calls `build_gpt2_model(...)` with the remaining keys as keyword arguments.
+
+The file loads without an opt-in only when it is inside the `nemo_automodel` package that Python imports, such as a repository checkout installed in editable mode. For any other location, including a modified copy of the file, launch with `NEMO_ENABLE_USER_MODULES=1`, because loading the file runs its code.
 
 ### Import Path to a Callable (Function or Class)
 
@@ -333,7 +335,7 @@ model:
   n_head: 12
 ```
 
-### Hugging Face Models using `from_config` Function
+### Hugging Face Models Using the from_config Function
 
 You can instantiate any Hugging Face causal LM with a config-first flow by targeting a `from_config` callable and providing a nested `config` node. The nested node is itself resolved using `_target_`, so you can compose Hugging Face configs directly in YAML.
 
@@ -364,8 +366,8 @@ model:
 ```
 
 <Note>
-- The `model._target_` may reference an import path or a local Python file using the `path.py:object` form.
-- Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This supports both Hugging Face `from_config` callables and direct architecture constructors.
+- The `model._target_` can reference an import path or a local Python file using the `path.py:object` form. A local file outside the installed package requires `NEMO_ENABLE_USER_MODULES=1`.
+- Any nested mapping that includes `_target_` (for example, `config:`) is instantiated first and its result is passed upward. This supports both Hugging Face `from_config` callables and direct architecture constructors.
 - You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
 
 </Note>
@@ -406,13 +408,15 @@ distributed:
   cp_size: 1
 ```
 
-**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel package (or any Python module). For example, `nemo_automodel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
+**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel package (or any Python module). For example, `nemo_automodel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (for example, `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while using the training infrastructure.
 
 Update the `file_pattern` to match your data location. For example, if using `tools/nanogpt_data_processor.py` with the default settings: `"tools/fineweb_max_tokens_500M/dataset.bin"`
 
-Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is model-agnostic.
+Scale **width and depth**, `batch_size`, or `seq_len` as needed. The recipe is model-agnostic.
 
 ## Launch Training
+
+Use one of the following commands:
 
 ```bash
 # Single GPU
@@ -422,7 +426,7 @@ uv run automodel examples/llm_pretrain/nanogpt_pretrain.yaml
 uv run automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
 ```
 <Tip>
-Adjust the `distributed` section in the YAML config to change between DDP, FSDP2, etc.
+Adjust the `distributed` section in the YAML config to change between Distributed Data Parallel (DDP), FSDP2, and other strategies.
 
 </Tip>
 
@@ -436,7 +440,7 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 ## Monitor and Evaluate Training
 
 * **TPS** (tokens per second), **gradient norm**, and **loss** statistics print every optimization step.
-* Enable `wandb` in the YAML for dashboards (`wandb.project`, `wandb.entity`, etc.).
+* Enable `wandb` in the YAML for dashboards (`wandb.project`, `wandb.entity`, and so on).
 * Periodic checkpoints can be loaded using `TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint()`.
 
 Example W&B configuration:
@@ -449,8 +453,10 @@ wandb:
 
 ## Explore Further Work
 
-1. **Scaling up**: Swap the GPT-2 config for `LlamaForCausalLM`, `Qwen2`, or any Hugging Face-compatible causal model; increase `n_layer`, `n_embd`, etc.
-2. **Mixed precision** - FSDP2 + `bfloat16` (`dtype: bfloat16` in distributed config) for memory savings.
-3. **Sequence packing** - set `packed_sequence.packed_sequence_size` &gt;0 to pack variable-length contexts and boost utilization.
-4. **Custom datasets** - implement your own `IterableDataset` or convert existing corpora to the `.bin` format using `tools/nanogpt_data_processor.py` as a template.
-5. **BOS alignment** - set `align_to_bos: true` in the dataset config to ensure sequences start with BOS tokens (requires `bos_token` parameter).
+The following options extend this guide:
+
+1. **Scaling up**: Swap the GPT-2 config for `LlamaForCausalLM`, `Qwen2`, or any Hugging Face-compatible causal model, and increase `n_layer`, `n_embd`, and similar settings.
+2. **Mixed precision**: Use FSDP2 and `bfloat16` (`dtype: bfloat16` in the distributed config) for memory savings.
+3. **Sequence packing**: Set `packed_sequence.packed_sequence_size` &gt; 0 to pack variable-length contexts and increase utilization.
+4. **Custom datasets**: Implement your own `IterableDataset` or convert existing corpora to the `.bin` format using `tools/nanogpt_data_processor.py` as a template.
+5. **BOS alignment**: Set `align_to_bos: true` in the dataset config to ensure sequences start with BOS tokens (requires the `bos_token` parameter).

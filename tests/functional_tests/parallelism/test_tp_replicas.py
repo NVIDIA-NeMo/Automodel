@@ -114,15 +114,6 @@ class _OwnerShardedExpertModel(nn.Module):
         exclude_from_tp_replica_sync(self.expert)
 
 
-class _ModelOwnedShardedParameterModel(nn.Module):
-    """Plain parameter whose rank-local shard is owned by the model."""
-
-    def __init__(self, rank: int, owner_world_size: int) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.full((4,), 80.0 + rank))
-        setattr(self.weight, "_nemo_model_owned_grad_divisor", float(owner_world_size))
-
-
 class _PartialGradientModel(nn.Module):
     """TP-replicated parameter whose gradient remains Partial on TP."""
 
@@ -233,14 +224,6 @@ def _run_replica_sync_worker(rank: int, world_size: int, init_file: str) -> None
         torch.testing.assert_close(owner_sharded_experts.expert.weight, torch.full((4,), 50.0 + rank))
         torch.testing.assert_close(owner_sharded_experts.expert.scale, torch.full((2,), 60.0 + rank))
         torch.testing.assert_close(owner_sharded_experts.expert.weight.grad, torch.full((4,), 70.0 + rank))
-        torch.distributed.barrier()
-
-        model_owned_shard = _ModelOwnedShardedParameterModel(rank, world_size)
-        model_owned_shard.weight.grad = torch.full_like(model_owned_shard.weight, 100.0 + rank)
-        assert broadcast_tp_replicas([model_owned_shard], tp_mesh) == 0
-        assert synchronize_tp_replica_gradients([model_owned_shard], tp_mesh) == 0
-        torch.testing.assert_close(model_owned_shard.weight, torch.full((4,), 80.0 + rank))
-        torch.testing.assert_close(model_owned_shard.weight.grad, torch.full((4,), 100.0 + rank))
         torch.distributed.barrier()
 
         partial_gradient_model = _PartialGradientModel(rank, tp_mesh)

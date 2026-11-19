@@ -54,7 +54,7 @@ from nemo_automodel.components.speculative.streaming.store import FeatureStore
 logger = logging.getLogger(__name__)
 
 
-def _resolve_algorithm(backend: object) -> FeatureAlgorithm:
+def _resolve_algorithm(backend: Eagle3TargetBackend) -> FeatureAlgorithm:
     """Pick the producer-side :class:`FeatureAlgorithm` for a backend.
 
     Dispatch on the backend's base class, not its class-name string: every

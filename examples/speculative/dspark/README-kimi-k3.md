@@ -1,4 +1,4 @@
-# Training a Kimi K3 DSpark drafter
+# Train a Kimi K3 DSpark Drafter
 
 This recipe trains a dense Kimi K3 MLA drafter against the frozen Kimi K3 text
 model. The draft preserves the target's MLA projections, output gate, RMSNorm,
@@ -11,7 +11,7 @@ reference configuration and its header comment describes the architecture.
 The target has 896 routed experts, so shard it with expert parallelism and pick
 an `ep_size` that divides 896. `pp_size` must remain 1: online hidden-state
 capture hooks one complete, non-pipelined target forward. The provided
-configuration uses `ep_size: 64`, i.e. 64 ranks across eight 8-GPU nodes; lower
+configuration uses `ep_size: 64`, that is, 64 ranks across eight 8-GPU nodes; lower
 it to fit a smaller allocation.
 
 ## Data
@@ -27,5 +27,5 @@ Run the same command on every node, varying only `--node-rank`. Node 0 provides
 the rendezvous address.
 
 ```bash
-torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/kimi_k3_dspark.yaml
+torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/kimi_k3_dspark.yaml
 ```

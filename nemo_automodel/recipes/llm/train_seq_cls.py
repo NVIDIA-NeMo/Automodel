@@ -35,7 +35,7 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
@@ -123,6 +123,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             # Preserve the pre-freeze_config behavior for existing PEFT sequence
             # classification recipes; new configs declare this selector directly.
             freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
+            logging.info(
+                "freeze_config is not set: training the classifier in full next to the LoRA adapters "
+                "(unfreeze_modules: [{glob: '*classifier'}]). Keep the classifier out of the PEFT targets."
+            )
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,
@@ -147,15 +151,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         def materialize_loader(config):
             build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
-            with ScopedRNG(seed=config.seed, ranked=True):
-                return config.build(
-                    tokenizer=self.tokenizer,
-                    dataset_build_context=build_context,
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                    pp_enabled=False,
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
-                )
+            return config.build(
+                tokenizer=self.tokenizer,
+                dataset_build_context=build_context,
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                pp_enabled=False,
+                cp_size=self.cfg.get("distributed.cp_size", 1),
+            )
 
         self.dataloader = materialize_loader(self.cfg.dataloader)
 

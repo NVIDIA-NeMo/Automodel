@@ -1014,7 +1014,7 @@ class CrossEncoderModel(nn.Module):
         self.is_causal = is_causal
 
     def _get_consolidated_hf_metadata_exporter(
-        self, *, tokenizer: object, original_model_path: str | None
+        self, *, tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None, original_model_path: str | None
     ) -> "_ConsolidatedHFMetadataExporter | None":
         """Use the same CrossEncoder metadata contract for direct and consolidated saves."""
         # Generative backbones keep their language-model export contract. Classifier

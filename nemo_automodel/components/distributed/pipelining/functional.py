@@ -46,7 +46,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _get_optional_hook(module: object, name: str) -> Callable | None:
+def _get_optional_hook(module: nn.Module, name: str) -> Callable | None:
     try:
         inspect.getattr_static(module, name)
     except AttributeError:
@@ -649,7 +649,7 @@ def split_model_into_stages(
     text_model = get_text_module(model.model if has_model_attr else model)
     text_model_attr_name = ""
     for attr_name in TEXT_MODULE_ATTRS:
-        if hasattr(model, attr_name) or hasattr(model.model, attr_name):
+        if hasattr(model, attr_name) or (has_model_attr and hasattr(model.model, attr_name)):
             text_model_attr_name = attr_name
             break
     has_rotary_emb = hasattr(text_model, "rotary_emb")
@@ -860,7 +860,8 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages.
+        A schedule whose ``step()`` and ``eval()`` discard outputs by default.
+        Pass ``return_outputs=True`` to return merged outputs; read losses from ``losses``.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 
@@ -911,6 +912,7 @@ def build_pipeline_schedule(
         )
         schedule._load_csv(pp_schedule_csv)
 
+    schedule.step = functools.partial(schedule.step, return_outputs=False)
     return schedule
 
 

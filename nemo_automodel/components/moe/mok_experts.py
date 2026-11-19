@@ -16,8 +16,8 @@
 
 import math
 from collections import OrderedDict
-from dataclasses import fields, is_dataclass
-from typing import Any
+from dataclasses import Field, fields, is_dataclass
+from typing import Any, ClassVar, Protocol
 
 import torch
 import torch.distributed as dist
@@ -30,6 +30,25 @@ from nemo_automodel.components.models.common import BackendConfig, MoKBackendCon
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import safe_import
+
+
+class _MoKTensorRecord(Protocol):
+    """Tensor-only dataclass accepted by checkpoint flattening and reconstruction."""
+
+    __dataclass_fields__: ClassVar[dict[str, Field[torch.Tensor | tuple[torch.Tensor, ...]]]]
+
+
+class _MoKAutogradContext(Protocol):
+    runtime: "_MoKRuntime"
+    saved_tensors: tuple[torch.Tensor, ...]
+    mok_tensor_specs: tuple[
+        tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]],
+        tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]],
+    ]
+    mxfp8_weight_tensor_count: int
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
+
 
 _MOK_IMPORT_MESSAGE = (
     "dispatcher='mok' requires a built Mixture-of-Kittens installation or an importable mixture-of-kittens checkout."
@@ -123,8 +142,8 @@ def _copy_local_init_weight(destination: torch.Tensor, source: torch.Tensor) -> 
 
 
 def _flatten_mok_tensor_dataclass(
-    value: object,
-) -> tuple[tuple[torch.Tensor, ...], tuple[type, tuple[tuple[str, int], ...]]]:
+    value: _MoKTensorRecord,
+) -> tuple[tuple[torch.Tensor, ...], tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]]]:
     """Flatten a MoK schedule/context without retaining tensor references in metadata.
 
     MoK's dataclasses contain either tensors or tuples of tensors (the latter for
@@ -164,10 +183,10 @@ def _flatten_mok_tensor_dataclass(
 
 
 def _unflatten_mok_tensor_dataclass(
-    spec: tuple[type, tuple[tuple[str, int], ...]],
+    spec: tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]],
     tensors: tuple[torch.Tensor, ...],
     offset: int,
-) -> tuple[object, int]:
+) -> tuple[_MoKTensorRecord, int]:
     """Reconstruct a MoK dataclass from checkpoint-managed saved tensors."""
     dataclass_type, field_layout = spec
     values: dict[str, Any] = {}
@@ -284,8 +303,8 @@ class _MoKRuntime:
         routed_down_weights: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
-        object,
-        object,
+        _MoKTensorRecord,
+        _MoKTensorRecord,
         tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None,
     ]:
         """Run MoK's manual forward and retain its backward context.
@@ -352,8 +371,8 @@ class _MoKRuntime:
 
     def backward(
         self,
-        schedule: object,
-        forward_context: object,
+        schedule: _MoKTensorRecord,
+        forward_context: _MoKTensorRecord,
         grad_output: torch.Tensor,
         x: torch.Tensor,
         router_weights: torch.Tensor,
@@ -363,7 +382,7 @@ class _MoKRuntime:
         routed_gate_weights: torch.Tensor,
         routed_up_weights: torch.Tensor,
         routed_down_weights: torch.Tensor,
-        mxfp8_weights: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None,
+        mxfp8_weights: tuple[tuple[torch.Tensor, ...], ...] | None,
     ) -> tuple[torch.Tensor, ...]:
         """Run MoK's manual backward.
 
@@ -437,7 +456,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx: object,
+        ctx: _MoKAutogradContext,
         runtime: _MoKRuntime,
         x: torch.Tensor,
         router_weights: torch.Tensor,
@@ -505,7 +524,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+    def backward(ctx: _MoKAutogradContext, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         """Run the fused MoK backward pass.
 
         Args:

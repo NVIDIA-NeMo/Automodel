@@ -859,3 +859,98 @@ class MiniMaxM3VLStateDictAdapter(StateDictAdapter):
         # Text backbone (model.* / lm_head.*): delegate, then re-add language_model. prefix.
         converted = self.text_adapter.convert_single_tensor_to_hf(fqn, tensor, **kwargs)
         return [("language_model." + k, v) for k, v in converted]
+
+
+_DSPARK_RELEASED_PREFIX = "language_model.model.dspark."
+# The released draft shares these with the target and does not store them.
+_DSPARK_SHARED_KEYS = frozenset({"embed_tokens.weight", "lm_head.weight"})
+
+
+def _dspark_released_key(native_key: str) -> str:
+    """Return the released checkpoint name of a native draft key."""
+    key = re.sub(r"^layers\.(\d+)\.", r"layers.\1.decoder_layer.", native_key)
+    if key.startswith("norm."):
+        key = f"final_{key}"
+    return f"{_DSPARK_RELEASED_PREFIX}{key}"
+
+
+def _dspark_native_key(released_key: str) -> str:
+    """Return the native draft key of a released checkpoint name."""
+    if not released_key.startswith(_DSPARK_RELEASED_PREFIX):
+        raise ValueError(f"Checkpoint key {released_key} is not a DSpark key under {_DSPARK_RELEASED_PREFIX}")
+    key = released_key.removeprefix(_DSPARK_RELEASED_PREFIX).replace(".decoder_layer.", ".")
+    return key.removeprefix("final_") if key.startswith("final_norm.") else key
+
+
+class MiniMaxM3DSparkStateDictAdapter(StateDictAdapter):
+    """Convert the DSpark draft between native keys and the released ``dspark/`` layout."""
+
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: str | None = None,
+        quantization: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Rename native draft tensors to released names.
+
+        Args:
+            state_dict: Native mapping. Every tensor keeps its parameter layout, and
+                the shared embedding and LM head are left out of the result.
+            exclude_key_regex: Optional pattern of released names to drop.
+            quantization: Must be false; the draft trains and exports unquantized.
+            **kwargs: Additional checkpoint protocol arguments.
+
+        Returns:
+            Mapping from released names to the same tensor objects.
+        """
+        output: dict[str, Any] = {}
+        for key, value in state_dict.items():
+            output.update(
+                self.convert_single_tensor_to_hf(
+                    key,
+                    value,
+                    exclude_key_regex=exclude_key_regex,
+                    quantization=quantization,
+                    **kwargs,
+                )
+            )
+        return output
+
+    def from_hf(
+        self,
+        hf_state_dict: dict[str, Any],
+        device_mesh: DeviceMesh | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Rename released draft tensors to native names.
+
+        Args:
+            hf_state_dict: Mapping from released names to tensors in their parameter
+                layout. The mapping is consumed.
+            device_mesh: Unused because the draft has no routed experts.
+            **kwargs: Additional checkpoint protocol arguments.
+
+        Returns:
+            Mapping from native names to the same tensor objects.
+        """
+        return {_dspark_native_key(key): hf_state_dict.pop(key) for key in list(hf_state_dict)}
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
+        """Rename one native draft tensor.
+
+        Args:
+            fqn: Native name of the tensor.
+            tensor: Tensor in its parameter layout, returned as the same object.
+            **kwargs: ``exclude_key_regex`` and ``quantization``.
+
+        Returns:
+            The released name and tensor, or an empty list for shared or excluded keys.
+        """
+        if kwargs.get("quantization", False):
+            raise ValueError("The MiniMax M3 DSpark draft exports unquantized weights")
+        if fqn in _DSPARK_SHARED_KEYS:
+            return []
+        key = _dspark_released_key(fqn)
+        exclude = kwargs.get("exclude_key_regex")
+        return [] if exclude and re.match(exclude, key) else [(key, tensor)]

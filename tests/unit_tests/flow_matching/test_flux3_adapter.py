@@ -326,6 +326,21 @@ class TestFlux3Forward:
         assert call_kwargs["return_dict"] is False
         assert "guidance" not in call_kwargs
 
+    def test_forward_preserves_required_grid_metadata(self) -> None:
+        """The same prepared input payload can be forwarded more than once."""
+        adapter = Flux3Adapter()
+        inputs = self._make_inputs(1, 8, 2, 3, seq_len=2)
+        model = MagicMock(return_value=(torch.randn(1, 6, 8),))
+
+        first = adapter.forward(model, inputs)
+        second = adapter.forward(model, inputs)
+
+        assert torch.equal(first, second)
+        assert inputs["_h_p"] == 2
+        assert inputs["_w_p"] == 3
+        assert "_h_p" not in model.call_args.kwargs
+        assert "_w_p" not in model.call_args.kwargs
+
     def test_prediction_space_matches_target_space(self):
         # forward() must return prediction in the unpacked latent space so
         # MSE against (noise - latents) is computed elementwise-aligned.

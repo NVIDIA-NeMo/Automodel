@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import gc
 import math
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal, Protocol, runtime_checkable
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -28,6 +30,19 @@ from nemo_automodel.components.training.triton.grad_norm import multi_tensor_abs
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
 _GradNormBackend = Literal["triton", "te"]
+
+
+@runtime_checkable
+class SketchClippingOptimizer(Protocol):
+    """Optimizer that owns gradient synchronization and clipping (e.g. gradient sketch).
+
+    Matched structurally so this component does not import the optim component; plain
+    ``torch.optim.Optimizer`` instances have neither member.
+    """
+
+    ready: bool
+
+    def synchronize_and_clip(self, process_group: Any, max_norm: float | None) -> torch.Tensor: ...
 
 
 def _ep_local_expert_param_ids(
@@ -77,7 +92,7 @@ def _combine_norms(norms: list[torch.Tensor], norm_type: float, target_device: t
 
 def _all_reduce_scalar(
     scalar: torch.Tensor,
-    op: torch.distributed.ReduceOp,
+    op: torch.distributed.ReduceOp.RedOpType | torch.distributed.ReduceOp,
     mesh: DeviceMesh,
     mesh_dim: int | None = None,
 ) -> torch.Tensor:
@@ -109,7 +124,7 @@ def _all_reduce_scalar(
 
 
 @torch.no_grad()
-def count_tail_padding(labels, ignore_label=-100):
+def count_tail_padding(labels: torch.Tensor, ignore_label: int = -100) -> int:
     """Counts the total number of padding token in the tail of labels
 
     e.g.
@@ -134,7 +149,7 @@ def count_tail_padding(labels, ignore_label=-100):
     prod_mask = torch.cumprod(tail_mask.int(), dim=1)
 
     # Count tail -100s by summing cumprod mask along the sequence dimension
-    return prod_mask.view(-1).sum().item()
+    return int(prod_mask.view(-1).sum().item())
 
 
 def _use_fused_grad_norm(representative: torch.Tensor, norm_type: float) -> bool:
@@ -206,7 +221,7 @@ def _local_te_l2_norm(gradients: list[torch.Tensor], target_device: torch.device
         have_te_optimizers, te_optimizers = (
             safe_import("transformer_engine.pytorch.optimizers") if have_te else (False, None)
         )
-        if not have_te_optimizers:
+        if not (have_te_optimizers and te_optimizers is not None):
             raise RuntimeError("Transformer Engine gradient-norm backend requested but unavailable")
         for (device, _), group in te_groups.items():
             overflow = torch.zeros(1, dtype=torch.int32, device=device)
@@ -331,16 +346,18 @@ def _clip_grad_norm_impl(
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in representative.placements)
 
-        def _reduce_group_scalar(scalar: torch.Tensor, op: torch.distributed.ReduceOp) -> torch.Tensor:
+        def _reduce_group_scalar(
+            scalar: torch.Tensor, op: torch.distributed.ReduceOp.RedOpType | torch.distributed.ReduceOp
+        ) -> torch.Tensor:
             # The same reductions must run for MAX (before the overflow-guard
             # scale) and SUM (after), and on every rank of each group whether
             # or not this rank contributed grads.
-            if is_dtensor and not has_partial:
+            if isinstance(representative, DTensor) and not has_partial:
                 for dim_idx, pl in enumerate(representative.placements):
                     if isinstance(pl, Replicate):
                         continue
                     scalar = _all_reduce_scalar(scalar, op, representative.device_mesh, dim_idx)
-            if is_ep_group:
+            if is_ep_group and ep_mesh is not None:
                 # Expert grads differ per EP rank but their own mesh (if any)
                 # lacks the EP dim, so fold in the EP-wide reduction too.
                 scalar = _all_reduce_scalar(scalar, op, ep_mesh)
@@ -552,11 +569,7 @@ def clip_grad_norm(
     )
     if can_use_torch_clip:
         for p in parameters:
-            if (
-                isinstance(p, DTensor)
-                or isinstance(p.grad, DTensor)
-                or getattr(p, "_nemo_model_owned_grad_divisor", None) is not None
-            ):
+            if isinstance(p, DTensor) or isinstance(p.grad, DTensor):
                 can_use_torch_clip = False
                 break
 
@@ -585,7 +598,7 @@ def clip_grad_norm(
     return grad_norm
 
 
-def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
+def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled: bool = False) -> None:
     """Prepare model parts before starting gradient accumulation.
 
     This is typically called once at the start of gradient accumulation to prepare
@@ -601,11 +614,12 @@ def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled
         return
 
     for mp in model_parts:
-        if hasattr(mp, "prepare_for_grad_accumulation"):
-            mp.prepare_for_grad_accumulation(pp_enabled=pp_enabled)
+        fn = getattr(mp, "prepare_for_grad_accumulation", None)
+        if callable(fn):
+            fn(pp_enabled=pp_enabled)
 
 
-def prepare_after_first_microbatch():
+def prepare_after_first_microbatch() -> None:
     """Disable first-microbatch flag after the first forward-backward pass.
 
     Called after the first microbatch in gradient accumulation so that
@@ -614,7 +628,7 @@ def prepare_after_first_microbatch():
     set_is_first_microbatch(False)
 
 
-def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
+def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: bool = False) -> None:
     """Prepare model parts before the final backward pass.
 
     This is typically called before the final gradient accumulation step to prepare
@@ -629,8 +643,9 @@ def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: b
         return
 
     for mp in model_parts:
-        if hasattr(mp, "prepare_for_final_backward"):
-            mp.prepare_for_final_backward(pp_enabled=pp_enabled)
+        fn = getattr(mp, "prepare_for_final_backward", None)
+        if callable(fn):
+            fn(pp_enabled=pp_enabled)
 
 
 def get_expert_tp_replication_factor(
@@ -673,16 +688,16 @@ def scale_grads_and_clip_grad_norm(
     use_torch_clip_grad_norm: bool = False,
     grad_norm_backend: _GradNormBackend = "triton",
 ) -> torch.Tensor | float:
-    """Scale gradients for PP/EP and model-owned shards, then clip.
+    """Scale gradients for PP/EP, then clip.
 
     The caller must synchronize TP-replicated gradients once after accumulation
     and before calling this function. This helper does not synchronize replicas.
+    Parameters a model shards itself (for example an Engram table routed over an
+    owner group) arrive here already averaged by the model's own backward.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
     - EP scaling: for parameters on the expert axis, divide grads by
       ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
-    - Owner-sharded scaling: divide each marked gradient by the explicit factor
-      declared by its model-owned sharding contract.
     - Finally, perform grad clipping with PP/EP-aware reductions.
 
     Args:
@@ -721,46 +736,41 @@ def scale_grads_and_clip_grad_norm(
 
     ep_ratio: float | None = None
     if moe_mesh is not None and dp_group_size is not None:
-        ep_shard_size = moe_mesh["ep_shard"].size() if "ep_shard" in moe_mesh.mesh_dim_names else 1
+        mesh_names = getattr(moe_mesh, "mesh_dim_names", None)
+        ep_shard_size = moe_mesh["ep_shard"].size() if (mesh_names is not None and "ep_shard" in mesh_names) else 1
         if ep_shard_size > 0:
             ep_ratio = float(dp_group_size) / float(ep_shard_size)
             ep_ratio *= float(expert_tp_replication_factor)
-
-    has_model_owned_sharded_params = any(
-        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
-        for model_part in model_parts
-        for parameter in model_part.parameters()
-    )
 
     # One structural scan shared by the EP grad scaling below and the EP norm
     # reduction inside clipping.
     ep_param_ids = _ep_local_expert_param_ids(model_parts, ep_axis_name) if moe_mesh is not None else None
 
     # Single pass over parameters to apply both scalings where applicable
-    if pp_divisor is not None or ep_ratio is not None or has_model_owned_sharded_params:
+    if pp_divisor is not None or ep_ratio is not None:
         for mp in model_parts:
             for p in mp.parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
-                owner_divisor = getattr(p, "_nemo_model_owned_grad_divisor", None)
-                if owner_divisor is not None:
-                    p.grad.div_(float(owner_divisor))
                 if ep_ratio is not None:
                     # Scale expert gradients by the FSDP/EP ratio and by any
                     # identical TP token replicas that were gathered inside EP.
                     # DTensor experts carrying the EP axis: check their mesh.
                     # TE grouped experts (never DTensor-wrapped on EP): the
                     # structural marker set collected above.
+                    p_mesh = getattr(p, "device_mesh", None)
+                    p_mesh_names = getattr(p_mesh, "mesh_dim_names", None)
                     is_ep_sharded_dtensor = (
                         isinstance(p, DTensor)
                         and isinstance(p.grad, DTensor)
-                        and ep_axis_name
-                        and ep_axis_name in p.device_mesh.mesh_dim_names
+                        and bool(ep_axis_name)
+                        and p_mesh_names is not None
+                        and ep_axis_name in p_mesh_names
                     )
                     is_expert_param = ep_param_ids is not None and id(p) in ep_param_ids
-                    if owner_divisor is None and (is_ep_sharded_dtensor or is_expert_param):
+                    if is_ep_sharded_dtensor or is_expert_param:
                         p.grad.div_(ep_ratio)
 
     # Clip with the existing PP/EP-aware helper
@@ -780,7 +790,66 @@ def scale_grads_and_clip_grad_norm(
     )
 
 
-def move_to_device(model, device):
+def _reject_presketch_gradient_scaling(model_parts: list[torch.nn.Module], clip_kwargs: dict[str, Any]) -> None:
+    """Reject layouts whose gradients ``scale_grads_and_clip_grad_norm`` would pre-scale.
+
+    The sketch path bypasses that helper, so expert-parallel ratio scaling and model-owned
+    gradient divisors would be silently skipped.
+    """
+    moe_mesh = clip_kwargs.get("moe_mesh")
+    ep_axis_name = clip_kwargs.get("ep_axis_name")
+    mesh_names = getattr(moe_mesh, "mesh_dim_names", None) or ()
+    expert_parallel = (
+        moe_mesh is not None and bool(ep_axis_name) and ep_axis_name in mesh_names and moe_mesh[ep_axis_name].size() > 1
+    )
+    owner_scaled = any(
+        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        for model_part in model_parts
+        for parameter in model_part.parameters()
+    )
+    if expert_parallel or owner_scaled:
+        raise RuntimeError("gradient sketch does not support expert parallelism or owner-scaled gradients")
+
+
+def clip_grads_for_optimizers(
+    optimizers: list[torch.optim.Optimizer],
+    max_grad_norm: float | None,
+    model_parts: list[torch.nn.Module],
+    *,
+    dp_group: Any = None,
+    **clip_kwargs: Any,
+) -> torch.Tensor | float:
+    """Clip gradients the way the configured optimizers require.
+
+    Gradient-sketch optimizers own their gradients (sketches plus native grads) and
+    synchronize them as part of clipping; everything else goes through
+    :func:`scale_grads_and_clip_grad_norm` with ``clip_kwargs`` forwarded verbatim.
+
+    Args:
+        optimizers: Optimizers built for ``model_parts`` (one per part).
+        max_grad_norm: Clip threshold, or ``None`` to only measure.
+        model_parts: Model parts whose parameters the optimizers update.
+        dp_group: Data-parallel process group used by sketch synchronization.
+        **clip_kwargs: Keyword arguments for ``scale_grads_and_clip_grad_norm``.
+
+    Returns:
+        The pre-clip global norm.
+
+    Raises:
+        ValueError: If sketch and non-sketch optimizers are mixed.
+        RuntimeError: If sketch optimizers are used with expert parallelism or owner-scaled gradients.
+    """
+    sketch_optimizers = [o for o in optimizers if isinstance(o, SketchClippingOptimizer)]
+    if sketch_optimizers and len(sketch_optimizers) != len(optimizers):
+        raise ValueError("Cannot mix gradient-sketch optimizers with other optimizers across model parts")
+    if sketch_optimizers:
+        _reject_presketch_gradient_scaling(model_parts, clip_kwargs)
+        norms = [o.synchronize_and_clip(dp_group, max_grad_norm) for o in sketch_optimizers]
+        return torch.stack(norms).square().sum().sqrt() if len(norms) > 1 else norms[0]
+    return scale_grads_and_clip_grad_norm(max_grad_norm, model_parts, **clip_kwargs)
+
+
+def move_to_device(model: torch.nn.Module, device: torch.device | str) -> None:
     """Move a model and its buffers to a device and release stale CUDA cache."""
     # FSDP modules do not move buffers to the device automatically
     for v in model.buffers():
@@ -793,16 +862,21 @@ def move_to_device(model, device):
 class ScopedModuleOffloading:
     """Context manager that temporarily moves a module between CPU and CUDA."""
 
-    def __init__(self, model, enabled=False):
+    def __init__(self, model: torch.nn.Module, enabled: bool = False) -> None:
         self.model = model
         self.enabled = enabled
 
-    def __enter__(self):
+    def __enter__(self) -> ScopedModuleOffloading:
         if self.enabled:
             move_to_device(self.model, "cuda")
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> bool:
         if self.enabled:
             move_to_device(self.model, "cpu")
         return False  # Re-raise exceptions by default

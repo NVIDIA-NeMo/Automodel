@@ -28,6 +28,8 @@ import importlib.util
 import pytest
 import torch
 
+from nemo_automodel.components.models.common.packing import get_packing_capabilities
+
 transformers = pytest.importorskip("transformers")
 
 from nemo_automodel.components.datasets.utils import neat_packed_collater  # noqa: E402
@@ -71,7 +73,7 @@ def test_sdpa_block_causal_has_no_cross_document_leakage():
         "attention_mask": torch.tensor([1, 1, 1, 1, 2, 2, 2]),
         "position_ids": torch.tensor([0, 1, 2, 3, 0, 1, 2]),
     }
-    batch = neat_packed_collater([packed_sample], attn_implementation="sdpa")
+    batch = neat_packed_collater([packed_sample], attn_implementation="sdpa", packing=get_packing_capabilities("sdpa"))
     assert batch["attention_mask"].shape == (1, 1, seq, seq)
 
     with torch.no_grad():
@@ -104,7 +106,7 @@ def test_sdpa_padded_pack_has_no_cross_document_leakage():
         "attention_mask": torch.tensor([1, 1, 1, 1, 2, 2, 2, 0, 0]),
         "position_ids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 0, 0]),
     }
-    batch = neat_packed_collater([packed_sample], attn_implementation="sdpa")
+    batch = neat_packed_collater([packed_sample], attn_implementation="sdpa", packing=get_packing_capabilities("sdpa"))
 
     with torch.no_grad():
         packed_logits = model(
@@ -140,7 +142,7 @@ def test_sdpa_batch_gt_1_uneven_padding_has_no_cross_document_leakage():
         "attention_mask": torch.tensor([1, 1, 1, 1, 0, 0]),
         "position_ids": torch.tensor([0, 1, 2, 3, 0, 0]),
     }
-    batch = neat_packed_collater([row0, row1], attn_implementation="sdpa")
+    batch = neat_packed_collater([row0, row1], attn_implementation="sdpa", packing=get_packing_capabilities("sdpa"))
     assert batch["input_ids"].shape == (2, 6)
 
     with torch.no_grad():
@@ -187,7 +189,9 @@ def test_flash_varlen_has_no_cross_document_leakage_on_gpu(pad):
         "attention_mask": torch.tensor([1, 1, 1, 1, 2, 2, 2] + [0] * pad),
         "position_ids": torch.tensor([0, 1, 2, 3, 0, 1, 2] + [0] * pad),
     }
-    flash_batch = neat_packed_collater([packed_sample], attn_implementation="flash_attention_2")
+    flash_batch = neat_packed_collater(
+        [packed_sample], attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+    )
 
     to_cuda = lambda t: t.to("cuda") if isinstance(t, torch.Tensor) else t
     with torch.no_grad():
@@ -243,7 +247,9 @@ def test_flash_varlen_batch_gt_1_uneven_padding_no_leakage_on_gpu():
         "attention_mask": torch.tensor([1, 1, 1, 1, 0, 0]),
         "position_ids": torch.tensor([0, 1, 2, 3, 0, 0]),
     }
-    flash_batch = neat_packed_collater([row0, row1], attn_implementation="flash_attention_2")
+    flash_batch = neat_packed_collater(
+        [row0, row1], attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+    )
 
     to_cuda = lambda t: t.to("cuda") if isinstance(t, torch.Tensor) else t
     with torch.no_grad():
