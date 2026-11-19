@@ -484,7 +484,7 @@ def _nvfp4_resident_model() -> torch.nn.Module:
     return model
 
 
-@pytest.mark.parametrize(("world_size", "ep_size", "pp_size"), [(1, 1, 1), (2, 2, 1), (4, 2, 2)])
+@pytest.mark.parametrize(("world_size", "ep_size", "pp_size"), [(2, 2, 1), (4, 2, 2)])
 def test_nvfp4_resident_experts_accept_full_expert_parallelism(world_size: int, ep_size: int, pp_size: int) -> None:
     from nemo_automodel.components.moe.quantized_experts import validate_nvfp4_resident_experts
 
@@ -510,6 +510,25 @@ def test_nvfp4_resident_experts_reject_layouts_that_shard_them(ep_size: int, mat
     validate_nvfp4_resident_experts(
         _DummyModel(), device_mesh=mesh, ep_size=ep_size, pp_size=1, loads_base_checkpoint=True
     )
+
+
+def test_nvfp4_resident_experts_need_expert_parallelism() -> None:
+    """A student on one rank with its teacher on another: Transformer Engine experts need an expert-parallel group."""
+    from nemo_automodel.components.moe.quantized_experts import (
+        validate_nvfp4_resident_experts,
+        validate_packed_expert_topology,
+    )
+
+    with pytest.raises(ValueError, match="expert parallelism"):
+        validate_nvfp4_resident_experts(
+            _nvfp4_resident_model(),
+            device_mesh=SimpleNamespace(size=lambda: 1),
+            ep_size=1,
+            pp_size=1,
+            loads_base_checkpoint=True,
+        )
+    # Torch packed experts keep the allowance of one rank.
+    validate_packed_expert_topology("nvfp4", world_size=1, ep_size=1)
 
 
 def test_nvfp4_resident_experts_count_the_ranks_of_their_own_mesh() -> None:

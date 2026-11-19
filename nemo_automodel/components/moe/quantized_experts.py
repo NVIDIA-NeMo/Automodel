@@ -1213,8 +1213,8 @@ def validate_nvfp4_resident_experts(
         loads_base_checkpoint: Whether the base checkpoint is loaded into the model.
 
     Raises:
-        ValueError: If no base checkpoint fills the experts, or the layout would shard their packed
-            parameters (see ``validate_packed_expert_topology``).
+        ValueError: If no base checkpoint fills the experts, the layout would shard their packed
+            parameters (see ``validate_packed_expert_topology``), or the model runs without expert parallelism.
     """
     if not any(isinstance(module, GroupedExpertsTENVFP4) for module in model.modules()):
         return
@@ -1230,6 +1230,13 @@ def validate_nvfp4_resident_experts(
         raise ValueError(
             f"te_nvfp4.resident_weights keeps the experts packed (expert_weight_format='nvfp4'). {error}"
         ) from error
+    if ep_size <= 1:
+        # Transformer Engine experts route the tokens through their expert-parallel group; a model on one rank
+        # of a larger job, as a student with its teacher on a separate mesh, builds no such group.
+        raise ValueError(
+            "te_nvfp4.resident_weights needs expert parallelism: Transformer Engine experts route the tokens "
+            f"through their expert-parallel group, and this model runs on {world_size} rank(s) with ep_size={ep_size}."
+        )
 
 
 def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
