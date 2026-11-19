@@ -1,0 +1,133 @@
+# DRAFT: Qwen3-4B student with a Qwen3-30B-A3B MoE teacher.
+# Ten-step H100 validation, W&B logs, and reproduction overrides:
+# docs/guides/llm/knowledge-distillation.mdx#moe-knowledge-distillation
+# Convergence and checkpoint/resume are not covered by the short run.
+# Related issue:
+# https://github.com/NVIDIA-NeMo/Automodel/issues/3299
+# Target: one 8-GPU node, with four ranks per model; validated on H100 80GB.
+#   automodel examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml --nproc-per-node 8
+
+recipe: KnowledgeDistillationRecipeForNextTokenPrediction
+
+# Enable with --wandb.enable true; set WANDB_API_KEY and WANDB_ENTITY.
+wandb:
+  enable: false
+  project: automodel-moe-kd
+  name: qwen3_4b_from_qwen3_30b_a3b
+  tags: [knowledge-distillation, moe, separate-meshes]
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 2
+  log_remote_every_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+# Dense student on global ranks 0-3; FP32 master weights for AdamW.
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-4B
+  torch_dtype: float32
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+
+# Frozen MoE teacher on global ranks 4-7.
+teacher_model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+separate_meshes: true
+# Whole-teacher offload is unsupported with separate meshes.
+offload_teacher_model: false
+
+# Explicit DP sizes assign all eight ranks: student 4 + teacher 4.
+# EP overlays each model's DP/TP/CP ranks; it adds no launch processes.
+distributed:
+  strategy: fsdp2
+  dp_size: 4
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+# Teacher ep_shard_size = (DP * TP * CP) / EP = 1.
+# Its expert parameters are not FSDP-sharded, so FSDP CPU offload does not
+# offload those parameters. Keep them resident for this draft.
+teacher_distributed:
+  strategy: fsdp2
+  dp_size: 4
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 4
+  sequence_parallel: false
+  activation_checkpointing: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh/
+  model_save_format: safetensors
+  save_consolidated: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: true
+
+kd_ratio: 0.5
+kd_loss_fn:
+  _target_: nemo_automodel.components.loss.kd_loss.KDLoss
+  ignore_index: -100
+  temperature: 1.0
+  fp32_upcast: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+  foreach: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
