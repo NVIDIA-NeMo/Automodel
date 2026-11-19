@@ -26,6 +26,8 @@ from typing import Protocol, TypedDict, cast
 import torch
 import torch.nn.functional as F
 from pydantic import BaseModel, JsonValue
+from transformers import PreTrainedTokenizerBase
+from transformers.configuration_utils import PreTrainedConfig
 
 
 class GS1Target(TypedDict):
@@ -68,6 +70,52 @@ class GS1Compiler(Protocol):
     """Public compiler interface exposed by GS1 checkpoints."""
 
     def compile(self, request: BaseModel) -> GS1CompiledRequest: ...
+
+
+class GS1DecisionModel(Protocol):
+    """Native checkpoint methods needed to build the training adapter."""
+
+    def decision_compiler(self, tokenizer: PreTrainedTokenizerBase, *, max_context: int) -> GS1Compiler: ...
+
+
+@dataclass(frozen=True)
+class GS1TrainingConfig:
+    """Build the compiler and request schema from a native GS1 checkpoint."""
+
+    model_id: str
+    revision: str | None = None
+    code_revision: str | None = None
+    max_context: int = 16384
+
+    def build(self, model: GS1DecisionModel, tokenizer: PreTrainedTokenizerBase) -> tuple[GS1Compiler, type[BaseModel]]:
+        """Create native GS1 components using the checkpoint's pinned code."""
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        compiler = model.decision_compiler(tokenizer, max_context=self.max_context)
+        request_type = cast(
+            type[BaseModel],
+            get_class_from_dynamic_module(
+                "schema.DecisionRequest",
+                self.model_id,
+                revision=self.revision,
+                code_revision=self.code_revision,
+            ),
+        )
+        return compiler, request_type
+
+
+def ensure_gs1_transformers_compat() -> None:
+    """Keep the pinned GS1 code compatible with Transformers' cache API."""
+    from transformers.cache_utils import DynamicCache
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    if not hasattr(modeling_qwen3_5, "Qwen3_5DynamicCache"):
+
+        class Qwen3_5DynamicCache(DynamicCache):
+            def __init__(self, config: PreTrainedConfig) -> None:
+                super().__init__(config=config)
+
+        modeling_qwen3_5.Qwen3_5DynamicCache = Qwen3_5DynamicCache
 
 
 @dataclass(frozen=True)
@@ -153,13 +201,9 @@ class GS1DecisionObjective:
 
 
 def _contains_media(state: JsonValue) -> bool:
-    if isinstance(state, dict):
-        if state.get("type") in {"image", "video"}:
-            return True
-        return any(_contains_media(value) for value in state.values())
-    if isinstance(state, list):
-        return any(_contains_media(value) for value in state)
-    return False
+    return isinstance(state, list) and any(
+        isinstance(item, dict) and item.get("type") in ("image", "video") for item in state
+    )
 
 
 def _candidate_ids(question: dict[str, JsonValue]) -> list[str]:

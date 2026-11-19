@@ -22,13 +22,10 @@ import math
 import random
 from copy import copy
 from pathlib import Path
-from typing import Protocol, cast
 
 import torch
 import torch.distributed as dist
-from pydantic import BaseModel
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from transformers import AutoTokenizer
 
 from nemo_automodel.components.checkpoint.utils import unwrap_ddp_model
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -36,10 +33,11 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.models.gs1.training import (
-    GS1Compiler,
     GS1DecisionExample,
     GS1DecisionObjective,
+    GS1TrainingConfig,
     collate_gs1_examples,
+    ensure_gs1_transformers_compat,
     load_gs1_examples,
 )
 from nemo_automodel.components.training.utils import clip_grad_norm
@@ -49,12 +47,6 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
-
-
-class GS1CompilerOwner(Protocol):
-    """Native model interface needed by the GS1 data compiler."""
-
-    def decision_compiler(self, tokenizer: PreTrainedTokenizerBase, **overrides: int) -> GS1Compiler: ...
 
 
 class TrainGS1DecisionRecipe(BaseRecipe):
@@ -100,6 +92,7 @@ class TrainGS1DecisionRecipe(BaseRecipe):
         if self.pp_enabled or self.mesh_context.tp_size > 1 or self.mesh_context.cp_size > 1:
             raise ValueError("The GS1 decision recipe currently supports data parallelism only")
 
+        ensure_gs1_transformers_compat()
         model_path = str(self.cfg.get("model.pretrained_model_name_or_path"))
         revision = self.cfg.get("model.revision", None)
         self.model = self.cfg.model.instantiate(distributed_setup=self.distributed_setup)
@@ -116,17 +109,13 @@ class TrainGS1DecisionRecipe(BaseRecipe):
             raise ValueError("GS1 tokenizer must define pad_token_id or eos_token_id")
         self.pad_token_id = int(pad_token_id)
 
-        native_model = cast(GS1CompilerOwner, unwrap_ddp_model(self.model))
-        compiler = native_model.decision_compiler(self.tokenizer, max_context=self.max_length)
-        request_type = cast(
-            type[BaseModel],
-            get_class_from_dynamic_module(
-                "schema.DecisionRequest",
-                model_path,
-                revision=revision,
-                code_revision=self.cfg.get("model.code_revision", revision),
-            ),
+        training_config = GS1TrainingConfig(
+            model_id=model_path,
+            revision=revision,
+            code_revision=self.cfg.get("model.code_revision", revision),
+            max_context=self.max_length,
         )
+        compiler, request_type = training_config.build(unwrap_ddp_model(self.model), self.tokenizer)
         self.examples = load_gs1_examples(
             self.cfg.get("data.train"),
             compiler=compiler,
@@ -191,7 +180,8 @@ class TrainGS1DecisionRecipe(BaseRecipe):
                 examples = [self.examples[index] for index in indices[start : start + self.local_batch_size]]
                 for optimizer in self.optimizers:
                     optimizer.zero_grad(set_to_none=True)
-                loss, metrics = self._forward_loss(examples)
+                with self._autocast_context():
+                    loss, metrics = self._forward_loss(examples)
                 if not bool(torch.isfinite(loss)):
                     raise ValueError("GS1 training objective became nonfinite")
                 loss.backward()
@@ -202,7 +192,12 @@ class TrainGS1DecisionRecipe(BaseRecipe):
                 if log is not None:
                     values = {key: float(value) for key, value in metrics.items()}
                     values.update(
-                        {"epoch": epoch, "step": step, "loss": float(loss.detach()), "grad_norm": float(grad_norm)}
+                        {
+                            "epoch": epoch,
+                            "step": step,
+                            "loss": float(loss.detach()),
+                            "grad_norm": float(grad_norm),
+                        }
                     )
                     log.write(json.dumps(values) + "\n")
                     if step % int(self.cfg.get("train.log_interval", 10)) == 0:
@@ -216,10 +211,12 @@ class TrainGS1DecisionRecipe(BaseRecipe):
 
     def _save_final_checkpoint(self) -> None:
         """Publish final model weights through NeMo's checkpoint lifecycle."""
+        if not self.checkpointer.config.enabled:
+            return
         path = self.output_dir / "final"
         self.checkpointer.lifecycle.reserve(str(path))
         self.checkpointer.save_model(
-            self.model,
+            unwrap_ddp_model(self.model),
             str(path),
             tokenizer=self.tokenizer,
             is_final_checkpoint=True,
