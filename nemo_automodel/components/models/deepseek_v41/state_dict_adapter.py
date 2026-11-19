@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import math
 import re
+import zlib
 from typing import Any
 
 import torch
@@ -67,6 +68,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
+from nemo_automodel.components.models.deepseek_v41.quantization import spread_native_masters
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.state_dict_utils import is_dtensor, should_load_expert_for_rank
@@ -161,12 +163,36 @@ def _checkpoint_dtensor(local: torch.Tensor, template: DTensor, shape: tuple[int
     return DTensor(local, spec, requires_grad=False)
 
 
+def _cell_positions(seed: int, rows: torch.Tensor, columns: torch.Tensor, row_width: int) -> torch.Tensor:
+    """Hash global element indices to reproducible uniform positions.
+
+    Args:
+        seed: Integer in [0, 2**63) identifying the tensor and the run seed.
+        rows: INT64 tensor of shape [local_rows] with global row indices.
+        columns: INT64 tensor of shape [local_columns] with global column indices.
+        row_width: Number of columns of the global matrix.
+
+    Returns:
+        FP32 tensor of shape [local_rows, local_columns] with values in [0, 1).
+        Each value depends only on the seed and the element's global index, so
+        every shard layout yields the same position for the same element.
+    """
+    # SplitMix64 finalizer; INT64 products wrap, and the masks turn the
+    # arithmetic right shifts into logical ones.
+    value = rows[:, None] * row_width + columns[None, :] + seed
+    value = (value ^ ((value >> 30) & ((1 << 34) - 1))) * (0xBF58476D1CE4E5B9 - (1 << 64))
+    value = (value ^ ((value >> 27) & ((1 << 37) - 1))) * (0x94D049BB133111EB - (1 << 64))
+    value = value ^ ((value >> 31) & ((1 << 33) - 1))
+    return ((value >> 40) & ((1 << 24) - 1)).float() * 2**-24
+
+
 def dequantize_checkpoint_weight(
     weight: torch.Tensor,
     scale: torch.Tensor,
     *,
     dtype: torch.dtype = torch.bfloat16,
     rowwise: bool = False,
+    spread_seed: int | None = None,
 ) -> torch.Tensor:
     """Decode released FP8 or packed FP4 weights with bounded FP32 temporaries.
 
@@ -181,6 +207,12 @@ def dequantize_checkpoint_weight(
             a DTensor scale must cover the weight shard at matching offsets.
         dtype: Dequantized floating-point storage dtype.
         rowwise: Use per-row scales for FP8 Engram tables. FP4 always uses them.
+        spread_seed: Integer in [0, 2**63). When given, each element is placed
+            at a reproducible random point of its rounding cell instead of the
+            released value at the cell centre; quantizing the result with the
+            native QAT rule still gives the released values. Requires FP32
+            output, 32x32 or FP4 scales, and FP4 column shards on 32-column
+            boundaries.
 
     Returns:
         Independent tensor of shape [rows, columns] in ``dtype``; DTensor
@@ -189,6 +221,8 @@ def dequantize_checkpoint_weight(
     """
     if weight.ndim != 2 or scale.ndim != 2:
         raise ValueError("Checkpoint weights and scales must both be two-dimensional")
+    if spread_seed is not None and (dtype != torch.float32 or rowwise):
+        raise ValueError("Spreading masters inside rounding cells requires FP32 output and block scales")
     packed = weight.dtype == torch.int8
     if not packed and weight.dtype != torch.float8_e4m3fn:
         raise TypeError(f"Expected packed INT8 FP4 or E4M3 FP8 weights, got {weight.dtype}")
@@ -218,6 +252,8 @@ def dequantize_checkpoint_weight(
         )
     if local_scale.device != local_weight.device:
         raise ValueError("Checkpoint weight and scale shards must reside on the same device")
+    if spread_seed is not None and packed and (offsets[1] % 32 or columns % 32):
+        raise ValueError("Spreading FP4 masters requires column shards on 32-column boundaries")
     output = torch.empty((rows, columns), dtype=dtype, device=local_weight.device)
     if not local_weight.is_meta and rows and columns:
         column_ids = (torch.arange(columns, device=local_weight.device) + offsets[1]) // 32 - starts[1]
@@ -247,8 +283,17 @@ def dequantize_checkpoint_weight(
                 - starts[0]
                 - scale_begin
             )
-            scales = local_scale[scale_begin:scale_end].float()
-            output[begin:end].copy_(decoded * scales[row_ids[:, None], column_ids])
+            scales = local_scale[scale_begin:scale_end].float()[row_ids[:, None], column_ids]
+            if spread_seed is None:
+                output[begin:end].copy_(decoded * scales)
+            else:
+                positions = _cell_positions(
+                    spread_seed,
+                    torch.arange(begin, end, device=local_weight.device) + offsets[0],
+                    torch.arange(columns, device=local_weight.device) + offsets[1],
+                    global_shape[1],
+                )
+                output[begin:end].copy_(spread_native_masters(decoded, scales, positions, fp4=packed))
     if isinstance(weight, DTensor):
         return _checkpoint_dtensor(output, weight, global_shape)
     return output
@@ -469,6 +514,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         Raises:
             ValueError: A packed INT8 or FP8 E4M3 weight has no companion scale.
         """
+        seed = self.config.text_config.native_qat_master_seed
         for key in list(state_dict.keys()):
             if not key.endswith(".weight"):
                 continue
@@ -479,8 +525,11 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                     raise ValueError(f"Quantized weight {key} is missing its scale tensor {scale_key}")
                 continue
             scale = state_dict.pop(scale_key)
+            rowwise = ".engram.embed." in key
+            # Engram tables are not native-QAT weights and keep released values.
+            spread_seed = None if seed is None or rowwise else (seed << 32) | zlib.crc32(key.encode())
             state_dict[key] = dequantize_checkpoint_weight(
-                weight, scale, dtype=self.dtype, rowwise=".engram.embed." in key
+                weight, scale, dtype=self.dtype, rowwise=rowwise, spread_seed=spread_seed
             )
         return state_dict
 

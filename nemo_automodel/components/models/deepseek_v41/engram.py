@@ -37,6 +37,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     Qwen3_8_FlashNextOwnerShardedEmbedding,
 )
 from .host_engram import FrozenHostEngramTable, HostEngramTableConfig
+from .qat import NativeQATLinear
 
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
@@ -253,13 +254,15 @@ class DeepseekV41Engram(nn.Module):
                 embedding_dim=config.engram_head_dim,
                 initializer_range=config.initializer_range,
             ).build(process_group=process_group, dtype=dtype)
-        self.wkv = initialize_linear_module(
-            backend.linear,
-            self.hash_heads * config.engram_head_dim,
-            self.hidden_size * (self.hc_mult + 1),
-            bias=False,
-            dtype=dtype,
-        )
+        wkv_in = self.hash_heads * config.engram_head_dim
+        wkv_out = self.hidden_size * (self.hc_mult + 1)
+        if config.native_qat:
+            # The rollout runs wkv as an MXFP8 linear. Its 32-channel activation
+            # blocks coincide with the table's own 32-column blocks inside each
+            # head, so rows read from the released table pass through unchanged.
+            self.wkv = NativeQATLinear(wkv_in, wkv_out, bias=False, dtype=dtype)
+        else:
+            self.wkv = initialize_linear_module(backend.linear, wkv_in, wkv_out, bias=False, dtype=dtype)
         self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
         self.init_weights()

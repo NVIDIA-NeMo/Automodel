@@ -79,12 +79,14 @@ from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE_START,
     image_inputs_from_batch,
 )
+from nemo_automodel.components.models.deepseek_v41.qat import NativeQATExpertsDeepEP, NativeQATMLP
 from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepseekV41StateDictAdapter
 from nemo_automodel.components.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTransformer,
 )
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str
@@ -104,8 +106,35 @@ class DeepseekV41Block(nn.Module):
     ) -> None:
         super().__init__()
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
+        if config.native_qat and (
+            backend.experts != "torch_mm" or backend.dispatcher != "hybridep" or moe_config.expert_bias
+        ):
+            raise ValueError("Native V4.1 QAT requires torch_mm experts, hybridep dispatcher, and no expert bias")
         self.attn = DeepseekV41Attention(config, layer_idx, backend)
         self.ffn = MoE(moe_config, backend)
+        if config.native_qat:
+            # Construction-time replacement preserves the checkpoint namespace and
+            # happens before initialization, sharding, hooks and optimizer capture.
+            if not isinstance(self.ffn.experts, GroupedExpertsDeepEP):
+                # MoE falls back to all-gather experts at world size one; those have no QAT compute.
+                raise ValueError("Native V4.1 QAT requires expert parallelism (more than one rank)")
+            self.ffn.experts = NativeQATExpertsDeepEP(
+                moe_config,
+                backend=backend,
+                dispatcher_backend=backend.dispatcher,
+                dispatcher_num_sms=backend.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+            )
+            self.ffn.shared_experts = NativeQATMLP(
+                moe_config.dim,
+                moe_config.shared_expert_inter_dim or moe_config.moe_inter_dim,
+                backend.linear,
+                dtype=moe_config.dtype,
+                activation=moe_config.expert_activation,
+                swiglu_limit=moe_config.swiglu_limit,
+            )
+
         # V4.1 uses exactly V4's modality-aware score routing with hash routing
         # disabled. The shared MoE keeps ownership of gate, experts and dispatch.
         self.ffn.gate = DeepseekV4VisionGate(
@@ -333,6 +362,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         super().__init__(config)
         text = config.text_config
+        if text.native_qat and config.vision_config.num_hidden_layers:
+            raise ValueError("Native V4.1 QAT currently supports text-only models")
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
         )

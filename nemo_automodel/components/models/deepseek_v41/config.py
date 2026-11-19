@@ -98,12 +98,18 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dspark_markov_rank: int = 256,
         dspark_n_routed_experts: int = 128,
         dspark_num_experts_per_tok: int = 3,
+        native_qat: bool = False,
+        native_qat_master_seed: int | None = None,
         dtype: str = "bfloat16",
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
         **kwargs: Any,
     ) -> None:
+        self.native_qat = native_qat
+        # Seed for loading each released quantized weight at a random point of
+        # its rounding cell instead of the centre; None keeps the released values.
+        self.native_qat_master_seed = native_qat_master_seed
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
@@ -203,6 +209,24 @@ class DeepseekV41TextConfig(PretrainedConfig):
         )
 
     def _validate_dimensions(self) -> None:
+        if type(self.native_qat) is not bool:
+            raise ValueError("native_qat must be a boolean")
+        seed = self.native_qat_master_seed
+        if seed is not None and (type(seed) is not int or not 0 <= seed < 2**31 or not self.native_qat):
+            raise ValueError("native_qat_master_seed must be an integer in [0, 2**31) and requires native_qat")
+        if self.native_qat:
+            dimensions = (
+                self.hidden_size,
+                self.moe_intermediate_size,
+                self.q_lora_rank,
+                self.o_lora_rank,
+                self.head_dim,
+                self.index_n_heads * self.index_head_dim,
+            )
+            if any(dimension % 32 for dimension in dimensions):
+                raise ValueError("Native QAT projections require complete 32-channel/row blocks")
+            if self.compressed_kv_format != "nvfp4":
+                raise ValueError("Native QAT requires compressed_kv_format='nvfp4'")
         for name, value in (
             ("vocab_size", self.vocab_size),
             ("hidden_size", self.hidden_size),
@@ -264,6 +288,8 @@ class DeepseekV41TextConfig(PretrainedConfig):
                     raise ValueError(f"{name} must be a positive integer, got {value!r}")
             if self.engram_max_ngram_size < 2:
                 raise ValueError("engram_max_ngram_size must be at least 2 when Engram is enabled")
+            if self.native_qat and self.engram_head_dim % 32:
+                raise ValueError("Native QAT Engram projections require complete 32-channel blocks per head")
             if not 0 <= self.engram_pad_token_id < self.vocab_size:
                 raise ValueError("engram_pad_token_id must be within the token vocabulary")
 

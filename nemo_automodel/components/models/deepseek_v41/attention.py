@@ -38,6 +38,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Pa
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41RMSNorm
+from nemo_automodel.components.models.deepseek_v41.qat import NativeQATGroupedLinear, NativeQATLinear
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -245,7 +246,8 @@ class _Indexer(nn.Module):
         self.topk = config.index_topk
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=dtype)
+        linear = NativeQATLinear if config.native_qat else nn.Linear
+        self.wq_b = linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=dtype)
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False, dtype=dtype)
         if self.owns_keys:
             self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False, dtype=dtype)
@@ -366,7 +368,9 @@ class DeepseekV41Attention(nn.Module):
         self.is_kv_source = layer_idx in config.kv_source_layer_ids
         self.is_index_source = layer_idx in config.index_source_layer_ids
         dtype = dtype_from_str(config.torch_dtype, torch.bfloat16)
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype)
+        linear = NativeQATLinear if config.native_qat else nn.Linear
+        grouped_linear = NativeQATGroupedLinear if config.native_qat else DeepseekV4GroupedLinear
+        self.wq_a = linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype)
         # TE defaults to CUDA when device is omitted, including under a meta
         # construction context. Use the projection's actual device explicitly.
         norm = (
@@ -375,15 +379,15 @@ class DeepseekV41Attention(nn.Module):
             else DeepseekV41RMSNorm
         )
         self.q_norm = norm(config.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=dtype)
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
+        self.wq_b = linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=dtype)
+        self.wkv = linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
         self.kv_norm = norm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
-        self.wo_a = DeepseekV4GroupedLinear(
+        self.wo_a = grouped_linear(
             self.num_heads * self.head_dim // self.num_groups,
             self.num_groups * config.o_lora_rank,
             self.num_groups,
         ).to(dtype=dtype)
-        self.wo_b = nn.Linear(self.num_groups * config.o_lora_rank, config.hidden_size, bias=False, dtype=dtype)
+        self.wo_b = linear(self.num_groups * config.o_lora_rank, config.hidden_size, bias=False, dtype=dtype)
         self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.rotary_emb = _RotaryEmbedding(config, compressed=bool(self.compress_ratio))
         self.compressor = (

@@ -1013,6 +1013,37 @@ class GroupedExpertsDeepEP(nn.Module):
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
 
+    def compute_grouped(
+        self,
+        hidden_states: torch.Tensor,
+        gate_and_up_projs: torch.Tensor,
+        down_projs: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute bias-free torch_mm expert GEMMs independently of dispatch and combine.
+
+        Args:
+            hidden_states: Tensor [tokens, hidden], received tokens sorted by local expert.
+            gate_and_up_projs: Tensor [local_experts, hidden, projection_size],
+                where projection_size is intermediate or 2 * intermediate.
+            down_projs: Tensor [local_experts, intermediate, hidden].
+            tokens_per_expert: Integer tensor [local_experts] on the compute device.
+            permuted_probs: Tensor [tokens, 1] of activation routing weights.
+
+        Returns:
+            Tensor [tokens, hidden] in the compute dtype.
+        """
+        return _torch_mm_experts_fwd(
+            hidden_states,
+            gate_and_up_projs,
+            down_projs,
+            tokens_per_expert,
+            permuted_probs,
+            self.expert_activation,
+            use_mxfp8=self.use_mxfp8,
+        )
+
     def _init_deepep_buffer(self, ep_group: dist.ProcessGroup) -> None:
         """Initialize DeepEP communication buffers before activation checkpointing."""
         from nemo_automodel.components.moe.megatron.fused_a2a import get_buffer
@@ -1105,14 +1136,12 @@ class GroupedExpertsDeepEP(nn.Module):
                         None if self.config.apply_router_weight_after_down else permuted_probs,
                     )
                 else:
-                    output2 = _torch_mm_experts_fwd(
+                    output2 = self.compute_grouped(
                         permuted_local_hidden_states,
                         gate_and_up_projs,
                         down_projs,
                         tokens_per_expert_gpu,
                         activation_probs,
-                        self.expert_activation,
-                        use_mxfp8=self.use_mxfp8,
                     )
             else:
                 # ops.gmm sizes its launches from a CPU copy of tokens_per_expert; under
