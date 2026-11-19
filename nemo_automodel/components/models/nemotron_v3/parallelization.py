@@ -36,9 +36,27 @@ from nemo_automodel.components.moe.parallelizer import apply_ac
 logger = logging.getLogger(__name__)
 
 
+def _is_hf_layout(model: nn.Module) -> bool:
+    """Return whether ``model`` is the HF NemotronH layout rather than native Nemotron-V3.
+
+    Both classes are named ``NemotronHForCausalLM`` and share this parallelizer: the HF
+    remote-code model keeps its decoder blocks in ``backbone.layers`` (``nn.ModuleList``),
+    while the native model keeps them in ``model.layers`` (``nn.ModuleDict``). The HF class
+    exposes no API that distinguishes the two, so this attribute probe is the single place
+    the layout is decided.
+
+    Args:
+        model: A Nemotron-H or native Nemotron-V3 causal LM.
+
+    Returns:
+        ``True`` for the HF layout, ``False`` for the native layout.
+    """
+    return hasattr(model, "backbone")
+
+
 def _decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
     """Return the mutable decoder container and its ordered blocks."""
-    inner = model.backbone if hasattr(model, "backbone") else model.model
+    inner = model.backbone if _is_hf_layout(model) else model.model
     container = inner.layers
     blocks = list(container.values()) if isinstance(container, nn.ModuleDict) else list(container)
     return container, blocks
@@ -124,7 +142,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
                         )
 
         if activation_checkpointing:
-            if hasattr(model, "backbone"):
+            if _is_hf_layout(model):
                 # HF NemotronH layout: only mlp and mamba blocks are checkpointed.
                 for key, layer in list(enumerate(block_container)):
                     if getattr(layer, "block_type", None) in ("mlp", "mamba"):
