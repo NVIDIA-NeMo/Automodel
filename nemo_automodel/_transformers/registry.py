@@ -88,6 +88,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),
         (
+            "Ernie5_5_MoeForCausalLM",
+            ("nemo_automodel.components.models.ernie5_5.model", "Ernie5_5_MoeForCausalLM"),
+        ),
+        (
             "FlintForCausalLM",
             ("nemo_automodel.components.models.flint.model", "FlintForCausalLM"),
         ),
@@ -203,6 +207,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "LagunaForCausalLM",
             ("nemo_automodel.components.models.laguna.model", "LagunaForCausalLM"),
+        ),
+        (
+            "Lfm3ForCausalLM",
+            ("nemo_automodel.components.models.lfm3.model", "Lfm3ForCausalLM"),
+        ),
+        (
+            "Lfm3VlForConditionalGeneration",
+            ("nemo_automodel.components.models.lfm3.vl_model", "Lfm3VlForConditionalGeneration"),
         ),
         (
             "Ministral3ForCausalLM",
@@ -441,6 +453,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41Config"),
     "deepseek_v41_text": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41TextConfig"),
     "deepseek_v41_vision": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41VisionConfig"),
+    "ernie5_5_moe": ("nemo_automodel.components.models.ernie5_5.config", "Ernie5_5Config"),
     "flint": ("nemo_automodel.components.models.flint.config", "FlintConfig"),
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
@@ -458,6 +471,9 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
+    "lfm3": ("nemo_automodel.components.models.lfm3.config", "Lfm3Config"),
+    "lfm3_vl": ("nemo_automodel.components.models.lfm3.config", "Lfm3VlConfig"),
+    "lfm3_vl_vision": ("nemo_automodel.components.models.lfm3.config", "Lfm3VlVisionConfig"),
     "llama_nemotron_vl": ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
@@ -507,6 +523,7 @@ _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "kimi_k31": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
+    "lfm3_vl": ("nemo_automodel.components.models.lfm3.processing", "Lfm3VlProcessor"),
 }
 
 # model_types whose custom model implementation should win over a transformers
