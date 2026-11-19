@@ -157,10 +157,11 @@ class Inkling2LMHead(LMHead):
         super().__init__(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.logit_softcapping, self.unpadded_vocab_size = config.final_logit_softcapping, config.unpadded_vocab_size
 
-    def project(self, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, *, weight: torch.Tensor | None = None) -> torch.Tensor:
         """Project FP32 copies of input [..., hidden] and weight [vocab, hidden] to softcapped logits
         [..., vocab]; the padded vocabulary rows from ``unpadded_vocab_size`` on are negative infinity."""
-        logits = super().project(input.float(), weight.float(), None if bias is None else bias.float())
+        weight = self.weight if weight is None else weight
+        logits = super().forward(input.float(), weight=weight.float())
         padded = torch.arange(logits.shape[-1], device=logits.device) >= self.unpadded_vocab_size
         return logits.masked_fill(padded, float("-inf"))
 

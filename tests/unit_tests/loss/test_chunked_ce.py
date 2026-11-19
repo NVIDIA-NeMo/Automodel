@@ -413,13 +413,17 @@ def test_validate_lm_head_accepts_plain_and_fp32_logits_heads():
             """
             return 2 * super().forward(input)
 
+    class InputOnlyHead(LMHead):
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            return super().forward(input)
+
     plain = torch.nn.Linear(4, 8, bias=False)
     fp32_head = LMHead(4, 8, logits_dtype=torch.float32)
     loss_fn = ChunkedCrossEntropy(4, compile=False)
 
     assert loss_fn.validate_lm_head(plain) is plain
     assert loss_fn.validate_lm_head(fp32_head) is fp32_head
-    for head in (TransformedHead(4, 8, bias=False), LMHead(4, 8, bias=True, logits_dtype=torch.float32)):
+    for head in (TransformedHead(4, 8, bias=False), InputOnlyHead(4, 8), LMHead(4, 8, bias=True)):
         with pytest.raises(ValueError, match="plain bias-free nn.Linear"):
             loss_fn.validate_lm_head(head)
 

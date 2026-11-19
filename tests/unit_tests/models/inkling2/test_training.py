@@ -145,7 +145,6 @@ def test_chunked_cross_entropy_reproduces_the_model_logits(dtype: str) -> None:
         labels=labels,
     )
 
-    # Every chunk calls the head's project, so it sees the softcapped, masked FP32 logits.
     torch.testing.assert_close(actual, expected)
     weight = model.get_output_embeddings().weight
     (actual_grad,) = torch.autograd.grad(actual, weight, retain_graph=True)

@@ -75,9 +75,8 @@ class LMHead(nn.Linear):
 
     With ``logits_dtype`` set, the GEMM reads the input in the weight's dtype, accumulates in FP32 and
     writes FP32 logits (vLLM's ``head_dtype=float32``), unaffected by autocast, then casts them; the
-    backward casts the gradient to the weight's dtype. ``forward`` calls ``project``, which losses that
-    gather the weight call too, so subclasses that change the logits override ``project``. Repo models
-    take ``logits_dtype`` as a constructor argument and build their head with it; their forwards call
+    backward casts the gradient to the weight's dtype. Chunked losses pass their materialized weight to ``forward``.
+    Repo models take ``logits_dtype`` as a constructor argument and build their head with it; their forwards call
     ``LMHead.output(self.lm_head, hidden_states, ...)``, which also takes a stage without a head.
     """
 
@@ -98,19 +97,10 @@ class LMHead(nn.Linear):
         self.logits_dtype = logits_dtype
         self.logit_softcapping = logit_softcapping
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Return ``project(input, self.weight, self.bias)``: logits [..., vocab] of input [..., hidden]."""
-        return self.project(input, self.weight, self.bias)
-
-    def project(self, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        """Compute the head's logits [..., vocab] with ``weight``, which a chunked loss may have gathered.
-
-        Args:
-            input: Hidden states of shape [..., hidden], with arbitrary leading dimensions.
-            weight: Tensor of shape [vocab, hidden]; a vocabulary-sharded DTensor shards the logits.
-            bias: Optional tensor of shape [vocab].
-        """
-        logits = self.linear(input, weight, bias, logits_dtype=self.logits_dtype)
+    def forward(self, input: torch.Tensor, *, weight: torch.Tensor | None = None) -> torch.Tensor:
+        """Project hidden states [..., hidden] with the head weight or an explicit [vocab, hidden] weight."""
+        weight = self.weight if weight is None else weight
+        logits = self.linear(input, weight, self.bias, logits_dtype=self.logits_dtype)
         if self.logit_softcapping is not None:
             logits = self.logit_softcapping * torch.tanh(logits / self.logit_softcapping)
         return logits
