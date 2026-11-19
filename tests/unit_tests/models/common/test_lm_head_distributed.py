@@ -261,6 +261,41 @@ def _check_fsdp(weight: torch.Tensor, input_ids: torch.Tensor, labels: torch.Ten
             torch.testing.assert_close(_full(param).detach(), reference[name], rtol=0, atol=0, msg=f"{tied=} {name}")
 
 
+def _check_fsdp_head_casts_its_own_input(weight: torch.Tensor, hidden: torch.Tensor) -> None:
+    """Check a standalone FSDP2 head with FP32 storage and BF16 compute on FP32 hidden states.
+
+    FSDP2 does not cast the input under this policy and the sharded weight shows the FP32 storage dtype,
+    so only the head knows its compute dtype, inside forward.
+
+    Args:
+        weight: FP32 tensor of shape [vocab, hidden].
+        hidden: FP32 tensor of shape [batch, sequence, hidden], identical on every rank.
+    """
+    mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("dp",))
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=None, cast_forward_inputs=False
+    )
+    bf16_hidden, bf16_weight = hidden.bfloat16(), weight.bfloat16()
+    references = {
+        None: F.linear(bf16_hidden, bf16_weight),
+        torch.float32: F.linear(bf16_hidden.float(), bf16_weight.float()),
+    }
+    for logits_dtype, reference in references.items():
+        head = LMHead(_HIDDEN, _VOCAB, logits_dtype=logits_dtype)
+        head.weight = nn.Parameter(weight.clone())
+        fully_shard(head, mesh=mesh, mp_policy=policy)
+        assert head.weight.dtype == torch.float32
+        logits = LMHead.output(head, hidden).logits
+        assert logits.dtype == reference.dtype == (logits_dtype or torch.bfloat16)
+        torch.testing.assert_close(logits, reference, rtol=0, atol=0)
+
+    # Only an LMHead casts its input: a plain linear head must receive the compute dtype.
+    plain = nn.Linear(_HIDDEN, _VOCAB, bias=False)
+    fully_shard(plain, mesh=mesh, mp_policy=policy)
+    with pytest.raises(RuntimeError, match="same dtype"):
+        LMHead.output(plain, hidden)
+
+
 def _worker(rank: int, port: int) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -280,6 +315,7 @@ def _worker(rank: int, port: int) -> None:
         _check_weight_layouts(hidden, weight.bfloat16(), upstream)
         _check_biased_tensor_parallel(hidden, weight.bfloat16(), upstream)
         _check_fsdp(weight, input_ids, labels)
+        _check_fsdp_head_casts_its_own_input(weight, hidden.float())
     finally:
         dist.destroy_process_group()
 

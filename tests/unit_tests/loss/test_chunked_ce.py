@@ -235,11 +235,8 @@ def test_fp32_head_bf16_hidden_matches_model_projection(rounding, compiled):
 
     torch.manual_seed(67)
     model = torch.nn.Module()
-    # An FP32 head may round its own logits to bf16 (out_dtype) ...
-    if rounding == "head":
-        model.lm_head = LMHead(19, 37, bias=False, logits_dtype=torch.bfloat16)
-    else:
-        model.lm_head = torch.nn.Linear(19, 37, bias=False)
+    # An FP32 head may round its own logits to bf16 (logits_dtype) ...
+    model.lm_head = LMHead(19, 37, logits_dtype=torch.bfloat16 if rounding == "head" else None)
     hidden = torch.randn(2, 9, 19, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(37, (2, 9))
     logits = LMHead.output(model.lm_head, hidden).logits

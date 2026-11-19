@@ -14,9 +14,6 @@
 
 """LMHead: logits dtype against FP64, backward contract, FLOP accounting and head conversion."""
 
-from types import SimpleNamespace
-from unittest.mock import patch
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -335,13 +332,20 @@ class TestLMHeadOutput:
         assert out.logits.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.logits, hidden.unsqueeze(0))
 
-    def test_fp32_weight_head_returns_fp32_logits(self):
-        """An fp32 head weight projects the upcast bf16 input in fp32 and keeps fp32 logits."""
-        lm_head = self._lm_head()  # nn.Linear with an fp32 weight
-        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.bfloat16)
-        out = LMHead.output(lm_head, hidden, logits_to_keep=0)
-        assert out.logits.dtype == torch.float32
-        torch.testing.assert_close(out.logits, lm_head(hidden.float()), rtol=0, atol=0)
+    @pytest.mark.parametrize(
+        ("head_dtype", "hidden_dtype"),
+        [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)],
+        ids=["bf16-head-fp32-hidden", "fp32-head-bf16-hidden"],
+    )
+    def test_lm_head_casts_its_input_to_the_weight_dtype(self, head_dtype, hidden_dtype):
+        """An LMHead computes in its weight dtype whatever the hidden states' dtype, also after slicing."""
+        lm_head = LMHead(self.HIDDEN, self.VOCAB, dtype=head_dtype)
+        hidden = torch.randn(2, 5, self.HIDDEN, dtype=hidden_dtype)
+        out = LMHead.output(lm_head, hidden, logits_to_keep=2)
+        assert out.logits.shape == (2, 2, self.VOCAB)
+        assert out.logits.dtype == head_dtype
+        expected = F.linear(hidden[:, -2:].to(head_dtype), lm_head.weight)
+        torch.testing.assert_close(out.logits, expected, rtol=0, atol=0)
 
     def test_fp32_logits_head_composes_with_slicing(self):
         """A bf16 LMHead with FP32 logits writes fp32 logits for the kept positions (2D THD input)."""
@@ -354,44 +358,6 @@ class TestLMHeadOutput:
         assert out.logits.dtype == torch.float32
         expected = hidden[-3:].float() @ lm_head.weight.float().t()
         torch.testing.assert_close(out.logits, expected.unsqueeze(0), rtol=0, atol=0)
-
-    def test_lm_head_dtype_casts_after_slicing(self):
-        lm_head = self._lm_head().to(torch.bfloat16)
-        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
-
-        out = LMHead.output(lm_head, hidden, logits_to_keep=2)
-
-        expected = lm_head(hidden[:, -2:, :].to(torch.bfloat16))
-        assert out.logits.shape == (2, 2, self.VOCAB)
-        assert out.logits.dtype == torch.bfloat16
-        torch.testing.assert_close(out.logits, expected)
-
-    def test_fsdp_lm_head_uses_policy_compute_dtype(self):
-        hidden_size = self.HIDDEN
-        vocab_size = self.VOCAB
-
-        class FakeFSDPHead(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight = nn.Parameter(torch.randn(vocab_size, hidden_size, dtype=torch.float32))
-
-            def _get_fsdp_state(self):
-                return SimpleNamespace(_mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
-
-            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-                """Project hidden states of shape [batch, sequence, hidden]."""
-                assert hidden_states.dtype == torch.bfloat16
-                return hidden_states @ self.weight.to(hidden_states.dtype).T
-
-        lm_head = FakeFSDPHead()
-        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
-
-        with patch("nemo_automodel.components.models.common.lm_head.FSDPModule", FakeFSDPHead):
-            out = LMHead.output(lm_head, hidden, logits_to_keep=2)
-
-        assert lm_head.weight.dtype == torch.float32
-        assert out.logits.shape == (2, 2, self.VOCAB)
-        assert out.logits.dtype == torch.bfloat16
 
     def test_output_hidden_states_attaches_hidden(self):
         """output_hidden_states attaches the final hidden states; default leaves them None."""

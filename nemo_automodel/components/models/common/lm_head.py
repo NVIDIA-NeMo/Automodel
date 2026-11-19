@@ -20,7 +20,6 @@ from typing import Self
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from torch.utils.flop_counter import register_flop_formula
@@ -124,6 +123,7 @@ class LMHead(nn.Linear):
 
         ``logits_dtype`` None runs a plain linear in the weight's dtype that autocast may lower.
         """
+        # The weight sets the compute dtype: inside forward, FSDP2 has already unsharded it to its param_dtype.
         input = input.to(weight.dtype)
         if logits_dtype is None:
             if isinstance(weight, DTensor):  # tensor-parallel weight: compile-safe like TPLinear
@@ -156,14 +156,12 @@ class LMHead(nn.Linear):
     ) -> CausalLMOutputWithPast:
         """Project hidden states through ``lm_head`` and wrap the result, for every custom causal LM ``forward()``.
 
-        ``lm_head`` is the model's head: an ``LMHead``, or whatever replaced it, such as a backend, LoRA or
-        quantized linear.
+        ``lm_head`` is the model's head. An ``LMHead`` casts the input to its weight dtype and returns its
+        ``logits_dtype``; any other head, such as a LoRA or quantized linear, must accept the hidden states' dtype.
 
         ``logits_to_keep=0`` projects every position without slicing, since ``slice(0, None)`` on a DTensor
-        raises under sequence parallelism. The input is cast to the head's compute dtype: a standalone FSDP2
-        head's ``param_dtype``, because its sharded weight may still expose the storage dtype, else its weight
-        dtype. The head decides the logits dtype, e.g. an ``LMHead``'s ``logits_dtype``. A causal LM output is
-        batched, so 2D (THD) logits and hidden states regain a leading batch dim of 1.
+        raises under sequence parallelism. A causal LM output is batched, so 2D (THD) logits and hidden states
+        regain a leading batch dim of 1.
 
         Args:
             lm_head: Head module, or ``None`` on a pipeline stage without it, which passes ``hidden_states`` on.
@@ -177,20 +175,11 @@ class LMHead(nn.Linear):
         """
         if lm_head is None:
             logits = hidden_states
+        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = lm_head(hidden_states)
         else:
-            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                sliced = hidden_states
-            else:
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                sliced = hidden_states[..., slice_indices, :]
-            compute_dtype = None
-            if isinstance(lm_head, FSDPModule):
-                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
-            lm_head_weight = getattr(lm_head, "weight", None)
-            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
-                compute_dtype = lm_head_weight.dtype
-            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
-            logits = lm_head(projection_input)
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = lm_head(hidden_states[..., slice_indices, :])
         if logits.dim() == 2:
             logits = logits.unsqueeze(0)
 
