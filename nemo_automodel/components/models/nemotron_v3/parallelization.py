@@ -150,8 +150,9 @@ class NemotronHModelParallelizer(ModelParallelizer):
             else:
                 # Native Nemotron-V3 layout: checkpoint every decoder block (mamba, attention,
                 # mlp, moe) and the MTP blocks the same way the expert-parallel path does.
-                # apply_ac pins the MoE routing across the recompute and keeps the gate's
-                # expert-load accounting from counting it twice.
+                # For MoE models apply_ac pins the routing across the recompute and keeps the
+                # gate's expert-load accounting from counting it twice. Dense models
+                # (moe_config=None) have no routing to pin and recompute whole blocks.
                 apply_ac(
                     model,
                     selective=is_selective_activation_checkpointing(activation_checkpointing),

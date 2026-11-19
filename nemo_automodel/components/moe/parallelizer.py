@@ -730,7 +730,9 @@ def apply_ac(
             non-deterministic re-routing changing dispatch shapes). If False, a warning is emitted.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
-            first, then falls back to model.config attributes.
+            first, then falls back to model.config attributes. A model whose ``moe_config`` is
+            ``None`` has no routed experts: its blocks are recomputed in full, with no router
+            outputs saved.
         selective: If True, applies TorchTitan-style per-op selective activation checkpointing
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy saves ``topk``, and HybridEP reuses the
@@ -851,7 +853,12 @@ def apply_ac(
 
     if num_experts is None:
         _inner = getattr(model, "model", model)
-        if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
+        if hasattr(_inner, "moe_config") and _inner.moe_config is None:
+            # An explicit ``moe_config=None`` declares a model without routed experts (e.g. the
+            # dense native Nemotron-H Nano models). There is no routing to pin, so each block is
+            # recomputed in full below.
+            logger.info("Model has no routed experts; activation checkpointing recomputes whole blocks")
+        elif hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
             num_experts = _inner.moe_config.n_routed_experts
         else:
             cfg = getattr(model, "config", None)
@@ -863,7 +870,7 @@ def apply_ac(
             else:
                 raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
-    _custom_policy = router_save_checkpoint_policy(hidden_size, num_experts)
+    _custom_policy = router_save_checkpoint_policy(hidden_size, num_experts) if num_experts is not None else None
 
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)

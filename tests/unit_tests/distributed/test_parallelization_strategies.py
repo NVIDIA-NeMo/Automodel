@@ -971,6 +971,34 @@ class TestNemotronHModelParallelizer:
         assert all(isinstance(block, CheckpointWrapper) for block in blocks)
         assert [block._checkpoint_wrapped_module.block_type for block in blocks] == block_types
 
+    @pytest.mark.parametrize("activation_checkpointing", [True, "selective"])
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
+    def test_activation_checkpointing_native_dense_layout_wraps_every_block(
+        self,
+        mock_fully_shard_by_dtype,
+        mock_fully_shard,
+        activation_checkpointing,
+        strategy,
+        mock_device_mesh,
+    ):
+        """Dense native Nemotron-H (Nano 4B/9B/12B) has moe_config=None and no expert-count config fields."""
+        mesh, _, _, _ = mock_device_mesh
+        mock_fully_shard.side_effect = lambda model, **kwargs: model
+        mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+        block_types = ["mamba", "attention", "mlp", "mamba"]
+        model = MockNemotronV3Model(num_layers=len(block_types))
+        for layer, block_type in zip(model.model.layers.values(), block_types):
+            setattr(layer, "block_type", block_type)
+        model.config = SimpleNamespace(hidden_size=8)
+        model.model.moe_config = None
+
+        strategy._apply(model=model, device_mesh=mesh, activation_checkpointing=activation_checkpointing)
+
+        blocks = list(model.model.layers.values())
+        assert all(isinstance(block, CheckpointWrapper) for block in blocks)
+        assert [block._checkpoint_wrapped_module.block_type for block in blocks] == block_types
+
 
 class _MockQwen35Model(nn.Module):
     """Minimal Qwen3.5-shaped model: a decoder ``layers`` list under ``model``."""
