@@ -15,6 +15,7 @@
 """LM head whose logits dtype is independent of its weight dtype."""
 
 import math
+from dataclasses import dataclass
 from typing import Self
 
 import torch
@@ -76,13 +77,34 @@ _fp32_logits.register_autograd(
 register_flop_formula(torch.ops.nemo_automodel.fp32_logits)(lambda x, w, *_, **__: 2 * math.prod(x) * w[0])
 
 
+@dataclass(frozen=True)
+class LogitsProjection:
+    """Parameter-free projection settings shared by the model and chunked cross entropy."""
+
+    logits_dtype: torch.dtype | None = None
+    logit_softcapping: float | None = None
+    operand_dtype: torch.dtype | None = None
+    unpadded_vocab_size: int | None = None
+
+    def __call__(self, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        """Compute logits [..., vocab] from hidden states [..., hidden] and explicit vocabulary rows."""
+        if self.operand_dtype is not None:
+            input, weight = input.to(self.operand_dtype), weight.to(self.operand_dtype)
+        logits = LMHead.linear(input, weight, bias, logits_dtype=self.logits_dtype)
+        if self.logit_softcapping is not None:
+            logits = self.logit_softcapping * torch.tanh(logits / self.logit_softcapping)
+        if self.unpadded_vocab_size is not None:
+            padded = torch.arange(logits.shape[-1], device=logits.device) >= self.unpadded_vocab_size
+            logits = logits.masked_fill(padded, float("-inf"))
+        return logits
+
+
 class LMHead(nn.Linear):
     """``nn.Linear`` vocabulary head that returns ``logits_dtype`` logits whatever its weight dtype.
 
     With ``logits_dtype`` set, the GEMM reads the input in the weight's dtype, accumulates in FP32 and
     writes FP32 logits (vLLM's ``head_dtype=float32``), unaffected by autocast, then casts them; the
-    backward casts the gradient to the weight's dtype. Chunked losses, which gather the weight themselves, call
-    ``project``, so subclasses that change the logits override it.
+    backward casts the gradient to the weight's dtype. Chunked losses use the same parameter-free projection settings.
     Repo models take ``logits_dtype`` as a constructor argument and build their head with it; their forwards call
     ``LMHead.output(self.lm_head, hidden_states, ...)``, which also takes a stage without a head.
     """
@@ -104,16 +126,14 @@ class LMHead(nn.Linear):
         self.logits_dtype = logits_dtype
         self.logit_softcapping = logit_softcapping
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Project hidden states [..., hidden] to logits [..., vocab] with the head's own weight."""
-        return self.project(input, self.weight)
+    @property
+    def projection(self) -> LogitsProjection:
+        """Return the settings needed to reproduce logits from an explicit weight."""
+        return LogitsProjection(self.logits_dtype, self.logit_softcapping)
 
-    def project(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        """Project input [..., hidden] to logits [..., vocab] with ``weight`` [vocab, hidden]."""
-        logits = self.linear(input, weight, self.bias, logits_dtype=self.logits_dtype)
-        if self.logit_softcapping is not None:
-            logits = self.logit_softcapping * torch.tanh(logits / self.logit_softcapping)
-        return logits
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Project hidden states [..., hidden] with the head's own parameters."""
+        return self.projection(input, self.weight, self.bias)
 
     @staticmethod
     def linear(

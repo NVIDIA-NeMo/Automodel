@@ -24,7 +24,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, LogitsProjection
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
@@ -157,12 +157,10 @@ class Inkling2LMHead(LMHead):
         super().__init__(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.logit_softcapping, self.unpadded_vocab_size = config.final_logit_softcapping, config.unpadded_vocab_size
 
-    def project(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        """Project FP32 copies of input [..., hidden] and weight [vocab, hidden] to softcapped logits
-        [..., vocab]; the padded vocabulary rows from ``unpadded_vocab_size`` on are negative infinity."""
-        logits = super().project(input.float(), weight.float())
-        padded = torch.arange(logits.shape[-1], device=logits.device) >= self.unpadded_vocab_size
-        return logits.masked_fill(padded, float("-inf"))
+    @property
+    def projection(self) -> LogitsProjection:
+        """Use FP32 operands, apply the softcap and mask padded vocabulary rows."""
+        return LogitsProjection(self.logits_dtype, self.logit_softcapping, torch.float32, self.unpadded_vocab_size)
 
 
 class ShortConvolution(nn.Module):

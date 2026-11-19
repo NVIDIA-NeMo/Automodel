@@ -24,7 +24,7 @@ from torch.distributed.fsdp import FSDPModule
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, LogitsProjection
 
 
 def _validate_chunk_len(chunk_len: int) -> int:
@@ -61,7 +61,7 @@ def _linear_cross_entropy(
     labels: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype | None,
-    lm_head: LMHead | None = None,
+    projection: LogitsProjection | None = None,
 ) -> torch.Tensor:
     """Project one token chunk and compute CE.
 
@@ -71,13 +71,13 @@ def _linear_cross_entropy(
         labels: Target indices shaped [chunk_tokens].
         ignore_index: Ignored target value.
         logits_dtype: Optional model-owned output dtype after projection.
-        lm_head: The model's ``LMHead``, whose ``project`` gives the logits; None for a plain head.
+        projection: Optional parameter-free settings for model-specific logits.
 
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    logits = F.linear(hidden.to(weight.dtype), weight) if lm_head is None else lm_head.project(hidden, weight)
-    if lm_head is not None and lm_head.logits_dtype in (torch.float16, torch.bfloat16):
+    logits = F.linear(hidden.to(weight.dtype), weight) if projection is None else projection(hidden, weight)
+    if projection is not None and projection.logits_dtype in (torch.float16, torch.bfloat16):
         # The head rounds its FP32 GEMM output to logits_dtype: keep that boundary too.
         torch._dynamo.graph_break()
     if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:
@@ -215,7 +215,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         A linear module alone does not rule out post-projection transformations.
         Read the text configuration through the HF config contract, including
         multimodal models whose output settings live in a nested text config.
-        Each chunk calls an ``LMHead``'s ``project``, so only a softcap outside the head is rejected.
+        Each chunk applies the projection settings, including any head-owned softcap.
 
         Args:
             lm_head: Output head with weight of global shape [vocab, hidden].
@@ -282,7 +282,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         *,
         mask: torch.Tensor | None = None,
         logits_dtype: torch.dtype | None = None,
-        lm_head: LMHead | None = None,
+        projection: LogitsProjection | None = None,
     ) -> torch.Tensor:
         """Compute CE directly from hidden states, with no full-logit allocation.
 
@@ -301,8 +301,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             logits_dtype: Optional output cast after projection, matching the
                 owning model. Projection uses lm_weight.dtype; mixed-dtype
                 hidden states are converted per chunk, never the full weight.
-            lm_head: The model's ``LMHead``, whose ``project`` each chunk calls with the
-                materialized weight; None projects like a plain bias-free linear head.
+            projection: Optional parameter-free settings applied to the materialized weight.
 
         Returns:
             FP32 scalar, or losses shaped [...] for reduction="none". Inputs
@@ -331,7 +330,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             self.chunk_len,
             self.ignore_index,
             logits_dtype,
-            partial(self._compute_loss, lm_head=lm_head),
+            partial(self._compute_loss, projection=projection),
         ).reshape(labels.shape)
         if loss_weights is not None:
             losses = losses * loss_weights.to(device=losses.device, dtype=torch.float32)
