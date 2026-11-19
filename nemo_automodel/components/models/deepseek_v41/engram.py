@@ -366,20 +366,21 @@ class DeepseekV41Engram(nn.Module):
         result.__dict__.update(copy.deepcopy(self.__dict__, memo))
         return result
 
-    def set_owner_group(self, process_group: dist.ProcessGroup) -> None:
-        """Bind an unmaterialized table to its stage-local owner group.
+    def set_owner_group(self, process_group: dist.ProcessGroup | None) -> None:
+        """Bind an unmaterialized table to its stage-local owner group, or to one local owner for ``None``.
 
         This runs after pipeline trimming, before FSDP and checkpoint loading.
         A populated table cannot be rebound: silently discarding its old owner
         shard would corrupt checkpoint loading and optimizer parameter identities.
         """
         old = self.embed
-        ranks = tuple(dist.get_process_group_ranks(process_group))
-        if old.process_group is not None and tuple(dist.get_process_group_ranks(old.process_group)) == ranks:
+        ranks = () if process_group is None else tuple(dist.get_process_group_ranks(process_group))
+        old_ranks = () if old.process_group is None else tuple(dist.get_process_group_ranks(old.process_group))
+        if old_ranks == ranks:
             return
         if not old.weight.is_meta:
             raise ValueError("Changing the Engram owner group requires an unmaterialized meta table")
-        owner_size = len(ranks)
+        owner_size = max(len(ranks), 1)
         self.embed = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=-(-self.num_embeddings // owner_size) * owner_size,
             embedding_dim=old.embedding_dim,

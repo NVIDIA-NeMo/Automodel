@@ -2017,3 +2017,19 @@ class TestPreserveGradsAcrossStageReinit:
         _preserve_grads_across_stage_reinit([stage])
 
         assert not hasattr(stage, "_post_metadata_inference_cleanup")
+
+
+def test_explicit_partition_must_list_every_decoder_layer_once():
+    from nemo_automodel.components.distributed.pipelining.functional import _check_partition_lists_every_layer_once
+
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.layers.0", "model.layers.1"], ["model.layers.2", "model.lm_head"]], "model.", 3
+    )
+    with pytest.raises(ValueError, match=r"missing \[1\]"):
+        _check_partition_lists_every_layer_once([["model.layers.0"], ["model.layers.2"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[1\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers.0", "model.layers.1"], ["model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    with pytest.raises(ValueError, match=r"beyond the model \[3\]"):
+        _check_partition_lists_every_layer_once([[f"model.layers.{i}" for i in range(4)]], "model.", 3)

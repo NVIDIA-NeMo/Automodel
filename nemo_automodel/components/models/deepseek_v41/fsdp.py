@@ -84,11 +84,14 @@ class DeepseekV41ModelParallelizer(ModelParallelizer):
             model._pipeline_layer_bounds()
             first = model.model.embed_tokens is not None
             owner_mesh = mesh_context.device_mesh["dp_shard_cp"]
-            if owner_mesh.size() > 1 and mesh_context.ep_size == 1:
+            engrams = [layer.engram for layer in model.model.layers.values() if layer.engram is not None]
+            if engrams and owner_mesh.size() > 1 and mesh_context.ep_size == 1:
                 raise ValueError("DeepSeek V4.1 PP with sharded Engram currently requires expert parallelism")
-            for layer in model.model.layers.values():
-                if layer.engram is not None:
-                    layer.engram.set_owner_group(owner_mesh.get_group())
+            # One owner per stage keeps the complete table on the local lookup path; the model's default
+            # WORLD group would make the lookup expect an owner-managed DTensor.
+            owner_group = owner_mesh.get_group() if owner_mesh.size() > 1 else None
+            for engram in engrams:
+                engram.set_owner_group(owner_group)
             if not first and model.config.vision_config.num_hidden_layers > 0:
                 # Pipeline trimming handles child modules; these are direct Parameters.
                 for name in ("image_start", "image_end", "image_newline"):

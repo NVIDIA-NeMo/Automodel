@@ -461,6 +461,9 @@ class DeepseekV41Model(nn.Module):
             input_ids: Integer tensor of shape [batch, sequence], also used for Engram.
             position_ids: Optional integer tensor of shape [batch, sequence].
             attention_mask: Optional binary right-padding tensor [batch, sequence].
+            padding_mask: Optional boolean tensor [batch, sequence] with True at padding, as the standard
+                collator emits it; used when ``attention_mask`` is absent. Non-first PP stages take the
+                validity of each token from the stage metadata instead.
             image_mask: Optional boolean image-span tensor [batch, sequence].
             pixel_values: Optional image patches [all_patches, 3, patch_size, patch_size].
             image_grid_hws: Optional patch grids [images, 2].
@@ -759,6 +762,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
         input_ids: torch.Tensor,
         *pipeline_inputs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
@@ -813,6 +817,8 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
         """
         if cp_group is None and self.cp_mesh is not None:
             cp_group = self.cp_mesh.get_group()
+        if attention_mask is None and padding_mask is not None:
+            attention_mask = ~padding_mask.bool()
         is_pp_stage = self.lm_head is None or self.model.embed_tokens is None
         pipeline_hidden = pipeline_mix = pipeline_state = None
         if self.model.embed_tokens is None:

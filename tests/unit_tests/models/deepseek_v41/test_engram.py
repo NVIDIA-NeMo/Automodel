@@ -579,5 +579,32 @@ def _materialized_owner_worker(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
+def _singleton_owner_worker(rank: int, rendezvous: str) -> None:
+    """A stage with one owner rebinds its WORLD-grouped meta table to the local lookup path."""
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        with torch.device("meta"):
+            model = _owner_model((113, 253))
+        for layer_id, rows in ((1, 113), (4, 253)):
+            module = model.model.layers[str(layer_id)].engram
+            assert module.embed.process_group is not None  # the model defaults to WORLD under torch.distributed
+            module.set_owner_group(None)
+            module.set_owner_group(None)  # rebinding to the same owner is a no-op
+            assert module.embed.process_group is None and module.embed.owner_world_size == 1
+            assert module.embed.weight.shape[0] == rows
+            to_empty_parameters_only(module, device=torch.device("cpu"))
+            module.init_weights()
+            hidden = torch.randn(1, 3, module.hc_mult, module.hidden_size)
+            ids = torch.zeros(1, 3, module.hash_heads, dtype=torch.long)
+            assert module(hidden, ids).shape == hidden.shape
+    finally:
+        dist.destroy_process_group()
+
+
+def test_single_owner_stage_rebinds_engram_to_the_local_table(tmp_path: Path) -> None:
+    mp.spawn(_singleton_owner_worker, args=(str(tmp_path / "singleton_owner"),), nprocs=2, join=True)
+
+
 def test_materialized_pretrained_owner_gradients_norm_and_update(tmp_path: Path) -> None:
     mp.spawn(_materialized_owner_worker, args=(str(tmp_path / "materialized_owner"),), nprocs=2, join=True)

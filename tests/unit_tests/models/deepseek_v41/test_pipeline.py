@@ -163,6 +163,22 @@ def test_unpacked_pipeline_metadata_matches_unsplit(padding: str, length: int) -
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+def test_forward_accepts_the_standard_collator_padding_mask() -> None:
+    """The default collator's padding_mask (True at padding) works unsplit and on both PP stages."""
+    torch.set_num_threads(1)
+    torch.manual_seed(94)
+    with torch.compiler.set_stance("force_eager"):
+        reference = _model(full_schedule=True, engram=True)
+        first, last = _stages(reference)
+        ids = torch.arange(26).reshape(2, 13) % 7 + 1
+        mask = torch.ones_like(ids)
+        mask[0, 9:] = 0
+        expected = reference(ids, attention_mask=mask).logits
+        torch.testing.assert_close(reference(ids, padding_mask=mask == 0).logits, expected, atol=1e-6, rtol=1e-5)
+        actual = last(*first(ids, padding_mask=mask == 0), padding_mask=mask == 0).logits
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_pipeline_rejects_missing_or_rounded_pre_mix() -> None:
     first, last = _stages(_model(full_schedule=True))
     ids = torch.ones(1, 8, dtype=torch.long)

@@ -239,4 +239,5 @@ ci:
   recipe_owner: huiyingl
   nodes: 16
   cluster_tag: gb200
+  nemo_ci_schedule: skipped
   time: "01:00:00"

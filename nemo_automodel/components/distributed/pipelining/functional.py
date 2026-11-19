@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import copy
 import functools
 import inspect
 import logging
 import math
 import os
+import re
 import time
 import types
 from typing import Callable, Protocol
@@ -615,6 +617,27 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
     stage_model.forward = _pp_tensor_forward
 
 
+def _check_partition_lists_every_layer_once(
+    module_names_per_stage: list[list[str]], layers_prefix: str, num_layers: int
+) -> None:
+    """Reject an explicit partition that omits, repeats or invents a decoder layer.
+
+    A trimmed stage sees only its own modules, so a layer that no stage lists runs zero times and a layer that
+    two stages list runs twice, and the stages' wire contracts still match.
+    """
+    pattern = re.compile(rf"^{re.escape(layers_prefix)}layers\.(\d+)$")
+    listed = [int(m.group(1)) for names in module_names_per_stage for name in names if (m := pattern.match(name))]
+    counts = collections.Counter(listed)
+    missing = [i for i in range(num_layers) if i not in counts]
+    repeated = sorted(i for i, count in counts.items() if count > 1)
+    unknown = sorted(i for i in counts if i >= num_layers)
+    if missing or repeated or unknown:
+        raise ValueError(
+            "module_fqns_per_model_part must list every decoder layer exactly once: "
+            f"missing {missing}, repeated {repeated}, beyond the model {unknown}"
+        )
+
+
 def split_model_into_stages(
     model: torch.nn.Module,
     pp_mesh: DeviceMesh,
@@ -726,6 +749,8 @@ def split_model_into_stages(
             )
             if custom_module_names is not None:
                 module_names_per_stage = custom_module_names
+    else:
+        _check_partition_lists_every_layer_once(module_names_per_stage, layers_prefix, num_layers)
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int
