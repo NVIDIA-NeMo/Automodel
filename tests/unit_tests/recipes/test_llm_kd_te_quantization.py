@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The KD step without pipeline parallelism runs the student, and only the student, under its TE quantization."""
+"""The KD step runs the student, and only the student, under its TE quantization, with and without pipelines."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -134,3 +134,61 @@ def test_no_te_quantization_enters_no_context(monkeypatch: pytest.MonkeyPatch) -
     assert teacher.forward_seen == [False]
     assert torch.isfinite(loss)
     assert gradient is not None and gradient.abs().sum() > 0
+
+
+class _RecordingSchedule:
+    """A pipeline schedule that records whether the TE quantization context is entered when it runs."""
+
+    def __init__(self, entered: list[bool]) -> None:
+        self.entered = entered
+        self.seen: list[bool] = []
+
+    def step(self, input_ids: torch.Tensor, *, target: torch.Tensor, losses: list[torch.Tensor]) -> None:
+        """Record the context and report a zero loss.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+            target: Tensor of shape [batch, sequence].
+            losses: Receives one scalar Tensor.
+        """
+        self.seen.append(self.entered[0])
+        losses.append(torch.zeros(()))
+
+    eval = step
+
+
+@pytest.mark.parametrize("te_quantization", [TEFp8Config(), TENvfp4Config()], ids=["te_fp8", "te_nvfp4"])
+def test_the_pipeline_teacher_runs_outside_the_student_te_quantization(
+    monkeypatch: pytest.MonkeyPatch, te_quantization: TEQuantizationConfig
+) -> None:
+    entered = [False]
+
+    @contextmanager
+    def autocast() -> Iterator[None]:
+        entered[0] = True
+        try:
+            yield
+        finally:
+            entered[0] = False
+
+    monkeypatch.setattr(TEQuantizationConfig, "maybe_te_autocast", lambda self: autocast())
+    student, teacher = _RecordingSchedule(entered), _RecordingSchedule(entered)
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.model_parts = [nn.Identity()]
+    recipe.teacher_model = SimpleNamespace(_teacher_logits_capture=[None])
+    recipe.device_mesh = None
+    recipe.tokenizer = None
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.te_quantization = te_quantization
+    stages = {"has_first_stage": True, "has_last_stage": True}
+    recipe.pp = SimpleNamespace(info=SimpleNamespace(schedule=student, **stages), pp_batch_size=2, pp_microbatch_size=2)
+    recipe.teacher_pp = SimpleNamespace(info=SimpleNamespace(schedule=teacher, **stages))
+    batch = {"input_ids": torch.randint(1, VOCAB, (2, 5)), "labels": torch.randint(1, VOCAB, (2, 5))}
+    losses: list[torch.Tensor] = []
+
+    recipe._forward_backward_step_pp(0, batch, loss_buffer=losses, num_label_tokens=10, num_batches=1)
+
+    assert teacher.seen == [False]
+    assert student.seen == [True]
+    assert not entered[0]
+    assert len(losses) == 1

@@ -806,7 +806,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
 
-        with train_ctx(), te_ctx:
+        with train_ctx(), ExitStack() as student_ctx:
             if separate_teacher_logits is not None:
                 self._current_teacher_logits = list(
                     torch.split(separate_teacher_logits, self.pipeline_config.pp_microbatch_size, dim=0)
@@ -830,7 +830,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         self._current_teacher_logits = None
             self._current_num_label_tokens = num_label_tokens
 
-            # Run student forward (+ backward if training).
+            # Run student forward (+ backward if training) under its TE quantization; the teacher above does not.
+            student_ctx.enter_context(te_ctx)
             student_losses = [] if self.pp.info.has_last_stage else None
             if is_train:
                 if self.pp.info.has_first_stage:
