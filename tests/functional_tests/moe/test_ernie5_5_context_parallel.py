@@ -19,7 +19,8 @@ that no expert parallelism is needed, and packs the same three documents into on
 ranks the second document starts on the second rank and ends on the third.
 
 The test compares the logits and the gradients, summed over the ranks, of four shards with one process that holds
-the whole row.
+the whole row. The shards run with activation checkpointing, as in the packed recipes, so every layer runs again
+during backward, with its exchange between the ranks.
 """
 
 import os
@@ -37,6 +38,7 @@ from nemo_automodel.components.distributed.context_parallel import ContextParall
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ernie5_5.config import Ernie5_5Config
 from nemo_automodel.components.models.ernie5_5.model import Ernie5_5_MoeForCausalLM
+from nemo_automodel.components.moe.parallelizer import checkpoint_moe_block
 
 VOCAB, WINDOW = 64, 8
 # Once each document starts at a multiple of 128, the documents start at row offsets 0, 256 and 640.
@@ -123,8 +125,9 @@ def _check_shards(rank: int, mesh, model: Ernie5_5_MoeForCausalLM) -> list[str]:
     model.zero_grad()
 
     model.cp_mesh = mesh
-    for layer in model.model.layers:
+    for index, layer in enumerate(model.model.layers):
         layer.self_attn.setup_cp_attention(mesh)
+        model.model.layers[index] = checkpoint_moe_block(layer, router_policy=None)
     sharder = ContextParallelSharder(model, mesh, batch)
     _, local = sharder.shard(batch)
     logits = model(
@@ -136,7 +139,7 @@ def _check_shards(rank: int, mesh, model: Ernie5_5_MoeForCausalLM) -> list[str]:
     F.cross_entropy(logits[0], local["labels"][0], reduction="sum").backward()
     # Every collective runs before the first comparison, so that a failure on one rank cannot block another.
     row = sharder.gather_token_tensor(logits.detach(), seq_dim=1)[0]
-    parameters = dict(model.named_parameters())
+    parameters = {name.replace("._checkpoint_wrapped_module", ""): p for name, p in model.named_parameters()}
     gradients = {}
     for name in expected:
         gradient = parameters[name].grad
