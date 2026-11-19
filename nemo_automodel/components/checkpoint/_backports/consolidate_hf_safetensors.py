@@ -16,6 +16,7 @@
 
 import concurrent.futures
 import glob
+import io
 import json
 import logging
 import math
@@ -26,7 +27,7 @@ import struct
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO
+from typing import Any
 
 import torch
 from torch import distributed as dist
@@ -48,6 +49,7 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+_CAST_CHUNK_BYTES = 8 * 1024 * 1024
 _DTYPE_CAST_ALIASES: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
@@ -65,7 +67,6 @@ _DTYPE_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {dtype: key for key, dtype
 _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu}
 _QUANTIZED_DTYPE_WARNING_LIMIT = 5
 _MISSING_FQN_WARNING_LIMIT = 5
-_CAST_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 def resolve_dtype_cast(dtype_name: str | None) -> torch.dtype | None:
@@ -465,7 +466,7 @@ def _process_output_file(
                 _write_cast_tensor(output_stream, full_tensor_mv, tensor_fqn_data)
 
 
-def _write_cast_tensor(output_stream: BinaryIO, tensor_bytes: memoryview, tensor_data: _FqnData) -> None:
+def _write_cast_tensor(output_stream: io.BufferedWriter, tensor_bytes: memoryview, tensor_data: _FqnData) -> None:
     """Write at most _CAST_CHUNK_BYTES of converted tensor data at a time."""
     source_dtype = _get_known_dtype(tensor_data.source_dtype_str)
     cast_dtype = _get_known_dtype(tensor_data.dtype_str)
