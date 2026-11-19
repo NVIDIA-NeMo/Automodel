@@ -2847,6 +2847,69 @@ class TestRunTrainOptimStepSetsMoEScale:
         # 3 s optimizer step plus the reporting, CE and KD readbacks (1 s each) for 4 tokens.
         assert sample.metrics["tps"] == pytest.approx(4 / 6.0)
 
+    def test_inherited_dllm_step_times_its_metric_reductions(self, monkeypatch):
+        """The dLLM override reads the clock after its loss, FLOP and accuracy reductions and uses one interval."""
+        from nemo_automodel.components.utils.flops_utils import calculate_mfu
+        from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        def reduce(value, include_cp=False):
+            if value.dtype.is_floating_point:
+                advance(1.0)  # Queued GPU work completes during each blocking reduction.
+            return value
+
+        def forward_backward(recipe, index, batch, *, loss_buffer, **kwargs):
+            loss_buffer.append(torch.tensor(1.0))
+            recipe._dllm_loss_buffer.append(torch.tensor(0.5))
+
+        recipe = object.__new__(DiffusionLMSFTRecipe)
+        recipe.pp_enabled = False
+        recipe.dllm_mode = "mdlm"
+        recipe.dllm_strategy = SimpleNamespace(
+            pre_step=lambda recipe, batches: (4, 4), forward_backward=forward_backward
+        )
+        recipe._compute_loss_denominators = lambda batches, noise, supervised: (noise, supervised)
+        recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True, world_size=1)
+        recipe.device_mesh = None
+        recipe.moe_mesh = None
+        recipe.model_parts = [nn.Linear(2, 2)]
+        recipe._dllm_loss_buffer = []
+        recipe._dflash_correct_per_pos_buffer = [torch.tensor([1.0, 1.0])]
+        recipe._dflash_count_per_pos_buffer = [torch.tensor([2.0, 2.0])]
+        recipe._dp_allreduce = reduce
+        recipe._get_dp_group_size = lambda include_cp=False: 1
+        recipe._get_cp_group_size = lambda: 1
+        recipe.mfu_calculator = SimpleNamespace(get_flops=lambda _: 7e12, reference_mfu=1000.0)
+        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+        recipe.optimizer = [
+            SimpleNamespace(step=lambda: advance(3.0), zero_grad=lambda: None, param_groups=[{"lr": 0.1}])
+        ]
+        recipe.lr_scheduler = None
+        recipe.cfg = SimpleNamespace(get=lambda key, default=None: default)
+        recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+        recipe.timestamp = 0.0
+        for name in ("prepare_for_grad_accumulation", "prepare_for_final_backward", "prepare_after_first_microbatch"):
+            monkeypatch.setattr(f"nemo_automodel.recipes.dllm.train_ft.{name}", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.dllm.train_ft.synchronize_tp_replica_gradients", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.dllm.train_ft.scale_grads_and_clip_grad_norm", lambda *a, **k: torch.tensor(1.0)
+        )
+        monkeypatch.setattr("nemo_automodel.recipes.dllm.train_ft.time.perf_counter", lambda: clock[0])
+        monkeypatch.setattr("torch.cuda.max_memory_allocated", lambda: 0)
+
+        sample = recipe._run_train_optim_step([{"input_ids": torch.ones(1, 4, dtype=torch.long)}])
+
+        # 3 s optimizer step, then the loss (2), FLOP (1) and draft-accuracy (2) reductions, for 4 tokens.
+        assert sample.metrics["tps"] == pytest.approx(4 / 8.0)
+        assert sample.metrics["mfu"] == pytest.approx(calculate_mfu(7.0, 1, 8.0, reference_mfu=1000.0))
+        assert sample.metrics["draft_acc"] == pytest.approx(0.5)
+
     @pytest.mark.parametrize("unsupported", ["formula", "input"])
     def test_runtime_tflops_unavailable_for_incomplete_flops(self, monkeypatch, unsupported):
         recipe = self._make_recipe(monkeypatch, pp_enabled=False)

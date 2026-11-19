@@ -591,38 +591,23 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         dllm_loss = self._dp_allreduce(torch.stack(self._dllm_loss_buffer).sum(), include_cp=True).item()
         self._dllm_loss_buffer.clear()
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
-
-        mfu = None
+        # Every blocking metric reduction runs before the clock is read, as in the base recipe, so that queued
+        # GPU work completing during them stays inside this step's window.
+        step_flops = None
         mfu_calculator = getattr(self, "mfu_calculator", None)
         if batches and mfu_calculator is not None:
             step_flops = 0.0
-            flops_supported = True
             for batch in batches:
                 input_ids = batch.get("input_ids")
-                if input_ids is None:
-                    flops_supported = False
-                    break
-                batch_flops = mfu_calculator.get_flops(input_ids)
+                batch_flops = None if input_ids is None else mfu_calculator.get_flops(input_ids)
                 if batch_flops is None:
-                    flops_supported = False
+                    step_flops = None
                     break
                 step_flops += float(batch_flops)
-
-            if flops_supported:
+            if step_flops is not None:
                 step_flops = self._dp_allreduce(
                     torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
                 ).item()
-                mfu = calculate_mfu(
-                    step_flops / 1e12,
-                    self.dist_env.world_size,
-                    time_delta,
-                    reference_mfu=mfu_calculator.reference_mfu,
-                )
-
         # DFlash draft top-1 accuracy. Per-rank raw (correct, count) per block
         # offset are summed over grad-accum microbatches, SUM-allreduced across
         # DP+CP (same primitive as dllm_loss), then divided post-reduction to
@@ -645,6 +630,18 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             draft_acc_per_pos = (correct_per_pos / count_safe).tolist()
         self._dflash_correct_per_pos_buffer.clear()
         self._dflash_count_per_pos_buffer.clear()
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+        mfu = None
+        if step_flops is not None:
+            mfu = calculate_mfu(
+                step_flops / 1e12,
+                self.dist_env.world_size,
+                time_delta,
+                reference_mfu=mfu_calculator.reference_mfu,
+            )
 
         metrics = {
             "loss": total_loss,
