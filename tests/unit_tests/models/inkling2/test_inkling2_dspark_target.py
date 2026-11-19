@@ -339,11 +339,11 @@ def test_recipe_trains_the_released_draft_against_the_native_target(monkeypatch,
     built = {}
     batch = _batch()
     _patch_recipe(monkeypatch, target, built, batch)
-    cfg = _recipe_cfg(tmp_path, target_experts="torch")
+    cfg = _recipe_cfg(tmp_path, target_dispatcher="torch")
     recipe = TrainDSparkRecipe(cfg)
     recipe.setup()
 
-    assert built == {"path": "tiny-inkling2", "distributed_setup": "mesh", "backend": ("flex", "torch", "hybridep")}
+    assert built == {"path": "tiny-inkling2", "distributed_setup": "mesh", "backend": ("flex", "torch_mm", "torch")}
     draft = recipe.draft_model
     assert isinstance(draft, Inkling2DSparkModel)
     assert "embed_tokens.weight" not in draft.state_dict()
