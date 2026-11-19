@@ -113,9 +113,7 @@ def _build(seed: int = 0) -> Inkling2DSparkModel:
             elif name in ("fuse_weight", "markov_head.rnn_proj.bias", "markov_head.hidden_out.bias"):
                 param.normal_(0.0, 1.0)
     lm_head = torch.nn.Linear(_HIDDEN, _VOCAB, bias=False)
-    model.initialize_embeddings_and_head(
-        embed_tokens=torch.nn.Embedding(_VOCAB, _HIDDEN), lm_head=lm_head, freeze=True
-    )
+    model.initialize_embeddings_and_head(embed_tokens=torch.nn.Embedding(_VOCAB, _HIDDEN), lm_head=lm_head, freeze=True)
     return model
 
 
