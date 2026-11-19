@@ -111,6 +111,7 @@ checkpoint:
   enabled: false
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: hasuoshenyun
   cluster_tag: h100
   time: "00:15:00"
