@@ -33,7 +33,6 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import (
     HFCheckpointingMixin,
 )
-from nemo_automodel.components.models.common.logits import enable_fp32_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -246,7 +245,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.norm: nn.Module | None = initialize_rms_norm_module(
             "torch", config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.lm_head: nn.Module | None = Inkling2LMHead(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+        self.lm_head: Inkling2LMHead | None = Inkling2LMHead(config, dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Inkling2StateDictAdapter(config)
         Inkling2ForCausalLM.initialize_weights(self)
@@ -284,13 +283,9 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Return the untied token lookup; embed_norm is applied in forward."""
         return self.embed_tokens
 
-    def get_output_embeddings(self) -> nn.Module | None:
+    def get_output_embeddings(self) -> Inkling2LMHead | None:
         """Return the callable untied head for shared FSDP and output-loss setup."""
         return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-        """Replace the untied head, keeping its FP32 logits."""
-        self.lm_head = enable_fp32_logits(new_embeddings, forward=Inkling2LMHead.forward)
 
     def _pipeline_layer_ids(self) -> list[int]:
         """Validate contiguous global layer IDs and exclusive parameter ownership."""
@@ -583,7 +578,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         return hidden if return_hidden or self._pp_return_hidden_states else self._project_logits(hidden)
 
     def _project_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Apply the callable head, logit softcap and unused-vocabulary mask.
+        """Call the head, which applies the logit softcap and unused-vocabulary mask.
 
         Args:
             hidden: Compute-dtype tensor of shape [batch, sequence, hidden].
@@ -593,9 +588,4 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             negative infinity. The input is unchanged.
         """
         assert self.lm_head is not None
-        logits = self.lm_head(hidden)
-        cap = self.text_config.final_logit_softcapping
-        logits = cap * torch.tanh(logits / cap)
-        return logits.masked_fill(
-            torch.arange(self.vocab_size, device=logits.device) >= self.text_config.unpadded_vocab_size, float("-inf")
-        )
+        return self.lm_head(hidden)

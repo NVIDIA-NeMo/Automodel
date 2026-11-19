@@ -752,9 +752,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 - cache_dir (str): Cache directory for model weights.
                 - load_metadata_with_gloo (bool): Use a CPU process group for checkpoint
                   load planning while retaining the training group. Default: False.
-                - logits_dtype (str | torch.dtype): ``float32`` makes the LM-head GEMM write
-                  FP32 logits from operands in the head's compute dtype. The model must
-                  call a supported output head. Default: None (model default).
+                - logits_dtype (str | torch.dtype): Dtype of the LM head's logits, e.g.
+                  ``float32``. Default: None (the model's own head).
 
         Returns:
             transformers.PreTrainedModel: The loaded (and possibly patched)

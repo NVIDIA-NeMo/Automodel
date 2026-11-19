@@ -20,8 +20,10 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from nemo_automodel.components.loss.utils import prepare_lm_weight
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.utils import calculate_loss, prepare_lm_weight
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.inkling2.layers import Inkling2LMHead
 from nemo_automodel.components.models.inkling2.loss import Inkling2FusedLinearCrossEntropy
 from nemo_automodel.components.models.inkling2.model import Inkling2ForCausalLM
 
@@ -104,22 +106,18 @@ def test_output_projection_runs_module_hooks_and_preserves_fp32(dtype: torch.dty
     torch.testing.assert_close(output.logits[..., :37], expected[..., :37], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("replace_head", [False, True])
-def test_bf16_head_preserves_fp32_projection_and_gradients(replace_head: bool) -> None:
+def test_bf16_head_owns_the_fp32_softcapped_masked_logits_and_gradients() -> None:
     model = Inkling2ForCausalLM(tiny_config(dtype="bfloat16"))
     head = model.get_output_embeddings()
-    assert head is not None
-    if replace_head:
-        replacement = torch.nn.Linear(head.in_features, head.out_features, bias=False, dtype=torch.bfloat16)
-        model.set_output_embeddings(replacement)
-        head = model.get_output_embeddings()
-        assert head is replacement
-    assert head.weight.dtype == torch.bfloat16
+    assert isinstance(head, Inkling2LMHead) and head.weight.dtype == torch.bfloat16
     generator = torch.Generator().manual_seed(13)
     hidden = torch.randn(2, 3, head.in_features, generator=generator, requires_grad=True)
     upstream = torch.randn(2, 3, head.out_features, generator=generator)
 
-    expected = F.linear(hidden, head.weight.float())
+    cap = model.text_config.final_logit_softcapping
+    expected = cap * torch.tanh(F.linear(hidden, head.weight.float()) / cap)
+    padded = torch.arange(head.out_features) >= model.text_config.unpadded_vocab_size
+    expected = expected.masked_fill(padded, float("-inf"))
     with torch.autocast("cpu", dtype=torch.bfloat16):
         actual = head(hidden)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -128,6 +126,33 @@ def test_bf16_head_preserves_fp32_projection_and_gradients(replace_head: bool) -
         torch.autograd.grad(actual, inputs, upstream), torch.autograd.grad(expected, inputs, upstream)
     ):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_chunked_cross_entropy_reproduces_the_model_logits(dtype: str) -> None:
+    torch.manual_seed(0)
+    model = Inkling2ForCausalLM(tiny_config(dtype=dtype))
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    labels = torch.tensor([[2, 3, 4, 5, 6, -100]])
+    output = model(ids, output_hidden_states=True)
+    expected = F.cross_entropy(output.logits.flatten(0, 1), labels.flatten(), reduction="sum")
+
+    actual = calculate_loss(
+        ChunkedCrossEntropy(2, compile=False),
+        model=model,
+        hidden_states=output.hidden_states,
+        logits=output.logits,
+        labels=labels,
+    )
+
+    # Every chunk calls the head's project, so it sees the softcapped, masked FP32 logits.
+    torch.testing.assert_close(actual, expected)
+    weight = model.get_output_embeddings().weight
+    (actual_grad,) = torch.autograd.grad(actual, weight, retain_graph=True)
+    (expected_grad,) = torch.autograd.grad(expected, weight)
+    # Chunks accumulate the weight gradient in another order before the BF16 rounding.
+    error = (actual_grad.float() - expected_grad.float()).norm() / expected_grad.float().norm()
+    assert error < (1e-2 if dtype == "bfloat16" else 1e-5), error
 
 
 @pytest.mark.parametrize(

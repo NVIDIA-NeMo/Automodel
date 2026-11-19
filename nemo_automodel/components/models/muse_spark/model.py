@@ -24,7 +24,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.logits import Float32LogitsLinear
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -343,14 +343,8 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             if config.use_audio_perception
             else None
         )
-        # ``use_fp32_for_output`` returns FP32 logits (see get_pipeline_stage_metas).
-        self.lm_head = (
-            Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
-            if config.use_fp32_for_output
-            else initialize_linear_module(
-                self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype
-            )
-        )
+        logits_dtype = torch.float32 if config.use_fp32_for_output else None  # see get_pipeline_stage_metas
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
             adapter_cls = (

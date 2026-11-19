@@ -28,6 +28,7 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.flint.config import FlintConfig
 from nemo_automodel.components.models.flint.layers import FlintDecoderLayer
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -159,7 +160,7 @@ class FlintModelParallelizer(ModelParallelizer):
                 ignored_params=ignored_params,
             )
             return module
-        if getattr(inner, "fp32_logits", False):
+        if isinstance(inner, LMHead) and inner.logits_dtype == torch.float32:
             # Only the model-owned vocabulary head has this strict boundary.
             # Mixed-storage LoRA can also make projection/adapter linears
             # standalone FSDP units; they retain the caller's shared policy.

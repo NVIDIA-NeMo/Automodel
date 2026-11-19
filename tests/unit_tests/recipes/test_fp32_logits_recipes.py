@@ -33,6 +33,7 @@ from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.kd_loss import KDLoss
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -67,7 +68,7 @@ def _fp32_logits_llama() -> nn.Module:
     model = NeMoAutoModelForCausalLM.from_config(
         config, backend={"attn": "sdpa", "rms_norm": "torch"}, torch_dtype=torch.bfloat16, logits_dtype="float32"
     )
-    assert model.lm_head.fp32_logits
+    assert isinstance(model.lm_head, LMHead) and model.lm_head.logits_dtype == torch.float32
     return model
 
 

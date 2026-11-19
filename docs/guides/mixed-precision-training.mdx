@@ -248,7 +248,7 @@ The automatic warning about torch Adam/AdamW with trainable bf16 parameters curr
 
 ## FP32 Logits
 
-Set `model.logits_dtype: float32` to keep the language-model head's logits in fp32, for example to match vLLM's `head_dtype: float32` rollouts in reinforcement learning:
+Set `model.logits_dtype` to choose the dtype of the language-model head's logits independently of the model dtype, for example `float32` to match vLLM's `head_dtype: float32` rollouts in reinforcement learning:
 
 ```yaml
 model:
@@ -257,25 +257,16 @@ model:
   logits_dtype: float32
 ```
 
-For a standard linear head, the GEMM reads the hidden states and the head weight in the head's compute dtype (bf16 by default), accumulates in fp32 and writes fp32 logits, so no logit is rounded to bf16. This differs from `mp_policy.output_dtype: float32`, which upcasts logits that were already rounded to bf16. Parameter storage, master weights, optimizer state, gradient reduction and checkpoint keys are unchanged, and tied embeddings stay tied. In backward, the logits gradient is cast to the compute dtype and the head uses the same GEMMs as the default head.
-
-Some models compute fp32 logits by design and return them without `logits_dtype`: DeepSeek-V4, DeepSeek-V4.1, Flint, Inkling2, HY-MT2 with `enable_lm_head_fp32` (its default), and Muse Spark with `use_fp32_for_output`.
+The head's GEMM reads the hidden states and the weight in the head's compute dtype (bf16 by default), accumulates in fp32 and writes fp32 logits, so no logit is rounded to bf16; `mp_policy.output_dtype: float32` instead upcasts logits already rounded to bf16. The backward casts the logits gradient to the compute dtype. Parameters, optimizer state, checkpoints and tied embeddings are unchanged, and fp32 logits take twice the memory of bf16 logits. DeepSeek-V4, DeepSeek-V4.1, Flint, Inkling2, and Muse Spark with `use_fp32_for_output` return fp32 logits by default; HY-MT2 needs `logits_dtype: float32`.
 
 | Configuration | Status |
 | --- | --- |
-| NeMo AutoModel or Hugging Face model that calls its replaceable language-model head, including `force_hf` | Supported for PyTorch, Transformer Engine and quack linear heads, and native heads that implement FP32 projection. Models without an output head are rejected at setup. |
-| FSDP2, including a tied input embedding and head | Supported. Use an outer FSDP `mp_policy.output_dtype` of `null` or `float32` to keep the FP32 logits at the model boundary. |
-| Tensor parallelism with a column-parallel head, with or without sequence parallelism | Supported for bias-free heads |
+| PyTorch, Transformer Engine and quack linear heads, native or `force_hf` | Supported. Models without an output head, or with a model-specific projection such as Baichuan's, are rejected at setup. |
+| FSDP2, including tied embeddings; tensor parallelism, with or without sequence parallelism | Supported. Keep an outer FSDP `mp_policy.output_dtype` of `null` or `float32`. |
 | HSDP, context parallelism, and FSDP2 combined with tensor parallelism | Not yet validated |
-| Pipeline parallelism | Rejected at setup |
-| LoRA, quantized or QAT LM heads | Rejected at setup |
-| A Transformer Engine head under FP8 training | Supported; the head projects in its compute dtype instead of fp8. |
-| `MaskedCrossEntropy` and other logits-based losses | Supported; they consume the fp32 logits. |
-| `ChunkedCrossEntropy` | Supported for a bias-free linear head without model-specific logit transformations. Each chunk reproduces the FP32 projection. |
-| `FusedLinearCrossEntropy` with `impl: cce` | The CUDA kernel computes logits in FP32 internally and requires BF16 or FP16 hidden states and head weights. |
-| `FusedLinearCrossEntropy` with `impl: torch_compile` | Rounds logits to the head's compute dtype, so the loss does not see fp32 logits; use `impl: cce`. |
-
-The fp32 logits tensor is twice the size of bf16 logits. Losses that upcast logits to fp32 already hold a tensor of that size, so measure end-to-end memory for your workload.
+| Pipeline parallelism; LoRA, quantized or QAT heads | Rejected at setup |
+| `MaskedCrossEntropy` and `ChunkedCrossEntropy` | Supported. Each chunk calls the head's own projection, including Inkling2's softcap and vocabulary mask. |
+| `FusedLinearCrossEntropy` | `impl: cce` computes fp32 logits from bf16 or fp16 operands; `impl: torch_compile` rounds logits to the compute dtype. |
 
 ## Example Configs
 

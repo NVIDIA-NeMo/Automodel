@@ -15,7 +15,8 @@
 """Every registered model class keeps the LM-head interface that FP32 logits rely on.
 
 Each registered model with a vocabulary head is built on the meta device.
-Enabling FP32 logits must preserve the weight returned by ``get_output_embeddings()``.
+Enabling FP32 logits must install an ``LMHead`` that keeps the weight returned by
+``get_output_embeddings()``, or reject a model-specific head at setup.
 """
 
 import importlib
@@ -29,9 +30,10 @@ import torch
 from torch import nn
 from transformers import Glm4MoeLiteConfig, MiniMaxM2Config, Mistral3Config, NemotronHConfig, PretrainedConfig
 
-from nemo_automodel._transformers.infrastructure import _use_fp32_logits
+from nemo_automodel._transformers.infrastructure import _set_logits_dtype
 from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.hy_mt2.config import HyMT2Config
 
 # Registered classes without a vocabulary head: embedding, decision and policy models.
@@ -45,6 +47,9 @@ _NO_LM_HEAD = {
     "Mistral3VLBidirectionalForSequenceClassification",
     "PraxisPolicy",
 }
+
+# Heads with a model-specific projection that an LMHead cannot reproduce.
+_REJECTED_HEAD = {"BaichuanForCausalLM"}  # normalizes its weight
 
 # Construction needs an optional module.
 _NEEDS_MODULE = {
@@ -168,8 +173,12 @@ def test_registered_lm_head_converts_to_fp32_logits(name, monkeypatch):
         )
     head = model.get_output_embeddings()
 
-    _use_fp32_logits(model, torch.float32, pipelined=False)
+    if name in _REJECTED_HEAD:
+        with pytest.raises(ValueError, match="plain linear LM head"):
+            _set_logits_dtype(model, torch.float32, pipelined=False)
+        return
+    _set_logits_dtype(model, torch.float32, pipelined=False)
 
     fp32_head = model.get_output_embeddings()
-    assert fp32_head.fp32_logits
+    assert isinstance(fp32_head, LMHead) and fp32_head.logits_dtype == torch.float32
     assert fp32_head.weight is head.weight

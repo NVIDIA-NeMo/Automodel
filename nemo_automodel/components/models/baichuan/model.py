@@ -49,11 +49,11 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.logits import compute_lm_head_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)
@@ -263,21 +263,17 @@ class NormHead(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.first_flag = True
 
-    fp32_logits = False
-
     def forward(self, hidden_states):
         if self.training:
+            norm_weight = F.normalize(self.weight)
             self.first_flag = True
-            weight = F.normalize(self.weight)
+        elif self.first_flag:
+            self.first_flag = False
+            self.weight.data = F.normalize(self.weight)
+            norm_weight = self.weight
         else:
-            if self.first_flag:
-                self.first_flag = False
-                with torch.no_grad():
-                    self.weight.copy_(F.normalize(self.weight))
-            weight = self.weight
-        if self.fp32_logits:
-            return compute_lm_head_logits(weight, hidden_states).logits
-        return F.linear(hidden_states, weight)
+            norm_weight = self.weight
+        return F.linear(hidden_states, norm_weight)
 
 
 # ---------------------------------------------------------------------------

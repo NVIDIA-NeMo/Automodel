@@ -58,15 +58,16 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.logits import (
-    Float32LogitsLinear,
-    compute_lm_head_logits,
-)
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
     build_dsv4_cp_causal_padding_mask,
@@ -1276,8 +1277,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        # DeepSeek-V4 keeps an FP32 head and returns its FP32 logits.
-        self.lm_head = Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.float32, logits_dtype=torch.float32)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,
@@ -1377,10 +1377,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            # The vocabulary projection writes FP32 logits.
-            output_meta = torch.empty(
-                microbatch_size, seq_len, self.config.vocab_size, device="meta", dtype=torch.float32
-            )
+            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size)).float()
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)
         else:

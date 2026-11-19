@@ -28,9 +28,6 @@ Architecture (from tencent/Hy-MT2-30B-A3B config.json):
 
 Notes vs. ``components/models/hy_v3`` (Hy3-preview 295B):
   - Smaller everywhere (48L / 128 experts / 32+4 heads / hidden=2048).
-  - ``enable_lm_head_fp32`` configures the LM head so its GEMM
-    writes FP32 logits. ``distributed.moe.lm_head_precision: float32`` in the
-    YAML additionally keeps the head weight in FP32 for the GEMM.
   - ``score_func`` is driven by ``config.moe_router_use_sigmoid`` instead
     of being hard-coded.
 """
@@ -49,15 +46,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.logits import (
-    Float32LogitsLinear,
-    compute_lm_head_logits,
-)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.hy_mt2.layers import HyMT2Attention
 from nemo_automodel.components.models.hy_mt2.state_dict_adapter import HyMT2StateDictAdapter
@@ -338,12 +331,7 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = HyMT2Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        # The HF reference computes FP32 logits when ``enable_lm_head_fp32`` is set.
-        self.lm_head = (
-            Float32LogitsLinear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.bfloat16)
-            if getattr(config, "enable_lm_head_fp32", False)
-            else initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
-        )
+        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = HyMT2StateDictAdapter(
                 self.config,

@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-rank Gloo checks of the FP32-logits head under tensor parallelism and FSDP2.
+"""Two-rank Gloo checks of an ``LMHead`` with FP32 logits under tensor parallelism and FSDP2.
 
 Each case compares FP32 logits, input and weight gradients, and the parameters after
 one SGD step against an unsharded single-process reference that runs the same head.
 Tensor-parallel input gradients are summed from per-rank BF16 partials, so they are
 compared with the BF16 ``nn.Linear`` head under the same layout, bit for bit.
-Tensor parallelism also covers a vocabulary the mesh does not divide evenly, a
-regular-tensor input, and the weight layouts the projection rejects.
+Tensor parallelism also covers a vocabulary the mesh does not divide evenly and weight
+layouts that DTensor must redistribute.
 """
 
 import os
@@ -36,7 +36,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
-from nemo_automodel.components.models.common.logits import compute_lm_head_logits, enable_fp32_logits
+from nemo_automodel.components.models.common.logits import LMHead
 
 pytestmark = pytest.mark.cpu_only
 
@@ -68,16 +68,19 @@ def _head(fp32_logits: bool, weight: torch.Tensor) -> nn.Linear:
     """Build a bias-free head owning a copy of ``weight``.
 
     Args:
-        fp32_logits: Configure the linear head for FP32 logits.
+        fp32_logits: Build an ``LMHead`` with FP32 logits instead of a plain ``nn.Linear``.
         weight: Tensor of shape [vocab, hidden]; its dtype becomes the parameter dtype.
 
     Returns:
         Head with weight of shape [vocab, hidden].
     """
-    head = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype)
+    if fp32_logits:
+        head = LMHead(weight.shape[1], weight.shape[0], logits_dtype=torch.float32, dtype=weight.dtype)
+    else:
+        head = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype)
     with torch.no_grad():
         head.weight.copy_(weight)
-    return enable_fp32_logits(head) if fp32_logits else head
+    return head
 
 
 def _check_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
@@ -132,8 +135,8 @@ def _check_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, upstream:
         torch.testing.assert_close(grads[True], grads[False], rtol=0, atol=0, msg=name)
 
 
-def _check_vocab_parallel_contract(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
-    """Check a regular-tensor input and the weight layouts the vocabulary-parallel projection rejects.
+def _check_weight_layouts(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
+    """Check FP32 logits and input gradients for each weight layout, which DTensor redistributes as needed.
 
     Args:
         hidden: BF16 tensor of shape [batch, sequence, hidden], identical on every rank.
@@ -141,40 +144,56 @@ def _check_vocab_parallel_contract(hidden: torch.Tensor, weight: torch.Tensor, u
         upstream: BF16-valued FP32 tensor of shape [batch, sequence, vocab].
     """
     mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("tp",))
+    mesh_2d = init_device_mesh("cpu", (1, _WORLD_SIZE), mesh_dim_names=("dp", "tp"))
     reference_hidden = hidden.clone().requires_grad_()
-    reference_logits = compute_lm_head_logits(weight, reference_hidden).logits
+    reference_logits = LMHead.linear(reference_hidden, weight, logits_dtype=torch.float32)
     reference_logits.backward(upstream)
-
-    # A regular tensor is the replicated input; each rank's input gradient is a partial sum.
-    local_hidden = hidden.clone().requires_grad_()
-    logits = compute_lm_head_logits(distribute_tensor(weight, mesh, [Shard(0)]), local_hidden).logits
-    assert logits.placements == (Shard(logits.ndim - 1),)
-    torch.testing.assert_close(logits.full_tensor(), reference_logits, rtol=1e-6, atol=1e-6)
-    logits.full_tensor().backward(upstream)
-    error = (local_hidden.grad.float() - reference_hidden.grad.float()).norm() / reference_hidden.grad.norm()
-    assert error < 1e-2, error
-
-    tp_mesh_2d = init_device_mesh("cpu", (1, _WORLD_SIZE), mesh_dim_names=("dp", "tp"))
-    unsupported = {
-        "replicated": distribute_tensor(weight, mesh, [Replicate()]),
-        "hidden-sharded": distribute_tensor(weight, mesh, [Shard(1)]),
-        "2-D mesh": distribute_tensor(weight, tp_mesh_2d, [Replicate(), Shard(0)]),
+    layouts = {
+        "vocabulary-sharded": (mesh, [Shard(0)]),
+        "replicated": (mesh, [Replicate()]),
+        "hidden-sharded": (mesh, [Shard(1)]),
+        "2-D mesh": (mesh_2d, [Replicate(), Shard(0)]),
     }
-    for name, unsupported_weight in unsupported.items():
-        try:
-            compute_lm_head_logits(unsupported_weight, hidden).logits
-        except NotImplementedError as error:
-            assert "vocabulary-sharded" in str(error), (name, error)
-        else:
-            raise AssertionError(f"FP32 logits accepted a {name} weight")
-    try:
-        compute_lm_head_logits(
-            distribute_tensor(weight, mesh, [Shard(0)]), hidden, bias=torch.zeros(weight.shape[0])
-        ).logits
-    except NotImplementedError as error:
-        assert "bias-free" in str(error), error
-    else:
-        raise AssertionError("FP32 logits accepted a biased column-parallel head")
+    for name, (layout_mesh, placements) in layouts.items():
+        local_hidden = hidden.clone().requires_grad_()
+        replicated_hidden = DTensor.from_local(local_hidden, layout_mesh, [Replicate()] * layout_mesh.ndim)
+        sharded_weight = distribute_tensor(weight, layout_mesh, placements)
+        logits = LMHead.linear(replicated_hidden, sharded_weight, logits_dtype=torch.float32)
+        assert logits.dtype == torch.float32, name
+        torch.testing.assert_close(logits.full_tensor(), reference_logits, rtol=1e-6, atol=1e-6, msg=name)
+        logits.full_tensor().backward(upstream)
+        error = (local_hidden.grad.float() - reference_hidden.grad.float()).norm() / reference_hidden.grad.norm()
+        assert error < 1e-2, (name, error)
+
+
+def _check_biased_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
+    """Compare a column-parallel head that has a bias with the unsharded head.
+
+    Args:
+        hidden: BF16 tensor of shape [batch, sequence, hidden], identical on every rank.
+        weight: BF16 tensor of shape [vocab, hidden], identical on every rank.
+        upstream: BF16-valued FP32 tensor of shape [batch, sequence, vocab].
+    """
+    mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("tp",))
+    bias = weight[:, 0].contiguous()
+
+    def biased_head() -> LMHead:
+        head = LMHead(weight.shape[1], weight.shape[0], bias=True, logits_dtype=torch.float32, dtype=weight.dtype)
+        with torch.no_grad():
+            head.weight.copy_(weight)
+            head.bias.copy_(bias)
+        return head
+
+    reference = biased_head()
+    reference_logits = reference(hidden)
+    reference_logits.backward(upstream)
+    head = parallelize_module(biased_head(), mesh, ColwiseParallel(output_layouts=Shard(-1), use_local_output=False))
+    logits = head(hidden)
+    logits.full_tensor().backward(upstream)
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits.full_tensor(), reference_logits, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(head.weight.grad.full_tensor(), reference.weight.grad)
+    torch.testing.assert_close(head.bias.grad.full_tensor(), reference.bias.grad)
 
 
 class _TinyLM(nn.Module):
@@ -259,7 +278,8 @@ def _worker(rank: int, port: int) -> None:
         uneven_upstream = torch.randn(2, 8, _VOCAB + 1, generator=generator).bfloat16().float()
         _check_tensor_parallel(hidden, weight.bfloat16(), upstream)
         _check_tensor_parallel(hidden, uneven_weight.bfloat16(), uneven_upstream)
-        _check_vocab_parallel_contract(hidden, weight.bfloat16(), upstream)
+        _check_weight_layouts(hidden, weight.bfloat16(), upstream)
+        _check_biased_tensor_parallel(hidden, weight.bfloat16(), upstream)
         _check_fsdp(weight, input_ids, labels)
     finally:
         dist.destroy_process_group()

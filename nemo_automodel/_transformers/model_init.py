@@ -1477,12 +1477,7 @@ def _apply_backend_module_overrides(model: torch.nn.Module, backend: BackendConf
                 continue
 
             replacement = replacements.get(id(child))
-            if (
-                replacement is None
-                and backend.linear == "quack"
-                and type(child) is torch.nn.Linear
-                and "forward" not in vars(child)
-            ):
+            if replacement is None and backend.linear == "quack" and type(child) is torch.nn.Linear:
                 replacement = initialize_linear_module(
                     "quack",
                     child.in_features,

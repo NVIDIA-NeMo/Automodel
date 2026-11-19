@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP32-output LM head: logits precision against FP64, backward contract and module surgery."""
+"""LMHead: logits dtype against FP64, backward contract, FLOP accounting and head conversion."""
 
 import sys
 import types
@@ -22,14 +22,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils.flop_counter import FlopCounterMode
 
-from nemo_automodel.components.models.common.logits import (
-    Float32LogitsLinear,
-    LogitsProcessor,
-    compute_lm_head_logits,
-    enable_fp32_logits,
-    head_compute_dtype,
-)
+from nemo_automodel.components.models.common.logits import LMHead
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 _DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"))]
 
@@ -43,12 +39,28 @@ def _operands(device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return hidden, weight, upstream
 
 
+def _head(weight: torch.Tensor, logits_dtype: torch.dtype | None) -> LMHead:
+    """Build a bias-free head holding a copy of ``weight``.
+
+    Args:
+        weight: Tensor of shape [vocab, hidden]; its dtype and device become the parameter's.
+        logits_dtype: The head's logits dtype.
+
+    Returns:
+        Head with weight of shape [vocab, hidden].
+    """
+    head = LMHead(weight.shape[1], weight.shape[0], logits_dtype=logits_dtype, device=weight.device, dtype=weight.dtype)
+    with torch.no_grad():
+        head.weight.copy_(weight)
+    return head
+
+
 @pytest.mark.parametrize("device", _DEVICES)
 def test_logits_keep_fp32_precision(device):
     hidden, weight, _ = _operands(device)
     reference = hidden.double() @ weight.double().t()
 
-    logits = compute_lm_head_logits(weight, hidden).logits
+    logits = _head(weight, torch.float32)(hidden)
 
     assert logits.dtype == torch.float32 and logits.shape == (2, 33, 320)
     fp32_error = (logits.double() - reference).abs().max()
@@ -59,18 +71,30 @@ def test_logits_keep_fp32_precision(device):
     assert (logits == logits.bfloat16().float()).float().mean() < 0.01
 
 
-def test_logits_processor_default_and_fp32_output():
+@pytest.mark.parametrize(
+    "weight_dtype,logits_dtype,expected",
+    [
+        (torch.bfloat16, None, lambda h, w: F.linear(h, w)),
+        (torch.bfloat16, torch.float32, lambda h, w: F.linear(h.float(), w.float())),
+        (torch.float32, None, lambda h, w: F.linear(h.float(), w)),
+        (torch.float32, torch.float32, lambda h, w: F.linear(h.float(), w)),
+        # An FP32 GEMM whose logits are rounded afterwards.
+        (torch.float32, torch.bfloat16, lambda h, w: F.linear(h.float(), w).bfloat16()),
+    ],
+)
+def test_logits_dtype_is_independent_of_the_weight_dtype(weight_dtype, logits_dtype, expected):
     hidden, weight, _ = _operands("cpu")
-    bias = weight[:, 0].contiguous()
-    native = LogitsProcessor()(weight, hidden, bias)
-    fp32 = LogitsProcessor(head_dtype=torch.float32)(weight, hidden, bias)
+    weight = weight.to(weight_dtype)
 
-    torch.testing.assert_close(native, F.linear(hidden, weight, bias), rtol=0, atol=0)
-    torch.testing.assert_close(fp32, F.linear(hidden.float(), weight.float()) + bias.float(), rtol=0, atol=0)
+    logits = _head(weight, logits_dtype)(hidden)
+
+    reference = expected(hidden, weight)
+    assert logits.dtype == (logits_dtype or weight_dtype) == reference.dtype
+    torch.testing.assert_close(logits, reference, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("out_dtype", [None, torch.float32])
-def test_processor_output_selects_kernel_and_keeps_packed_positions(out_dtype):
+@pytest.mark.parametrize("logits_dtype", [None, torch.float32])
+def test_head_uses_the_fp32_kernel_only_to_widen_and_keeps_packed_positions(logits_dtype):
     class CountProjection(TorchDispatchMode):
         calls = 0
 
@@ -79,22 +103,18 @@ def test_processor_output_selects_kernel_and_keeps_packed_positions(out_dtype):
                 self.calls += 1
             return func(*args, **(kwargs or {}))
 
-    head = nn.Linear(8, 12, dtype=torch.bfloat16)
+    head = LMHead(8, 12, bias=True, logits_dtype=logits_dtype, dtype=torch.bfloat16)
     hidden = torch.randn(5, 8, dtype=torch.bfloat16)
-    processor = LogitsProcessor(out_dtype=out_dtype)
     with CountProjection() as trace:
-        output = processor.compute_lm_head_logits(
-            head, hidden, logits_to_keep=2, is_thd=True, output_hidden_states=True
-        )
+        output = compute_lm_head_logits(head, hidden, logits_to_keep=2, is_thd=True, output_hidden_states=True)
 
-    assert trace.calls == int(out_dtype is torch.float32)
-    expected = processor(head.weight, hidden[-2:], head.bias)
+    assert trace.calls == int(logits_dtype is torch.float32)
+    expected = LMHead.linear(hidden[-2:], head.weight, head.bias, logits_dtype=logits_dtype)
     torch.testing.assert_close(output.logits, expected.unsqueeze(0), rtol=0, atol=0)
     torch.testing.assert_close(output.hidden_states, hidden.unsqueeze(0))
-    assert type(head) is nn.Linear
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="out_dtype GEMM requires CUDA or ROCm")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="logits_dtype GEMM requires CUDA or ROCm")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cuda_logits_match_vllm_projection(dtype):
     generator = torch.Generator(device="cuda").manual_seed(7)
@@ -102,7 +122,7 @@ def test_cuda_logits_match_vllm_projection(dtype):
         torch.randn(shape, device="cuda", dtype=dtype, generator=generator) for shape in ((2, 7, 64), (31, 64), (31,))
     ]
     expected = torch.mm(hidden.flatten(0, 1), weight.t(), out_dtype=torch.float32) + bias.float()
-    logits = compute_lm_head_logits(weight, hidden, bias=bias).logits
+    logits = LMHead.linear(hidden, weight, bias, logits_dtype=torch.float32)
     torch.testing.assert_close(logits, expected.view(2, 7, 31), rtol=0, atol=0)
 
 
@@ -112,7 +132,7 @@ def test_backward_equals_bf16_head_backward(device):
     fp32_hidden, fp32_weight = hidden.clone().requires_grad_(), weight.clone().requires_grad_()
     bf16_hidden, bf16_weight = hidden.clone().requires_grad_(), weight.clone().requires_grad_()
 
-    compute_lm_head_logits(fp32_weight, fp32_hidden).logits.backward(upstream.float())
+    LMHead.linear(fp32_hidden, fp32_weight, logits_dtype=torch.float32).backward(upstream.float())
     F.linear(bf16_hidden, bf16_weight).backward(upstream)
 
     # The FP32 logits gradient is cast to the operand dtype and fed to the BF16 head's GEMMs.
@@ -125,7 +145,7 @@ def test_frozen_weight_receives_no_gradient():
     hidden, weight, upstream = _operands("cpu")
     hidden.requires_grad_()
 
-    compute_lm_head_logits(weight, hidden).logits.backward(upstream.float())
+    LMHead.linear(hidden, weight, logits_dtype=torch.float32).backward(upstream.float())
 
     assert hidden.grad is not None and weight.grad is None
 
@@ -134,7 +154,7 @@ def test_fp32_weight_projects_in_fp32():
     hidden, weight, _ = _operands("cpu")
     weight = weight.float().requires_grad_()
 
-    logits = compute_lm_head_logits(weight, hidden).logits
+    logits = LMHead.linear(hidden, weight, logits_dtype=torch.float32)
     logits.sum().backward()
 
     torch.testing.assert_close(logits, F.linear(hidden.float(), weight.detach()), rtol=0, atol=0)
@@ -143,10 +163,10 @@ def test_fp32_weight_projects_in_fp32():
 
 def test_autocast_does_not_lower_logits():
     hidden, weight, _ = _operands("cpu")
-    expected = compute_lm_head_logits(weight, hidden).logits
+    expected = LMHead.linear(hidden, weight, logits_dtype=torch.float32)
 
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        logits = compute_lm_head_logits(weight, hidden.float()).logits
+        logits = LMHead.linear(hidden.float(), weight, logits_dtype=torch.float32)
 
     assert logits.dtype == torch.float32
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
@@ -154,7 +174,7 @@ def test_autocast_does_not_lower_logits():
 
 def test_fp32_head_backward_keeps_fp32_under_autocast():
     generator = torch.Generator().manual_seed(17)
-    head = enable_fp32_logits(nn.Linear(5, 7, bias=False, dtype=torch.float32))
+    head = LMHead(5, 7, logits_dtype=torch.float32, dtype=torch.float32)
     hidden = torch.randn(3, 5, generator=generator, requires_grad=True)
     upstream = torch.randn(3, 7, generator=generator)
     expected = torch.autograd.grad(head(hidden), (hidden, head.weight), upstream)
@@ -166,48 +186,62 @@ def test_fp32_head_backward_keeps_fp32_under_autocast():
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("bias", [False, True])
-def test_plain_head_keeps_its_parameters_and_hooks(bias):
-    head = nn.Linear(96, 320, bias=bias).eval()
-
-    weight, original_bias = head.weight, head.bias
-    keys = list(head.state_dict())
-    observed = []
-    head.register_forward_hook(lambda module, args, output: observed.append(output.dtype))
-
-    fp32_head = enable_fp32_logits(head)
-
-    assert fp32_head is head
-    assert fp32_head.weight is weight
-    assert fp32_head.bias is original_bias
-    assert not fp32_head.training
-    assert list(fp32_head.state_dict()) == keys
-    hidden = torch.randn(3, 96, dtype=torch.bfloat16)
-    torch.testing.assert_close(
-        fp32_head(hidden), compute_lm_head_logits(head.weight, hidden, bias=head.bias).logits, rtol=0, atol=0
-    )
-    assert observed == [torch.float32]
-
-
 def test_bias_is_added_in_fp32_and_receives_its_gradient():
     hidden, weight, upstream = _operands("cpu")
     bias = (torch.randn(320) * 0.1).to(torch.bfloat16).requires_grad_()
 
-    logits = compute_lm_head_logits(weight, hidden, bias=bias).logits
+    logits = LMHead.linear(hidden, weight, bias, logits_dtype=torch.float32)
     logits.backward(upstream.float())
 
     assert logits.dtype == torch.float32
     torch.testing.assert_close(
-        logits, compute_lm_head_logits(weight, hidden).logits + bias.detach().float(), rtol=0, atol=0
+        logits, LMHead.linear(hidden, weight, logits_dtype=torch.float32) + bias.detach().float(), rtol=0, atol=0
     )
     assert bias.grad.dtype == torch.bfloat16
     torch.testing.assert_close(bias.grad, upstream.float().sum((0, 1)).bfloat16(), rtol=0, atol=0)
 
 
-def test_fp32_logits_heads_are_returned_unchanged():
-    head = enable_fp32_logits(nn.Linear(96, 320, bias=False))
+def test_flop_counter_counts_the_fp32_gemm():
+    hidden, weight, _ = _operands("cpu")
+    counts = {}
+    for logits_dtype in (None, torch.float32):
+        with FlopCounterMode(display=False) as counter:
+            _head(weight, logits_dtype)(hidden)
+        counts[logits_dtype] = counter.get_total_flops()
 
-    assert enable_fp32_logits(head) is head
+    assert counts[torch.float32] == counts[None] == 2 * 2 * 33 * 96 * 320
+
+
+def test_project_applies_the_softcap_and_takes_a_gathered_weight():
+    hidden, weight, _ = _operands("cpu")
+    head = LMHead(96, 320, logits_dtype=torch.float32, logit_softcapping=2.0, dtype=torch.bfloat16)
+    with torch.no_grad():
+        head.weight.copy_(weight)
+
+    logits = head(hidden)
+
+    expected = 2.0 * torch.tanh(LMHead.linear(hidden, weight, logits_dtype=torch.float32) / 2.0)
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+    # A loss that gathers the weight itself calls project with that copy.
+    torch.testing.assert_close(head.project(hidden, weight.clone()), logits, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_from_linear_shares_the_parameters(bias):
+    linear = nn.Linear(96, 320, bias=bias, dtype=torch.bfloat16).eval()
+    keys = list(linear.state_dict())
+
+    head = LMHead.from_linear(linear, logits_dtype=torch.float32)
+
+    assert isinstance(head, LMHead) and head.logits_dtype == torch.float32
+    assert head.weight is linear.weight
+    assert head.bias is linear.bias
+    assert not head.training
+    assert list(head.state_dict()) == keys
+    hidden = torch.randn(3, 96, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        head(hidden), LMHead.linear(hidden, linear.weight, linear.bias, logits_dtype=torch.float32), rtol=0, atol=0
+    )
 
 
 class _BackendLinear(nn.Module):
@@ -232,36 +266,32 @@ def test_linear_kernel_backend_heads_convert(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.linear", te_linear)
     monkeypatch.setitem(sys.modules, "quack.linear", quack_linear)
 
-    for head in (_BackendLinear(96, 320), _QuackLinear(96, 320, bias=True)):
-        fp32_head = enable_fp32_logits(head)
-        assert isinstance(fp32_head, Float32LogitsLinear)
-        assert fp32_head.weight is head.weight
-        assert fp32_head.bias is (head.bias if isinstance(head.bias, nn.Parameter) else None)
-
-
-def test_baichuan_head_keeps_its_normalized_projection():
-    from nemo_automodel.components.models.baichuan.model import NormHead
-
-    head = NormHead(8, 13)
-    hidden = torch.randn(2, 8)
-    fp32_head = enable_fp32_logits(head)
-
-    assert fp32_head.weight is head.weight
-    torch.testing.assert_close(fp32_head(hidden), F.linear(hidden, F.normalize(head.weight)))
+    for linear in (_BackendLinear(96, 320), _QuackLinear(96, 320, bias=True)):
+        head = LMHead.from_linear(linear, logits_dtype=torch.float32)
+        assert isinstance(head, LMHead)
+        assert head.weight is linear.weight
+        assert head.bias is (linear.bias if isinstance(linear.bias, nn.Parameter) else None)
 
 
 class _LinearSubclass(nn.Linear):
     """Stands in for LoRA, FP8 and quantized heads, which subclass nn.Linear and own their projection."""
 
 
-@pytest.mark.parametrize("head", [_LinearSubclass(4, 8, bias=False), nn.Embedding(8, 4)])
-def test_rejects_heads_with_their_own_projection(head):
-    with pytest.raises(ValueError, match="linear kernel backend"):
-        enable_fp32_logits(head)
+def _linear_with_instance_forward() -> nn.Linear:
+    """Build a plain linear whose instance forward was replaced, as hooks libraries do."""
+    linear = nn.Linear(4, 8, bias=False)
+    linear.forward = lambda input: 2 * F.linear(input, linear.weight)
+    return linear
 
 
-def test_head_compute_dtype_follows_the_weight():
-    fp32_logits_head = enable_fp32_logits(nn.Linear(4, 8, bias=False, dtype=torch.bfloat16))
-
-    assert head_compute_dtype(fp32_logits_head) is torch.bfloat16
-    assert head_compute_dtype(nn.Identity()) is None
+@pytest.mark.parametrize(
+    "linear,match",
+    [
+        (_LinearSubclass(4, 8, bias=False), "plain linear LM head"),
+        (nn.Embedding(8, 4), "plain linear LM head"),
+        (_linear_with_instance_forward(), "plain linear LM head"),
+    ],
+)
+def test_from_linear_rejects_heads_with_their_own_projection(linear, match):
+    with pytest.raises(ValueError, match=match):
+        LMHead.from_linear(linear, logits_dtype=torch.float32)

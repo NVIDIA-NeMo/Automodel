@@ -68,7 +68,7 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.logits import enable_fp32_logits
+from nemo_automodel.components.models.common.logits import LMHead
 from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
@@ -452,42 +452,28 @@ def instantiate_infrastructure(
     return resolved_mesh_context, autopipeline, parallelize_fn, qat_quantizer
 
 
-def _use_fp32_logits(model: torch.nn.Module, logits_dtype: torch.dtype | str, *, pipelined: bool) -> None:
-    """Make the model's LM head write FP32 logits, or reject a configuration that cannot.
+def _set_logits_dtype(model: torch.nn.Module, logits_dtype: torch.dtype | str, *, pipelined: bool) -> None:
+    """Make the unsharded model's LM head return ``logits_dtype`` logits.
 
-    Configure the output embedding's projection while keeping its parameters and ties.
-    The embedding setter also updates models with a separate consumer of the head weight.
-
-    Args:
-        model: Unsharded model after PEFT and lower-precision conversion.
-        logits_dtype: Requested logits dtype; only ``torch.float32`` or ``"float32"``.
-        pipelined: Whether pipeline parallelism will split the model.
-
-    Raises:
-        ValueError: If ``logits_dtype`` is not float32, or the model has no LM head
-            whose projection can write FP32 logits.
-        NotImplementedError: With pipeline parallelism.
-        RuntimeError: If ``set_output_embeddings()`` does not install the head.
+    An ``LMHead`` is configured in place; a plain, Transformer Engine or quack linear head is replaced
+    through ``set_output_embeddings`` by an ``LMHead`` sharing its parameters. Pipeline parallelism,
+    whose stage outputs keep the model dtype, and models without such a head are rejected.
     """
-    if isinstance(logits_dtype, str):
-        logits_dtype = dtype_from_str(logits_dtype)
-    if logits_dtype != torch.float32:
-        raise ValueError(f"logits_dtype must be float32 or unset; got {logits_dtype}.")
     if pipelined:
-        raise NotImplementedError("logits_dtype=float32 does not support pipeline parallelism.")
-    # The output-embedding accessors are the shared contract for the vocabulary head;
-    # models without them (embedding, reward and policy models) have no such head.
+        raise NotImplementedError("logits_dtype does not support pipeline parallelism.")
+    logits_dtype = dtype_from_str(logits_dtype) if isinstance(logits_dtype, str) else logits_dtype
+    # Embedding, reward and policy models have no output-embedding head.
     get_output_embeddings = getattr(model, "get_output_embeddings", None)
     head = get_output_embeddings() if get_output_embeddings is not None else None
     if head is None:
-        raise ValueError(
-            f"logits_dtype=float32 needs an LM head, but {type(model).__name__} has none "
-            "(get_output_embeddings() is missing or returned None)."
-        )
-    fp32_head = enable_fp32_logits(head)
-    model.set_output_embeddings(fp32_head)
-    if model.get_output_embeddings() is not fp32_head:
-        raise RuntimeError(f"{type(model).__name__}.set_output_embeddings() did not install the FP32-logits head.")
+        raise ValueError(f"logits_dtype needs an LM head, but {type(model).__name__} has none.")
+    if isinstance(head, LMHead):
+        head.logits_dtype = logits_dtype
+        return
+    head = LMHead.from_linear(head, logits_dtype=logits_dtype)
+    model.set_output_embeddings(head)
+    if model.get_output_embeddings() is not head:
+        raise RuntimeError(f"{type(model).__name__}.set_output_embeddings() did not install the LMHead.")
 
 
 def _uses_te_attention(model) -> bool:
@@ -693,9 +679,8 @@ def apply_model_infrastructure(
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
         load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
-        logits_dtype: ``torch.float32`` (or ``"float32"``) makes the LM-head GEMM write FP32
-            logits from operands in the head's compute dtype when the model calls a supported
-            output head. Parameter storage and the FSDP policy are unchanged. Default: None.
+        logits_dtype: Dtype of the LM head's logits, or its name; ``float32`` writes FP32 logits
+            from the head's compute-dtype GEMM. Default: None (the model's own head).
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -766,10 +751,9 @@ def apply_model_infrastructure(
 
         _inject_te(model)
 
-    # After PEFT and FP8 so the head is final, and before sharding so tensor parallelism
-    # and FSDP wrap the FP32-logits head.
+    # After PEFT and FP8 so the head is final, and before sharding so TP and FSDP wrap it.
     if logits_dtype is not None:
-        _use_fp32_logits(model, logits_dtype, pipelined=autopipeline is not None)
+        _set_logits_dtype(model, logits_dtype, pipelined=autopipeline is not None)
 
     # Resolve exact parameter names while the complete, unwrapped model is still present.
     # Storage must be prepared before either loading branch can copy checkpoint values.

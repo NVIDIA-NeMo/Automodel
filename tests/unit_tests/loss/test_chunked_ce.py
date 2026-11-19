@@ -178,7 +178,7 @@ def test_glm_packing_to_loss(reduction):
     from types import SimpleNamespace
 
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
-    from nemo_automodel.components.models.common.logits import compute_lm_head_logits
+    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
     from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
 
     batch = packed_sequence_thd_collater(
@@ -217,19 +217,35 @@ def test_glm_packing_to_loss(reduction):
         torch.testing.assert_close(actual_grad, expected_grad)
 
 
-@pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("cast_logits", [False, True])
-def test_fp32_head_bf16_hidden_matches_model_projection(cast_logits, compiled):
-    from nemo_automodel.components.models.common.logits import compute_lm_head_logits
+@pytest.mark.parametrize(
+    "compiled",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.runtime_budget(
+                60, hard_timeout=120, reason="Cold Inductor compilation of mixed-dtype projection and backward"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("rounding", [None, "model_output", "head"])
+def test_fp32_head_bf16_hidden_matches_model_projection(rounding, compiled):
+    from nemo_automodel.components.models.common.logits import LMHead
+    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
     torch.manual_seed(67)
     model = torch.nn.Module()
-    model.lm_head = torch.nn.Linear(19, 37, bias=False)
+    # An FP32 head may round its own logits to bf16 (out_dtype) ...
+    if rounding == "head":
+        model.lm_head = LMHead(19, 37, bias=False, logits_dtype=torch.bfloat16)
+    else:
+        model.lm_head = torch.nn.Linear(19, 37, bias=False)
     hidden = torch.randn(2, 9, 19, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(37, (2, 9))
     logits = compute_lm_head_logits(model.lm_head, hidden).logits
-    # A model may round its fp32-head logits to bf16 (for example an FSDP output_dtype).
-    logits = logits.to(hidden.dtype) if cast_logits else logits
+    # ... or the model may round them at its output (for example an FSDP output_dtype).
+    logits = logits.to(hidden.dtype) if rounding == "model_output" else logits
     actual = calculate_loss(
         ChunkedCrossEntropy(4, compile=compiled),
         model=model,
@@ -330,11 +346,11 @@ def test_transformed_head_rejected_before_training():
 
 @pytest.mark.parametrize("chunk_len", [4, 64])
 def test_fp32_projection_reproduces_the_fp32_logits_head(chunk_len):
-    from nemo_automodel.components.models.common.logits import enable_fp32_logits
+    from nemo_automodel.components.models.common.logits import LMHead
 
     torch.manual_seed(71)
     model = torch.nn.Module()
-    model.lm_head = enable_fp32_logits(torch.nn.Linear(24, 53, bias=False, dtype=torch.bfloat16))
+    model.lm_head = LMHead(24, 53, logits_dtype=torch.float32, dtype=torch.bfloat16)
     hidden = torch.randn(2, 9, 24, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(53, (2, 9))
     labels[0, 3] = -100
@@ -364,15 +380,19 @@ def test_fp32_projection_reproduces_the_fp32_logits_head(chunk_len):
 
 
 def test_compiled_chunks_keep_the_fp32_projection():
+    from nemo_automodel.components.models.common.logits import LMHead
+
     # ChunkedCrossEntropy compiles its per-chunk loss by default.
     torch.manual_seed(71)
     weight = (torch.randn(53, 24) * 0.1).bfloat16().requires_grad_()
     hidden = torch.randn(2, 9, 24, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(53, (2, 9))
     labels[0, 3] = -100
+    # Chunks project with the gathered weight, so the head's own parameters stay on meta.
+    head = LMHead(24, 53, logits_dtype=torch.float32, device="meta")
     results = {}
     for use_compile in (False, True):
-        loss = ChunkedCrossEntropy(4, compile=use_compile)(hidden, labels, weight, projection_dtype=torch.float32)
+        loss = ChunkedCrossEntropy(4, compile=use_compile)(hidden, labels, weight, lm_head=head)
         results[use_compile] = (loss, *torch.autograd.grad(loss, (hidden, weight)))
 
     for compiled, eager in zip(results[True], results[False]):
@@ -386,7 +406,7 @@ def test_compiled_chunks_keep_the_fp32_projection():
 
 
 def test_validate_lm_head_accepts_plain_and_fp32_logits_heads():
-    from nemo_automodel.components.models.common.logits import enable_fp32_logits
+    from nemo_automodel.components.models.common.logits import LMHead
 
     class TransformedHead(torch.nn.Linear):
         def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -398,29 +418,43 @@ def test_validate_lm_head_accepts_plain_and_fp32_logits_heads():
             return 2 * super().forward(input)
 
     plain = torch.nn.Linear(4, 8, bias=False)
-    fp32_head = enable_fp32_logits(torch.nn.Linear(4, 8, bias=False))
+    fp32_head = LMHead(4, 8, logits_dtype=torch.float32)
     loss_fn = ChunkedCrossEntropy(4, compile=False)
 
     assert loss_fn.validate_lm_head(plain) is plain
     assert loss_fn.validate_lm_head(fp32_head) is fp32_head
-    for head in (TransformedHead(4, 8, bias=False), enable_fp32_logits(torch.nn.Linear(4, 8, bias=True))):
+    for head in (TransformedHead(4, 8, bias=False), LMHead(4, 8, bias=True, logits_dtype=torch.float32)):
         with pytest.raises(ValueError, match="plain bias-free nn.Linear"):
             loss_fn.validate_lm_head(head)
-    with pytest.raises(ValueError, match="projection_dtype must be None or torch.float32"):
-        loss_fn(torch.randn(3, 4), torch.zeros(3, dtype=torch.long), plain.weight, projection_dtype=torch.float16)
+
+
+def test_validate_lm_head_accepts_only_a_softcap_the_head_applies():
+    from transformers import PretrainedConfig
+
+    from nemo_automodel.components.models.common.logits import LMHead
+
+    config = PretrainedConfig(final_logit_softcapping=30.0)
+    loss_fn = ChunkedCrossEntropy(4, compile=False)
+    owned = LMHead(4, 8, logit_softcapping=30.0)
+
+    assert loss_fn.validate_lm_head(owned, model_config=config) is owned
+    # A model that softcaps after a head that does not would make every chunk wrong.
+    for head in (torch.nn.Linear(4, 8, bias=False), LMHead(4, 8), LMHead(4, 8, logit_softcapping=20.0)):
+        with pytest.raises(ValueError, match="final_logit_softcapping applied outside the LM head"):
+            loss_fn.validate_lm_head(head, model_config=config)
 
 
 def test_mtp_depths_project_like_the_fp32_logits_head():
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-    from nemo_automodel.components.models.common.logits import enable_fp32_logits
+    from nemo_automodel.components.models.common.logits import LMHead
 
     torch.manual_seed(73)
     bf16_head = torch.nn.Linear(24, 53, bias=False, dtype=torch.bfloat16)
     model, plain = torch.nn.Module(), torch.nn.Module()
     plain.lm_head = torch.nn.Linear(24, 53, bias=False, dtype=torch.bfloat16)
     plain.lm_head.weight = bf16_head.weight
-    model.lm_head = enable_fp32_logits(bf16_head)
+    model.lm_head = LMHead.from_linear(bf16_head, logits_dtype=torch.float32)
     depths = [torch.randn(2, 9, 24, dtype=torch.bfloat16) for _ in range(2)]
     labels = torch.randint(53, (2, 9))
 
@@ -440,14 +474,14 @@ def test_mtp_depths_project_like_the_fp32_logits_head():
 def test_recipe_setup_accepts_an_fp32_logits_head_for_chunked_ce(recipe):
     import importlib
 
-    from nemo_automodel.components.models.common.logits import enable_fp32_logits
+    from nemo_automodel.components.models.common.logits import LMHead
 
     _maybe_downgrade_loss_fn = importlib.import_module(f"nemo_automodel.recipes.{recipe}")._maybe_downgrade_loss_fn
 
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.lm_head = enable_fp32_logits(torch.nn.Linear(7, 13, bias=False, dtype=torch.bfloat16))
+            self.lm_head = LMHead(7, 13, logits_dtype=torch.float32, dtype=torch.bfloat16)
 
         def forward(self, input_ids, logits_to_keep=0):
             """Fail if setup runs the model.
