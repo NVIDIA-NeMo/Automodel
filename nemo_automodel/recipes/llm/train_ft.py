@@ -1325,7 +1325,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 input_ids = batch.pop("input_ids")
 
                 # Update PP stage shapes for the current batch's seq_len.
-                # This is a no-op when the length hasn't changed.
+                # This is a no-op when no rank's length has changed.
                 self.pp.update_seq_len(input_ids.shape[1])
 
                 # Filter out None values and empty dicts from batch to avoid PP chunking errors

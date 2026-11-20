@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining.microbatch import BlockMask, TensorChunkSpec
@@ -230,13 +231,16 @@ class AutoPipeline:
         with different seq_lens.
 
         Call this before every ``schedule.step()`` to update the stage shapes without
-        running an expensive forward pass.  Stage reset is a no-op when ``seq_len``
-        has not changed; model-owned runtime initializers are still prepared.
+        running an expensive forward pass.  When ``torch.distributed`` is initialized,
+        every rank of ``world_mesh`` must call this together: the reset decision is
+        collective, and each rank resets with its own ``seq_len`` if any rank's
+        ``seq_len`` changed.  Stage reset is a no-op when no rank's ``seq_len`` has
+        changed; model-owned runtime initializers are still prepared.
 
         Args:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
         """
-        if seq_len != self._pp_current_seq_len:
+        if self._any_rank_seq_len_changed(seq_len != self._pp_current_seq_len):
             if self._model_config is None:
                 raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
             self._pp_runtime_num_tokens = reset_pp_stage_shapes(
@@ -257,6 +261,16 @@ class AutoPipeline:
                 num_tokens=self._pp_runtime_num_tokens,
                 device=self.device,
             )
+
+    def _any_rank_seq_len_changed(self, changed: bool) -> bool:
+        """Return whether ``changed`` is true on any rank of ``world_mesh``."""
+        if not dist.is_initialized():
+            return changed
+        flag = torch.tensor([int(changed)], dtype=torch.int32, device=self.device)
+        for mesh_dim in range(self.world_mesh.ndim):
+            if self.world_mesh.size(mesh_dim) > 1:
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.world_mesh.get_group(mesh_dim))
+        return bool(flag.item())
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Build pipeline microbatch chunking metadata for keyword inputs.

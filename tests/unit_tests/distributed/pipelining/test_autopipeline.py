@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import faulthandler
+import os
+import socket
 import types
 from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
 
+from nemo_automodel.components.distributed.pipelining import autopipeline as autopipeline_module
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part,
@@ -1177,3 +1182,155 @@ class TestAutoPipelineUpdateSeqLen:
             ("reset", 4),
             ("prepare", 8, torch.device("cpu")),
         ]
+
+
+class _FakeMultiDimMesh:
+    """World mesh with named dims; ``pp`` returns a FakePPMesh."""
+
+    def __init__(self, dim_sizes: dict[str, int]):
+        self._names = list(dim_sizes)
+        self._sizes = list(dim_sizes.values())
+
+    @property
+    def ndim(self) -> int:
+        return len(self._sizes)
+
+    def __getitem__(self, key: str) -> FakePPMesh:
+        return FakePPMesh(size=self._sizes[self._names.index(key)], local_rank=0)
+
+    def size(self, mesh_dim: int) -> int:
+        return self._sizes[mesh_dim]
+
+    def get_group(self, mesh_dim: int) -> str:
+        return f"group_{self._names[mesh_dim]}"
+
+
+class TestAutoPipelineUpdateSeqLenCollective:
+    """update_seq_len must make the stage-reset decision across all ranks of world_mesh."""
+
+    def _make_pipeline(self, monkeypatch, peer_changed: bool):
+        ap = AutoPipeline(
+            world_mesh=_FakeMultiDimMesh({"pp": 2, "cp": 1, "dp_shard": 4}),
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=2,
+            pp_batch_size=4,
+            device=torch.device("cpu"),
+        )
+        ap._model_config = object()
+        ap._info.schedule = object()
+        ap._info.stages = []
+        ap._runtime_initializers = []
+
+        resets = []
+        groups = []
+
+        def record_reset(*args, **kwargs):
+            resets.append(args[4])
+            return ap.pp_microbatch_size * args[4]
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            """MAX-reduce the local flag with a simulated peer flag in place.
+
+            Args:
+                tensor: Flag tensor of shape [1], dtype int32, on CPU.
+                op: Reduction op; must be MAX.
+                group: Process group the reduction runs over.
+            """
+            assert op == torch.distributed.ReduceOp.MAX
+            groups.append(group)
+            tensor.fill_(max(int(tensor.item()), int(peer_changed)))
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.pipelining.autopipeline.reset_pp_stage_shapes",
+            record_reset,
+        )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        ap._pp_current_seq_len = 128
+        ap._pp_runtime_num_tokens = 256
+        return ap, resets, groups
+
+    def test_resets_own_seq_len_when_only_peer_changed(self, monkeypatch):
+        ap, resets, groups = self._make_pipeline(monkeypatch, peer_changed=True)
+
+        ap.update_seq_len(128)
+
+        assert resets == [128]
+        assert ap._pp_current_seq_len == 128
+        assert groups == ["group_pp", "group_dp_shard"]
+
+    def test_no_reset_when_no_rank_changed(self, monkeypatch):
+        ap, resets, groups = self._make_pipeline(monkeypatch, peer_changed=False)
+
+        ap.update_seq_len(128)
+
+        assert resets == []
+        assert groups == ["group_pp", "group_dp_shard"]
+
+    def test_resets_when_local_changed_and_peer_unchanged(self, monkeypatch):
+        ap, resets, groups = self._make_pipeline(monkeypatch, peer_changed=False)
+
+        ap.update_seq_len(64)
+
+        assert resets == [64]
+        assert ap._pp_current_seq_len == 64
+        assert ap._pp_runtime_num_tokens == 128
+        assert groups == ["group_pp", "group_dp_shard"]
+
+
+def _free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _update_seq_len_collective_worker(rank: int, world_size: int, port: int) -> None:
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    faulthandler.dump_traceback_later(60, exit=True)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    try:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        mesh = init_device_mesh("cpu", (1, world_size), mesh_dim_names=("pp", "dp_shard"))
+        ap = AutoPipeline(
+            world_mesh=mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=1,
+            device=torch.device("cpu"),
+        )
+        ap._model_config = object()
+        ap._info.schedule = object()
+        ap._info.stages = []
+        ap._runtime_initializers = []
+        ap._pp_current_seq_len = 128
+
+        resets = []
+
+        def record_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
+            resets.append(seq_len)
+            return microbatch_size * seq_len
+
+        autopipeline_module.reset_pp_stage_shapes = record_reset
+
+        local_seq_len = 64 if rank == 0 else 128
+        ap.update_seq_len(local_seq_len)
+        assert resets == [local_seq_len], (rank, resets)
+
+        ap.update_seq_len(local_seq_len)
+        assert resets == [local_seq_len], (rank, resets)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
+@pytest.mark.timeout(70)
+def test_update_seq_len_resets_every_rank_when_one_rank_changed_gloo():
+    mp.spawn(_update_seq_len_collective_worker, args=(2, _free_port()), nprocs=2, join=True)
