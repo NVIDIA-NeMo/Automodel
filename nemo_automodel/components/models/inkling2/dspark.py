@@ -56,9 +56,8 @@ import json
 import math
 import os
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -99,6 +98,33 @@ _REQUIRED_MTP_FIELDS = (
     "markov_head_type",
     "target_layer_ids",
 )
+
+
+class Inkling2MtpConfig(TypedDict):
+    """The ``mtp_config`` of the target's ``config.json``.
+
+    ``Inkling2DSparkReleasedConfig`` documents the fields. The release also stores
+    ``torch_dtype`` and the attention-bias flags, which the draft only checks or copies.
+    """
+
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    intermediate_size: int
+    max_position_embeddings: int
+    rms_norm_eps: float
+    rope_theta: float
+    local_layer_ids: list[int]
+    sliding_window_size: int
+    block_size: int
+    markov_rank: int
+    markov_head_type: str
+    target_layer_ids: list[int]
+    torch_dtype: NotRequired[str]
+    q_bias: NotRequired[bool]
+    o_bias: NotRequired[bool]
 
 
 class Inkling2DSparkOptions(Protocol):
@@ -164,10 +190,10 @@ class Inkling2DSparkReleasedConfig:
     markov_rank: int
     markov_head_type: str
     target_layer_ids: tuple[int, ...]
-    mtp_config: dict[str, Any]
+    mtp_config: Inkling2MtpConfig
 
     @classmethod
-    def from_mtp_config(cls, mtp_config: Mapping[str, Any]) -> Inkling2DSparkReleasedConfig:
+    def from_mtp_config(cls, mtp_config: Inkling2MtpConfig) -> Inkling2DSparkReleasedConfig:
         """Parse and validate a released ``mtp_config``.
 
         Args:
@@ -217,7 +243,7 @@ class Inkling2DSparkReleasedConfig:
             markov_rank=int(mtp_config["markov_rank"]),
             markov_head_type=str(mtp_config["markov_head_type"]),
             target_layer_ids=tuple(int(i) for i in mtp_config["target_layer_ids"]),
-            mtp_config=copy.deepcopy(dict(mtp_config)),
+            mtp_config=copy.deepcopy(mtp_config),
         )
 
     def dspark_target_layer_ids(self, num_target_layers: int) -> tuple[int, ...]:
@@ -269,7 +295,7 @@ class Inkling2DSparkConfig:
     def from_options(
         cls,
         text_config: Inkling2DSparkTextFields,
-        mtp_config: Mapping[str, Any],
+        mtp_config: Inkling2MtpConfig,
         options: Inkling2DSparkOptions,
     ) -> Inkling2DSparkConfig:
         """Validate the recipe's options against the released draft.
@@ -638,11 +664,11 @@ class Inkling2DSparkStateDictAdapter(StateDictAdapter):
 
     def to_hf(
         self,
-        state_dict: dict[str, Any],
+        state_dict: dict[str, torch.Tensor],
         exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> dict[str, torch.Tensor]:
         """Return the released tensors of a native state dict.
 
         Args:
@@ -654,7 +680,7 @@ class Inkling2DSparkStateDictAdapter(StateDictAdapter):
         Returns:
             Mapping from released names to the same tensor objects.
         """
-        output: dict[str, Any] = {}
+        output: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             output.update(
                 self.convert_single_tensor_to_hf(
@@ -665,10 +691,10 @@ class Inkling2DSparkStateDictAdapter(StateDictAdapter):
 
     def from_hf(
         self,
-        hf_state_dict: dict[str, Any],
+        hf_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> dict[str, torch.Tensor]:
         """Return native tensors of a released state dict.
 
         Args:
@@ -688,7 +714,9 @@ class Inkling2DSparkStateDictAdapter(StateDictAdapter):
             raise ValueError(f"Tensors {unexpected[:3]} are not part of the Inkling 2 DSpark draft.")
         return {key: hf_state_dict.pop(key) for key in list(hf_state_dict)}
 
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
+    def convert_single_tensor_to_hf(
+        self, fqn: str, tensor: torch.Tensor, **kwargs: Any
+    ) -> list[tuple[str, torch.Tensor]]:
         """Return the released name of one native tensor.
 
         Args:
@@ -713,7 +741,7 @@ class Inkling2DSparkStateDictAdapter(StateDictAdapter):
 class _ReleasedDraftMetadataExporter:
     """Write the draft contract next to consolidated draft weights."""
 
-    def __init__(self, mtp_config: dict[str, Any]) -> None:
+    def __init__(self, mtp_config: Inkling2MtpConfig) -> None:
         self._mtp_config = mtp_config
 
     def validate(
@@ -980,4 +1008,5 @@ __all__ = [
     "Inkling2DSparkModel",
     "Inkling2DSparkReleasedConfig",
     "Inkling2DSparkStateDictAdapter",
+    "Inkling2MtpConfig",
 ]
