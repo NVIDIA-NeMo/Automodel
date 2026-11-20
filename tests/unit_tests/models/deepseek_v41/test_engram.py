@@ -31,6 +31,7 @@ from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedTokenizerFast
 
 import nemo_automodel.components.models.deepseek_v41.engram as v41_engram
+from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 from nemo_automodel.components.distributed.multimodal_fsdp import ignored_params_for_root
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
@@ -259,6 +260,9 @@ def _owner_worker(rank: int, rendezvous: str) -> None:
         torch.testing.assert_close(actual, expected[rank : rank + 1], rtol=1e-5, atol=1e-6)
         expected.backward(upstream)
         actual.backward(upstream[rank : rank + 1])
+        # The reference saw both ranks' requests; the owner holds their mean because
+        # the value route's backward divides by the owner-group size.
+        reference.embed.weight.grad.div_(2)
         expected_table_grad = F.pad(reference.embed.weight.grad, (0, 0, 0, 1))[rank * 57 : (rank + 1) * 57]
         torch.testing.assert_close(owner_parameter.grad.to_local(), expected_table_grad, rtol=1e-5, atol=1e-6)
         for name in ("wkv.weight", "q_weight", "k_weight"):
@@ -355,14 +359,15 @@ def _owner_gradient_case(model: DeepseekV41ForCausalLM, layer_id: int, *, empty_
     table.weight.grad = None
     actual.backward(upstream)
     expected.backward(upstream)
+    # The owner's backward averages the requests over the owner group, so the
+    # owner shard equals the mean of the independent requester gradients.
     dist.all_reduce(oracle_weight.grad)
+    oracle_weight.grad.div_(dist.get_world_size())
     assert isinstance(table.weight.grad, DTensor)
     torch.testing.assert_close(table.weight.grad.to_local(), oracle_weight.grad[start:end], rtol=0, atol=0)
 
-    # Owner gradients sum requests across ranks; production normalization must
-    # produce the same gradient as the mean of the independent requester losses.
+    # Production normalization adds no owner scaling; only the clipping norm spans the group.
     actual_norm = scale_grads_and_clip_grad_norm(max_grad_norm=5.0 if empty_requester else None, model_parts=[module])
-    oracle_weight.grad.div_(dist.get_world_size())
     tolerance = {"rtol": 0, "atol": 0}
     if empty_requester:
         expected_norm = torch.linalg.vector_norm(oracle_weight.grad.double())
@@ -396,7 +401,6 @@ def _owner_checkpoint_roundtrip(model: DeepseekV41ForCausalLM, directory: Path) 
     for name, parameter in state.items():
         torch.testing.assert_close(parameter.to_local(), expected[name], rtol=0, atol=0)
         assert parameter.placements == (Shard(0),)
-        assert parameter._nemo_model_owned_grad_divisor == 2.0
 
     adapter = DeepseekV41StateDictAdapter(model.config, model.moe_config, model.backend, dtype=torch.float32)
     hf_state = dict(pair for name, value in state.items() for pair in adapter.convert_single_tensor_to_hf(name, value))
@@ -478,17 +482,13 @@ def _owner_checkpoint_worker(rank: int, store: str, directory: str, rows: tuple[
             assert parameter.to_local().data_ptr() == pointer
             assert parameter.shape == (module.embed.num_embeddings, module.embed.embedding_dim)
             assert parameter.requires_grad
-            assert parameter._nemo_model_owned_grad_divisor == 2.0
             assert ignored_params_for_root(model.model.layers[str(index)], ignored) == {parameter}
             module.init_weights()
             valid_rows = max(0, module.num_embeddings - module.embed.global_row_start)
             assert torch.count_nonzero(parameter.to_local()[valid_rows:]) == 0
 
-        # Same-device casts can clear custom DTensor attributes even when Python
-        # Parameter identity survives. The reused owner must re-stamp its contract.
+        # A same-device cast keeps the owner DTensor usable for the lookups below.
         model.to(device="cpu")
-        for module in modules:
-            assert module.embed.weight._nemo_model_owned_grad_divisor == 2.0
         for empty_requester in (False, True):
             for layer_id in (1, 4):
                 _owner_gradient_case(model, layer_id, empty_requester=empty_requester)
@@ -541,6 +541,7 @@ def _empty_requester_worker(rank: int, rendezvous: str) -> None:
         torch.testing.assert_close(actual, expected[rows], rtol=1e-5, atol=1e-6)
         actual.sum().backward()
         expected[0:1].sum().backward()  # the reference sees every request made across the group: rank 0's only
+        reference.embed.weight.grad.div_(2)  # the owner holds the mean over the two-rank owner group
         expected_table_grad = F.pad(reference.embed.weight.grad, (0, 0, 0, 1))[rank * 57 : (rank + 1) * 57]
         torch.testing.assert_close(owner_parameter.grad.to_local(), expected_table_grad, rtol=1e-5, atol=1e-6)
     finally:
@@ -552,3 +553,58 @@ def _empty_requester_worker(rank: int, rendezvous: str) -> None:
 @pytest.mark.runtime_budget(30, reason="spawns two Gloo workers")
 def test_empty_requester_takes_the_peers_validation_path(tmp_path: Path) -> None:
     mp.spawn(_empty_requester_worker, args=(str(tmp_path / "rendezvous-empty"),), nprocs=2, join=True)
+
+
+def _materialized_owner_worker(rank: int, rendezvous: str) -> None:
+    """Keep owner-mean gradients after native PP skips random initialization."""
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        mesh = DeviceMesh.from_group(dist.group.WORLD, device_type="cpu", mesh_dim_names=("dp_shard_cp",))
+        model = _owner_model((113, 253))
+        model._nemo_prepare_model_owned_dtensors(mesh)
+        for layer_id in (1, 4):
+            module = model.model.layers[str(layer_id)].engram
+            saved = {name: parameter.detach().clone() for name, parameter in module.named_parameters()}
+            # The native loader materializes Parameters and copies checkpoint
+            # values without calling initialize_weights() on pretrained PP parts.
+            to_empty_parameters_only(module, device=torch.device("cpu"))
+            with torch.no_grad():
+                for name, parameter in module.named_parameters():
+                    parameter.copy_(saved[name])
+            for empty in (False, True):
+                module.zero_grad(set_to_none=True)
+                _owner_gradient_case(model, layer_id, empty_requester=empty)
+    finally:
+        dist.destroy_process_group()
+
+
+def _singleton_owner_worker(rank: int, rendezvous: str) -> None:
+    """A stage with one owner rebinds its WORLD-grouped meta table to the local lookup path."""
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        with torch.device("meta"):
+            model = _owner_model((113, 253))
+        for layer_id, rows in ((1, 113), (4, 253)):
+            module = model.model.layers[str(layer_id)].engram
+            assert module.embed.process_group is not None  # the model defaults to WORLD under torch.distributed
+            module.set_owner_group(None)
+            module.set_owner_group(None)  # rebinding to the same owner is a no-op
+            assert module.embed.process_group is None and module.embed.owner_world_size == 1
+            assert module.embed.weight.shape[0] == rows
+            to_empty_parameters_only(module, device=torch.device("cpu"))
+            module.init_weights()
+            hidden = torch.randn(1, 3, module.hc_mult, module.hidden_size)
+            ids = torch.zeros(1, 3, module.hash_heads, dtype=torch.long)
+            assert module(hidden, ids).shape == hidden.shape
+    finally:
+        dist.destroy_process_group()
+
+
+def test_single_owner_stage_rebinds_engram_to_the_local_table(tmp_path: Path) -> None:
+    mp.spawn(_singleton_owner_worker, args=(str(tmp_path / "singleton_owner"),), nprocs=2, join=True)
+
+
+def test_materialized_pretrained_owner_gradients_norm_and_update(tmp_path: Path) -> None:
+    mp.spawn(_materialized_owner_worker, args=(str(tmp_path / "materialized_owner"),), nprocs=2, join=True)

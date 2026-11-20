@@ -148,4 +148,5 @@ wandb:
   name: <your_wandb_name>
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

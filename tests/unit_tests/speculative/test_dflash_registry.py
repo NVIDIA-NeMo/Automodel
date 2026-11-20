@@ -36,3 +36,25 @@ def test_resolve_first_match_wins():
 def test_resolve_unknown_raises():
     with pytest.raises(ValueError, match="no DFlash draft spec registered"):
         resolve_dflash_draft_spec(["LlamaForCausalLM"])
+
+
+@pytest.mark.parametrize(
+    "arch",
+    [
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ],
+)
+def test_qwen3_family_uses_the_recipe_draft_config_builder(arch):
+    """Qwen3-family targets must reach the recipe's ``_build_qwen3_draft_config``.
+
+    That builder projects the target config onto Qwen3 keys (dropping a Qwen3.5
+    target's ``partial_rotary_factor``) and applies ``draft_num_attention_heads``,
+    ``draft_head_dim`` and ``draft_sliding_window``; a spec-level builder would
+    bypass all of it and save a draft config that disagrees with training.
+    """
+    assert resolve_dflash_draft_spec([arch]).build_draft_config is None

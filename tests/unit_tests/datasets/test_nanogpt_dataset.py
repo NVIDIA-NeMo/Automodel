@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
+import pytest
 import torch
 from torch.utils.data import get_worker_info
 
@@ -322,3 +323,23 @@ def test_get_worker_id_and_total_workers():
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 2
         assert total_workers == 3
+
+
+def test_nanogpt_dataset_raises_when_no_sample_possible():
+    # A shard with exactly seq_len tokens cannot yield a sample (needs seq_len + 1); must not spin forever.
+    toks = np.arange(4, dtype=np.uint16)
+    with tempfile.TemporaryDirectory() as tmp:
+        shard = _make_fake_shard(Path(tmp), toks)
+        ds = NanogptDataset(str(shard), seq_len=4)
+        with pytest.raises(ValueError, match="no sample fits"):
+            next(iter(ds))
+
+
+def test_nanogpt_dataset_raises_when_align_to_bos_finds_no_bos():
+    # Plenty of tokens, but no BOS present: alignment skips to the end, so no sample can ever be produced.
+    toks = np.arange(1, 101, dtype=np.uint16)
+    with tempfile.TemporaryDirectory() as tmp:
+        shard = _make_fake_shard(Path(tmp), toks)
+        ds = NanogptDataset(str(shard), seq_len=4, align_to_bos=True, bos_token=0)
+        with pytest.raises(ValueError, match="no sample fits"):
+            next(iter(ds))
