@@ -4629,12 +4629,12 @@ class VariableLengthDataset:
 @pytest.mark.parametrize(
     "collate_fn",
     [
-        "nemo_automodel.components.datasets.utils.neat_packed_collater",
         {"_target_": "nemo_automodel.components.datasets.utils.neat_packed_collater", "attn_implementation": "sdpa"},
     ],
 )
 def test_setup_unpacked_validation_ignores_neat_packed_collater(monkeypatch, collate_fn):
-    """NEAT training keeps validation unpacked, so validation must not use the NEAT collater (#4817)."""
+    """A partial-wrapped NEAT collater is not matched by ``_should_pack_validation``, so validation stays
+    unpacked and must not keep it (#4817). The bare ``neat_packed_collater`` is packed instead."""
     dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.VariableLengthDataset"}
     typed_cfg = RecipeConfig(
         ConfigNode(
