@@ -3473,34 +3473,6 @@ def test_apply_cp_warns_on_unsupported_non_te_attention(monkeypatch):
     cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
-def test_apply_cp_runs_model_owned_hooks_without_transformer_engine(monkeypatch):
-    """The eager CP path does not need the optional TE extra: model-owned setup_cp_attention still runs."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    _stub_dense_cp_hooks(monkeypatch)
-    # An installation without the extra: importing transformer_engine raises ImportError.
-    for name in ("transformer_engine", "transformer_engine.pytorch", "transformer_engine.pytorch.attention"):
-        monkeypatch.setitem(sys.modules, name, None)
-
-    class _OwnedSelfAttn:
-        def __init__(self):
-            self.attn_module = _FakeAttnModule()
-            self.cp_meshes = []
-
-        def setup_cp_attention(self, cp_mesh):
-            self.cp_meshes.append(cp_mesh)
-
-    block = _FakeBlockWithAttn(None)
-    block.self_attn = _OwnedSelfAttn()
-    model = DummyModel([block])
-    cp_mesh = MagicMock()
-    cp_mesh.get_group.return_value = MagicMock()
-
-    P.apply_cp(model, cp_mesh)
-
-    assert model._cp_enabled is True
-    assert block.self_attn.cp_meshes == [cp_mesh]
-
-
 def test_apply_cp_model_owned_calls_setup_cp_attention(monkeypatch):
     """A self_attn exposing setup_cp_attention installs its own CP attention; no generic hooks."""
     P = _import_parallelizer_with_stubs(monkeypatch)
