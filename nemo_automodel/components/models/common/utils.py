@@ -1127,6 +1127,23 @@ def initialize_linear_module(
         raise ValueError(f"Unsupported Linear implementation: {linear_impl}")
 
 
+def initialize_lm_head(config: PretrainedConfig, linear_impl: str) -> tuple[torch.dtype, nn.Module]:
+    """Build an untied, bias-free LM head in the model dtype resolved from ``config.torch_dtype``.
+
+    Args:
+        config: Model config providing ``hidden_size``, ``vocab_size`` and ``torch_dtype``.
+        linear_impl: Backend implementation passed to :func:`initialize_linear_module`.
+
+    Returns:
+        Tuple of (model dtype, defaulting to bf16, LM head module).
+    """
+    model_dtype = dtype_from_str(getattr(config, "torch_dtype", None), torch.bfloat16)
+    lm_head = initialize_linear_module(
+        linear_impl, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+    )
+    return model_dtype, lm_head
+
+
 def _make_lazy_te_patcher():
     """Return a callable that patches TE modules exactly once.
 

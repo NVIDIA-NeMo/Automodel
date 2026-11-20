@@ -36,6 +36,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import initialize_lm_head
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
     DeepseekV3ForCausalLM,
@@ -216,8 +217,6 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         # Call grandparent __init__ to skip DeepseekV3ForCausalLM's __init__
         nn.Module.__init__(self)
 
-        from nemo_automodel.components.models.common import initialize_linear_module
-
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         # This __init__ calls nn.Module.__init__ directly rather than super(), so
@@ -238,10 +237,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        model_dtype, self.lm_head = initialize_lm_head(config, self.backend.linear)
         if self.backend.enable_hf_state_dict_adapter:
             # Use V3.2 adapter instead of V3 adapter
             self.state_dict_adapter = DeepSeekV32StateDictAdapter(
