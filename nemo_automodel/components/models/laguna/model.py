@@ -28,7 +28,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -976,12 +976,8 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **kwargs,
         )
-        return LMHead.output(
-            self.lm_head,
-            hidden,
-            logits_to_keep,
-            output_hidden_states=output_hidden_states,
-        )
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

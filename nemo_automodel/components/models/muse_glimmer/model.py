@@ -47,7 +47,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
-from nemo_automodel.components.models.common import BackendConfig, LMHead
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -902,8 +902,11 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        projected = LMHead.output(self.lm_head, hidden_states, logits_to_keep)
-        logits = projected.logits
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
         output_multiplier = float(self.config.output_multiplier)
         soft_cap = self.config.output_soft_cap_temp
         logits = logits * output_multiplier
@@ -927,8 +930,6 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         # Scaling here makes F.linear(hidden * multiplier, lm_head.weight) match
         # MuseGlimmer's native output multiplier before optional logit soft-capping.
         loss_hidden_states = hidden_states * output_multiplier
-        if is_thd and loss_hidden_states.ndim == 2:
-            loss_hidden_states = loss_hidden_states.unsqueeze(0)
         output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,

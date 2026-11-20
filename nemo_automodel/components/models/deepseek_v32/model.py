@@ -32,6 +32,7 @@ from nemo_automodel.components.models.common import (
     get_rope_config,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -314,7 +315,12 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             **attn_kwargs,
         )
 
-        return LMHead.output(self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
 
 ModelClass = DeepseekV32ForCausalLM

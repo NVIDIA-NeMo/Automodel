@@ -23,7 +23,6 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from torch.utils.flop_counter import register_flop_formula
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 
@@ -83,8 +82,8 @@ class LMHead(nn.Linear):
     writes FP32 logits (vLLM's ``head_dtype=float32``), unaffected by autocast, then casts them; the
     backward casts the gradient to the weight's dtype. Chunked losses, which gather the weight themselves, call
     ``project``, so subclasses that change the logits override it.
-    Repo models take ``logits_dtype`` as a constructor argument and build their head with it; their forwards call
-    ``LMHead.output(self.lm_head, hidden_states, ...)``, which also takes a stage without a head.
+    Repo models take ``logits_dtype`` as a constructor argument and build their head with it; their forwards pick
+    positions with ``slice_logits_to_keep`` before calling the head.
     """
 
     def __init__(
@@ -146,44 +145,15 @@ class LMHead(nn.Linear):
         new_head.weight, new_head.bias = head.weight, head.bias
         return new_head.train(head.training)
 
-    @staticmethod
-    def output(
-        lm_head: nn.Module | None,
-        hidden_states: torch.Tensor,
-        logits_to_keep: int | torch.Tensor = 0,
-        output_hidden_states: bool = False,
-    ) -> CausalLMOutputWithPast:
-        """Project hidden states through ``lm_head`` and wrap the result, for every custom causal LM ``forward()``.
 
-        ``lm_head`` is the model's head. An ``LMHead`` casts the input to its weight dtype and returns its
-        ``logits_dtype``; any other head, such as a LoRA or quantized linear, must accept the hidden states' dtype.
+def slice_logits_to_keep(hidden_states: torch.Tensor, logits_to_keep: int | torch.Tensor) -> torch.Tensor:
+    """Select the positions of hidden states [..., sequence, hidden] whose logits a forward returns.
 
-        ``logits_to_keep=0`` projects every position without slicing, since ``slice(0, None)`` on a DTensor
-        raises under sequence parallelism. A causal LM output is batched, so 2D (THD) logits and hidden states
-        regain a leading batch dim of 1.
-
-        Args:
-            lm_head: Head module, or ``None`` on a pipeline stage without it, which passes ``hidden_states`` on.
-            hidden_states: Final hidden states of shape [tokens, hidden] (THD) or [batch, sequence, hidden].
-            logits_to_keep: ``0`` for every position, a positive int for the last ``N``, or a tensor of indices.
-            output_hidden_states: Attach the full-sequence final hidden states, e.g. for linear losses.
-
-        Returns:
-            ``CausalLMOutputWithPast`` with logits of shape [batch, sequence, vocab] (or the passed-through
-            hidden states) and, if requested, the final hidden states of shape [batch, sequence, hidden].
-        """
-        if lm_head is None:
-            logits = hidden_states
-        elif isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = lm_head(hidden_states[..., slice_indices, :])
-        if logits.dim() == 2:
-            logits = logits.unsqueeze(0)
-
-        hidden_out = None
-        if output_hidden_states:
-            hidden_out = hidden_states.unsqueeze(0) if hidden_states.dim() == 2 else hidden_states
-
-        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
+    Hugging Face's ``slice_logits_to_keep`` (newer than the pinned transformers) for an int or a 1D index tensor,
+    on [batch, sequence, hidden] and packed (THD) [tokens, hidden] states alike: ``0`` keeps every position, a
+    positive int the last ``N``, and a tensor the given positions. ``0`` skips the slice, since a full
+    ``slice(0, None)`` of a DTensor has raised on ``aten.alias`` under sequence parallelism.
+    """
+    if isinstance(logits_to_keep, int):
+        return hidden_states if logits_to_keep == 0 else hidden_states[..., -logits_to_keep:, :]
+    return hidden_states[..., logits_to_keep, :]

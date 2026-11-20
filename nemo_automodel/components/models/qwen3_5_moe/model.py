@@ -76,7 +76,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -1095,11 +1095,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        lm_output = LMHead.output(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            output_hidden_states=output_hidden_states,
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
@@ -1150,8 +1147,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 )
 
         return Qwen3_5MoeCausalLMOutputWithPast(
-            logits=lm_output.logits,
-            hidden_states=lm_output.hidden_states,
+            logits=logits,
+            hidden_states=hidden_states if output_hidden_states else None,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
         )
@@ -1831,9 +1828,12 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         hidden_states = outputs.last_hidden_state
-
-        lm_output = LMHead.output(
-            self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
+        # Packed (THD) [tokens, hidden] -> [1, tokens, hidden] for the output; MTP keeps the packed states.
+        batched_hidden = hidden_states.unsqueeze(0) if hidden_states.dim() == 2 else hidden_states
+        logits = (
+            batched_hidden
+            if self.lm_head is None
+            else self.lm_head(slice_logits_to_keep(batched_hidden, logits_to_keep))
         )
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
@@ -1893,13 +1893,13 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     **mtp_kwargs,
                 )
             return Qwen3_5MoeCausalLMOutputWithPast(
-                logits=lm_output.logits,
-                hidden_states=lm_output.hidden_states,
+                logits=logits,
+                hidden_states=batched_hidden if output_hidden_states else None,
                 mtp_per_depth_h=mtp_per_depth_h,
                 mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
             )
 
-        return lm_output
+        return CausalLMOutputWithPast(logits=logits, hidden_states=batched_hidden if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

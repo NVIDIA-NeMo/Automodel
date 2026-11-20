@@ -40,7 +40,7 @@ from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
     is_indexed_packed_mask,
@@ -2610,8 +2610,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             attention_mask = None
             # THD packing drops the placeholder batch axis, but every Kimi layer
             # works in [batch, sequence, ...]. Restore it and let ``cu_seqlens``
-            # carry the document boundaries; ``LMHead.output`` leaves the
-            # already-batched [1, tokens, hidden] result untouched.
+            # carry the document boundaries; the head then sees the
+            # already-batched [1, tokens, hidden] result.
             if input_ids is not None and input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
             if inputs_embeds is not None and inputs_embeds.dim() == 2:
@@ -2632,7 +2632,10 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             return hidden_states
         if getattr(self, "_pp_return_hidden_states", False) is True:
             return hidden_states
-        return LMHead.output(self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states)
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
     def prepare_model_inputs_for_cp(
         self,

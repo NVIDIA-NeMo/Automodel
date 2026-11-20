@@ -31,7 +31,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -544,11 +544,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs,
         )
 
-        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        logits = LMHead.output(self.lm_head, hidden, logits_to_keep).logits
-
-        if is_thd and output_hidden_states and hidden.dim() == 2:
+        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
             hidden = hidden.unsqueeze(0)
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
 
         # 5. Optionally compute loss/aux outputs
         if labels is not None or output_router_logits:

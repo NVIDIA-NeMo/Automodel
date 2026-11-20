@@ -178,7 +178,6 @@ def test_glm_packing_to_loss(reduction):
     from types import SimpleNamespace
 
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
-    from nemo_automodel.components.models.common.lm_head import LMHead
     from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
 
     batch = packed_sequence_thd_collater(
@@ -199,16 +198,16 @@ def test_glm_packing_to_loss(reduction):
     model = torch.nn.Module()
     model.lm_head = torch.nn.Linear(7, 13, bias=False)
     hidden = torch.randn(4, 7, requires_grad=True)
-    out = LMHead.output(model.lm_head, hidden, output_hidden_states=True)
-    assert out.hidden_states.shape == (1, 4, 7)
+    batched = hidden.unsqueeze(0)  # a packed forward returns [1, tokens, hidden]
+    logits = model.lm_head(batched)
     actual = calculate_loss(
         ChunkedCrossEntropy(3, compile=False, reduction=reduction),
         model=model,
-        hidden_states=out.hidden_states,
-        logits=out.logits,
+        hidden_states=batched,
+        logits=logits,
         labels=labels,
     )
-    expected = F.cross_entropy(out.logits.squeeze(0), labels, reduction=reduction)
+    expected = F.cross_entropy(logits.squeeze(0), labels, reduction=reduction)
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected)
     actual_grads = torch.autograd.grad(actual.sum(), (hidden, model.lm_head.weight), retain_graph=True)
@@ -239,7 +238,7 @@ def test_fp32_head_bf16_hidden_matches_model_projection(rounding, compiled):
     model.lm_head = LMHead(19, 37, logits_dtype=torch.bfloat16 if rounding == "head" else None)
     hidden = torch.randn(2, 9, 19, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(37, (2, 9))
-    logits = LMHead.output(model.lm_head, hidden).logits
+    logits = model.lm_head(hidden)
     # ... or the model may round them at its output (for example an FSDP output_dtype).
     logits = logits.to(hidden.dtype) if rounding == "model_output" else logits
     actual = calculate_loss(

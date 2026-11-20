@@ -1714,7 +1714,7 @@ class TestWrapStageForwardToEmitTensor:
         assert torch.equal(out, logits)
 
     def test_nonfinal_stage_passthrough_hidden_states(self):
-        # lm_head is None on non-final stages -> LMHead.output returns
+        # lm_head is None on non-final stages -> the forward returns
         # CausalLMOutputWithPast(logits=hidden_states); unwrap must yield that tensor.
         from transformers.modeling_outputs import CausalLMOutputWithPast
 

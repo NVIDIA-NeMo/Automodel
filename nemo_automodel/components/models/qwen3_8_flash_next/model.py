@@ -44,7 +44,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -844,17 +844,17 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             _qwen3_8_flash_next_cp_context=_qwen3_8_flash_next_cp_context,
             **kwargs,
         )
-        lm_output = LMHead.output(
-            self.lm_head,
-            outputs.last_hidden_state,
-            logits_to_keep,
-            output_hidden_states=return_hidden_states,
+        last_hidden_state = outputs.last_hidden_state
+        logits = (
+            last_hidden_state
+            if self.lm_head is None
+            else self.lm_head(slice_logits_to_keep(last_hidden_state, logits_to_keep))
         )
-        return Qwen3_8_FlashNextCausalLMOutput(
-            logits=lm_output.logits,
-            past_key_values=None,
-            hidden_states=outputs.hidden_states if capture_all_hidden_states else lm_output.hidden_states,
-        )
+        if capture_all_hidden_states:
+            hidden_states = outputs.hidden_states
+        else:
+            hidden_states = last_hidden_state if return_hidden_states else None
+        return Qwen3_8_FlashNextCausalLMOutput(logits=logits, past_key_values=None, hidden_states=hidden_states)
 
     @torch.no_grad()
     def initialize_weights(

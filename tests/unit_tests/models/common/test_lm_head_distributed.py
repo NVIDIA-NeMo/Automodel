@@ -285,7 +285,7 @@ def _check_fsdp_head_casts_its_own_input(weight: torch.Tensor, hidden: torch.Ten
         head.weight = nn.Parameter(weight.clone())
         fully_shard(head, mesh=mesh, mp_policy=policy)
         assert head.weight.dtype == torch.float32
-        logits = LMHead.output(head, hidden).logits
+        logits = head(hidden)
         assert logits.dtype == reference.dtype == (logits_dtype or torch.bfloat16)
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)
 
@@ -293,7 +293,7 @@ def _check_fsdp_head_casts_its_own_input(weight: torch.Tensor, hidden: torch.Ten
     plain = nn.Linear(_HIDDEN, _VOCAB, bias=False)
     fully_shard(plain, mesh=mesh, mp_policy=policy)
     with pytest.raises(RuntimeError, match="same dtype"):
-        LMHead.output(plain, hidden)
+        plain(hidden)
 
 
 def _worker(rank: int, port: int) -> None:

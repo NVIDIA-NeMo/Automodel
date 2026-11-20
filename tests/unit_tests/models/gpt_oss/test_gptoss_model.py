@@ -849,11 +849,9 @@ def test_fa4_thd_capability_is_model_owned_and_does_not_enable_parallelism(backe
 
 
 @pytest.mark.cpu_only
-def test_fa4_thd_outer_normalizes_implicit_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fa4_thd_outer_normalizes_implicit_layout() -> None:
     """Offsets plus singleton token IDs select THD before the inner decoder sees them."""
     from types import SimpleNamespace
-
-    import nemo_automodel.components.models.gpt_oss.model as model_module
 
     model = GptOssForCausalLM.__new__(GptOssForCausalLM)
     torch.nn.Module.__init__(model)
@@ -863,7 +861,6 @@ def test_fa4_thd_outer_normalizes_implicit_layout(monkeypatch: pytest.MonkeyPatc
     # Capture at the child boundary; this check exercises the actual outer forward.
     with patch.object(model.model, "forward", return_value=torch.zeros(2, 4)) as capture:
         model.lm_head = torch.nn.Identity()
-        monkeypatch.setattr(model_module.LMHead, "output", staticmethod(lambda module, hidden, *args, **kwargs: hidden))
         model(
             torch.zeros(1, 2, dtype=torch.long),
             position_ids=torch.arange(2)[None],
@@ -931,7 +928,6 @@ def test_fa4_canonical_raw_thd_sharder_to_model_matches_te(monkeypatch: pytest.M
     converted = {}
     outputs = {}
     monkeypatch.setattr(model_module, "position_ids_to_freqs_cis", lambda *args, **kwargs: torch.ones(32768, 4))
-    monkeypatch.setattr(model_module.LMHead, "output", staticmethod(lambda module, hidden, *args, **kwargs: hidden))
     for backend in ("te", "fa4"):
         model = GptOssForCausalLM.__new__(GptOssForCausalLM)
         torch.nn.Module.__init__(model)
@@ -960,11 +956,12 @@ def test_fa4_canonical_raw_thd_sharder_to_model_matches_te(monkeypatch: pytest.M
         _, prepared = sharder.shard(batch)
         converted[backend] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in prepared.items()}
         prepared.pop("labels")
-        outputs[backend] = model(**prepared)
+        # The Identity head returns the hidden states, restored to the batched [1, tokens, hidden] layout.
+        outputs[backend] = model(**prepared).logits
         if backend == "fa4":
             assert model.supports_thd
-        assert outputs[backend].shape == (32768, 4)
-        assert torch.equal(outputs[backend], inner.embed_tokens(ids.reshape(-1)))
+        assert outputs[backend].shape == (1, 32768, 4)
+        assert torch.equal(outputs[backend], inner.embed_tokens(ids.reshape(-1)).unsqueeze(0))
         first, second = [call.call_args.kwargs for call in calls]
         assert first["padding_mask"].shape == (32768,)
         assert first["cu_seqlens_padded"][-1] == 32768

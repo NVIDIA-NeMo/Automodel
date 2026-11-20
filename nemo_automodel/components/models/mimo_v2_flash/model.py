@@ -34,7 +34,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -1359,18 +1359,15 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        output = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
-        if (
-            is_thd
-            and output.hidden_states is not None
-            and output.hidden_states.ndim == 3
-            and output.hidden_states.shape[0] == 1
-        ):
+        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden = hidden.unsqueeze(0)
+        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if output_hidden_states and is_thd and hidden.shape[0] == 1:
             # The TE THD sharder flattens labels to [T]. FusedLinearCrossEntropy
             # therefore consumes [T,H], while logits retain the public [1,T,V]
             # shape. PP returns above and keeps [microbatch,T,H] for its schedule.
-            output.hidden_states = output.hidden_states.squeeze(0)
-        return output
+            hidden = hidden.squeeze(0)
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     def get_pipeline_stage_metas(
         self,

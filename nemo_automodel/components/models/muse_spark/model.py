@@ -24,7 +24,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -1020,13 +1020,14 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 loss_hidden_states = loss_hidden_states.unsqueeze(0)
             return loss_hidden_states
 
-        projected = LMHead.output(self.lm_head, hidden_states, logits_to_keep)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         if self.lm_head is None:
             # No output scaling or soft cap may touch the residual stream
             # passed between non-final PP stages.
-            logits = projected.logits
+            logits = hidden_states
         else:
-            logits = projected.logits * self.config.output_multiplier
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep)) * self.config.output_multiplier
             if self.config.output_soft_cap_temp is not None:
                 cap = float(self.config.output_soft_cap_temp)
                 logits = torch.tanh(logits / cap) * cap
@@ -1044,8 +1045,6 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             )
 
         loss_hidden_states = hidden_states * self.config.output_multiplier
-        if is_thd and loss_hidden_states.ndim == 2:
-            loss_hidden_states = loss_hidden_states.unsqueeze(0)
         result = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,

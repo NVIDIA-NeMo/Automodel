@@ -33,6 +33,7 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import (
     HFCheckpointingMixin,
 )
+from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -538,11 +539,9 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if isinstance(logits_to_keep, int):
                 if logits_to_keep < 0:
                     raise ValueError("logits_to_keep must be nonnegative")
-                selected = hidden if logits_to_keep == 0 else hidden[:, -logits_to_keep:]
-            else:
-                if logits_to_keep.ndim != 1 or logits_to_keep.dtype != torch.int64:
-                    raise ValueError("logits_to_keep indices must be int64 [kept_sequence]")
-                selected = hidden[:, logits_to_keep]
+            elif logits_to_keep.ndim != 1 or logits_to_keep.dtype != torch.int64:
+                raise ValueError("logits_to_keep indices must be int64 [kept_sequence]")
+            selected = slice_logits_to_keep(hidden, logits_to_keep)
             # The common head helper casts logits to the head/input dtype; this
             # model's projection and output remain FP32 even with BF16 weights.
             logits = self._project_logits(selected)

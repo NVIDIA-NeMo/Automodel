@@ -33,7 +33,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -438,7 +438,8 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             return hidden
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden)
-        out = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
+        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        out = CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
         if labels is not None:
             if self.cp_mesh is not None and self.cp_mesh.size() > 1:
                 raise ValueError("Use the native recipe's globally shifted loss with CP")

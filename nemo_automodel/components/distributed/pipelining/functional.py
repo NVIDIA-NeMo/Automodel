@@ -582,7 +582,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
 
     Custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` models now return a
     ``CausalLMOutputWithPast`` from ``forward`` (fused-linear cross-entropy
-    support, ``LMHead.output``). ``torch.distributed.pipelining``
+    support). ``torch.distributed.pipelining``
     requires every stage to emit a tensor (or tuple/list of tensors):
     ``PipelineStage._validate_fwd_outputs`` and the inter-stage P2P send/recv
     treat the output as tensor leaves and read ``.shape`` on each, which raises
@@ -593,7 +593,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
     ``patch_causal_lm_model=False`` so only the inner model is patched. In both
     cases the kept outer ``forward`` returns a ``ModelOutput``. This wraps it so
     the return is unwrapped to its ``.logits`` tensor:
-    ``LMHead.output`` puts the projected logits there on the final stage
+    Those forwards put the projected logits there on the final stage
     and the pass-through ``hidden_states`` on non-final stages (``lm_head is
     None``) -- exactly the tensor each stage must forward, and the logits the
     last-stage loss (``PipelineCausalLMLoss`` / ``MaskedCrossEntropy``) consumes.

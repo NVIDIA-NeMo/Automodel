@@ -31,7 +31,7 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_round_robin
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -571,8 +571,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             return CausalLMOutputWithPast(hidden_states=hidden_states.float())
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden_states)
-        selected = hidden_states[:, -logits_to_keep:] if logits_to_keep else hidden_states
-        logits = self.lm_head(selected)
+        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         loss = None
         if labels is not None:
             if labels.shape != hidden_states.shape[:2]:

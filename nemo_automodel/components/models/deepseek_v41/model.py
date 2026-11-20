@@ -60,7 +60,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -947,10 +947,10 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
         if layout is not None:
             hidden = layout.restore(hidden)
             captured = None if captured is None else tuple(layout.restore(values) for values in captured)
-        projected = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
+        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         loss = None
         if labels is not None:
-            if projected.logits is None or projected.logits.shape[:2] != labels.shape:
+            if logits.shape[:2] != labels.shape:
                 raise ValueError("labels require logits for every input position")
             targets = labels[:, 1:]
             if layout is not None:
@@ -958,7 +958,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
                 same_document = (original_ids[:, 1:] > 0) & (original_ids[:, 1:] == original_ids[:, :-1])
                 targets = targets.masked_fill(~same_document, -100)
             loss = F.cross_entropy(
-                projected.logits[:, :-1].float().reshape(-1, self.config.text_config.vocab_size),
+                logits[:, :-1].float().reshape(-1, self.config.text_config.vocab_size),
                 targets.reshape(-1),
                 reduction="sum" if layout is not None else "mean",
             )
@@ -966,8 +966,8 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
                 loss = loss / (targets != -100).sum().clamp_min(1)
         return CausalLMOutputWithPast(
             loss=loss,
-            logits=projected.logits,
-            hidden_states=captured if output_residual_streams else projected.hidden_states,
+            logits=logits,
+            hidden_states=captured if output_residual_streams else (hidden if output_hidden_states else None),
         )
 
     @torch.no_grad()

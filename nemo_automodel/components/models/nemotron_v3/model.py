@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common import (
     HFCheckpointingMixin,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPContextParallelInputs,
     prepare_mtp_context_parallel_inputs,
@@ -911,7 +911,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             past_key_values.has_previous_state = True
 
         if compute_logits:
-            logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
         else:
             if labels is not None or is_pp_stage:
                 raise ValueError("compute_logits=False is only supported off-PP without labels.")

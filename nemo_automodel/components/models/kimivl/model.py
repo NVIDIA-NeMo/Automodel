@@ -109,7 +109,7 @@ class KimiVLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.models.common import BackendConfig, LMHead
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -802,7 +802,11 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             **kwargs,
         )
 
-        logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
+        if logits.dim() == 2:  # packed (THD) [tokens, vocab] -> [1, tokens, vocab]
+            logits = logits.unsqueeze(0)
 
         loss = None
         if labels is not None and self.lm_head is not None:
