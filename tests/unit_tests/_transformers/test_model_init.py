@@ -14,6 +14,7 @@
 
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
+import json
 import logging
 import os
 import types
@@ -1617,6 +1618,117 @@ def test_streaming_directory_uses_config_snapshot_and_subfolder(hf_config_hub):
     root, cache, _, _ = hf_config_hub
     result = _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root), subfolder="nested")
     assert result == str(cache / "snapshots" / ("b" * 40) / "nested")
+
+
+_SHARDS = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+
+
+@pytest.mark.parametrize(
+    "weight_files",
+    [
+        {"model.safetensors": ""},
+        {"pytorch_model.bin": ""},
+        {"model.safetensors.index.json": json.dumps({"weight_map": dict.fromkeys("ab", _SHARDS[0])}), _SHARDS[0]: ""},
+    ],
+    ids=["safetensors", "bin", "sharded"],
+)
+def test_model_dir_accepts_snapshot_missing_unread_listed_files(hf_config_hub, cached_tree_listing, weight_files):
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import IncompleteSnapshotError
+
+    root, cache, _, _ = hf_config_hub
+    # A weight-only download fetched config.json and the weights; the listing also names README.md.
+    for name, text in weight_files.items():
+        (cache / "snapshots" / ("b" * 40) / name).write_text(text)
+    cached_tree_listing(cache, "b" * 40, ["config.json", *weight_files, "README.md"])
+    with pytest.raises(IncompleteSnapshotError):
+        snapshot_download("test/config-race", revision="b" * 40, cache_dir=str(root), local_files_only=True)
+
+    result = _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root))
+
+    assert result == str(cache / "snapshots" / ("b" * 40))
+
+
+@pytest.mark.parametrize(
+    "index_text",
+    [
+        json.dumps({"weight_map": dict(zip("ab", _SHARDS))}),
+        "{",
+        "[]",
+        '{"weight_map": null}',
+        '{"weight_map": {}}',
+        None,
+    ],
+    ids=["missing_shard", "invalid_json", "not_a_mapping", "null_weight_map", "empty_weight_map", "no_weight_file"],
+)
+def test_model_dir_keeps_hub_error_for_incomplete_weights(hf_config_hub, cached_tree_listing, index_text):
+    from huggingface_hub.errors import IncompleteSnapshotError
+
+    root, cache, _, _ = hf_config_hub
+    snapshot = cache / "snapshots" / ("b" * 40)
+    index = snapshot / "model.safetensors.index.json"
+    if index_text is not None:
+        index.write_text(index_text)
+        (snapshot / _SHARDS[0]).write_bytes(b"")
+    cached_tree_listing(cache, "b" * 40, ["config.json", index.name, *_SHARDS])
+
+    with pytest.raises(IncompleteSnapshotError, match=_SHARDS[1]):
+        _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root))
+
+
+def test_model_dir_keeps_hub_error_for_incomplete_second_format(hf_config_hub, cached_tree_listing):
+    from huggingface_hub.errors import IncompleteSnapshotError
+
+    root, cache, _, _ = hf_config_hub
+    snapshot = cache / "snapshots" / ("b" * 40)
+    bin_shards = ["pytorch_model-00001-of-00002.bin", "pytorch_model-00002-of-00002.bin"]
+    # The safetensors weights are complete, but the checkpoint loader prefers the .bin files.
+    (snapshot / "model.safetensors").write_bytes(b"")
+    (snapshot / "pytorch_model.bin.index.json").write_text(json.dumps({"weight_map": dict(zip("ab", bin_shards))}))
+    (snapshot / bin_shards[0]).write_bytes(b"")
+    cached_tree_listing(
+        cache, "b" * 40, ["config.json", "model.safetensors", "pytorch_model.bin.index.json", *bin_shards]
+    )
+
+    with pytest.raises(IncompleteSnapshotError, match=bin_shards[1]):
+        _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root))
+
+
+@pytest.mark.parametrize("offline_setting", ["hub_offline_mode", "local_files_only"])
+def test_weight_download_accepts_snapshot_missing_unread_listed_files(
+    hf_config_hub, cached_tree_listing, monkeypatch, offline_setting
+):
+    from nemo_automodel._transformers import model_init
+
+    root, cache, _, requests = hf_config_hub
+    (cache / "snapshots" / ("b" * 40) / "model.safetensors").write_bytes(b"")
+    cached_tree_listing(cache, "b" * 40, ["config.json", "model.safetensors", "README.md"])
+    kwargs = {"revision": "b" * 40, "cache_dir": str(root)}
+    if offline_setting == "hub_offline_mode":
+        # Any value the Hub honors, e.g. HF_HUB_OFFLINE=true or TRANSFORMERS_OFFLINE=1.
+        monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", True)
+    else:
+        kwargs["local_files_only"] = True
+
+    model_init._download_model_weights(None, "test/config-race", **kwargs)
+
+    assert requests == []
+
+
+def test_weight_download_checks_weights_in_subfolder(hf_config_hub, cached_tree_listing):
+    from nemo_automodel._transformers import model_init
+
+    root, cache, _, requests = hf_config_hub
+    nested = cache / "snapshots" / ("b" * 40) / "nested"
+    nested.mkdir()
+    (nested / "model.safetensors").write_bytes(b"")
+    cached_tree_listing(cache, "b" * 40, ["config.json", "nested/model.safetensors", "README.md"])
+
+    model_init._download_model_weights(
+        None, "test/config-race", revision="b" * 40, cache_dir=str(root), local_files_only=True, subfolder="nested"
+    )
+
+    assert requests == []
 
 
 def test_model_owned_metadata_reads_keep_explicit_revision(hf_config_hub, monkeypatch):
