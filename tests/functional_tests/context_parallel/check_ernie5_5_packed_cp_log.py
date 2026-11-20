@@ -20,7 +20,7 @@ on two GB200 GPUs the losses of the two runs differ by at most 2.4e-3 at the fir
 at any of the four updates, with either attention backend. This checks the training path of the recipe;
 ``test_ernie5_5_context_parallel.py`` compares the shards with one process exactly.
 
-Called by ``L2_Ernie5_5_MoE_Packed_CP2.sh`` after the two torchrun invocations.
+Called by ``L2_CP_Ernie5_5_Packed_Test.sh`` after the two torchrun invocations.
 
 Usage:
     python check_ernie5_5_packed_cp_log.py cp1/training.jsonl cp2/training.jsonl --expected-steps 4 --vocab-size 4096

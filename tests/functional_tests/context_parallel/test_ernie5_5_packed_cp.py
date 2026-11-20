@@ -19,8 +19,8 @@ import pytest
 from tests.functional_tests.moe.test_ernie5_5_ep_training import DSA_BACKEND_VARIABLE, _cudnn_dsa_skip_reason
 from tests.utils.test_utils import run_test_script
 
-TEST_FOLDER = "moe"
-ERNIE5_5_PACKED_CP2 = "L2_Ernie5_5_MoE_Packed_CP2.sh"
+TEST_FOLDER = "context_parallel"
+ERNIE5_5_PACKED_CP2 = "L2_CP_Ernie5_5_Packed_Test.sh"
 
 
 class TestErnie5_5PackedCP2Training:

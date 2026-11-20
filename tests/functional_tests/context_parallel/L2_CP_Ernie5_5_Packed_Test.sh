@@ -64,7 +64,7 @@ for CP_SIZE in 1 2; do
         --checkpoint.checkpoint_dir "$RUN_DIR/cp$CP_SIZE"
 done
 
-python tests/functional_tests/moe/check_ernie5_5_packed_cp_log.py \
+python tests/functional_tests/context_parallel/check_ernie5_5_packed_cp_log.py \
     "$RUN_DIR/cp1/training.jsonl" "$RUN_DIR/cp2/training.jsonl" \
     --expected-steps "$MAX_STEPS" \
     --vocab-size "$VOCAB_SIZE"
