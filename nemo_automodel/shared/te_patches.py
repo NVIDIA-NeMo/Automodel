@@ -118,6 +118,42 @@ def _apply_fused_adam_quantized_tensor_patch() -> None:
     _logger.info("Applied FusedAdam QuantizedTensor monkey-patch.")
 
 
+def _skip_fused_adam_scaling_of_empty_states(fused_adam_cls: type) -> None:
+    """Make ``FusedAdam._apply_scale`` leave zero-element optimizer states untouched.
+
+    ``_apply_scale`` rescales an fp16 or FP8 optimizer state by the largest
+    magnitude of its unscaled values, which ``torch.aminmax`` cannot compute for
+    a zero-element tensor.  FusedAdam calls it after every step, when it
+    initializes fp16 master weights, and in ``load_state_dict``.  The state of
+    an empty local shard has nothing to rescale.
+    """
+    original = fused_adam_cls._apply_scale
+    if getattr(original, "_nemo_empty_shard_patch", False) is True:
+        return
+
+    def _apply_scale_unless_empty(
+        self: Any, state_name: str, unscaled_state: torch.Tensor, scaled_state: Any, scale: torch.Tensor
+    ) -> None:
+        """Rescale one optimizer state unless the state and its buffer are both empty.
+
+        Args:
+            state_name: ``exp_avg``, ``exp_avg_sq`` or ``master_param``.
+            unscaled_state: fp32 tensor with the shape of the parameter's local
+                shard; the original method may modify it in place.
+            scaled_state: Stored state with the same shape, a tensor or a TE
+                ``Float8Tensor``; written in place.
+            scale: fp32 tensor of shape [1]; written in place.
+        """
+        # Skip only when both sides are empty: a zero-element state for a nonempty buffer is a
+        # shape mismatch, which the original method reports.
+        if unscaled_state.numel() == 0 and scaled_state.numel() == 0:
+            return
+        original(self, state_name, unscaled_state, scaled_state, scale)
+
+    _apply_scale_unless_empty._nemo_empty_shard_patch = True
+    fused_adam_cls._apply_scale = _apply_scale_unless_empty
+
+
 def apply_fused_adam_empty_shard_patch() -> None:
     """Keep zero-element FSDP shards out of TE's native multi-tensor kernel.
 
@@ -125,6 +161,8 @@ def apply_fused_adam_empty_shard_patch() -> None:
     zero-element tensor occupies that slot (TE issue #3202).  Filter complete
     parameter/state columns at the Python/native boundary so state_dict keys,
     parameter groups, and the update for every nonempty shard stay intact.
+    FusedAdam's rescaling of fp16 and FP8 optimizer states is skipped for
+    zero-element states, which it cannot reduce over.
 
     Idempotent.  The optimizer configs call this before they construct TE
     FusedAdam, which keeps parameters with an empty local shard in its
@@ -139,6 +177,8 @@ def apply_fused_adam_empty_shard_patch() -> None:
     if not available:
         _logger.debug("Skipping FusedAdam empty-shard patch: Transformer Engine is unavailable")
         return
+
+    _skip_fused_adam_scaling_of_empty_states(fused_adam.FusedAdam)
 
     original = fused_adam.multi_tensor_applier
     if getattr(original, "_nemo_empty_shard_patch", False) is True:

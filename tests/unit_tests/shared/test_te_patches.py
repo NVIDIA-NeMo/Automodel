@@ -178,6 +178,52 @@ class TestFusedAdamEmptyShardPatch:
             applier("kernel", "overflow", columns)
         original.assert_not_called()
 
+    def _patched_apply_scale(self):
+        fused_adam_cls, _, _, modules = _build_te_mocks()
+        fused_adam = modules["transformer_engine.pytorch.optimizers.fused_adam"]
+        original = MagicMock()
+        fused_adam_cls._apply_scale = original
+        modules["transformer_engine.pytorch.optimizers"].fused_adam = fused_adam
+        with patch.dict("sys.modules", modules):
+            apply_fused_adam_empty_shard_patch()
+            installed = fused_adam_cls._apply_scale
+            apply_fused_adam_empty_shard_patch()
+        assert fused_adam_cls._apply_scale is installed
+        return installed, original
+
+    def test_skips_scaling_of_empty_state(self):
+        apply_scale, original = self._patched_apply_scale()
+        scale = torch.ones(1)
+
+        apply_scale("optimizer", "exp_avg", torch.empty(0, 3), torch.empty(0, 3, dtype=torch.float16), scale)
+
+        original.assert_not_called()
+        assert scale.item() == 1.0
+
+    def test_scales_nonempty_state_with_the_original_method(self):
+        apply_scale, original = self._patched_apply_scale()
+        unscaled = torch.ones(2, 3)
+        scaled = torch.zeros(2, 3, dtype=torch.float16)
+        scale = torch.ones(1)
+
+        apply_scale("optimizer", "exp_avg", unscaled, scaled, scale)
+
+        original.assert_called_once()
+        optimizer, state_name, sent_unscaled, sent_scaled, sent_scale = original.call_args.args
+        assert (optimizer, state_name) == ("optimizer", "exp_avg")
+        assert sent_unscaled is unscaled
+        assert sent_scaled is scaled
+        assert sent_scale is scale
+
+    def test_passes_empty_state_for_nonempty_buffer_to_the_original_method(self):
+        # A zero-element loaded state for a nonempty buffer is a shape mismatch; the
+        # original method must see it and raise, as it does without the patch.
+        apply_scale, original = self._patched_apply_scale()
+
+        apply_scale("optimizer", "exp_avg", torch.empty(0, 3), torch.zeros(2, 3, dtype=torch.float16), torch.ones(1))
+
+        original.assert_called_once()
+
 
 class TestFusedAdamInPlaceLoadPatch:
     def test_installs_once(self):

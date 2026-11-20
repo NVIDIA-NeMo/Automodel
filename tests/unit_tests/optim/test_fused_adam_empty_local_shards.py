@@ -63,6 +63,18 @@ class _RecordingFusedAdam:
         type(self).last_kwargs = kwargs
         self.param_groups = []
 
+    def _apply_scale(
+        self, state_name: str, unscaled_state: torch.Tensor, scaled_state: Any, scale: torch.Tensor
+    ) -> None:
+        """Stand-in for the TE method that the empty-shard patch wraps; does nothing.
+
+        Args:
+            state_name: Name of the optimizer state.
+            unscaled_state: Tensor with the shape of the parameter's local shard; not read.
+            scaled_state: Stored state with the same shape; not written.
+            scale: Tensor of shape [1]; not written.
+        """
+
 
 class _RecordingApplier:
     """Stand-in for TE's ``multi_tensor_applier`` that records what reaches the native kernel."""
@@ -124,6 +136,8 @@ def stub_te_modules(monkeypatch):
     modules = _te_stub_modules()
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
+    # The empty-shard patch wraps this method on the class; restore it after the test.
+    monkeypatch.setattr(_RecordingFusedAdam, "_apply_scale", _RecordingFusedAdam._apply_scale)
     _RecordingFusedAdam.last_params = None
     _RecordingFusedAdam.last_kwargs = None
     return modules
@@ -357,6 +371,7 @@ def test_fused_adam_cuda_step_keeps_locally_empty_parameter():
     before = kept.detach().clone()
 
     original_applier = fused_adam.multi_tensor_applier
+    original_apply_scale = fused_adam.FusedAdam._apply_scale
     try:
         opt = FusedAdamConfig(lr=1e-2, master_weight_dtype="torch.float32")._build_optimizer([empty, kept])
         assert len(opt.param_groups) == 1
@@ -375,3 +390,64 @@ def test_fused_adam_cuda_step_keeps_locally_empty_parameter():
         assert all(value.numel() == 3 for value in state_dict["state"][1].values())
     finally:
         fused_adam.multi_tensor_applier = original_applier
+        fused_adam.FusedAdam._apply_scale = original_apply_scale
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_adam_cuda_fp16_state_keeps_locally_empty_parameter():
+    """Real TE FusedAdam with fp16 moments steps and reloads with a zero-numel parameter present.
+
+    FusedAdam rescales fp16 moments after every step and in ``load_state_dict``
+    by the largest magnitude of the state, which has no value for a
+    zero-numel state.
+    """
+    fused_adam = pytest.importorskip("transformer_engine.pytorch.optimizers.fused_adam")
+
+    device = torch.device("cuda", 0)
+    values = torch.tensor([1.0, -2.0, 3.0], device=device, dtype=torch.bfloat16)
+    gradient = torch.tensor([0.5, -0.25, 1.0], device=device, dtype=torch.bfloat16)
+    original_applier = fused_adam.multi_tensor_applier
+    original_apply_scale = fused_adam.FusedAdam._apply_scale
+    try:
+
+        def build() -> tuple[torch.optim.Optimizer, nn.Module]:
+            model = nn.Module()
+            model.empty = nn.Parameter(torch.empty(0, device=device, dtype=torch.bfloat16))
+            model.kept = nn.Parameter(values.clone())
+            config = OptimizerFromFactoryConfig(
+                factory=fused_adam.FusedAdam,
+                kwargs={
+                    "lr": 1e-2,
+                    "master_weights": True,
+                    "exp_avg_dtype": "torch.float16",
+                    "exp_avg_sq_dtype": "torch.float16",
+                },
+            )
+            return config.build(model)[0], model
+
+        def step(opt: torch.optim.Optimizer, model: nn.Module) -> None:
+            model.empty.grad = torch.empty_like(model.empty)
+            model.kept.grad = gradient.clone()
+            opt.step()
+            torch.cuda.synchronize(device)
+
+        opt, model = build()
+        _assert_same_parameters(opt.param_groups[0]["params"], [model.empty, model.kept])
+        step(opt, model)
+        assert torch.isfinite(model.kept).all()
+        assert not torch.equal(model.kept, values)
+        assert opt.state[model.kept]["exp_avg"].dtype == torch.float16
+
+        resumed, resumed_model = build()
+        with torch.no_grad():
+            resumed_model.kept.copy_(model.kept)
+        resumed.load_state_dict(opt.state_dict())
+        step(opt, model)
+        step(resumed, resumed_model)
+        # A reload rescales the fp16 moments once more, so allow one bf16 step of the parameter.
+        torch.testing.assert_close(resumed_model.kept.float(), model.kept.float(), rtol=1e-2, atol=0)
+        assert resumed.param_groups[0]["step"] == opt.param_groups[0]["step"] == 2
+        assert all(value.numel() == 0 for value in resumed.state[resumed_model.empty].values())
+    finally:
+        fused_adam.multi_tensor_applier = original_applier
+        fused_adam.FusedAdam._apply_scale = original_apply_scale
