@@ -96,7 +96,10 @@ def worker(case: str, output: Path) -> None:
         # Width exceeds a CP4 shard in the short case; includes static and dynamic taps.
         cfg.sconv_kernel_size = 5
         if "loop" in case:
-            # Layers 6-11 run three times; later passes read the previous one through messages.
+            # Layers 6-11 form two residual blocks of three layers and run three times; later passes read
+            # the previous ones through messages. A single block would leave the message softmax constant
+            # and the message-query tables without gradient.
+            cfg.n_layers_per_attn_res_block = 3
             cfg.loop_config = {"core_start": 6, "core_end": 12, "num_passes": 3, "gate_rank": 4, "is_varloop": False}
         text_cfg = cfg
         if image:
@@ -366,6 +369,10 @@ def worker(case: str, output: Path) -> None:
             if compare:
                 expected_loss = F.cross_entropy(expected.flatten(0, 1), labels.flatten(), reduction="sum") / count
                 expected_loss.backward()
+                if "loop" in case:
+                    # The gradient comparison below covers the message queries only when they receive gradient.
+                    for queries in (reference.message_queries, reference.message_kv_queries):
+                        assert float(queries.weight.grad.norm()) > 0, "a message-query table received no gradient"
             if cpu:
                 for parameter in owners.values():
                     assert parameter.grad is not None

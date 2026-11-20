@@ -19,7 +19,7 @@ import pytest
 import torch
 from transformers import AutoConfig
 
-from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
 from nemo_automodel.components.models.inkling2.config import (
     Inkling2Config,
     Inkling2LoopConfig,
@@ -27,6 +27,7 @@ from nemo_automodel.components.models.inkling2.config import (
     Inkling2TextConfig,
 )
 from nemo_automodel.components.models.inkling2.model import Inkling2ForCausalLM
+from nemo_automodel.components.models.inkling2.multimodal import Inkling2ForConditionalGeneration
 from nemo_automodel.components.models.inkling2.state_dict_adapter import Inkling2StateDictAdapter
 
 from . import reference
@@ -166,11 +167,15 @@ def test_unsupported_loop_settings_are_rejected(change: dict[str, int | bool], m
 
 def test_looped_checkpoint_config_resolution(tmp_path: Path) -> None:
     text = looped_config().to_dict()
-    raw = {"architectures": ["Inkling2ForConditionalGeneration"], "model_type": "inkling2_loop", "text_config": text}
+    raw = {
+        "architectures": ["Inkling2LoopForConditionalGeneration"],
+        "model_type": "inkling2_loop",
+        "text_config": text,
+    }
     (tmp_path / "config.json").write_text(json.dumps(raw))
     config = AutoConfig.from_pretrained(tmp_path)
     assert type(config) is Inkling2LoopConfiguration
-    assert ModelRegistry.has_custom_model("Inkling2ForConditionalGeneration")
+    assert _resolve_custom_model_cls_for_config(config) is Inkling2ForConditionalGeneration
     assert config.text_config.loop_config == LOOP
     assert list(config.text_config.loop_core_layers) == [2, 3, 4, 5]
     config.save_pretrained(tmp_path / "saved")

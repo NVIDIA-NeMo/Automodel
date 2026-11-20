@@ -426,6 +426,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
             "Inkling2ForConditionalGeneration",
             ("nemo_automodel.components.models.inkling2.multimodal", "Inkling2ForConditionalGeneration"),
         ),
+        # Architecture name declared by the released looped Inkling2 checkpoints.
+        (
+            "Inkling2LoopForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling2.multimodal", "Inkling2ForConditionalGeneration"),
+        ),
         (
             "Inkling2ForCausalLM",
             ("nemo_automodel.components.models.inkling2.model", "Inkling2ForCausalLM"),
