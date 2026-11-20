@@ -1364,7 +1364,13 @@ def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, exp
         assert result.ignore_index == 0
 
 
-def test_run_train_validation_loop_calls_gc_hook_once_per_step():
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_run_train_validation_loop_calls_gc_without_device_sync(
+    monkeypatch: pytest.MonkeyPatch, device_type: str
+) -> None:
+    synchronize = MagicMock(side_effect=AssertionError("Throughput timing must not drain all CUDA streams"))
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+
     class _OneStepScheduler:
         stream_exhausted = False
 
@@ -1383,6 +1389,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             yield ["dummy-batch"]
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.dist_env = SimpleNamespace(device=torch.device(device_type))
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneStepScheduler()
     trainer.dataloader = []
@@ -1405,6 +1412,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.run_train_validation_loop()
 
     trainer._maybe_collect_garbage.assert_called_once()
+    synchronize.assert_not_called()
 
 
 def test_run_train_validation_loop_reports_weighted_domain_validation():
@@ -1426,6 +1434,7 @@ def test_run_train_validation_loop_reports_weighted_domain_validation():
             yield ["dummy-batch"]
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.dist_env = SimpleNamespace(device=torch.device("cpu"))
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneValidationStep()
     trainer.dataloader = []
@@ -2657,6 +2666,318 @@ class TestRunTrainOptimStepSetsMoEScale:
         metrics = recipe._run_train_optim_step([{"labels": torch.tensor([[1, 2, 3, -100]])}])
 
         assert "pack_fill" not in metrics.metrics
+
+    @pytest.mark.parametrize("dp_size,cp_size,world_size", [(1, 1, 1), (2, 1, 2), (2, 2, 8)])
+    @pytest.mark.parametrize("elapsed", [1.0, 2.0])
+    def test_runtime_tflops_accumulate_shapes_without_recounting_cp(
+        self, monkeypatch, dp_size, cp_size, world_size, elapsed
+    ):
+        """Rates use all microbatches and divide by every GPU, counting CP input once."""
+        from transformers import LlamaConfig
+
+        from nemo_automodel._transformers.mfu import AutoMFU
+
+        recipe = self._make_recipe(
+            monkeypatch,
+            pp_enabled=False,
+            dp_group_size=dp_size,
+            cp_group_size=cp_size,
+            world_size=world_size,
+        )
+        recipe.mfu_calculator = AutoMFU(
+            LlamaConfig(
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                vocab_size=16,
+            ),
+            peak_tflops=1000.0,
+        )
+        monkeypatch.setattr(
+            recipe,
+            "_dp_allreduce",
+            lambda value, include_cp=False: value * dp_size * (cp_size if include_cp else 1),
+        )
+        recipe.timestamp = 10.0
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.time.perf_counter", lambda: 10.0 + elapsed)
+        batches = [
+            {"input_ids": torch.ones(shape, dtype=torch.long), "labels": torch.ones(shape, dtype=torch.long)}
+            for shape in ((1, 8), (2, 5))
+        ]
+
+        sample = recipe._run_train_optim_step(batches)
+
+        # Hand-counted tiny Llama: 1248 FLOPs/token in projections/MLP/logits,
+        # plus 24 * sequence**2 in causal attention. The two batches cost
+        # 11520 + 13680 = 25200 FLOPs per DP replica.
+        expected_rate = 25200 * dp_size / elapsed / 1e12
+        assert sample.metrics["step_time"] == pytest.approx(elapsed)
+        assert sample.metrics["tflops_per_sec"] == pytest.approx(expected_rate)
+        assert sample.metrics["tflops_per_sec_per_gpu"] == pytest.approx(expected_rate / world_size)
+        assert sample.metrics["mfu"] == pytest.approx(expected_rate / world_size / 1000 * 100)
+
+    def test_runtime_tflops_times_loading_and_reductions_but_not_validation(self, monkeypatch):
+        """A full loop keeps the FLOPs numerator and training time on the same steps."""
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False)
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        class Scheduler:
+            epochs = [0]
+            step = 0
+            epoch = 0
+            is_val_step = True
+            is_ckpt_step = True
+            sigterm_flag = False
+            stream_exhausted = False
+
+            def set_epoch(self, epoch):
+                self.epoch = epoch
+
+            def __iter__(self):
+                for step in (1, 2):
+                    self.step = step
+                    advance(2.0)  # Fetch data before entering the optimizer step.
+                    yield [
+                        {"input_ids": torch.ones(1, 4, dtype=torch.long), "labels": torch.ones(1, 4, dtype=torch.long)}
+                    ]
+
+        def reduce(value, include_cp=False):
+            if value.dtype.is_floating_point:
+                advance(1.0)  # One FLOPs reduction and one reporting-loss reduction.
+            return value
+
+        def validate(dataloader):
+            advance(100.0)
+            return SimpleNamespace(metrics={"val_loss": 1.0, "num_label_tokens": 4})
+
+        recipe.step_scheduler = Scheduler()
+        recipe.mfu_calculator = SimpleNamespace(get_flops=lambda _: 7e12, reference_mfu=1000.0)
+        recipe.optimizer[0].step = lambda: advance(3.0)
+        recipe._dp_allreduce = reduce
+        recipe.max_grad_norm = None
+        recipe.partial_cuda_graph_manager = None
+        recipe._partial_cuda_graph_capture_pending = False
+        recipe._enable_qat_if_delayed = MagicMock()
+        recipe._collect_moe_load_balance = MagicMock()
+        recipe._make_progress_bar = lambda: None
+        recipe._update_progress_bar = MagicMock()
+        recipe._maybe_collect_garbage = MagicMock()
+        recipe.val_dataloaders = {"val": object()}
+        recipe._run_validation_epoch = validate
+        recipe.log_val_metrics = MagicMock()
+        recipe.save_checkpoint = lambda *args, **kwargs: advance(200.0)
+        recipe.best_metric_key = "default"
+        recipe.metric_logger_train = SimpleNamespace(close=lambda: None)
+        recipe.metric_logger_valid = {"val": SimpleNamespace(close=lambda: None)}
+        recipe._finalize_and_close_checkpointer = MagicMock()
+        recipe.dataloader = None
+        samples = []
+
+        def log(sample):
+            samples.append(sample)
+            advance(10.0)
+
+        recipe.log_train_metrics = log
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.time.perf_counter", lambda: clock[0])
+
+        recipe.run_train_validation_loop()
+
+        assert len(samples) == 2
+        for sample in samples:
+            assert sample.metrics["step_time"] == pytest.approx(7.0)
+            assert sample.metrics["tflops_per_sec"] == pytest.approx(1.0)
+            assert sample.metrics["tflops_per_sec_per_gpu"] == pytest.approx(1.0)
+
+    def test_inherited_kd_step_times_its_own_loss_readbacks(self, monkeypatch):
+        """The KD override closes its step window after its CE/KD readbacks, as the base recipe does after its loss readback."""
+        from nemo_automodel.recipes.llm.kd import KnowledgeDistillationRecipeForNextTokenPrediction
+
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        def reduce(value, include_cp=False):
+            if value.dtype.is_floating_point:
+                advance(1.0)  # Queued GPU work completes during each loss readback.
+            return value
+
+        recipe = object.__new__(KnowledgeDistillationRecipeForNextTokenPrediction)
+        recipe.pp_enabled = False
+        recipe.loss_fn = SimpleNamespace(ignore_index=-100)
+        recipe.kd_loss_fn = SimpleNamespace(temperature=1.0)
+        recipe.kd_ratio = 0.5
+        recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True, world_size=1)
+        recipe.device_mesh = None
+        recipe.moe_mesh = None
+        recipe.model_parts = [nn.Linear(2, 2)]
+        recipe._ce_loss_buffer = []
+        recipe._kd_loss_buffer = []
+        recipe._dp_allreduce = reduce
+        recipe._get_dp_group_size = lambda include_cp=False: 1
+        recipe._set_moe_aux_loss_backward_scale = MagicMock()
+        recipe._forward_backward_step = lambda i, batch, **kwargs: (
+            torch.tensor(1.0),
+            torch.tensor(0.5),
+            torch.tensor(0.5),
+        )
+        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+        recipe.optimizer = [
+            SimpleNamespace(step=lambda: advance(3.0), zero_grad=lambda: None, param_groups=[{"lr": 0.1}])
+        ]
+        recipe.lr_scheduler = None
+        recipe.cfg = SimpleNamespace(get=lambda key, default=None: default)
+        recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+        recipe.timestamp = 0.0
+        monkeypatch.setattr("nemo_automodel.recipes.llm.kd.synchronize_tp_replica_gradients", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.kd.scale_grads_and_clip_grad_norm", lambda *a, **k: torch.tensor(1.0)
+        )
+        monkeypatch.setattr("nemo_automodel.recipes.llm.kd.get_expert_tp_replication_factor", lambda *a, **k: 1)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.kd.time.perf_counter", lambda: clock[0])
+        monkeypatch.setattr("torch.cuda.max_memory_allocated", lambda: 0)
+
+        sample = recipe._run_train_optim_step([{"labels": torch.ones(1, 4, dtype=torch.long)}])
+
+        # 3 s optimizer step plus the reporting, CE and KD readbacks (1 s each) for 4 tokens.
+        assert sample.metrics["tps"] == pytest.approx(4 / 6.0)
+
+    def test_inherited_dllm_step_times_its_metric_reductions(self, monkeypatch):
+        """The dLLM override reads the clock after its loss, FLOP and accuracy reductions and uses one interval."""
+        from nemo_automodel.components.utils.flops_utils import calculate_mfu
+        from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        def reduce(value, include_cp=False):
+            if value.dtype.is_floating_point:
+                advance(1.0)  # Queued GPU work completes during each blocking reduction.
+            return value
+
+        def forward_backward(recipe, index, batch, *, loss_buffer, **kwargs):
+            loss_buffer.append(torch.tensor(1.0))
+            recipe._dllm_loss_buffer.append(torch.tensor(0.5))
+
+        recipe = object.__new__(DiffusionLMSFTRecipe)
+        recipe.pp_enabled = False
+        recipe.dllm_mode = "mdlm"
+        recipe.dllm_strategy = SimpleNamespace(
+            pre_step=lambda recipe, batches: (4, 4), forward_backward=forward_backward
+        )
+        recipe._compute_loss_denominators = lambda batches, noise, supervised: (noise, supervised)
+        recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True, world_size=1)
+        recipe.device_mesh = None
+        recipe.moe_mesh = None
+        recipe.model_parts = [nn.Linear(2, 2)]
+        recipe._dllm_loss_buffer = []
+        recipe._dflash_correct_per_pos_buffer = [torch.tensor([1.0, 1.0])]
+        recipe._dflash_count_per_pos_buffer = [torch.tensor([2.0, 2.0])]
+        recipe._dp_allreduce = reduce
+        recipe._get_dp_group_size = lambda include_cp=False: 1
+        recipe._get_cp_group_size = lambda: 1
+        recipe.mfu_calculator = SimpleNamespace(get_flops=lambda _: 7e12, reference_mfu=1000.0)
+        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+        recipe.optimizer = [
+            SimpleNamespace(step=lambda: advance(3.0), zero_grad=lambda: None, param_groups=[{"lr": 0.1}])
+        ]
+        recipe.lr_scheduler = None
+        recipe.cfg = SimpleNamespace(get=lambda key, default=None: default)
+        recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+        recipe.timestamp = 0.0
+        for name in ("prepare_for_grad_accumulation", "prepare_for_final_backward", "prepare_after_first_microbatch"):
+            monkeypatch.setattr(f"nemo_automodel.recipes.dllm.train_ft.{name}", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.dllm.train_ft.synchronize_tp_replica_gradients", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.dllm.train_ft.scale_grads_and_clip_grad_norm", lambda *a, **k: torch.tensor(1.0)
+        )
+        monkeypatch.setattr("nemo_automodel.recipes.dllm.train_ft.time.perf_counter", lambda: clock[0])
+        monkeypatch.setattr("torch.cuda.max_memory_allocated", lambda: 0)
+
+        sample = recipe._run_train_optim_step([{"input_ids": torch.ones(1, 4, dtype=torch.long)}])
+
+        # 3 s optimizer step, then the loss (2), FLOP (1) and draft-accuracy (2) reductions, for 4 tokens.
+        assert sample.metrics["tps"] == pytest.approx(4 / 8.0)
+        assert sample.metrics["mfu"] == pytest.approx(calculate_mfu(7.0, 1, 8.0, reference_mfu=1000.0))
+        assert sample.metrics["draft_acc"] == pytest.approx(0.5)
+
+    @pytest.mark.parametrize("unsupported", ["formula", "input"])
+    def test_runtime_tflops_unavailable_for_incomplete_flops(self, monkeypatch, unsupported):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False)
+        recipe.mfu_calculator = SimpleNamespace(
+            get_flops=lambda shape: None if unsupported == "formula" else 1e12,
+            reference_mfu=1000.0,
+        )
+        batches = [
+            {"input_ids": torch.ones(1, 4, dtype=torch.long), "labels": torch.ones(1, 4, dtype=torch.long)},
+            {"input_ids": torch.ones(1, 4, dtype=torch.long), "labels": torch.ones(1, 4, dtype=torch.long)},
+        ]
+        if unsupported == "input":
+            del batches[1]["input_ids"]
+
+        sample = recipe._run_train_optim_step(batches)
+
+        assert sample.metrics["tflops_per_sec"] is None
+        assert sample.metrics["tflops_per_sec_per_gpu"] is None
+        assert sample.metrics["mfu"] is None
+
+    def test_runtime_tflops_does_not_require_a_known_gpu_peak(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False)
+        recipe.mfu_calculator = SimpleNamespace(get_flops=lambda shape: 2e12, reference_mfu=float("inf"))
+        recipe.timestamp = 5.0
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.time.perf_counter", lambda: 7.0)
+        batches = [{"input_ids": torch.ones(1, 4, dtype=torch.long), "labels": torch.ones(1, 4, dtype=torch.long)}]
+
+        sample = recipe._run_train_optim_step(batches)
+
+        assert sample.metrics["tflops_per_sec"] == pytest.approx(1.0)
+        assert sample.metrics["tflops_per_sec_per_gpu"] == pytest.approx(1.0)
+        assert sample.metrics["mfu"] == 0.0
+
+    @pytest.mark.parametrize("supported", [False, True])
+    def test_runtime_tflops_reaches_console_and_metric_logger(self, monkeypatch, caplog, supported):
+        from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False)
+        recipe.step_scheduler.is_remote_logging_step = False
+        recipe.metric_logger_train = MagicMock()
+        monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+        sample = MetricsSample(
+            step=1,
+            epoch=0,
+            metrics={
+                "loss": 1.0,
+                "grad_norm": 1.0,
+                "lr": 0.01,
+                "mem": 0.0,
+                "tps": 100.0,
+                "tps_per_gpu": 50.0,
+                "num_label_tokens": 10,
+                "num_tokens_per_step": 20,
+                "mfu": None,
+                "tflops_per_sec": 240.0 if supported else None,
+                "tflops_per_sec_per_gpu": 120.0 if supported else None,
+            },
+        )
+
+        with caplog.at_level(logging.INFO):
+            recipe.log_train_metrics(sample)
+
+        recipe.metric_logger_train.log.assert_called_once_with(sample)
+        if supported:
+            assert "model TFLOPs/s 240.00(120.00/gpu)" in caplog.text
+            assert sample.to_dict()["tflops_per_sec_per_gpu"] == 120.0
+        else:
+            assert "model TFLOPs/s" not in caplog.text
 
 
 # -----------------------------------------------------------------------------
