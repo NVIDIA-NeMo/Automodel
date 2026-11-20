@@ -1,0 +1,217 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GLM-5.3-Flash SFT on Tulu-3 with 128K-token packed sequences.
+# 16 nodes x 8 H100 80GB; BF16; PP4 with two virtual stages per rank (interleaved 1F1B),
+# CP32, EP32, TP1, DP1. Global and local batch are 8; the pipeline microbatch is 1.
+# Tulu-3 conversations are shuffled with a fixed seed, then packed in order into THD
+# sequences; the packs keep that order (shuffle: false).
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+nvtx: false
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 8
+  max_steps: 100
+  num_epochs: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 1000
+  log_remote_every_steps: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+model:
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.glm5_next.backend.Glm5NextBackendConfig
+    attn: cudnn
+    sinkhorn: tilelang
+    compile_hc: true
+    compile_norm: true
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    dispatcher_num_sms: 20
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+    compile_router_weight: true
+    dispatcher_equal_token_counts: false
+    dispatcher_capacity_factor: null
+    indexer: cudnn
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: zai-org/GLM-5.3-Flash
+  attn_implementation: sdpa
+  text_config:
+    output_hidden_states: true
+    num_nextn_predict_layers: 0
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 32
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  enable_compile: false
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+  multimodal:
+    frozen_sharding: per_layer
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+    module_fqns_per_model_part:
+    - - model.language_model.embed_tokens
+      - model.visual
+      - model.language_model.layers.0
+      - model.language_model.layers.1
+      - model.language_model.layers.2
+      - model.language_model.layers.3
+      - model.language_model.layers.4
+      - model.language_model.layers.5
+    - - model.language_model.layers.6
+      - model.language_model.layers.7
+      - model.language_model.layers.8
+      - model.language_model.layers.9
+      - model.language_model.layers.10
+      - model.language_model.layers.11
+    - - model.language_model.layers.12
+      - model.language_model.layers.13
+      - model.language_model.layers.14
+      - model.language_model.layers.15
+      - model.language_model.layers.16
+      - model.language_model.layers.17
+    - - model.language_model.layers.18
+      - model.language_model.layers.19
+      - model.language_model.layers.20
+      - model.language_model.layers.21
+      - model.language_model.layers.22
+    - - model.language_model.layers.23
+      - model.language_model.layers.24
+      - model.language_model.layers.25
+      - model.language_model.layers.26
+      - model.language_model.layers.27
+      - model.language_model.layers.28
+    - - model.language_model.layers.29
+      - model.language_model.layers.30
+      - model.language_model.layers.31
+      - model.language_model.layers.32
+      - model.language_model.layers.33
+      - model.language_model.layers.34
+    - - model.language_model.layers.35
+      - model.language_model.layers.36
+      - model.language_model.layers.37
+      - model.language_model.layers.38
+      - model.language_model.layers.39
+      - model.language_model.layers.40
+    - - model.language_model.layers.41
+      - model.language_model.layers.42
+      - model.language_model.layers.43
+      - model.language_model.layers.44
+      - model.language_model.norm
+      - lm_head
+    pp_recv_buffer_pool: true
+    pp_recv_buffer_pool_slack: 2
+    pp_seq_len: 131072
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/glm5_3_flash_tulu3_128k_pp4_vpp2_cp32_ep32_100steps/
+  dequantize_base_checkpoint: true
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  ignore_index: -100
+  impl: torch_compile
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 1234
+  seq_length: 131072
+  truncation: true
+  padding: do_not_pad
+  chat_template: examples/llm_finetune/glm5_next/glm5_3_flash_training_chat_template.jinja
+packed_sequence:
+  packed_sequence_size: 131072
+  packing_strategy: thd
+  pad_to_multiple_of: 64
+  max_packs: 800  # max_steps * global_batch_size
+  num_proc: 1
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 8
+  num_workers: 0
+  shuffle: false
+  drop_last: true
+  pin_memory: true
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  lr: 5.0e-06
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: glm5_3_flash
+  name: glm5_3_flash_tulu3_128k_pp4_vpp2_cp32_ep32_100steps
+  dir: logs/glm5_3_flash_tulu3_128k_pp4_vpp2_cp32_ep32_100steps/wandb
+  tags: [glm5.3-flash, tulu3, packed128k, pp4, vpp2, cp32, ep32]
+moe_metrics:
+  enabled: true
+  mode: detailed
+  detailed_every_steps: 1
+  top_k_experts: 0
+clip_grad_norm:
+  max_norm: 1.0
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 10
+  lr_decay_steps: 100
+  wd_incr_steps: 100
+mfu:
+  peak_tflops: 989
+validation_dataset: null
+validation_dataloader: null
+ci:
+  cluster_tag: h100
+  recipe_owner: HuiyingLi
+  nodes: 16
+  time: "01:00:00"
+  max_steps: 2
