@@ -48,7 +48,11 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
+    cast_model_to_dtype,
+    generation_config_from_model_config,
+)
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4RotaryEmbedding, build_causal_padding_mask
 from nemo_automodel.components.models.ernie5_5.config import (
@@ -511,6 +515,9 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         self.backend = backend or BackendConfig(attn="cudnn", linear="torch", experts="torch", dispatcher="torch")
         dtype = dtype_from_str(self.config.dtype, torch.bfloat16)
         self._validate_backend(dtype)
+        # As PreTrainedModel does: the loader restores the checkpoint's generation_config.json onto this
+        # attribute, and the consolidated export writes it back out.
+        self.generation_config = generation_config_from_model_config(self.config)
         moe_config = MoEConfig(
             n_routed_experts=self.config.n_routed_experts,
             n_shared_experts=self.config.n_shared_experts,
