@@ -251,6 +251,37 @@ def _mtp_block_causal_mask(packing_mask: torch.Tensor, inputs_embeds: torch.Tens
     return (same_doc & causal.unsqueeze(0) & not_padding).unsqueeze(1)
 
 
+def _mtp_sdpa_causal_mask(
+    config: Qwen3_5TextConfig,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_values: Any | None,
+    position_ids: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Build the MTP fallback causal mask in the SDPA layout used by the MTP sublayers.
+
+    Args:
+        config: Backbone text config; a shallow copy with ``_attn_implementation="sdpa"`` is used.
+        inputs_embeds: Tensor of shape [batch, sequence, hidden].
+        attention_mask: Optional 0/1 padding mask of shape [batch, sequence].
+        past_key_values: Optional KV cache.
+        position_ids: Optional text position ids of shape [batch, sequence].
+
+    Returns:
+        Boolean mask of shape [batch, 1, sequence, sequence] (``True`` = attend), or ``None`` when
+        SDPA can run with ``is_causal``.
+    """
+    sdpa_config = copy.copy(config)
+    sdpa_config._attn_implementation = "sdpa"
+    return create_causal_mask(
+        config=sdpa_config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
+
+
 def _rolled_embed_inputs(inputs_embeds: torch.Tensor, num_depths: int) -> tuple[torch.Tensor, ...]:
     embed_inputs = []
     cur = inputs_embeds
@@ -1272,7 +1303,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             if is_indexed_packed_mask(packing_mask):
                 causal_mask = _mtp_block_causal_mask(packing_mask, source_embeds)
             else:
-                causal_mask = create_causal_mask(
+                causal_mask = _mtp_sdpa_causal_mask(
                     config=self.model.config,
                     inputs_embeds=source_embeds,
                     attention_mask=attention_mask,
@@ -2018,7 +2049,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             if is_indexed_packed_mask(packing_mask):
                 causal_mask = _mtp_block_causal_mask(packing_mask, source_embeds)
             else:
-                causal_mask = create_causal_mask(
+                causal_mask = _mtp_sdpa_causal_mask(
                     config=language_model.config,
                     inputs_embeds=source_embeds,
                     attention_mask=attention_mask,
