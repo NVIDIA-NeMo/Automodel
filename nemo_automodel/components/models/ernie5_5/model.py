@@ -23,11 +23,12 @@ Forward contract:
 3. Contract the streams with the hyper-head, then apply the final RMSNorm, the output projection and the MultiMax
    correction of the logits.
 
-One call processes one document: a single unpadded row whose positions start at zero. Padding, a row whose masks or
-positions mark several documents, and a KV cache are rejected; several documents concatenated in one row without such
-metadata are not detected. ``forward`` declares no packed-sequence and no context-parallel input, so the framework
-refuses THD packing when it builds the data loader, and context parallelism through the capability declaration. The
-model returns logits only; the recipe computes the loss.
+A row is one unpadded document whose positions start at zero, or a packed row: several documents with their lengths
+in ``seq_lens``. Under context parallelism a rank holds one contiguous shard of a row, prepared by the sharder of
+``prepare_model_inputs_for_cp``. A packed row and its shards are laid out so that every document starts at a multiple
+of the HCA compression ratio, and no attention layer reads across a document boundary. Without ``seq_lens``, padding,
+a row whose masks or positions mark several documents, and a KV cache are rejected; several documents concatenated in
+one row without such metadata are not detected. The model returns logits only; the recipe computes the loss.
 
 The MTP block of the released checkpoint is not built: the model accepts ``num_nextn_predict_layers == 0`` only and
 does not load the MTP weights. The DSA indexers only select keys, receive no gradient and stay frozen.
@@ -35,13 +36,24 @@ does not load the MTP weights. The DSA indexers only select keys, receive no gra
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, replace
+from functools import partial
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -55,6 +67,8 @@ from nemo_automodel.components.models.common.utils import (
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4RotaryEmbedding, build_causal_padding_mask
+from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
+from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.ernie5_5.config import (
     Ernie5_5Config,
     Ernie5_5LayerPlan,
@@ -64,7 +78,12 @@ from nemo_automodel.components.models.ernie5_5.config import (
     main_rope_theta,
     validate_architecture,
 )
-from nemo_automodel.components.models.ernie5_5.dsa import Ernie5_5DSAAttention, freeze_ernie5_5_indexer_params
+from nemo_automodel.components.models.ernie5_5.dsa import (
+    Ernie5_5DSAAttention,
+    cudnn_dsa_layout,
+    dsa_selection_replay,
+    freeze_ernie5_5_indexer_params,
+)
 from nemo_automodel.components.models.ernie5_5.hca import Ernie5_5HCAAttention
 from nemo_automodel.components.models.ernie5_5.layers import (
     DENSE_ATTENTION_BACKENDS,
@@ -73,16 +92,51 @@ from nemo_automodel.components.models.ernie5_5.layers import (
     Ernie5_5HyperHead,
     Ernie5_5MultiMax,
     Ernie5_5RMSNorm,
+    shard_start,
 )
 from nemo_automodel.components.models.ernie5_5.moe import Ernie5_5MoE
 from nemo_automodel.components.models.ernie5_5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.ernie5_5.state_dict_adapter import Ernie5_5StateDictAdapter
+from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import CudnnDsaPackedMetadata
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str
 
 # Rank of the virtual-head mixing factors of the released checkpoint. The released config.json does not carry it.
 _VHA_RANK = 16
+
+
+def _require_supervision_within_documents(
+    seq_lens: torch.Tensor, seq_lens_padded: torch.Tensor | None, supervised: torch.Tensor
+) -> None:
+    """Reject supervised positions in the padding of a packed row: the layout drops them after they were counted.
+
+    Args:
+        seq_lens: Real document lengths of shape [batch, documents]; negative entries are unused.
+        seq_lens_padded: Optional physical spans of the same shape.
+        supervised: Boolean tensor of shape [batch, sequence], True where the loss counts a target.
+    """
+    lengths = seq_lens.clamp_min(0)
+    spans = lengths if seq_lens_padded is None else seq_lens_padded.clamp_min(0)
+    starts = spans.cumsum(dim=-1) - spans
+    positions = torch.arange(supervised.shape[-1], device=supervised.device)
+    real = ((positions >= starts.unsqueeze(-1)) & (positions < (starts + lengths).unsqueeze(-1))).any(dim=-2)
+    dropped = supervised & ~real.to(supervised.device)
+    if bool(dropped.any()):
+        raise ValueError(
+            f"{int(dropped.sum())} supervised labels of a packed row lie in document padding, which the packed "
+            "layout drops after the loss has counted them: give them the loss's ignore index"
+        )
+
+
+def _require_full_row_spans(seq_lens: torch.Tensor, seq_lens_padded: torch.Tensor | None, row_length: int) -> None:
+    """Reject packed rows whose document spans do not add up to the row length."""
+    spans = seq_lens if seq_lens_padded is None else seq_lens_padded
+    if bool((spans.clamp_min(0).sum(dim=-1) != row_length).any()):
+        raise ValueError(
+            "The document spans of a packed row (seq_lens_padded, or seq_lens without it) must add up to "
+            f"the row length {row_length}"
+        )
 
 
 def _hca_attention_config(config: Ernie5_5Config, dtype: torch.dtype) -> DeepseekV4Config:
@@ -131,28 +185,32 @@ def _hca_attention_config(config: Ernie5_5Config, dtype: torch.dtype) -> Deepsee
 class Ernie5_5AttentionInputs:
     """Position and mask inputs of one forward call, shared by all decoder blocks.
 
-    Every row is one unpadded document that starts at position zero.
+    ``attention_inputs`` builds them for rows that are one unpadded document starting at position zero, and
+    ``packed_attention_inputs`` for a packed row or one context-parallel shard of it.
 
     Attributes:
-        position_ids: Integer tensor of shape [batch, sequence] with the positions ``0..sequence-1`` of every row.
-        document_ids: Integer tensor of shape [batch, sequence], all zeros: the document of every token, read by
-            the eager DSA path.
-        cu_seqlens: Int32 tensor of shape [2] holding ``[0, sequence]``: the cumulative document lengths of the
-            single row, read by the cuDNN DSA path.
+        position_ids: Integer tensor of shape [batch, sequence] with the position of every token in its document.
+        document_ids: Integer tensor of shape [batch, sequence] with the document of every token, numbered from
+            zero along the row; -1 marks padding.
+        cu_seqlens: Int32 tensor of shape [documents + 1] with the cumulative document lengths of the row, read by
+            the cuDNN DSA path; None for a packed row on the eager path.
         hca_rope: Cosine and sine of the HCA compress rotary embedding, each of shape
             [batch, sequence, qk_rope_head_dim], in the dtype of the token embedding.
         hca_rotary: The rotary module that produced ``hca_rope``; the HCA compressor calls it for the positions of
             the compressed keys.
         hca_mask: Additive causal sliding-window mask of shape [batch, 1, sequence, sequence] in the dtype of the
-            token embedding: zero for visible keys, the most negative finite value for hidden keys.
+            token embedding: zero for visible keys, the most negative finite value for hidden keys. None for a
+            packed row or a shard, whose HCA layers attend over key indices.
+        dsa_metadata: Layout of a packed row and of the local queries in it for the cuDNN DSA path; None otherwise.
     """
 
     position_ids: torch.Tensor
     document_ids: torch.Tensor
-    cu_seqlens: torch.Tensor
+    cu_seqlens: torch.Tensor | None
     hca_rope: tuple[torch.Tensor, torch.Tensor]
     hca_rotary: DeepseekV4RotaryEmbedding
-    hca_mask: torch.Tensor
+    hca_mask: torch.Tensor | None
+    dsa_metadata: CudnnDsaPackedMetadata | None = None
 
 
 class Ernie5_5Block(nn.Module):
@@ -175,7 +233,7 @@ class Ernie5_5Block(nn.Module):
         Args:
             config: Decoder-only model configuration.
             layer: Attention and feed-forward kind of this layer.
-            backend: Backend selection of the model. A DSA layer reads ``attn`` from it; HCA and MoE layers receive
+            backend: Backend selection of the model. The attention layer reads ``attn`` from it; MoE layers receive
                 a copy with ``attn="eager"``.
             moe_config: Configuration of the latent MoE; read by MoE layers only.
             hca_config: HCA dimensions in the configuration type of the DeepSeek V4 attention; read by HCA layers
@@ -207,7 +265,7 @@ class Ernie5_5Block(nn.Module):
                 backend=backend,
             )
         else:
-            self.attention = Ernie5_5HCAAttention(hca_config, layer.layer_index, dense_backend, vha_rank=_VHA_RANK)
+            self.attention = Ernie5_5HCAAttention(hca_config, layer.layer_index, backend, vha_rank=_VHA_RANK)
         if self.is_moe:
             self.moe = Ernie5_5MoE(
                 moe_config,
@@ -233,6 +291,24 @@ class Ernie5_5Block(nn.Module):
         self.input_layernorm = Ernie5_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.post_attention_layernorm = Ernie5_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
+    @property
+    def self_attn(self) -> nn.Module:
+        """The attention layer, under the name that the shared context-parallel setup looks up."""
+        return self.attention
+
+    def nemo_checkpoint_context_fn(
+        self, context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Make the recomputation of a checkpointed DSA layer call reuse the key selection of its forward.
+
+        Args:
+            context_fn: Factory of the forward and recomputation contexts of activation checkpointing, or None.
+
+        Returns:
+            The factory with the selection record of one call bound for a DSA layer, otherwise ``context_fn``.
+        """
+        return dsa_selection_replay.checkpoint_context_fn(context_fn) if self.is_dsa else context_fn
+
     def _attend(self, hidden_states: torch.Tensor, inputs: Ernie5_5AttentionInputs) -> torch.Tensor:
         """Run the attention layer with the inputs of its kind.
 
@@ -243,7 +319,16 @@ class Ernie5_5Block(nn.Module):
         Returns:
             Attention output of shape [batch, sequence, hidden].
         """
-        if not self.is_dsa:
+        if not self.is_dsa and inputs.hca_mask is None:
+            output, _ = self.attention(
+                hidden_states,
+                position_embeddings=inputs.hca_rope,
+                position_embeddings_compress=inputs.hca_rope,
+                rotary_compress=inputs.hca_rotary,
+                position_ids=inputs.position_ids,
+                packed_seq_ids=inputs.document_ids + 1,
+            )
+        elif not self.is_dsa:
             output, _ = self.attention(
                 hidden_states,
                 position_embeddings=inputs.hca_rope,
@@ -257,6 +342,7 @@ class Ernie5_5Block(nn.Module):
                 position_ids=inputs.position_ids,
                 cu_seqlens=inputs.cu_seqlens,
                 max_seqlen=hidden_states.shape[1],
+                metadata=inputs.dsa_metadata,
             )
         else:
             output, _ = self.attention(
@@ -290,7 +376,7 @@ class Ernie5_5Block(nn.Module):
         hidden_streams = self.attn_hc.expand(self._attend(normalized, inputs), hidden_streams, post, comb)
         pre, post, comb = self.ffn_hc(hidden_streams)
         normalized = self.post_attention_layernorm(self.ffn_hc.collapse(hidden_streams, pre))
-        output = self.moe(normalized) if self.is_moe else self.mlp(normalized)
+        output = self.moe(normalized, inputs.document_ids < 0) if self.is_moe else self.mlp(normalized)
         return self.ffn_hc.expand(output, hidden_streams, post, comb)
 
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
@@ -341,6 +427,17 @@ class Ernie5_5Model(nn.Module):
         self.norm = Ernie5_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
         self.multimax = Ernie5_5MultiMax(dtype=dtype)
+        self.dsa_uses_cudnn = backend.attn == "cudnn" and any(layer.is_dsa for layer in self.layers)
+
+    def _hca_rotary(self, device: torch.device) -> DeepseekV4RotaryEmbedding:
+        """Create the FP32 rotary module of the HCA layers on ``device``."""
+        return DeepseekV4RotaryEmbedding(
+            rope_theta=self.config.compress_rope_theta,
+            head_dim=self.config.qk_rope_head_dim,
+            partial_rotary_factor=1.0,
+            rope_scaling=hca_rope_scaling(self.config),
+            device=device,
+        )
 
     def attention_inputs(self, input_ids: torch.Tensor) -> Ernie5_5AttentionInputs:
         """Build the position and mask inputs of the attention layers for unpadded single-document rows.
@@ -355,17 +452,10 @@ class Ernie5_5Model(nn.Module):
         Returns:
             The inputs shared by all decoder blocks, on the device of ``input_ids``.
         """
-        config = self.config
         batch, sequence = input_ids.shape
         device, dtype = input_ids.device, self.embed_tokens.weight.dtype
         positions = torch.arange(sequence, device=device).expand(batch, -1)
-        rotary = DeepseekV4RotaryEmbedding(
-            rope_theta=config.compress_rope_theta,
-            head_dim=config.qk_rope_head_dim,
-            partial_rotary_factor=1.0,
-            rope_scaling=hca_rope_scaling(config),
-            device=device,
-        )
+        rotary = self._hca_rotary(device)
         rope = rotary(torch.empty(batch, sequence, 1, device=device, dtype=dtype), positions)
         mask = build_causal_padding_mask(
             None,
@@ -384,17 +474,65 @@ class Ernie5_5Model(nn.Module):
             hca_mask=mask,
         )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Compute the logits of unpadded single-document rows.
+    def packed_attention_inputs(
+        self, position_ids: torch.Tensor, document_ids: torch.Tensor, cp_group: dist.ProcessGroup | None
+    ) -> Ernie5_5AttentionInputs:
+        """Build the inputs of the attention layers for a packed row or one context-parallel shard of it.
 
         Args:
-            input_ids: Integer tensor of shape [batch, sequence]; every row is one unpadded document that starts
-                at position zero.
+            position_ids: Integer tensor of shape [batch, sequence] with the position of every token in its
+                document.
+            document_ids: Integer tensor of shape [batch, sequence] with the document of every token, numbered
+                from zero along the row; -1 marks padding. Every document starts at a row offset that is a
+                multiple of the HCA compression ratio.
+            cp_group: Context-parallel group whose ranks hold consecutive shards of the row, or None.
+
+        Returns:
+            The inputs shared by all decoder blocks, on the device of ``position_ids``.
+        """
+        batch, sequence = position_ids.shape
+        device, dtype = position_ids.device, self.embed_tokens.weight.dtype
+        rotary = self._hca_rotary(device)
+        cu_seqlens = metadata = None
+        if self.dsa_uses_cudnn:
+            cu_seqlens, metadata = cudnn_dsa_layout(
+                gather_sequence(document_ids, cp_group)[0], shard_start(cp_group, sequence), sequence
+            )
+        return Ernie5_5AttentionInputs(
+            position_ids=position_ids,
+            document_ids=document_ids,
+            cu_seqlens=cu_seqlens,
+            hca_rope=rotary(torch.empty(batch, sequence, 1, device=device, dtype=dtype), position_ids),
+            hca_rotary=rotary,
+            hca_mask=None,
+            dsa_metadata=metadata,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        document_ids: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
+    ) -> torch.Tensor:
+        """Compute the logits of unpadded single-document rows, or of a packed row or shard.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence]. Without ``document_ids`` every row is one
+                unpadded document that starts at position zero.
+            position_ids: Position of every token in its document, of shape [batch, sequence]; required with
+                ``document_ids``.
+            document_ids: Document of every token of a packed row or shard, of shape [batch, sequence]; see
+                ``packed_attention_inputs``.
+            cp_group: Context-parallel group whose ranks hold consecutive shards of the row, or None.
 
         Returns:
             Logits of shape [batch, sequence, vocab] in the model dtype.
         """
-        inputs = self.attention_inputs(input_ids)
+        if document_ids is None:
+            inputs = self.attention_inputs(input_ids)
+        else:
+            inputs = self.packed_attention_inputs(position_ids, document_ids, cp_group)
         hidden = self.embed_tokens(input_ids).float()
         streams = hidden.unsqueeze(-2).expand(*hidden.shape[:-1], self.config.hc_mult, -1).contiguous()
         for layer in self.layers:
@@ -409,7 +547,7 @@ class Ernie5_5Model(nn.Module):
             init_std: Standard deviation of the weight draws.
         """
         nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
-        for layer in self.layers:
+        for layer in map(unwrap_checkpoint_wrapper, self.layers):
             layer.init_weights(buffer_device, init_std)
         self.hyper_head.init_weights(init_std)
         self.norm.reset_parameters()
@@ -425,11 +563,17 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     normalized copy of the configuration passed in, see ``decoder_only_config``.
 
     ``backend.attn`` selects the attention path. ``"cudnn"`` runs the DSA layers on the cuDNN sparse-attention
-    kernels and the HCA layers on eager attention; it requires ``nvidia-cudnn-frontend[cutedsl]`` and FlashMLA,
-    BF16 and the released latent and indexer dimensions, and was validated on SM100-class GPUs only. ``"eager"``,
-    ``"torch"`` and ``"sdpa"`` run both kinds of layer on eager PyTorch attention on any device; the eager DSA
-    path is limited to 512 tokens. Without a ``backend`` argument the model selects ``"cudnn"``; pass
-    ``attn="eager"`` where those kernels are not available.
+    kernels and the HCA layers on eager attention, or, for a packed row or a context-parallel shard, on the same
+    kernels; it requires ``nvidia-cudnn-frontend[cutedsl]`` and FlashMLA, BF16 and the released latent and indexer
+    dimensions, and was validated on SM100-class GPUs only. ``"eager"``, ``"torch"`` and ``"sdpa"`` run both kinds
+    of layer on eager PyTorch attention on any device; the eager DSA path is limited to 512 tokens. Without a
+    ``backend`` argument the model selects ``"cudnn"``; pass ``attn="eager"`` where those kernels are not
+    available.
+
+    Packed rows and context parallelism: ``forward`` takes the document lengths of a packed row in ``seq_lens``,
+    and ``prepare_model_inputs_for_cp`` returns the sharder that gives every context-parallel rank one contiguous
+    shard of a row. Under context parallelism the HCA layers exchange the window keys at the shard boundaries and
+    share the compressed keys, and the DSA layers gather the latent and indexer keys of the row.
 
     The model reads one more ``BackendConfig`` field: ``enable_hf_state_dict_adapter`` attaches the checkpoint
     adapter. Every other field must hold a value the layers implement. ``linear`` is ``"torch"``. ``experts`` and
@@ -469,16 +613,23 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         "hyper_head.",
     ]
     parallelizer = PARALLELIZER
+    # Every attention layer carries the document boundaries of a packed row and its own exchange of keys between
+    # context-parallel ranks, with every attention backend.
+    _owns_cp_attention = True
+    _owns_packed_attention = True
+    # The sharder of ``prepare_model_inputs_for_cp`` also lays out the packed rows of a run without context
+    # parallelism.
+    supports_thd = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
-        supports_thd: bool = False
+        supports_thd: bool = True
 
     @classmethod
     def from_config(cls, config: Ernie5_5Config, backend: BackendConfig | None = None) -> Ernie5_5_MoeForCausalLM:
@@ -512,6 +663,10 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         super().__init__()
         self.config = decoder_only_config(config)
         validate_architecture(self.config)
+        # Set by the shared context-parallel setup of the parallelizer.
+        self.cp_mesh: DeviceMesh | None = None
+        # Documents of a packed row start at multiples of the HCA compression ratio.
+        self.packed_alignment = math.lcm(*(ratio for ratio in self.config.compress_ratios if ratio > 0))
         self.backend = backend or BackendConfig(attn="cudnn", linear="torch", experts="torch", dispatcher="torch")
         dtype = dtype_from_str(self.config.dtype, torch.bfloat16)
         self._validate_backend(dtype)
@@ -678,6 +833,35 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             if position_ids.dtype not in (torch.int32, torch.int64) or not torch.equal(position_ids, expected):
                 raise ValueError("Only contiguous zero-based position_ids are supported: a row must hold one document")
 
+    def _validate_packed_layout(self, position_ids: torch.Tensor, packed_seq_ids: torch.Tensor, first: int) -> None:
+        """Reject a laid-out row or shard whose documents are not numbered, aligned and counted as the model reads them.
+
+        Args:
+            position_ids: Integer tensor of shape [batch, sequence] with the position of every token in its document.
+            packed_seq_ids: Integer tensor of shape [batch, sequence] with the document of every token; zero marks
+                padding.
+            first: Row offset of the first token of this shard; zero for a whole row.
+
+        Raises:
+            ValueError: If a document does not start at a multiple of the HCA compression ratio, its positions do
+                not count up from zero at its first token, or a document id returns after another document.
+        """
+        starts = first + torch.arange(position_ids.shape[1], device=position_ids.device) - position_ids
+        same = packed_seq_ids[:, 1:] == packed_seq_ids[:, :-1]
+        highest = torch.cummax(packed_seq_ids, dim=1).values
+        # A token continues its document, or starts a new one: at position zero, with an id that is new in the row.
+        new = (position_ids[:, 1:] == 0) & (packed_seq_ids[:, 1:] > highest[:, :-1])
+        counted = torch.where(same, starts[:, 1:] == starts[:, :-1], new)
+        # The first token of a later shard may continue a document of the preceding shard.
+        head = position_ids[:, :1] == 0 if first == 0 else torch.ones_like(same[:, :1])
+        valid = torch.cat((head, counted), dim=1) & (starts % self.packed_alignment == 0)
+        if not bool((valid | (packed_seq_ids <= 0)).all()):
+            raise ValueError(
+                "position_ids of a packed row must count up from zero in every document of packed_seq_ids, the "
+                "documents must be numbered in row order, and every document must start at a multiple of "
+                f"{self.packed_alignment} tokens"
+            )
+
     def _require_frozen_indexers(self) -> None:
         """Reject training while a DSA indexer parameter requires gradients.
 
@@ -690,13 +874,60 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         Raises:
             ValueError: If a parameter of a DSA indexer requires gradients.
         """
-        for index, layer in enumerate(self.model.layers):
+        for index, layer in enumerate(map(unwrap_checkpoint_wrapper, self.model.layers)):
             if layer.is_dsa and any(parameter.requires_grad for parameter in layer.attention.indexer.parameters()):
                 raise ValueError(
                     f"model.layers.{index}.attention.indexer has trainable parameters. The DSA indexer only "
                     "selects keys and is not trained: remove it from the unfreeze selectors of freeze_config and "
                     "from the modules that peft.target_modules selects"
                 )
+
+    def prepare_model_inputs_for_cp(
+        self, batch: dict[str, torch.Tensor | str], *, num_chunks: int = 1
+    ) -> dict[str, ContextParallelSharder]:
+        """Return the sharder that gives every context-parallel rank one contiguous shard of a row.
+
+        The sharder starts every document of a packed row at a multiple of the HCA compression ratio, pads the row
+        so that every shard holds whole compression windows, and adds ``packed_seq_ids`` and the document-local
+        ``position_ids`` that ``forward`` reads.
+
+        Args:
+            batch: Full rows: ``input_ids`` and ``labels`` of shape [batch, sequence], and ``seq_lens`` of shape
+                [batch, documents] for packed rows, with optional ``seq_lens_padded``. The hook checks the
+                spans of packed rows and leaves the batch unchanged.
+            num_chunks: Chunk count of the framework; this model uses one chunk.
+
+        Returns:
+            The sharder, under the key ``cp_sharder``.
+
+        Raises:
+            ValueError: If the document spans of a packed row do not add up to its length, or a supervised
+                label lies in the padding of a document.
+        """
+        del num_chunks
+        seq_lens = batch.get("seq_lens")
+        if seq_lens is not None:
+            # The shared sharder accepts spans that cover only a prefix of the row, and drops the labels of
+            # uncovered positions and of document padding after the recipe has counted them, so both checks
+            # run here.
+            seq_lens_padded = batch.get("seq_lens_padded")
+            _require_full_row_spans(seq_lens, seq_lens_padded, batch["input_ids"].shape[1])
+            labels = batch.get("labels")
+            if labels is not None:
+                # The recipe's supervision mask when the collator provides one; otherwise the labels that
+                # are token IDs. Token IDs are non-negative, while -100 and a loss's configured
+                # ignore_index are negative sentinels.
+                loss_mask = batch.get("loss_mask")
+                supervised = loss_mask.bool() if loss_mask is not None else labels >= 0
+                _require_supervision_within_documents(seq_lens, seq_lens_padded, supervised)
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=partial(
+                    shard_cp_batch, pad_multiple=self.packed_alignment, packed_alignment=self.packed_alignment
+                ),
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
 
     def forward(
         self,
@@ -705,37 +936,87 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         *,
+        packed_seq_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        seq_lens_padded: torch.Tensor | None = None,
         use_cache: bool = False,
     ) -> CausalLMOutputWithPast:
-        """Compute the logits of one unpadded document.
+        """Compute the logits of one unpadded document, of a packed row, or of this rank's shard of a row.
 
-        The signature has no ``seq_lens`` and no variadic keyword, so the framework's packed-sequence probe is
-        false for this model and THD packing is refused when the data loader is built. A row whose masks or
-        positions mark padding or several documents is rejected by the mask and position checks. Several documents
-        concatenated in one row without such metadata cannot be detected; the data pipeline must supply one
-        document per row.
+        Without ``seq_lens``, ``packed_seq_ids`` and context parallelism the row is one unpadded document: a row
+        whose masks or positions mark padding or several documents is rejected by the mask and position checks, and
+        several documents concatenated in one row without such metadata cannot be detected.
+
+        ``seq_lens`` marks a packed row. Its documents are moved to multiples of the HCA compression ratio for the
+        forward, and the logits are returned in the layout of ``input_ids``. ``packed_seq_ids`` marks a row or a
+        shard that the sharder of ``prepare_model_inputs_for_cp`` has laid out already; the logits keep that
+        layout. A shard of unpacked rows is one document per row, with ``attention_mask`` marking its tokens.
 
         Args:
-            input_ids: Integer tensor of shape [1, sequence]: one document without padding.
-            attention_mask: Optional tensor of shape [1, sequence]; must be one for every token.
+            input_ids: Integer tensor of shape [batch, sequence]; [1, sequence] for one unpadded document.
+            attention_mask: Optional tensor of shape [batch, sequence]. For one unpadded document it must be one
+                for every token; for a shard it is true for tokens and false for padding.
             padding_mask: Optional tensor of shape [1, sequence]; must be zero (False) for every token.
-            position_ids: Optional integer tensor of shape [1, sequence]; must hold ``0..sequence-1``.
+            position_ids: Optional integer tensor of shape [batch, sequence]. For one unpadded document it must
+                hold ``0..sequence-1``; with ``packed_seq_ids`` or for a shard it is required and holds the
+                position of every token in its document.
+            packed_seq_ids: Optional integer tensor of shape [batch, sequence] with the document of every token,
+                counted from one along the row; zero marks padding.
+            seq_lens: Optional integer tensor of shape [batch, documents] with the document lengths of a packed
+                row; -1000 marks an unused entry.
+            seq_lens_padded: Optional integer tensor of shape [batch, documents] with the length of every document
+                including its padding in ``input_ids``; these spans, or ``seq_lens`` without them, add up to the
+                row length.
             use_cache: Must be False: the model keeps no KV cache.
 
         Returns:
-            ``CausalLMOutputWithPast`` whose ``logits`` have shape [1, sequence, vocab] in the model dtype. No
+            ``CausalLMOutputWithPast`` whose ``logits`` have shape [batch, sequence, vocab] in the model dtype. No
             loss, hidden states or cache are returned.
 
         Raises:
-            ValueError: If the input is not one unpadded document starting at position zero, ``use_cache`` is set,
-                or the model is in training mode and a DSA indexer parameter requires gradients.
+            ValueError: If a row without packing metadata is not one unpadded document starting at position zero,
+                ``seq_lens`` comes with ``packed_seq_ids`` or under context parallelism, the document spans of
+                ``seq_lens`` do not add up to the row length, a shard or a row with ``packed_seq_ids`` lacks its
+                positions or its documents, its positions do not count up from zero in every document, its
+                documents are not numbered in row order or do not start at multiples of the HCA compression ratio,
+                ``use_cache`` is set, or the
+                model is in training mode and a DSA indexer parameter requires gradients.
         """
         if use_cache:
             raise ValueError("A KV cache is unsupported: use_cache must be False")
         if self.training:
             self._require_frozen_indexers()
-        self._validate_single_document(input_ids, attention_mask, padding_mask, position_ids)
-        return CausalLMOutputWithPast(logits=self.model(input_ids))
+        cp_group = None if self.cp_mesh is None else self.cp_mesh.get_group()
+        if cp_group is None and seq_lens is None and packed_seq_ids is None:
+            self._validate_single_document(input_ids, attention_mask, padding_mask, position_ids)
+            return CausalLMOutputWithPast(logits=self.model(input_ids))
+        layout = None
+        if seq_lens is not None:
+            if cp_group is not None or packed_seq_ids is not None:
+                raise ValueError(
+                    "seq_lens describes a whole packed row: under context parallelism the row must pass through "
+                    "the sharder of prepare_model_inputs_for_cp, which replaces seq_lens by packed_seq_ids"
+                )
+            _require_full_row_spans(seq_lens, seq_lens_padded, input_ids.shape[1])
+            layout = packed_layout(
+                seq_lens,
+                seq_lens_padded=seq_lens_padded,
+                input_shape=tuple(input_ids.shape),
+                alignment=self.packed_alignment,
+                minimum_length=input_ids.shape[1],
+            )
+            input_ids = layout.pack(input_ids, fill=self.config.pad_token_id or 0)
+            position_ids, packed_seq_ids = layout.position_ids, layout.sequence_ids
+        elif position_ids is None or (packed_seq_ids is None and attention_mask is None):
+            raise ValueError(
+                "A packed row or a context-parallel shard requires position_ids, and packed_seq_ids or attention_mask"
+            )
+        elif packed_seq_ids is None:
+            packed_seq_ids = attention_mask.to(torch.int64)
+        if layout is None:
+            self._validate_packed_layout(position_ids, packed_seq_ids, shard_start(cp_group, input_ids.shape[1]))
+        logits = self.model(input_ids, position_ids, packed_seq_ids - 1, cp_group)
+        return CausalLMOutputWithPast(logits=logits if layout is None else layout.restore(logits))
 
     @torch.no_grad()
     def initialize_weights(self, buffer_device: torch.device | None = None, dtype: torch.dtype | None = None) -> None:
