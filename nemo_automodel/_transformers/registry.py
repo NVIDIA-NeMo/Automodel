@@ -461,6 +461,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "inkling2": ("nemo_automodel.components.models.inkling2.config", "Inkling2Config"),
+    "inkling2_loop": ("nemo_automodel.components.models.inkling2.config", "Inkling2LoopConfiguration"),
     "inkling2_mm_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2LegacyConfig"),
     "inkling2_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2TextConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
