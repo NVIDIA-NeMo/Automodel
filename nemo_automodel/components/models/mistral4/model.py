@@ -27,11 +27,12 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.moe_gate import update_moe_gate_biases
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, initialize_lm_head
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype, init_lm_head_weight, initialize_lm_head
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.model import Block
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
@@ -47,7 +48,6 @@ from nemo_automodel.components.models.mistral4.state_dict_adapter import (
 from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -321,10 +321,7 @@ class Mistral4Model(nn.Module):
         return h
 
     def update_moe_gate_bias(self) -> None:
-        with torch.no_grad():
-            for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+        update_moe_gate_biases(self.layers)
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -463,10 +460,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
     def update_moe_gate_bias(self) -> None:
-        with torch.no_grad():
-            for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+        update_moe_gate_biases(self.model.layers)
 
     @torch.no_grad()
     def initialize_weights(
@@ -475,16 +469,8 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
             self.model.init_weights(buffer_device=buffer_device)
-            final_out_std = self.config.hidden_size**-0.5
-            cutoff_factor = 3
             if self.lm_head is not None:
-                nn.init.trunc_normal_(
-                    self.lm_head.weight,
-                    mean=0.0,
-                    std=final_out_std,
-                    a=-cutoff_factor * final_out_std,
-                    b=cutoff_factor * final_out_std,
-                )
+                init_lm_head_weight(self.lm_head.weight, self.config.hidden_size)
 
         cast_model_to_dtype(self, dtype)
         with buffer_device:
@@ -906,30 +892,17 @@ if _HF_MISTRAL3_AVAILABLE:
             return logits
 
         def update_moe_gate_bias(self) -> None:
-            with torch.no_grad():
-                for _, block in self.model.language_model.layers.named_children():
-                    if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                        block.mlp.gate.update_bias()
+            update_moe_gate_biases(self.model.language_model.layers)
 
         @torch.no_grad()
         def initialize_weights(
             self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
         ) -> None:
             buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-            text_config = self.config.text_config
-
             with buffer_device:
                 self.model.language_model.init_weights(buffer_device=buffer_device)
-                final_out_std = text_config.hidden_size**-0.5
-                cutoff_factor = 3
                 if self.lm_head is not None:
-                    nn.init.trunc_normal_(
-                        self.lm_head.weight,
-                        mean=0.0,
-                        std=final_out_std,
-                        a=-cutoff_factor * final_out_std,
-                        b=cutoff_factor * final_out_std,
-                    )
+                    init_lm_head_weight(self.lm_head.weight, self.config.text_config.hidden_size)
 
             cast_model_to_dtype(self, dtype)
 

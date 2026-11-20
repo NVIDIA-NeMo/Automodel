@@ -39,6 +39,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.moe_gate import update_moe_gate_biases
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -403,10 +404,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         return self.lm_head(self.model.norm(hidden)).float()
 
     def update_moe_gate_bias(self) -> None:
-        with torch.no_grad():
-            for block in self.model.layers.values():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+        update_moe_gate_biases(self.model.layers)
 
     @torch.no_grad()
     def initialize_weights(

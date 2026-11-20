@@ -1221,6 +1221,19 @@ def get_rope_config(config) -> tuple[float, dict, float]:
     return rope_theta, rope_parameters, partial_rotary_factor
 
 
+def init_lm_head_weight(weight: torch.Tensor, hidden_size: int) -> None:
+    """Sample an output-projection weight from N(0, hidden_size**-0.5) truncated at three standard deviations."""
+    final_out_std = hidden_size**-0.5
+    cutoff_factor = 3
+    nn.init.trunc_normal_(
+        weight,
+        mean=0.0,
+        std=final_out_std,
+        a=-cutoff_factor * final_out_std,
+        b=cutoff_factor * final_out_std,
+    )
+
+
 def cast_model_to_dtype(
     model: nn.Module,
     dtype: torch.dtype = torch.bfloat16,

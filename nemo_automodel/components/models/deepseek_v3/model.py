@@ -26,11 +26,17 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.moe_gate import update_moe_gate_biases
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits, initialize_lm_head, yield_fp32_model
+from nemo_automodel.components.models.common.utils import (
+    compute_lm_head_logits,
+    init_lm_head_weight,
+    initialize_lm_head,
+    yield_fp32_model,
+)
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -237,10 +243,7 @@ class DeepseekV3Model(nn.Module):
 
     def update_moe_gate_bias(self) -> None:
         """Update correction biases only for gates with adaptation enabled."""
-        with torch.no_grad():
-            for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+        update_moe_gate_biases(self.layers)
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -401,10 +404,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def update_moe_gate_bias(self) -> None:
         """Update correction biases only for gates with adaptation enabled."""
-        with torch.no_grad():
-            for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+        update_moe_gate_biases(self.model.layers)
 
     @torch.no_grad()
     def initialize_weights(
@@ -417,16 +417,8 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         with yield_fp32_model(self, dtype):
             with buffer_device:
                 self.model.init_weights(buffer_device=buffer_device)
-                final_out_std = self.config.hidden_size**-0.5
-                cutoff_factor = 3
                 if self.lm_head is not None:
-                    nn.init.trunc_normal_(
-                        self.lm_head.weight,
-                        mean=0.0,
-                        std=final_out_std,
-                        a=-cutoff_factor * final_out_std,
-                        b=cutoff_factor * final_out_std,
-                    )
+                    init_lm_head_weight(self.lm_head.weight, self.config.hidden_size)
 
         with buffer_device:
             rope_theta, rope_scaling, _ = get_rope_config(self.config)
