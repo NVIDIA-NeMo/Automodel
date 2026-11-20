@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import copy
 import gc
 
@@ -333,15 +334,24 @@ def test_bf16_fused_expert_master_is_stored_3d_and_updated_as_rows():
 def test_backward_leaves_no_cyclic_garbage():
     net, opt = _build()
     _backward(net)
-    gc.collect()
+    # Garbage left by earlier tests can take several collections to drain: a finalizer run by one
+    # collection may drop the last reference to another cycle (e.g. Dynamo tracing state of a
+    # torch.compile test on PyTorch 2.15). Measure only cycles this backward creates.
+    while gc.collect():
+        pass
     gc.disable()
+    # Keep what the collector finds so a failure names the leaked types.
+    gc.set_debug(gc.DEBUG_SAVEALL)
     try:
         for _ in range(3):
             _backward(net)
         unreachable = gc.collect()
+        leaked = collections.Counter(f"{type(obj).__module__}.{type(obj).__qualname__}" for obj in gc.garbage)
     finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
         gc.enable()
-    assert unreachable == 0
+    assert unreachable == 0, leaked.most_common(20)
 
 
 @pytest.mark.parametrize("placements", ["replicate", "two_shards"])

@@ -93,6 +93,8 @@ navigation:
                 path: ../../model-coverage/llm/baidu/ernie4-5.mdx
               - page: "ERNIE-4.5-21B-A3B-PT"
                 path: ../../model-coverage/llm/baidu/ernie-4-5-21b-a3b-pt.mdx
+              - page: "ERNIE-5.5-Flash-Base-BF16"
+                path: ../../model-coverage/llm/baidu/ernie-5-5-flash-base-bf16.mdx
           - section: "BigCode"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRogDAABXRUJQVlA4THsDAAAvE8AEEA0obNu2TUHKbiP6HxF1K+BX/QcKMCCTtgm751/o7gkx2rZt0hqqioqmJpKkaMLj/8EFCMC/BeKLUdH/AMDjUQI8/BIlFoh/f/SYr6rI2wPb3m4dgBzZtlVbmWvf7y64u7tbB4jIiKifERFqZH2xDkAD3B0yd3d7cs89e3/phNza2hTJeV911U7XLDMzWcwospTC5qEImBWEYpAvS/76YpbHXDX1y5Ek2bWV7D73oSxMuf/1YWk47TiSJCdKNG5hEj9eGltxQJ8chW3bIKXhJYvytw6lD63GJCABAIEJhxAmQgQAAID8RV5RrCGDihQYZ4hU+KcwMFGDCgTAOIUypAmSjW8BGWFMi9fec//9vcTfC7WDayZX6WJcIEESmPFOIGj3fPpTdcXRz39tP2PhtevYj//2X/8ngYmJFgQAICpIhIEbx7b+WNIbqVEd/6g1SH85/vCTH44CAMTEl8OAmFJPgs8/58Aui3vjn6doUaiy42T+4U++uq2ycBAACINSsa+DLc3rd0d8TxX1ywBX8lG0KCC1eOJjRo6uHActepgsUGAgoswNGFmp//FotcmhvFQAgkSrKysV7ur8Ea1uGi4MxuxEG8jVv3BUbYf7x28dtVgtxM0fb73lUftXWTQSpeJ85zvfVQYwZlOKkf9s/VaN+kDHrY/XtWfTmupdfHylpjXqwuO4+eSh8PKv1B5mt6ZUCUJliofx+Dh6tIWXVB/f/x05X958uff7nYWjl8fyVF+/0Ag0I8P5Mc8HTLgKohXuwVTHhefXr3Bs23xvxeoHz+tJfmZ01ffBWXR5dp0eJfz4UGebnGpFITCAUPQQnzIX7xAcqUH//PEHUHR4YMwf+e/0d/L4UVw8o10lFQwAZNGh6F+GEM1CCqEqQuOUwBhTmJt2sWh2yowAACSqwmA8uiceHl6yJ1Eu8CVGeaSQwrgG4mPqGFU+RABAKMzF/3xdvXpduhLvnh7OQ9Xx6hXfPrDlkMzU3s3lU9piPXlW7W04ACAwJKpEqihTbO2P1f8+ejP33U2rutXyMutVf///dS4hUfiyCgzYF6QgAAlTZOiJMaWzXqV/cjlaiKZmuONhxI+/VwvjBgYIWKA8IgkAASMLt6hEq5VEKKxEcoHRIsIFBIyIYHe4tGCD7HAPqKhGViJCEW5UjqhGFBAalYALEqKHywQA"/></svg>'
             slug: bigcode
