@@ -196,3 +196,5 @@ ci:
   cluster_tag: h100
   env_vars:
     NCCL_PXN_DISABLE: "1"
+  perf_testing:
+    schedule: nightly

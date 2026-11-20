@@ -129,3 +129,5 @@ ci:
   cluster_tag: gb200
   time: 02:00:00
   max_steps: 2
+  perf_testing:
+    schedule: weekly

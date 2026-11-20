@@ -139,3 +139,5 @@ ci:
   nodes: 64
   # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.
   time: "00:30:00"
+  perf_testing:
+    schedule: weekly

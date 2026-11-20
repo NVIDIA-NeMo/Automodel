@@ -163,3 +163,5 @@ ci:
     resume_tolerance_profile: relaxed
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+  perf_testing:
+    schedule: nightly
