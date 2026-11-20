@@ -37,7 +37,6 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -322,37 +321,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 scheduler.step(1)
 
         # Calculate throughput (tokens per second)
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
-
-        mfu = None
-        mfu_calculator = getattr(self, "mfu_calculator", None)
-        if batches and mfu_calculator is not None:
-            step_flops = 0.0
-            flops_supported = True
-            for batch in batches:
-                input_ids = batch.get("input_ids")
-                if input_ids is None:
-                    flops_supported = False
-                    break
-                batch_flops = mfu_calculator.get_flops(input_ids)
-                if batch_flops is None:
-                    flops_supported = False
-                    break
-                step_flops += float(batch_flops)
-
-            if flops_supported:
-                step_flops = self._dp_allreduce(
-                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
-                ).item()
-                mfu = calculate_mfu(
-                    step_flops / 1e12,
-                    self.dist_env.world_size,
-                    time_delta,
-                    reference_mfu=mfu_calculator.reference_mfu,
-                )
+        tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
 
         # Global summed loss over every micro-batch and DP rank, divided by the
         # same global label count as the gradient. Dividing by len(batches)
