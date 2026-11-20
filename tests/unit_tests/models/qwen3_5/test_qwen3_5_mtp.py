@@ -274,6 +274,17 @@ class TestQwen3_5MTPFlashAttentionPaddedMask:
         mtp_forward = model.mtp.forward
 
         def _capture(*args, **kwargs):
+            """Record the mask the MTP sublayer receives, then delegate to the real forward.
+
+            Args:
+                *args: Positional arguments forwarded unchanged; hidden states arrive as
+                    `[batch, sequence, hidden]`.
+                **kwargs: Keyword arguments forwarded unchanged; `attention_mask` is recorded and
+                    has shape `[batch, 1, sequence, sequence]`.
+
+            Returns:
+                The MTP output list, unchanged.
+            """
             captured["attention_mask"] = kwargs["attention_mask"]
             return mtp_forward(*args, **kwargs)
 

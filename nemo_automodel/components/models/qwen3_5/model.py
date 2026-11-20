@@ -263,7 +263,8 @@ def _mtp_sdpa_causal_mask(
     Args:
         config: Backbone text config; a shallow copy with ``_attn_implementation="sdpa"`` is used.
         inputs_embeds: Tensor of shape [batch, sequence, hidden].
-        attention_mask: Optional 0/1 padding mask of shape [batch, sequence].
+        attention_mask: Optional 0/1 padding mask `[batch, sequence]`, or an already prepared SDPA mask
+            `[batch, 1, sequence, sequence]`.
         past_key_values: Optional KV cache.
         position_ids: Optional text position ids of shape [batch, sequence].
 
