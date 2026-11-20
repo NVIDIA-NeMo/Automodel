@@ -130,6 +130,10 @@ def test_stage_metadata_preserves_fp32_coefficients_and_local_sequence() -> None
     assert outputs[1].dtype == torch.float32
     assert outputs[2].shape == (1, 4096, 5) and outputs[2].dtype == torch.long
     assert logits[0].dtype == torch.float32
+    # The last stage declares the logits dtype its head returns.
+    last.lm_head.logits_dtype = torch.bfloat16
+    _, logits = last.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=4096, dtype=torch.bfloat16)
+    assert logits[0].dtype == torch.bfloat16
     last._pp_return_hidden_states = True
     _, hidden = last.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=4096, dtype=torch.bfloat16)
     assert hidden[0].shape == (1, 4096, 16)
