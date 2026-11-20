@@ -361,17 +361,21 @@ def test_uneven_engram_owner_rows_and_misaligned_dense_shards(tmp_path: Path) ->
     mp.spawn(_owner_checkpoint_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
 
 
-def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size: int = 1) -> None:
+def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size: int = 1, pp_size: int = 1) -> None:
     """Read a real quantized HF dump through DCP, then round-trip SafeTensors."""
-    world_size = 2 * expert_shard_size
+    owners = 2 * expert_shard_size
+    world_size = owners * pp_size
+    owner_rank, pp_rank = rank % owners, rank // owners
     dim = 32 * expert_shard_size
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
     try:
-        mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("fsdp",))
+        mesh = init_device_mesh("cpu", (pp_size, owners), mesh_dim_names=("pp", "fsdp"))["fsdp"]
         expert_mesh = (
-            init_device_mesh("cpu", (expert_shard_size, 2), mesh_dim_names=("ep_shard", "ep"))
+            init_device_mesh("cpu", (pp_size, expert_shard_size, 2), mesh_dim_names=("pp", "ep_shard", "ep"))[
+                ("ep_shard", "ep")
+            ]
             if expert_shard_size > 1
-            else init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
+            else init_device_mesh("cpu", (pp_size, 2), mesh_dim_names=("pp", "ep"))["ep"]
         )
         adapter = _adapter(17, second_engram_rows=19, dtype=torch.bfloat16, experts="torch_mm", dim=dim)
         # Match the released checkpoint metadata used to select quantized DCP load targets.
@@ -390,7 +394,7 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
             source[f"layers.{layer}.engram.embed.weight"] = raw
             source[f"layers.{layer}.engram.embed.scale"] = scales
             logical = (raw.float() * scales.float().repeat_interleave(32, dim=1)).bfloat16()
-            padded_rows = (rows + world_size - 1) // world_size * world_size
+            padded_rows = (rows + owners - 1) // owners * owners
             expected[f"model.layers.{layer}.engram.embed.weight"] = torch.nn.functional.pad(
                 logical, (0, 0, 0, padded_rows - rows)
             )
@@ -457,15 +461,19 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
         local_expected = {}
         tensors = {}
         for key, value in expected.items():
+            # PP stages retain disjoint language layers, while both tables use
+            # their own stage-local row-owner mesh rather than WORLD.
+            if pp_size > 1 and (".layers.14." in key) != (pp_rank == 1):
+                continue
             expert = ".ffn.experts." in key
             if expert:
-                local = value[rank % 2 : rank % 2 + 1]
+                local = value[owner_rank % 2 : owner_rank % 2 + 1]
                 if expert_shard_size > 1:
-                    local = local[:, (rank // 2) * 32 : (rank // 2 + 1) * 32]
+                    local = local[:, (owner_rank // 2) * 32 : (owner_rank // 2 + 1) * 32]
                 placements = (Shard(1), Shard(0)) if expert_shard_size > 1 else (Shard(0),)
             else:
-                local_rows = (value.shape[0] + world_size - 1) // world_size
-                local = value[rank * local_rows : (rank + 1) * local_rows]
+                local_rows = (value.shape[0] + owners - 1) // owners
+                local = value[owner_rank * local_rows : (owner_rank + 1) * local_rows]
                 placements = (Shard(0),)
             local_expected[key] = local
             tensors[key] = DTensor.from_local(
@@ -486,9 +494,9 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
                 model_repo_id="test/deepseek-v41",
                 dequantize_base_checkpoint=True,
             ),
-            dp_rank=rank,
+            dp_rank=owner_rank,
             tp_rank=0,
-            pp_rank=0,
+            pp_rank=pp_rank,
             process_group=dist.group.WORLD,
             moe_mesh=expert_mesh,
         )
@@ -557,3 +565,13 @@ def test_generic_checkpoint_keys_and_optional_tower_weights_are_preserved() -> N
     assert adapter.forced_hf_dtype_mapping(native) == {
         key: "float32" for key, value in source.items() if value.dtype == torch.float32
     }
+
+
+def test_quantized_hf_load_and_resume_with_pipeline_owner_groups(tmp_path: Path) -> None:
+    """Four CPU ranks: PP2, two table owners per stage, and disjoint HF keys."""
+    mp.spawn(
+        _quantized_checkpointer_worker,
+        args=(str(tmp_path / "pipeline_rendezvous"), 1, 2),
+        nprocs=4,
+        join=True,
+    )
