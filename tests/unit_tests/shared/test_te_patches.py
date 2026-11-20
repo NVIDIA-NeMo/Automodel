@@ -25,9 +25,9 @@ import torch
 import nemo_automodel.shared.te_patches as te_patches_module
 from nemo_automodel.shared.te_patches import (
     _apply_fused_adam_cached_lists_patch,
-    _apply_fused_adam_empty_shard_patch,
     _apply_fused_adam_in_place_load_patch,
     _apply_fused_adam_quantized_tensor_patch,
+    apply_fused_adam_empty_shard_patch,
     apply_te_patches,
 )
 
@@ -89,7 +89,7 @@ class TestApplyTePatchesIdempotent:
 
     @patch.object(te_patches_module, "_apply_fused_adam_cached_lists_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
-    @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
+    @patch.object(te_patches_module, "apply_fused_adam_empty_shard_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_in_place_load_patch")
     def test_apply_te_patches_calls_fused_adam_patch(
         self, mock_load_patch, mock_empty_patch, mock_patch_fn, mock_cached_patch
@@ -102,7 +102,7 @@ class TestApplyTePatchesIdempotent:
 
     @patch.object(te_patches_module, "_apply_fused_adam_cached_lists_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
-    @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
+    @patch.object(te_patches_module, "apply_fused_adam_empty_shard_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_in_place_load_patch")
     def test_apply_te_patches_idempotent(self, mock_load_patch, mock_empty_patch, mock_patch_fn, mock_cached_patch):
         apply_te_patches()
@@ -114,7 +114,7 @@ class TestApplyTePatchesIdempotent:
 
     @patch.object(te_patches_module, "_apply_fused_adam_cached_lists_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
-    @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
+    @patch.object(te_patches_module, "apply_fused_adam_empty_shard_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_in_place_load_patch")
     def test_apply_te_patches_sets_flag(self, mock_load_patch, mock_empty_patch, mock_patch_fn, mock_cached_patch):
         assert not te_patches_module._TE_PATCHES_APPLIED
@@ -130,8 +130,8 @@ class TestFusedAdamEmptyShardPatch:
         fused_adam.multi_tensor_applier = original
         modules["transformer_engine.pytorch.optimizers"].fused_adam = fused_adam
         with patch.dict("sys.modules", modules):
-            _apply_fused_adam_empty_shard_patch()
-            _apply_fused_adam_empty_shard_patch()
+            apply_fused_adam_empty_shard_patch()
+            apply_fused_adam_empty_shard_patch()
         return fused_adam.multi_tensor_applier, original
 
     def test_filters_last_empty_slot_across_all_five_lists(self):

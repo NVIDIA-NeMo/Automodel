@@ -118,13 +118,17 @@ def _apply_fused_adam_quantized_tensor_patch() -> None:
     _logger.info("Applied FusedAdam QuantizedTensor monkey-patch.")
 
 
-def _apply_fused_adam_empty_shard_patch() -> None:
+def apply_fused_adam_empty_shard_patch() -> None:
     """Keep zero-element FSDP shards out of TE's native multi-tensor kernel.
 
     TE's multi_tensor_apply metadata writer can overrun its final slot when a
     zero-element tensor occupies that slot (TE issue #3202).  Filter complete
     parameter/state columns at the Python/native boundary so state_dict keys,
     parameter groups, and the update for every nonempty shard stay intact.
+
+    Idempotent.  The optimizer configs call this before they construct TE
+    FusedAdam, which keeps parameters with an empty local shard in its
+    parameter list.
     """
     from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
@@ -551,7 +555,7 @@ def apply_te_patches() -> None:
         return
 
     _apply_fused_adam_quantized_tensor_patch()
-    _apply_fused_adam_empty_shard_patch()
+    apply_fused_adam_empty_shard_patch()
     _apply_fused_adam_in_place_load_patch()
     _apply_fused_adam_cached_lists_patch()
 
