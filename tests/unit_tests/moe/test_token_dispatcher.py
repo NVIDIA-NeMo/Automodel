@@ -421,6 +421,7 @@ def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkey
         ("moe_hybridep_capacity_factor", 1.5),
         ("moe_hybridep_equal_token_counts", True),
         ("moe_hybridep_recompute_cache", "combine"),
+        ("moe_router_expert_pad_multiple", 128),
     ],
 )
 def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, setting, value):
@@ -460,6 +461,29 @@ def test_flex_dispatcher_forwards_max_tokens_per_rank_for_both_sharing_modes(mon
         assert dispatcher._comm_manager is MoEFlexTokenDispatcher.shared_hybridep_manager
     else:
         assert MoEFlexTokenDispatcher.shared_hybridep_manager is None
+
+
+@pytest.mark.parametrize("share_token_dispatcher", [True, False])
+def test_flex_dispatcher_forwards_expert_pad_multiple_for_both_sharing_modes(monkeypatch, share_token_dispatcher):
+    """HybridEP pads every expert segment by the configured multiple, shared dispatcher or not."""
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", Mock())
+    config = TokenDispatcherConfig(
+        moe_flex_dispatcher_backend="hybridep",
+        num_moe_experts=8,
+        moe_share_token_dispatcher=share_token_dispatcher,
+        moe_router_expert_pad_multiple=128,
+    )
+    group = Mock()
+    group.size.return_value = 4
+
+    dispatcher = MoEFlexTokenDispatcher(2, [0, 1], config, group)
+
+    assert dispatcher._comm_manager.pad_multiple == 128
+    with pytest.raises(ValueError, match="must be positive"):
+        _HybridEPManager(
+            group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_router_expert_pad_multiple=0
+        )
 
 
 class TestIndicesToMultihot:
