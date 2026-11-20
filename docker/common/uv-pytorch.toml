@@ -1,17 +1,17 @@
 override-dependencies = [
     # Override Trackio's Pillow<13 cap to enforce the security update.
     "pillow==13.0.0",
-    # ffpa-attn (<=0.2.5) pins nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4. 4.6.2 lacks sm_107
-    # (VR200), where PyTorch 2.15's CuTe-DSL RMSNorm override then fails; move the stack to 4.8.0.
+    # ffpa-attn (<=0.2.5) and quack-kernels 0.6.4 pin nvidia-cutlass-dsl==4.6.2, which has no sm_107
+    # (VR200) target: PyTorch 2.15's CuTe-DSL RMSNorm override and flash_attn.cute fail there with
+    # KeyError: 'sm_107a'. 4.8.0 is the 26.11 base's version and the first with sm_107.
     "nvidia-cutlass-dsl[cu13]==4.8.0; sys_platform == 'linux'",
-    "quack-kernels==0.6.5; sys_platform == 'linux'",
     # The 26.11 base registers platformdirs.pytest_plugin; an older venv copy
     # shadows its module while pytest still discovers the system entry point.
     # Update this pin with the base image; remove once the regular lock is aligned.
     "platformdirs==4.14.5",
     # TE 2.21.0 requires >=1.29, newer than the regular lock's version. The 26.11
-    # base ships 1.32.0, but 1.32 requires nvidia-cutlass-dsl>=4.8 while FA4,
-    # quack-kernels and ffpa pin 4.6.2; move to the base's version with that pin.
+    # base ships 1.32.0, which requires nvidia-cutlass-dsl>=4.8; 1.30.0 accepts the
+    # 4.8.0 pin above (>=4.6.2). Moving to the base's version is a separate change.
     "nvidia-cudnn-frontend==1.30.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; retain the security floor
     "anyio>=4.14.2",
