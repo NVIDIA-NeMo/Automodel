@@ -52,9 +52,9 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.dense_causal_lm import dense_causal_lm_forward
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -657,72 +657,25 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
             Causal LM output with logits ``[B, S, V]``. Packed THD logits are
             restored to ``[1, T, V]`` for the shared loss contract.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        is_thd = kwargs.get("qkv_format") == "thd"
-        if is_thd:
-            if position_ids is None:
-                raise ValueError("Packed THD input requires position_ids.")
-            kwargs.pop("padding_mask", None)
-            if input_ids is not None and input_ids.ndim > 1:
-                input_ids = input_ids.squeeze(0)
-            if position_ids.ndim > 1:
-                position_ids = position_ids.squeeze(0)
-            for key, value in kwargs.items():
-                if not isinstance(value, torch.Tensor):
-                    continue
-                if key == "max_seqlen":
-                    kwargs[key] = value.item()
-                    continue
-                if value.ndim > 1:
-                    value = value.squeeze(0)
-                if key in ("cu_seqlens", "cu_seqlens_padded"):
-                    value = value[value != -1000].contiguous()
-                kwargs[key] = value
-            if inputs_embeds is not None and inputs_embeds.ndim > 2:
-                inputs_embeds = inputs_embeds.squeeze(0)
-            if labels is not None and labels.ndim > 1:
-                labels = labels.squeeze(0)
-            attention_mask = None
-
-        # Always use return_dict internally so we can reliably access fields.
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
+        return dense_causal_lm_forward(
+            self.model,
+            self.lm_head,
+            self.loss_function,
+            self.config,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            inputs_embeds,
+            labels,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+            cache_position,
+            logits_to_keep,
             **kwargs,
         )
-
-        hidden_states = outputs.last_hidden_state
-
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd).logits
-
-        loss = None
-        if labels is not None:
-            if is_thd and labels.ndim == 1:
-                labels = labels.unsqueeze(0)
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
-        out = CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-        )
-        if return_dict:
-            return out
-        return out.to_tuple()
 
 
 ModelClass = LlamaForCausalLM
