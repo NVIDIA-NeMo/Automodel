@@ -43,8 +43,13 @@ CPU parity harness in the unit tests).
 Native interleaved 1F1B uses a separate, instance-local implementation in
 :func:`install_interleaved_recv_pool`. Its pools are colored from the actual lowered schedule. Copies give each
 microbatch independent input and gradient storage before receive-slot reuse.
+
+PyTorch 2.15 (NGC 26.11, pytorch/pytorch#196463) allocates each receive buffer just
+before its receive and hands it to the stage computation, so no per-microbatch buffer
+sets exist to pool. Both installers keep the stock buffers there.
 """
 
+import importlib.util
 import logging
 from collections import deque
 from types import MethodType
@@ -92,6 +97,17 @@ def _ring_size(stage, num_microbatches: int, slack: int) -> int:
     return max(2, min(num_microbatches, inflight + slack))
 
 
+def _native_recv_buffers_are_just_in_time() -> bool:
+    """Return whether PyTorch allocates each pipeline receive buffer just before its receive.
+
+    PyTorch 2.15 (pytorch/pytorch#196463) moved receive-buffer ownership into
+    ``torch.distributed.pipelining._recv_buffers``: a buffer is allocated right before its
+    P2P receive and released to the stage computation, so it lives no longer than pooling
+    would allow.
+    """
+    return importlib.util.find_spec("torch.distributed.pipelining._recv_buffers") is not None
+
+
 def install_recv_buffer_pool(slack: int = 2) -> bool:
     """Monkeypatch pipeline-stage recv-buffer setup with ring pooling.
 
@@ -104,8 +120,9 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
             transient recv-ahead (default 2).
 
     Returns:
-        True if installed (or already installed), False if the torch
-        internals do not match any known layout (stock behavior is kept).
+        True if installed (or already installed), False if PyTorch already
+        allocates receive buffers just in time or the torch internals do not
+        match any known layout (stock behavior is kept).
 
     Raises:
         ValueError: if ``slack`` is negative (a ring smaller than the 1F1B
@@ -116,6 +133,10 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         raise ValueError(f"recv_buffer_pool: slack must be >= 0, got {slack}")
     if _INSTALLED:
         return True
+    if _native_recv_buffers_are_just_in_time():
+        if _is_rank_zero():
+            logger.info("recv_buffer_pool: PyTorch allocates receive buffers just in time; keeping stock buffers")
+        return False
 
     try:
         from torch.distributed.pipelining import stage as stage_mod
@@ -357,6 +378,10 @@ def install_interleaved_recv_pool(schedule: ScheduleInterleaved1F1B, slack: int 
         raise RuntimeError("Interleaved recv pooling cannot share the process-wide ordinary 1F1B pool")
     if type(schedule) is not ScheduleInterleaved1F1B:
         raise ValueError("Recv pooling requires the native interleaved 1F1B schedule")
+    if _native_recv_buffers_are_just_in_time():
+        # The copies below would only add memory on top of just-in-time receive buffers.
+        logger.info("interleaved recv pool: PyTorch allocates receive buffers just in time; keeping stock buffers")
+        return
     # PyTorch's older prepare-infra layout does not expose the per-direction
     # allocation seam used here. Keep native buffers on that third-party API.
     if not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")):

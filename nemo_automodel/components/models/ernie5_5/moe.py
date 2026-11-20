@@ -244,7 +244,12 @@ def _routed_situ(x: torch.Tensor, weights: torch.Tensor, *, beta: float, linear_
 
 
 class Ernie5_5SharedExpert(MLP):
-    """Preserve ERNIE shared-expert arithmetic at a callable FSDP boundary."""
+    """Preserve ERNIE shared-expert arithmetic at a callable FSDP boundary.
+
+    The module has the gate, up and down projections of the shared ``MLP`` and computes SiTU between them. Its
+    ``activation`` attribute is ``"situ"``: code that selects a kernel from that attribute, such as the fused LoRA
+    MLP path, finds no SwiGLU module here and leaves ``forward`` in place.
+    """
 
     def __init__(self, old: MLP, *, beta: float, linear_beta: float | None) -> None:
         """Wrap an existing shared-expert MLP.
@@ -272,6 +277,10 @@ class Ernie5_5SharedExpert(MLP):
             )
         self.gate_proj, self.up_proj, self.down_proj = old.gate_proj, old.up_proj, old.down_proj
         self.beta, self.linear_beta = beta, linear_beta
+        # The base class builds the gated layout for "swiglu" and records that name. This forward computes SiTU,
+        # so the recorded name is corrected: the fused LoRA MLP path replaces the forward of a module that
+        # reports "swiglu" with a SwiGLU kernel.
+        self.activation = "situ"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run SiTU and the output projection inside the FSDP-wrapped module.

@@ -38,9 +38,10 @@
 # over two domains has not been run.
 #
 # Not supported: tensor, context and pipeline parallelism, activation checkpointing, packed
-# sequences and padded batches. LoRA has not been validated. The multi-token prediction (MTP)
-# block of the released checkpoint is not loaded or trained. The parameters of the DSA indexers
-# are frozen. The router correction bias is a fixed buffer, not a parameter.
+# sequences and padded batches. The multi-token prediction (MTP) block of the released
+# checkpoint is not loaded or trained. The parameters of the DSA indexers are frozen. The
+# router correction bias is a fixed buffer, not a parameter. For LoRA on 2 nodes see
+# ernie5_5_flash_squad_ep_lora.yaml.
 # Checkpoint saving is disabled in this recipe because of its size: one checkpoint of the full
 # model and optimizer is about 3.1 TiB (523 GiB of weights, 2.5 TiB of optimizer state).
 #
