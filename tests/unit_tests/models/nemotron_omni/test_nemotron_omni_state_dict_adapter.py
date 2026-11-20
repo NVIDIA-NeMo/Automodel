@@ -796,12 +796,10 @@ def test_production_save_and_hf_peft_reload(tmp_path):
             layer = nn.Module()
             layer.mixer = nn.Module()
             layer.mixer.in_proj = nn.Linear(16, 16)
-            layer.mixer.experts = nn.ModuleList(
-                [
-                    nn.Module(),
-                    nn.Module(),
-                ]
-            )
+            layer.mixer.experts = nn.ModuleList([
+                nn.Module(),
+                nn.Module(),
+            ])
             layer.mixer.experts[0].gate_proj = nn.Linear(16, 8)
             layer.mixer.experts[0].up_proj = nn.Linear(16, 8)
             layer.mixer.experts[0].down_proj = nn.Linear(8, 16)
