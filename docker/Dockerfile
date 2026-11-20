@@ -294,7 +294,7 @@ COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=true
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
-        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
+        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.8.0" && \
         FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
         VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
