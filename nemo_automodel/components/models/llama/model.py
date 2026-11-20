@@ -410,12 +410,12 @@ class LlamaModel(LlamaPreTrainedModel):
         """Run the Llama decoder in padded BSHD or packed THD layout.
 
         Args:
-            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[T]``.
+            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[1, T]`` (or ``[T]``).
             attention_mask: Optional padded mask ``[B, S]`` or broadcastable
                 causal mask. THD ignores this mask and uses ``cu_seqlens``.
-            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
+            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[1, T]`` (or ``[T]``).
             past_key_values: Optional BSHD generation cache; unsupported for THD.
-            inputs_embeds: Alternative hidden inputs ``[B, S, H]`` or ``[T, H]``.
+            inputs_embeds: Alternative hidden inputs ``[B, S, H]`` or packed ``[1, T, H]`` (or ``[T, H]``).
             use_cache: Whether to update the BSHD KV cache.
             output_attentions: Whether to request attention outputs.
             output_hidden_states: Whether to retain per-layer hidden states.
@@ -436,6 +436,30 @@ class LlamaModel(LlamaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd:  # TE's packed kernels take [tokens, ...]
+            if position_ids is None:
+                raise ValueError("Packed THD input requires position_ids.")
+            kwargs.pop("padding_mask", None)
+            if input_ids is not None and input_ids.ndim > 1:
+                input_ids = input_ids.squeeze(0)
+            if position_ids.ndim > 1:
+                position_ids = position_ids.squeeze(0)
+            for key, value in kwargs.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if key == "max_seqlen":
+                    kwargs[key] = value.item()
+                    continue
+                if value.ndim > 1:
+                    value = value.squeeze(0)
+                if key in ("cu_seqlens", "cu_seqlens_padded"):
+                    value = value[value != -1000].contiguous()
+                kwargs[key] = value
+            if inputs_embeds is not None and inputs_embeds.ndim > 2:
+                inputs_embeds = inputs_embeds.squeeze(0)
+            attention_mask = None
+
         # Validate inputs
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -444,7 +468,6 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        is_thd = kwargs.get("qkv_format") == "thd"
         if is_thd and inputs_embeds.ndim != 2:
             raise ValueError(f"THD model input must be [T, H], got {tuple(inputs_embeds.shape)}.")
         if is_thd:
@@ -512,6 +535,8 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
 
         if not return_dict:
             return tuple(
@@ -666,32 +691,6 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        is_thd = kwargs.get("qkv_format") == "thd"
-        if is_thd:
-            if position_ids is None:
-                raise ValueError("Packed THD input requires position_ids.")
-            kwargs.pop("padding_mask", None)
-            if input_ids is not None and input_ids.ndim > 1:
-                input_ids = input_ids.squeeze(0)
-            if position_ids.ndim > 1:
-                position_ids = position_ids.squeeze(0)
-            for key, value in kwargs.items():
-                if not isinstance(value, torch.Tensor):
-                    continue
-                if key == "max_seqlen":
-                    kwargs[key] = value.item()
-                    continue
-                if value.ndim > 1:
-                    value = value.squeeze(0)
-                if key in ("cu_seqlens", "cu_seqlens_padded"):
-                    value = value[value != -1000].contiguous()
-                kwargs[key] = value
-            if inputs_embeds is not None and inputs_embeds.ndim > 2:
-                inputs_embeds = inputs_embeds.squeeze(0)
-            if labels is not None and labels.ndim > 1:
-                labels = labels.squeeze(0)
-            attention_mask = None
-
         # Always use return_dict internally so we can reliably access fields.
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -708,16 +707,12 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         )
 
         hidden_states = outputs.last_hidden_state
-        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden_states = hidden_states.unsqueeze(0)
         logits = (
             hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
 
         loss = None
         if labels is not None:
-            if is_thd and labels.ndim == 1:
-                labels = labels.unsqueeze(0)
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         out = CausalLMOutputWithPast(

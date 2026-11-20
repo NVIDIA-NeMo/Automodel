@@ -200,8 +200,9 @@ class MuseSparkTextModel(nn.Module):
             **kwargs: Attention backend metadata, including packed sequence boundaries.
 
         Returns:
-            Decoder output with last_hidden_state [batch, sequence, hidden] or
-            [tokens, hidden], and optionally a tuple of residuals in the same layout.
+            Decoder output with last_hidden_state [batch, sequence, hidden], or
+            [1, tokens, hidden] for packed input, and optionally a tuple of residuals
+            in the layout the layers saw.
         """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -266,6 +267,8 @@ class MuseSparkTextModel(nn.Module):
             hidden_states = stream
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=None,
@@ -1015,13 +1018,8 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         )
         hidden_states = outputs.last_hidden_state
         if return_pipeline_hidden_states:
-            loss_hidden_states = hidden_states * self.config.output_multiplier
-            if is_thd and loss_hidden_states.ndim == 2:
-                loss_hidden_states = loss_hidden_states.unsqueeze(0)
-            return loss_hidden_states
+            return hidden_states * self.config.output_multiplier
 
-        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden_states = hidden_states.unsqueeze(0)
         if self.lm_head is None:
             # No output scaling or soft cap may touch the residual stream
             # passed between non-final PP stages.

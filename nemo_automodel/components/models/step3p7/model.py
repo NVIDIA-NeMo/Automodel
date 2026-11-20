@@ -701,8 +701,6 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         logits = (
             hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
-        if logits.dim() == 2:  # packed (THD) [tokens, vocab] -> [1, tokens, vocab]
-            logits = logits.unsqueeze(0)
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)
@@ -720,7 +718,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 cp_size=kwargs.get("cp_size", 1),
             )
             mtp_kwargs = {
-                "hidden_states": hidden_states,
+                # The MTP blocks embed the packed [tokens] ids, so they take packed [tokens, hidden] states.
+                "hidden_states": hidden_states.squeeze(0) if kwargs.get("qkv_format") == "thd" else hidden_states,
                 "freqs_cis": freqs_cis,
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,

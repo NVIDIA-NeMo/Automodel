@@ -169,17 +169,25 @@ class BeamModel(nn.Module):
         """Run this pipeline stage with one shared FP32 RoPE-table pair per layer type.
 
         Args:
-            input_ids: Integer tensor [batch, sequence] or packed [tokens]; later PP stages
+            input_ids: Integer tensor [batch, sequence] or packed [1, tokens], squeezed to [tokens] for the
+                layers; later PP stages
                 receive floating hidden states with an extra final hidden axis. Positions are local under CP.
-            position_ids: Optional integer tensor [batch, sequence] or [tokens], absolute within each document.
+            position_ids: Optional integer tensor [batch, sequence] or packed [1, tokens], absolute within each
+                document.
             attention_mask: Optional [batch, sequence] bool/0-1 mask; True/1 means valid. None on flex.
             padding_mask: Optional bool tensor matching the position axes; True skips routing.
             **attn_kwargs: Backend metadata: qkv_format (bshd/thd), integer cu_seqlens and
                 cu_seqlens_padded [documents + 1], scalar max_seqlen, cp_size and cp_rank.
 
         Returns:
-            Hidden states [batch, sequence, hidden] or [tokens, hidden], local under CP,
+            Hidden states [batch, sequence, hidden], or [1, tokens, hidden] for packed input, local under CP,
             in the final layer/norm dtype."""
+        if attn_kwargs.get("qkv_format") == "thd":  # TE's packed kernels take [tokens, ...]
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if position_ids is None:
             # ``input_ids`` is [B, S] (or [T] packed); on later pipeline stages it carries the hidden states
             # [B, S, H] instead, so the sequence length is the second dimension, never the last.
@@ -218,7 +226,8 @@ class BeamModel(nn.Module):
                 padding_mask=padding_mask,
                 **attn_kwargs,
             )
-        return self.norm(h) if self.norm else h
+        h = self.norm(h) if self.norm else h
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -351,12 +360,6 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
-        is_thd = attn_kwargs.get("qkv_format") == "thd"
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
         if getattr(self, "_cp_enabled", False):
             # Set by the CP parallelizer (moe.parallelizer.apply_cp). The sequence is sharded per rank while a
             # padded batch mask would span the full sequence, and TE rejects padding masks under CP; causal
@@ -369,8 +372,6 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden = hidden.unsqueeze(0)
         logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         # Final-logit soft cap, as in HF: cap * tanh(logits / cap), computed in fp32. Only the stage
         # that owns the head has logits (on other PP stages ``lm_head`` is None and the hidden

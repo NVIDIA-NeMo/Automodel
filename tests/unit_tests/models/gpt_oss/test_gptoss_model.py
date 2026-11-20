@@ -849,26 +849,33 @@ def test_fa4_thd_capability_is_model_owned_and_does_not_enable_parallelism(backe
 
 
 @pytest.mark.cpu_only
-def test_fa4_thd_outer_normalizes_implicit_layout() -> None:
-    """Offsets plus singleton token IDs select THD before the inner decoder sees them."""
+def test_fa4_thd_decoder_normalizes_implicit_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offsets plus singleton token IDs select THD: layers see [tokens] inputs, the output stays batched."""
     from types import SimpleNamespace
+    from unittest.mock import Mock
 
-    model = GptOssForCausalLM.__new__(GptOssForCausalLM)
-    torch.nn.Module.__init__(model)
-    model.backend = SimpleNamespace(attn="fa4")
-    model.config = SimpleNamespace(output_hidden_states=False)
-    model.model = torch.nn.Identity()
-    # Capture at the child boundary; this check exercises the actual outer forward.
-    with patch.object(model.model, "forward", return_value=torch.zeros(2, 4)) as capture:
-        model.lm_head = torch.nn.Identity()
-        model(
-            torch.zeros(1, 2, dtype=torch.long),
-            position_ids=torch.arange(2)[None],
-            padding_mask=torch.zeros(1, 2, dtype=torch.bool),
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
-        )
+    import nemo_automodel.components.models.gpt_oss.model as model_module
+
+    inner = GptOssModel.__new__(GptOssModel)
+    torch.nn.Module.__init__(inner)
+    inner.backend = SimpleNamespace(attn="fa4", rope_fusion=False)
+    inner.rotary_emb = None
+    inner.embed_tokens = torch.nn.Embedding(2, 4)
+    inner.norm = torch.nn.Identity()
+    inner.layers = torch.nn.ModuleDict({"0": torch.nn.Identity()})
+    capture = Mock(side_effect=lambda hidden, **kwargs: hidden)
+    monkeypatch.setattr(inner.layers["0"], "forward", capture)
+    monkeypatch.setattr(model_module, "position_ids_to_freqs_cis", lambda *args, **kwargs: torch.ones(2, 4))
+    out = inner(
+        torch.zeros(1, 2, dtype=torch.long),
+        position_ids=torch.arange(2)[None],
+        padding_mask=torch.zeros(1, 2, dtype=torch.bool),
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    assert capture.call_args.args[0].shape == (2, 4)
     assert capture.call_args.kwargs["qkv_format"] == "thd"
     assert capture.call_args.kwargs["padding_mask"].shape == (2,)
+    assert out.shape == (1, 2, 4)
 
 
 @pytest.mark.cpu_only
@@ -900,7 +907,7 @@ def test_fa4_thd_inner_prepares_once_and_rejects_short_mask(monkeypatch: pytest.
     assert prepare.call_count == 1
     first, second = [capture.call_args.kwargs for capture in captures]
     assert first["_fa4_cu_seqlens"] is second["_fa4_cu_seqlens"]
-    assert first["padding_mask"] is padding
+    assert torch.equal(first["padding_mask"], padding)
     with pytest.raises(ValueError, match="padding_mask length"):
         inner(torch.zeros(3, dtype=torch.long), position_ids=torch.arange(3), **kwargs)
 

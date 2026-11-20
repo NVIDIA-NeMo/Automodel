@@ -198,8 +198,9 @@ class Qwen3MoeModel(nn.Module):
 
         Args:
             input_ids: Token IDs of shape [batch, sequence] or physical THD token IDs
-                of shape [tokens]. Pipeline stages after the first receive hidden states
-                of shape [batch, sequence, hidden] or [tokens, hidden] in this slot.
+                of shape [1, tokens], squeezed to [tokens] for the layers. Pipeline stages
+                after the first receive hidden states of shape [batch, sequence, hidden] or
+                [1, tokens, hidden] in this slot.
             position_ids: Optional positions with the token layout of input_ids.
             attention_mask: Optional [batch, sequence] padding mask or packed document
                 IDs, or a [batch, 1, sequence, sequence] dense mask. None for THD.
@@ -212,8 +213,14 @@ class Qwen3MoeModel(nn.Module):
                 Inputs are not mutated.
 
         Returns:
-            Hidden states of shape [batch, sequence, hidden] or [tokens, hidden].
+            Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for THD input.
         """
+        if attn_kwargs.get("qkv_format") == "thd":  # TE's packed kernels take [tokens, ...]
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if self.backend.attn == "fa4" and attn_kwargs.get("qkv_format") == "thd":
             prepared = prepare_packed_metadata(self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask})
             if prepared is not None:
@@ -245,7 +252,7 @@ class Qwen3MoeModel(nn.Module):
             )
 
         h = self.norm(h) if self.norm else h
-        return h
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -419,11 +426,6 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             and bool(padding_mask.any())
         ):
             attention_mask = padding_mask.logical_not()
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
 
         hidden = self.model(
             input_ids,
@@ -433,8 +435,6 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden = hidden.unsqueeze(0)
         logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 

@@ -764,7 +764,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
-            hidden].
+            hidden]; packed [tokens, hidden] input from the multimodal wrapper
+            comes back as [1, tokens, hidden].
         """
         for key in ("cu_seqlens", "max_seqlen"):
             if f"_text_{key}" in attn_kwargs:
@@ -849,6 +850,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
 
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return Qwen3_5MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=None,
@@ -1828,16 +1831,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         hidden_states = outputs.last_hidden_state
-        # Packed (THD) [tokens, hidden] -> [1, tokens, hidden] for the output; MTP keeps the packed states.
-        batched_hidden = hidden_states.unsqueeze(0) if hidden_states.dim() == 2 else hidden_states
         logits = (
-            batched_hidden
-            if self.lm_head is None
-            else self.lm_head(slice_logits_to_keep(batched_hidden, logits_to_keep))
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
+            # The MTP blocks embed the packed [tokens] ids, so they take packed [tokens, hidden] states.
+            mtp_hidden = hidden_states.squeeze(0) if kwargs.get("qkv_format") == "thd" else hidden_states
             language_model = self.model.language_model
             source_embeds = inputs_embeds if inputs_embeds is not None else language_model.embed_tokens(input_ids)
             mtp_position_ids = _split_qwen3_5_moe_position_ids(
@@ -1861,7 +1862,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             }
             if mtp_embed_inputs is not None:
                 mtp_per_depth_h = self.mtp(
-                    hidden_states,
+                    mtp_hidden,
                     embed_inputs=mtp_embed_inputs,
                     position_ids_per_depth=mtp_per_depth_position_ids,
                     attention_mask=attention_mask,
@@ -1873,7 +1874,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 raise ValueError("Context-parallel Qwen3.5-MoE MTP requires globally prepared per-depth inputs")
             elif input_ids is None:
                 mtp_per_depth_h = self.mtp(
-                    hidden_states,
+                    mtp_hidden,
                     embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
                     position_ids=mtp_position_ids,
                     attention_mask=attention_mask,
@@ -1883,7 +1884,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 )
             else:
                 mtp_per_depth_h = self.mtp(
-                    hidden_states,
+                    mtp_hidden,
                     input_ids=input_ids,
                     embed_fn=language_model.embed_tokens,
                     position_ids=mtp_position_ids,
@@ -1894,12 +1895,12 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 )
             return Qwen3_5MoeCausalLMOutputWithPast(
                 logits=logits,
-                hidden_states=batched_hidden if output_hidden_states else None,
+                hidden_states=hidden_states if output_hidden_states else None,
                 mtp_per_depth_h=mtp_per_depth_h,
                 mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
             )
 
-        return CausalLMOutputWithPast(logits=logits, hidden_states=batched_hidden if output_hidden_states else None)
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

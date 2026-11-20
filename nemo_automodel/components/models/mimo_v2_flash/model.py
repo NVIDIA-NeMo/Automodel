@@ -1359,8 +1359,6 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden = hidden.unsqueeze(0)
         logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         if output_hidden_states and is_thd and hidden.shape[0] == 1:
             # The TE THD sharder flattens labels to [T]. FusedLinearCrossEntropy

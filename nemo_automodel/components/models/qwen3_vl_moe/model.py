@@ -384,6 +384,27 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         use_cache: bool | None = None,
         **attn_kwargs: Any,
     ) -> Qwen3VLMoeModelOutputWithPast:
+        """Run the text decoder; packed (THD) input from the multimodal wrapper comes back batched.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence], or packed [tokens].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or packed [tokens, hidden].
+            attention_mask: Optional padding or attention mask for unpacked input.
+            position_ids: Optional positions of shape [batch, sequence] or [axes, batch, sequence], with 3
+                multimodal rotary axes (a 4th leading axis is dropped); packed input passes the wrapper's squeezed
+                positions.
+            cache_position: Optional token positions of shape [sequence].
+            visual_pos_masks: Optional bool mask of shape [batch, sequence], true at visual tokens.
+            deepstack_visual_embeds: Optional per-layer visual features, each of shape [visual_tokens, hidden].
+            padding_mask: Optional bool mask with the token layout of input_ids, true at padding.
+            past_key_values: Unsupported cache.
+            use_cache: Whether to use a cache; only ``False`` or ``None`` is supported.
+            **attn_kwargs: Backend metadata, including packed sequence boundaries.
+
+        Returns:
+            Model output whose ``last_hidden_state`` has shape [batch, sequence, hidden], or [1, tokens, hidden]
+            for packed input.
+        """
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3-VL backend implementation.")
 
@@ -438,6 +459,8 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
 
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return Qwen3VLMoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=None,
@@ -709,8 +732,6 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         if self.lm_head is None:
             return hidden_states
 
-        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden_states = hidden_states.unsqueeze(0)
         logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 

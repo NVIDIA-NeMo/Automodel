@@ -136,7 +136,21 @@ class Qwen3OmniMoeThinkerTextModel(
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        r"""
+        r"""Run the thinker text decoder; packed (THD) input comes back batched.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence], or packed [tokens].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or packed [tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence] or [axes, batch, sequence], with 3
+                multimodal rotary axes (a 4th leading axis is dropped); packed input passes the thinker's
+                squeezed positions.
+            attention_mask: Optional padding or attention mask for unpacked input.
+            padding_mask: Optional bool mask with the token layout of input_ids, true at padding.
+            **attn_kwargs: Backend metadata, including packed sequence boundaries.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
+
         visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
             The mask of the visual positions.
         deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
@@ -191,7 +205,8 @@ class Qwen3OmniMoeThinkerTextModel(
                 )
 
         hidden_states = self.norm(hidden_states)
-
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return hidden_states
 
     def _deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
@@ -544,8 +559,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs,
         )
 
-        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden = hidden.unsqueeze(0)
         logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
 
         # 5. Optionally compute loss/aux outputs

@@ -805,8 +805,6 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         logits = (
             hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
-        if logits.dim() == 2:  # packed (THD) [tokens, vocab] -> [1, tokens, vocab]
-            logits = logits.unsqueeze(0)
 
         loss = None
         if labels is not None and self.lm_head is not None:

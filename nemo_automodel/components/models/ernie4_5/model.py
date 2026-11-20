@@ -293,6 +293,31 @@ class Ernie4_5Model(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run the decoder layers on padded or packed (THD) input.
+
+        Packed input arrives batched and is squeezed to [tokens, ...] for the layers, which TE's packed kernels
+        take; the hidden states come back batched.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or packed token IDs of shape [1, tokens]. Later
+                pipeline stages pass hidden states of shape [batch, sequence, hidden] or [1, tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence]; packed input requires them, as
+                [1, tokens].
+            attention_mask: Optional padding or attention mask for unpacked input; packed input ignores it.
+            padding_mask: Optional bool mask of shape [batch, sequence] or [1, tokens], true at padding.
+            **attn_kwargs: Backend metadata. Packed input sets ``qkv_format="thd"`` and passes int32
+                ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
+        """
+        if attn_kwargs.get("qkv_format") == "thd":  # TE's packed kernels take [tokens, ...]
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if position_ids is None:
             if input_ids.ndim == 1:
                 position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
@@ -314,7 +339,8 @@ class Ernie4_5Model(nn.Module):
                 padding_mask=padding_mask,
                 **attn_kwargs,
             )
-        return self.norm(h)
+        h = self.norm(h)
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
 
 class Ernie4_5_MoeModel(nn.Module):
@@ -396,6 +422,31 @@ class Ernie4_5_MoeModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run the decoder layers on padded or packed (THD) input.
+
+        Packed input arrives batched and is squeezed to [tokens, ...] for the layers, which TE's packed kernels
+        take; the hidden states come back batched.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or packed token IDs of shape [1, tokens]. Later
+                pipeline stages pass hidden states of shape [batch, sequence, hidden] or [1, tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence]; packed input requires them, as
+                [1, tokens].
+            attention_mask: Optional padding or attention mask for unpacked input; packed input ignores it.
+            padding_mask: Optional bool mask of shape [batch, sequence] or [1, tokens], true at padding.
+            **attn_kwargs: Backend metadata. Packed input sets ``qkv_format="thd"`` and passes int32
+                ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
+        """
+        if attn_kwargs.get("qkv_format") == "thd":  # TE's packed kernels take [tokens, ...]
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if position_ids is None:
             if input_ids.ndim == 1:
                 position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
@@ -417,7 +468,8 @@ class Ernie4_5_MoeModel(nn.Module):
                 padding_mask=padding_mask,
                 **attn_kwargs,
             )
-        return self.norm(h)
+        h = self.norm(h)
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
 
 class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
@@ -505,13 +557,6 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
-
         hidden = self.model(
             input_ids,
             position_ids=position_ids,
@@ -520,8 +565,6 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             **attn_kwargs,
         )
 
-        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden = hidden.unsqueeze(0)
         logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
@@ -650,13 +693,6 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
-
         hidden = self.model(
             input_ids,
             position_ids=position_ids,
@@ -665,8 +701,6 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             **attn_kwargs,
         )
 
-        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden = hidden.unsqueeze(0)
         logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 

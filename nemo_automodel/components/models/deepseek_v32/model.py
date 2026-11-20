@@ -47,7 +47,6 @@ from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Conf
 from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32MLA
 from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -300,13 +299,6 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        is_thd = attn_kwargs.get("qkv_format") == "thd"
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
-
         hidden_states = self.model(
             input_ids,
             position_ids=position_ids,
@@ -315,8 +307,6 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             **attn_kwargs,
         )
 
-        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden_states = hidden_states.unsqueeze(0)
         logits = (
             hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )

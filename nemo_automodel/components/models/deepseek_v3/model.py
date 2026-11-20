@@ -200,6 +200,35 @@ class DeepseekV3Model(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the decoder layers on padded or packed (THD) input.
+
+        Packed input arrives batched and is squeezed to [tokens, ...] for the layers, which TE's packed kernels
+        take; the hidden states come back batched.
+        Callers that already squeezed packed input for their own preprocessing pass [tokens] layouts,
+        which the squeeze leaves unchanged.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or packed token IDs of shape [1, tokens]. Later
+                pipeline stages pass hidden states of shape [batch, sequence, hidden] or [1, tokens, hidden].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden] used instead of input_ids,
+                or packed [tokens, hidden] from a caller that already squeezed packed input.
+            position_ids: Optional positions of shape [batch, sequence]; packed input requires them, as
+                [1, tokens].
+            attention_mask: Optional padding or attention mask for unpacked input; packed input ignores it.
+            padding_mask: Optional bool mask of shape [batch, sequence] or [1, tokens], true at padding.
+            **attn_kwargs: Backend metadata. Packed input sets ``qkv_format="thd"`` and passes int32
+                ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
+        """
+        if attn_kwargs.get("qkv_format") == "thd":  # TE's packed kernels take [tokens, ...]
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -234,7 +263,7 @@ class DeepseekV3Model(nn.Module):
             )
 
         h = self.norm(h) if self.norm else h
-        return h
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
     def update_moe_gate_bias(self) -> None:
         """Update correction biases only for gates with adaptation enabled."""
@@ -384,13 +413,6 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
-
         hidden_states = self.model(
             input_ids,
             position_ids=position_ids,
@@ -399,8 +421,6 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
-            hidden_states = hidden_states.unsqueeze(0)
         logits = (
             hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )

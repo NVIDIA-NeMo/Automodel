@@ -147,12 +147,19 @@ class LMHead(nn.Linear):
 
 
 def slice_logits_to_keep(hidden_states: torch.Tensor, logits_to_keep: int | torch.Tensor) -> torch.Tensor:
-    """Select the positions of hidden states [..., sequence, hidden] whose logits a forward returns.
+    """Select the positions of hidden states whose logits a forward returns, before the head projects them.
 
-    Hugging Face's ``slice_logits_to_keep`` (newer than the pinned transformers) for an int or a 1D index tensor,
-    on [batch, sequence, hidden] and packed (THD) [tokens, hidden] states alike: ``0`` keeps every position, a
-    positive int the last ``N``, and a tensor the given positions. ``0`` skips the slice, since a full
-    ``slice(0, None)`` of a DTensor has raised on ``aten.alias`` under sequence parallelism.
+    Hugging Face's ``slice_logits_to_keep`` (newer than the pinned transformers), for an int or a 1D index tensor.
+
+    Args:
+        hidden_states: Tensor of shape [batch, sequence, hidden], or packed (THD) [tokens, hidden].
+        logits_to_keep: ``0`` keeps every position and returns ``hidden_states`` itself, since a full
+            ``slice(0, None)`` of a DTensor has raised on ``aten.alias`` under sequence parallelism. A positive int
+            keeps the last ``N`` positions; an integer tensor of shape [kept] keeps those positions.
+
+    Returns:
+        Tensor of shape [batch, kept, hidden], or [kept, hidden] for packed input: a view of ``hidden_states`` for
+        an int, a copy for an index tensor.
     """
     if isinstance(logits_to_keep, int):
         return hidden_states if logits_to_keep == 0 else hidden_states[..., -logits_to_keep:, :]

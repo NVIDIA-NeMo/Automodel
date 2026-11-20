@@ -21,8 +21,18 @@ class _EchoTextModel(nn.Module):
     """Return the residual unchanged so PP/CP boundary behavior is isolated."""
 
     def forward(self, *, inputs_embeds, **kwargs):
+        """Echo inputs_embeds, batched like ``MuseSparkTextModel``.
+
+        Args:
+            inputs_embeds: Tensor of shape [batch, sequence, hidden], or packed (THD) [tokens, hidden].
+            **kwargs: Ignored decoder metadata.
+
+        Returns:
+            Namespace whose last_hidden_state is inputs_embeds, with packed input as [1, tokens, hidden].
+        """
         del kwargs
-        return SimpleNamespace(last_hidden_state=inputs_embeds)
+        hidden = inputs_embeds.unsqueeze(0) if inputs_embeds.dim() == 2 else inputs_embeds
+        return SimpleNamespace(last_hidden_state=hidden)
 
 
 def test_tiny_text_forward_backward_is_finite() -> None:
