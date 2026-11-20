@@ -262,6 +262,80 @@ def test_checkpoint_style_config_with_mtp_disabled_builds_the_decoder_and_its_ke
         )
 
 
+def test_generation_config_is_initialized_from_model_config():
+    from transformers.generation import GenerationConfig
+
+    with torch.device("meta"):
+        model = Ernie5_5_MoeForCausalLM(_tiny_config(bos_token_id=1, eos_token_id=2), _eager_backend())
+
+    assert isinstance(model.generation_config, GenerationConfig)
+    assert model.generation_config.eos_token_id == 2
+    assert model.generation_config.bos_token_id == 1
+    assert model.generation_config.pad_token_id == 0
+
+
+def _export_metadata_of_a_pretrained_build(tmp_path, generation_config: dict | None):
+    """Build the tiny model from a hand-written checkpoint directory as the loader does and export its metadata."""
+    from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    config = _tiny_config(bos_token_id=1, eos_token_id=2)
+    config.architectures = ["Ernie5_5_MoeForCausalLM"]
+    config.save_pretrained(checkpoint_dir)
+    if generation_config is not None:
+        (checkpoint_dir / "generation_config.json").write_text(json.dumps(generation_config))
+
+    with torch.device("meta"):
+        custom, model = model_init._init_model(
+            object, str(checkpoint_dir), None, torch.float32, None, False, backend=_eager_backend()
+        )
+    assert custom and type(model) is Ernie5_5_MoeForCausalLM
+
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(export_dir),
+        fqn_to_file_index_mapping={},
+        tokenizer=None,
+        original_model_path=str(checkpoint_dir),
+        v4_compatible=False,
+    )
+    return export_dir
+
+
+def test_pretrained_build_preserves_generation_config_in_export(tmp_path):
+    """The end-of-sequence ids of the checkpoint's generation_config.json reach the export."""
+    from transformers.generation import GenerationConfig
+
+    export_dir = _export_metadata_of_a_pretrained_build(
+        tmp_path, {"bos_token_id": 1, "eos_token_id": [2, 8], "pad_token_id": 0}
+    )
+
+    assert (export_dir / "generation_config.json").is_file()
+    exported = GenerationConfig.from_pretrained(export_dir)
+    assert exported.eos_token_id == [2, 8]
+    assert exported.bos_token_id == 1
+    assert exported.pad_token_id == 0
+
+
+def test_pretrained_build_without_generation_config_exports_the_ids_of_the_model_config(tmp_path):
+    """Without a generation_config.json in the checkpoint, loaders resolve the same ids as from config.json."""
+    from transformers.generation import GenerationConfig
+
+    export_dir = _export_metadata_of_a_pretrained_build(tmp_path, None)
+
+    assert (export_dir / "generation_config.json").is_file()
+    exported = GenerationConfig.from_pretrained(export_dir)
+    from_model_config = GenerationConfig.from_pretrained(
+        export_dir, config_file_name="config.json", _from_model_config=True
+    )
+    assert exported.eos_token_id == from_model_config.eos_token_id == 2
+    assert exported.bos_token_id == from_model_config.bos_token_id == 1
+    assert exported.pad_token_id == from_model_config.pad_token_id == 0
+
+
 def test_default_configuration_with_a_schedule_builds_without_an_override():
     decoder_ratios = checkpoint_style_config()["compress_ratios"][:43]
     config = Ernie5_5Config(compress_ratios=decoder_ratios, rope_interleave=True)
