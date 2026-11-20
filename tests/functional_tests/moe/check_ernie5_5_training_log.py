@@ -15,8 +15,11 @@
 """Check the ``training.jsonl`` log of the 2-GPU ERNIE 5.5 expert-parallel training run.
 
 The run trains a randomly initialized proxy on one repeated batch of two documents, so a model that trains lowers
-the loss. The two loss bounds were measured on two GPUs with seed 1234: the loss starts at 8.349 and ends at 5.017
-with eager DSA and at 5.027 with cuDNN DSA, 0.60 of its first value.
+the loss. The checker bounds the loss twice: the first loss must lie within 0.25 of ln(vocab_size), and the last
+loss must be below 0.7 of the first by default. The margins were chosen against runs on two GB200 GPUs with seed 1234
+and 8 steps. There the first loss was 8.349 with eager DSA and with cuDNN DSA, and ln(4096) is 8.318. The last loss
+varied between runs: 5.009 to 5.017 with eager DSA and 4.99 to 5.05 with cuDNN DSA, each 0.60 of the first loss. A
+run on H100 GPUs with another PyTorch build gave other values, inside both bounds.
 
 Called by ``L2_Ernie5_5_MoE_EP2.sh`` after the torchrun invocation. ``run_ernie5_5_lora_training.py`` imports
 ``check_training_log`` and passes its own bound.
