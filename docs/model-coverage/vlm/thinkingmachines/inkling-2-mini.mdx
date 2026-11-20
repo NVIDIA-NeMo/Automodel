@@ -99,7 +99,7 @@ holds one contiguous shard of the row, 32,768 tokens here.
 | Property | Value |
 | --- | --- |
 | Checkpoint | [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) |
-| Architecture | `Inkling2ForConditionalGeneration` with `model_type: inkling2_loop`, a vision-language model with a routed Mixture-of-Experts decoder whose middle layers run three times |
+| Architecture | `Inkling2LoopForConditionalGeneration` (`model_type: inkling2_loop`), loaded as `Inkling2ForConditionalGeneration`: a vision-language model with a routed Mixture-of-Experts decoder whose middle layers run three times |
 | Parameters | 26B total; 5B active per token, counting every pass through the looped layers |
 | Inputs | Text and images |
 | Context length | Up to 1M tokens |
