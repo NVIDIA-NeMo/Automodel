@@ -1195,6 +1195,10 @@ class _FakeMultiDimMesh:
     def ndim(self) -> int:
         return len(self._sizes)
 
+    @property
+    def mesh_dim_names(self) -> tuple[str, ...]:
+        return tuple(self._names)
+
     def __getitem__(self, key: str) -> FakePPMesh:
         return FakePPMesh(size=self._sizes[self._names.index(key)], local_rank=0)
 
@@ -1206,11 +1210,12 @@ class _FakeMultiDimMesh:
 
 
 class TestAutoPipelineUpdateSeqLenCollective:
-    """update_seq_len must make the stage-reset decision across all ranks of world_mesh."""
+    """update_seq_len must make the stage-reset decision across the ranks that share forward collectives."""
 
-    def _make_pipeline(self, monkeypatch, peer_changed: bool):
+    def _make_pipeline(self, monkeypatch, peer_changed: bool, world_dims=None, moe_dims=None):
         ap = AutoPipeline(
-            world_mesh=_FakeMultiDimMesh({"pp": 2, "cp": 1, "dp_shard": 4}),
+            world_mesh=_FakeMultiDimMesh(world_dims or {"pp": 2, "cp": 1, "dp_shard": 4}),
+            moe_mesh=_FakeMultiDimMesh(moe_dims) if moe_dims else None,
             pp_axis_name="pp",
             pp_schedule="1f1b",
             pp_microbatch_size=2,
@@ -1278,6 +1283,19 @@ class TestAutoPipelineUpdateSeqLenCollective:
         assert ap._pp_runtime_num_tokens == 128
         assert groups == ["group_pp", "group_dp_shard"]
 
+    def test_vote_skips_dp_replicate_and_includes_moe_dims(self, monkeypatch):
+        ap, resets, groups = self._make_pipeline(
+            monkeypatch,
+            peer_changed=True,
+            world_dims={"pp": 2, "dp_replicate": 2, "dp_shard": 2, "cp": 1, "tp": 1},
+            moe_dims={"ep_shard": 1, "ep": 4},
+        )
+
+        ap.update_seq_len(128)
+
+        assert resets == [128]
+        assert groups == ["group_pp", "group_dp_shard", "group_ep"]
+
 
 def _free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1334,3 +1352,62 @@ def _update_seq_len_collective_worker(rank: int, world_size: int, port: int) -> 
 @pytest.mark.timeout(70)
 def test_update_seq_len_resets_every_rank_when_one_rank_changed_gloo():
     mp.spawn(_update_seq_len_collective_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, port: int) -> None:
+    import datetime
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    faulthandler.dump_traceback_later(90, exit=True)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    try:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=20))
+        mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("pp", "dp_replicate", "dp_shard"))
+        ap = AutoPipeline(
+            world_mesh=mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=1,
+            device=torch.device("cpu"),
+        )
+        ap._model_config = object()
+        ap._info.schedule = object()
+        ap._info.stages = []
+        ap._runtime_initializers = []
+        ap._pp_current_seq_len = 128
+
+        resets = []
+
+        def record_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
+            resets.append(seq_len)
+            return microbatch_size * seq_len
+
+        autopipeline_module.reset_pp_stage_shapes = record_reset
+
+        replica = mesh.get_local_rank("dp_replicate")
+        shard = mesh.get_local_rank("dp_shard")
+        # Replica 0 has two validation batches and replica 1 has one; only one shard of replica 0 changes length.
+        batch_seq_lens = [[[128, 64], [128, 128]], [[128], [128]]][replica][shard]
+        for seq_len in batch_seq_lens:
+            ap.update_seq_len(seq_len)
+
+        expected = [[[64], [128]], [[], []]][replica][shard]
+        assert resets == expected, (rank, resets)
+
+        # Final validation reduction across replicas, reached after an uneven number of batches.
+        total = torch.ones(1)
+        dist.all_reduce(total)
+        assert total.item() == world_size
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
+@pytest.mark.timeout(150)
+def test_update_seq_len_hsdp_replicas_with_uneven_batches_gloo():
+    mp.spawn(_update_seq_len_hsdp_uneven_batches_worker, args=(8, _free_port()), nprocs=8, join=True)

@@ -26,6 +26,7 @@ from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
 from torch.utils._pytree import tree_map
 
+from nemo_automodel.components.distributed.mesh import MeshAxisName
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
     pipeline_model,
@@ -232,10 +233,13 @@ class AutoPipeline:
 
         Call this before every ``schedule.step()`` to update the stage shapes without
         running an expensive forward pass.  When ``torch.distributed`` is initialized,
-        every rank of ``world_mesh`` must call this together: the reset decision is
-        collective, and each rank resets with its own ``seq_len`` if any rank's
-        ``seq_len`` changed.  Stage reset is a no-op when no rank's ``seq_len`` has
-        changed; model-owned runtime initializers are still prepared.
+        the reset decision is collective over the ranks that share forward collectives
+        (every ``world_mesh`` dim except ``dp_replicate``, plus the ``moe_mesh`` dims),
+        so those ranks must call this the same number of times; independent
+        ``dp_replicate`` replicas may run different numbers of batches.  Each rank
+        resets with its own ``seq_len`` if any rank of that group changed.  Stage reset
+        is a no-op when no such rank's ``seq_len`` has changed; model-owned runtime
+        initializers are still prepared.
 
         Args:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
@@ -263,13 +267,16 @@ class AutoPipeline:
             )
 
     def _any_rank_seq_len_changed(self, changed: bool) -> bool:
-        """Return whether ``changed`` is true on any rank of ``world_mesh``."""
+        """Return whether ``changed`` is true on any rank that shares forward collectives with this one."""
         if not dist.is_initialized():
             return changed
         flag = torch.tensor([int(changed)], dtype=torch.int32, device=self.device)
-        for mesh_dim in range(self.world_mesh.ndim):
-            if self.world_mesh.size(mesh_dim) > 1:
-                dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.world_mesh.get_group(mesh_dim))
+        for mesh in (self.world_mesh, self.moe_mesh):
+            if mesh is None:
+                continue
+            for mesh_dim, name in enumerate(mesh.mesh_dim_names):
+                if name != MeshAxisName.DP_REPLICATE and mesh.size(mesh_dim) > 1:
+                    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=mesh.get_group(mesh_dim))
         return bool(flag.item())
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
