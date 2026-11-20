@@ -715,6 +715,8 @@ navigation:
             contents:
               - page: "Inkling"
                 path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
+              - page: "Inkling-2-Mini"
+                path: ../../model-coverage/vlm/thinkingmachines/inkling-2-mini.mdx
               - page: "Inkling-2-Small"
                 path: ../../model-coverage/vlm/thinkingmachines/inkling2.mdx
               - page: "Inkling-Small"

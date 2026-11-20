@@ -67,7 +67,6 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.dllm.strategy import BlockDiffusionStrategy, get_dllm_strategy
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -593,21 +592,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         self._dllm_loss_buffer.clear()
         # Every blocking metric reduction runs before the clock is read, as in the base recipe, so that queued
         # GPU work completing during them stays inside this step's window.
-        step_flops = None
-        mfu_calculator = getattr(self, "mfu_calculator", None)
-        if batches and mfu_calculator is not None:
-            step_flops = 0.0
-            for batch in batches:
-                input_ids = batch.get("input_ids")
-                batch_flops = None if input_ids is None else mfu_calculator.get_flops(input_ids)
-                if batch_flops is None:
-                    step_flops = None
-                    break
-                step_flops += float(batch_flops)
-            if step_flops is not None:
-                step_flops = self._dp_allreduce(
-                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
-                ).item()
+        step_flops = self._step_flops(batches)
         # DFlash draft top-1 accuracy. Per-rank raw (correct, count) per block
         # offset are summed over grad-accum microbatches, SUM-allreduced across
         # DP+CP (same primitive as dllm_loss), then divided post-reduction to
@@ -634,14 +619,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
-        mfu = None
-        if step_flops is not None:
-            mfu = calculate_mfu(
-                step_flops / 1e12,
-                self.dist_env.world_size,
-                time_delta,
-                reference_mfu=mfu_calculator.reference_mfu,
-            )
+        _, mfu = self._model_flop_rates(step_flops, time_delta)
 
         metrics = {
             "loss": total_loss,

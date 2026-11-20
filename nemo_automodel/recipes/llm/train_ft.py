@@ -119,7 +119,6 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     FreezeConfig,
     _supports_logits_to_keep,
@@ -1685,27 +1684,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
-        step_flops = None
-        mfu_calculator = getattr(self, "mfu_calculator", None)
-        if batches and mfu_calculator is not None:
-            step_flops = 0.0
-            for batch in batches:
-                input_ids = batch.get("input_ids")
-                if input_ids is None:
-                    step_flops = None
-                    break
-                batch_flops = mfu_calculator.get_flops(input_ids)
-                if batch_flops is None:
-                    step_flops = None
-                    break
-                step_flops += float(batch_flops)
-
-            if step_flops is not None:
-                # These are full input shapes before CP sharding. Only DP ranks
-                # consume distinct batches; reducing over CP would count them twice.
-                step_flops = self._dp_allreduce(
-                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device)
-                ).item()
+        step_flops = self._step_flops(batches)
 
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         if self.pp_enabled:
@@ -1724,18 +1703,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Include data loading and metric reductions in the same step window.
         time_delta = time.perf_counter() - self.timestamp
         tps = num_tokens_in_batch / time_delta
-        tflops_per_sec = None
-        tflops_per_sec_per_gpu = None
-        mfu = None
-        if step_flops is not None:
-            tflops_per_sec = step_flops / time_delta / 1e12
-            tflops_per_sec_per_gpu = tflops_per_sec / self.dist_env.world_size
-            mfu = calculate_mfu(
-                step_flops / 1e12,
-                self.dist_env.world_size,
-                time_delta,
-                reference_mfu=mfu_calculator.reference_mfu,
-            )
+        tflops_per_sec, mfu = self._model_flop_rates(step_flops, time_delta)
+        tflops_per_sec_per_gpu = None if tflops_per_sec is None else tflops_per_sec / self.dist_env.world_size
 
         metrics = {
             "loss": reporting_loss,

@@ -41,8 +41,12 @@ def make_schedule(virtual: int, microbatches: int, physical: int = 4) -> Schedul
     schedule._stages = []
     schedule.stage_index_to_group_rank = {stage: stage % physical for stage in range(physical * virtual)}
     schedule._defer_pp_recv = False
-    # Match _PipelineScheduleRuntime.__init__ in PyTorch 2.15; older generators ignore it.
+    # Match the defaults of _PipelineScheduleRuntime.__init__ in PyTorch 2.15 (NGC 26.10 and
+    # 26.11 builds); older generators ignore the attributes they do not read.
     schedule._max_active_stages = 3
+    schedule._unshard_lookahead = "full"
+    schedule._defer_reduce_grad_wait = False
+    schedule._max_outstanding_sends = None
     schedule.number_of_rounds = max(1, microbatches // physical)
     schedule.microbatches_per_round = microbatches // schedule.number_of_rounds
     schedule.pipeline_order = {rank: schedule._calculate_single_rank_operations(rank) for rank in range(physical)}
@@ -190,8 +194,23 @@ def test_unsupported_stage_api_keeps_stock_buffers(
     """An older PyTorch stage API must leave the schedule untouched."""
     schedule = make_schedule(2, 16)
     monkeypatch.setattr(recv_pool, "_INSTALLED", False)
+    monkeypatch.setattr(recv_pool, "_native_recv_buffers_are_just_in_time", lambda: False)
     monkeypatch.setattr(recv_pool, "PipelineStage", type("LegacyStage", (), {}))
     before = dict(vars(schedule))
     recv_pool.install_interleaved_recv_pool(schedule)
     assert vars(schedule) == before
     assert "keeping stock buffers" in caplog.text
+
+
+def test_just_in_time_receive_buffers_keep_stock_buffers(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PyTorch 2.15 allocates receive buffers just in time, so pooling would only add copies."""
+    schedule = make_schedule(2, 16)
+    monkeypatch.setattr(recv_pool, "_INSTALLED", False)
+    monkeypatch.setattr(recv_pool, "_native_recv_buffers_are_just_in_time", lambda: True)
+    before = dict(vars(schedule))
+    with caplog.at_level("INFO", logger=recv_pool.__name__):
+        recv_pool.install_interleaved_recv_pool(schedule)
+    assert vars(schedule) == before
+    assert "just in time" in caplog.text

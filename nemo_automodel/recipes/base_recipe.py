@@ -16,9 +16,12 @@ import getpass
 import logging
 import os
 import socket
+import time
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -56,7 +59,12 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.recipes._typed_config import RecipeConfig
+
+if TYPE_CHECKING:
+    from nemo_automodel._transformers.mfu import AutoMFU
+    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +171,10 @@ class BaseRecipe:
     """
     BaseRecipe provides checkpoint load/save functionality for recipes.
     """
+
+    dist_env: "DistInfo"
+    mfu_calculator: "AutoMFU | None" = None
+    timestamp: float
 
     @staticmethod
     def _distributed_setup_attributes(distributed_setup):
@@ -842,6 +854,60 @@ class BaseRecipe:
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
+
+    def _step_throughput(
+        self, batches: Sequence[Mapping[str, torch.Tensor]], num_tokens_in_batch: float
+    ) -> tuple[float, float | None]:
+        """Advance the step timer and return the step's tokens/s and MFU.
+
+        MFU is ``None`` without an MFU calculator, without batches, or when any batch
+        lacks ``input_ids`` or has no FLOPs formula.
+        """
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+
+        _, mfu = self._model_flop_rates(self._step_flops(batches), time_delta)
+        return tps, mfu
+
+    def _step_flops(self, batches: Sequence[Mapping[str, torch.Tensor]]) -> float | None:
+        """Count global model FLOPs across the distinct data-parallel microbatches.
+
+        Args:
+            batches: Local microbatches with input_ids of shape [batch, sequence]
+                before context-parallel sharding.
+
+        Returns:
+            Total FLOPs, or None when a microbatch has no supported estimate.
+        """
+        mfu_calculator = self.mfu_calculator
+        if not batches or mfu_calculator is None:
+            return None
+        step_flops = 0.0
+        for batch in batches:
+            input_ids = batch.get("input_ids")
+            if input_ids is None:
+                return None
+            batch_flops = mfu_calculator.get_flops(input_ids)
+            if batch_flops is None:
+                return None
+            step_flops += float(batch_flops)
+
+        # Sum over DP ranks only, like the token count. Every CP rank of a DP replica holds
+        # the same unsharded batches (CP shards a copy inside the step), so including CP
+        # would count each sequence's FLOPs cp_size times.
+        return self._dp_allreduce(torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device)).item()
+
+    def _model_flop_rates(self, step_flops: float | None, elapsed: float) -> tuple[float | None, float | None]:
+        """Return aggregate model TFLOPs/s and MFU for the same measured interval."""
+        if step_flops is None or self.mfu_calculator is None:
+            return None, None
+        step_tflops = step_flops / 1e12
+        mfu = calculate_mfu(
+            step_tflops, self.dist_env.world_size, elapsed, reference_mfu=self.mfu_calculator.reference_mfu
+        )
+        return step_tflops / elapsed, mfu
 
     def _make_progress_bar(self, total: int | None = None, initial: int = 0):
         """Create a tqdm progress bar on rank 0; returns None on other ranks.
