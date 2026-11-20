@@ -1411,3 +1411,112 @@ def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, port:
 @pytest.mark.timeout(150)
 def test_update_seq_len_hsdp_replicas_with_uneven_batches_gloo():
     mp.spawn(_update_seq_len_hsdp_uneven_batches_worker, args=(8, _free_port()), nprocs=8, join=True)
+
+
+def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) -> None:
+    import datetime
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    faulthandler.dump_traceback_later(120, exit=True)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.set_num_threads(1)
+    vocab_size, batch_size = 256, 2
+    # Local length of each DP-shard peer per evaluation; the third repeats the second.
+    eval_seq_lens = [(128, 128), (128, 64), (128, 64)]
+    # Cumulative resets every rank must record: the second evaluation resets every peer, the third none.
+    expected_resets = [1, 2, 2]
+    # float32 throughout and FSDP all-gathers copy weights bit-exactly; the reference runs one sample per call
+    # like the 1-sample microbatches, so only the fp32 accumulation order of CPU kernels may differ.
+    rtol = atol = 1e-5
+    try:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=60))
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
+        dp_rank = mesh.get_local_rank("dp_shard")
+
+        def build_model() -> LlamaForCausalLM:
+            config = LlamaConfig(
+                vocab_size=vocab_size,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=256,
+                use_cache=False,
+            )
+            torch.manual_seed(0)
+            return LlamaForCausalLM(config).to(torch.float32)
+
+        def parallelize(model, world_mesh, dp_axis_names, **kwargs):
+            # Unsharded parameters stay resident after a no-backward forward, as in evaluation.
+            dp_mesh = world_mesh[dp_axis_names[0]]
+            for layer in model.model.layers.values():
+                fully_shard(layer, mesh=dp_mesh, reshard_after_forward=False)
+            fully_shard(model, mesh=dp_mesh, reshard_after_forward=False)
+
+        resets = []
+        real_reset = autopipeline_module.reset_pp_stage_shapes
+
+        def spy_reset(*args, **kwargs):
+            resets.append(args[4])
+            return real_reset(*args, **kwargs)
+
+        autopipeline_module.reset_pp_stage_shapes = spy_reset
+
+        captured = []
+
+        def loss_fn(logits, target):
+            captured.append(logits.detach().clone())
+            return nn.functional.cross_entropy(logits.flatten(0, 1), target.flatten(0, 1))
+
+        reference = build_model().eval()
+        ap = AutoPipeline(
+            world_mesh=mesh,
+            pp_axis_name="pp",
+            dp_axis_names=("dp_shard",),
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=batch_size,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).build(build_model(), loss_fn=loss_fn, parallelize_fn=parallelize)
+        for part in ap.parts:
+            part.eval()
+
+        for eval_idx, seq_lens in enumerate(eval_seq_lens):
+            seq_len = seq_lens[dp_rank]
+            generator = torch.Generator().manual_seed(1000 * eval_idx + dp_rank)
+            input_ids = torch.randint(2, vocab_size, (batch_size, seq_len), generator=generator)
+            captured.clear()
+            with torch.no_grad():
+                ap.update_seq_len(seq_len)
+                assert len(resets) == expected_resets[eval_idx], ("reset symmetry", rank, eval_idx, resets)
+                assert resets[-1] == seq_len, ("local seq_len", rank, eval_idx, resets)
+                if ap.info.has_first_stage:
+                    ap.info.schedule.eval(input_ids, target=input_ids)
+                else:
+                    ap.info.schedule.eval(target=input_ids, losses=[])
+            assert len(resets) == expected_resets[eval_idx], ("reset symmetry", rank, eval_idx, resets)
+
+            if ap.info.has_last_stage:
+                logits = torch.cat(captured)
+                assert logits.shape == (batch_size, seq_len, vocab_size), (rank, eval_idx, logits.shape)
+                assert torch.isfinite(logits).all(), (rank, eval_idx)
+                with torch.no_grad():
+                    expected = torch.cat([reference(input_ids=sample[None]).logits for sample in input_ids])
+                torch.testing.assert_close(logits, expected, rtol=rtol, atol=atol)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
+@pytest.mark.timeout(150)
+def test_update_seq_len_pp_fsdp_eval_resets_every_shard_peer_gloo():
+    """PP2 x DP-shard2 FSDP2 evaluation: a length change on one shard peer resets every rank exactly once."""
+    mp.spawn(_pp_fsdp_eval_seq_len_reset_worker, args=(4, _free_port()), nprocs=4, join=True)
