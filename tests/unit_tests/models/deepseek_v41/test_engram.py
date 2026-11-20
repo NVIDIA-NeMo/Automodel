@@ -31,6 +31,7 @@ from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedTokenizerFast
 
 import nemo_automodel.components.models.deepseek_v41.engram as v41_engram
+from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 from nemo_automodel.components.distributed.multimodal_fsdp import ignored_params_for_root
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
@@ -552,3 +553,58 @@ def _empty_requester_worker(rank: int, rendezvous: str) -> None:
 @pytest.mark.runtime_budget(30, reason="spawns two Gloo workers")
 def test_empty_requester_takes_the_peers_validation_path(tmp_path: Path) -> None:
     mp.spawn(_empty_requester_worker, args=(str(tmp_path / "rendezvous-empty"),), nprocs=2, join=True)
+
+
+def _materialized_owner_worker(rank: int, rendezvous: str) -> None:
+    """Keep owner-mean gradients after native PP skips random initialization."""
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        mesh = DeviceMesh.from_group(dist.group.WORLD, device_type="cpu", mesh_dim_names=("dp_shard_cp",))
+        model = _owner_model((113, 253))
+        model._nemo_prepare_model_owned_dtensors(mesh)
+        for layer_id in (1, 4):
+            module = model.model.layers[str(layer_id)].engram
+            saved = {name: parameter.detach().clone() for name, parameter in module.named_parameters()}
+            # The native loader materializes Parameters and copies checkpoint
+            # values without calling initialize_weights() on pretrained PP parts.
+            to_empty_parameters_only(module, device=torch.device("cpu"))
+            with torch.no_grad():
+                for name, parameter in module.named_parameters():
+                    parameter.copy_(saved[name])
+            for empty in (False, True):
+                module.zero_grad(set_to_none=True)
+                _owner_gradient_case(model, layer_id, empty_requester=empty)
+    finally:
+        dist.destroy_process_group()
+
+
+def _singleton_owner_worker(rank: int, rendezvous: str) -> None:
+    """A stage with one owner rebinds its WORLD-grouped meta table to the local lookup path."""
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        with torch.device("meta"):
+            model = _owner_model((113, 253))
+        for layer_id, rows in ((1, 113), (4, 253)):
+            module = model.model.layers[str(layer_id)].engram
+            assert module.embed.process_group is not None  # the model defaults to WORLD under torch.distributed
+            module.set_owner_group(None)
+            module.set_owner_group(None)  # rebinding to the same owner is a no-op
+            assert module.embed.process_group is None and module.embed.owner_world_size == 1
+            assert module.embed.weight.shape[0] == rows
+            to_empty_parameters_only(module, device=torch.device("cpu"))
+            module.init_weights()
+            hidden = torch.randn(1, 3, module.hc_mult, module.hidden_size)
+            ids = torch.zeros(1, 3, module.hash_heads, dtype=torch.long)
+            assert module(hidden, ids).shape == hidden.shape
+    finally:
+        dist.destroy_process_group()
+
+
+def test_single_owner_stage_rebinds_engram_to_the_local_table(tmp_path: Path) -> None:
+    mp.spawn(_singleton_owner_worker, args=(str(tmp_path / "singleton_owner"),), nprocs=2, join=True)
+
+
+def test_materialized_pretrained_owner_gradients_norm_and_update(tmp_path: Path) -> None:
+    mp.spawn(_materialized_owner_worker, args=(str(tmp_path / "materialized_owner"),), nprocs=2, join=True)
