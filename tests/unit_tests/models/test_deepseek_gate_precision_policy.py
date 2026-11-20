@@ -22,21 +22,11 @@ there does not reach it. Parametrizing every part over both classes keeps
 the two construction paths from drifting apart silently.
 """
 
-import importlib.util
-import sys
-import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
-
-# Mock fast_hadamard_transform before importing deepseek_v32 modules
-if "fast_hadamard_transform" not in sys.modules:
-    mock_hadamard = types.ModuleType("fast_hadamard_transform")
-    mock_hadamard.__spec__ = importlib.util.spec_from_loader("fast_hadamard_transform", loader=None)
-    mock_hadamard.hadamard_transform = lambda x, scale: x
-    sys.modules["fast_hadamard_transform"] = mock_hadamard
 
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 

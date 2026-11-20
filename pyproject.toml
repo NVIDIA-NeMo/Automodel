@@ -79,7 +79,7 @@ dependencies = [
     "ninja",
     "pyyaml",
     "tiktoken",
-    "torch>=2.8.0",
+    "torch>=2.10.0",
     "torchdata",
     # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
     # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
@@ -144,7 +144,9 @@ fa = ["flash-attn<=2.8.3"]
 # FA4, so do not relax this floor.
 ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.6.2"]
 fla = [
-    "flash-linear-attention>=0.4.2",
+    # 0.5.2 is the first release without Triton block pointers, which Triton 3.9 removed.
+    # docker/common/fla-autotune-keys.patch and the CP prewarm launches target 0.5.x.
+    "flash-linear-attention>=0.5.2,<0.6",
 ]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata

@@ -3248,6 +3248,16 @@ class TestMakeRobustCollate:
         with pytest.raises(RuntimeError, match="Collate failed after 2 retries"):
             wrapped([{"x": 0}])
 
+    def test_wrapper_pickles_for_spawn_workers(self):
+        """spawn and forkserver DataLoader workers receive the collate function by pickle."""
+        import pickle
+
+        from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
+
+        dataset = [{"x": i} for i in range(3)]
+        wrapped = pickle.loads(pickle.dumps(make_robust_collate(dataset, len, max_retries=2)))  # noqa: S301
+        assert wrapped([{"x": 0}, {"x": 1}]) == 2
+
 
 # ---------------------------------------------------------------------------
 # neat_packed_vlm_collater — structural packing contracts
