@@ -34,7 +34,55 @@ For the single-GPU LoRA workflow, including its 256p cache, checkpoint restore, 
 | [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | 8-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training. |
 | [qwen_image_edit_2511_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml) | Single-GPU BF16 LoRA starting configuration with a 256p cache and no FSDP. |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching. |
+| [qwen_image_t2i_flow_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow_fp8.yaml) | Fine-tune Qwen-Image with flow matching using FP8 matrix multiplies (Transformer Engine) on Hopper or newer GPUs. |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching. |
+
+## FP8 Training
+
+[qwen_image_t2i_flow_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow_fp8.yaml) fine-tunes Qwen-Image with FP8 matrix multiplies through Transformer Engine. [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) is the bf16 recipe. FP8 requires Transformer Engine and a GPU with FP8 tensor cores (Hopper or newer) and was tested on H100 GPUs. Weights and optimizer state stay in the model dtype (bf16 by default); FP8 applies to the forward and backward GEMMs of the converted linear layers.
+
+The recipe sets these `model:` keys:
+
+| Key | Purpose |
+|---|---|
+| `transformer_engine_fp8: true` | Replaces eligible `nn.Linear` layers with Transformer Engine linears and runs each step under FP8 autocast. |
+| `transformer_engine_fp8_recipe: "current"` | Per-tensor current scaling. |
+| `transformer_engine_fp8_fprop_split_accumulator: true` | Accumulates the forward FP8 GEMM with periodic fp32 promotion (`current` recipe only). Without it, the validation loss of a 2-epoch run on the Naruto dataset ended about 14% above the bf16 run (0.1056 vs 0.0929). |
+| `transformer_engine_fp8_exclude` | Name fragments of linears to keep in bf16. The recipe keeps the AdaLN modulation layers (`img_mod`, `txt_mod`), whose weight-gradient GEMM reduces over the per-GPU batch that FP8 requires to be a multiple of 16, and the text-stream layers, which see only a few tokens per sample. |
+
+FP8 is only faster than bf16 together with the other settings the recipe changes, which it marks as "FP8-tuned": `fsdp.activation_checkpointing: true`, `fsdp.reshard_after_forward: false`, `fsdp.reduce_dtype: bfloat16`, and `local_batch_size: 32` with `global_batch_size: 256`. With `activation_checkpointing: true`, Transformer Engine's checkpoint is selected automatically when the model holds Transformer Engine linears, so the recompute replays the FP8 state. Enabling FP8 alone with the bf16 recipe's settings made training about 8% slower than bf16 (43.6 vs 47.5 samples/s).
+
+### Compare with bf16
+
+Turn FP8 off from the command line to compare on the same settings, which isolates the effect of FP8:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_t2i_flow_fp8.yaml \
+  --model.transformer_engine_fp8 false
+```
+
+The stock bf16 recipe is [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml). It differs from the FP8 recipe only in the settings the FP8 recipe marks "bf16 recipe". Two of those keys are unset in the stock recipe, and a key cannot be unset from the command line, so run that file instead of overriding the FP8 one.
+
+On 8 H100 GPUs (512x512 images, a 1,093-image dataset), the micro-batch (`local_batch_size`, the samples per GPU in one forward and backward pass) sets how much FP8 helps, because larger batches make the GEMMs bigger. The global batch is the micro-batch times 8 GPUs, with no gradient accumulation. Samples per second, FP8 against the same settings in bf16:
+
+| `local_batch_size` (global) | FP8 | bf16 (FP8 off) | FP8 over bf16 | Memory per GPU |
+|---|---|---|---|---|
+| 8 (64) | 57.9 | 53.3 | 1.09x | 58.6 GB |
+| 16 (128) | 70.2 | 59.1 | 1.19x | 60.9 GB |
+| 32 (256) | 77.2 | 63.3 | 1.22x | 69.2 GB |
+| 40 (320) | 70.3 | 56.8 | 1.24x | 73.6 GB |
+
+The recipe uses 32 per GPU, the fastest setting measured. At 40 per GPU memory approaches the 80 GB limit and throughput drops for both precisions. For reference, the stock bf16 recipe (`qwen_image_t2i_flow.yaml`, micro-batch 5, global batch 40) reaches 47.5 samples/s, but that comparison also changes the batch size. These are single-seed, short runs.
+
+<Note>
+A larger global batch also changes the optimization. With about 1,100 images, a global batch of 256 is 4 optimizer steps per epoch, and at a fixed learning rate a larger global batch needed more samples to reach the same validation loss (global 128 against 64: 0.0947 against 0.0931 at about 2,000 samples). In a 512-step run of this recipe (128 epochs at global batch 256), FP8 ended 0.28% above bf16 in validation loss (0.08505 against 0.08482) and 2.6% above in average training loss (0.0901 against 0.0878), with the validation gap flat after step 128. Other batch sizes were checked only for throughput and finite training loss. For real training, consider scaling the learning rate (for example by the square root of the batch ratio) and the number of epochs, and validate; set `local_batch_size: 8` and `global_batch_size: 64` for the validated batch.
+</Note>
+
+<Note>
+The text-stream exclusion was chosen with captions of about 15 tokens, where those GEMMs are too small for FP8 to help. With long captions they are larger, so measure before keeping the exclusion.
+</Note>
 
 ## Prepare MagicBrush
 
