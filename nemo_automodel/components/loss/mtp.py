@@ -115,7 +115,7 @@ def calculate_mtp_loss(
     labels: torch.Tensor,
     model: nn.Module,
     scaling_factor: float = 0.1,
-    num_label_tokens: int | None = None,
+    num_label_tokens: int | torch.Tensor | None = None,
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
@@ -137,7 +137,7 @@ def calculate_mtp_loss(
     labels: torch.Tensor,
     model: nn.Module,
     scaling_factor: float = 0.1,
-    num_label_tokens: int | None = None,
+    num_label_tokens: int | torch.Tensor | None = None,
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
@@ -159,7 +159,7 @@ def calculate_mtp_loss(
     labels: torch.Tensor,
     model: nn.Module,
     scaling_factor: float = 0.1,
-    num_label_tokens: int | None = None,
+    num_label_tokens: int | torch.Tensor | None = None,
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
@@ -180,7 +180,7 @@ def calculate_mtp_loss(
     labels: torch.Tensor,
     model: nn.Module,
     scaling_factor: float = 0.1,
-    num_label_tokens: int | None = None,
+    num_label_tokens: int | torch.Tensor | None = None,
     ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
@@ -216,7 +216,7 @@ def calculate_mtp_loss(
         model: The wrapped model; used to fetch the shared LM head when the
             loss class needs materialized logits (non-FusedLinearCE path).
         scaling_factor: Coefficient applied to the summed per-depth CE.
-        num_label_tokens: Total non-ignore label-token count used for
+        num_label_tokens: Total non-ignore label-token count as an integer or device scalar used for
             sum-reduction normalization.
         ignore_index: Label value masked out of the CE loss for the trailing
             ``k+1`` rolled positions at depth ``k``. Defaults to the configured

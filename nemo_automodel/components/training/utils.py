@@ -682,7 +682,7 @@ def scale_grads_and_clip_grad_norm(
     ep_axis_name: str | None = None,
     pp_axis_name: str | None = None,
     foreach: bool = True,
-    num_label_tokens: int | None = None,
+    num_label_tokens: int | torch.Tensor | None = None,
     dp_group_size: int | None = None,
     expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
@@ -711,7 +711,7 @@ def scale_grads_and_clip_grad_norm(
         ep_axis_name: Expert axis in the parameter mesh.
         pp_axis_name: Pipeline axis in the training mesh.
         foreach: Whether to use foreach for in-place clipping.
-        num_label_tokens: Global supervised-token count for PP normalization.
+        num_label_tokens: Global supervised-token count as an integer or a device scalar for PP normalization.
         dp_group_size: Data-parallel group size, including CP when configured.
         expert_tp_replication_factor: Number of identical TP copies of expert tokens.
         use_torch_clip_grad_norm: Prefer PyTorch's regular-tensor clipping fast path.
@@ -724,10 +724,17 @@ def scale_grads_and_clip_grad_norm(
 
     # Precompute scale factors
     pp_divisor: float | None = None
+    pp_inverse: torch.Tensor | None = None
+    pp_inverse_float: torch.Tensor | None = None
     if pp_enabled and num_label_tokens is not None and dp_group_size is not None:
         if dp_group_size != 0:
-            candidate = num_label_tokens / dp_group_size
-            pp_divisor = float(candidate) if candidate != 0 else None
+            if isinstance(num_label_tokens, torch.Tensor):
+                divisor = num_label_tokens.to(torch.float64) / dp_group_size
+                pp_inverse = torch.where(num_label_tokens != 0, divisor, 1.0).reciprocal()
+                pp_inverse_float = pp_inverse.float()
+            else:
+                candidate = num_label_tokens / dp_group_size
+                pp_divisor = candidate if candidate != 0 else None
 
     if not isinstance(expert_tp_replication_factor, int) or isinstance(expert_tp_replication_factor, bool):
         raise TypeError("expert_tp_replication_factor must be an integer")
@@ -747,13 +754,21 @@ def scale_grads_and_clip_grad_norm(
     ep_param_ids = _ep_local_expert_param_ids(model_parts, ep_axis_name) if moe_mesh is not None else None
 
     # Single pass over parameters to apply both scalings where applicable
-    if pp_divisor is not None or ep_ratio is not None:
+    if pp_divisor is not None or pp_inverse is not None or ep_ratio is not None:
         for mp in model_parts:
             for p in mp.parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
+                elif pp_inverse is not None and pp_inverse_float is not None:
+                    grad = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+                    inverse = pp_inverse if grad.dtype == torch.float64 else pp_inverse_float
+                    # A scalar-tensor operand would narrow to BF16 or FP16 before multiplying.
+                    if grad.ndim:
+                        torch.mul(grad, inverse.expand_as(grad), out=grad)
+                    else:
+                        torch.mul(grad.unsqueeze(0), inverse.unsqueeze(0), out=grad.unsqueeze(0))
                 if ep_ratio is not None:
                     # Scale expert gradients by the FSDP/EP ratio and by any
                     # identical TP token replicas that were gathered inside EP.

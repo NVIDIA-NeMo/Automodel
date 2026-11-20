@@ -23,6 +23,7 @@ from torch.distributed.fsdp import FSDPModule
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.loss.token_normalization import normalize_token_loss
 
 
 def _validate_chunk_len(chunk_len: int) -> int:
@@ -267,7 +268,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
         lm_weight: torch.Tensor,
-        num_label_tokens: int | None = None,
+        num_label_tokens: int | torch.Tensor | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
         loss_weights: torch.Tensor | None = None,
         *,
@@ -284,7 +285,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             lm_weight: Weight shaped [vocab, hidden]; FSDP DTensors use the
                 LinearCrossEntropy.materialize_lm_weight contract. TP-sharded
                 vocabulary/hidden states are not supported by this loss.
-            num_label_tokens: Global count normalizing a sum-reduced loss.
+            num_label_tokens: Global count as an integer or a device scalar normalizing a sum-reduced loss.
             grad_reduce_group: DP/CP group contributing independent token losses.
             loss_weights: Optional constant multipliers shaped [...], sum only.
             mask: Optional mask shaped [...]; zero positions are ignored.
@@ -329,5 +330,5 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         if self.reduction == "mean":
             loss = loss / (labels != self.ignore_index).sum()
         if num_label_tokens is not None:
-            loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens
+            loss = normalize_token_loss(loss, num_label_tokens)
         return loss

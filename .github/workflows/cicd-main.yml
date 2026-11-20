@@ -493,13 +493,12 @@ jobs:
             timeout: 40
             shard-id: 1
             num-shards: 2
-          # Run cold Magi/TileLang compilation alongside the general unit shards.
-          # These functional parity checks remain required on every PR.
+          # Run kernel parity and the training step sync budget alongside the unit shards.
           - test-name: L0_Kernel_Parity_GPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             is-unit-test: false
             cpu-only: false
-            test-folder: kernel_parity
+            test-folder: kernel_parity,training/step_metrics
             timeout: 20
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}

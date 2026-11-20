@@ -34,7 +34,7 @@ def test_get_device_nccl_cpu(monkeypatch):
     We monkey-patch torch.distributed.get_backend -> 'nccl' and request rank 3.
     The returned torch.device must have type == 'cuda' and index == 3.
     """
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "nccl")
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group=None: "nccl")
 
     dev = sutils.get_device(local_rank=3)
     assert isinstance(dev, torch.device)
@@ -46,7 +46,7 @@ def test_get_device_gloo(monkeypatch):
     """
     get_device should return CPU when the backend is 'gloo'.
     """
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group=None: "gloo")
 
     dev = sutils.get_device()
     assert dev.type == "cpu"
@@ -56,7 +56,7 @@ def test_get_device_unknown_backend(monkeypatch):
     """
     An unsupported backend must raise RuntimeError.
     """
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "mpi")
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group=None: "mpi")
 
     with pytest.raises(RuntimeError):
         _ = sutils.get_device()
@@ -76,7 +76,7 @@ def fake_distributed(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "gloo")  # re-used by get_device
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group=None: "gloo")  # re-used by get_device
 
     # A no-op all_gather that simply copies the input tensor into every output slot
     def _fake_all_gather(out_list: list[torch.Tensor], in_tensor: torch.Tensor, *_args: Any, **_kw: Any) -> None:
@@ -92,7 +92,7 @@ def test_all_gather_item_collects_scalar(fake_distributed, monkeypatch):
     each rank.  We fake a two-rank world so the expected result is [42, 42].
     """
     # Ensure get_device inside all_gather_item picks CPU so CUDA is never used
-    monkeypatch.setattr(sutils, "get_device", lambda _rank=None: torch.device("cpu"))
+    monkeypatch.setattr(sutils, "get_device", lambda _rank=None, *, group=None: torch.device("cpu"))
 
     gathered = sutils.all_gather_item(42, dtype=torch.int64)
     assert gathered == [42, 42]
