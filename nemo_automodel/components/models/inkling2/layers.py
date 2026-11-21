@@ -84,6 +84,58 @@ class ResidualQuery(nn.Module):
         return residual_mix(state, self.weight, normalize_values=self.normalize_values)
 
 
+class MessageQueries(nn.Module):
+    """FP32 owner of the cross-pass message queries, two per loop core layer."""
+
+    def __init__(self, hidden_size: int, core_layers: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(2 * core_layers, hidden_size, dtype=torch.float32))
+
+    def forward(self) -> torch.Tensor:
+        """Return a copy of the queries.
+
+        Returns:
+            FP32 tensor of shape [2 * core_layers, hidden]. Layers read it after FSDP
+            has resharded the parameter, so it does not alias the parameter storage.
+        """
+        return self.weight.clone()
+
+
+class MessageController(nn.Module):
+    """Low-rank gate that mixes a message from the previous pass into one layer input."""
+
+    def __init__(self, hidden_size: int, rank: int, *, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.down_weight = nn.Parameter(torch.empty(rank, 2 * hidden_size, dtype=dtype))
+        self.gain_weight = nn.Parameter(torch.empty(hidden_size, rank, dtype=dtype))
+        self.forget_weight = nn.Parameter(torch.empty(hidden_size, rank, dtype=dtype))
+
+    @torch.no_grad()
+    def reset_parameters(self, init_std: float) -> None:
+        """Initialize the three projections without checkpoint data."""
+        for weight in (self.down_weight, self.gain_weight, self.forget_weight):
+            nn.init.normal_(weight, std=init_std)
+
+    def forward(self, destination: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
+        """Keep part of the destination and add part of the message, per channel and token.
+
+        Args:
+            destination: FP32 layer input of shape [batch, sequence, hidden].
+            message: FP32 message of shape [batch, sequence, hidden].
+
+        Returns:
+            FP32 tensor of shape [batch, sequence, hidden]. The inputs are unchanged.
+        """
+        normalized = torch.cat(
+            [value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6) for value in (destination, message)],
+            dim=-1,
+        )
+        hidden = F.linear(normalized.to(self.down_weight.dtype), self.down_weight).float()
+        gain = torch.tanh(F.linear(hidden, self.gain_weight.float()))
+        forget = torch.tanh(F.linear(hidden, self.forget_weight.float()))
+        return (1 - forget) * destination + gain * message
+
+
 def capped_swiglu(
     gate_up: torch.Tensor,
     weights: torch.Tensor,
