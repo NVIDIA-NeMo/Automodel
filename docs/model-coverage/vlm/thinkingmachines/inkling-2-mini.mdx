@@ -1,16 +1,16 @@
 ---
 title: "Inkling-2-Mini"
-description: "Fine-tune Inkling-2-Mini with NeMo AutoModel: MedPix full SFT, MedPix LoRA, and 128K packed Tulu 3 SFT with context parallelism on one node with four GB200 GPUs."
+description: "Fine-tune Inkling-2-Mini with NeMo AutoModel: MedPix full SFT, MedPix LoRA, and 128K packed Tulu 3 SFT with context parallelism on one node with 4 GB200 GPUs."
 slug: model-coverage/vision-language-models/thinkingmachines/Inkling-2-Mini
 ---
 
-[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is a vision-language
-Mixture-of-Experts (MoE) model from Thinking Machines Lab with 26B total and 5B active parameters. It
-accepts text and image inputs, generates text, and supports a context window of up to 1M tokens. It is
-a looped Inkling 2 model: twelve of its 24 decoder layers run three times for every token, and the
+NeMo AutoModel supports fine-tuning [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), a
+vision-language Mixture-of-Experts (MoE) model from Thinking Machines Lab with 26B total and 5B active
+parameters. It accepts text and image inputs, generates text, and supports a context window of up to 1M tokens. It is
+a looped Inkling 2 model: 12 of its 24 decoder layers run three times for every token, and the
 active-parameter count includes every pass.
 NeMo AutoModel provides two image-text recipes (`Inkling2ForConditionalGeneration`) and a text recipe
-(`Inkling2ForCausalLM`) for the released checkpoint. Each recipe runs on one node with four GPUs.
+(`Inkling2ForCausalLM`) for the released checkpoint. Each recipe runs on one node with 4 GPUs.
 
 <Note>
 The training loader dequantizes the NVFP4 and MXFP8 expert weights into floating-point storage, and the
@@ -21,8 +21,8 @@ the training scope of these recipes.
 
 ## Fine-Tune Inkling-2-Mini
 
-Follow the [installation instructions](/get-started/installation), then run a recipe from the
-repository root on a node with four GB200 GPUs. For example, launch the LoRA recipe:
+Follow the [installation instructions](/get-started/installation), and then run a recipe from the
+repository root on a node with 4 GB200 GPUs. For example, launch the LoRA recipe:
 
 ```bash
 automodel examples/vlm_finetune/inkling2/inkling2_mini_medpix_lora_ep4.yaml --nproc-per-node 4
@@ -35,7 +35,7 @@ automodel examples/vlm_finetune/inkling2/inkling2_mini_medpix_lora_ep4.yaml --np
 | Full image-text SFT on MedPix | [inkling2_mini_medpix_sft_ep4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_mini_medpix_sft_ep4.yaml) |
 | Image-text LoRA on MedPix | [inkling2_mini_medpix_lora_ep4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_mini_medpix_lora_ep4.yaml) |
 | 128K packed text SFT on Tulu 3 with context parallelism | [inkling2_mini_tulu3_packed128k_ep4_cp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_mini_tulu3_packed128k_ep4_cp4.yaml) |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Prepare your environment | [Installation instructions](/get-started/installation) |
 
 ### Configuration
 
@@ -52,7 +52,7 @@ automodel examples/vlm_finetune/inkling2/inkling2_mini_medpix_lora_ep4.yaml --np
 | Steps | 100 | 100 | 100 |
 
 All three recipes load `thinkingmachines/Inkling-2-Mini` and dequantize its NVFP4 and MXFP8 expert
-weights at load time (`checkpoint.dequantize_base_checkpoint: true`). They use flex attention,
+weights at load time (`checkpoint.dequantize_base_checkpoint: true`). They use FlexAttention,
 `torch_mm` experts with the HybridEP dispatcher and FP32 router gates, and full activation
 checkpointing. The output loss, `Inkling2FusedLinearCrossEntropy`, applies the logit soft cap of 30
 over the 200,058 usable vocabulary rows.
@@ -62,7 +62,7 @@ The text recipe builds `Inkling2ForCausalLM` from the image-text checkpoint thro
 
 W&B is opt-in: set `wandb.enable: true` and configure your entity and project when launching.
 
-The following table shows measurements of the three recipes over 100 steps on one node with four
+The following table shows measurements of the three recipes over 100 steps on one node with 4
 GB200 GPUs:
 
 | Recipe | First Loss | Mean Loss of the Last 10 Steps | Time per Step | Peak Memory per GPU |
@@ -98,7 +98,7 @@ holds one contiguous shard of the row, 32,768 tokens here.
 
 | Property | Value |
 | --- | --- |
-| Checkpoint | [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) |
+| Checkpoint | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) |
 | Architecture | `Inkling2LoopForConditionalGeneration` (`model_type: inkling2_loop`), loaded as `Inkling2ForConditionalGeneration`: a vision-language model with a routed Mixture-of-Experts decoder whose middle layers run three times |
 | Parameters | 26B total; 5B active per token, counting every pass through the looped layers |
 | Inputs | Text and images |
@@ -120,7 +120,7 @@ holds one contiguous shard of the row, 32,768 tokens here.
 
 Inkling-2-Mini is an Inkling 2 model with one change to how the layer stack runs. Layers 6-17 run
 three times for every token with the same weights, so 24 layers of weights give 48 layer visits.
-Layers 0-5 run once before the loop and layers 18-23 run once after it.
+Layers 0-5 run once before the loop, and layers 18-23 run once after it.
 
 Each later pass starts again from the state that entered layer 6 and reads the previous pass through
 messages. Every looped layer mixes a message into its attention query, key, and value inputs and
@@ -145,13 +145,11 @@ The recipes use the following distributed and kernel features:
 Pipeline parallelism and tensor parallelism greater than one are not available for this model.
 Packed context-parallel training covers text. Image-text training uses the non-packed path.
 
-See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared training options.
+Refer to the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared training options.
 
 ## Hugging Face Model Card
 
-View the model card for the checkpoint:
-
-- [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+View the model card for the [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) checkpoint.
 
 ## Related Resources
 
