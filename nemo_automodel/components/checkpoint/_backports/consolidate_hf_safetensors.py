@@ -16,6 +16,7 @@
 
 import concurrent.futures
 import glob
+import io
 import json
 import logging
 import math
@@ -48,6 +49,7 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+_CAST_CHUNK_BYTES = 8 * 1024 * 1024
 _DTYPE_CAST_ALIASES: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
@@ -461,30 +463,17 @@ def _process_output_file(
             if tensor_fqn_data.source_dtype_str == tensor_fqn_data.dtype_str:
                 output_stream.write(full_tensor_mv)
             else:
-                output_stream.write(
-                    _cast_tensor_bytes(
-                        full_tensor_mv,
-                        tensor_fqn_data.shape_in_file,
-                        tensor_fqn_data.source_dtype_str,
-                        tensor_fqn_data.dtype_str,
-                    )
-                )
+                _write_cast_tensor(output_stream, full_tensor_mv, tensor_fqn_data)
 
 
-def _cast_tensor_bytes(
-    tensor_bytes: memoryview,
-    tensor_shape: list[int],
-    source_dtype_str: str,
-    cast_dtype_str: str,
-) -> bytes:
-    """Cast a contiguous tensor byte buffer from its source dtype to the cast dtype."""
-    source_dtype = _get_known_dtype(source_dtype_str)
-    cast_dtype = _get_known_dtype(cast_dtype_str)
-    tensor = torch.frombuffer(tensor_bytes, dtype=source_dtype)
-    if tensor_shape:
-        tensor = tensor.reshape(tensor_shape)
-    cast_tensor = tensor.to(dtype=cast_dtype).contiguous()
-    return cast_tensor.view(torch.uint8).numpy().tobytes()
+def _write_cast_tensor(output_stream: io.BufferedWriter, tensor_bytes: memoryview, tensor_data: _FqnData) -> None:
+    """Write at most _CAST_CHUNK_BYTES of converted tensor data at a time."""
+    source_dtype = _get_known_dtype(tensor_data.source_dtype_str)
+    cast_dtype = _get_known_dtype(tensor_data.dtype_str)
+    source_chunk_bytes = (_CAST_CHUNK_BYTES // tensor_data.dtype_size) * tensor_data.source_dtype_size
+    for start in range(0, len(tensor_bytes), source_chunk_bytes):
+        chunk = torch.frombuffer(tensor_bytes[start : start + source_chunk_bytes], dtype=source_dtype)
+        output_stream.write(memoryview(chunk.to(cast_dtype).view(torch.uint8).numpy()))
 
 
 def _write_data(

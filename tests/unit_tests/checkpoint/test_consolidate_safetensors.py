@@ -124,7 +124,8 @@ def test_consolidate_writes_output_safetensors_without_append(tmp_path, monkeypa
 
 
 @pytest.mark.run_only_on("CPU")
-def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cast_dtype", [None, torch.float16])
+def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(tmp_path, monkeypatch, cast_dtype):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
     input_dir.mkdir()
@@ -172,13 +173,35 @@ def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(
         return real_open(file, mode, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", tracking_open)
-
-    consolidate_safetensors_files(
-        input_dir=str(input_dir),
-        output_dir=str(output_dir),
-        fqn_to_index_mapping={"linear.weight": 1, "norm.weight": 2},
-        num_threads=2,
+    # A five-element FP16 chunk crosses row and shard boundaries and leaves a short tail.
+    cast_chunk_bytes = 10
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors._CAST_CHUNK_BYTES", cast_chunk_bytes
     )
+    tensor_to = torch.Tensor.to
+
+    def bounded_to(tensor, *args, **kwargs):
+        """Check the temporary allocation for each dtype conversion.
+
+        Args:
+            tensor: CPU tensor of arbitrary shape in checkpoint element order.
+
+        Returns:
+            Tensor with the same shape and the requested dtype.
+        """
+        result = tensor_to(tensor, *args, **kwargs)
+        if result.dtype != tensor.dtype and result.nbytes > cast_chunk_bytes:
+            pytest.fail(f"Converted {result.nbytes} bytes at once (limit {cast_chunk_bytes})")
+        return result
+
+    with patch.object(torch.Tensor, "to", bounded_to):
+        consolidate_safetensors_files(
+            input_dir=str(input_dir),
+            output_dir=str(output_dir),
+            fqn_to_index_mapping={"linear.weight": 1, "norm.weight": 2},
+            num_threads=2,
+            cast_dtype=cast_dtype,
+        )
 
     # Stop tracking before verifying output to avoid counting read-opens from load_file().
     monkeypatch.setattr(builtins, "open", real_open)
@@ -187,6 +210,8 @@ def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(
     for file_name in expected_weight_map.values():
         output_tensors.update(load_file(output_dir / file_name))
 
+    if cast_dtype is not None:
+        expected_tensors["linear.weight"] = expected_tensors["linear.weight"].to(cast_dtype)
     assert set(output_tensors) == set(expected_tensors)
     for name, expected_tensor in expected_tensors.items():
         assert output_tensors[name].shape == expected_tensor.shape
