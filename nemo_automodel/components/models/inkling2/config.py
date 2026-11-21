@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
     from nemo_automodel.components.distributed.config import DistributedSetup
 
-    from .dspark import Inkling2DSparkModel, Inkling2DSparkOptions
+    from .dspark import Inkling2DSparkModel, Inkling2DSparkOptions, Inkling2MtpConfig
 
 
 class Inkling2QuantizationConfig(TypedDict):
@@ -417,7 +417,7 @@ class Inkling2Config(PretrainedConfig):
         *,
         text_config: Inkling2TextConfig | dict[str, Any] | None = None,
         vision_config: Inkling2VisionConfig | dict[str, Any] | None = None,
-        mtp_config: dict[str, Any] | None = None,
+        mtp_config: "Inkling2MtpConfig | None" = None,
         quantization_config: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None = None,
         **kwargs: Any,
     ) -> None:
