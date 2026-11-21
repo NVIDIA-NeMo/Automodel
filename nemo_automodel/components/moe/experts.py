@@ -1473,6 +1473,8 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
+    token_dispatcher: MoEFlexTokenDispatcher | None
+
     def __init__(
         self,
         config: MoEConfig,
@@ -1584,6 +1586,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
 
+        self.token_dispatcher = None
         self.expert_activation = get_expert_activation_for_deepep(config)
 
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
@@ -1660,6 +1663,8 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             empty probabilities use the configured compute dtype.
         """
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        if self.token_dispatcher is None:
+            raise RuntimeError("token_dispatcher is not initialized. Call init_token_dispatcher first.")
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,
             num_local_tokens=x.size(0),
@@ -1737,6 +1742,9 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             torch.Tensor: Output tensor after expert computation.
                 Shape is [num_tokens, model_dim]
         """
+        if self.token_dispatcher is None:
+            raise RuntimeError("token_dispatcher is not initialized. Call init_token_dispatcher first.")
+
         assert not isinstance(x, DTensor)
 
         assert self.n_routed_experts % self.ep_size == 0, (
