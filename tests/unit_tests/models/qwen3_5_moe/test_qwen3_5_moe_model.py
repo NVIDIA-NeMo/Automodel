@@ -430,18 +430,57 @@ class TestQwen3_5MoeModel:
         assert core.embed_tokens is core.language_model.embed_tokens
         assert core.norm is core.language_model.norm
 
-    def test_forward_text_only_forwards_input_ids_to_language_model(
+    def test_forward_text_only_embeds_before_language_model(self, vl_config, backend_config, moe_config, device):
+        """Text-only path embeds input_ids before entering language_model so the
+        FSDP2 unshard order (embed_tokens -> language_model) matches the
+        multimodal path."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 2, 3
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+        expected_embeds = core.embed_tokens(input_ids)
+
+        call_order = []
+        orig_embed_forward = core.embed_tokens.forward
+
+        def _tracked_embed(*args, **kwargs):
+            call_order.append("embed_tokens")
+            return orig_embed_forward(*args, **kwargs)
+
+        mock_output = MagicMock()
+        mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+
+        def _tracked_lang_forward(*args, **kwargs):
+            call_order.append("language_model")
+            return mock_output
+
+        with (
+            patch.object(core.embed_tokens, "forward", side_effect=_tracked_embed),
+            patch.object(core.language_model, "forward", side_effect=_tracked_lang_forward) as mock_lang_forward,
+        ):
+            core.forward(input_ids=input_ids)
+
+        assert call_order == ["embed_tokens", "language_model"]
+        call_kwargs = mock_lang_forward.call_args.kwargs
+        assert call_kwargs["input_ids"] is None
+        torch.testing.assert_close(call_kwargs["inputs_embeds"], expected_embeds)
+
+    def test_forward_text_only_forwards_input_ids_when_embed_tokens_absent(
         self, vl_config, backend_config, moe_config, device
     ):
-        """Text-only path passes integer input_ids straight to the backend language
-        model (which embeds internally), rather than pre-embedding here."""
+        """When get_input_embeddings() returns None, integer input_ids are still
+        forwarded to language_model so it can raise its pipeline-stage error."""
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         core = model.model
 
         batch, seq_len = 2, 3
         input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
 
-        with patch.object(core.language_model, "forward") as mock_lang_forward:
+        with (
+            patch.object(core.language_model, "get_input_embeddings", return_value=None),
+            patch.object(core.language_model, "forward") as mock_lang_forward,
+        ):
             mock_output = MagicMock()
             mock_output.last_hidden_state = torch.randn(
                 batch, seq_len, vl_config.text_config.hidden_size, device=device

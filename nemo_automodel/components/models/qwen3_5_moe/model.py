@@ -635,6 +635,12 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
         if input_ids is None and inputs_embeds is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
 
+        if inputs_embeds is None and input_ids is not None:
+            embed_tokens = getattr(self.language_model, "embed_tokens", None)
+            if embed_tokens is not None:
+                inputs_embeds = embed_tokens(input_ids)
+                input_ids = None
+
         outputs = self.language_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
