@@ -32,7 +32,7 @@ model:
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: fa4
     linear: te
     rms_norm: te
     rope_fusion: true
@@ -83,4 +83,6 @@ ci:
   nproc_per_node: 4
   perf_testing:
     schedule: nightly
+    # Fifty steps at this global batch take about three hours on GB200.
+    time: 04:00:00
     fake_balanced_gate: true

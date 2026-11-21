@@ -258,8 +258,17 @@ def _build_transformer_engine_fp8_recipe(
     *,
     amax_history_len: int,
     amax_compute_algo: str,
+    fprop_split_accumulator: bool = False,
 ) -> Any:
-    """Build a Transformer Engine FP8 recipe from CLI-friendly config values."""
+    """Build a Transformer Engine FP8 recipe from CLI-friendly config values.
+
+    Args:
+        recipe_name: One of ``delayed``, ``current`` or ``mxfp8``.
+        amax_history_len: Amax history length (``delayed`` recipe only).
+        amax_compute_algo: Amax reduction over the history (``delayed`` recipe only).
+        fprop_split_accumulator: Accumulate the forward FP8 GEMM with periodic fp32 promotion (``current`` recipe
+            only). Transformer Engine defaults this off for speed; Qwen-Image SFT needs it on to match bf16 loss.
+    """
     normalized_recipe_name = recipe_name.replace("-", "_").lower()
     if normalized_recipe_name in {"delayed", "delayed_scaling"}:
         available, delayed_scaling = safe_import_from(
@@ -279,7 +288,12 @@ def _build_transformer_engine_fp8_recipe(
         )
         if not available:
             raise ImportError("model.transformer_engine_fp8_recipe=current requires Float8CurrentScaling")
-        return current_scaling()
+        _, mm_params = safe_import_from(
+            "transformer_engine.common.recipe",
+            "MMParams",
+            msg="model.transformer_engine_fp8_recipe=current requires Transformer Engine MMParams",
+        )
+        return current_scaling(fp8_gemm_fprop=mm_params(use_split_accumulator=fprop_split_accumulator))
 
     if normalized_recipe_name in {"mxfp8", "mx", "mx_fp8"}:
         available, mxfp8_block_scaling = safe_import_from(
@@ -321,6 +335,7 @@ def build_diffusion_pipeline(
     attention_backend: str | None = None,
     transformer_engine_linear: bool = False,
     transformer_engine_fp8_safe_only: bool = False,
+    transformer_engine_fp8_exclude: tuple[str, ...] = (),
     fuse_qkv_projections: bool = False,
     compact_fused_qkv_projections: bool = False,
     pipeline_spec: Dict[str, Any] | None = None,
@@ -349,6 +364,7 @@ def build_diffusion_pipeline(
         attention_backend: Optional attention backend override.
         transformer_engine_linear: Whether to replace transformer torch.nn.Linear modules with Transformer Engine Linear.
         transformer_engine_fp8_safe_only: Whether to skip TE conversion for known FP8-incompatible modules.
+        transformer_engine_fp8_exclude: Name fragments of Linear modules to keep in high precision when FP8 is enabled.
         fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer before FSDP.
         compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
         pipeline_spec: Pipeline specification for pretraining (from_config).
@@ -422,6 +438,7 @@ def build_diffusion_pipeline(
             active_transformer=active_transformer,
             transformer_engine_linear=transformer_engine_linear,
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            transformer_engine_fp8_exclude=transformer_engine_fp8_exclude,
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
@@ -454,6 +471,7 @@ def build_diffusion_pipeline(
             components_to_load=["transformer"],
             transformer_engine_linear=transformer_engine_linear,
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            transformer_engine_fp8_exclude=transformer_engine_fp8_exclude,
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
@@ -557,6 +575,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.transformer_engine_fp8_amax_compute_algo = str(
             self.cfg.get("model.transformer_engine_fp8_amax_compute_algo", "max")
         )
+        self.transformer_engine_fp8_fprop_split_accumulator = bool(
+            self.cfg.get("model.transformer_engine_fp8_fprop_split_accumulator", False)
+        )
+        self.transformer_engine_fp8_exclude = tuple(self.cfg.get("model.transformer_engine_fp8_exclude", None) or ())
         self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
         self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
         self.optimize_hunyuan_flash_varlen_mask = bool(self.cfg.get("model.optimize_hunyuan_flash_varlen_mask", False))
@@ -590,6 +612,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.transformer_engine_fp8_recipe_name,
                 amax_history_len=self.transformer_engine_fp8_amax_history_len,
                 amax_compute_algo=self.transformer_engine_fp8_amax_compute_algo,
+                fprop_split_accumulator=self.transformer_engine_fp8_fprop_split_accumulator,
             )
             self._te_fp8_group = dist.group.WORLD if dist.is_initialized() else None
 
@@ -743,6 +766,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             ddp_cfg=ddp_cfg,
             transformer_engine_linear=self.transformer_engine_linear,
             transformer_engine_fp8_safe_only=self.transformer_engine_fp8,
+            transformer_engine_fp8_exclude=self.transformer_engine_fp8_exclude,
             fuse_qkv_projections=self.fuse_qkv_projections,
             compact_fused_qkv_projections=self.compact_fused_qkv_projections,
             attention_backend=self.attention_backend,

@@ -157,6 +157,15 @@ def test_dotted_get_set_contains():
     assert cfg.get("non.existent", default="sentinel") == "sentinel"
 
 
+def test_contains_matches_get_for_leaves_and_lists():
+    cfg = ConfigNode({"optimizer": {"lr": 0.1, "betas": [0.9, 0.95]}, "peft": None, "steps": 0})
+    for key in ("optimizer.lr", "optimizer.betas", "optimizer.betas.1", "optimizer.betas.-1", "peft", "steps"):
+        assert key in cfg
+    for key in ("optimizer.lr.foo", "optimizer.betas.7", "optimizer.betas.x", "peft.dim", "steps.max", "nope"):
+        assert key not in cfg
+        assert cfg.get(key, "sentinel") == "sentinel"
+
+
 def test_set_by_dotted_indexes_into_lists():
     cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.95]}, "ds": [{"path": "a"}, {"path": "b"}]})
 
