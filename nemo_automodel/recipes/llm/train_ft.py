@@ -185,6 +185,31 @@ def _should_pack_validation(
     )
 
 
+_LOSS_NORMALIZATIONS = ("per_token", "sum")
+
+
+def _get_loss_normalization(cfg: ConfigNode) -> str:
+    """Return how the training loss of one optimizer step is normalized.
+
+    ``per_token`` (the default) divides the summed token loss by the step's
+    global supervised-token count. ``sum`` leaves it unnormalized, so gradient
+    magnitude grows with the number of supervised tokens in the step.
+
+    Args:
+        cfg: Recipe config; reads the top-level ``loss_normalization`` key.
+
+    Returns:
+        ``"per_token"`` or ``"sum"``.
+
+    Raises:
+        ValueError: If ``loss_normalization`` names another mode.
+    """
+    mode = cfg.get("loss_normalization", "per_token")
+    if mode not in _LOSS_NORMALIZATIONS:
+        raise ValueError(f"loss_normalization must be one of {_LOSS_NORMALIZATIONS}, got {mode!r}")
+    return mode
+
+
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     # Probe the wrapped model's signature, head, and config; training still calls DDP.
@@ -526,7 +551,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
+            NotImplementedError: If ``loss_normalization`` is not ``per_token`` and a subclass
+                overrides the training step that implements it.
+            ValueError: If ``loss_normalization`` names an unknown mode.
         """
+        self.loss_normalization = _get_loss_normalization(self.cfg)
+        if (
+            self.loss_normalization != "per_token"
+            and type(self)._run_train_optim_step is not TrainFinetuneRecipeForNextTokenPrediction._run_train_optim_step
+        ):
+            raise NotImplementedError(f"{type(self).__name__} supports only loss_normalization: per_token")
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = initialize_distributed(
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
@@ -1568,6 +1602,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        # Divisor applied to the summed token loss before backward (or to the
+        # gradients under PP). The reported loss stays a per-token mean either way.
+        sum_loss = self.loss_normalization == "sum"
+        loss_denominator = 1 if sum_loss else num_label_tokens
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1604,7 +1642,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             domain_label_counts = self._dp_allreduce(domain_label_counts)
 
         num_batches = len(batches)
-        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=loss_denominator)
 
         loss_buffer = []
 
@@ -1625,7 +1663,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
             self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                i, batch, loss_buffer=loss_buffer, num_label_tokens=loss_denominator, num_batches=num_batches
             )
 
             if i == 0:
@@ -1644,7 +1682,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_label_tokens,
+            num_label_tokens=loss_denominator,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
             grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
@@ -1690,6 +1728,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # fp32 zeros. Every PP broadcast participant needs the same dtype.
             reporting_loss = reporting_loss.float()
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+        if sum_loss and not self.pp_enabled:
+            reporting_loss = reporting_loss / max(num_label_tokens, 1)
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
