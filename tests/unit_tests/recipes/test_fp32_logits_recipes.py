@@ -46,6 +46,8 @@ _VOCAB = 128
 
 @pytest.fixture(autouse=True)
 def _cpu_current_device(monkeypatch):
+    # Build on the CPU on GPU machines too: setup checks the CUDA device when CUDA is available.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
 
 

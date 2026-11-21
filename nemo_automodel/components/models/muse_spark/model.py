@@ -456,7 +456,12 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             already-local activations. No per-batch mode is needed to size them.
         """
         residual_dtype = _residual_dtype(self.config)
-        output_dtype = residual_dtype if self.lm_head is None else (self.lm_head.logits_dtype or dtype)
+        if self.lm_head is None:
+            output_dtype = residual_dtype
+        elif getattr(self, "_pp_return_hidden_states", False) is True:  # the final norm's output, not logits
+            output_dtype = residual_dtype if self.config.use_fp32_for_output else dtype
+        else:
+            output_dtype = self.lm_head.logits_dtype or dtype
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         local_seq_len = seq_len
         if cp_size > 1:

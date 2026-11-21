@@ -507,7 +507,8 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
             logits = logits / self.final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * self.final_logit_softcapping
-        return logits
+        # The softcap runs in FP32; the logits leave in the head's logits_dtype, FP32 by default.
+        return logits.to(self.lm_head.logits_dtype or torch.float32)
 
     def forward(
         self,

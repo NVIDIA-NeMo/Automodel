@@ -484,8 +484,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
         primary_shape = vocab_shape if self.lm_head is not None else hidden_shape
         mtp_shape = vocab_shape if self.lm_head is not None else hidden_shape
+        # Only the primary logits pass through the LMHead; the MTP heads' logits stay in the compute dtype.
         out_dtype = (self.lm_head.logits_dtype or dtype) if self.lm_head is not None else dtype
-        outputs_meta = (meta(primary_shape).to(out_dtype), *(meta(mtp_shape).to(out_dtype) for _ in range(mtp_depth)))
+        outputs_meta = (meta(primary_shape).to(out_dtype), *(meta(mtp_shape) for _ in range(mtp_depth)))
         return inputs_meta, outputs_meta
 
     def _is_pipeline_parallel_stage(self) -> bool:
@@ -734,8 +735,10 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 mtp_kwargs["embed_fn"] = self.model.language_model.embed_tokens
             mtp_per_depth_logits = self.mtp(**mtp_kwargs)
         elif pp_mtp_enabled and self.lm_head is not None:
+            # Placeholders for the MTP heads' logits, in their compute dtype like the stage metadata.
             mtp_per_depth_logits = [
-                logits.new_empty(logits.shape) for _ in range(int(getattr(self.mtp_config, "num_layers", 0) or 0))
+                hidden_states.new_empty(logits.shape)
+                for _ in range(int(getattr(self.mtp_config, "num_layers", 0) or 0))
             ]
 
         if is_pp_stage:

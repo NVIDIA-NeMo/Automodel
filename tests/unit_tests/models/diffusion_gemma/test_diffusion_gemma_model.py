@@ -105,6 +105,21 @@ def test_construct_and_forward_shape():
     assert torch.isfinite(out.logits).all()
 
 
+@pytest.mark.parametrize("logits_dtype", [None, torch.bfloat16, torch.float32])
+def test_forward_returns_the_requested_logits_dtype(logits_dtype):
+    """The softcap runs in FP32; the logits leave in the head's logits_dtype, FP32 by default."""
+    torch.manual_seed(0)
+    model, _ = _tiny_model()
+    model.train()
+    model.lm_head.logits_dtype = logits_dtype
+    clean = torch.randint(0, 64, (1, 8))
+    masks = _masks(model, 1, 8, 4, clean.device)
+
+    out = model(input_ids=clean, canvas_ids=clean.clone(), decoder_attention_mask=masks, do_self_conditioning=True)
+
+    assert out.logits.dtype == out.encoder_logits.dtype == (logits_dtype or torch.float32)
+
+
 def test_tie_weights_restores_lm_head_alias():
     model, _ = _tiny_model()
     model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())

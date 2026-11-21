@@ -355,6 +355,13 @@ def test_pipeline_fused_head_metadata_uses_cp_local_hidden_size() -> None:
     assert fused[0].dtype == torch.bfloat16
     with pytest.raises(ValueError, match="labels to be passed to the pipeline loss"):
         model(input_ids=torch.ones(1, 4, dtype=torch.long), labels=torch.ones(1, 4, dtype=torch.long))
+    # FP32 logits do not change the hidden states that the fused loss receives instead of logits.
+    model.lm_head.logits_dtype = torch.float32
+    _, fused = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=64, dtype=torch.bfloat16)
+    assert fused[0].dtype == torch.bfloat16
+    model._pp_return_hidden_states = False
+    _, ordinary = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=64, dtype=torch.bfloat16)
+    assert ordinary[0].dtype == torch.float32
 
 
 def test_vlm_pipeline_fused_loss_receives_hidden_states() -> None:

@@ -339,6 +339,20 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     assert all(o.shape[1] == 4 for o in outs)
 
 
+def test_get_pipeline_stage_metas_declares_fp32_logits_for_the_primary_head_only():
+    """FP32 logits come from the LMHead; the MTP heads' logits stay in the compute dtype."""
+    from nemo_automodel.components.models.common.mtp.mtp import MTPConfig
+
+    wrapper, _ = _wrapper_with_fake_inner()
+    text_config = wrapper.config.text_config
+    wrapper.lm_head = LMHead(text_config.hidden_size, text_config.vocab_size, logits_dtype=torch.float32)
+    wrapper.mtp_config = MTPConfig(num_layers=2)
+
+    _, outs = wrapper.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.bfloat16)
+
+    assert [o.dtype for o in outs] == [torch.float32, torch.bfloat16, torch.bfloat16]
+
+
 def test_forward_consumes_pp_vlm_chunks_and_drops_mismatched_masks(monkeypatch):
     wrapper, fake_inner = _wrapper_with_fake_inner()
     monkeypatch.setenv("NEMO_STEP3P7_DEBUG_VISION", "1")

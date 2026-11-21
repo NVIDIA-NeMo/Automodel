@@ -932,12 +932,8 @@ if _HF_MISTRAL3_AVAILABLE:
                 lm = self.lm_head
             except (AttributeError, TypeError):
                 lm = None
-            logits = lm(hidden_states) if lm is not None else hidden_states
-
-            if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
-                logits = logits.unsqueeze(0)
-
-            return logits
+            # The decoder restores the batch axis of packed (THD) input: hidden states are [1, tokens, hidden].
+            return lm(hidden_states) if lm is not None else hidden_states
 
         def update_moe_gate_bias(self) -> None:
             with torch.no_grad():

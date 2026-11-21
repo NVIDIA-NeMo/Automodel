@@ -37,6 +37,8 @@ def _is_fp32_logits_head(head: nn.Module) -> bool:
 
 @pytest.fixture(autouse=True)
 def _cpu_current_device(monkeypatch):
+    # Build on the CPU on GPU runners too: the checkpoint loader queries the CUDA device when CUDA is available.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
 
 
@@ -150,12 +152,14 @@ def test_hugging_face_models_ignore_logits_dtype_with_a_warning(config, caplog):
     torch.manual_seed(0)
     with caplog.at_level(logging.WARNING):
         model = NeMoAutoModelForCausalLM.from_config(
-            # Liger kernels would replace the HF norms with Triton kernels that cannot run on CPU.
+            # Liger kernels would replace the HF norms with Triton kernels that cannot run on CPU, and the default
+            # attention is FlashAttention 2 wherever flash-attn is installed.
             config,
             force_hf=True,
             torch_dtype=torch.bfloat16,
             logits_dtype="float32",
             use_liger_kernel=False,
+            attn_implementation="eager",
         )
 
     assert "logits_dtype is ignored" in caplog.text

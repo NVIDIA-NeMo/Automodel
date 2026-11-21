@@ -195,6 +195,27 @@ def _check_biased_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, up
     torch.testing.assert_close(head.bias.grad.full_tensor(), reference.bias.grad)
 
 
+def _check_gemma4_tied_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor) -> None:
+    """Check that Gemma 4's E-series tensor parallelism projects its vocabulary-sharded head with FP32 logits.
+
+    Args:
+        hidden: BF16 tensor of shape [batch, sequence, hidden], identical on every rank.
+        weight: BF16 tensor of shape [vocab, hidden], identical on every rank.
+    """
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
+
+    mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("tp",))
+    head = _head(True, weight)
+    head.weight = nn.Parameter(distribute_tensor(head.weight.detach(), mesh, [Shard(0)]))
+    # The E-series plan leaves the tied head's module hooks unused and calls it through this method.
+    model = SimpleNamespace(lm_head=head, _gemma4_tp_enabled=True, _gemma4_tp_mesh=mesh)
+    logits = Gemma4ForConditionalGeneration._dense_parallel_lm_head(model, hidden, 0)
+    assert logits.dtype == torch.float32 and logits.placements == (Shard(2),)
+    torch.testing.assert_close(logits.full_tensor(), _head(True, weight)(hidden), rtol=1e-6, atol=1e-6)
+
+
 class _TinyLM(nn.Module):
     """Embedding followed by an FP32-logits head, optionally sharing one weight."""
 
@@ -314,6 +335,7 @@ def _worker(rank: int, port: int) -> None:
         _check_tensor_parallel(hidden, uneven_weight.bfloat16(), uneven_upstream)
         _check_weight_layouts(hidden, weight.bfloat16(), upstream)
         _check_biased_tensor_parallel(hidden, weight.bfloat16(), upstream)
+        _check_gemma4_tied_tensor_parallel(hidden, weight.bfloat16())
         _check_fsdp(weight, input_ids, labels)
         _check_fsdp_head_casts_its_own_input(weight, hidden.float())
     finally:

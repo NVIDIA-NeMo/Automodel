@@ -388,7 +388,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             input_ids: Long tensor of shape [batch, sequence].
 
         Returns:
-            fp32 tensor of shape [batch, sequence, vocab].
+            Tensor of shape [batch, sequence, vocab] in the head's ``logits_dtype``, FP32 by default.
         """
         _, seq_len = input_ids.shape
         cos, sin = rope_cos_sin(
@@ -397,7 +397,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             self.config.rope_theta,
         )
         hidden = self.model(self.model.embed_tokens(input_ids), cos, sin)
-        return self.lm_head(self.model.norm(hidden)).float()
+        return self.lm_head(self.model.norm(hidden)).to(self.lm_head.logits_dtype or torch.float32)
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():

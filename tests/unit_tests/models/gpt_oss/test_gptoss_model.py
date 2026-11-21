@@ -23,6 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 
 @pytest.fixture
@@ -402,13 +403,7 @@ class TestGptOssForCausalLM:
             assert output.device == device
 
     def test_forward_thd_unsqueeze(self, gpt_config, backend_config, device):
-        """Test that THD format produces 3D logits with unsqueezed batch dimension.
-
-        When qkv_format='thd' is used (sequence packing with TE attention),
-        the model squeezes [1, T] inputs to [T] via squeeze_input_for_thd,
-        producing 2D [T, V] logits. The forward method must unsqueeze to
-        [1, T, V] to match the expected 3D batch format.
-        """
+        """THD input [1, T]: the decoder's layers see [T, H], and logits and hidden states keep the [1, T] batch."""
         model = GptOssForCausalLM(gpt_config, backend=backend_config)
         model = model.to(device)
 
@@ -418,30 +413,18 @@ class TestGptOssForCausalLM:
         position_ids = torch.arange(total_tokens, device=device).unsqueeze(0)
         cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32, device=device)
 
-        with patch.object(model.model, "forward") as mock_model:
-            # After squeeze_input_for_thd, input is 1D [T], so backbone returns [T, H]
-            mock_model.return_value = torch.randn(
-                total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
-            )
+        output, layer_inputs = run_with_passthrough_layers(
+            model,
+            input_ids,
+            position_ids=position_ids,
+            qkv_format="thd",
+            cu_seqlens=cu_seqlens,
+            output_hidden_states=True,
+        )
 
-            output = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                cu_seqlens=cu_seqlens,
-                output_hidden_states=True,
-            )
-
-            # Logits must be 3D [1, T, V] after unsqueeze
-            assert output.logits.ndim == 3
-            assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
-            assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
-
-            # Verify backbone received squeezed 1D input_ids
-            call_args = mock_model.call_args
-            actual_input_ids = call_args[0][0]
-            assert actual_input_ids.ndim == 1
-            assert actual_input_ids.shape[0] == total_tokens
+        assert layer_inputs and all(shape == (total_tokens, gpt_config.hidden_size) for shape in layer_inputs)
+        assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
+        assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
 
     def test_forward_non_thd_no_unsqueeze(self, gpt_config, backend_config, device):
         """Test that non-THD forward does not add extra dimensions."""
@@ -473,11 +456,11 @@ class TestGptOssForCausalLM:
         attention_mask = torch.ones(1, total_tokens, dtype=torch.bool, device=device)
         cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32, device=device)
 
-        with patch.object(model.model, "forward") as mock_model:
-            mock_model.return_value = torch.randn(
-                total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
-            )
-
+        with ExitStack() as stack:
+            layer_forwards = [
+                stack.enter_context(patch.object(layer, "forward", side_effect=lambda hidden, **kwargs: hidden))
+                for layer in model.model.layers.values()
+            ]
             output = model(
                 input_ids,
                 position_ids=position_ids,
@@ -486,13 +469,12 @@ class TestGptOssForCausalLM:
                 output_hidden_states=True,
             )
 
-        actual_input_ids = mock_model.call_args.args[0]
-        actual_kwargs = mock_model.call_args.kwargs
-        assert actual_input_ids.shape == (total_tokens,)
-        assert actual_kwargs["position_ids"].shape == (total_tokens,)
-        assert actual_kwargs["attention_mask"] is None
-        assert actual_kwargs["qkv_format"] == "thd"
-        assert torch.equal(actual_kwargs["cu_seqlens"], torch.tensor([0, 8, 16], dtype=torch.int32, device=device))
+        # The decoder selects THD from the offsets: its layers see packed [T, H] states and THD kwargs.
+        layer_args, layer_kwargs = layer_forwards[0].call_args
+        assert layer_args[0].shape == (total_tokens, gpt_config.hidden_size)
+        assert layer_kwargs["attention_mask"] is None
+        assert layer_kwargs["qkv_format"] == "thd"
+        assert torch.equal(layer_kwargs["cu_seqlens"], torch.tensor([0, 8, 16], dtype=torch.int32, device=device))
         assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
         assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
 
@@ -794,8 +776,8 @@ class TestGptOssModelTHD:
                     )
 
                 output = model(input_ids, qkv_format="thd")
-                # Should not crash — 1D input_ids handled correctly
-                assert output.shape == (total_tokens, gpt_config.hidden_size)
+                # Should not crash — 1D input_ids handled correctly; packed output keeps the [1, T] batch layout
+                assert output.shape == (1, total_tokens, gpt_config.hidden_size)
 
     def test_2d_input_ids_generates_2d_position_ids(self, gpt_config, backend_config, device):
         """Standard 2D [B, S] input should still generate 2D position_ids."""

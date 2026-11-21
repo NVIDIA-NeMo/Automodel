@@ -51,11 +51,10 @@ _NEEDS_MODULE = {
     "KimiK31ForConditionalGeneration": "fla",
     "KimiK3ForCausalLM": "fla",
     "KimiK3ForConditionalGeneration": "fla",
-    "NemotronParseForConditionalGeneration": "timm",
 }
 
 # Construction needs the checkpoint's remote-code configuration (vision and audio encoders).
-_NEEDS_CHECKPOINT = {"NemotronOmniForConditionalGeneration"}
+_NEEDS_CHECKPOINT = {"NemotronOmniForConditionalGeneration", "NemotronParseForConditionalGeneration"}
 
 
 def _helper(path: str) -> Callable[..., PretrainedConfig]:
@@ -76,6 +75,12 @@ def _mistral_large4_vlm_config() -> PretrainedConfig:
 def _registry_config(model_type: str, **kwargs: object) -> PretrainedConfig:
     module, name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]
     return getattr(importlib.import_module(module), name)(**kwargs)
+
+
+def _eager_vision(config: PretrainedConfig) -> PretrainedConfig:
+    """Select eager vision attention: FlashAttention 2, the default, raises at construction without CUDA."""
+    config.vision_config._attn_implementation = "eager"
+    return config
 
 
 # Classes whose default config does not build. Prefer the tiny config of the model's own tests.
@@ -103,6 +108,8 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     "Glm4MoeLiteForCausalLM": Glm4MoeLiteConfig,
     "HYV3ForCausalLM": lambda: _registry_config("hy_v3"),
     "HyMT2ForCausalLM": HyMT2Config,
+    "KimiK31ForConditionalGeneration": lambda: _eager_vision(_registry_config("kimi_k31")),
+    "KimiK3ForConditionalGeneration": lambda: _eager_vision(_registry_config("kimi_k3")),
     "KimiLinear48BForCausalLM": lambda: _helper("tests.unit_tests.models.kimi_linear.test_model:_tiny_kimi_config")(),
     "KimiVLForConditionalGeneration": lambda: _registry_config("kimi_vl"),
     "MiniMaxM2ForCausalLM": MiniMaxM2Config,
@@ -111,13 +118,6 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     "Mistral4ForCausalLM": lambda: _registry_config("mistral4"),
     "MistralLarge4ForConditionalGeneration": _mistral_large4_vlm_config,
     "NemotronHForCausalLM": NemotronHConfig,
-    "NemotronParseForConditionalGeneration": lambda: importlib.import_module(
-        "nemo_automodel.components.models.nemotron_parse.model"
-    ).NemotronParseConfig(
-        encoder={"patch_size": 16, "max_resolution": 64},
-        decoder={"vocab_size": 64, "d_model": 32, "encoder_attention_heads": 4, "decoder_attention_heads": 4},
-        max_sequence_length=32,
-    ),
     "Qwen3_8_FlashNextForConditionalGeneration": lambda: _helper(
         "tests.unit_tests.models.qwen3_8_flash_next.test_qsa_route_replay:_tiny_config"
     )(),

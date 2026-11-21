@@ -1635,18 +1635,16 @@ class Gemma4ForConditionalGeneration(
         """
         selected_hidden_states = slice_logits_to_keep(hidden_states, logits_to_keep)
         if getattr(self, "_gemma4_tp_enabled", False) and isinstance(self.lm_head.weight, DTensor):
-            # The tied vocabulary shard is invoked through F.linear rather than
-            # lm_head.forward (the latter still owns pre-TP module hooks). Match
-            # the shared weight's effective dtype explicitly, mirroring the
-            # input cast in LMHead.linear for other heads.
-            selected_hidden_states = selected_hidden_states.to(self.lm_head.weight.dtype)
+            # The tied vocabulary shard is projected through LMHead.project rather
+            # than lm_head.forward (the latter still owns pre-TP module hooks), so
+            # the head's logits_dtype applies and the input is cast to the weight's dtype.
             replicated_hidden_states = DTensor.from_local(
                 selected_hidden_states,
                 device_mesh=self._gemma4_tp_mesh,
                 placements=(Replicate(),),
                 run_check=False,
             )
-            return F.linear(replicated_hidden_states, self.lm_head.weight)
+            return self.lm_head.project(replicated_hidden_states, self.lm_head.weight)
         return hidden_states if self.lm_head is None else self.lm_head(selected_hidden_states)
 
     def _get_special_image_mask(
