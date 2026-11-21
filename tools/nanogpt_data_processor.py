@@ -245,12 +245,17 @@ class BinaryDataWriter:
         """
         Write tokens to the binary and index files.
 
+        The BOS index stores int32 token positions within the shard (indices into
+        the token array that follows the header), which is what
+        ``NanogptDataset`` reads back. Both the header token count and the index
+        are int32, so a shard holds fewer than 2**31 tokens.
+
         Args:
             tokens: np.ndarray | list
-                Tokens to write to the binary and index files.
+                Token ids of shape [tokens].
 
         Returns:
-            int: Number of tokens written.
+            int: Number of bytes written.
         """
         if self.bin_fp is None:
             self.bin_fp, self.idx_fp = self._write_header()
@@ -262,14 +267,16 @@ class BinaryDataWriter:
             )
             tokens = tokens.astype(self.dtype)
 
-        pos = self.bin_fp.tell()
-        assert pos + tokens.size * self.dtype.itemsize < 2**32 - 1, "token count too large"
+        start = self.items_written
+        if start + tokens.size >= 2**31:
+            raise ValueError("token count exceeds the int32 range of the shard header and BOS index")
         # write chunk tokens
         tok_bytes = tokens.tobytes()
         self.bin_fp.write(tok_bytes)
 
-        # write BOS index
-        self.idx_fp.write((pos + np.where(tokens == self.bos_token_id)[0].astype(np.int32)).tobytes())
+        # write BOS index as token positions, computed in int64 before the int32 cast
+        bos_positions = start + np.flatnonzero(tokens == self.bos_token_id)
+        self.idx_fp.write(bos_positions.astype(np.int32).tobytes())
         self.bytes_written += len(tok_bytes)
         return len(tok_bytes)
 
