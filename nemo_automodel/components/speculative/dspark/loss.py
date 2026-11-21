@@ -67,15 +67,26 @@ def _compute_l1_dist_per_token(
     aligned_target_logits: torch.Tensor,
     chunk_size: int = _PROBABILITY_CHUNK_TOKENS,
 ) -> torch.Tensor:
-    """Compute exact FP32 probability L1 distances without full-vocab temporaries."""
+    """Compute exact FP32 probability L1 distances without full-vocab temporaries.
+
+    The rows are chunked with ``torch.split`` rather than slicing: the backward of
+    one split concatenates the chunk gradients once, while each slice's backward
+    builds and accumulates its own full-size gradient.
+
+    Args:
+        draft_logits: Draft logits of shape [..., vocab].
+        aligned_target_logits: Target logits of the same shape as ``draft_logits``.
+        chunk_size: Rows per FP32 probability chunk.
+
+    Returns:
+        Per-token L1 distances of shape ``draft_logits.shape[:-1]``.
+    """
     output_shape = draft_logits.shape[:-1]
     vocab_size = draft_logits.shape[-1]
     flat_draft = draft_logits.reshape(-1, vocab_size)
     flat_target = aligned_target_logits.reshape(-1, vocab_size)
     distances = []
-    for start in range(0, flat_draft.shape[0], chunk_size):
-        draft_chunk = flat_draft[start : start + chunk_size]
-        target_chunk = flat_target[start : start + chunk_size]
+    for draft_chunk, target_chunk in zip(flat_draft.split(chunk_size), flat_target.split(chunk_size)):
         if torch.is_grad_enabled() and draft_chunk.requires_grad:
             distance = checkpoint(
                 _l1_probability_distance_chunk,
