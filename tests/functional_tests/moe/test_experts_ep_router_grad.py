@@ -22,12 +22,17 @@ silently leaves the router trainable only through auxiliary losses.
 
 The NCCL LoRA variant also covers unequal per-rank token counts and checks its
 sharded adapter gradients against a single-process fp32 reference.
+
+Post-down routing additionally checks the loop and native grouped-MM backends
+against a dense, single-process fp32 oracle, including ranks with no input tokens
+or no local expert routes. No DeepEP installation or transport mocks are used.
 """
 
 from __future__ import annotations
 
 import os
 import socket
+import time
 from datetime import timedelta
 
 import pytest
@@ -35,10 +40,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
 
@@ -98,18 +105,18 @@ def _global_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Te
     return x, weights, indices, token_mask
 
 
-def _build_experts(config: MoEConfig) -> GroupedExperts:
+def _build_experts(config: MoEConfig, backend: BackendConfig | None = None) -> GroupedExperts:
     generator = torch.Generator().manual_seed(4321)
-    experts = GroupedExperts(config)
+    experts = GroupedExperts(config, backend=backend)
     with torch.no_grad():
         experts.gate_and_up_projs.copy_(torch.randn(experts.gate_and_up_projs.shape, generator=generator) * 0.05)
         experts.down_projs.copy_(torch.randn(experts.down_projs.shape, generator=generator) * 0.05)
     return experts
 
 
-def _build_lora_experts(config: MoEConfig) -> GroupedExpertsLoRA:
+def _build_lora_experts(config: MoEConfig, backend: BackendConfig | None = None) -> GroupedExpertsLoRA:
     """Build experts with deterministic, nonzero LoRA weights."""
-    experts = GroupedExpertsLoRA(_build_experts(config), lora_dim=_LORA_DIM, alpha=8)
+    experts = GroupedExpertsLoRA(_build_experts(config, backend), lora_dim=_LORA_DIM, alpha=8)
     generator = torch.Generator().manual_seed(9876)
     with torch.no_grad():
         for name in _LORA_PARAM_NAMES:
@@ -278,3 +285,170 @@ def test_ep_all_gather_propagates_router_weight_gradients():
 def test_lora_ep_ragged_forward_backward_matches_reference():
     world_size = len(_TOKENS_PER_RANK)
     mp.spawn(_lora_ep_ragged_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+
+
+def _dense_post_down_reference(
+    experts: GroupedExpertsLoRA,
+    x: torch.Tensor,
+    token_mask: torch.Tensor,
+    router_logits: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate every expert with merged LoRA weights, without sparse dispatch.
+
+    Args:
+        experts: Unsharded fp32 experts with gate/up weights [experts, hidden,
+            2 * intermediate], down weights [experts, intermediate, hidden],
+            and their matching low-rank adapters.
+        x: Global fp32 tensor of shape [tokens, hidden].
+        token_mask: Global boolean tensor of shape [tokens].
+        router_logits: Global fp32 tensor of shape [tokens, experts].
+        indices: Global integer expert IDs of shape [tokens, top_k].
+
+    Returns:
+        FP32 output [tokens, hidden] and selected routing probabilities
+        [tokens, top_k], on x's device. No inputs are mutated.
+    """
+    gate_up = experts.gate_and_up_projs + experts.scale * (experts.lora_gate_and_up_A @ experts.lora_gate_and_up_B)
+    down = experts.down_projs + experts.scale * (experts.lora_down_A @ experts.lora_down_B)
+    gate, up = torch.einsum("th,ehi->tei", x, gate_up).chunk(2, dim=-1)
+    all_outputs = torch.einsum("tei,eih->teh", F.silu(gate) * up, down)
+    selected = all_outputs.gather(1, indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+    weights = router_logits.softmax(dim=-1).gather(1, indices)
+    return (selected * weights.unsqueeze(-1)).sum(dim=1) * token_mask.unsqueeze(-1), weights
+
+
+def _lora_post_down_ep_worker(rank: int, port: int, backend_name: str, route_case: str) -> None:
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = "2"
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+        dist.init_process_group("nccl", rank=rank, world_size=2, timeout=timedelta(seconds=60))
+
+        dtype = torch.bfloat16 if backend_name == "torch_mm" else torch.float32
+        config = _tiny_moe_config()
+        config.apply_router_weight_after_down = True
+        backend = BackendConfig(experts=backend_name, dispatcher="torch")
+        experts = _build_lora_experts(config, backend).to(device=device, dtype=dtype)
+        # Round parameters to the compute dtype before the fp32 oracle, so the
+        # comparison measures compute/reduction error, not initial quantization.
+        reference = _build_lora_experts(config).to(dtype=dtype).float().to(device)
+        tokens_per_rank = (0, 5) if route_case == "zero_token_rank" else _TOKENS_PER_RANK
+        generator = torch.Generator().manual_seed(4567)
+        x = torch.randn(5, _DIM, generator=generator).to(device=device, dtype=dtype)
+        logits = torch.randn(5, _N_EXPERTS, generator=generator).to(device)
+        # Expert 3 receives no routes; expert 2 receives far fewer than expert 0.
+        indices = torch.tensor([[0, 2], [0, 1], [0, 2], [1, 0], [0, 1]], device=device)
+        if route_case == "no_local_routes":
+            indices = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0], [0, 1]], device=device)
+        # Make the chosen routes actual top-k choices, with nonuniform scores.
+        logits.scatter_add_(1, indices, torch.full((5, _TOP_K), 8.0, device=device))
+        indices = logits.topk(_TOP_K, dim=-1).indices
+        token_mask = torch.ones(5, dtype=torch.bool, device=device)
+        if route_case == "fully_masked":
+            token_mask.zero_()
+        output_grad = torch.randn(5, _DIM, generator=generator).to(device=device, dtype=dtype)
+
+        ref_x = x.float().detach().requires_grad_(True)
+        ref_logits = logits.detach().clone().requires_grad_(True)
+        y_ref, ref_weights = _dense_post_down_reference(reference, ref_x, token_mask, ref_logits, indices)
+        ref_weights.retain_grad()
+        y_ref.backward(output_grad.float())
+
+        ep_mesh = init_device_mesh("cuda", (2,), mesh_dim_names=("ep",))
+        for name, param in list(experts.named_parameters(recurse=False)):
+            experts.register_parameter(
+                name,
+                nn.Parameter(
+                    distribute_tensor(param.detach(), ep_mesh, [Shard(0)]),
+                    requires_grad=param.requires_grad,
+                ),
+            )
+        assert experts.use_torch_mm == (backend_name == "torch_mm")
+        assert experts.gate_and_up_projs.placements == (Shard(0),)
+        start = sum(tokens_per_rank[:rank])
+        end = start + tokens_per_rank[rank]
+        local_x = x[start:end].detach().clone().requires_grad_(True)
+        local_logits = logits[start:end].detach().clone().requires_grad_(True)
+        local_weights = local_logits.softmax(dim=-1).gather(1, indices[start:end])
+        local_weights.retain_grad()
+        y = experts(local_x, token_mask[start:end], local_weights, indices[start:end])
+        y.backward(output_grad[start:end])
+
+        # BF16 grouped GEMMs round each additive LoRA projection, unlike the
+        # merged fp32 oracle. FP32 loop parity uses much tighter tolerances.
+        rtol, atol = (4e-2, 2e-4) if dtype == torch.bfloat16 else (1e-4, 1e-6)
+        for label, actual, expected in (
+            ("output", y, y_ref[start:end]),
+            ("input gradient", local_x.grad, ref_x.grad[start:end]),
+            ("router gradient", local_logits.grad, ref_logits.grad[start:end]),
+            ("routing probability gradient", local_weights.grad, ref_weights.grad[start:end]),
+        ):
+            assert actual is not None, f"{label} missing on rank {rank}, {route_case}, {backend_name}"
+            assert torch.isfinite(actual).all(), label
+            assert torch.isfinite(expected).all(), label
+            torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol, msg=label)
+            if route_case == "fully_masked":
+                assert torch.count_nonzero(actual) == 0, label
+            elif actual.numel():
+                assert torch.count_nonzero(actual) > 0, label
+
+        expert_start = rank * (_N_EXPERTS // 2)
+        expert_end = expert_start + _N_EXPERTS // 2
+        active_experts = torch.bincount(indices[token_mask].flatten(), minlength=_N_EXPERTS) > 0
+        local_active = active_experts[expert_start:expert_end]
+        for name in _LORA_PARAM_NAMES:
+            param = getattr(experts, name)
+            assert param.placements == (Shard(0),)
+            assert param.grad is not None, f"{name} missing on rank {rank}, {route_case}, {backend_name}"
+            grad = param.grad.to_local()
+            ref_grad = getattr(reference, name).grad
+            assert ref_grad is not None
+            assert torch.isfinite(grad).all()
+            assert torch.isfinite(ref_grad).all()
+            torch.testing.assert_close(grad.float(), ref_grad[expert_start:expert_end], rtol=rtol, atol=atol, msg=name)
+            # Unused experts (including an entirely idle rank) must have exact
+            # zero gradients, while routed experts must exercise all adapters.
+            assert torch.count_nonzero(grad[~local_active]) == 0, name
+            assert torch.count_nonzero(ref_grad[~active_experts]) == 0, name
+            for expert_grad in grad[local_active]:
+                assert torch.count_nonzero(expert_grad) > 0, name
+        for name in ("gate_and_up_projs", "down_projs"):
+            assert not getattr(experts, name).requires_grad
+            assert getattr(experts, name).grad is None
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_nccl_available() or torch.cuda.device_count() < 2,
+    reason="requires two CUDA devices and NCCL",
+)
+@pytest.mark.parametrize("backend_name", ["torch", "torch_mm"], ids=["loop-fp32", "native-grouped-mm-bf16"])
+@pytest.mark.parametrize("route_case", ["uneven_routes", "no_local_routes", "zero_token_rank", "fully_masked"])
+def test_lora_post_down_ep_forward_backward_matches_dense_reference(backend_name: str, route_case: str) -> None:
+    """Exercise post-down slot reduction with real two-rank NCCL transport."""
+    if backend_name == "torch_mm" and (
+        not hasattr(torch, "_grouped_mm") or any(torch.cuda.get_device_capability(rank)[0] < 9 for rank in range(2))
+    ):
+        pytest.skip("native CUDA torch._grouped_mm requires PyTorch support and two SM90+ GPUs")
+    context = mp.spawn(_lora_post_down_ep_worker, args=(_free_port(), backend_name, route_case), nprocs=2, join=False)
+    deadline = time.monotonic() + 180
+    try:
+        while not context.join(timeout=1):
+            if time.monotonic() >= deadline:
+                pytest.fail(f"two-rank post-down LoRA timed out: {backend_name}, {route_case}")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in context.processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
