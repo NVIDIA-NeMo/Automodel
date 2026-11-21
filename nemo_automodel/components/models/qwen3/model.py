@@ -41,7 +41,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -254,12 +254,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
         """Run the Qwen3 decoder in padded BSHD or packed THD layout.
 
         Args:
-            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[T]``.
+            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[1, T]`` (or ``[T]``).
             attention_mask: Optional padded mask ``[B, S]``. THD uses packed
                 document boundaries instead.
-            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
+            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[1, T]`` (or ``[T]``).
             past_key_values: Optional BSHD generation cache; unsupported for THD.
-            inputs_embeds: Alternative hidden inputs ``[B, S, H]`` or ``[T, H]``.
+            inputs_embeds: Alternative hidden inputs ``[B, S, H]`` or packed ``[1, T, H]`` (or ``[T, H]``).
             use_cache: Whether to update the BSHD KV cache.
             output_attentions: Whether to request attention outputs.
             output_hidden_states: Whether to retain per-layer hidden states.
@@ -279,12 +279,35 @@ class Qwen3Model(Qwen3PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd:  # TE's packed kernels take [tokens, ...]
+            if position_ids is None:
+                raise ValueError("Packed THD input requires position_ids.")
+            kwargs.pop("padding_mask", None)
+            if input_ids is not None and input_ids.ndim > 1:
+                input_ids = input_ids.squeeze(0)
+            if position_ids.ndim > 1:
+                position_ids = position_ids.squeeze(0)
+            for key, value in kwargs.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if key == "max_seqlen":
+                    kwargs[key] = value.item()
+                    continue
+                if value.ndim > 1:
+                    value = value.squeeze(0)
+                if key in ("cu_seqlens", "cu_seqlens_padded"):
+                    value = value[value != -1000].contiguous()
+                kwargs[key] = value
+            if inputs_embeds is not None and inputs_embeds.ndim > 2:
+                inputs_embeds = inputs_embeds.squeeze(0)
+            attention_mask = None
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        is_thd = kwargs.get("qkv_format") == "thd"
         if is_thd and inputs_embeds.ndim != 2:
             raise ValueError(f"THD model input must be [T, H], got {tuple(inputs_embeds.shape)}.")
         if is_thd:
@@ -347,6 +370,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         if not return_dict:
             return tuple(
                 value
@@ -384,12 +409,14 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
         supports_pp: bool = True
         supports_ep: bool = False
 
-    def __init__(self, config: Qwen3Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self, config: Qwen3Config, backend: BackendConfig | None = None, *, logits_dtype: torch.dtype | None = None
+    ) -> None:
         super().__init__(config)
         self.backend = backend or BackendConfig()
         self.model = Qwen3Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         if config.dtype is not None:
             cast_model_to_dtype(self, config.dtype)
@@ -456,32 +483,6 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        is_thd = kwargs.get("qkv_format") == "thd"
-        if is_thd:
-            if position_ids is None:
-                raise ValueError("Packed THD input requires position_ids.")
-            kwargs.pop("padding_mask", None)
-            if input_ids is not None and input_ids.ndim > 1:
-                input_ids = input_ids.squeeze(0)
-            if position_ids.ndim > 1:
-                position_ids = position_ids.squeeze(0)
-            for key, value in kwargs.items():
-                if not isinstance(value, torch.Tensor):
-                    continue
-                if key == "max_seqlen":
-                    kwargs[key] = value.item()
-                    continue
-                if value.ndim > 1:
-                    value = value.squeeze(0)
-                if key in ("cu_seqlens", "cu_seqlens_padded"):
-                    value = value[value != -1000].contiguous()
-                kwargs[key] = value
-            if inputs_embeds is not None and inputs_embeds.ndim > 2:
-                inputs_embeds = inputs_embeds.squeeze(0)
-            if labels is not None and labels.ndim > 1:
-                labels = labels.squeeze(0)
-            attention_mask = None
-
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -495,12 +496,13 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
             cache_position=cache_position,
             **kwargs,
         )
-        logits = compute_lm_head_logits(self.lm_head, outputs.last_hidden_state, logits_to_keep, is_thd=is_thd).logits
+        hidden_states = outputs.last_hidden_state
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         loss = None
         if labels is not None:
-            if is_thd and labels.ndim == 1:
-                labels = labels.unsqueeze(0)
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         out = CausalLMOutputWithPast(

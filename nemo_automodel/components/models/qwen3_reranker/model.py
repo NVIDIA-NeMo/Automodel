@@ -62,6 +62,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.utils import can_return_tuple, logging
 
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_tie_word_embeddings_flip,
@@ -223,7 +224,7 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
     # aliases is load-bearing here, not incidental.
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config: Qwen3RerankerConfig) -> None:
+    def __init__(self, config: Qwen3RerankerConfig, *, logits_dtype: torch.dtype | None = None) -> None:
         _validate_reranker_options(
             num_labels=config.num_labels,
             pooling=getattr(config, "pooling", None),
@@ -235,6 +236,7 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         # policy later cannot silently produce a model with a randomly-initialised head.
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
 
     @dataclass(frozen=True)
     class ModelCapabilities:

@@ -32,12 +32,13 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import roll_tensor
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 from nemo_automodel.components.models.step3p5.model import Step3p5Model
 from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
@@ -367,6 +368,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         config: Step3p7Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -381,11 +384,11 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
-            bias=False,
+            dtype=torch.bfloat16,
+            logits_dtype=logits_dtype,
         )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = getattr(config.text_config, "pad_token_id", None)
@@ -481,7 +484,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
         primary_shape = vocab_shape if self.lm_head is not None else hidden_shape
         mtp_shape = vocab_shape if self.lm_head is not None else hidden_shape
-        outputs_meta = (meta(primary_shape), *(meta(mtp_shape) for _ in range(mtp_depth)))
+        out_dtype = (self.lm_head.logits_dtype or dtype) if self.lm_head is not None else dtype
+        outputs_meta = (meta(primary_shape).to(out_dtype), *(meta(mtp_shape).to(out_dtype) for _ in range(mtp_depth)))
         return inputs_meta, outputs_meta
 
     def _is_pipeline_parallel_stage(self) -> bool:
@@ -694,7 +698,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             **kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)
@@ -712,7 +718,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 cp_size=kwargs.get("cp_size", 1),
             )
             mtp_kwargs = {
-                "hidden_states": hidden_states,
+                # The MTP blocks embed the packed [tokens] ids, so they take packed [tokens, hidden] states.
+                "hidden_states": hidden_states.squeeze(0) if kwargs.get("qkv_format") == "thd" else hidden_states,
                 "freqs_cis": freqs_cis,
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,

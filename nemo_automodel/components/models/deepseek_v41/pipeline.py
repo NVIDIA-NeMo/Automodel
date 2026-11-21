@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from nemo_automodel.components.models.common.lm_head import LMHead
+
 from .attention import DeepseekV41AttentionState
 from .config import DeepseekV41Config
 
@@ -50,7 +52,7 @@ class DeepseekV41PipelineMixin:
 
     config: DeepseekV41Config
     model: nn.Module
-    lm_head: nn.Module | None
+    lm_head: LMHead | None
     _pp_keep_self_forward = True
     _pp_return_hidden_states_supported = True
     _pp_return_hidden_states = False
@@ -236,7 +238,8 @@ class DeepseekV41PipelineMixin:
             vision-token type. A document-ID column of -1 preserves unpacked mode.
             Live CSA2 tensors from _pack_pipeline_state follow this prefix when
             the next stage needs the current source. Final output is hidden [microbatch, local_sequence,
-            hidden] for a linear loss, or FP32 logits [microbatch, local_sequence, vocab].
+            hidden] for a linear loss, or logits [microbatch, local_sequence, vocab] in the head's
+            ``logits_dtype`` (FP32 if unset).
             seq_len is already local; do not divide it by CP again.
         """
         start, end = self._pipeline_layer_bounds()
@@ -256,6 +259,6 @@ class DeepseekV41PipelineMixin:
             outputs = payload + self._shared_state_metas(end, microbatch_size, seq_len, dtype)
         else:
             width = text.hidden_size if self._pp_return_hidden_states else text.vocab_size
-            output_dtype = dtype if self._pp_return_hidden_states else torch.float32
+            output_dtype = dtype if self._pp_return_hidden_states else (self.lm_head.logits_dtype or torch.float32)
             outputs = (torch.empty(*shape, width, device="meta", dtype=output_dtype),)
         return inputs, outputs

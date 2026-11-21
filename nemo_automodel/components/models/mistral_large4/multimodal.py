@@ -164,7 +164,13 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
         stages[0].extend(("vision_encoder", "pre_mm_projector_norm", "patch_merger", "vision_language_adapter"))
         return stages
 
-    def __init__(self, config: MistralLarge4Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: MistralLarge4Config,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ) -> None:
         if not config.vision_config:
             raise ValueError("Conditional generation requires the native vision_config")
         self.vision_settings = MistralLarge4VisionConfig(**config.vision_config)
@@ -179,7 +185,7 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
             raise ValueError("Image delimiter IDs must fit vocab_size")
         config = copy.deepcopy(config)
         config.architectures = ["MistralLarge4ForConditionalGeneration"]
-        super().__init__(config, backend)
+        super().__init__(config, backend, logits_dtype=logits_dtype)
         dtype = self.model.embed_tokens.weight.dtype
         self.vision_encoder = self.vision_settings.build(dtype=dtype)
         self.pre_mm_projector_norm = Float32RMSNorm(self.vision_settings.hidden_size, eps=1e-5, dtype=dtype)

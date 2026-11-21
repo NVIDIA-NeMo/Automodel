@@ -92,7 +92,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_sequence_for_cp_contiguous,
 )
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -1204,6 +1204,8 @@ class Gemma4ForConditionalGeneration(
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         text_config: dict | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         if not _GEMMA4_HF_AVAILABLE:
@@ -1241,6 +1243,7 @@ class Gemma4ForConditionalGeneration(
 
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
 
         self.backend = backend
 
@@ -1598,11 +1601,9 @@ class Gemma4ForConditionalGeneration(
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-        ).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping
@@ -1632,17 +1633,12 @@ class Gemma4ForConditionalGeneration(
             this is a DTensor sharded on the vocab axis; otherwise it is a local
             tensor.
         """
+        selected_hidden_states = slice_logits_to_keep(hidden_states, logits_to_keep)
         if getattr(self, "_gemma4_tp_enabled", False) and isinstance(self.lm_head.weight, DTensor):
-            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                selected_hidden_states = hidden_states
-            else:
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                selected_hidden_states = hidden_states[:, slice_indices, :]
-
             # The tied vocabulary shard is invoked through F.linear rather than
             # lm_head.forward (the latter still owns pre-TP module hooks). Match
             # the shared weight's effective dtype explicitly, mirroring the
-            # dtype boundary enforced by compute_lm_head_logits for other heads.
+            # input cast in LMHead.linear for other heads.
             selected_hidden_states = selected_hidden_states.to(self.lm_head.weight.dtype)
             replicated_hidden_states = DTensor.from_local(
                 selected_hidden_states,
@@ -1651,11 +1647,7 @@ class Gemma4ForConditionalGeneration(
                 run_check=False,
             )
             return F.linear(replicated_hidden_states, self.lm_head.weight)
-        return compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-        ).logits
+        return hidden_states if self.lm_head is None else self.lm_head(selected_hidden_states)
 
     def _get_special_image_mask(
         self,

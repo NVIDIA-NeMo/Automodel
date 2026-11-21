@@ -40,11 +40,11 @@ from transformers.models.mbart.modeling_mbart import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 logger = logging.getLogger(__name__)
 
@@ -492,7 +492,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
+    def __init__(self, config: NemotronParseConfig, loss_fn=None, *, logits_dtype: torch.dtype | None = None, **kwargs):
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.loss_fn = loss_fn
@@ -504,7 +504,9 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         self.decoder = NemotronParseDecoder(config.decoder)
         self.decoder = self.decoder.to(torch.bfloat16)
 
-        self.lm_head = nn.Linear(config.decoder.d_model, config.decoder.vocab_size, bias=False, dtype=torch.bfloat16)
+        self.lm_head = LMHead(
+            config.decoder.d_model, config.decoder.vocab_size, dtype=torch.bfloat16, logits_dtype=logits_dtype
+        )
 
         num_extra_heads = getattr(config, "num_extra_heads", 0)
         self.decoder.extra_heads = nn.ModuleList(
@@ -604,7 +606,11 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # Final decoder hidden states feeding the lm_head.
         final_hidden_states = decoder_outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, final_hidden_states, logits_to_keep).logits
+        logits = (
+            final_hidden_states
+            if self.lm_head is None
+            else self.lm_head(slice_logits_to_keep(final_hidden_states, logits_to_keep))
+        )
 
         if not return_dict:
             return decoder_outputs + encoder_outputs

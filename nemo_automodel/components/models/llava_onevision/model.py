@@ -35,11 +35,11 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.llava_onevision.rice_vit import RiceTransformer
 
 LOGGER = logging.getLogger(__name__)
@@ -315,6 +315,8 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         self,
         config,
         attn_implementation: str | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -323,7 +325,9 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         if attn_implementation is None:
             attn_implementation = getattr(config, "_attn_implementation", None) or "eager"
         self.model = LLaVAOneVision1_5_Model(config, attn_implementation=attn_implementation)
-        self.lm_head = nn.Linear(self.model.text_config.hidden_size, self.model.text_config.vocab_size, bias=False)
+        self.lm_head = LMHead(
+            self.model.text_config.hidden_size, self.model.text_config.vocab_size, logits_dtype=logits_dtype
+        )
         self.vocab_size = self.model.text_config.vocab_size
         self.image_token_id = getattr(config, "image_token_id", 151655)
         self.video_token_id = getattr(config, "video_token_id", 151656)
@@ -396,7 +400,9 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         loss = None
         if labels is not None:

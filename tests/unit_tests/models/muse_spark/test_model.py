@@ -21,8 +21,18 @@ class _EchoTextModel(nn.Module):
     """Return the residual unchanged so PP/CP boundary behavior is isolated."""
 
     def forward(self, *, inputs_embeds, **kwargs):
+        """Echo inputs_embeds, batched like ``MuseSparkTextModel``.
+
+        Args:
+            inputs_embeds: Tensor of shape [batch, sequence, hidden], or packed (THD) [tokens, hidden].
+            **kwargs: Ignored decoder metadata.
+
+        Returns:
+            Namespace whose last_hidden_state is inputs_embeds, with packed input as [1, tokens, hidden].
+        """
         del kwargs
-        return SimpleNamespace(last_hidden_state=inputs_embeds)
+        hidden = inputs_embeds.unsqueeze(0) if inputs_embeds.dim() == 2 else inputs_embeds
+        return SimpleNamespace(last_hidden_state=hidden)
 
 
 def test_tiny_text_forward_backward_is_finite() -> None:
@@ -407,8 +417,12 @@ def test_pipeline_residual_preserves_fp32_values_and_gradients(qkv_format, compu
 @pytest.mark.parametrize("fp32_output", [False, True])
 def test_pipeline_final_stage_receives_fp32_residual_with_separate_output_dtype(fused_head, fp32_output) -> None:
     """The final stage receives the residual dtype even when its head uses BF16."""
-    model = tiny_muse_spark_model()
-    model.config.use_fp32_for_output = fp32_output
+    from nemo_automodel.components.models.muse_spark.model import MuseSpark1xOmniForCausalLM
+    from tests.unit_tests.models.muse_spark.conftest import tiny_backend, tiny_muse_spark_config
+
+    config = tiny_muse_spark_config()
+    config.use_fp32_for_output = fp32_output
+    model = MuseSpark1xOmniForCausalLM(config, backend=tiny_backend())
     model._pp_return_hidden_states = fused_head
     inputs, outputs = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=4, dtype=torch.bfloat16)
     assert inputs[0].dtype == torch.float32

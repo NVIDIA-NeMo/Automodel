@@ -37,9 +37,10 @@ from nemo_automodel.components.attention.utils import (
     preprocess_args_and_kwargs_for_attn,
 )
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
     is_indexed_packed_mask,
@@ -48,7 +49,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
     CudnnDsaPackedMetadata,
     cudnn_indexer_topk,
@@ -2389,6 +2390,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         num_hidden_layers: int | None = None,
         kda_mode: str | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -2435,12 +2438,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            text_config.hidden_size,
-            text_config.vocab_size,
-            bias=False,
-            dtype=model_dtype,
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype
         )
         self.vocab_size = text_config.vocab_size
         if self.backend.enable_hf_state_dict_adapter:
@@ -2547,7 +2546,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
         if self.lm_head is not None and not emits_hidden_states:
-            head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
+            head_dtype = self.lm_head.logits_dtype or self.lm_head.weight.dtype
             outputs_meta = (meta(microbatch_size, seq_len, text_config.vocab_size, tensor_dtype=head_dtype),)
         elif self.model.norm is not None or block_size is None:
             outputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
@@ -2611,8 +2610,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             attention_mask = None
             # THD packing drops the placeholder batch axis, but every Kimi layer
             # works in [batch, sequence, ...]. Restore it and let ``cu_seqlens``
-            # carry the document boundaries; ``compute_lm_head_logits`` leaves the
-            # already-batched [1, tokens, hidden] result untouched.
+            # carry the document boundaries; the head then sees the
+            # already-batched [1, tokens, hidden] result.
             if input_ids is not None and input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
             if inputs_embeds is not None and inputs_embeds.dim() == 2:
@@ -2633,13 +2632,10 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             return hidden_states
         if getattr(self, "_pp_return_hidden_states", False) is True:
             return hidden_states
-        return compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
     def prepare_model_inputs_for_cp(
         self,

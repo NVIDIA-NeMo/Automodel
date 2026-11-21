@@ -55,10 +55,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -66,7 +66,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
-    compute_lm_head_logits,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
@@ -950,8 +949,7 @@ class DeepseekV4Model(nn.Module):
             # Packed-sequence (THD) inputs arrive with the batch axis collapsed
             # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
             # Restore the leading batch dim so the hc_mult expand below sees the
-            # expected ``[B, S, dim]`` rank, mirroring the output-side THD
-            # ``unsqueeze(0)`` in ``compute_lm_head_logits(is_thd=True)``.
+            # expected ``[B, S, dim]`` rank, so the head and every output stay batched.
             if inputs_embeds.dim() == 2:
                 inputs_embeds = inputs_embeds.unsqueeze(0)
             # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
@@ -1247,6 +1245,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: DeepseekV4Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = torch.float32,
         **kwargs,
     ):
         super().__init__()
@@ -1277,13 +1277,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=torch.float32,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,
@@ -1383,7 +1377,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
+            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size)).to(
+                self.lm_head.logits_dtype or dtype
+            )
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)
         else:
@@ -1551,17 +1547,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # path can recompute logits over every position.
         final_hidden_states = hidden_states
 
-        # deepseek runs the lm_head in fp32: project in fp32 and cast the logits
-        # back to the hidden dtype via the shared helper.
         # Linear CE owns the final projection in PP, avoiding a full logits
         # allocation for every in-flight microbatch. MTP still carries its
         # per-depth hidden states through the existing tuple contract.
-        if self._pp_return_hidden_states:
+        if self._pp_return_hidden_states or self.lm_head is None:
             logits = hidden_states
         else:
-            logits = compute_lm_head_logits(
-                self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True
-            ).logits
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

@@ -49,11 +49,11 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)
@@ -257,8 +257,9 @@ class DecoderLayer(nn.Module):
 
 
 class NormHead(nn.Module):
-    def __init__(self, hidden_size, vocab_size, bias=False):
+    def __init__(self, hidden_size, vocab_size, bias=False, logits_dtype: torch.dtype | None = None):
         super().__init__()
+        self.logits_dtype = logits_dtype
         self.weight = nn.Parameter(torch.empty((vocab_size, hidden_size)))
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.first_flag = True
@@ -273,7 +274,7 @@ class NormHead(nn.Module):
             norm_weight = self.weight
         else:
             norm_weight = self.weight
-        return F.linear(hidden_states, norm_weight)
+        return LMHead.linear(hidden_states, norm_weight, logits_dtype=self.logits_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -492,12 +493,12 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BaichuanConfig, **model_kwargs):
+    def __init__(self, config: BaichuanConfig, *, logits_dtype: torch.dtype | None = None, **model_kwargs):
         warn_deprecated_model_class("BaichuanForCausalLM")
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = BaichuanModel(config)
-        self.lm_head = NormHead(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = NormHead(config.hidden_size, config.vocab_size, bias=False, logits_dtype=logits_dtype)
         self.post_init()
 
     def get_input_embeddings(self):
@@ -555,7 +556,9 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()

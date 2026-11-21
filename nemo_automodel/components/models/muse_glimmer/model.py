@@ -47,7 +47,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -547,9 +547,56 @@ class MuseGlimmerModel(MuseGlimmerPreTrainedModel):
         vision_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
+        """Run the decoder on padded or packed (THD) input; packed input comes back batched.
+
+        Packed input is squeezed to [tokens, ...] for the layers, which TE's packed kernels take.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or packed [1, tokens].
+            attention_mask: Optional padding mask for unpacked input; packed input ignores it.
+            position_ids: Optional positions of shape [batch, sequence], or packed [1, tokens].
+            past_key_values: Optional generation cache; packed input disables it.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or packed [1, tokens, hidden].
+            use_cache: Whether to return the cache.
+            output_hidden_states: Whether to return each layer's hidden states.
+            return_dict: Whether to return ``BaseModelOutputWithPast`` instead of a tuple.
+            cache_position: Optional token positions of shape [sequence].
+            pixel_values: Optional flattened image patches of shape [patches, patch_features].
+            image_grid_thw: Optional int grid of shape [images, 3] holding each image's (t, h, w) patch counts.
+            pixel_values_videos: Optional flattened video patches of shape [patches, patch_features].
+            video_grid_thw: Optional int grid of shape [videos, 3] holding each video's (t, h, w) patch counts.
+            vision_mask: Optional bool mask of shape [batch, sequence], true at media tokens.
+            **kwargs: Backend metadata. Packed input sets ``qkv_format="thd"`` and passes ``cu_seqlens`` and
+                ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and ``max_seqlen``.
+
+        Returns:
+            Output whose ``last_hidden_state`` has shape [batch, sequence, hidden], or [1, tokens, hidden] for
+            packed input; requested per-layer hidden states keep the layout the layers saw ([tokens, hidden]).
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
         is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd:  # TE's packed kernels take [tokens, ...]
+            kwargs.pop("padding_mask", None)
+            if input_ids is not None and input_ids.ndim > 1:
+                input_ids = input_ids.squeeze(0)
+            if inputs_embeds is not None and inputs_embeds.ndim > 2:
+                inputs_embeds = inputs_embeds.squeeze(0)
+            if position_ids is not None and position_ids.ndim > 1:
+                position_ids = position_ids.squeeze(0)
+            for key, value in tuple(kwargs.items()):
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if key == "max_seqlen":
+                    kwargs[key] = int(value.item())
+                    continue
+                if value.ndim > 1:
+                    value = value.squeeze(0)
+                if key in ("cu_seqlens", "cu_seqlens_padded"):
+                    value = value[value != -1000].contiguous()
+                kwargs[key] = value
+            attention_mask = None
+            use_cache = False
         global_vision_mask = kwargs.pop("_muse_glimmer_global_vision_mask", None)
         thd_local_indices = kwargs.pop("_thd_local_indices", None)
         output_hidden_states = (
@@ -662,6 +709,8 @@ class MuseGlimmerModel(MuseGlimmerPreTrainedModel):
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         past = past_key_values if use_cache else None
         if not return_dict:
             return tuple(value for value in (hidden_states, past, all_hidden_states) if value is not None)
@@ -702,14 +751,20 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         del kwargs
         return cls(config, backend=backend)
 
-    def __init__(self, config: MuseGlimmerConfig, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: MuseGlimmerConfig,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()
         self.model = MuseGlimmerModel(config, self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MuseGlimmerStateDictAdapter(config)
@@ -852,31 +907,6 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         del output_attentions
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else not self.training
-        is_thd = kwargs.get("qkv_format") == "thd"
-
-        if is_thd:
-            kwargs.pop("padding_mask", None)
-            if input_ids is not None and input_ids.ndim > 1:
-                input_ids = input_ids.squeeze(0)
-            if inputs_embeds is not None and inputs_embeds.ndim > 2:
-                inputs_embeds = inputs_embeds.squeeze(0)
-            if position_ids is not None and position_ids.ndim > 1:
-                position_ids = position_ids.squeeze(0)
-            if labels is not None and labels.ndim > 1:
-                labels = labels.squeeze(0)
-            for key, value in tuple(kwargs.items()):
-                if not isinstance(value, torch.Tensor):
-                    continue
-                if key == "max_seqlen":
-                    kwargs[key] = int(value.item())
-                    continue
-                if value.ndim > 1:
-                    value = value.squeeze(0)
-                if key in ("cu_seqlens", "cu_seqlens_padded"):
-                    value = value[value != -1000].contiguous()
-                kwargs[key] = value
-            attention_mask = None
-            use_cache = False
 
         outputs = self.model(
             input_ids=input_ids,
@@ -896,13 +926,9 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        projected = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
-        logits = projected.logits
         output_multiplier = float(self.config.output_multiplier)
         soft_cap = self.config.output_soft_cap_temp
         logits = logits * output_multiplier
@@ -913,8 +939,6 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
 
         loss = None
         if labels is not None:
-            if is_thd and labels.ndim == 1:
-                labels = labels.unsqueeze(0)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
@@ -926,8 +950,6 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         # Scaling here makes F.linear(hidden * multiplier, lm_head.weight) match
         # MuseGlimmer's native output multiplier before optional logit soft-capping.
         loss_hidden_states = hidden_states * output_multiplier
-        if is_thd and loss_hidden_states.ndim == 2:
-            loss_hidden_states = loss_hidden_states.unsqueeze(0)
         output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
