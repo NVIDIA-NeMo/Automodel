@@ -2331,6 +2331,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         pp_microbatches=1,
         world_size=1,
         clip_grad_norm=None,
+        loss_normalization="per_token",
     ):
         from nemo_automodel.components.config.loader import ConfigNode
 
@@ -2366,6 +2367,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
         object.__setattr__(recipe, "te_fp8", None)
+        object.__setattr__(recipe, "loss_normalization", loss_normalization)
         object.__setattr__(recipe, "model_parts", [nn.Linear(4, 4)])
         object.__setattr__(
             recipe,
@@ -2657,6 +2659,108 @@ class TestRunTrainOptimStepSetsMoEScale:
         metrics = recipe._run_train_optim_step([{"labels": torch.tensor([[1, 2, 3, -100]])}])
 
         assert "pack_fill" not in metrics.metrics
+
+    @pytest.mark.parametrize("pp_enabled", [False, True])
+    @pytest.mark.parametrize("loss_normalization", ["per_token", "sum"])
+    def test_loss_normalization_scales_update_and_reports_per_token_loss(
+        self, monkeypatch: pytest.MonkeyPatch, pp_enabled: bool, loss_normalization: str
+    ) -> None:
+        """``sum`` updates with the summed-token gradient; both modes report the per-token mean loss."""
+        from nemo_automodel.components.loss.utils import calculate_loss
+        from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+
+        recipe = self._make_recipe(
+            monkeypatch, pp_enabled=pp_enabled, dp_group_size=1, loss_normalization=loss_normalization
+        )
+        torch.manual_seed(0)
+        model = nn.Linear(4, 5, bias=False)
+        reference = nn.Linear(4, 5, bias=False)
+        reference.load_state_dict(model.state_dict())
+        recipe.model_parts = [model]
+        recipe.optimizer = [torch.optim.SGD(model.parameters(), lr=0.1)]
+        inputs = [torch.randn(1, 4, 4), torch.randn(1, 3, 4)]
+        batches = [
+            {"labels": torch.tensor([[1, 2, -100, 3]])},
+            {"labels": torch.tensor([[4, 0, -100]])},
+        ]
+        num_label_tokens = 5
+
+        def forward_backward_step(
+            idx: int,
+            batch: dict[str, torch.Tensor],
+            *,
+            loss_buffer: list[torch.Tensor],
+            num_label_tokens: int,
+            num_batches: int,
+            is_train: bool = True,
+        ) -> None:
+            """Mirror the recipe's loss call: PP sums raw CE, non-PP normalizes inside the loss.
+
+            Args:
+                idx: Microbatch index into ``inputs``.
+                batch: Mapping with ``labels`` of shape [batch, sequence], -100 for ignored positions.
+                loss_buffer: List of scalar loss tensors; appended in place.
+                num_label_tokens: Loss divisor the step passes to its microbatches.
+                num_batches: Number of accumulated microbatches.
+                is_train: Whether this is a training step.
+            """
+            logits = model(inputs[idx])
+            loss = calculate_loss(
+                MaskedCrossEntropy(),
+                logits=logits,
+                labels=batch["labels"],
+                model=model,
+                num_label_tokens=None if pp_enabled else num_label_tokens,
+            )
+            loss.backward()
+            loss_buffer.append(loss.detach())
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        monkeypatch.setattr(
+            "nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm",
+            scale_grads_and_clip_grad_norm,
+        )
+
+        metrics = recipe._run_train_optim_step(batches, max_grad_norm=None)
+
+        summed_ce = sum(MaskedCrossEntropy()(reference(x), b["labels"]) for x, b in zip(inputs, batches, strict=True))
+        summed_ce.backward()
+        expected_grad = reference.weight.grad
+        if loss_normalization == "per_token":
+            expected_grad = expected_grad / num_label_tokens
+        torch.testing.assert_close(model.weight, reference.weight - 0.1 * expected_grad)
+        assert metrics.metrics["loss"] == pytest.approx(summed_ce.item() / num_label_tokens, rel=1e-5)
+        assert metrics.metrics["num_label_tokens"] == num_label_tokens
+
+    def test_sum_loss_normalization_leaves_moe_aux_scale_unnormalized_under_pp(self, monkeypatch):
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        recipe = self._make_recipe(monkeypatch, pp_enabled=True, dp_group_size=2, loss_normalization="sum")
+        batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
+
+        recipe._run_train_optim_step(batches)
+
+        # PP divides gradients by loss_denominator / dp = 1 / 2 after backward; the aux scale undoes that.
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("value", ["mean", "token_mean"])
+def test_setup_rejects_unknown_loss_normalization(value):
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(ConfigNode({"loss_normalization": value}))
+
+    with pytest.raises(ValueError, match="loss_normalization must be one of"):
+        recipe.setup()
+
+
+def test_setup_rejects_sum_loss_normalization_when_train_step_is_overridden():
+    class OwnStepRecipe(TrainFinetuneRecipeForNextTokenPrediction):
+        def _run_train_optim_step(self, batches, max_grad_norm=None):
+            raise AssertionError("not reached")
+
+    recipe = OwnStepRecipe(ConfigNode({"loss_normalization": "sum"}))
+
+    with pytest.raises(NotImplementedError, match="supports only loss_normalization: per_token"):
+        recipe.setup()
 
 
 # -----------------------------------------------------------------------------
