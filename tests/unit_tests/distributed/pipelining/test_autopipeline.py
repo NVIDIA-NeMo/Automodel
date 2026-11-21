@@ -1184,174 +1184,12 @@ class TestAutoPipelineUpdateSeqLen:
         ]
 
 
-class _FakeMultiDimMesh:
-    """World mesh with named dims; ``pp`` returns a FakePPMesh."""
-
-    def __init__(self, dim_sizes: dict[str, int]):
-        self._names = list(dim_sizes)
-        self._sizes = list(dim_sizes.values())
-
-    @property
-    def ndim(self) -> int:
-        return len(self._sizes)
-
-    @property
-    def mesh_dim_names(self) -> tuple[str, ...]:
-        return tuple(self._names)
-
-    def __getitem__(self, key: str) -> FakePPMesh:
-        return FakePPMesh(size=self._sizes[self._names.index(key)], local_rank=0)
-
-    def size(self, mesh_dim: int) -> int:
-        return self._sizes[mesh_dim]
-
-    def get_group(self, mesh_dim: int) -> str:
-        return f"group_{self._names[mesh_dim]}"
-
-
-class TestAutoPipelineUpdateSeqLenCollective:
-    """update_seq_len must make the stage-reset decision across the ranks that share forward collectives."""
-
-    def _make_pipeline(self, monkeypatch, peer_changed: bool, world_dims=None, moe_dims=None):
-        ap = AutoPipeline(
-            world_mesh=_FakeMultiDimMesh(world_dims or {"pp": 2, "cp": 1, "dp_shard": 4}),
-            moe_mesh=_FakeMultiDimMesh(moe_dims) if moe_dims else None,
-            pp_axis_name="pp",
-            pp_schedule="1f1b",
-            pp_microbatch_size=2,
-            pp_batch_size=4,
-            device=torch.device("cpu"),
-        )
-        ap._model_config = object()
-        ap._info.schedule = object()
-        ap._info.stages = []
-        ap._runtime_initializers = []
-
-        resets = []
-        groups = []
-
-        def record_reset(*args, **kwargs):
-            resets.append(args[4])
-            return ap.pp_microbatch_size * args[4]
-
-        def fake_all_reduce(tensor, op=None, group=None):
-            """MAX-reduce the local flag with a simulated peer flag in place.
-
-            Args:
-                tensor: Flag tensor of shape [1], dtype int32, on CPU.
-                op: Reduction op; must be MAX.
-                group: Process group the reduction runs over.
-            """
-            assert op == torch.distributed.ReduceOp.MAX
-            groups.append(group)
-            tensor.fill_(max(int(tensor.item()), int(peer_changed)))
-
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.pipelining.autopipeline.reset_pp_stage_shapes",
-            record_reset,
-        )
-        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-        ap._pp_current_seq_len = 128
-        ap._pp_runtime_num_tokens = 256
-        return ap, resets, groups
-
-    def test_resets_own_seq_len_when_only_peer_changed(self, monkeypatch):
-        ap, resets, groups = self._make_pipeline(monkeypatch, peer_changed=True)
-
-        ap.update_seq_len(128)
-
-        assert resets == [128]
-        assert ap._pp_current_seq_len == 128
-        assert groups == ["group_pp", "group_dp_shard"]
-
-    def test_no_reset_when_no_rank_changed(self, monkeypatch):
-        ap, resets, groups = self._make_pipeline(monkeypatch, peer_changed=False)
-
-        ap.update_seq_len(128)
-
-        assert resets == []
-        assert groups == ["group_pp", "group_dp_shard"]
-
-    def test_resets_when_local_changed_and_peer_unchanged(self, monkeypatch):
-        ap, resets, groups = self._make_pipeline(monkeypatch, peer_changed=False)
-
-        ap.update_seq_len(64)
-
-        assert resets == [64]
-        assert ap._pp_current_seq_len == 64
-        assert ap._pp_runtime_num_tokens == 128
-        assert groups == ["group_pp", "group_dp_shard"]
-
-    def test_vote_skips_dp_replicate_and_includes_moe_dims(self, monkeypatch):
-        ap, resets, groups = self._make_pipeline(
-            monkeypatch,
-            peer_changed=True,
-            world_dims={"pp": 2, "dp_replicate": 2, "dp_shard": 2, "cp": 1, "tp": 1},
-            moe_dims={"ep_shard": 1, "ep": 4},
-        )
-
-        ap.update_seq_len(128)
-
-        assert resets == [128]
-        assert groups == ["group_pp", "group_dp_shard", "group_ep"]
-
-
 def _free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
     return port
-
-
-def _update_seq_len_collective_worker(rank: int, world_size: int, port: int) -> None:
-    import torch.distributed as dist
-    from torch.distributed.device_mesh import init_device_mesh
-
-    faulthandler.dump_traceback_later(60, exit=True)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    try:
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        mesh = init_device_mesh("cpu", (1, world_size), mesh_dim_names=("pp", "dp_shard"))
-        ap = AutoPipeline(
-            world_mesh=mesh,
-            pp_axis_name="pp",
-            pp_schedule="1f1b",
-            pp_microbatch_size=1,
-            pp_batch_size=1,
-            device=torch.device("cpu"),
-        )
-        ap._model_config = object()
-        ap._info.schedule = object()
-        ap._info.stages = []
-        ap._runtime_initializers = []
-        ap._pp_current_seq_len = 128
-
-        resets = []
-
-        def record_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
-            resets.append(seq_len)
-            return microbatch_size * seq_len
-
-        autopipeline_module.reset_pp_stage_shapes = record_reset
-
-        local_seq_len = 64 if rank == 0 else 128
-        ap.update_seq_len(local_seq_len)
-        assert resets == [local_seq_len], (rank, resets)
-
-        ap.update_seq_len(local_seq_len)
-        assert resets == [local_seq_len], (rank, resets)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-# Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
-@pytest.mark.timeout(70)
-def test_update_seq_len_resets_every_rank_when_one_rank_changed_gloo():
-    mp.spawn(_update_seq_len_collective_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
 def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, port: int) -> None:
@@ -1395,7 +1233,8 @@ def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, port:
         for seq_len in batch_seq_lens:
             ap.update_seq_len(seq_len)
 
-        expected = [[[64], [128]], [[], []]][replica][shard]
+        # Each rank resets only for its own length change.
+        expected = [[[64], []], [[], []]][replica][shard]
         assert resets == expected, (rank, resets)
 
         # Final validation reduction across replicas, reached after an uneven number of batches.
@@ -1426,10 +1265,9 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) ->
     os.environ["MASTER_PORT"] = str(port)
     torch.set_num_threads(1)
     vocab_size, batch_size = 256, 2
-    # Local length of each DP-shard peer per evaluation; the third repeats the second.
-    eval_seq_lens = [(128, 128), (128, 64), (128, 64)]
-    # Cumulative resets every rank must record: the second evaluation resets every peer, the third none.
-    expected_resets = [1, 2, 2]
+    # Length of each evaluation batch per DP-shard rank: batches 1 and 3 change length only on
+    # DP rank 0, and batch 2 only on DP rank 1.
+    eval_seq_lens = ((64, 128, 128, 64), (64, 64, 96, 96))
     # float32 throughout and FSDP all-gathers copy weights bit-exactly; the reference runs one sample per call
     # like the 1-sample microbatches, so only the fp32 accumulation order of CPU kernels may differ.
     rtol = atol = 1e-5
@@ -1453,20 +1291,15 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) ->
             return LlamaForCausalLM(config).to(torch.float32)
 
         def parallelize(model, world_mesh, dp_axis_names, **kwargs):
-            # Unsharded parameters stay resident after a no-backward forward, as in evaluation.
+            # Like the MoE parallelizer with wrap_outer_model: false, the stage root is not an FSDP module,
+            # and unsharded parameters stay resident after a no-backward forward, as in evaluation.
             dp_mesh = world_mesh[dp_axis_names[0]]
             for layer in model.model.layers.values():
                 fully_shard(layer, mesh=dp_mesh, reshard_after_forward=False)
-            fully_shard(model, mesh=dp_mesh, reshard_after_forward=False)
-
-        resets = []
-        real_reset = autopipeline_module.reset_pp_stage_shapes
-
-        def spy_reset(*args, **kwargs):
-            resets.append(args[4])
-            return real_reset(*args, **kwargs)
-
-        autopipeline_module.reset_pp_stage_shapes = spy_reset
+            for module in (model.model.embed_tokens, model.lm_head):
+                if module is not None:
+                    fully_shard(module, mesh=dp_mesh, reshard_after_forward=False)
+            fully_shard(model.model, mesh=dp_mesh, reshard_after_forward=False)
 
         captured = []
 
@@ -1488,28 +1321,27 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) ->
         for part in ap.parts:
             part.eval()
 
-        for eval_idx, seq_lens in enumerate(eval_seq_lens):
-            seq_len = seq_lens[dp_rank]
-            generator = torch.Generator().manual_seed(1000 * eval_idx + dp_rank)
-            input_ids = torch.randint(2, vocab_size, (batch_size, seq_len), generator=generator)
-            captured.clear()
-            with torch.no_grad():
+        with torch.no_grad():
+            for batch_idx, seq_len in enumerate(eval_seq_lens[dp_rank]):
+                generator = torch.Generator().manual_seed(1000 * batch_idx + dp_rank)
+                input_ids = torch.randint(2, vocab_size, (batch_size, seq_len), generator=generator)
+                captured.clear()
+                # Same calls as the recipe's validation step.
                 ap.update_seq_len(seq_len)
-                assert len(resets) == expected_resets[eval_idx], ("reset symmetry", rank, eval_idx, resets)
-                assert resets[-1] == seq_len, ("local seq_len", rank, eval_idx, resets)
                 if ap.info.has_first_stage:
                     ap.info.schedule.eval(input_ids, target=input_ids)
                 else:
                     ap.info.schedule.eval(target=input_ids, losses=[])
-            assert len(resets) == expected_resets[eval_idx], ("reset symmetry", rank, eval_idx, resets)
 
-            if ap.info.has_last_stage:
-                logits = torch.cat(captured)
-                assert logits.shape == (batch_size, seq_len, vocab_size), (rank, eval_idx, logits.shape)
-                assert torch.isfinite(logits).all(), (rank, eval_idx)
-                with torch.no_grad():
+                if ap.info.has_last_stage:
+                    logits = torch.cat(captured)
                     expected = torch.cat([reference(input_ids=sample[None]).logits for sample in input_ids])
-                torch.testing.assert_close(logits, expected, rtol=rtol, atol=atol)
+                    torch.testing.assert_close(logits, expected, rtol=rtol, atol=atol)
+
+            # The validation epoch ends with a DP all-reduce of the loss totals.
+            total = torch.ones(1)
+            dist.all_reduce(total, group=mesh["dp_shard"].get_group())
+            assert total.item() == mesh["dp_shard"].size()
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -1517,6 +1349,6 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) ->
 
 # Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
 @pytest.mark.timeout(150)
-def test_update_seq_len_pp_fsdp_eval_resets_every_shard_peer_gloo():
-    """PP2 x DP-shard2 FSDP2 evaluation: a length change on one shard peer resets every rank exactly once."""
+def test_update_seq_len_pp_fsdp_eval_with_rank_local_resets_gloo():
+    """PP2 x DP-shard2 FSDP2 evaluation with an unwrapped stage root finishes and matches the reference."""
     mp.spawn(_pp_fsdp_eval_seq_len_reset_worker, args=(4, _free_port()), nprocs=4, join=True)
