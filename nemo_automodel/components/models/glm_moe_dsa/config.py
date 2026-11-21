@@ -17,6 +17,8 @@
 
 from transformers.configuration_utils import PretrainedConfig
 
+from nemo_automodel.components.models.glm_moe_dsa.flops import model_flops
+
 __all__ = ["GlmMoeDsaConfig"]
 
 
@@ -38,6 +40,9 @@ class GlmMoeDsaConfig(PretrainedConfig):
     model_type = "glm_moe_dsa"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"num_local_experts": "n_routed_experts"}
+    # Sparse MLA with a causal-capped top-k, a forward-only indexer on "full" layers only, and no MTP
+    # module: the generic MLA+MoE formula overcounts all three.
+    flops_formula = staticmethod(model_flops)
 
     def __init__(
         self,
