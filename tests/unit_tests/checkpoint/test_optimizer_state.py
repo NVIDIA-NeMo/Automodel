@@ -24,7 +24,7 @@ from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
-from nemo_automodel.components.moe.experts import GroupedExpertsTE
+from nemo_automodel.components.moe.experts import _global_expert_name
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
@@ -478,23 +478,21 @@ def test_optimizer_checkpoint_restores_group_mults(tmp_path, native):
 
 
 class _RankLocalExpertsModel(nn.Module):
-    """Experts whose weights are plain parameters with the same names on every expert-parallel rank.
+    """Experts whose weights are plain parameters of one expert-parallel rank.
 
-    Stands in for Transformer Engine grouped experts: two local experts per rank, each with a ``weight0`` and a
-    ``weight1`` of shape [2, 3] in both projections.
+    Stands in for Transformer Engine grouped experts: two local experts per rank in both projections, each a
+    weight of shape [2, 3] that is named as ``GroupedExpertsTE`` names the weights of its ``GroupedLinear``.
     """
 
     def __init__(self, rank: int) -> None:
         super().__init__()
-        experts = object.__new__(GroupedExpertsTE)
-        nn.Module.__init__(experts)
-        experts.ep_rank, experts.num_local_experts, experts.expert_bias = rank, 2, False
+        self.experts = nn.Module()
         for name in ("gate_up_linear", "down_linear"):
             linear = nn.Module()
             for index in range(2):
-                linear.register_parameter(f"weight{index}", nn.Parameter(torch.zeros(2, 3)))
-            experts.add_module(name, linear)
-        self.experts = experts
+                weight = nn.Parameter(torch.zeros(2, 3))
+                linear.register_parameter(_global_expert_name(f"weight{index}", first_expert=2 * rank), weight)
+            self.experts.add_module(name, linear)
 
 
 def _run_rank_local_expert_optimizer_round_trip(
@@ -509,8 +507,9 @@ def _run_rank_local_expert_optimizer_round_trip(
             parameter.grad = torch.ones_like(parameter)
         optimizer.step()
         # Every first moment holds the global index of its expert: rank 0 owns experts 0 and 1, rank 1 owns 2 and 3.
-        for name, parameter in model.named_parameters():
-            optimizer.state[parameter]["exp_avg"].fill_(2 * rank + int(name[-1]))
+        for linear in model.experts.children():
+            for index, parameter in enumerate(linear.parameters()):
+                optimizer.state[parameter]["exp_avg"].fill_(2 * rank + index)
         checkpointer = _make_distributed_checkpointer(rank, checkpoint_dir)
         checkpointer.save_optimizer(optimizer, model, checkpoint_dir)
         torch.distributed.barrier()
@@ -525,9 +524,10 @@ def _run_rank_local_expert_optimizer_round_trip(
         restored = _RankLocalExpertsModel(rank)
         restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.5, foreach=False)
         checkpointer.load_optimizer(restored_optimizer, restored, checkpoint_dir)
-        for name, parameter in restored.named_parameters():
-            expected = torch.full_like(parameter, 2 * rank + int(name[-1]))
-            assert torch.equal(restored_optimizer.state[parameter]["exp_avg"], expected), name
+        for linear in restored.experts.children():
+            for index, parameter in enumerate(linear.parameters()):
+                expected = torch.full_like(parameter, 2 * rank + index)
+                assert torch.equal(restored_optimizer.state[parameter]["exp_avg"], expected), (rank, index)
         assert restored_optimizer.param_groups[0]["lr"] == 0.01
     finally:
         torch.distributed.destroy_process_group()

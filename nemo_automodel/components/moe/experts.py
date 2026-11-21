@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -41,9 +42,10 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
+from nemo_automodel.shared.import_utils import is_te_min_version, safe_import, safe_import_te
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
+_HAVE_TE, transformer_engine = safe_import_te()
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
@@ -255,6 +257,9 @@ class _AllGatherConcatVarlenFn(Function):
 if TYPE_CHECKING:
     from transformer_engine.common.recipe import Recipe
     from transformer_engine.pytorch import GroupedLinear
+else:
+    # Without Transformer Engine this is a placeholder: it can be subclassed and raises when constructed.
+    GroupedLinear = transformer_engine.pytorch.GroupedLinear if _HAVE_TE else transformer_engine
 
     from nemo_automodel.components.models.common.utils import BackendConfig
 
@@ -1910,6 +1915,54 @@ def _torch_mm_experts_fwd(
     return output2
 
 
+_TE_EXPERT_PARAMETER = re.compile(r"(weight|bias)(\d+)")
+
+
+def _global_expert_name(name: str, first_expert: int) -> str:
+    """Shift the expert index in a ``GroupedLinear`` parameter name from local to global.
+
+    Args:
+        name: An attribute name. ``weight{i}`` and ``bias{i}`` with ``i < first_expert`` are TE's names for the
+            parameters of local expert ``i``.
+        first_expert: Global index of the module's first expert.
+
+    Returns:
+        ``weight{first_expert + i}`` or ``bias{first_expert + i}`` for such a name; any other name unchanged.
+    """
+    match = _TE_EXPERT_PARAMETER.fullmatch(name)
+    if match is None or int(match[2]) >= first_expert:
+        return name
+    return f"{match[1]}{first_expert + int(match[2])}"
+
+
+class _ExpertGroupedLinear(GroupedLinear):
+    """``GroupedLinear`` whose expert parameters are named by their global expert index.
+
+    TE registers the parameters of GEMM ``i`` as ``weight{i}`` and ``bias{i}`` and reads them back under those
+    names. With expert parallelism every rank would hold a ``weight0``, each for a different expert, and state
+    that is kept per parameter name, such as the optimizer state in a checkpoint, would collide between ranks.
+    Here they are registered as ``weight{first_expert + i}``, so their names are unique across expert-parallel
+    ranks, and the names TE uses resolve to them.
+    """
+
+    def __init__(self, *args: Any, first_expert: int, **kwargs: Any) -> None:
+        """
+        Args:
+            *args: ``GroupedLinear`` arguments.
+            first_expert: Global index of the expert computed by GEMM 0: 0, or at least the number of GEMMs, so
+                that the registered names of this module never read as TE's local names.
+            **kwargs: ``GroupedLinear`` arguments.
+        """
+        self.first_expert = first_expert  # TE registers the parameters in its __init__.
+        super().__init__(*args, **kwargs)
+
+    def register_parameter(self, name: str, param: nn.Parameter | None, **kwargs: Any) -> None:
+        super().register_parameter(_global_expert_name(name, self.first_expert), param, **kwargs)
+
+    def __getattr__(self, name: str) -> torch.Tensor | nn.Module:
+        return super().__getattr__(_global_expert_name(name, self.first_expert))
+
+
 class GroupedExpertsTE(nn.Module):
     """
     MoE experts using TE's GroupedLinear module directly.
@@ -2024,7 +2077,7 @@ class GroupedExpertsTE(nn.Module):
             str(getattr(backend, "dispatcher_recompute_cache", "none")) if backend is not None else "none"
         )
 
-        self._init_grouped_layers(self.num_local_experts)
+        self._init_grouped_layers(self.num_local_experts, first_expert=0)
         self.expert_activation = get_expert_activation_for_deepep(config)
         self._grouped_tensor_signature: tuple["Recipe | None", torch.dtype] | None = None
 
@@ -2033,15 +2086,20 @@ class GroupedExpertsTE(nn.Module):
         self.moe_mesh = None
         self.ep_rank = 0
 
-    def _init_grouped_layers(self, num_local_experts: int) -> None:
-        """Construct both TE projections and their padding for this EP partition."""
-        from transformer_engine.pytorch import GroupedLinear
+    def _init_grouped_layers(self, num_local_experts: int, first_expert: int) -> None:
+        """Construct both TE projections and their padding for this EP partition.
 
+        Args:
+            num_local_experts: Number of experts held by this rank.
+            first_expert: Global index of this rank's first expert; the parameters of local expert ``i`` are
+                named ``weight{first_expert + i}`` and ``bias{first_expert + i}``.
+        """
         grouped_linear_kwargs = {"use_grouped_tensor": True} if self.use_grouped_tensor else {}
         gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
 
         # Create both projections on meta for the current local expert count.
-        self.gate_up_linear = GroupedLinear(
+        self.gate_up_linear = _ExpertGroupedLinear(
+            first_expert=first_expert,
             num_gemms=num_local_experts,
             in_features=self.config.expert_dim,
             out_features=gate_up_out_features,
@@ -2051,7 +2109,8 @@ class GroupedExpertsTE(nn.Module):
             **grouped_linear_kwargs,
         )
         # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
+        self.down_linear = _ExpertGroupedLinear(
+            first_expert=first_expert,
             num_gemms=num_local_experts,
             in_features=self.config.moe_inter_dim,
             out_features=self.config.expert_dim,
@@ -2114,22 +2173,6 @@ class GroupedExpertsTE(nn.Module):
         device_mesh = self.moe_mesh or self.ep_mesh
         dtensor = create_dtensor_from_local(tensor, device_mesh, self.ep_rank if device_mesh is not None else None)
         return dtensor
-
-    def global_expert_parameter_names(self) -> dict[str, str]:
-        """Map the parameter names of this rank's experts to names that carry the global expert index.
-
-        Every expert-parallel rank names the weights of its experts ``weight0``, ``weight1``, and so on. State
-        that a checkpoint keeps per parameter name, such as optimizer state, needs names that differ between
-        ranks.
-        """
-        first = self.ep_rank * self.num_local_experts
-        kinds = ("weight", "bias") if self.expert_bias else ("weight",)
-        return {
-            f"{linear}.{kind}{index}": f"{linear}.{kind}{first + index}"
-            for linear in ("gate_up_linear", "down_linear")
-            for kind in kinds
-            for index in range(self.num_local_experts)
-        }
 
     def _normalize_moe_mesh(self, moe_mesh: DeviceMesh | None) -> DeviceMesh | None:
         if moe_mesh is None:
@@ -2323,8 +2366,9 @@ class GroupedExpertsTE(nn.Module):
             f"n_routed_experts ({self.config.n_routed_experts}) must be divisible by ep_size ({self.ep_size})"
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
+        local_expert_indices_offset = self.ep_rank * self.num_local_experts
 
-        self._init_grouped_layers(self.num_local_experts)
+        self._init_grouped_layers(self.num_local_experts, first_expert=local_expert_indices_offset)
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -2348,7 +2392,6 @@ class GroupedExpertsTE(nn.Module):
             moe_benchmark_static_routing=self.static_routing,
         )
 
-        local_expert_indices_offset = self.ep_rank * self.num_local_experts
         local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
 
         self.token_dispatcher = MoEFlexTokenDispatcher(
