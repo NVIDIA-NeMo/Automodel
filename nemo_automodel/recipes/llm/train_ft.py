@@ -761,7 +761,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp = None
 
         from nemo_automodel.components.moe.mok_experts import enable_mok_mxfp8_optimizer_step_cache
-        from nemo_automodel.components.moe.nvfp4_resident_adam import enable_nvfp4_fused_adam_step
+        from nemo_automodel.components.optim.nvfp4_resident_adam import enable_nvfp4_fused_adam_step
 
         enable_mok_mxfp8_optimizer_step_cache(self.model_parts, self.optimizer)
         enable_nvfp4_fused_adam_step(self.model_parts, self.optimizer)

@@ -26,10 +26,10 @@ te = pytest.importorskip("transformer_engine.pytorch")
 from transformer_engine.pytorch.optimizers import FusedAdam  # noqa: E402
 
 from nemo_automodel.components.models.common.utils import BackendConfig  # noqa: E402
-from nemo_automodel.components.moe import nvfp4_resident_adam  # noqa: E402
 from nemo_automodel.components.moe.config import MoEConfig  # noqa: E402
-from nemo_automodel.components.moe.nvfp4_resident_adam import enable_nvfp4_fused_adam_step  # noqa: E402
 from nemo_automodel.components.moe.quantized_experts import GroupedExpertsTENVFP4  # noqa: E402
+from nemo_automodel.components.optim import nvfp4_resident_adam  # noqa: E402
+from nemo_automodel.components.optim.nvfp4_resident_adam import enable_nvfp4_fused_adam_step  # noqa: E402
 from nemo_automodel.components.quantization.nvfp4 import quantize_nvfp4  # noqa: E402
 
 pytestmark = pytest.mark.skipif(

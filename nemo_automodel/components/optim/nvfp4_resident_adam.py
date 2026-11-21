@@ -16,7 +16,8 @@
 
 Transformer Engine ``FusedAdam`` steps an NVFP4 weight in three passes over its FP32 master weight: it casts the
 BF16 gradient to FP32, runs Adam, and quantizes the master back into the weight. ``enable_nvfp4_fused_adam_step``
-replaces these for the weights of ``GroupedExpertsTENVFP4`` with one kernel that runs Adam on the BF16 gradient
+replaces these for the ``NVFP4Tensor`` parameters of a model, which are the expert weights of
+``GroupedExpertsTENVFP4``, with one kernel that runs Adam on the BF16 gradient
 and records the largest magnitude of each updated master, and one kernel that writes the row-wise and column-wise
 NVFP4 operands of every weight from its master. Master weights, moments, codes, block scales and outer scales
 come out bit-identical to the ``FusedAdam`` step; the optimizer state stays where ``FusedAdam`` keeps it, so
@@ -41,8 +42,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.moe import nvfp4_adam_cuda as sources
-from nemo_automodel.components.moe.quantized_experts import GroupedExpertsTENVFP4
+from nemo_automodel.components.optim import nvfp4_adam_cuda as sources
 from nemo_automodel.shared.import_utils import safe_import_from
 
 if TYPE_CHECKING:
@@ -247,8 +247,9 @@ class _FusedAdamStep:
 def enable_nvfp4_fused_adam_step(model_parts: list[nn.Module], optimizers: list[torch.optim.Optimizer]) -> None:
     """Step the resident NVFP4 expert weights of every model part in the fused kernels.
 
-    Applies to the weights of ``GroupedExpertsTENVFP4`` that are 2D block-scaled, rounded to nearest and hold
-    both operands, and to Transformer Engine ``FusedAdam`` optimizers with FP32 master weights that are not
+    Applies to the ``NVFP4Tensor`` parameters of the model parts (the expert weights of
+    ``GroupedExpertsTENVFP4``) that are 2D block-scaled, rounded to nearest and hold both operands, and to
+    Transformer Engine ``FusedAdam`` optimizers with FP32 master weights that are not
     capturable. Every other weight and optimizer keeps the ``FusedAdam`` step, as do all weights when the kernels
     cannot be built (logged as a warning).
 
@@ -259,11 +260,16 @@ def enable_nvfp4_fused_adam_step(model_parts: list[nn.Module], optimizers: list[
     Raises:
         ValueError: If there is not one optimizer per model part.
     """
-    expert_modules = [
-        [module for module in model_part.modules() if isinstance(module, GroupedExpertsTENVFP4)]
+    has_nvfp4_tensor, nvfp4_tensor_cls = safe_import_from(
+        "transformer_engine.pytorch.tensor.nvfp4_tensor", "NVFP4Tensor"
+    )
+    if not has_nvfp4_tensor:
+        return
+    resident_weights = [
+        [parameter for parameter in model_part.parameters() if isinstance(parameter, nvfp4_tensor_cls)]
         for model_part in model_parts
     ]
-    if not any(expert_modules):
+    if not any(resident_weights):
         return
     if len(model_parts) != len(optimizers):
         raise ValueError(
@@ -271,10 +277,9 @@ def enable_nvfp4_fused_adam_step(model_parts: list[nn.Module], optimizers: list[
             f"for {len(model_parts)} parts"
         )
     _, fused_adam_cls = safe_import_from("transformer_engine.pytorch.optimizers", "FusedAdam")
-    _, nvfp4_tensor_cls = safe_import_from("transformer_engine.pytorch.tensor.nvfp4_tensor", "NVFP4Tensor")
 
     steps: list[tuple[torch.optim.Optimizer, list["NVFP4Tensor"]]] = []
-    for modules, optimizer in zip(expert_modules, optimizers, strict=True):
+    for part_weights, optimizer in zip(resident_weights, optimizers, strict=True):
         if (
             not isinstance(optimizer, fused_adam_cls)
             or not optimizer.master_weights
@@ -282,12 +287,7 @@ def enable_nvfp4_fused_adam_step(model_parts: list[nn.Module], optimizers: list[
             or optimizer.use_decoupled_grad
         ):
             continue
-        weights = [
-            parameter
-            for module in modules
-            for parameter in module.parameters()
-            if isinstance(parameter, nvfp4_tensor_cls) and _kernels_cover(parameter)
-        ]
+        weights = [weight for weight in part_weights if _kernels_cover(weight)]
         if weights:
             steps.append((optimizer, weights))
     if not steps:
