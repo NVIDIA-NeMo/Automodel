@@ -461,6 +461,13 @@ def test_quantization_config_boundary() -> None:
         adapter.to_hf({}, unsupported=True)
     with pytest.raises(ValueError, match="legacy"):
         adapter.to_hf({}, v4_compatible=True)
+    norm = torch.ones(cfg.hidden_size)
+    assert adapter.convert_single_tensor_to_hf(
+        "norm.weight", norm, exclude_key_regex=r".*_extra_state.*", quantization=False
+    ) == [("model.llm.norm.weight", norm)]
+    assert adapter.convert_single_tensor_to_hf("norm.weight", norm, exclude_key_regex="norm") == []
+    with pytest.raises(ValueError, match="without quantization"):
+        adapter.convert_single_tensor_to_hf("norm.weight", norm, quantization=True)
     assert adapter.forced_hf_dtype_mapping(
         {"pseudo_query": torch.zeros(3), "expert": torch.zeros(3, dtype=torch.bfloat16)}
     ) == {"pseudo_query": "F32", "expert": "BF16"}

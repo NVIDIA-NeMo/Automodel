@@ -302,6 +302,8 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         fqn: str,
         tensor: torch.Tensor,
         *,
+        exclude_key_regex: str | None = None,
+        quantization: bool = False,
         for_checkpoint_load: bool = False,
         **kwargs: Any,
     ) -> list[tuple[str, torch.Tensor]]:
@@ -310,6 +312,8 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         Args:
             fqn: Native text parameter or persistent-buffer name.
             tensor: Native parameter layout; grouped experts are [experts, input, output].
+            exclude_key_regex: Optional exclusion pattern; a matching name yields no tensors.
+            quantization: Must be false; trained weights are exported without quantization.
             for_checkpoint_load: Zero omitted fused-projection padding in destination storage before loading.
                 Floating export otherwise leaves the input unchanged.
 
@@ -321,6 +325,10 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         # StateDictAdapter imposes an open keyword boundary; unknown modes are rejected.
         if kwargs:
             raise TypeError(f"Unsupported Inkling2 adapter options: {sorted(kwargs)}")
+        if quantization:
+            raise ValueError("Trained Inkling2 weights are exported without quantization")
+        if exclude_key_regex is not None and re.search(exclude_key_regex, fqn) is not None:
+            return []
         # Adapter checkpoints retain the native fused-projection/grouped-expert
         # layout. Automodel's shared PEFT loader restores these names and owns
         # EP slicing; no serving-format split or weight transpose applies.
