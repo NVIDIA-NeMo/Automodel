@@ -81,6 +81,7 @@ class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
         ngram_vocab_size_base: int = 20000000,
         make_ngram_vocab_size_divisible_by: int = 128,
         split_ngram_parts: int = 128,
+        ple_embedding_dtype: str | None = None,
         # QSA indexer.
         indexer_budget: int = 2048,
         indexer_compress_ratio: int = 4,
@@ -133,6 +134,12 @@ class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
             ple_layer_ids = []
         else:
             ple_layer_ids = list(ple_layer_ids)
+        # The checkpoint stores the PLE table either as BF16 shards (absent or
+        # "bfloat16") or as FP8 shards plus one global BF16 ``weight_scale``.
+        if ple_embedding_dtype not in (None, "bfloat16", "float8_e4m3fn"):
+            raise ValueError(
+                f"ple_embedding_dtype must be None, 'bfloat16' or 'float8_e4m3fn', got {ple_embedding_dtype!r}"
+            )
 
         if mlp_only_layers is None:
             mlp_only_layers = []
@@ -213,6 +220,7 @@ class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
         self.ngram_vocab_size_base = ngram_vocab_size_base
         self.make_ngram_vocab_size_divisible_by = make_ngram_vocab_size_divisible_by
         self.split_ngram_parts = split_ngram_parts
+        self.ple_embedding_dtype = ple_embedding_dtype
 
         self.indexer_budget = indexer_budget
         self.indexer_compress_ratio = indexer_compress_ratio

@@ -746,6 +746,8 @@ class Checkpointer:
             v4_compatible=self.config.v4_compatible,
             legacy_paramwrapper_layout=self.config.legacy_paramwrapper_layout,
         )
+        if not self.config.is_peft:
+            state_dict.update(_adapter_tensors_outside_state_dict(model_state.model[0]))
         if self.config.model_save_format == SerializationFormat.SAFETENSORS:
             # Module metadata (e.g. Transformer Engine state) is not part of HF weights.
             state_dict = {key: value for key, value in state_dict.items() if not key.endswith("_extra_state")}
@@ -1064,6 +1066,8 @@ class Checkpointer:
             cpu_offload=self.config.cpu_offload,
             has_expert_parallelism=self.moe_mesh is not None,
         )
+        if is_init_step:
+            _set_adapter_base_checkpoint_dir(model_state.model[0], model_path)
         should_dequantize_base_checkpoint = bool(
             is_init_step
             and _should_dequantize_base_checkpoint(model_state.model[0], self.config.dequantize_base_checkpoint)
@@ -3063,6 +3067,32 @@ def _maybe_adapt_state_dict_to_hf(
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
+
+
+def _set_adapter_base_checkpoint_dir(model_part: nn.Module, model_path: str) -> None:
+    """Name the base checkpoint directory to a state-dict adapter that reads checkpoint files directly.
+
+    ``model_path`` is the snapshot the base weights load from. An adapter that
+    reads other checkpoint files itself (for example a frozen table kept
+    outside the state dict) must read them from this directory, never from its
+    own resolution of a Hub ID, which can select another revision.
+    """
+    adapter = getattr(unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    set_base_checkpoint_dir = getattr(adapter, "set_base_checkpoint_dir", None)
+    if callable(set_base_checkpoint_dir):
+        set_base_checkpoint_dir(model_path)
+
+
+def _adapter_tensors_outside_state_dict(model_part: nn.Module) -> dict[str, torch.Tensor]:
+    """Return the HF-named tensors a state-dict adapter saves although the model's state dict lacks them.
+
+    A frozen tensor kept outside the state dict, the optimizer and FSDP must
+    still be in a saved checkpoint, so that the checkpoint and its consolidated
+    export load without the base checkpoint.
+    """
+    adapter = getattr(unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    tensors_outside_state_dict = getattr(adapter, "hf_tensors_outside_state_dict", None)
+    return dict(tensors_outside_state_dict()) if callable(tensors_outside_state_dict) else {}
 
 
 def _materialize_to_hf_views_for_save(state_dict: dict[str, torch.Tensor]) -> None:
