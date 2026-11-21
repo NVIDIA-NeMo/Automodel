@@ -477,3 +477,56 @@ def test_draft_declares_the_same_cross_block_fsdp_holders_as_the_base_model() ->
             holders = [m for n, m in block.named_modules() if n == name or n.endswith("." + name)]
             assert holders, (name, [n for n, _ in block.named_modules()][:8])
             assert {p.dtype for h in holders for p in h.parameters()} == {torch.float32}
+
+
+@pytest.mark.parametrize("cuda", [False, True])
+def test_default_backend_uses_grouped_experts_only_on_cuda(monkeypatch: pytest.MonkeyPatch, cuda: bool) -> None:
+    """Without an explicit backend, the draft's routed experts take torch_mm on CUDA and the loop elsewhere."""
+    from nemo_automodel.components.moe.experts import GroupedExperts
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    model = DeepseekV41DSparkModel(_config(), num_anchors=1, enable_confidence_head=True)
+    experts = [module for module in model.modules() if isinstance(module, GroupedExperts)]
+    assert len(experts) == 3
+    assert {module.use_torch_mm for module in experts} == {cuda}
+
+    explicit = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41DSparkModel(_config(), explicit, num_anchors=1, enable_confidence_head=True)
+    assert not any(module.use_torch_mm for module in model.modules() if isinstance(module, GroupedExperts))
+
+
+@pytest.mark.runtime_budget(
+    20,
+    hard_timeout=70,
+    reason="Runs the three-stage draft forward/backward once per expert backend, including CPU MoE activation compilation.",
+)
+def test_grouped_experts_match_the_loop_through_the_draft() -> None:
+    """In FP32 the torch_mm experts give the loop's draft outputs and gradients."""
+    torch.manual_seed(23)
+    loop_model = _model()
+    mm_backend = BackendConfig(
+        attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch"
+    )
+    mm_model = DeepseekV41DSparkBackbone(_config(), mm_backend)
+    mm_model.load_state_dict(loop_model.state_dict())
+    noise_embeddings = torch.randn(1, 5, 16)
+    target_hidden_states = torch.randn(1, 6, 32)
+    position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 6]])
+    attention_mask = torch.zeros(1, 1, 5, 11)
+    upstream = torch.randn(1, 5, 16)
+
+    results = []
+    for model in (loop_model, mm_model):
+        inputs = noise_embeddings.clone().requires_grad_(True)
+        output = model(inputs, target_hidden_states, position_ids=position_ids, attention_mask=attention_mask)
+        output.normalized_hidden_states.backward(upstream)
+        grads = {name: param.grad for name, param in model.named_parameters() if param.grad is not None}
+        results.append((output.normalized_hidden_states.detach(), inputs.grad, grads))
+
+    (loop_out, loop_input_grad, loop_grads), (mm_out, mm_input_grad, mm_grads) = results
+    assert any("experts.gate_and_up_projs" in name for name in loop_grads)
+    assert loop_grads.keys() == mm_grads.keys()
+    torch.testing.assert_close(mm_out, loop_out, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(mm_input_grad, loop_input_grad, rtol=1e-5, atol=1e-6)
+    for name, grad in loop_grads.items():
+        torch.testing.assert_close(mm_grads[name], grad, rtol=1e-5, atol=1e-6, msg=name)
