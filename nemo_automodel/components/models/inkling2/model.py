@@ -43,7 +43,16 @@ from nemo_automodel.shared.utils import dtype_from_str
 from .attention import AttentionSources, Inkling2Attention
 from .config import Inkling2Config, Inkling2TextConfig, resolve_quantization_config
 from .context_parallel import CPBatch, prepare_cp_inputs, unpack_row_layout, validate_document_positions
-from .layers import Inkling2LMHead, Inkling2MoE, ResidualQuery, ResidualState, ShortConvolution
+from .layers import (
+    Inkling2LMHead,
+    Inkling2MoE,
+    MessageController,
+    MessageQueries,
+    ResidualQuery,
+    ResidualState,
+    ShortConvolution,
+    residual_mix,
+)
 from .parallelization import FP32_MODULES, Inkling2Parallelizer
 from .state_dict_adapter import Inkling2StateDictAdapter
 
@@ -96,19 +105,40 @@ class Inkling2DecoderLayer(nn.Module):
         # Parameter-free; its forward input is the partial block entering this layer, the
         # capture point of the DSpark target features (get_dspark_target_feature_modules).
         self.partial_input = nn.Identity()
+        self.controllers = (
+            nn.ModuleDict(
+                {
+                    name: MessageController(config.hidden_size, config.loop_config["gate_rank"], dtype=dtype)
+                    for name in ("attn", "k", "v", "mlp")
+                }
+            )
+            if config.loop_config is not None and layer_idx in config.loop_core_layers
+            else None
+        )
 
     @property
     def self_attn(self) -> Inkling2Attention:
         """Expose the shared MoE CP setup hook without another parameter owner."""
         return self.attn
 
-    def forward(self, state: ResidualState, valid: torch.Tensor, positions: torch.Tensor) -> ResidualState:
+    def forward(
+        self,
+        state: ResidualState,
+        valid: torch.Tensor,
+        positions: torch.Tensor,
+        bank: ResidualState | None = None,
+        message_queries: torch.Tensor | None = None,
+    ) -> ResidualState:
         """Advance a depth block, with a new block beginning after boundary attention.
 
         Args:
             state: Completed blocks and partial, each [batch, sequence, hidden].
             valid: Boolean tensor of shape [batch, sequence].
             positions: Integer tensor of shape [batch, sequence].
+            bank: Residual blocks the previous loop pass wrote, each [batch, sequence, hidden];
+                None in the first pass and outside the loop core.
+            message_queries: FP32 tensor of shape [4, hidden] with this layer's queries for
+                the attention Q, K, V and MoE inputs; given together with ``bank``.
 
         Returns:
             New state with tensors of shape [batch, sequence, hidden]; previous state is unchanged.
@@ -118,13 +148,28 @@ class Inkling2DecoderLayer(nn.Module):
         streams = (
             (state.partial,) * len(self.attn_norms) if self.attn_query is None else self.attn_query(state).unbind(0)
         )
-        normed = tuple(norm(stream.float()).to(dtype) for norm, stream in zip(self.attn_norms, streams))
-        sources = AttentionSources(normed[0], normed[0], normed[0]) if self.is_local else AttentionSources(*normed)
+        norms = tuple(self.attn_norms)
+        messages = None
+        if bank is not None:
+            assert self.controllers is not None and message_queries is not None
+            messages = residual_mix(bank, message_queries, normalize_values=True)
+            # In later passes a local layer also gets separate Q, K and V inputs, through its one norm.
+            streams, norms = (streams * 3, norms * 3) if self.is_local else (streams, norms)
+            streams = tuple(
+                self.controllers[name](stream.float(), message)
+                for name, stream, message in zip(("attn", "k", "v"), streams, messages)
+            )
+        normed = tuple(norm(stream.float()).to(dtype) for norm, stream in zip(norms, streams))
+        sources = AttentionSources(normed[0], normed[0], normed[0]) if len(normed) == 1 else AttentionSources(*normed)
         attention = self.attn_sconv(self.attn(sources, valid, positions), valid, positions=positions)
         blocks = (*state.blocks, state.partial) if self.is_boundary else state.blocks
         # Mixture arithmetic sees the FP32 sum before the residual storage cast.
         partial = attention.float() if self.is_boundary else state.partial.float() + attention.float()
-        mlp_input = self.mlp_norm(self.mlp_query(ResidualState(blocks, partial))[0]).to(dtype)
+        mlp_stream = self.mlp_query(ResidualState(blocks, partial))[0]
+        if messages is not None:
+            assert self.controllers is not None
+            mlp_stream = self.controllers["mlp"](mlp_stream, messages[3])
+        mlp_input = self.mlp_norm(mlp_stream).to(dtype)
         mlp = self.mlp_sconv(self.mlp(mlp_input, padding_mask=~valid), valid, positions=positions)
         return ResidualState(blocks, (partial + mlp.float()).to(dtype))
 
@@ -142,6 +187,9 @@ class Inkling2DecoderLayer(nn.Module):
         self.mlp.init_weights(buffer_device, init_std)
         self.attn_sconv.reset_parameters(init_std)
         self.mlp_sconv.reset_parameters(init_std)
+        if self.controllers is not None:
+            for controller in self.controllers.values():
+                cast(MessageController, controller).reset_parameters(init_std)
 
 
 class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -243,6 +291,13 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             }
         )
         self.moe_config = cast(Inkling2DecoderLayer, self.layers["0"]).mlp.moe_config
+        core_layers = len(config.loop_core_layers)
+        self.message_queries: MessageQueries | None = (
+            MessageQueries(config.hidden_size, core_layers) if core_layers else None
+        )
+        self.message_kv_queries: MessageQueries | None = (
+            MessageQueries(config.hidden_size, core_layers) if core_layers else None
+        )
         self.output_query: ResidualQuery | None = ResidualQuery(
             config.hidden_size, 1, normalize_values=config.attn_res_normalize_values
         )
@@ -282,6 +337,9 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             cast(nn.RMSNorm, self.norm).reset_parameters()
             assert self.output_query is not None
             self.output_query.weight.zero_()
+        for queries in (self.message_queries, self.message_kv_queries):
+            if queries is not None:
+                queries.weight.zero_()
         for layer in self.layers.values():
             cast(Inkling2DecoderLayer, layer).reset_parameters(self.text_config.initializer_range, device)
 
@@ -329,6 +387,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def _pipeline_layer_ids(self) -> list[int]:
         """Validate contiguous global layer IDs and exclusive parameter ownership."""
+        if self.text_config.loop_config is not None:
+            raise ValueError("Looped Inkling2 does not support pipeline parallelism")
         ids = [int(index) for index in self.layers]
         if not ids or ids != list(range(ids[0], ids[-1] + 1)):
             raise ValueError("Inkling2 PP stages require nonempty contiguous decoder layers")
@@ -353,6 +413,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             Copied FQN lists with embed_norm first and output_query last.
         """
         del text_model
+        if self.text_config.loop_config is not None:
+            raise ValueError("Looped Inkling2 does not support pipeline parallelism")
         if layers_prefix or not module_names_per_stage:
             raise ValueError("Inkling2 PP expects nonempty stages with top-level layers")
         stages = [
@@ -607,8 +669,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             otherwise hidden states [batch, sequence, hidden] or FP32 logits
             [batch, sequence, vocab]. Packed history owns fresh storage and retains autograd.
         """
-        for layer in self.layers.values():
-            state = layer(state, valid, positions)
+        state = self._run_layers(state, valid, positions)
         if self.lm_head is None:
             return torch.stack((*state.blocks, state.partial), dim=2), torch.stack(
                 (positions.long(), valid.long()), dim=-1
@@ -616,6 +677,46 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         assert self.norm is not None and self.output_query is not None
         hidden = self.norm(self.output_query(state)[0]).to(state.partial.dtype)
         return hidden if return_hidden or self._pp_return_hidden_states else self._project_logits(hidden)
+
+    def _run_layers(self, state: ResidualState, valid: torch.Tensor, positions: torch.Tensor) -> ResidualState:
+        """Run every layer once, or the loop core once per pass with messages between passes.
+
+        Args:
+            state: Completed blocks and partial [batch, sequence, hidden] entering the first layer.
+            valid: Boolean token validity [batch, sequence].
+            positions: Integer token positions [batch, sequence].
+
+        Returns:
+            State after the last layer. A later loop pass restarts from the state that
+            entered the core and reads the previous pass only through its messages.
+        """
+        loop = self.text_config.loop_config
+        if loop is None:
+            for layer in self.layers.values():
+                state = layer(state, valid, positions)
+            return state
+        core = self.text_config.loop_core_layers
+        assert self.message_queries is not None and self.message_kv_queries is not None
+        queries, kv_queries = self.message_queries(), self.message_kv_queries()
+        for index in range(core.start):
+            state = self.layers[str(index)](state, valid, positions)
+        prelude, bank = state, None
+        for pass_index in range(loop["num_passes"]):
+            if pass_index:
+                bank = ResidualState(state.blocks[len(prelude.blocks) + 1 :], state.partial)
+                state = prelude
+            for offset, index in enumerate(core):
+                # Row 2 * offset holds the attention Q (or K) query, the next row the MoE (or V) query.
+                first, second = 2 * offset, 2 * offset + 1
+                layer_queries = (
+                    None
+                    if bank is None
+                    else torch.stack((queries[first], kv_queries[first], kv_queries[second], queries[second]))
+                )
+                state = self.layers[str(index)](state, valid, positions, bank, layer_queries)
+        for index in range(core.stop, self.text_config.num_hidden_layers):
+            state = self.layers[str(index)](state, valid, positions)
+        return state
 
     def _project_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """Apply the callable head, logit softcap and unused-vocabulary mask.

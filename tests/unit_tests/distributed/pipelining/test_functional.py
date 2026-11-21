@@ -2017,3 +2017,50 @@ class TestPreserveGradsAcrossStageReinit:
         _preserve_grads_across_stage_reinit([stage])
 
         assert not hasattr(stage, "_post_metadata_inference_cleanup")
+
+
+def test_explicit_partition_must_list_every_decoder_layer_once():
+    from nemo_automodel.components.distributed.pipelining.functional import _check_partition_lists_every_layer_once
+
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.layers.0", "model.layers.1"], ["model.layers.2", "model.lm_head"]], "model.", 3
+    )
+    with pytest.raises(ValueError, match=r"missing \[1\]"):
+        _check_partition_lists_every_layer_once([["model.layers.0"], ["model.layers.2"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[1\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers.0", "model.layers.1"], ["model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    with pytest.raises(ValueError, match=r"beyond the model \[3\]"):
+        _check_partition_lists_every_layer_once([[f"model.layers.{i}" for i in range(4)]], "model.", 3)
+    # A listed ancestor retains the whole container, as the splitter does.
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.rotary_emb", "model.layers"], ["model.norm", "lm_head"]], "model.", 3
+    )
+    _check_partition_lists_every_layer_once([["model"], ["lm_head"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[0, 1, 2\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers"], ["model.layers.0", "model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    # Only the canonical decimal key retains a ModuleDict layer: "04" is not "4".
+    with pytest.raises(ValueError, match=r"missing \[4\]"):
+        _check_partition_lists_every_layer_once(
+            [[f"model.layers.{i}" for i in range(4)], ["model.layers.04", "model.layers.5"]], "model.", 6
+        )
+    # The whole FQN must match: with a trailing newline it is another string than the ModuleDict key.
+    with pytest.raises(ValueError, match=r"missing \[4\]"):
+        _check_partition_lists_every_layer_once(
+            [[f"model.layers.{i}" for i in range(4)], ["model.layers.4\n", "model.layers.5"]], "model.", 6
+        )
+    # Stages must own increasing layer ranges: [0,4), [5,6), [4,5), [6,8) covers every layer once but reorders.
+    with pytest.raises(ValueError, match=r"increasing order.*\(0, 3\), \(5, 5\), \(4, 4\), \(6, 7\)"):
+        _check_partition_lists_every_layer_once(
+            [
+                [f"model.layers.{i}" for i in range(0, 4)],
+                ["model.layers.5"],
+                ["model.layers.4"],
+                [f"model.layers.{i}" for i in range(6, 8)],
+            ],
+            "model.",
+            8,
+        )

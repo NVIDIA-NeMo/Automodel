@@ -49,6 +49,16 @@ class Inkling2ReleasedQuantizationLabel(TypedDict):
     quant_algo: Literal["NVFP4", "MXFP8"]
 
 
+class Inkling2LoopConfig(TypedDict):
+    """Layers ``[core_start, core_end)`` run ``num_passes`` times for every token."""
+
+    core_start: int
+    core_end: int
+    num_passes: int
+    gate_rank: int
+    is_varloop: bool
+
+
 class _ParameterGroup(TypedDict):
     """One ``hf_quant_config.json`` group; only the keys the loader reads."""
 
@@ -220,6 +230,7 @@ class Inkling2TextConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         tie_word_embeddings: bool = False,
         quantization_config: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None = None,
+        loop_config: Inkling2LoopConfig | None = None,
         **kwargs: Any,
     ) -> None:
         # Hugging Face owns the open-ended serialized metadata at this boundary.
@@ -297,6 +308,19 @@ class Inkling2TextConfig(PretrainedConfig):
             else _checked_quantization_config(quantization_config, num_hidden_layers)
         )
         self.use_cache = False
+        self.loop_config = loop_config
+        if loop_config is not None:
+            if set(loop_config) != {"core_start", "core_end", "num_passes", "gate_rank", "is_varloop"}:
+                raise ValueError("Unsupported Inkling2 loop_config fields")
+            start, end, block = loop_config["core_start"], loop_config["core_end"], self.n_layers_per_attn_res_block
+            if not 0 <= start < end <= num_hidden_layers or start % block or end % block:
+                raise ValueError("The loop core must cover whole attention residual blocks inside the layer stack")
+            if loop_config["num_passes"] < 2 or loop_config["gate_rank"] <= 0:
+                raise ValueError("Looping requires at least two passes and a positive gate rank")
+            if loop_config["is_varloop"]:
+                raise ValueError("Inkling2 checkpoints with a variable number of passes are not supported")
+            if not attn_res_normalize_values:
+                raise ValueError("Loop messages require attn_res_normalize_values=True")
         if (
             min(
                 hidden_size,
@@ -351,6 +375,12 @@ class Inkling2TextConfig(PretrainedConfig):
             <= 0
         ):
             raise ValueError("Inkling2 epsilon, thresholds, softcaps and initialization scale must be positive")
+
+    @property
+    def loop_core_layers(self) -> range:
+        """Decoder layers that run once per pass; empty without a loop."""
+        loop = self.loop_config
+        return range(0) if loop is None else range(loop["core_start"], loop["core_end"])
 
 
 class Inkling2VisionConfig(PretrainedConfig):
@@ -437,6 +467,8 @@ class Inkling2Config(PretrainedConfig):
             else _checked_quantization_config(quantization_config, self.text_config.num_hidden_layers)
         )
         self.text_config.quantization_config = self.quantization_config
+        if self.text_config.loop_config is not None and self.model_type != "inkling2_loop":
+            raise ValueError("A loop_config requires model_type inkling2_loop")
         kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)
 
@@ -522,4 +554,14 @@ class Inkling2LegacyConfig(Inkling2Config):
     def __init__(self, **kwargs: Any) -> None:
         # Transformers dataclass-wraps subclasses without an explicit initializer.
         # Delegate so nested text/vision dictionaries retain their typed conversion.
+        super().__init__(**kwargs)
+
+
+class Inkling2LoopConfiguration(Inkling2Config):
+    """Released configuration of a checkpoint whose middle layers run several times."""
+
+    model_type = "inkling2_loop"
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Transformers dataclass-wraps subclasses without an explicit initializer.
         super().__init__(**kwargs)
