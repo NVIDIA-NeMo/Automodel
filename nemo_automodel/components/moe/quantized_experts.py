@@ -65,9 +65,8 @@ from nemo_automodel.components.quantization.nvfp4 import (
 from nemo_automodel.shared.import_utils import safe_import_from
 
 if TYPE_CHECKING:
-    from transformer_engine.pytorch import GroupedLinear
-
     from nemo_automodel.components.models.common.utils import BackendConfig
+    from nemo_automodel.components.moe.experts import _ExpertGroupedLinear
 
 logger = logging.getLogger(__name__)
 
@@ -948,22 +947,22 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
         # Outer scale every expert weight was built with, per projection: [local experts].
         self._built_amax: dict[str, torch.Tensor] = {}
         self._packed_storage_ready = True
-        self._init_grouped_layers(self.num_local_experts)
+        self._init_grouped_layers(self.num_local_experts, first_expert=0)
 
-    def _init_grouped_layers(self, num_local_experts: int) -> None:
+    def _init_grouped_layers(self, num_local_experts: int, first_expert: int) -> None:
         """Create the projections without floating-point weights and the packed placeholders of this rank."""
         if not self._packed_storage_ready:
-            super()._init_grouped_layers(num_local_experts)
+            super()._init_grouped_layers(num_local_experts, first_expert=first_expert)
             return
         _, quantized_model_init = safe_import_from("transformer_engine.pytorch", "quantized_model_init")
 
         assert self.te_nvfp4 is not None
         # Inside quantized_model_init the projections expect NVFP4Tensor weights and never quantize them.
         with quantized_model_init(enabled=True, recipe=self.te_nvfp4.build_recipe()):
-            super()._init_grouped_layers(num_local_experts)
+            super()._init_grouped_layers(num_local_experts, first_expert=first_expert)
         for linear in (self.gate_up_linear, self.down_linear):
             for index in range(num_local_experts):
-                del linear._parameters[f"weight{index}"]
+                del linear._parameters[f"weight{first_expert + index}"]
         cfg = self.config
         gate_up_out = cfg.moe_inter_dim * 2 if self.is_gated else cfg.moe_inter_dim
         dims = {"gate_and_up_projs": (gate_up_out, cfg.expert_dim), "down_projs": (cfg.expert_dim, cfg.moe_inter_dim)}
@@ -985,7 +984,7 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
             _preserve_packed_storage_dtypes(self, (packed_name, scales_name, global_name))
         self._te_weights_built = False
 
-    def _projections(self) -> tuple[tuple[str, "GroupedLinear"], ...]:
+    def _projections(self) -> tuple[tuple[str, "_ExpertGroupedLinear"], ...]:
         """Packed base name and Transformer Engine module of both projections."""
         return (("gate_and_up_projs", self.gate_up_linear), ("down_projs", self.down_linear))
 
@@ -1023,7 +1022,7 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
                 quantizer.set_usage(rowwise=True, columnwise=True)
                 dequantized = dequantize_nvfp4(packed[index], scales[index], row_scale[index], self.config.dtype)
                 quantized = quantizer(dequantized)
-                if f"weight{index}" in linear._parameters:
+                if f"weight{linear.first_expert + index}" in linear._parameters:
                     weight = getattr(linear, f"weight{index}")
                     weight._columnwise_data.copy_(quantized._columnwise_data)
                     weight._columnwise_scale_inv.copy_(quantized._columnwise_scale_inv)

@@ -311,6 +311,25 @@ def test_a_checkpoint_loaded_again_keeps_the_weights_the_optimizer_holds() -> No
     assert (weight.dequantize(dtype=torch.float32) - master).norm() / master.norm() < 0.15
 
 
+def test_reloading_nonzero_expert_rank_preserves_registered_weights() -> None:
+    experts = GroupedExpertsTENVFP4(_config(), backend=_backend())
+    experts._init_grouped_layers(EXPERTS, first_expert=EXPERTS)
+    experts.to_empty(device="cuda")
+    state = {name: value.cuda() for name, value in _packed_state().items()}
+    experts.load_state_dict(state, strict=False)
+
+    expected_names = {f"weight{i}" for i in range(EXPERTS, 2 * EXPERTS)}
+    projections = (experts.gate_up_linear, experts.down_linear)
+    original = [dict(projection.named_parameters()) for projection in projections]
+    experts.load_state_dict(state, strict=False)
+    for projection, weights in zip(projections, original, strict=True):
+        assert weights.keys() == expected_names
+        for local_index in range(EXPERTS):
+            weight = weights[f"weight{EXPERTS + local_index}"]
+            assert projection.get_parameter(f"weight{local_index}") is weight
+            assert projection.get_parameter(f"weight{EXPERTS + local_index}") is weight
+
+
 def test_forward_needs_loaded_weights() -> None:
     experts = _experts()
     x = torch.zeros(ROWS, DIM, device="cuda", dtype=torch.bfloat16)

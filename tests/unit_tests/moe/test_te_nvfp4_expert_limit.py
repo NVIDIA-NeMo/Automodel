@@ -29,13 +29,24 @@ from nemo_automodel.components.moe.layers import MoE
 class _FakeGroupedLinear(torch.nn.Module):
     """CPU stand-in for TE ``GroupedLinear``: one ``weight{i}`` per expert."""
 
-    def __init__(self, *, num_gemms, in_features, out_features, bias, params_dtype, device, use_grouped_tensor=False):
+    def __init__(
+        self,
+        *,
+        first_expert,
+        num_gemms,
+        in_features,
+        out_features,
+        bias,
+        params_dtype,
+        device,
+        use_grouped_tensor=False,
+    ):
         super().__init__()
         self.num_gemms = num_gemms
         self.use_bias = bias
         for index in range(num_gemms):
             weight = torch.nn.Parameter(torch.empty(out_features, in_features, dtype=params_dtype))
-            self.register_parameter(f"weight{index}", weight)
+            self.register_parameter(f"weight{first_expert + index}", weight)
 
 
 class _FakePadding(torch.nn.Module):
@@ -63,7 +74,8 @@ class _FakeMesh:
 def fake_te(monkeypatch):
     """Stand in for Transformer Engine and the token dispatcher so the experts are built on CPU."""
     te = ModuleType("transformer_engine.pytorch")
-    te.GroupedLinear, te.Fp8Padding, te.Fp8Unpadding = _FakeGroupedLinear, _FakePadding, _FakePadding
+    te.Fp8Padding, te.Fp8Unpadding = _FakePadding, _FakePadding
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._ExpertGroupedLinear", _FakeGroupedLinear)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te)
     monkeypatch.setattr("nemo_automodel.components.moe.experts.is_te_min_version", lambda version: True)
     monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)

@@ -46,6 +46,7 @@ from nemo_automodel.components.optim import nvfp4_adam_cuda as sources
 from nemo_automodel.shared.import_utils import safe_import_from
 
 if TYPE_CHECKING:
+    from transformer_engine.pytorch.optimizers import FusedAdam
     from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
 
 logger = logging.getLogger(__name__)
@@ -202,7 +203,7 @@ class _FusedAdamStep:
 
     @torch.no_grad()
     def step_held_weights(
-        self, optimizer: torch.optim.Optimizer, args: tuple[_StepArgument, ...], kwargs: dict[str, _StepArgument]
+        self, optimizer: "FusedAdam", args: tuple[_StepArgument, ...], kwargs: dict[str, _StepArgument]
     ) -> None:
         """Post-step hook: return the gradients and step their weights.
 
@@ -278,7 +279,7 @@ def enable_nvfp4_fused_adam_step(model_parts: list[nn.Module], optimizers: list[
         )
     _, fused_adam_cls = safe_import_from("transformer_engine.pytorch.optimizers", "FusedAdam")
 
-    steps: list[tuple[torch.optim.Optimizer, list["NVFP4Tensor"]]] = []
+    steps: list[tuple["FusedAdam", list["NVFP4Tensor"]]] = []
     for part_weights, optimizer in zip(resident_weights, optimizers, strict=True):
         if (
             not isinstance(optimizer, fused_adam_cls)

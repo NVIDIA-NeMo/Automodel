@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -427,6 +428,30 @@ def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch
     assert len(calls) == 1
     assert calls[0][0] == torch.distributed.ReduceOp.SUM
     assert calls[0][1] is None
+
+
+def test_step_throughput_counts_context_parallel_flops_once(monkeypatch):
+    """CP ranks hold their DP replica's unsharded batch, so its FLOPs count once, like its tokens."""
+    dp_size, cp_size = 2, 2
+    recipe = BaseRecipe.__new__(BaseRecipe)
+    recipe.__dict__["dist_env"] = SimpleNamespace(device=torch.device("cpu"), world_size=dp_size * cp_size)
+    recipe.__dict__["timestamp"] = 10.0
+    recipe.__dict__["mfu_calculator"] = SimpleNamespace(
+        get_flops=lambda input_ids: 1e12 * input_ids.numel(), reference_mfu=100.0
+    )
+
+    def dp_allreduce(tensor, op=torch.distributed.ReduceOp.SUM, include_cp=False):
+        # Every rank of the reduced group holds the same per-rank value.
+        return tensor * (dp_size * cp_size if include_cp else dp_size)
+
+    recipe.__dict__["_dp_allreduce"] = dp_allreduce
+    monkeypatch.setattr(time, "perf_counter", lambda: 12.0)
+
+    tps, mfu = recipe._step_throughput([{"input_ids": torch.ones(1, 8, dtype=torch.long)}], num_tokens_in_batch=16)
+
+    assert tps == pytest.approx(8.0)
+    # 8 TFLOPs per DP replica x 2 replicas = 16 TFLOPs, over 2 s on 4 GPUs with a 100 TFLOP/s peak.
+    assert mfu == pytest.approx(2.0)
 
 
 def test_optimizer_checkpoint_part_ids_use_global_pipeline_stage_indices(tmp_path):
