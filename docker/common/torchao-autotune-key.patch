@@ -1,0 +1,43 @@
+# Backport of pytorch/ao#4880 ("Fix MoE FP8 Triton autotune key", commit
+# 9e5ea7fde7132df0c09b2acb12c2defad90aecb9) to torchao v0.17.0 (commit
+# 02105d46c61dc80a8c9d39d5836e827ba3af8439), file torchao/prototype/moe_training/kernels/float8_rowwise.py.
+# The triton.autotune key of _triton_fp8_rowwise_3d_transpose_cast_rhs_kernel names "num_elements", which
+# is not a kernel argument. Triton 3.9 (PyTorch 26.11 base) rejects such keys when
+# torchao.prototype.moe_training is imported, which the MXFP8 grouped GEMM needs. Remove this patch when
+# TORCHAO_REF moves past v0.17.0; the Docker build accepts only the original or the already-patched source.
+#
+# Copyright 2023 Meta
+# All contributions by Arm:
+# Copyright (c) 2024-2026 Arm Limited and/or its affiliates
+#
+# Redistribution and use in source and binary forms, with or without modification, are permitted provided
+# that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the
+#    following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and
+#    the following disclaimer in the documentation and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or
+#    promote products derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+# WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+--- a/torchao/prototype/moe_training/kernels/float8_rowwise.py
++++ b/torchao/prototype/moe_training/kernels/float8_rowwise.py
+@@ -210,7 +210,7 @@
+         else:
+             tl.atomic_min(scales_ptr + scales_offs, scales[None, :], mask=scales_mask)
+ 
+-    @triton.autotune(configs=atomic_kernel_configs_2D, key=["num_elements"])
++    @triton.autotune(configs=atomic_kernel_configs_2D, key=["K", "N"])
+     @triton.jit
+     def _triton_fp8_rowwise_3d_transpose_cast_rhs_kernel(
+         input_ptr,

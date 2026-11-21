@@ -144,3 +144,5 @@ ci:
   recipe_owner: HuiyingLi
   nodes: 16
   time: "04:00:00"
+  perf_testing:
+    schedule: nightly

@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import copy
 import functools
 import inspect
 import logging
 import math
 import os
+import re
 import time
 import types
 from typing import Callable, Protocol
@@ -615,6 +617,53 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
     stage_model.forward = _pp_tensor_forward
 
 
+def _stage_layer_ids(module_names: list[str], layers_prefix: str, num_layers: int) -> list[int]:
+    """Return the decoder layers a stage retains under the splitter's rules.
+
+    The splitter keeps a module whole when its FQN is listed, so a listed ancestor of the layer container
+    (``model.layers`` or ``model``) retains every layer; otherwise a layer is retained when its own FQN is
+    listed.
+    """
+    container = f"{layers_prefix}layers"
+    parts = container.split(".")
+    ancestors = {".".join(parts[:k]) for k in range(1, len(parts) + 1)}
+    names = set(module_names)
+    if names & ancestors:
+        return list(range(num_layers))
+    # The splitter matches ModuleDict keys by exact string, so only the canonical decimal form of an index,
+    # and nothing around it, retains a layer: neither ``layers.04`` nor ``layers.4`` with a trailing newline.
+    pattern = re.compile(rf"{re.escape(container)}\.(0|[1-9][0-9]*)")
+    return sorted({int(m.group(1)) for name in names if (m := pattern.fullmatch(name))})
+
+
+def _check_partition_lists_every_layer_once(
+    module_names_per_stage: list[list[str]], layers_prefix: str, num_layers: int
+) -> None:
+    """Reject an explicit partition that omits, repeats, invents or reorders a decoder layer.
+
+    A trimmed stage sees only its own modules, so a layer that no stage retains runs zero times, a layer that
+    two stages retain runs twice, and layers assigned to stages out of order run out of order, while the stages'
+    wire contracts still match.
+    """
+    per_stage = [_stage_layer_ids(names, layers_prefix, num_layers) for names in module_names_per_stage]
+    listed = [i for ids in per_stage for i in ids]
+    counts = collections.Counter(listed)
+    missing = [i for i in range(num_layers) if i not in counts]
+    repeated = sorted(i for i, count in counts.items() if count > 1)
+    unknown = sorted(i for i in counts if i >= num_layers)
+    if missing or repeated or unknown:
+        raise ValueError(
+            "module_fqns_per_model_part must retain every decoder layer exactly once: "
+            f"missing {missing}, repeated {repeated}, beyond the model {unknown}"
+        )
+    if listed != sorted(listed):
+        ranges = [(ids[0], ids[-1]) if ids else None for ids in per_stage]
+        raise ValueError(
+            "module_fqns_per_model_part must assign decoder layers to stages in increasing order; "
+            f"the stages retain the layer ranges {ranges}"
+        )
+
+
 def split_model_into_stages(
     model: torch.nn.Module,
     pp_mesh: DeviceMesh,
@@ -726,6 +775,8 @@ def split_model_into_stages(
             )
             if custom_module_names is not None:
                 module_names_per_stage = custom_module_names
+    else:
+        _check_partition_lists_every_layer_once(module_names_per_stage, layers_prefix, num_layers)
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int
@@ -860,7 +911,8 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages.
+        A schedule whose ``step()`` and ``eval()`` discard outputs by default.
+        Pass ``return_outputs=True`` to return merged outputs; read losses from ``losses``.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 
@@ -911,6 +963,7 @@ def build_pipeline_schedule(
         )
         schedule._load_csv(pp_schedule_csv)
 
+    schedule.step = functools.partial(schedule.step, return_outputs=False)
     return schedule
 
 

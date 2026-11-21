@@ -1,0 +1,168 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full fine-tuning of the 43-layer main decoder of ERNIE-5.5-Flash-Base-BF16 on Tulu-3 packed
+# to 131072 tokens with context parallelism: 100 updates of 8 packed rows each.
+# Target topology: 16 nodes x 4 GB200 GPUs, WORLD=64, CP=8, EP=8, TP=PP=1. The 64 ranks form 8
+# groups of 8 consecutive ranks, the two nodes with NODE_RANK 2k and 2k+1. A group holds one
+# packed row, split into 8 contiguous shards of 16384 tokens, and is one expert-parallel
+# group as in ernie5_5_flash_squad_ep.yaml, so the routed tokens of a row stay on its two
+# nodes. Place the two nodes of a group in one NVLink domain. All parameters are sharded with
+# FSDP2 over the 64 ranks.
+#
+# The data, the attention across ranks and its kernels are those of
+# ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml; the optimizer, the HybridEP notes and the
+# notes on the model, the tokenizer and the Hub cache are those of
+# ernie5_5_flash_squad_ep.yaml.
+#
+# Memory: activation checkpointing recomputes every decoder layer in backward, and the
+# weights of a layer are resharded after the layer has used them (moe.reshard_after_forward),
+# so that a rank holds the weights of one layer at a time next to its shard of the weights,
+# the gradients and the optimizer state: a GPU peaked at 128 GiB allocated in the validated
+# run.
+#
+# To run this recipe, from the repository root, on each of the 16 nodes with 4 GPUs, with
+# NODE_RANK set from 0 to 15 and MASTER_ADDR set to the first node:
+#   uv run torchrun --nnodes=16 --nproc-per-node=4 --node-rank=$NODE_RANK \
+#     --master-addr=$MASTER_ADDR --master-port=29500 \
+#     -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_tulu3_packed128k_cp8.yaml
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  # 8 packed rows of 131072 tokens per update, one per group of 8 context-parallel ranks.
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+  revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+  trust_remote_code: false
+  dtype: bfloat16
+  # The released config declares one MTP block (num_nextn_predict_layers: 1) that this model
+  # does not construct; this override selects the 43 decoder layers.
+  num_nextn_predict_layers: 0
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # cuDNN sparse attention for the DSA layers and for the HCA layers of packed rows.
+    attn: cudnn
+    # HybridEP exchanges routed-expert tokens in BF16; other BackendConfig fields keep their defaults.
+    linear: torch
+    experts: torch_mm
+    dispatcher: hybridep
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  pp_size: 1
+  # Every rank holds one contiguous shard of 131072 / 8 = 16384 tokens.
+  cp_size: 8
+  # A group of 8 context-parallel ranks is one expert-parallel group; its experts are
+  # sharded over the 8 groups.
+  ep_size: 8
+  activation_checkpointing: true
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: null
+    reduce_dtype: float32
+    output_dtype: null
+    cast_forward_inputs: false
+  moe:
+    # Keeps the weights of a layer sharded outside the layer that uses them.
+    reshard_after_forward: true
+    wrap_outer_model: true
+
+checkpoint:
+  enabled: false
+  save_consolidated: false
+  checkpoint_dir: checkpoints/ernie5_5_flash_tulu3_packed128k_cp8/
+  # Plans the loading of the weights over a CPU process group, as ernie5_5_flash_squad_ep.yaml does.
+  load_metadata_with_gloo: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 1234
+  seq_length: 131072
+  truncation: true
+  padding: false
+  chat_template: examples/llm_finetune/ernie5_5/tulu3_chat_template.jinja
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+    revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
+
+packed_sequence:
+  packing_strategy: thd
+  packed_sequence_size: 131072
+  # Every document starts at a multiple of the HCA compression window.
+  pad_to_multiple_of: 128
+  # 100 updates of 8 packed rows, plus a small margin, without tokenizing the whole mixture.
+  max_packs: 808
+  num_proc: 1
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  num_workers: 0
+  drop_last: true
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 1.0e-6
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: gb200
+  recipe_owner: HuiyingLi
+  nodes: 16
+  time: "02:00:00"
+  nproc_per_node: 4

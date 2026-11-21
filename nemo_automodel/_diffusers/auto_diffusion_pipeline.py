@@ -308,9 +308,17 @@ def _ensure_params_trainable(module: nn.Module, module_name: str | None = None) 
     return num_trainable_parameters
 
 
-def _is_fp8_training_safe_linear(name: str, linear: nn.Linear) -> bool:
-    """Return whether a Linear has shapes that are safe for FP8 training kernels."""
+def _is_fp8_training_safe_linear(name: str, linear: nn.Linear, fp8_exclude: tuple[str, ...] = ()) -> bool:
+    """Return whether a Linear has shapes that are safe for FP8 training kernels.
+
+    Args:
+        name: Fully qualified module name inside the transformer.
+        linear: The linear layer to check.
+        fp8_exclude: Name fragments; a Linear whose name contains any of them stays in high precision.
+    """
     if linear.weight.shape[0] % 16 != 0 or linear.weight.shape[1] % 16 != 0:
+        return False
+    if any(fragment in name for fragment in fp8_exclude):
         return False
     if name.startswith(("time_text_embed.", "norm_out.")):
         return False
@@ -324,6 +332,7 @@ def _replace_linear_with_transformer_engine(
     module_name: str,
     *,
     fp8_safe_only: bool = False,
+    fp8_exclude: tuple[str, ...] = (),
 ) -> int:
     """Replace torch Linear modules with Transformer Engine Linear modules."""
     has_te, transformer_engine = safe_import_te()
@@ -339,10 +348,10 @@ def _replace_linear_with_transformer_engine(
         for child_name, child in list(parent.named_children()):
             child_fqn = f"{prefix}.{child_name}" if prefix else child_name
             if isinstance(child, nn.Linear):
-                if fp8_safe_only and not _is_fp8_training_safe_linear(child_fqn, child):
+                if fp8_safe_only and not _is_fp8_training_safe_linear(child_fqn, child, fp8_exclude):
                     skipped += 1
                     logger.info(
-                        "[TE] Keeping %s.%s as torch.nn.Linear for FP8 shape compatibility; weight shape=%s",
+                        "[TE] Keeping %s.%s as torch.nn.Linear (not FP8-eligible); weight shape=%s",
                         module_name,
                         child_fqn,
                         tuple(child.weight.shape),
@@ -702,6 +711,7 @@ class NeMoAutoDiffusionPipeline:
         active_transformer: str | None = None,
         transformer_engine_linear: bool = False,
         transformer_engine_fp8_safe_only: bool = False,
+        transformer_engine_fp8_exclude: tuple[str, ...] = (),
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
@@ -750,6 +760,7 @@ class NeMoAutoDiffusionPipeline:
                 device placement so only one transformer occupies GPU memory.
             transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
             transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
+            transformer_engine_fp8_exclude: Name fragments of Linear modules to keep in high precision when FP8 is enabled.
             fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
@@ -891,6 +902,7 @@ class NeMoAutoDiffusionPipeline:
                         module,
                         name,
                         fp8_safe_only=transformer_engine_fp8_safe_only,
+                        fp8_exclude=transformer_engine_fp8_exclude,
                     )
 
         if peft_cfg is not None:
@@ -1046,6 +1058,7 @@ class NeMoAutoDiffusionPipeline:
         components_to_load: Iterable[str] | None = None,
         transformer_engine_linear: bool = False,
         transformer_engine_fp8_safe_only: bool = False,
+        transformer_engine_fp8_exclude: tuple[str, ...] = (),
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
@@ -1078,6 +1091,7 @@ class NeMoAutoDiffusionPipeline:
             components_to_load: Which components to process (default: all)
             transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
             transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
+            transformer_engine_fp8_exclude: Name fragments of Linear modules to keep in high precision when FP8 is enabled.
             fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
@@ -1185,6 +1199,7 @@ class NeMoAutoDiffusionPipeline:
                         module,
                         name,
                         fp8_safe_only=transformer_engine_fp8_safe_only,
+                        fp8_exclude=transformer_engine_fp8_exclude,
                     )
                 _ensure_params_trainable(module, module_name=name)
 
