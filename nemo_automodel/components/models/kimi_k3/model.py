@@ -2392,7 +2392,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         kda_mode: str | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         text_config = getattr(config, "text_config", config)
@@ -2430,7 +2430,6 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = copy.copy(backend) if backend is not None else BackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = KimiK3TextModel(
             text_config,
             self.backend,

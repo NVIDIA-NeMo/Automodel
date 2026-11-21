@@ -644,13 +644,12 @@ class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
 
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         moe_defaults = dict(

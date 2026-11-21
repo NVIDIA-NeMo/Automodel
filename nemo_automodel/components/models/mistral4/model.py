@@ -41,6 +41,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     precompute_freqs_cis,
     yarn_get_mscale,
 )
+from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
 from nemo_automodel.components.models.mistral4.state_dict_adapter import (
     Mistral4MultimodalStateDictAdapter,
     Mistral4StateDictAdapter,
@@ -416,12 +417,12 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def __init__(
         self,
-        config,
+        config: Mistral4Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         # Reject an unsupported tied request on the controlling top-level flag
@@ -431,7 +432,6 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config = getattr(config, "text_config", config)
         self.config = config
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Mistral4Model(
             config,
             backend=self.backend,
@@ -528,6 +528,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 # =============================================================================
 
 try:
+    from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
     from transformers.models.mistral3.modeling_mistral3 import (  # noqa: F401
         Mistral3ForConditionalGeneration as HFMistral3ForConditionalGeneration,
     )
@@ -555,7 +556,7 @@ if _HF_MISTRAL3_AVAILABLE:
 
         def __init__(
             self,
-            config,
+            config: Mistral4Config,
             backend: BackendConfig,
             *,
             moe_config: MoEConfig | None = None,
@@ -791,19 +792,19 @@ if _HF_MISTRAL3_AVAILABLE:
 
         def __init__(
             self,
-            config,
+            config: Mistral3Config,
             moe_config: MoEConfig | None = None,
             backend: BackendConfig | None = None,
             *,
             logits_dtype: torch.dtype | None = None,
-            **kwargs,
+            num_hidden_layers: int | None = None,
+            moe_overrides: dict | None = None,
         ):
             super().__init__()
             # Read the nested text_config flag: the composite Mistral3Config top-level
             # defaults to tie=True and does not reflect the untied Mistral4 backbone.
             reject_unsupported_tie_word_embeddings(type(self), config.text_config)
             backend = backend or BackendConfig()
-            num_hidden_layers = kwargs.pop("num_hidden_layers", None)
             if num_hidden_layers is not None:
                 config.text_config.num_hidden_layers = num_hidden_layers
 
@@ -827,7 +828,6 @@ if _HF_MISTRAL3_AVAILABLE:
             vision_tower = AutoModel.from_config(config.vision_config)
             apply_pixtral_forward_backport(vision_tower)
             multi_modal_projector = Mistral3MultiModalProjector(config)
-            moe_overrides = kwargs.pop("moe_overrides", None)
             language_model = Mistral4TextModelBackend(
                 text_config,
                 backend=backend,

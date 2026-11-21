@@ -1273,7 +1273,7 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -1281,7 +1281,6 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         self.backend = copy.copy(backend) if backend is not None else BackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = KimiLinear48BModel(config, self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)

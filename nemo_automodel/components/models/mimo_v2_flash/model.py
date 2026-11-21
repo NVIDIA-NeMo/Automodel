@@ -1110,14 +1110,13 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         *,
         revision: str | None = None,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ) -> None:
         """Construct the model and bind checkpoint metadata reads to ``revision``."""
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = MiMoV2FlashModel(
             config,
             backend=self.backend,

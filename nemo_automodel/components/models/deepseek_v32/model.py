@@ -213,7 +213,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         # Call grandparent __init__ to skip DeepseekV3ForCausalLM's __init__
         nn.Module.__init__(self)
@@ -231,7 +231,6 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
         self.backend = resolved_backend
         # Use V3.2 Model instead of V3 Model
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV32Model(
             config,
             backend=self.backend,

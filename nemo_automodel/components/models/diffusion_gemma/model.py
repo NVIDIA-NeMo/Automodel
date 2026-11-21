@@ -380,7 +380,6 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         freeze_router: bool | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
     ):
         reject_unsupported_tie_word_embeddings(type(self), config)
         # ``canvas_length`` is a declared field on the reference config (and round-trips),

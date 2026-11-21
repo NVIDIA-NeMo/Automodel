@@ -266,7 +266,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -277,7 +277,6 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         self.backend = copy.copy(backend) if backend is not None else BackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm5NextModel(
             config,
             self.backend,

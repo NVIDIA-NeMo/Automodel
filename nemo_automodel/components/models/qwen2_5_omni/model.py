@@ -106,7 +106,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
     ):
         # Check the controlling top-level flag on the original config before
         # resolving to thinker_config and building the HF parent.

@@ -338,13 +338,12 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)

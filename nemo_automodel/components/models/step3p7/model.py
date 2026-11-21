@@ -370,14 +370,13 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict | None = None,
+        mtp_loss_scaling_factor: float = 0.1,
     ) -> None:
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = Step3p7Model(
             config,
             backend=self.backend,

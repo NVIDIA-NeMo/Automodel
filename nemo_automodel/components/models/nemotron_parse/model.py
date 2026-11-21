@@ -492,7 +492,9 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: NemotronParseConfig, loss_fn=None, *, logits_dtype: torch.dtype | None = None, **kwargs):
+    def __init__(
+        self, config: NemotronParseConfig, loss_fn: nn.Module | None = None, *, logits_dtype: torch.dtype | None = None
+    ):
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.loss_fn = loss_fn

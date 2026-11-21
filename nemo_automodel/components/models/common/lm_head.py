@@ -30,7 +30,17 @@ from nemo_automodel.shared.tp_linear import tp_linear_forward
 # aten::mm.dtype has no derivative in PyTorch 2.10, and an opaque op keeps compilers off the GEMM.
 @torch.library.custom_op("nemo_automodel::fp32_logits", mutates_args=())
 def _fp32_logits(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    """FP32 logits [..., vocab] of input [..., hidden] and weight [vocab, hidden], one dtype, plus bias [vocab]."""
+    """Compute FP32 logits from operands in one dtype.
+
+    Args:
+        input: Tensor of shape [..., hidden].
+        weight: Tensor of shape [vocab, hidden], in input's dtype.
+        bias: Optional tensor of shape [vocab].
+
+    Returns:
+        FP32 tensor of shape [..., vocab]. CUDA BF16/FP16 operands accumulate in FP32 without an upcast copy;
+        other operands are upcast first.
+    """
     flat = input.reshape(-1, input.shape[-1])
     with torch.autocast(device_type=flat.device.type, enabled=False):
         if flat.is_cuda and flat.dtype in (torch.float16, torch.bfloat16):
@@ -44,21 +54,61 @@ def _fp32_logits(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
 
 @_fp32_logits.register_fake
 def _fp32_logits_fake(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    """Allocate FP32 logits [..., vocab] for input [..., hidden] and weight [vocab, hidden]."""
+    """Allocate the logits of a traced call.
+
+    Args:
+        input: Tensor of shape [..., hidden].
+        weight: Tensor of shape [vocab, hidden].
+        bias: Optional tensor of shape [vocab]; unused.
+
+    Returns:
+        Empty FP32 tensor of shape [..., vocab] on input's device.
+    """
     return input.new_empty((*input.shape[:-1], weight.shape[0]), dtype=torch.float32)
 
 
 @register_sharding(torch.ops.nemo_automodel.fp32_logits.default)
 def _fp32_logits_sharding(input, weight, bias):
-    """Shard logits over the vocabulary like a column-parallel linear, or over input's leading dims."""
+    """Shard the logits like a column-parallel linear, or along one of input's leading dimensions.
+
+    Args:
+        input: Tensor metadata of global shape [..., hidden].
+        weight: Tensor metadata of global shape [vocab, hidden].
+        bias: Tensor metadata of global shape [vocab], or None.
+
+    Returns:
+        Supported output/input placements on each mesh axis: everything replicated; the vocabulary sharded, with
+        input replicated and weight and bias sharded on dim 0; or a leading dimension sharded on input and
+        logits, with weight and bias replicated.
+    """
     strategies = [(Replicate(), Replicate(), Replicate()), (Shard(input.ndim - 1), Replicate(), Shard(0))]
     strategies += [(Shard(dim), Shard(dim), Replicate()) for dim in range(input.ndim - 1)]
     # Each is (logits, input, weight); the bias [vocab] is placed like the weight's vocabulary axis.
     return [([out], [inp, w, None if bias is None else w]) for out, inp, w in strategies]
 
 
+def _fp32_logits_setup_context(ctx, inputs, output):
+    """Save the operands for the backward GEMMs.
+
+    Args:
+        ctx: Autograd context that owns the saved tensors.
+        inputs: Tuple of input [..., hidden], weight [vocab, hidden], and bias [vocab] or None.
+        output: FP32 logits of shape [..., vocab]; unused.
+    """
+    ctx.save_for_backward(*inputs)
+
+
 def _fp32_logits_backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
-    """Run a head's GEMMs in the operand dtype on the FP32 logits gradient [..., vocab], which the bias sums."""
+    """Run the head's backward GEMMs in the weight's dtype.
+
+    Args:
+        ctx: Autograd context holding input, weight and bias.
+        grad: FP32 gradient of the logits, shape [..., vocab].
+
+    Returns:
+        Gradients of input [..., hidden] and weight [vocab, hidden] in the weight's dtype and of bias [vocab] in
+        its own dtype (the sum of grad over tokens); None for an operand that needs no gradient.
+    """
     input, weight, bias = ctx.saved_tensors
     grad = grad.reshape(-1, weight.shape[0])
     grad_bias = grad.sum(0).to(bias.dtype) if ctx.needs_input_grad[2] else None
@@ -69,10 +119,23 @@ def _fp32_logits_backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor | None,
     return grad_input, grad_weight, grad_bias
 
 
-_fp32_logits.register_autograd(
-    _fp32_logits_backward, setup_context=lambda ctx, inputs, output: ctx.save_for_backward(*inputs)
-)
-register_flop_formula(torch.ops.nemo_automodel.fp32_logits)(lambda x, w, *_, **__: 2 * math.prod(x) * w[0])
+_fp32_logits.register_autograd(_fp32_logits_backward, setup_context=_fp32_logits_setup_context)
+
+
+@register_flop_formula(torch.ops.nemo_automodel.fp32_logits)
+def _fp32_logits_flops(input_shape, weight_shape, bias_shape, out_shape):
+    """Count the projection's FLOPs.
+
+    Args:
+        input_shape: Shape [..., hidden] of input.
+        weight_shape: Shape [vocab, hidden] of weight.
+        bias_shape: Shape [vocab] of bias, or None; bias additions are not counted.
+        out_shape: Shape [..., vocab] of the logits; unused.
+
+    Returns:
+        Two FLOPs per multiply-accumulate: 2 * input elements * vocab.
+    """
+    return 2 * math.prod(input_shape) * weight_shape[0]
 
 
 class LMHead(nn.Linear):
@@ -97,18 +160,47 @@ class LMHead(nn.Linear):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        """Create the head; ``logits_dtype`` None keeps the weight's dtype, and ``logit_softcapping`` ``c``
-        applies ``c * tanh(logits / c)``. The other arguments are ``nn.Linear``'s."""
+        """Create the head.
+
+        Args:
+            in_features: Hidden size.
+            out_features: Vocabulary size.
+            bias: Whether the head has a bias of shape [vocab].
+            logits_dtype: Dtype of the logits. None keeps the weight's dtype, which autocast may lower.
+            logit_softcapping: Cap ``c`` that applies ``c * tanh(logits / c)`` to the logits; None applies none.
+            device: Device of the parameters.
+            dtype: Dtype of the parameters.
+        """
         super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
         self.logits_dtype = logits_dtype
         self.logit_softcapping = logit_softcapping
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Project hidden states [..., hidden] to logits [..., vocab] with the head's own weight."""
+        """Project hidden states with the head's own weight.
+
+        Args:
+            input: Tensor of shape [..., hidden].
+
+        Returns:
+            Logits of shape [..., vocab], as ``project`` returns them.
+        """
         return self.project(input, self.weight)
 
     def project(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        """Project input [..., hidden] to logits [..., vocab] with ``weight`` [vocab, hidden]."""
+        """Project hidden states with a supplied vocabulary weight.
+
+        Args:
+            input: Tensor of shape [..., hidden], with arbitrary leading dimensions. It is cast to the supplied
+                weight's dtype before projection.
+            weight: Tensor of shape [vocab, hidden], on the input's device. Chunked losses supply their gathered
+                weight here. For column-parallel DTensors these are global shapes: the weight uses Shard(0), and
+                the input is replicated on the same mesh.
+
+        Returns:
+            Logits of shape [..., vocab], with leading axes unchanged and the configured softcap applied.
+            Column-parallel output is sharded on the vocabulary axis. The dtype is ``logits_dtype`` when set;
+            otherwise it follows the linear's compute (autocast) dtype. Inputs are not mutated.
+        """
         logits = self.linear(input, weight, self.bias, logits_dtype=self.logits_dtype)
         if self.logit_softcapping is not None:
             logits = self.logit_softcapping * torch.tanh(logits / self.logit_softcapping)
@@ -118,9 +210,18 @@ class LMHead(nn.Linear):
     def linear(
         input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, *, logits_dtype: torch.dtype | None
     ) -> torch.Tensor:
-        """Project input [..., hidden] to logits [..., vocab] with weight [vocab, hidden] and bias [vocab].
+        """Project hidden states with a supplied weight and bias, without a softcap.
 
-        ``logits_dtype`` None runs a plain linear in the weight's dtype that autocast may lower.
+        Args:
+            input: Tensor of shape [..., hidden], cast to the weight's dtype.
+            weight: Tensor of shape [vocab, hidden]; a column-parallel DTensor uses Shard(0), with the input
+                replicated on the same mesh.
+            bias: Optional tensor of shape [vocab].
+            logits_dtype: Dtype of the logits. None runs a plain linear in the weight's dtype that autocast may
+                lower; otherwise the GEMM accumulates and writes FP32 logits, which are cast to this dtype.
+
+        Returns:
+            Logits of shape [..., vocab], sharded on the vocabulary axis for a column-parallel weight.
         """
         # The weight sets the compute dtype: inside forward, FSDP2 has already unsharded it to its param_dtype.
         input = input.to(weight.dtype)

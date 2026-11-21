@@ -383,7 +383,7 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.config = config
@@ -398,7 +398,6 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         if resolved_backend.gate_precision is None:
             resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
         self.backend = resolved_backend
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = BailingMoeV2Model(
             config,
             backend=self.backend,

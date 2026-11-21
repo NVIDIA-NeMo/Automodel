@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedConfig
 from transformers.models.gemma4_unified.modeling_gemma4_unified import (
     Gemma4UnifiedCausalLMOutputWithPast,
     Gemma4UnifiedTextAttention,
@@ -65,7 +66,7 @@ class Gemma4UnifiedForConditionalGeneration(
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config, *, logits_dtype: torch.dtype | None = None) -> None:
+    def __init__(self, config: Gemma4UnifiedConfig, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)

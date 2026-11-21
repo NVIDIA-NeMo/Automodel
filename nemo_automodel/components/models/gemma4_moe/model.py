@@ -1184,12 +1184,14 @@ class Gemma4ForConditionalGeneration(
         return cls(config, moe_config=moe_config, backend=backend, **kwargs)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str, *model_args, attn_implementation: str | None = None, **kwargs
+    ):
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
         config = Gemma4Config.from_pretrained(pretrained_model_name_or_path)
         # #2208: fused bf16 SDPA NaNs on Hopper; run SDPA in fp32 instead.
-        attn_impl = kwargs.get("attn_implementation") or getattr(config, "_attn_implementation", None)
+        attn_impl = attn_implementation or getattr(config, "_attn_implementation", None)
         if attn_impl == "sdpa":
             enable_gemma4_sdpa_fp32()
         return cls.from_config(config, *model_args, **kwargs)
@@ -1206,7 +1208,7 @@ class Gemma4ForConditionalGeneration(
         text_config: dict | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
@@ -1263,7 +1265,6 @@ class Gemma4ForConditionalGeneration(
             return
 
         # --- MoE path: replace the text model ---
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.__class__ = Gemma4MoEModel
         self.model.language_model = Gemma4MoETextModelBackend(
             text_config,

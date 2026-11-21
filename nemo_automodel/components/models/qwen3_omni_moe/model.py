@@ -277,7 +277,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         base_config = config.thinker_config if hasattr(config, "thinker_config") else config
         backend = backend or BackendConfig()
@@ -304,7 +304,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.backend = backend
 
         text_config = base_config.text_config if hasattr(base_config, "text_config") else base_config
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )

@@ -952,7 +952,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         LOGGER.info(f"Model config has {num_layers} layers")
 
         config.torch_dtype = torch_dtype
-        model = cls.from_config(config, torch_dtype=torch_dtype, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
         model.name_or_path = pretrained_model_name_or_path
         cast_model_to_dtype(model, torch_dtype)
 
@@ -961,12 +961,11 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
 
     def __init__(
         self,
-        config,
+        config: KimiK25VLConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
     ):
         super().__init__()
         self.config = config

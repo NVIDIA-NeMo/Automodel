@@ -570,7 +570,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         engram_process_group: dist.ProcessGroup | None = None,
         engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict[str, Any] | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         if not config.language_model_only:
@@ -579,9 +579,6 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
                 "config.language_model_only=True. Vision and video training have not been validated."
             )
         super().__init__()
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        if kwargs:
-            raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
         self.config = config
         self.backend = _qwen3_8_flash_next_backend(backend)
         self.model = Qwen3_8_FlashNextModel(

@@ -313,11 +313,10 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
 
     def __init__(
         self,
-        config,
+        config: Llavaonevision1_5Config,
         attn_implementation: str | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
     ):
         super().__init__()
         self.config = config

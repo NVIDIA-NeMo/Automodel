@@ -1148,11 +1148,9 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
-        del kwargs
         self.config = config
         self.backend = _qwen3_5_backend(backend)
 
@@ -1411,10 +1409,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
-        del kwargs
         super().__init__(config)
         self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         self.backend = _qwen3_5_backend(backend)

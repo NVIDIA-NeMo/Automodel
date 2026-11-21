@@ -664,12 +664,11 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
 
     def __init__(
         self,
-        config,
+        config: KimiVLConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
     ):
         warn_deprecated_model_class("KimiVLForConditionalGeneration")
         super().__init__()

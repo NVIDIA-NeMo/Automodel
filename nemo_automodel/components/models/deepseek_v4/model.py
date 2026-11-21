@@ -1247,7 +1247,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = torch.float32,
-        **kwargs,
+        moe_overrides: dict | None = None,
+        mtp_loss_scaling_factor: float = 0.1,
     ):
         super().__init__()
         self.config = config
@@ -1269,8 +1270,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 "self_attn.compressor.indexer.wgate",
                 "self_attn.compressor.indexer.ape_param",
             )
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = DeepseekV4Model(
             config,
             backend=self.backend,

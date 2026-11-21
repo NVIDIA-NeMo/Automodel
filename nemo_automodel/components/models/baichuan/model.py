@@ -257,7 +257,7 @@ class DecoderLayer(nn.Module):
 
 
 class NormHead(nn.Module):
-    def __init__(self, hidden_size, vocab_size, bias=False, logits_dtype: torch.dtype | None = None):
+    def __init__(self, hidden_size: int, vocab_size: int, bias: bool = False, logits_dtype: torch.dtype | None = None):
         super().__init__()
         self.logits_dtype = logits_dtype
         self.weight = nn.Parameter(torch.empty((vocab_size, hidden_size)))
@@ -493,7 +493,7 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BaichuanConfig, *, logits_dtype: torch.dtype | None = None, **model_kwargs):
+    def __init__(self, config: BaichuanConfig, *, logits_dtype: torch.dtype | None = None):
         warn_deprecated_model_class("BaichuanForCausalLM")
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)

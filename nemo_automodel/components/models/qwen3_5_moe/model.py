@@ -940,15 +940,12 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         num_nextn_predict_layers: int | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict | None = None,
     ) -> None:
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        if kwargs:
-            raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
 
         self.config = config
         self.backend = _qwen3_5_moe_backend(backend)
@@ -1270,7 +1267,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         num_nextn_predict_layers: int | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
@@ -1300,7 +1297,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.language_model = Qwen3_5MoeTextModelBackend(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )

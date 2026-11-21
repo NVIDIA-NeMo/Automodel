@@ -121,10 +121,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
     ) -> None:
         super().__init__()
-        del kwargs
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
         self.backend = backend or BackendConfig()

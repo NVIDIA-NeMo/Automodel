@@ -550,7 +550,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         backend = backend or BackendConfig()
 
@@ -574,7 +574,6 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         self.model.__class__ = Qwen3VLMoeModel
 
         text_config = config.text_config if hasattr(config, "text_config") else config
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.language_model = Qwen3VLMoeTextModelBackend(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )

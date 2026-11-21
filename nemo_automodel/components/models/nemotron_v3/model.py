@@ -18,7 +18,7 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig
+from transformers import AutoConfig, NemotronHConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -394,20 +394,23 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def __init__(
         self,
-        config,
+        config: NemotronHConfig,
         backend: BackendConfig | None = None,
         *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
         mtp_use_repeated_layer: bool = False,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
     ):
         """Initialize NemotronV3ForCausalLM.
 
         Args:
             config: NemotronH config.
             backend: Backend configuration.
+            moe_config: MoE configuration (optional, will create default if None).
+            moe_overrides: Optional dict of overrides to apply to the default MoE config.
             mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
                 (default ``0.1``). Programmatic override only — not exposed
                 as a YAML knob to keep recipe configs auto-detected.
@@ -421,8 +424,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 MTP depth and reuse it across all iterations. Mirrors
                 Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
             logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
-            **kwargs: Additional arguments. Recognized keys:
-                ``moe_config``, ``moe_overrides``.
         """
         super().__init__()
         self.config = config
@@ -430,8 +431,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self.backend = backend or BackendConfig()
 
         # Base model
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        moe_config = kwargs.pop("moe_config", None)
         self.model = NemotronV3Model(
             config,
             backend=self.backend,
