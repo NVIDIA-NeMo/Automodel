@@ -500,29 +500,6 @@ class ChatDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    @staticmethod
-    def _keep_last_supervised_run(seq: List[int], unsupervised_value: int) -> None:
-        """In place, keep only the final contiguous supervised run; mask the rest.
-
-        Supervised positions are those ``!= unsupervised_value`` (0 for ``loss_mask``,
-        -100 for ``labels``). Used for ``mask_history``: a multi-turn conversation has
-        one supervised run per assistant turn separated by unsupervised user turns;
-        this collapses it to the last turn so the supervised tokens form a single
-        suffix.
-        """
-        last = -1
-        for i in range(len(seq) - 1, -1, -1):
-            if seq[i] != unsupervised_value:
-                last = i
-                break
-        if last < 0:
-            return
-        start = last
-        while start - 1 >= 0 and seq[start - 1] != unsupervised_value:
-            start -= 1
-        for i in range(start):
-            seq[i] = unsupervised_value
-
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
         messages = row.get("messages")
@@ -562,17 +539,12 @@ class ChatDataset(Dataset):
             truncation=self.truncation,
             tools=tools,
             mask_reasoning_content=self.mask_reasoning_content,
+            # Restrict to the final turn inside format_chat_template, before the reasoning
+            # hole is cut: a post-hoc last-run collapse would mistake that hole for a turn
+            # boundary and drop the start of the final turn.
+            train_on_last_turn_only=self.mask_history,
             unshifted=self.unshifted,
             mask_generation_prompt=self.mask_generation_prompt,
             chat_template_kwargs=self.chat_template_kwargs,
         )
-        if self.mask_history:
-            # Collapse multi-turn supervision to the final assistant turn so the
-            # supervised tokens are a single contiguous suffix (prior turns become
-            # clean prompt context) — required by the block-diffusion response window
-            # and matching Google's prompt+single-response data model.
-            if "loss_mask" in sample:
-                self._keep_last_supervised_run(sample["loss_mask"], 0)
-            if "labels" in sample:
-                self._keep_last_supervised_run(sample["labels"], -100)
         return sample

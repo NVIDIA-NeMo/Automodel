@@ -42,7 +42,7 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: fa4
     linear: te
     rms_norm: te  #PR4637: torch_fp32
     rope_fusion: false
@@ -127,6 +127,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: gb200
   nodes: 2
   recipe_owner: akoumpa  #PR4637: hemildesai

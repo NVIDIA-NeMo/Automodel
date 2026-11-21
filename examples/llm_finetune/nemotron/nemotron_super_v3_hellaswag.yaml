@@ -117,6 +117,7 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   nodes: 8  #PR4637: 4
   vllm_deploy: true

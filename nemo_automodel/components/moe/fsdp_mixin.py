@@ -114,6 +114,26 @@ def _configure_fsdp_module(
     fsdp_module.set_requires_gradient_sync(requires_gradient_sync)
 
 
+def _fsdp_backward_finalized(fsdp_state: Any) -> bool:
+    """Return whether FSDP has no backward iteration left to finalize for this root state context.
+
+    PyTorch 2.15 (NGC 26.11) records the backward finalization mode when FSDP sees a backward
+    start and clears it when the root post-backward final callback ends the iteration; the
+    callback asserts that the mode is set. The FSDP units of one model share their root's
+    state context, so once one unit's callback has finalized, the others find the mode
+    cleared, as does a manual callback after FSDP's own autograd callback finalized a
+    synchronized last backward. A root that no backward reached has nothing to reduce either.
+    Earlier PyTorch has no such field and accepts repeated callbacks.
+
+    Args:
+        fsdp_state: The ``FSDPState`` of an FSDP unit.
+
+    Returns:
+        True when calling ``_root_post_backward_final_callback`` must be skipped.
+    """
+    return getattr(fsdp_state._state_ctx, "manual_backward_finalization_active", False) is None
+
+
 def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
     """Run post-backward for every FSDP state and return the root final callback.
 
@@ -138,6 +158,8 @@ def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
                 continue
 
     def _final_callback() -> None:
+        if _fsdp_backward_finalized(fsdp_state):
+            return
         try:
             fsdp_state._root_post_backward_final_callback()
         except AttributeError as exc:
@@ -365,7 +387,8 @@ def patched_backward_maybe_with_nosync(
                 # it would be much better if pipelining backward invoked .backward so autograd hooks
                 # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,
                 # we need to call this too to ensure FSDP syncs its grad reduction ops back to the default stream.
-                fsdp_state._root_post_backward_final_callback()
+                if not _fsdp_backward_finalized(fsdp_state):
+                    fsdp_state._root_post_backward_final_callback()
 
             run_post_backward(self.submod)
     # If submod is a MoEFSDPSyncMixin, use the MoE-specific FSDP functions

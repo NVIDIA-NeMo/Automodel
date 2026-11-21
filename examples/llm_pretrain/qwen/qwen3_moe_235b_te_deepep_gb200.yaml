@@ -32,7 +32,7 @@ model:
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: fa4
     linear: te
     rms_norm: te
     rope_fusion: true
@@ -71,6 +71,7 @@ rng:
   seed: 1234
   ranked: true
 ci:
+  nemo_ci_schedule: skipped
   time: 01:00:00
   nodes: 8
   cluster_tag: gb200
@@ -78,4 +79,6 @@ ci:
   nproc_per_node: 4
   perf_testing:
     schedule: nightly
+    # Fifty steps at this global batch take about three hours on GB200.
+    time: 04:00:00
     fake_balanced_gate: true

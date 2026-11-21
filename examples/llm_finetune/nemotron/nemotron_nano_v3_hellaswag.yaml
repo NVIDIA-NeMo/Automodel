@@ -110,11 +110,13 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   vllm_deploy: true
   vllm_smoke_test: true
   recipe_owner: adil-a
-  time: "00:40:00"  #PR4637: "00:30:00"
+  # The 26.10 nightly finished training plus the robustness phases in 39.6 min; 26.11 trains ~3% slower.
+  time: "00:50:00"  #PR4637: "00:30:00", PR4827: "00:40:00"
   checkpoint_robustness:
     # AMINT-401: CI runs intermittently pass/fail the standard resume loss tolerance.
     # Step 7 reached a 0.016007 loss gap vs 0.011047 allowed despite exact restored
