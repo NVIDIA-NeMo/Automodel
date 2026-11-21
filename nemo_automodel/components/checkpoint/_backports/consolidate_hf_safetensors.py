@@ -458,7 +458,7 @@ def _process_output_file(
                     metadata[SHAPE_KEY],  # Shape of this shard
                 )
 
-            if tensor_fqn_data.source_dtype_str == tensor_fqn_data.dtype_str:
+            if not full_tensor_mv or tensor_fqn_data.source_dtype_str == tensor_fqn_data.dtype_str:
                 output_stream.write(full_tensor_mv)
             else:
                 output_stream.write(

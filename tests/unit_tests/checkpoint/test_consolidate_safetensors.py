@@ -205,14 +205,17 @@ def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(
 
 
 @pytest.mark.run_only_on("CPU")
-def test_consolidate_casts_float_tensors_only_when_cast_dtype_is_set(tmp_path, caplog):
+@pytest.mark.parametrize(
+    "float_weight", [torch.arange(4, dtype=torch.float32).reshape(2, 2), torch.empty(2, 0, dtype=torch.float32)]
+)
+def test_consolidate_casts_float_tensors_only_when_cast_dtype_is_set(tmp_path, caplog, float_weight):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
     input_dir.mkdir()
     output_dir.mkdir()
 
     tensors = {
-        "float_weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+        "float_weight": float_weight,
         "int_weight": torch.arange(4, dtype=torch.int64),
     }
     dcp_metadata = {name: {"saved_offsets": [0 for _ in tensor.shape]} for name, tensor in tensors.items()}
