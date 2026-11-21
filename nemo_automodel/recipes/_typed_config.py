@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
@@ -688,6 +689,14 @@ class RecipeConfig:
         node = self._raw.get("mtp", None)
         distillation_mode = _section_kwargs(node).get("distillation_mode", "hard") if node is not None else "hard"
         return MTPLossConfig(distillation_mode=distillation_mode)
+
+    @cached_property
+    def gated_mtp(self) -> "GatedMTPConfig | None":
+        """Resolve the optional gated-LoRA multi-token-prediction configuration."""
+        from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig
+
+        node = self._raw.get("gated_mtp", None)
+        return GatedMTPConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":

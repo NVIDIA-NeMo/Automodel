@@ -1010,6 +1010,8 @@ class ModelState:
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
             if self.is_peft:
                 # ignore_frozen_params still returns every persistent buffer; keep those of full modules.
+                # The gated-mtp sampler is a fully-trainable non-LoRA module, so it is already covered
+                # generically via full_modules/_select_peft_tensors -- no special-casing needed here.
                 model_state_dict = _select_peft_tensors(model_state_dict, self.model, full_modules)
 
         # Pipeline parallelism partitions layers across PP ranks, so each rank's

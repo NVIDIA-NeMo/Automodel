@@ -49,3 +49,43 @@ Watch `val_mtp_tau_sim` across validation runs: it should trend upward as the
 MTP head adapts to the fine-tuning domain. A value near `1.0` means the MTP
 head is barely contributing beyond the main head's own next token; a value
 approaching `1 + num_mtp_layers` means every MTP depth is being accepted.
+
+## Gated-LoRA MTP for Models without an MTP Head
+
+`qwen3_0p6b_gated_lora_mtp.yaml` adds MTP to a model that has no MTP layers,
+following [Your LLM Knows the Future](https://arxiv.org/abs/2507.11851). A
+`gated_mtp:` block lists one mask token id per MTP depth:
+
+```yaml
+gated_mtp:
+  mask_token_ids: [151700, 151701, 151702]
+```
+
+Every position in the batch is an anchor: one mask token per depth is appended
+after it, and a LoRA adapter that is active only on the mask tokens learns to
+draft the next tokens from them. All other tokens use the frozen base weights,
+so the model's own next-token distribution is unchanged and it verifies the
+drafts losslessly. A small sampler MLP (Sec. 2.3) rides along with the LoRA
+adapter, refining each draft from its hidden state plus the previous depth's
+predicted token; it's zero-initialized, so it's a no-op until trained. The
+mask tokens' hidden states feed the same MTP loss and `val_mtp_tau_sim`
+metric as a native MTP head. `mtp.distillation_mode: soft`
+distills every depth toward the frozen base model's distribution, the
+verifier at decode time:
+
+```bash
+automodel examples/llm_finetune/mtp_finetune/qwen3_0p6b_gated_lora_mtp.yaml --nproc-per-node 1
+```
+
+The validation loss stays constant during training, since it is the base
+model's loss. The dense layout multiplies the sequence length by
+`1 + len(mask_token_ids)` and needs an attention backend that accepts a custom
+mask (`flex_attention`, preferred at scale, `sdpa`, or `eager`). It supports
+FSDP2/HSDP and DDP, but not yet tensor, context, or pipeline parallelism,
+packed sequences, DoRA, LoRA on MoE experts, or (with the sampler attached)
+multi-GPU.
+
+The mask-token ids are just reserved, unused rows of the base embedding
+table -- no resizing. `setup()` randomizes them once (`randomize_embedding_rows`,
+seeded from `cfg.seed`) and freezes them, so they aren't saved in the PEFT
+checkpoint; loading the adapter elsewhere needs that same call first.
