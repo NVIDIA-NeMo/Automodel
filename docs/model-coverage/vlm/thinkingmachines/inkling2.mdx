@@ -4,8 +4,8 @@ description: "Fine-tune Inkling-2-Small with NeMo AutoModel using 128K packed Tu
 slug: model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small
 ---
 
-[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) is a vision-language
-Mixture-of-Experts (MoE) model from Thinking Machines Lab with 594B total and 17B active parameters. It
+NeMo AutoModel supports fine-tuning [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small), a vision-language
+Mixture-of-Experts (MoE) model from Thinking Machines Lab with 594B total and 17B active parameters. The model
 accepts text and image inputs, generates text, and supports a context window of up to 1M tokens.
 NeMo AutoModel provides a text recipe (`Inkling2ForCausalLM`) and two image-text recipes
 (`Inkling2ForConditionalGeneration`) for the released checkpoint.
@@ -13,8 +13,9 @@ NeMo AutoModel provides a text recipe (`Inkling2ForCausalLM`) and two image-text
 <Note>
 The training loader dequantizes expert weights into floating-point storage.
 Numerical equivalence to the original quantized inference runtime is not
-established. The checkpoint's auxiliary multi-token prediction module is
-outside the training scope of these recipes.
+established. The checkpoint's auxiliary multi-token prediction (MTP) module is
+outside the training scope of these recipes. The DSpark recipe below trains a
+draft in its layout.
 
 </Note>
 
@@ -40,7 +41,8 @@ Run the text recipe with `examples/llm_finetune/finetune.py`.
 | 128K packed text SFT on Tulu 3 | [inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml) |
 | Image-text LoRA on MedPix | [inkling2_medpix_lora_ep32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml) |
 | Full image-text SFT on MedPix | [inkling2_medpix_sft_ep64_pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_sft_ep64_pp4.yaml) |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Train a draft in the released `mtp.safetensors` layout with DSpark | [inkling2_small_dspark.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/inkling2_small_dspark.yaml) and the [DSpark guide](/recipes-e2e-examples/dspark-speculative-decoding) |
+| Prepare your environment | [Installation instructions](/get-started/installation) |
 
 ### Configuration
 
@@ -48,17 +50,17 @@ Run the text recipe with `examples/llm_finetune/finetune.py`.
 | --- | --- | --- | --- |
 | Model | `Inkling2ForCausalLM`, text only | `Inkling2ForConditionalGeneration` | `Inkling2ForConditionalGeneration` |
 | GPUs | 64 GB200, 16 nodes | 32 GB200, 8 nodes | 256 GB200, 64 nodes |
-| Parallelism | EP32, PP2, CP32, TP1; FSDP2 | EP32, four replicas, TP1; FSDP2 | EP64, PP4, TP1; FSDP2 |
+| Parallelism | EP32, PP2, CP32, TP1, and FSDP2 | EP32, four replicas, TP1, and FSDP2 | EP64, PP4, TP1, and FSDP2 |
 | Pipeline schedule | Interleaved 1F1B, 12 layers per stage | None | Interleaved 1F1B, 6 layers per stage |
 | Sequence | Packed THD, 131,072 tokens | Nonpacked, up to 4,097 tokens | Nonpacked, up to 4,097 tokens |
 | Batch | Global 8, local 8 | Global 32, local 1 | Global 256, local 4 |
 | Trained weights | Language model | LoRA rank 8, alpha 32, on attention projections and routed experts | Language model |
-| Weights and optimizer | BF16 weights; FusedAdam with FP32 master weights and BF16 moments | BF16 weights; FusedAdam with FP32 master weights and BF16 moments | FP32 weights; AdamW |
+| Weights and optimizer | BF16 weights and FusedAdam with FP32 master weights and BF16 moments | BF16 weights and FusedAdam with FP32 master weights and BF16 moments | FP32 weights and AdamW |
 | Learning rate | 5e-6, constant | 5e-6, constant | 5e-6, 10 warmup steps |
 | Steps | 50 | 100 | 100 |
 
 All three recipes load `thinkingmachines/Inkling-2-Small` and dequantize its NVFP4 and MXFP8 expert
-weights at load time (`checkpoint.dequantize_base_checkpoint: true`). They use flex attention,
+weights at load time (`checkpoint.dequantize_base_checkpoint: true`). They use FlexAttention,
 `torch_mm` experts with FP32 router gates, and full activation checkpointing. The output loss,
 `Inkling2FusedLinearCrossEntropy`, applies the logit soft cap of 30 over the 200,058 usable
 vocabulary rows.
@@ -86,10 +88,10 @@ W&B is opt-in: set `wandb.enable: true` and configure your entity and project wh
 | Local attention window | 1,024 tokens, causal |
 | Experts | 384 routed experts per layer, top-8 sigmoid routing, intermediate size 2,304 |
 | Routing scale | 8 |
-| Vocabulary | 201,024 embedding rows; 200,058 usable token IDs |
-| Output logits | Soft cap of 30; padded vocabulary rows excluded |
+| Vocabulary | 201,024 embedding rows and 200,058 usable token IDs |
+| Output logits | Soft cap of 30, with padded vocabulary rows excluded |
 | Vision tower | 23 layers, hidden size 1,024, 16 attention heads |
-| Vision projection | Native 20-by-20 patches; neighboring 2-by-2 features merged before projection |
+| Vision projection | Native 20-by-20 patches, with neighboring 2-by-2 features merged before projection |
 | Expert weights | `Inkling-2-Small`: NVFP4 in layers 0-39, MXFP8 in layers 40-47; `Inkling-2-Small-MXFP8`: MXFP8 in all layers |
 
 ### Attention and Residuals
@@ -153,8 +155,8 @@ helper or checkpoint copy is required.
 
 ## Run MedPix LoRA
 
-Set shared output paths and a W&B run identity. Authenticate W&B in the
-training environment through your usual account setup:
+Authenticate W&B in the training environment through your usual account
+setup, then set shared output paths and a W&B run identity:
 
 ```bash
 export INKLING2_RUN_DIR=/path/to/shared/inkling2-medpix-lora
@@ -218,7 +220,7 @@ language model while freezing the vision tower.
 
 PP4 uses two virtual chunks per stage, six decoder layers per chunk,
 Interleaved1F1B, and pipeline microbatch size 1. Local batch 4 supplies four
-microbatches per pipeline iteration; global batch 256 preserves that
+microbatches per pipeline iteration. Global batch 256 preserves that
 relationship across the 64 data replicas. EP shards expert ownership across
 those replicas. It is not an extra divisor for the data batch. Stage 0 owns
 the vision encoder, and each microbatch receives its matching image patches.
@@ -248,7 +250,7 @@ and `checkpoint.restore_from` restores training state.
 
 ## Packed Context Parallelism
 
-The recipe reads `allenai/tulu-3-sft-mixture` from the Hugging Face Hub and
+The Tulu 3 recipe reads `allenai/tulu-3-sft-mixture` from the Hugging Face Hub and
 packs it when training starts. Conversations are rendered with the Inkling chat
 template in `examples/llm_finetune/inkling2/inkling2_chat_template.jinja`,
 shuffled with seed 1234, truncated to 131,072 tokens, and packed into 416 THD
@@ -276,7 +278,7 @@ uv run torchrun --nnodes=16 --nproc-per-node=4 \
 
 Choose a new run ID and output directory and set `NODE_RANK` from 0 to 15.
 PP2/CP32 leaves one data replica. Local and global batches are both 8.
-Interleaved1F1B uses twelve layers per virtual chunk and microbatch size 1.
+Interleaved1F1B uses 12 layers per virtual chunk and microbatch size 1.
 The recipe uses FlexAttention with the Inkling CP implementation, BF16 model
 storage, and TE FusedAdam with FP32 master weights and BF16 moments.
 
@@ -294,12 +296,12 @@ The recipes use the following distributed and kernel features:
 - Shared fused linear cross entropy over usable vocabulary rows, with BF16
   projection inputs, FP32 accumulation, and the soft cap of 30.
 
-The recipes now select HybridEP; full-model training with this dispatcher
+The recipes now select HybridEP. Full-model training with this dispatcher
 remains to be qualified. Tensor parallelism greater than one, MTP training, and
 quantized activation training are not qualified by these recipes. Packed CP
 training covers text. Image-text pipeline training uses the non-packed path.
 
-See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared
+Refer to the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared
 training options.
 
 ## Hugging Face Model Card

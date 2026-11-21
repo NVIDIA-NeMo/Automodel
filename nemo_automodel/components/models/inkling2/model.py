@@ -102,6 +102,9 @@ class Inkling2DecoderLayer(nn.Module):
         self.mlp = Inkling2MoE(config, backend, dtype=dtype)
         self.attn_sconv = ShortConvolution(config.hidden_size, config.sconv_kernel_size, dtype=dtype)
         self.mlp_sconv = ShortConvolution(config.hidden_size, config.sconv_kernel_size, dtype=dtype)
+        # Parameter-free; its forward input is the partial block entering this layer, the
+        # capture point of the DSpark target features (get_dspark_target_feature_modules).
+        self.partial_input = nn.Identity()
         self.controllers = (
             nn.ModuleDict(
                 {
@@ -140,6 +143,7 @@ class Inkling2DecoderLayer(nn.Module):
         Returns:
             New state with tensors of shape [batch, sequence, hidden]; previous state is unchanged.
         """
+        state = ResidualState(state.blocks, self.partial_input(state.partial))
         dtype = self.attn.qkvr.weight.dtype
         streams = (
             (state.partial,) * len(self.attn_norms) if self.attn_query is None else self.attn_query(state).unbind(0)
@@ -346,6 +350,42 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def get_output_embeddings(self) -> Inkling2LMHead | None:
         """Return the callable untied head for shared FSDP and output-loss setup."""
         return self.lm_head
+
+    def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
+        """Return modules whose first forward input is each DSpark target feature.
+
+        The feature of decoder layer ``i`` is the partial block it returns, which is
+        the input of layer ``i + 1``'s ``partial_input``; ``-1`` selects the normalized
+        embedding entering layer 0. The last layer's feature is the post-final-norm
+        hidden state, the input of ``lm_head``. These are the features the released
+        DSpark drafter reads.
+
+        Args:
+            layer_ids: Strictly increasing decoder-layer indices in ``[-1, num_hidden_layers)``.
+
+        Returns:
+            Modules ordered like ``layer_ids``. Each receives a tensor of shape
+            [batch, sequence, hidden] in the compute dtype as its first forward argument.
+
+        Raises:
+            ValueError: If the indices are duplicated, unsorted or outside the decoder
+                depth, this model is a pipeline stage, or its decoder is looped.
+        """
+        if self.text_config.loop_config is not None:
+            raise ValueError("DSpark target features need an unlooped Inkling2 decoder")
+        num_layers = self.text_config.num_hidden_layers
+        if layer_ids != sorted(set(layer_ids)):
+            raise ValueError(f"DSpark target layer IDs must be strictly increasing, got {layer_ids}")
+        if any(type(layer_id) is not int or not -1 <= layer_id < num_layers for layer_id in layer_ids):
+            raise ValueError(f"DSpark target layer IDs must be integers in [-1, {num_layers}), got {layer_ids}")
+        if self.embed_tokens is None or self.lm_head is None:
+            raise ValueError("DSpark target features need the whole Inkling2 decoder, not a pipeline stage")
+        return tuple(
+            self.lm_head
+            if layer_id == num_layers - 1
+            else cast(Inkling2DecoderLayer, self.layers[str(layer_id + 1)]).partial_input
+            for layer_id in layer_ids
+        )
 
     def _pipeline_layer_ids(self) -> list[int]:
         """Validate contiguous global layer IDs and exclusive parameter ownership."""
