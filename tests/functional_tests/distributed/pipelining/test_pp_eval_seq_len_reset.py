@@ -32,6 +32,7 @@ import faulthandler
 import functools
 import gc
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -236,24 +237,30 @@ def _run_cases_on_gpu(rank: int, results_dir: str) -> None:
     # matches the mesh coordinates.
     pp_index, dp_index = divmod(rank, _DP_SHARD_SIZE)
     gpu = rank if torch.cuda.device_count() >= _WORLD_SIZE else (pp_index + dp_index) % 2
+    # NCCL selects unbound subgroup devices from LOCAL_RANK during initialization.
+    os.environ["LOCAL_RANK"] = str(gpu)
     device = torch.device("cuda", gpu)
     torch.cuda.set_device(device)
     # Create the CUDA context before any rank starts GPU work: context creation on a shared
     # GPU serializes, and other ranks' kernels would otherwise wait behind it.
     torch.zeros(1, device=device)
-    # No device_id: a bound default group would create a four-rank NCCL communicator,
-    # which NCCL rejects when two ranks share a GPU. World-group collectives here use Gloo.
+    # The four-rank world group uses CPU tensors and may span ranks sharing a GPU.
     dist.init_process_group(
-        backend="cuda:nccl,cpu:gloo",
+        backend="gloo",
         init_method=f"file://{results_dir}/store",
         rank=rank,
         world_size=_WORLD_SIZE,
         timeout=_RENDEZVOUS_TIMEOUT,
     )
     try:
-        # A CPU tensor keeps world-group collectives on Gloo.
         dist.all_reduce(torch.zeros(1))
-        mesh = init_device_mesh("cuda", (_PP_SIZE, _DP_SHARD_SIZE), mesh_dim_names=("pp", "dp_shard"))
+        # Each PP and DP-shard group spans distinct GPUs and can use NCCL.
+        mesh = init_device_mesh(
+            "cuda",
+            (_PP_SIZE, _DP_SHARD_SIZE),
+            mesh_dim_names=("pp", "dp_shard"),
+            backend_override={"pp": "nccl", "dp_shard": "nccl"},
+        )
         records = {}
         for stage_root, schedule in _CASES:
             records[f"{stage_root}-{schedule}"] = _evaluate(mesh, device, stage_root, schedule)
