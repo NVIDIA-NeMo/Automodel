@@ -27,6 +27,13 @@ class D1OmniConfig(PretrainedConfig):
     model_type = "d1_omni"
     sub_configs = {"text_config": Lfm2Config}
 
+    # Declared as dataclass fields so Transformers 5.22 keeps these model-owned
+    # values out of the generation-parameter rejection during save_pretrained.
+    max_length: int = 16384
+    image_text_length: int = 896
+    audio_text_length: int = 15360
+    temperatures: dict[str, float] | None = None
+
     def __init__(
         self,
         text_config: dict[str, Any] | Lfm2Config | None = None,
