@@ -38,6 +38,7 @@ from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetMo
 from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe
 
 from . import reference
+from .test_loop import looped_config
 
 pytestmark = pytest.mark.cpu_only
 
@@ -182,6 +183,12 @@ def test_feature_modules_reject_invalid_ids_and_pipeline_stages():
     stage.lm_head = None
     with pytest.raises(ValueError, match="pipeline stage"):
         stage.get_dspark_target_feature_modules([1])
+
+
+def test_feature_modules_reject_a_looped_decoder():
+    looped = Inkling2ForCausalLM(looped_config())
+    with pytest.raises(ValueError, match="unlooped"):
+        looped.get_dspark_target_feature_modules([1])
 
 
 def test_config_provides_the_draft_and_the_target():

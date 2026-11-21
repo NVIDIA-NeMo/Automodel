@@ -369,8 +369,10 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         Raises:
             ValueError: If the indices are duplicated, unsorted or outside the decoder
-                depth, or this model is a pipeline stage.
+                depth, this model is a pipeline stage, or its decoder is looped.
         """
+        if self.text_config.loop_config is not None:
+            raise ValueError("DSpark target features need an unlooped Inkling2 decoder")
         num_layers = self.text_config.num_hidden_layers
         if layer_ids != sorted(set(layer_ids)):
             raise ValueError(f"DSpark target layer IDs must be strictly increasing, got {layer_ids}")
