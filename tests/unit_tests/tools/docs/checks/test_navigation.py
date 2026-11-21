@@ -23,6 +23,7 @@ import pytest
 
 from tools.docs.build.coverage_tables import _load_model_doc_catalog
 from tools.docs.checks.navigation import (
+    _model_size_key,
     _validate_internal_links,
     _validate_provider_sections,
     _validate_published_training_routes,
@@ -32,6 +33,13 @@ from tools.docs.checks.navigation import (
 )
 
 pytestmark = pytest.mark.timeout(70)
+
+
+@pytest.mark.parametrize("suffix", ["", "-BF16", "-FP8", "-Instruct"])
+def test_glm_flash_recipes_keep_their_distinct_architecture_card(suffix: str) -> None:
+    flash = _model_size_key(f"zai-org/GLM-5.3-Flash{suffix}")
+    assert flash == ("zai-org", "glm-5.3-flash")
+    assert flash != _model_size_key(f"zai-org/GLM-5.3{suffix}")
 
 
 def test_regrouped_training_pages_preserve_published_urls():

@@ -84,6 +84,10 @@ def _model_size_key(hf_model_id: str) -> tuple[str, str]:
         )
         model_stem = variant_suffixes.sub("", model_name)
     normalized_stem = model_stem.casefold().replace("_", "-")
+    # GLM-5.3-Flash uses glm5_next, not the GLM-5.3 glm_moe_dsa backbone.
+    # Its text-only recipes still belong to the distinct multimodal model card.
+    if organization.casefold() == "zai-org" and re.match(r"(?i)^glm-5\.3[-_]flash(?:$|[-_])", model_name):
+        normalized_stem = "glm-5.3-flash"
     if organization.casefold() == "meta-llama":
         normalized_stem = re.sub("^meta-", "", normalized_stem)
     size_aliases = {("xiaomimimo", "mimo-v2.6-flash-rl"): "mimo-v2"}
