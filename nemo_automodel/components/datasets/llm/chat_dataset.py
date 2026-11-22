@@ -54,20 +54,41 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
             yield x
 
 
-_SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
+# Hugging Face slice syntax: absolute or percent bounds, either may be negative,
+# e.g. ``train[1024:]``, ``train[-500:]``, ``train[:95%]`` or ``train[-5%:]``.
+_SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(-?\d+%?)?:(-?\d+%?)?\]$")
 
 
 def _parse_split_slice(split: str | None):
-    """Parse a split string like ``"train[1024:]"`` into ``(base_split, slice | None)``."""
+    """Parse a split string like ``"train[1024:]"`` into ``(base_split, bounds | None)``.
+
+    ``bounds`` is a ``(start, stop)`` pair of the raw bound strings (``None`` when a
+    bound is omitted). Resolve it against a row count with ``_split_slice_indices``.
+    """
     if split is None:
         return split, None
     match = _SPLIT_SLICE_RE.match(split)
     if not match:
         return split, None
-    base = match.group(1)
-    start = int(match.group(2)) if match.group(2) else None
-    end = int(match.group(3)) if match.group(3) else None
-    return base, slice(start, end)
+    return match.group(1), (match.group(2), match.group(3))
+
+
+def _resolve_split_bound(bound: str | None, num_rows: int) -> int | None:
+    """Convert one slice bound to an absolute row offset the way ``datasets`` does.
+
+    Percent bounds use the ``closest`` rounding of ``datasets.ReadInstruction``.
+    """
+    if bound is None:
+        return None
+    if bound.endswith("%"):
+        return int(round(float(bound[:-1]) * num_rows / 100.0))
+    return int(bound)
+
+
+def _split_slice_indices(bounds: tuple[str | None, str | None], num_rows: int) -> range:
+    """Row indices selected by parsed slice ``bounds`` out of ``num_rows`` rows."""
+    start, stop = (_resolve_split_bound(b, num_rows) for b in bounds)
+    return range(*slice(start, stop).indices(num_rows))
 
 
 def _load_openai_messages(
@@ -112,8 +133,7 @@ def _load_openai_messages(
             dataset = dataset.shuffle(seed=shuffle_seed)
 
         if sl is not None:
-            indices = range(*sl.indices(len(dataset)))
-            dataset = dataset.select(indices)
+            dataset = dataset.select(_split_slice_indices(sl, len(dataset)))
 
         return dataset
 
@@ -143,8 +163,7 @@ def _load_openai_messages(
             if shuffle_seed is not None:
                 dataset = dataset.shuffle(seed=shuffle_seed)
             if sl is not None:
-                indices = range(*sl.indices(len(dataset)))
-                dataset = dataset.select(indices)
+                dataset = dataset.select(_split_slice_indices(sl, len(dataset)))
             return dataset
 
     # Fall back to manual JSON/JSONL parsing for local files.
@@ -191,7 +210,14 @@ def _load_openai_messages(
     # branches do. Local rows are not shuffled, so the slice is in file order.
     _, sl = _parse_split_slice(split)
     if sl is not None:
-        rows = rows[sl]
+        rows = [rows[i] for i in _split_slice_indices(sl, len(rows))]
+    elif split is not None and "[" in split:
+        # Returning every row here would silently turn a validation slice into
+        # the whole file, so reject slice syntax that cannot be applied.
+        raise ValueError(
+            f"Unsupported split slice {split!r} for local JSON/JSONL files; use e.g. "
+            "'train[:1024]', 'train[-500:]' or 'train[:95%]'"
+        )
 
     return rows
 

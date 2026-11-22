@@ -254,6 +254,68 @@ def test_load_openai_messages_local_applies_split_slice(tmp_path, suffix):
     assert len(tcd._load_openai_messages(str(fp), split="train")) == 10
 
 
+@pytest.mark.parametrize(
+    ("split", "expected"),
+    [
+        ("train[-2:]", ["q8", "q9"]),
+        ("train[:-8]", ["q0", "q1"]),
+        ("train[-3:-1]", ["q7", "q8"]),
+        ("train[:20%]", ["q0", "q1"]),
+        ("train[80%:]", ["q8", "q9"]),
+        ("train[-25%:]", ["q8", "q9"]),
+        ("train[:33%]", ["q0", "q1", "q2"]),
+    ],
+)
+def test_load_openai_messages_local_applies_negative_and_percent_slices(tmp_path, split, expected):
+    """Local files honor the same slice syntax ``datasets`` accepts, instead of returning every row."""
+    fp = tmp_path / "data.jsonl"
+    fp.write_text(
+        "\n".join(json.dumps({"messages": [{"role": "user", "content": f"q{i}"}]}) for i in range(10)),
+        encoding="utf-8",
+    )
+    rows = tcd._load_openai_messages(str(fp), split=split)
+    assert [r["messages"][0]["content"] for r in rows] == expected
+
+
+def test_load_openai_messages_local_rejects_unparsed_slice(tmp_path):
+    fp = tmp_path / "data.jsonl"
+    fp.write_text(json.dumps({"messages": [{"role": "user", "content": "q"}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported split slice"):
+        tcd._load_openai_messages(str(fp), split="train[:1.5%]")
+
+
+@pytest.mark.parametrize(
+    ("split", "expected"),
+    [("train[:10%]", list(range(10))), ("train[95%:]", list(range(95, 100))), ("train[-5:]", list(range(95, 100)))],
+)
+def test_load_openai_messages_hf_shuffles_before_percent_and_negative_slices(monkeypatch, split, expected):
+    """Percent and negative slices are applied after the shuffle, like absolute ones."""
+    monkeypatch.setattr(tcd, "_is_hf_repo_id", lambda v: True)
+    calls = {}
+
+    class _FakeDataset:
+        def __len__(self):
+            return 100
+
+        def shuffle(self, seed=None):
+            calls["shuffle_seed"] = seed
+            return self
+
+        def select(self, indices):
+            calls["select_indices"] = list(indices)
+            return self
+
+    def _load_dataset(*args, **kwargs):
+        calls["split"] = kwargs["split"]
+        return _FakeDataset()
+
+    monkeypatch.setattr(tcd, "load_dataset", _load_dataset)
+    tcd._load_openai_messages("org/name", split=split, shuffle_seed=42)
+    assert calls["split"] == "train"
+    assert calls["shuffle_seed"] == 42
+    assert calls["select_indices"] == expected
+
+
 def test_load_openai_messages_hf_shuffle_and_slice(monkeypatch):
     """Verify that HF datasets are shuffled before slicing."""
     monkeypatch.setattr(tcd, "_is_hf_repo_id", lambda v: True)
