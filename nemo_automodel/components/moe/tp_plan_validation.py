@@ -46,7 +46,7 @@ def _is_unsafe_moe_tp_module_path(module_path: str) -> bool:
     )
 
 
-def _validate_moe_tp_plan(plan: object, model: nn.Module | None = None) -> dict[str, ParallelStyle]:
+def _validate_moe_tp_plan(plan: dict[str, ParallelStyle], model: nn.Module | None = None) -> dict[str, ParallelStyle]:
     """Validate that a TP plan cannot shard routed-expert parameters.
 
     Routed experts are owned by expert parallelism and, when configured, the

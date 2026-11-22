@@ -62,12 +62,16 @@ configure_diffusion_finetune_recipe() {
             PROCESSOR="qwen_image_edit"
             GENERATE_CONFIG="examples/diffusion/generate/configs/generate_qwen_image_edit.yaml"
             MODEL_NAME="Qwen/Qwen-Image-Edit-2511"
+            local resolution_args="--max_pixels 1048576"
+            if [[ "$recipe_name" == "qwen_image_edit_2511_flow_lora" ]]; then
+                resolution_args="--resolution_preset 256p"
+            fi
             PREPROCESS_EXTRA_ARGS="--dataset_name osunlp/MagicBrush --dataset_split dev \
                 --dataset_media_mapping target=target_img \
                 --dataset_media_mapping context=source_img \
                 --dataset_media_mapping condition=source_img \
                 --dataset_caption_column instruction \
-                --max_items 64 --max_pixels 1048576 --max_sequence_length 512"
+                --max_items 64 $resolution_args --max_sequence_length 512"
             ;;
         qwen_image_t2i_flow*)
             MEDIA_TYPE="image"

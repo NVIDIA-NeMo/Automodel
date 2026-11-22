@@ -38,6 +38,7 @@ def main() -> None:
     config = tiny_glm5_next_config()
     config.text_config.linear_head_dim = 32
     config.text_config.hc_mult = 4
+    config.text_config.num_nextn_predict_layers = 0
     model = Glm5NextForConditionalGeneration(config, backend=tiny_backend(adapter=False))
     model.initialize_weights(torch.device("cpu"), dtype=torch.bfloat16)
     model.to(device)

@@ -21,10 +21,9 @@ from typing import Literal
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Placement, Replicate
 
 _TP_REPLICA_GRAD_REDUCTION_ATTR = "_nemo_tp_replica_grad_reduction"
-_MODEL_OWNED_GRAD_DIVISOR_ATTR = "_nemo_model_owned_grad_divisor"
 _MAX_FLAT_BUFFER_BYTES = 256 * 1024 * 1024
 
 
@@ -129,8 +128,6 @@ def _iter_unique_parameters(
             if reduction not in ("mean", "sum"):
                 raise ValueError(f"Unsupported TP replica gradient reduction: {reduction!r}")
             for parameter in module.parameters(recurse=False):
-                if getattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, None) is not None:
-                    continue
                 parameter_id = id(parameter)
                 prior_reduction = seen.get(parameter_id)
                 if prior_reduction is not None:
@@ -212,7 +209,7 @@ def broadcast_tp_replicas(
     source_rank = dist.get_global_rank(group, 0)
     tp_group_ranks = tuple(dist.get_process_group_ranks(group))
     current_rank = dist.get_rank()
-    placement_cache: dict[tuple[int, tuple[object, ...]], bool] = {}
+    placement_cache: dict[tuple[int, tuple[Placement, ...]], bool] = {}
 
     def is_replicated(tensor: torch.Tensor) -> bool:
         if not isinstance(tensor, DTensor):
@@ -318,7 +315,7 @@ def synchronize_tp_replica_gradients(
     group = tp_mesh.get_group()
     tp_group_ranks = tuple(dist.get_process_group_ranks(group))
     current_rank = dist.get_rank()
-    placement_cache: dict[tuple[int, tuple[object, ...]], bool] = {}
+    placement_cache: dict[tuple[int, tuple[Placement, ...]], bool] = {}
     replicated_parameters = []
     for parameter, reduction in _iter_unique_parameters_by_name(model_parts):
         if not parameter.requires_grad:

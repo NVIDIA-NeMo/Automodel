@@ -4,7 +4,7 @@ description: "Fine-tune gemma-4-12B for text generation with NeMo AutoModel usin
 slug: model-coverage/large-language-models/google/gemma-4-12B
 ---
 
-[Gemma-4-12B](https://huggingface.co/google/gemma-4-12B) has a checked-in NeMo AutoModel recipe for text generation.
+[Gemma-4-12B](https://huggingface.co/google/gemma-4-12B) has checked-in NeMo AutoModel recipes for text generation.
 The Hugging Face configuration declares the `Gemma4UnifiedForConditionalGeneration` architecture.
 
 ## Fine-Tune Gemma-4-12B
@@ -15,11 +15,51 @@ Follow the [installation instructions](/get-started/installation), then run the 
 automodel examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml --nproc-per-node 8
 ```
 
+## Train on Long Sequences with Context Parallelism
+
+Gemma-4-12B supports context parallelism (`distributed.cp_size > 1`). Each rank keeps a contiguous slice
+of the sequence, and the sliding-window and full-attention layers exchange keys and values over a p2p ring:
+
+```bash
+automodel examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp2.yaml --nproc-per-node 8
+```
+
+For 64K-token sequences on a single 8-GPU node, `gemma_4_12b_tulu3_cp8_64k.yaml` packs Tulu-3
+conversations into 64K-token sequences (THD) and shards each over `cp_size: 8` (8K tokens per rank):
+
+```bash
+automodel examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp8_64k.yaml --nproc-per-node 8
+```
+
+The CP recipes use `FusedLinearCrossEntropy`, which computes the loss from the hidden states instead of
+materializing the 262K-vocab logits for every token of the shard. Longer sequences take more ranks at
+the same 8K-token shard length rather than longer per-rank shards, which exceed 80 GB per GPU with this
+model: `gemma_4_12b_tulu3_cp16_128k.yaml` trains 128K-token sequences over two nodes (`cp_size: 16`),
+launched with `torchrun` on each node:
+
+```bash
+torchrun --nnodes 2 --node-rank <0|1> --master-addr <node-0 address> --master-port 29500 --nproc-per-node 8 examples/llm_finetune/finetune.py --config examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp16_128k.yaml
+```
+
+Context parallelism needs `attn_implementation: sdpa`, which the ring attention replaces. The CP recipes
+set `text_config.cp_full_attn_backend: ffpa`, which runs the head_dim=512 full-attention ring chunks
+through the FFPA kernel and needs the `ffpa` extra (`uv sync --extra ffpa`); remove the key to use Flex
+there instead. The 64K and 128K recipes also set `text_config.cp_sliding_attn_backend: fa`, which runs
+the sliding-window layers through FlashAttention and needs the `fa` extra; without it they use Flex.
+The base checkpoint ships no chat template, so the Tulu-3 recipes load the tokenizer of
+`google/gemma-4-12B-it`, which has the same vocabulary and the Gemma 4 chat template.
+Context parallelism covers text and image inputs; video and audio inputs are rejected under CP. Image
+tokens marked by `mm_token_type_ids` attend bidirectionally on the sliding-window layers only, with and
+without CP.
+
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml). |
+| Train on long sequences with context parallelism | Use the [CP recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp2.yaml). |
+| Train on 64K-token sequences on one node | Use the [64K CP recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp8_64k.yaml). |
+| Train on 128K-token sequences on two nodes | Use the [128K CP recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp16_128k.yaml). |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ### Configuration

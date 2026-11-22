@@ -13,7 +13,16 @@ from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunk
 from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
 from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
 from nemo_automodel.components.moe.parallelizer import apply_ac
-from tests.unit_tests.models.glm5_next.conftest import tiny_glm5_next_model
+from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
+
+
+def tiny_pp_model() -> Glm5NextForConditionalGeneration:
+    """Tiny model without the MTP head, which pipeline stages do not support."""
+    config = tiny_glm5_next_config()
+    config.text_config.num_nextn_predict_layers = 0
+    model = Glm5NextForConditionalGeneration(config, backend=tiny_backend())
+    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+    return model
 
 
 def split_stages(model: Glm5NextForConditionalGeneration, count: int) -> list[Glm5NextForConditionalGeneration]:
@@ -42,7 +51,7 @@ def split_stages(model: Glm5NextForConditionalGeneration, count: int) -> list[Gl
 def test_pipeline_outputs_and_all_parameter_gradients(stage_count, vision, fused_loss, activation_checkpointing):
     """Compare packed [B,S,V] logits and gradients with the unsplit model."""
     torch.manual_seed(31)
-    reference = tiny_glm5_next_model()
+    reference = tiny_pp_model()
     stages = split_stages(reference, stage_count)
     stages[-1]._pp_return_hidden_states = fused_loss
     if activation_checkpointing:
@@ -84,7 +93,7 @@ def test_pipeline_outputs_and_all_parameter_gradients(stage_count, vision, fused
 
 def test_packed_metadata_follows_microbatch_rows():
     """Exercise Torch's actual kwargs splitter with different [B,S] document maps."""
-    model = tiny_glm5_next_model()
+    model = tiny_pp_model()
     ids = torch.arange(1, 25).reshape(2, 12)
     docs = torch.tensor([[1] * 6 + [2] * 6, [1] * 3 + [2] * 9], dtype=torch.int32)
     sharder = model.prepare_model_inputs_for_cp({}, num_chunks=2)["cp_sharder"]
@@ -109,7 +118,7 @@ def test_packed_metadata_follows_microbatch_rows():
 @pytest.mark.parametrize("fused_loss", [False, True])
 def test_stage_metas_and_initialization(cp_size, fused_loss):
     """Metadata uses padded local sequence lengths and keeps mHC streams."""
-    model = tiny_glm5_next_model()
+    model = tiny_pp_model()
     stages = split_stages(model, 4)
     local_length = (13 + (-13) % cp_size) // cp_size
     for index, stage in enumerate(stages):
@@ -127,7 +136,7 @@ def test_stage_metas_and_initialization(cp_size, fused_loss):
 
 def test_nonfirst_stage_does_not_slice_cp_activations_again():
     """A later CP rank receives already-local [B,Slocal,HC,H] activations."""
-    stage = split_stages(tiny_glm5_next_model(), 4)[1]
+    stage = split_stages(tiny_pp_model(), 4)[1]
     stage.language_model.layers = torch.nn.ModuleDict()
     hidden = torch.randn(1, 6, 2, 16)
     context = Glm5NextPackedContext(torch.ones(1, 12, dtype=torch.int32), seq_start=6, cp_size=2)
@@ -137,7 +146,7 @@ def test_nonfirst_stage_does_not_slice_cp_activations_again():
 def test_vision_microbatch_cursor_consumes_empty_slots():
     """Stage-zero media chunks map to image/text/image samples exactly once."""
     torch.manual_seed(47)
-    reference = tiny_glm5_next_model()
+    reference = tiny_pp_model()
     stage = split_stages(reference, 2)[0]
     first, second = torch.randn(4, 24), torch.randn(4, 24)
     grid = torch.tensor([[1, 2, 2]])
@@ -156,7 +165,7 @@ def test_vision_microbatch_cursor_consumes_empty_slots():
 def test_pipeline_packed_documents_match_separate_execution():
     """Packed [1,12,V] outputs equal two independent six-token documents."""
     torch.manual_seed(61)
-    stages = split_stages(tiny_glm5_next_model().eval(), 4)
+    stages = split_stages(tiny_pp_model().eval(), 4)
     ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]])
     docs = torch.tensor([[1] * 6 + [2] * 6], dtype=torch.int32)
 
@@ -181,7 +190,7 @@ def test_pipeline_packed_documents_match_separate_execution():
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_cp_microbatch_metadata_retains_global_map_and_local_offsets(cp_size):
     """Chunk batch rows while retaining CP's padded [B,Sglobal] document map."""
-    model = tiny_glm5_next_model()
+    model = tiny_pp_model()
     mesh = SimpleNamespace(size=lambda: cp_size, get_local_rank=lambda: cp_size - 1)
     ids = torch.arange(1, 27).reshape(2, 13)
     docs = torch.tensor([[1] * 6 + [2] * 7, [1] * 3 + [2] * 10], dtype=torch.int32)
@@ -207,7 +216,7 @@ def test_cp_microbatch_metadata_retains_global_map_and_local_offsets(cp_size):
 
 def test_kda_checkpoint_metadata_is_private_to_each_invocation():
     """Checkpoint replay gets fresh metadata while Q/K/V share each call's map."""
-    stage = split_stages(tiny_glm5_next_model(), 2)[0]
+    stage = split_stages(tiny_pp_model(), 2)[0]
     attention = stage.language_model.layers["0"].self_attn
     seen = []
     handles = [
@@ -233,7 +242,7 @@ def test_kda_checkpoint_metadata_is_private_to_each_invocation():
 
 def test_kda_reuses_packed_context_cpu_boundaries():
     """Every convolution receives cached CPU boundaries and fresh device metadata."""
-    stage = split_stages(tiny_glm5_next_model(), 2)[0]
+    stage = split_stages(tiny_pp_model(), 2)[0]
     attention = stage.language_model.layers["0"].self_attn
     context = Glm5NextPackedContext(torch.tensor([[1, 1, 1, 2, 2, 3]], dtype=torch.int32))
     boundaries, boundaries_cpu = context.row_cu_seqlens(0)
@@ -258,3 +267,18 @@ def test_kda_reuses_packed_context_cpu_boundaries():
         assert cpu_copy is boundaries_cpu
         assert cpu_copy.device.type == "cpu"
         torch.testing.assert_close(device_copy, torch.tensor([0, 3, 5, 6]))
+
+
+@pytest.mark.parametrize("stage_index", [0, 1])
+def test_pipeline_stage_with_mtp_head_raises(stage_index):
+    """The MTP head cannot be combined with pipeline stages."""
+    torch.manual_seed(5)
+    config = tiny_glm5_next_config()
+    config.text_config.num_nextn_predict_layers = 1
+    model = Glm5NextForConditionalGeneration(config, backend=tiny_backend())
+    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+    stage = split_stages(model, 2)[stage_index]
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+    value = ids if stage_index == 0 else torch.randn(1, 8, 2, 16)
+    with pytest.raises(ValueError, match="MTP is not supported with pipeline parallelism"):
+        stage(value, attention_mask=torch.ones_like(ids, dtype=torch.int32))

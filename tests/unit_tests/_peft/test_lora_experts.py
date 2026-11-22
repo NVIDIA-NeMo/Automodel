@@ -31,8 +31,10 @@ from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linea
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
     GroupedExpertsLoRA,
+    _init_stacked_lora_A,
     _pad_lora_rank_for_grouped_mm,
 )
+from nemo_automodel.components.checkpoint.checkpointing import _init_peft_adapters
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
@@ -1465,3 +1467,90 @@ def test_lora_after_down_zero_tokens_keeps_routing_weights_attached(moe_config, 
     torch.testing.assert_close(out, torch.zeros_like(out))
     assert weights.grad is not None
     torch.testing.assert_close(weights.grad, torch.zeros_like(weights))
+
+
+def test_init_stacked_lora_a_invalid_method_raises():
+    """Invalid init method strings raise ValueError instead of silently falling through."""
+    weight = torch.empty(4, 16, 4)
+    with pytest.raises(ValueError, match="expected init_method to be 'xavier' or 'kaiming'"):
+        _init_stacked_lora_A(weight, "unsupported")
+
+
+def test_lora_experts_attribute_types(moe_config, device):
+    """Declared adapter attributes and types match on GroupedExpertsLoRA."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_A_init_method="xavier")
+
+    assert isinstance(lora_experts.lora_gate_and_up_A, nn.Parameter)
+    assert isinstance(lora_experts.lora_gate_and_up_B, nn.Parameter)
+    assert isinstance(lora_experts.lora_down_A, nn.Parameter)
+    assert isinstance(lora_experts.lora_down_B, nn.Parameter)
+    assert isinstance(lora_experts.use_torch_mm, bool)
+    assert callable(lora_experts.expert_activation_grouped)
+
+
+@pytest.mark.parametrize(
+    "adapter_cls,orig_cls",
+    [
+        (GroupedExpertsLoRA, GroupedExperts),
+        (GroupedExpertsDeepEPLoRA, GroupedExpertsDeepEP),
+    ],
+)
+def test_init_peft_adapters_raises_value_error_for_invalid_method(moe_config, device, adapter_cls, orig_cls):
+    """_init_peft_adapters propagates ValueError for unsupported init methods."""
+    orig = orig_cls(moe_config).to(device)
+    lora_experts = adapter_cls(orig, lora_dim=4, alpha=8).to(device)
+    with pytest.raises(ValueError, match="expected init_method to be 'xavier' or 'kaiming'"):
+        _init_peft_adapters(lora_experts, "unsupported")
+
+
+@pytest.mark.parametrize(
+    "adapter_cls,orig_cls",
+    [
+        (GroupedExpertsLoRA, GroupedExperts),
+        (GroupedExpertsDeepEPLoRA, GroupedExpertsDeepEP),
+    ],
+)
+@pytest.mark.parametrize("method", ["xavier", "kaiming"])
+def test_init_peft_adapters_reinitializes_weights(moe_config, device, adapter_cls, orig_cls, method):
+    """_init_peft_adapters reinitializes A and zeroes B for valid methods."""
+    orig = orig_cls(moe_config).to(device)
+    lora_experts = adapter_cls(orig, lora_dim=4, alpha=8).to(device)
+    with torch.no_grad():
+        lora_experts.lora_gate_and_up_B.fill_(1.0)
+        lora_experts.lora_down_B.fill_(1.0)
+    _init_peft_adapters(lora_experts, method)
+    assert torch.all(lora_experts.lora_gate_and_up_B == 0.0)
+    assert torch.all(lora_experts.lora_down_B == 0.0)
+    assert torch.all(torch.isfinite(lora_experts.lora_gate_and_up_A))
+    assert torch.all(torch.isfinite(lora_experts.lora_down_A))
+
+
+def test_grouped_experts_deepep_lora_token_dispatcher_contract(moe_config, device):
+    """GroupedExpertsDeepEPLoRA inherits token_dispatcher contract and preserves wrapping states."""
+    orig = GroupedExpertsDeepEP(moe_config).to(device)
+    assert orig.token_dispatcher is None
+    wrapped = GroupedExpertsDeepEPLoRA(orig, lora_dim=4, alpha=8).to(device)
+    assert wrapped.token_dispatcher is None
+
+    mock_dispatcher = MagicMock()
+    orig.token_dispatcher = mock_dispatcher
+    wrapped_with_disp = GroupedExpertsDeepEPLoRA(orig, lora_dim=4, alpha=8).to(device)
+    assert wrapped_with_disp.token_dispatcher is mock_dispatcher
+
+
+def test_grouped_experts_deepep_raises_when_token_dispatcher_uninitialized(moe_config, device):
+    """GroupedExpertsDeepEP raises RuntimeError if token_dispatcher is None during dispatch or forward."""
+    orig = GroupedExpertsDeepEP(moe_config).to(device)
+    assert orig.token_dispatcher is None
+    num_tokens = 4
+    x = torch.randn(num_tokens, moe_config.dim, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, moe_config.n_activated_experts, device=device)
+    indices = torch.randint(0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device)
+
+    with pytest.raises(RuntimeError, match="token_dispatcher is not initialized"):
+        orig._dispatch_tokens(x, token_mask, weights, indices)
+
+    with pytest.raises(RuntimeError, match="token_dispatcher is not initialized"):
+        orig(x, token_mask, weights, indices)

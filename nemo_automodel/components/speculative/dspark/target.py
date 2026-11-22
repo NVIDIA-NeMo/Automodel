@@ -244,7 +244,7 @@ class HFDSparkTargetModel:
         """
         layers = self._get_transformer_layers()
         last = self._num_layers - 1
-        captured: dict[object, torch.Tensor] = {}
+        captured: dict[int | str, torch.Tensor] = {}
         handles = []
 
         def _make_hook(key):

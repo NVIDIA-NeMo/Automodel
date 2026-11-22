@@ -16,10 +16,12 @@
 
 Implements the technique from "NEFTune: Noisy Embeddings Improve Instruction Finetuning"
 (https://arxiv.org/abs/2310.05914). Adds scaled uniform noise to token embeddings during
-training to improve generalization, with no additional compute or data overhead.
 """
 
+from __future__ import annotations
+
 import logging
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -45,14 +47,16 @@ class NEFTune:
         neftune.deactivate(model)
     """
 
-    def __init__(self, noise_alpha: float = 5.0):
+    def __init__(self, noise_alpha: float = 5.0) -> None:
         if noise_alpha < 0:
             raise ValueError(f"noise_alpha must be non-negative, got {noise_alpha}")
         self.noise_alpha = noise_alpha
-        self._hook_handle: torch.utils.hooks.RemovableHook | None = None
-        self._original_forward = None
+        self._hook_handle: torch.utils.hooks.RemovableHandle | None = None
+        self._original_forward: Any = None
 
-    def _neftune_forward_hook(self, module: nn.Module, input: tuple, output: torch.Tensor) -> torch.Tensor:
+    def _neftune_forward_hook(
+        self, module: nn.Module, input: tuple[torch.Tensor, ...], output: torch.Tensor
+    ) -> torch.Tensor:
         """Forward hook that adds NEFTune noise to embedding output during training."""
         if module.training and self.noise_alpha > 0:
             dims = torch.tensor(output.size(1) * output.size(2), dtype=output.dtype, device=output.device)
@@ -116,7 +120,7 @@ def _get_input_embeddings(model: nn.Module) -> nn.Module | None:
     """
     if hasattr(model, "get_input_embeddings") and callable(model.get_input_embeddings):
         emb = model.get_input_embeddings()
-        if emb is not None:
+        if isinstance(emb, nn.Module):
             return emb
 
     for attr_path in ["embed_tokens", "model.embed_tokens", "transformer.wte"]:

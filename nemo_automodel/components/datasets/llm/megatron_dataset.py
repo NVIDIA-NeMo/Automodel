@@ -24,8 +24,8 @@ from typing import ClassVar, Dict, List, Union
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
-from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
+from nemo_automodel.components.datasets.llm.megatron.builder import BlendedDataset, BlendedMegatronDatasetBuilder
+from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDataset, GPTDatasetConfig
 from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import ObjectStorageConfig, _is_object_storage_path
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
 from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
@@ -73,7 +73,7 @@ class MegatronPretrainingConfig:
     """Whether to memory-map .bin files."""
     splits_to_build: str | list[str] | None = None
     """Splits to build (None builds all splits)."""
-    object_storage_config: dict[str, object] | ObjectStorageConfig | None = None
+    object_storage_config: dict[str, str | int] | ObjectStorageConfig | None = None
     """Configuration for reading .bin/.idx files from S3/MSC."""
 
     def build(
@@ -81,7 +81,7 @@ class MegatronPretrainingConfig:
         *,
         tokenizer: PreTrainedTokenizerBase | None,
         training_schedule: DatasetBuildSchedule,
-    ) -> object:
+    ) -> GPTDataset | BlendedDataset:
         """Build the Megatron pretraining torch ``Dataset`` (for ``DataloaderConfig.dataset_config``).
 
         Constructs the :class:`MegatronPretraining` builder, runs its ``build()``, and returns the requested

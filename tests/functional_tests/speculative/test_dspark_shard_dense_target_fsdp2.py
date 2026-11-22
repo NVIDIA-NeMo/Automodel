@@ -53,7 +53,7 @@ from nemo_automodel.components.speculative.dspark import (
 )
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.llm._dspark_target_build import gather_full_weight_module
+from nemo_automodel.recipes.speculative_decoding._dspark_target_build import gather_full_weight_module
 
 pytestmark = pytest.mark.skipif(
     torch.cuda.device_count() < 2, reason="needs 2 GPUs (FSDP2 sharding + FlexAttention backward)"

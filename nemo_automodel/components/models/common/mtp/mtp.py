@@ -76,6 +76,58 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
     return rolled
 
 
+def resolve_mtp_seq_idx(
+    labels: torch.Tensor,
+    seq_idx: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Normalize a packed-sequence boundary into a per-token sub-sequence index.
+
+    Shared by ``calculate_mtp_loss`` and the MTP acceptance-length metric so
+    both see identical packed-sequence boundaries. ``seq_idx`` takes
+    precedence over ``cu_seqlens``; a bare ``cu_seqlens`` is converted via
+    ``searchsorted``, matching the model's own mamba ``seq_idx`` build
+    (``nemotron_v3/layers.py``).
+
+    Args:
+        labels: Label tensor whose shape the returned index must match.
+        seq_idx: Optional per-token sub-sequence index ``[B, S]`` (or ``[S]``).
+        cu_seqlens: Optional cumulative sequence lengths ``[num_seqs+1]``
+            (THD-pack layout), used only when ``seq_idx`` is not given.
+
+    Returns:
+        A sub-sequence index tensor matching ``labels.shape``, or ``None``
+        when neither argument is given.
+    """
+    if seq_idx is None and cu_seqlens is not None:
+        cs = cu_seqlens
+        if cs.dim() == 2 and cs.shape[0] == 1:
+            cs = cs.squeeze(0)
+        if cs.dim() == 1:
+            # Span the full (padded) token axis; cu_seqlens[-1] excludes tail pad.
+            total_len = labels.shape[-1]
+            positions = torch.arange(total_len, device=labels.device)
+            # ``right=True`` so a position equal to a boundary (the first token
+            # of sub-seq k, position == cu_seqlens[k]) maps to k, not k-1.
+            seq_idx = torch.searchsorted(cs[1:].contiguous(), positions, right=True)
+            if labels.dim() == 2:
+                seq_idx = seq_idx.unsqueeze(0).expand(labels.shape[0], -1)
+    elif seq_idx is not None:
+        if seq_idx.dim() == 1 and labels.dim() == 2:
+            seq_idx = seq_idx.unsqueeze(0).expand(labels.shape[0], -1)
+        elif seq_idx.dim() == 2 and labels.dim() == 1 and seq_idx.shape[0] == 1:
+            seq_idx = seq_idx.squeeze(0)
+        # Under PP the caller must chunk seq_idx to per-microbatch shape; a
+        # mismatch is a wiring bug, not a runtime condition to swallow.
+        if seq_idx.shape != labels.shape:
+            raise ValueError(
+                f"seq_idx.shape={tuple(seq_idx.shape)} does not match "
+                f"labels.shape={tuple(labels.shape)}; under PP, chunk seq_idx "
+                "into per-microbatch pieces before passing it in."
+            )
+    return seq_idx
+
+
 def shift_packed_tensor(
     tensor: torch.Tensor,
     *,

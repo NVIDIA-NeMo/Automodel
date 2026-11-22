@@ -2268,7 +2268,7 @@ def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeyp
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
     class LegacyGroupedLinear(torch.nn.Module):
-        def __init__(self, *, num_gemms, in_features, out_features, bias, params_dtype, device):
+        def __init__(self, *, first_expert, num_gemms, in_features, out_features, bias, params_dtype, device):
             super().__init__()
             self.num_gemms = num_gemms
 
@@ -2279,11 +2279,11 @@ def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeyp
     te = ModuleType("transformer_engine")
     te.__version__ = "2.14.1"
     te_pytorch = ModuleType("transformer_engine.pytorch")
-    te_pytorch.GroupedLinear = LegacyGroupedLinear
     te_pytorch.Fp8Padding = LegacyPadding
     te_pytorch.Fp8Unpadding = LegacyPadding
     monkeypatch.setitem(sys.modules, "transformer_engine", te)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te_pytorch)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._ExpertGroupedLinear", LegacyGroupedLinear)
     monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
     backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
     if native:
@@ -2303,13 +2303,41 @@ def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeyp
         assert experts.down_linear.num_gemms == moe_config.n_routed_experts // 2
 
 
+@pytest.mark.parametrize(
+    ("name", "first_expert", "expected"),
+    [
+        ("weight0", 4, "weight4"),  # TE's name for local expert 0 on the rank that holds experts 4..7
+        ("bias3", 4, "bias7"),
+        ("weight4", 4, "weight4"),  # already the registered name
+        ("weight7", 4, "weight7"),
+        ("weight3", 0, "weight3"),  # the first rank keeps TE's names
+        ("weight", 4, "weight"),  # TE's single grouped weight
+        ("weight_scale0", 4, "weight_scale0"),
+        ("0", 4, "0"),
+    ],
+)
+def test_global_expert_name(name, first_expert, expected):
+    from nemo_automodel.components.moe.experts import _global_expert_name
+
+    assert _global_expert_name(name, first_expert) == expected
+
+
 @pytest.fixture
 def fake_native_te(monkeypatch):
     """Exercise Automodel's TE integration on CPU, including coupled autograd outputs."""
 
     class GroupedLinear(torch.nn.Module):
         def __init__(
-            self, *, num_gemms, in_features, out_features, bias, params_dtype, device, use_grouped_tensor=False
+            self,
+            *,
+            first_expert,
+            num_gemms,
+            in_features,
+            out_features,
+            bias,
+            params_dtype,
+            device,
+            use_grouped_tensor=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -2362,7 +2390,7 @@ def fake_native_te(monkeypatch):
     state.is_fp8_enabled.return_value = False
     supported = Mock(return_value=True)
     te = ModuleType("transformer_engine.pytorch")
-    te.GroupedLinear, te.Fp8Padding, te.Fp8Unpadding = GroupedLinear, Padding, Unpadding
+    te.Fp8Padding, te.Fp8Unpadding = Padding, Unpadding
     quantization = ModuleType("transformer_engine.pytorch.quantization")
     quantization.FP8GlobalStateManager = state
     grouped_linear = ModuleType("transformer_engine.pytorch.module.grouped_linear")
@@ -2370,6 +2398,7 @@ def fake_native_te(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.quantization", quantization)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.grouped_linear", grouped_linear)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._ExpertGroupedLinear", GroupedLinear)
     monkeypatch.setattr("nemo_automodel.components.moe.experts.is_te_min_version", lambda version: True)
     monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
     monkeypatch.setattr("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", Dispatcher)
@@ -2480,6 +2509,46 @@ def test_te_honors_compile_router_weight(moe_config, fake_native_te, monkeypatch
     assert called == []
     GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep", compile_router_weight=True))
     assert called == [1]
+
+
+@pytest.mark.parametrize("equal_token_counts", [None, False, True], ids=["omitted", "false", "true"])
+def test_te_passes_equal_token_counts_to_the_hybridep_manager(
+    moe_config, fake_native_te, monkeypatch, equal_token_counts
+):
+    """dispatcher_equal_token_counts reaches the HybridEP manager on the TE path as on the native one; dropped, every
+    dispatch keeps the EP-group max all-reduce and host sync that the setting exists to skip."""
+    import nemo_automodel.components.moe.megatron.token_dispatcher as token_dispatcher
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    # The real dispatcher builds the manager; only the HybridEP kernel entry point is missing on CPU.
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", token_dispatcher.MoEFlexTokenDispatcher
+    )
+    monkeypatch.setattr(token_dispatcher.MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", Mock())
+    knobs = {} if equal_token_counts is None else {"dispatcher_equal_token_counts": equal_token_counts}
+    backend = BackendConfig(experts="te", dispatcher="hybridep", **knobs)
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
+    group = Mock()
+    group.size.return_value = 2
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.get_group.return_value = group
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+
+    assert experts.token_dispatcher._comm_manager.equal_token_counts is bool(equal_token_counts)
+
+
+def test_te_rejects_the_hybridep_capacity_factor(moe_config, fake_native_te):
+    """Capacity mode pads the dispatched buffer past the routed rows, which TE's per-expert split sizes cannot
+    describe, so the TE experts refuse the factor instead of silently keeping the blocking dispatch."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    backend = BackendConfig(experts="te", dispatcher="hybridep", dispatcher_capacity_factor=1.5)
+    with pytest.raises(ValueError, match="dispatcher_capacity_factor is not supported by the TE grouped experts"):
+        GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
 
 
 def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
@@ -2940,6 +3009,32 @@ class TestGroupedExpertsTE:
             assert experts.ep_rank == 0
             assert experts.num_local_experts == te_moe_config.n_routed_experts // 2
             assert experts.token_dispatcher is not None
+
+    @pytest.mark.parametrize("ep_rank", [0, 1])
+    def test_init_token_dispatcher_names_parameters_by_global_expert(self, te_moe_config_with_bias, ep_rank):
+        """Each EP rank holds its experts under their global index, so per-name state does not collide."""
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        experts = GroupedExpertsTE(te_moe_config_with_bias)
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = ep_rank
+        mock_mesh.get_group.return_value = Mock()
+        mock_mesh.mesh_dim_names = ("ep",)
+        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher"):
+            experts.init_token_dispatcher(mock_mesh)
+        experts.init_weights(torch.device("cuda"))
+
+        num_local = te_moe_config_with_bias.n_routed_experts // 2
+        owned = range(ep_rank * num_local, (ep_rank + 1) * num_local)
+        assert [name for name, _ in experts.named_parameters()] == [
+            f"{linear}.{kind}{expert}"
+            for linear in ("gate_up_linear", "down_linear")
+            for expert in owned
+            for kind in ("weight", "bias")
+        ]
+        for local, expert in enumerate(owned):
+            assert getattr(experts.down_linear, f"weight{local}") is getattr(experts.down_linear, f"weight{expert}")
 
     def test_grouped_experts_te_forwards_the_combine_cache_to_the_dispatcher(self, te_moe_config):
         """BackendConfig accepts TE + HybridEP + "combine": the setting must reach the dispatcher config, or the

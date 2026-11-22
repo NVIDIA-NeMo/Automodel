@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from typing import Any, Dict
 
@@ -55,6 +55,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.loader import StreamDatasetConfig
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -325,9 +326,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             pp_microbatch_size=pp_microbatch_size,
         )
 
-    def _configure_packing(self) -> PackingCapabilities:
+    @property
+    def _packing_contract(self) -> PackingCapabilities:
         """Emit metadata for both KD consumers, including a teacher built later."""
-        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+        return replace(super()._packing_contract, return_packed_sequence_metadata=True)
 
     def _configure_teacher_packing(self) -> None:
         """Adapt teacher stages and reject incompatible student/teacher mask layouts.
@@ -353,6 +355,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is not None and isinstance(dataloader_config.dataset_config, StreamDatasetConfig):
+            raise ValueError("Stream-loader knowledge distillation is not yet certified")
         # Right now, we only support tokenizer compatibility for the same tokenizer.
         # We will add support for different tokenizers in the future.
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
@@ -679,7 +684,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if is_train
             else nullcontext()
         )
-        with train_ctx(), sync_ctx:
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
+        with train_ctx(), sync_ctx, ExitStack() as student_ctx:
             # No grad for teacher forward.
             if separate_teacher_logits is None:
                 with (
@@ -692,7 +698,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             else:
                 teacher_logits = separate_teacher_logits
 
-            # Student forward.
+            # The student runs under its TE quantization; the full-precision teacher above does not.
+            student_ctx.enter_context(te_ctx)
             student_batch = dict(batch)
             if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
                 student_batch["output_hidden_states"] = True
@@ -797,9 +804,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # Only the last PP stage needs targets for the loss function.
         targets = labels.clone() if self.pp.info.has_last_stage else None
 
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
 
-        with train_ctx(), fp8_ctx:
+        with train_ctx(), ExitStack() as student_ctx:
             if separate_teacher_logits is not None:
                 self._current_teacher_logits = list(
                     torch.split(separate_teacher_logits, self.pipeline_config.pp_microbatch_size, dim=0)
@@ -823,7 +830,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         self._current_teacher_logits = None
             self._current_num_label_tokens = num_label_tokens
 
-            # Run student forward (+ backward if training).
+            # Run student forward (+ backward if training) under its TE quantization; the teacher above does not.
+            student_ctx.enter_context(te_ctx)
             student_losses = [] if self.pp.info.has_last_stage else None
             if is_train:
                 if self.pp.info.has_first_stage:

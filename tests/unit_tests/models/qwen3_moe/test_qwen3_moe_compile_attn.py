@@ -14,13 +14,19 @@
 
 """CPU unit tests for the Qwen3-MoE compile_attn (fullgraph attention compile) wiring.
 
-These mock the submodule initializers so Qwen3MoeAttention constructs without a GPU or
-TransformerEngine. They cover the compile_attn gating in __init__ (default off, and the
-warn/no-op path when attn != 'sdpa'); the actual torch.compile call (attn='sdpa' + GPU)
-is pragma-excluded as it only runs on the GPU benchmark.
+Attention kernels are replaced by stubs so Qwen3MoeAttention constructs without a GPU,
+TransformerEngine or FlashAttention-4. The tests cover the compile_attn gating in __init__
+(default off, the warn/no-op path for other backends, whole-attention SDPA compilation and
+FA4 projection compilation), deep-copy safety of the compiled callables under Dynamo's eager
+backend, TE output layouts and the native FA4 packing contract. Inductor compilation with
+real FA4 kernels is covered by tests/functional_tests/attention/test_qwen3_moe_compiled_fa4.py.
 """
 
+import copy
 from unittest.mock import Mock, patch
+
+import pytest
+import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
@@ -68,3 +74,183 @@ class TestQwen3MoeCompileAttn:
         backend = BackendConfig(attn="te", linear="torch", rms_norm="torch", rope_fusion=False, compile_attn=True)
         attn = self._build(mock_lin, mock_rms, mock_attn, backend)
         assert attn._compiled_forward is None
+
+    def test_fa4_compiles_only_fixed_shape_projections(self, mock_lin: Mock, mock_rms: Mock, mock_attn: Mock) -> None:
+        backend = BackendConfig(attn="fa4", linear="torch", rms_norm="torch", rope_fusion=False, compile_attn=True)
+        with patch("torch.compile", side_effect=lambda fn, **kwargs: fn) as compile_fn:
+            attn = self._build(mock_lin, mock_rms, mock_attn, backend)
+        assert attn._compiled_forward is None
+        assert [call.args[0].__name__ for call in compile_fn.call_args_list] == ["_project_qkv", "_project_output"]
+        assert all(call.kwargs == {"fullgraph": True, "dynamic": False} for call in compile_fn.call_args_list)
+
+    @pytest.mark.parametrize("option", [{"linear": "te"}, {"rms_norm": "te"}])
+    def test_fa4_rejects_uncompilable_projection_settings(
+        self, mock_lin: Mock, mock_rms: Mock, mock_attn: Mock, option: dict[str, str]
+    ) -> None:
+        settings = {"attn": "fa4", "linear": "torch", "rms_norm": "torch", "rope_fusion": False, "compile_attn": True}
+        settings.update(option)
+        with pytest.raises(ValueError, match="compiled FA4 requires"):
+            self._build(mock_lin, mock_rms, mock_attn, BackendConfig(**settings))
+
+    def test_sdpa_keeps_full_attention_compile(self, mock_lin: Mock, mock_rms: Mock, mock_attn: Mock) -> None:
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False, compile_attn=True)
+        with patch("torch.compile", side_effect=lambda fn, **kwargs: fn) as compile_fn:
+            attn = self._build(mock_lin, mock_rms, mock_attn, backend)
+        assert compile_fn.call_count == 1
+        assert compile_fn.call_args.args[0].__name__ == "_forward_impl"
+        assert attn._compiled_qkv is None
+
+
+@pytest.mark.parametrize("thd", [False, True])
+def test_te_flattened_attention_output_preserves_token_axes(thd: bool) -> None:
+    """TE's already flattened head axis must retain batch/sequence or token axes."""
+
+    def te_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        """Return TE layout from Q [batch, sequence, heads, dim] or [tokens, heads, dim].
+
+        Args:
+            q: Query tensor with batched or THD token axes followed by [heads, dim].
+            k: Key tensor with the same token axes and [kv_heads, dim].
+            v: Value tensor with the same token axes and [kv_heads, dim].
+            **kwargs: Unused TE metadata.
+
+        Returns:
+            Tensor preserving token axes with a final flattened [heads * dim] axis.
+        """
+        return q.flatten(-2)
+
+    config = _config()
+    config.dtype = torch.float32
+    backend = BackendConfig(attn="te", linear="torch", rms_norm="torch", rope_fusion=False)
+    with patch(
+        "nemo_automodel.components.models.qwen3_moe.layers.initialize_attn_module_and_func",
+        return_value=(None, te_attention),
+    ):
+        module = Qwen3MoeAttention(config, backend)
+    shape = (7, 64) if thd else (2, 7, 64)
+    inputs = torch.randn(shape, requires_grad=True)
+    frequencies = torch.cat([torch.ones(*shape[:-1], 8), torch.zeros(*shape[:-1], 8)], dim=-1)
+    kwargs = {"cu_seqlens": torch.tensor([0, 3, 7], dtype=torch.int32), "max_seqlen": 4} if thd else {}
+    output = module(inputs, freqs_cis=frequencies, **kwargs)
+    assert output.shape == inputs.shape
+    output.square().sum().backward()
+    assert inputs.grad.shape == inputs.shape
+
+
+@pytest.mark.parametrize("attn", ["fa4", "sdpa"])
+def test_compiled_attention_deep_copy_uses_copied_parameters(attn: str) -> None:
+    """Deep copies, such as pipeline stages, must run compiled code on their own parameters."""
+
+    def attention_stub(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        """Return the queries as the attention output.
+
+        Args:
+            q: Query tensor of shape [batch, sequence, heads, head_dim] for FA4, or
+                [batch, heads, sequence, head_dim] after SDPA preprocessing.
+            k: Key tensor with the layout of q and kv_heads in place of heads.
+            v: Value tensor with the layout of k.
+            **kwargs: Unused backend metadata.
+
+        Returns:
+            Tensor with the shape of q.
+        """
+        return q
+
+    config = _config()
+    config.dtype = torch.float32
+    backend = BackendConfig(attn=attn, linear="torch", rms_norm="torch", rope_fusion=False, compile_attn=True)
+    compile_function = torch.compile
+    with (
+        patch(
+            "nemo_automodel.components.models.qwen3_moe.layers.torch.compile",
+            side_effect=lambda function, **options: compile_function(function, backend="eager", **options),
+        ),
+        patch(
+            "nemo_automodel.components.models.qwen3_moe.layers.initialize_attn_module_and_func",
+            return_value=(None, attention_stub),
+        ),
+    ):
+        original = Qwen3MoeAttention(config, backend)
+    stage = copy.deepcopy(original)
+    with torch.no_grad():
+        stage.q_proj.weight.mul_(-2.0)
+        stage.o_proj.weight.mul_(0.5)
+    inputs = torch.randn(2, 5, 64)
+    frequencies = torch.cat([torch.rand(2, 5, 8), torch.rand(2, 5, 8)], dim=-1)
+
+    compiled = stage(inputs, freqs_cis=frequencies)
+    with (
+        patch.object(stage, "_compiled_forward", None),
+        patch.object(stage, "_compiled_qkv", None),
+        patch.object(stage, "_compiled_output", None),
+    ):
+        uncompiled = stage(inputs, freqs_cis=frequencies)
+    torch.testing.assert_close(compiled, uncompiled)
+    assert not torch.allclose(original(inputs, freqs_cis=frequencies), uncompiled)
+
+
+def test_native_fa4_model_declares_neat_metadata_contract() -> None:
+    """The production model opts into document IDs and model-entry offset flattening."""
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common.packing import configure_packing
+    from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
+    from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
+
+    config = _config()
+    config.num_hidden_layers = 0
+    config.num_experts = 2
+    config.dtype = torch.float32
+    backend = BackendConfig(
+        attn="fa4",
+        linear="torch",
+        rms_norm="torch",
+        rope_fusion=False,
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch(
+            "nemo_automodel.components.models.qwen3_moe.model.RotaryEmbedding",
+            side_effect=lambda **kwargs: RotaryEmbedding(**{**kwargs, "device": torch.device("cpu")}),
+        ),
+    ):
+        model = Qwen3MoeForCausalLM(config, backend=backend)
+    capabilities = configure_packing("fa4", model=model)
+    assert capabilities.uses_native_fa4
+    assert capabilities.packed_mask_type == "document_ids"
+    assert capabilities.return_packed_sequence_metadata
+    batch = neat_packed_collater(
+        [
+            {
+                "input_ids": [1, 2, 3, 0],
+                "labels": [1, 2, 3, -100],
+                "attention_mask": [1, 1, 2, 0],
+                "position_ids": [0, 1, 0, 0],
+            }
+        ],
+        packing=capabilities,
+    )
+    assert batch["attention_mask"].shape == (1, 4)
+    assert batch["cu_seqlens"].ndim == 2
+    seen = {}
+
+    def observe_metadata(module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+        """Record the forward inputs after the production model-entry normalizer.
+
+        Args:
+            module: Model receiving the forward call.
+            args: Positional forward inputs; empty because the batch is passed by keyword.
+            kwargs: Forward inputs, including input_ids and document-ID attention_mask of
+                shape [batch, sequence], int64 packed_token_indices of shape [tokens]
+                indexing the flattened [batch * sequence] axis, and int32 cu_seqlens of
+                shape [documents + 1].
+        """
+        seen.update(kwargs)
+
+    handle = model.register_forward_pre_hook(observe_metadata, with_kwargs=True)
+    model(**{key: value for key, value in batch.items() if key not in {"labels", "loss_mask"}})
+    handle.remove()
+    assert seen["cu_seqlens"].tolist() == [0, 2, 3]
+    assert seen["packed_token_indices"].tolist() == [0, 1, 2]

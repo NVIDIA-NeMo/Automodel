@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+import copy
+import types
+from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +26,7 @@ from torch import nn
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
+    TENvfp4Config,
     compute_lm_head_logits,
     generation_config_from_model_config,
     get_is_first_microbatch,
@@ -142,6 +146,55 @@ class TestIsFirstMicrobatch:
         assert get_is_first_microbatch() is False
 
 
+@contextmanager
+def _fake_te_autocast():
+    """Stand in for ``transformer_engine.pytorch.quantization.autocast`` and record every ``enabled`` flag."""
+    entered: list[bool] = []
+
+    @contextmanager
+    def autocast(enabled: bool = True, **kwargs):
+        entered.append(enabled)
+        yield
+
+    quantization = types.ModuleType("transformer_engine.pytorch.quantization")
+    quantization.autocast = autocast
+    te_pytorch = types.ModuleType("transformer_engine.pytorch")
+    te_pytorch.quantization = quantization
+    te_root = types.ModuleType("transformer_engine")
+    te_root.pytorch = te_pytorch
+    modules = {
+        "transformer_engine": te_root,
+        "transformer_engine.pytorch": te_pytorch,
+        "transformer_engine.pytorch.quantization": quantization,
+    }
+    with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
+        yield entered
+
+
+@contextmanager
+def _fake_te_nvfp4_recipe(available: bool = True):
+    """Stand in for ``transformer_engine.common.recipe``, with or without ``NVFP4BlockScaling``."""
+    recipe_module = types.ModuleType("transformer_engine.common.recipe")
+    if available:
+
+        class NVFP4BlockScaling:
+            def __init__(self, **kwargs: bool | str) -> None:
+                self.kwargs = kwargs
+
+        recipe_module.NVFP4BlockScaling = NVFP4BlockScaling
+    te_common = types.ModuleType("transformer_engine.common")
+    te_common.recipe = recipe_module
+    te_root = types.ModuleType("transformer_engine")
+    te_root.common = te_common
+    modules = {
+        "transformer_engine": te_root,
+        "transformer_engine.common": te_common,
+        "transformer_engine.common.recipe": recipe_module,
+    }
+    with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
+        yield
+
+
 class TestTEFp8Config:
     def test_default_recipe(self):
         cfg = TEFp8Config()
@@ -170,6 +223,76 @@ class TestTEFp8Config:
         with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
             assert cfg.build_recipe() is None
 
+    def test_exclude_fqns_default_and_normalization(self):
+        assert TEFp8Config().exclude_fqns == ("lm_head",)
+        assert TEFp8Config(exclude_fqns=["lm_head", "model.score"]).exclude_fqns == ("lm_head", "model.score")
+        assert TEFp8Config(exclude_fqns="score").exclude_fqns == ("score",)
+        assert TEFp8Config(exclude_fqns=()).exclude_fqns == ()
+        with pytest.raises(ValueError, match="exclude_fqns"):
+            TEFp8Config(exclude_fqns=[""])
+        cfg = BackendConfig(te_fp8={"recipe": "block", "exclude_fqns": ["lm_head"]}, experts="te", dispatcher="deepep")
+        assert cfg.te_fp8.exclude_fqns == ("lm_head",)
+
+    def test_module_excluded_uses_substring_match_like_torchao_filter_fqns(self):
+        cfg = TEFp8Config(exclude_fqns=["lm_head"])
+        assert cfg.module_excluded("lm_head")
+        assert cfg.module_excluded("model.language_model.lm_head")
+        assert not cfg.module_excluded("model.layers.0.mlp.gate")
+
+    def test_exclude_modules_wraps_matching_forwards_once(self):
+        """Excluded modules run inside the disabled autocast, others do not; idempotent; survives deepcopy."""
+        model = nn.Sequential(OrderedDict(body=nn.Linear(4, 4), lm_head=nn.Linear(4, 3)))
+        x = torch.randn(2, 4)
+        expected = model(x)
+        cfg = TEFp8Config(recipe="block")
+        with _fake_te_autocast() as entered:
+            assert cfg.exclude_modules(model) == ["lm_head"]
+            assert cfg.exclude_modules(model) == ["lm_head"]  # idempotent: one wrapper, not two
+            torch.testing.assert_close(model(x), expected)
+            assert entered == [False]  # lm_head once, with the autocast disabled; body never
+            clone = copy.deepcopy(model)
+            assert clone.lm_head.forward.__self__ is clone.lm_head
+            torch.testing.assert_close(clone(x), expected)
+            assert entered == [False, False]
+        assert list(model.state_dict()) == ["body.weight", "body.bias", "lm_head.weight", "lm_head.bias"]
+        assert "forward" not in vars(model.body)
+
+    def test_exclude_modules_keeps_an_installed_instance_forward(self):
+        """A forward installed before the exclusion (tensor-parallel style, pipeline wrapper) still runs, outside FP8."""
+        calls: list[str] = []
+
+        def parallel_forward(module: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+            calls.append("tp")
+            return nn.Linear.forward(module, x) + 1.0
+
+        model = nn.Sequential(OrderedDict(body=nn.Linear(4, 4), o_proj=nn.Linear(4, 4)))
+        model.o_proj.forward = types.MethodType(parallel_forward, model.o_proj)
+        x = torch.randn(2, 4)
+        expected = model(x)
+        assert calls == ["tp"]
+        cfg = TEFp8Config(recipe="block", exclude_fqns=["o_proj"])
+        with _fake_te_autocast() as entered:
+            assert cfg.exclude_modules(model) == ["o_proj"]
+            torch.testing.assert_close(model(x), expected)
+            assert calls == ["tp", "tp"] and entered == [False]
+            installed = model.o_proj._te_fp8_excluded_forward
+            assert installed.__func__ is parallel_forward and installed.__self__ is model.o_proj
+            assert cfg.exclude_modules(model) == ["o_proj"]  # re-applying keeps the installed forward
+            assert model.o_proj._te_fp8_excluded_forward is installed
+            clone = copy.deepcopy(model)
+            assert clone.o_proj._te_fp8_excluded_forward.__self__ is clone.o_proj
+            torch.testing.assert_close(clone(x), expected)
+            assert calls == ["tp", "tp", "tp"] and entered == [False, False]
+
+    def test_exclude_modules_is_a_no_op_without_te_or_exclusions(self):
+        model = nn.Sequential(OrderedDict(lm_head=nn.Linear(2, 2)))
+        module = "nemo_automodel.components.models.common.utils"
+        with patch(f"{module}.HAVE_TE", False):
+            assert TEFp8Config().exclude_modules(model) == []
+        with patch(f"{module}.HAVE_TE", True):
+            assert TEFp8Config(exclude_fqns=()).exclude_modules(model) == []
+        assert "forward" not in vars(model.lm_head)
+
 
 class TestBackendConfigTeFp8:
     def test_te_fp8_default_is_none(self):
@@ -187,6 +310,103 @@ class TestBackendConfigTeFp8:
         """te_fp8 requires linear='te' or experts='te'."""
         with pytest.raises(ValueError, match="te_fp8 requires at least one TE backend"):
             BackendConfig(te_fp8=TEFp8Config(), linear="torch", experts="torch")
+
+
+class TestTENvfp4Config:
+    def test_default_options_keep_the_recipe_defaults(self):
+        cfg = TENvfp4Config()
+        assert cfg.recipe_kwargs() == {}
+        assert not cfg.resident_weights
+        with _fake_te_nvfp4_recipe():
+            assert cfg.build_recipe().kwargs == {}
+
+    def test_options_reach_the_te_recipe(self):
+        cfg = TENvfp4Config(
+            random_hadamard_transform=False,
+            stochastic_rounding=False,
+            weight_blocks_2d=False,
+            row_scaled_activation=True,
+            four_over_six="activations",
+            backward="high_precision",
+            resident_weights=True,
+        )
+        with _fake_te_nvfp4_recipe():
+            built = cfg.build_recipe()
+        assert built.kwargs == {
+            "disable_rht": True,
+            "disable_stochastic_rounding": True,
+            "disable_2d_quantization": True,
+            "row_scaled_activation": True,
+            "nvfp4_4over6": "activations",
+            "backward_override": "high_precision",
+        }
+
+    def test_build_recipe_without_te(self):
+        with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
+            assert TENvfp4Config().build_recipe() is None
+
+    def test_build_recipe_needs_te_with_nvfp4(self):
+        """A TE build without NVFP4BlockScaling is reported."""
+        with _fake_te_nvfp4_recipe(available=False):
+            with pytest.raises(ImportError, match="NVFP4BlockScaling"):
+                TENvfp4Config().build_recipe()
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"row_scaled_activation": True},
+            {"four_over_six": "activations"},
+            {"four_over_six": "all"},
+            {"four_over_six": "sometimes", "random_hadamard_transform": False},
+            {"backward": "float"},
+        ],
+    )
+    def test_unsupported_options_are_rejected(self, options):
+        with pytest.raises(ValueError, match="te_nvfp4"):
+            TENvfp4Config(**options)
+
+    def test_exclude_fqns_default_and_normalization(self):
+        assert TENvfp4Config().exclude_fqns == ("lm_head",)
+        assert TENvfp4Config(exclude_fqns=["lm_head", "model.score"]).exclude_fqns == ("lm_head", "model.score")
+        assert TENvfp4Config(exclude_fqns="score").module_excluded("model.score")
+        with pytest.raises(ValueError, match="te_nvfp4.exclude_fqns"):
+            TENvfp4Config(exclude_fqns=[""])
+
+
+class TestBackendConfigTeNvfp4:
+    def test_te_nvfp4_default_is_none(self):
+        cfg = BackendConfig()
+        assert cfg.te_nvfp4 is None
+        assert cfg.te_quantization is None
+
+    def test_te_nvfp4_dict_normalized(self):
+        cfg = BackendConfig(
+            te_nvfp4={"stochastic_rounding": False, "resident_weights": True}, experts="te", dispatcher="deepep"
+        )
+        assert cfg.te_nvfp4 == TENvfp4Config(stochastic_rounding=False, resident_weights=True)
+        assert cfg.te_fp8 is None
+        assert cfg.te_quantization is cfg.te_nvfp4
+
+    def test_empty_te_nvfp4_keeps_the_recipe_defaults(self):
+        cfg = BackendConfig(te_nvfp4={}, experts="te", dispatcher="deepep")
+        assert cfg.te_nvfp4 == TENvfp4Config()
+
+    def test_te_quantization_is_te_fp8_when_that_is_set(self):
+        cfg = BackendConfig(te_fp8={"recipe": "block"}, experts="te", dispatcher="deepep")
+        assert cfg.te_nvfp4 is None
+        assert cfg.te_quantization is cfg.te_fp8
+
+    def test_te_nvfp4_and_te_fp8_together_are_rejected(self):
+        with pytest.raises(ValueError, match="te_fp8 and te_nvfp4 are mutually exclusive"):
+            BackendConfig(te_nvfp4={}, te_fp8={"recipe": "mxfp8"}, experts="te", dispatcher="deepep")
+
+    def test_te_nvfp4_requires_te_backend(self):
+        with pytest.raises(ValueError, match="te_nvfp4 requires at least one TE backend"):
+            BackendConfig(te_nvfp4={}, linear="torch", experts="torch")
+
+    def test_te_nvfp4_rejects_unsupported_options(self):
+        with pytest.raises(ValueError, match="te_nvfp4.backward"):
+            BackendConfig(te_nvfp4={"backward": "float"}, experts="te", dispatcher="deepep")
 
 
 class TestGetRopeConfig:

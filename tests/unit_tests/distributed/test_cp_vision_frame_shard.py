@@ -461,18 +461,18 @@ def test_all_gather_var_tokens_forward_backward(monkeypatch, world):
     rank_blocks = [torch.randn(n, H) for n in token_counts]
     max_tok = max(token_counts)
 
-    def fake_all_gather(out_list, x, group=None):
+    def fake_all_gather(output, x, group=None):
         # simulate every rank's padded [max_tok, H] block being gathered
-        for o, blk in zip(out_list, rank_blocks):
+        for o, blk in zip(output.chunk(world, dim=0), rank_blocks):
             padded = torch.cat([blk, blk.new_zeros(max_tok - blk.shape[0], H)], 0)
             o.copy_(padded)
 
-    def fake_reduce_scatter(local, chunks, op=None, group=None):
-        local.copy_(sum(chunks))
+    def fake_reduce_scatter(local, source, op=None, group=None):
+        local.copy_(sum(source.chunk(world, dim=0)))
 
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: world)
-    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
-    monkeypatch.setattr(torch.distributed, "reduce_scatter", fake_reduce_scatter)
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(torch.distributed, "reduce_scatter_tensor", fake_reduce_scatter)
 
     local = rank_blocks[0].clone().requires_grad_(True)
     # pad local to max so it matches the all-gather shape contract
@@ -571,25 +571,25 @@ def _simulate_maybe_distribute(
 
     call = {"i": 0}
 
-    def fake_all_gather(out_list, x, group=None):
+    def fake_all_gather(output, x, group=None):
         data = queue[call["i"]]
         call["i"] += 1
-        for o, p in zip(out_list, data):
+        for o, p in zip(output.chunk(world, dim=0), data):
             o.copy_(p)
 
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: world)
     monkeypatch.setattr(dist, "get_rank", lambda group=None: rank)
-    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
     # The token-count consensus all-reduce is a no-op with a single in-process rank: the
     # stub always produces the planned token count, so the flag stays 0 and no rank raises.
     monkeypatch.setattr(dist, "all_reduce", lambda tensor, op=None, group=None: None)
     if grad:
-        # _AllGatherSeqDiff.backward does reduce_scatter(local, chunks, SUM): hand rank
+        # _AllGatherSeqDiff.backward does reduce_scatter_tensor(local, source, SUM): hand rank
         # `rank` its own chunk (no other process contributes in this in-process sim).
-        def fake_reduce_scatter(local, chunks, op=None, group=None):
-            local.copy_(chunks[rank])
+        def fake_reduce_scatter(local, source, op=None, group=None):
+            local.copy_(source.chunk(world, dim=0)[rank])
 
-        monkeypatch.setattr(dist, "reduce_scatter", fake_reduce_scatter)
+        monkeypatch.setattr(dist, "reduce_scatter_tensor", fake_reduce_scatter)
 
     tok = vs.set_cp_vision_group(
         object(),
@@ -773,7 +773,7 @@ def test_maybe_distribute_falls_back_when_media_inputs_are_none(monkeypatch, pix
     def fail_collective(*args, **kwargs):
         raise AssertionError("no-media fallback must not enter collectives")
 
-    monkeypatch.setattr(dist, "all_gather", fail_collective)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fail_collective)
 
     pixel = None if pixel_is_none else _pixels(_grid(_ENTRIES))
     grid = None if grid_is_none else _grid(_ENTRIES)
@@ -802,7 +802,7 @@ def test_trainable_tower_rejects_group_not_declared_cp_only(monkeypatch):
     def fail_collective(*args, **kwargs):
         raise AssertionError("trainable-tower scope violation must raise before collectives")
 
-    monkeypatch.setattr(dist, "all_gather", fail_collective)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fail_collective)
 
     grid = _grid(_ENTRIES)
     pixel = _pixels(grid)
@@ -855,7 +855,7 @@ def test_maybe_distribute_falls_back_below_min_tokens(monkeypatch):
     def fail_if_all_gather(*args, **kwargs):
         raise AssertionError("small visual workload should not enter sharded all_gather")
 
-    monkeypatch.setattr(dist, "all_gather", fail_if_all_gather)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fail_if_all_gather)
 
     grid = _grid([(1, 2, 2)])
     pixel = _pixels(grid)

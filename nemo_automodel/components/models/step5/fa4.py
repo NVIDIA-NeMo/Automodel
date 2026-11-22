@@ -52,7 +52,7 @@ def _load_fa4(
         )
     ]
     if not all(available for available, _ in imported):
-        raise ImportError("Step5 FA4 requires the AutoModel INSTALL_FA4 image (CuTe DSL 4.6.2 and compatible TVM FFI)")
+        raise ImportError("Step5 FA4 requires the AutoModel INSTALL_FA4 image (CuTe DSL 4.8.0 and compatible TVM FFI)")
     interface, sparsity, cutlass, cute, utils = [module for _, module in imported]
 
     @cute.jit

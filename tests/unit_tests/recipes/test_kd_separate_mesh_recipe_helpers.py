@@ -25,6 +25,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -115,6 +116,24 @@ _RECIPE_CASES = (
 )
 
 
+def test_llm_kd_rejects_stream_datasets_before_model_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig
+    from tests.unit_tests.datasets.test_dataset_loader import StreamDataloaderConfig
+
+    class StreamConfig(StreamDatasetConfig):
+        def build(self, *, context):
+            raise AssertionError("Stream construction must not start for an unsupported recipe")
+
+    verify_tokenizers = Mock()
+    monkeypatch.setattr(llm_kd, "_verify_tokenizer_compatibility", verify_tokenizers)
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.cfg = SimpleNamespace(dataloader=StreamDataloaderConfig(dataset_config=StreamConfig()))
+
+    with pytest.raises(ValueError, match="Stream-loader knowledge distillation"):
+        recipe.setup()
+    verify_tokenizers.assert_not_called()
+
+
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
 def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe_module, recipe_cls, _):
     def no_op_sharder(model, mesh, batch, **kwargs):
@@ -150,6 +169,7 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
     recipe.kd_loss_fn = KDLoss()
     recipe.kd_ratio = 0.5
     recipe._offload_teacher_model = False
+    recipe.te_quantization = None
     recipe.separate_meshes = False
     recipe._get_dp_group = lambda include_cp=True: grad_reduce_group
     recipe._get_dp_group_size = lambda include_cp=True: 1
@@ -257,6 +277,7 @@ def test_kd_uses_main_loss_mask_and_denominator(
     recipe.kd_loss_fn = KDLoss()
     recipe.kd_ratio = 1.0
     recipe._offload_teacher_model = False
+    recipe.te_quantization = None
     recipe.separate_meshes = False
     recipe._get_dp_group_size = lambda include_cp=True: 1
 
@@ -307,6 +328,7 @@ def test_kd_setup_preserves_requested_storage_dtype(monkeypatch, recipe_module, 
         {
             "model": model_settings,
             "teacher_model": {},
+            "dataloader": None,
             "optimizer": {"_target_": "torch.optim.AdamW", "lr": 0.01},
         }
     )
@@ -318,7 +340,7 @@ def test_kd_setup_preserves_requested_storage_dtype(monkeypatch, recipe_module, 
     monkeypatch.setattr(parent_cls, "setup", stop_parent_setup)
 
     recipe = object.__new__(recipe_cls)
-    recipe.cfg = cfg
+    recipe.cfg = RecipeConfig(cfg)
 
     with pytest.raises(SetupStopped):
         recipe.setup()
@@ -587,6 +609,7 @@ def test_chunked_kd_real_llama_loss_and_gradients(recipe_module, recipe_cls, _, 
         recipe.kd_loss_fn = KDLoss()
         recipe.kd_ratio = 0.5
         recipe._offload_teacher_model = False
+        recipe.te_quantization = None
         recipe.separate_meshes = False
         recipe._get_dp_group = lambda **kw: None
         recipe._get_dp_group_size = lambda **kw: 1
@@ -644,8 +667,8 @@ def test_kd_packing_covers_teacher_metadata_and_hooks(teacher_backend, recipe_mo
     recipe.teacher_model = Model(teacher_backend)
     recipe.teacher_pp = None
     recipe.separate_meshes = False
-    contract = recipe._configure_packing()
-    assert contract.requires_packed_sequence_metadata
+    contract = recipe._packing_contract
+    assert contract.return_packed_sequence_metadata
     recipe._configure_teacher_packing()
     batch = neat_packed_collater(
         [
@@ -741,6 +764,7 @@ def test_kd_only_delivers_neat_offsets_to_consumers_that_require_them(
 ):
     from nemo_automodel.components.datasets.utils import neat_packed_collater
     from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.common.packing import configure_packing_for_models
 
     class Model(nn.Module):
         def __init__(self, requires_metadata):
@@ -777,7 +801,8 @@ def test_kd_only_delivers_neat_offsets_to_consumers_that_require_them(
     recipe.teacher_model = Model(teacher_requires)
     recipe.teacher_pp = None
     recipe.separate_meshes = False
-    contract = recipe._configure_packing()
+    contract = recipe._packing_contract
+    configure_packing_for_models(recipe.model_parts)
     recipe._configure_teacher_packing()
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
@@ -787,6 +812,7 @@ def test_kd_only_delivers_neat_offsets_to_consumers_that_require_them(
     recipe.kd_loss_fn = KDLoss()
     recipe.kd_ratio = 0.5
     recipe._offload_teacher_model = False
+    recipe.te_quantization = None
     recipe._get_dp_group = lambda **kwargs: None
     recipe._get_dp_group_size = lambda **kwargs: 1
     recipe._ce_loss_buffer = []

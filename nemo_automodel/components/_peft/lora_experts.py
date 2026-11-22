@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import torch.distributed.nn.functional as dist_nn_f
@@ -32,6 +33,8 @@ from nemo_automodel.components.moe.experts import (
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.shared.utils import dtype_from_str
+
+LoraAInitMethod = Literal["xavier", "kaiming"]
 
 
 def _to_local(proj: torch.Tensor) -> torch.Tensor:
@@ -55,7 +58,7 @@ def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) ->
 
 
 @torch.no_grad
-def _init_stacked_lora_A(lora_A: torch.Tensor, init_method: str) -> None:
+def _init_stacked_lora_A(lora_A: torch.Tensor, init_method: LoraAInitMethod | str) -> None:
     """Initialize a stacked per-expert LoRA A tensor of shape ``[n_experts, in_features, rank]``.
 
     Every expert's ``[in_features, rank]`` slice is one LoRA A matrix and must be drawn
@@ -76,9 +79,11 @@ def _init_stacked_lora_A(lora_A: torch.Tensor, init_method: str) -> None:
     in_features, rank = lora_A.shape[1], lora_A.shape[2]
     if init_method == "xavier":
         lora_A.normal_(0.0, math.sqrt(2.0 / (in_features + rank)))
-    else:
+    elif init_method == "kaiming":
         bound = 1.0 / math.sqrt(in_features)
         lora_A.uniform_(-bound, bound)
+    else:
+        raise ValueError(f"expected init_method to be 'xavier' or 'kaiming', got {init_method!r}")
 
 
 class GroupedExpertsLoRA(GroupedExperts):
@@ -102,13 +107,19 @@ class GroupedExpertsLoRA(GroupedExperts):
     lora_gate_and_up_B: nn.Parameter
     lora_down_A: nn.Parameter
     lora_down_B: nn.Parameter
+    use_torch_mm: bool
+    expert_activation_grouped: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    gate_and_up_projs: nn.Parameter | DTensor
+    down_projs: nn.Parameter | DTensor
+    gate_up_proj_bias: nn.Parameter | DTensor | None
+    down_proj_bias: nn.Parameter | DTensor | None
 
     def __init__(
         self,
         orig_module: GroupedExperts,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         # Build the wrapper without allocating another full set of expert weights.
@@ -139,7 +150,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         obj: GroupedExpertsLoRA,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         obj.lora_dim = lora_dim
@@ -182,7 +193,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         GroupedExpertsLoRA.init_lora_weights(obj, lora_A_init_method)
 
     @torch.no_grad
-    def init_lora_weights(self, init_method: str) -> None:
+    def init_lora_weights(self, init_method: LoraAInitMethod | str) -> None:
         """Initialize LoRA weights.
 
         IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
@@ -565,13 +576,32 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     lora_gate_and_up_B: nn.Parameter
     lora_down_A: nn.Parameter
     lora_down_B: nn.Parameter
+    dispatcher_hybridep_permute_fusion: bool
+    dispatcher_hybridep_compact_routing: bool
+    dispatcher_hybridep_num_sms_preprocessing: int | None
+    dispatcher_hybridep_num_blocks_permute: int | None
+    dispatcher_hybridep_num_blocks_unpermute: int | None
+    dispatcher_hybridep_max_tokens_per_rank: int | None
+    dispatcher_capacity_factor: float | None
+    dispatcher_equal_token_counts: bool
+    dispatch_rows_never_empty: bool
+    dispatcher_recompute_cache: str
+    n_routed_experts: int
+    ep_size: int
+    ep_rank: int
+    use_mxfp8: bool
+    expert_activation: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    gate_and_up_projs: nn.Parameter | DTensor
+    down_projs: nn.Parameter | DTensor
+    gate_up_proj_bias: nn.Parameter | DTensor | None
+    down_proj_bias: nn.Parameter | DTensor | None
 
     def __init__(
         self,
         orig_module: GroupedExpertsDeepEP,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         # Preserve the existing base storage, including its dtype and device.
@@ -583,11 +613,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.nccl_ep = orig_module.nccl_ep
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
         self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
         self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
+        self.dispatcher_hybridep_max_tokens_per_rank = orig_module.dispatcher_hybridep_max_tokens_per_rank
         # Sync-free dispatch knobs (BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts) travel
         # with the other HybridEP settings: the shared dispatcher is built from the first (wrapped) layer.
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
@@ -625,7 +657,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         obj: GroupedExpertsDeepEPLoRA,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         obj.lora_dim = lora_dim
@@ -665,7 +697,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)
 
     @torch.no_grad
-    def init_lora_weights(self, init_method: str) -> None:
+    def init_lora_weights(self, init_method: LoraAInitMethod | str) -> None:
         """Initialize LoRA weights.
 
         IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
@@ -693,16 +725,16 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         """Apply LoRA while preserving the base expert transform and routing order.
 
         Args:
-            x: Local input activations [local_tokens, expert_dim].
-            token_mask: Valid-token flags [local_tokens].
-            weights: Selected routing probabilities [local_tokens, topk].
-            indices: Global expert IDs [local_tokens, topk].
-            post_expert_output: Optional transform from [routed_tokens, expert_dim]
-                to the same layout, applied after the down projection and before
-                router weighting when apply_router_weight_after_down is enabled.
+            x: Tensor of shape [local_tokens, hidden].
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Routing probabilities of shape [local_tokens, top_k].
+            indices: Global expert IDs of shape [local_tokens, top_k].
+            post_expert_output: Optional transform from [routed_tokens, hidden] to the same layout,
+                applied after the down projection and before router weighting when
+                apply_router_weight_after_down is enabled.
 
         Returns:
-            Combined local activations [local_tokens, expert_dim], with x's dtype.
+            Combined expert output of shape [local_tokens, hidden], with x's dtype.
         """
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
@@ -722,9 +754,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if self._has_dispatched_rows(permuted_local_hidden_states, tokens_per_expert):
             lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                 lora_gate_and_up_A, lora_gate_and_up_B
             )
@@ -761,11 +791,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     None if self.config.apply_router_weight_after_down else permuted_probs,
                 )
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
+            # Preserve the dispatch backward edge on empty receiving ranks.
+            output1 = torch.matmul(permuted_local_hidden_states, gate_and_up_projs[0])
             output1 = (
                 output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
+                + torch.matmul(torch.matmul(permuted_local_hidden_states, lora_gate_and_up_A[0]), lora_gate_and_up_B[0])
+                * self.scale
             )
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])

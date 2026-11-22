@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import importlib
 import sys
 import types
@@ -18,6 +19,8 @@ import types
 import pytest
 import torch
 from PIL import Image as PILImage
+
+from nemo_automodel.components.models.common.packing import PackingCapabilities, get_packing_capabilities
 
 CONVERSATION = [
     {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
@@ -3245,6 +3248,16 @@ class TestMakeRobustCollate:
         with pytest.raises(RuntimeError, match="Collate failed after 2 retries"):
             wrapped([{"x": 0}])
 
+    def test_wrapper_pickles_for_spawn_workers(self):
+        """spawn and forkserver DataLoader workers receive the collate function by pickle."""
+        import pickle
+
+        from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
+
+        dataset = [{"x": i} for i in range(3)]
+        wrapped = pickle.loads(pickle.dumps(make_robust_collate(dataset, len, max_retries=2)))  # noqa: S301
+        assert wrapped([{"x": 0}, {"x": 1}]) == 2
+
 
 # ---------------------------------------------------------------------------
 # neat_packed_vlm_collater — structural packing contracts
@@ -3272,16 +3285,18 @@ class TestNeatPackedVlmCollaterPackingContract:
 
     @staticmethod
     def _packing(*, packed_mask_type="block_causal", requires_metadata=False):
-        return types.SimpleNamespace(
+        return PackingCapabilities(
             packed_mask_type=packed_mask_type,
-            requires_packed_sequence_metadata=requires_metadata,
+            return_packed_sequence_metadata=requires_metadata,
         )
 
     def test_flash_attention_2_emits_varlen_kwargs_instead_of_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
-        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            batch, attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+        )
         # Dropping the mask is what routes HF to flash_attn_varlen_func; the cumulative
         # boundaries themselves are checked in test_neat_packing_vlm.py.
         assert "attention_mask" not in result
@@ -3303,7 +3318,9 @@ class TestNeatPackedVlmCollaterPackingContract:
 
         batch = [self._make_packed_sample(8, 0)]
         with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
-            result = neat_packed_vlm_collater(batch, 0, None, "flash_attention_2")
+            result = neat_packed_vlm_collater(
+                batch, 0, None, "flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+            )
 
         assert "attention_mask" not in result
         assert result["cu_seq_lens_q"].tolist() == [0, 8]
@@ -3457,6 +3474,54 @@ def test_gemma4_inject_thinking_prefix_accepts_processor_or_tokenizer(collate_mo
     out_proc = collate_mod.gemma4_inject_thinking_prefix(batch_a, _Processor())
     out_tok = collate_mod.gemma4_inject_thinking_prefix(batch_b, _GemmaTokenizerStub())
     assert torch.equal(out_proc["input_ids"], out_tok["input_ids"])
+
+
+class _OverlapMarkerTokenizer:
+    """Marker [7, 7] overlaps itself; prefix is three tokens."""
+
+    pad_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        if text == "<|turn>model\n":
+            return [7, 7]
+        if text == "<|channel>thought\n<channel|>":
+            return [20, 21, 22]
+        return []
+
+
+def test_gemma4_inject_thinking_prefix_keeps_nonoverlapping_matches(collate_mod):
+    """A hit that starts inside an earlier marker is not a second insert."""
+    seq = torch.tensor([[7, 7, 7, 1]])
+    batch = {
+        "input_ids": seq,
+        "attention_mask": torch.ones_like(seq),
+        "assistant_masks": torch.zeros_like(seq),
+    }
+    out = collate_mod.gemma4_inject_thinking_prefix(batch, _OverlapMarkerTokenizer())
+    assert out["input_ids"].tolist() == [[7, 7, 20, 21, 22, 7, 1]]
+    assert out["assistant_masks"].tolist() == [[0, 0, 0, 0, 0, 0, 0]]
+
+    end = torch.tensor([[1, 7, 7]])
+    end_batch = {"input_ids": end, "attention_mask": torch.ones_like(end)}
+    end_out = collate_mod.gemma4_inject_thinking_prefix(end_batch, _OverlapMarkerTokenizer())
+    assert end_out["input_ids"].tolist() == [[1, 7, 7, 20, 21, 22]]
+
+    rows = torch.tensor([[7, 7, 3, 7, 7], [4, 5, 6, 8, 9]])
+    paired = {
+        "input_ids": rows,
+        "attention_mask": torch.ones_like(rows),
+        "mm_token_type_ids": torch.arange(rows.numel()).reshape(rows.shape),
+    }
+    paired_out = collate_mod.gemma4_inject_thinking_prefix(paired, _OverlapMarkerTokenizer())
+    assert paired_out["input_ids"].tolist() == [
+        [7, 7, 20, 21, 22, 3, 7, 7, 20, 21, 22],
+        [4, 5, 6, 8, 9, 0, 0, 0, 0, 0, 0],
+    ]
+    assert paired_out["attention_mask"].tolist()[1] == [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+    assert paired_out["mm_token_type_ids"].tolist() == [
+        [0, 1, 0, 0, 0, 2, 3, 4, 0, 0, 0],
+        [5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0],
+    ]
 
 
 def _thd_vlm_make_sample(doc_lens, n_img_patches=0):

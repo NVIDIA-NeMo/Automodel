@@ -66,7 +66,12 @@ else
             echo "Functional test folder names must not be empty" >&2
             exit 2
         fi
-        TEST_DIRS+=("tests/functional_tests/$TEST_FOLDER")
+        if [[ "$TEST_FOLDER" == "integration" ]]; then
+            # End-to-end checks in tests/integration live outside tests/functional_tests.
+            TEST_DIRS+=("tests/integration")
+        else
+            TEST_DIRS+=("tests/functional_tests/$TEST_FOLDER")
+        fi
     done
 fi
 

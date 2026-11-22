@@ -27,16 +27,16 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.minimax_m3_vl import msa, msa_bindings
+from nemo_automodel.components.models.minimax_m3_vl.kernels import MSA_CAPABILITIES, sm_count
 from nemo_automodel.components.models.minimax_m3_vl.kernels import msa_schedule as sched
-from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_count
 from nemo_automodel.shared.import_utils import UnavailableError
 
 _BLOCK, _KV_HEADS, _TOPK, _QUERY_HEADS = 128, 4, 16, 64
 
 
 def _unavailable() -> str | None:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        return "requires an SM100 GPU"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in MSA_CAPABILITIES:
+        return "requires an SM100 or SM103 GPU"
     try:
         msa_bindings.kernels()
     except UnavailableError:

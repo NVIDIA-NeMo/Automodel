@@ -20,6 +20,12 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.mtp import (
+    MTPConfig,
+    MTPContextParallelInputs,
+    prepare_mtp_context_parallel_inputs,
+    shift_packed_tensor,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -34,6 +40,8 @@ from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendCo
 from nemo_automodel.components.models.glm5_next.config import Glm5NextConfig, Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
+    _global_doc_ids_from_batch,
+    _normalize_batch_axis,
     doc_ids_from_cu_seqlens,
     shard_batch_for_glm5_next_cp,
 )
@@ -41,11 +49,27 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextDecoderLayer,
     Glm5NextRMSNorm,
 )
+from nemo_automodel.components.models.glm5_next.mtp import Glm5NextMTP
 from nemo_automodel.components.models.glm5_next.parallelization import PARALLELIZER
 from nemo_automodel.components.models.glm5_next.vision import Glm5NextVisionModel, Glm5NextVisionOutput
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass
+class Glm5NextCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """GLM-5.3 output extended with the MTP head's per-depth hidden states.
+
+    Attributes:
+        mtp_per_depth_h: One ``[batch, local_sequence, hidden]`` tensor per MTP
+            depth, already normalized for the shared ``lm_head``; ``None``
+            outside training or when MTP is disabled.
+        mtp_loss_scaling_factor: Weight of the summed per-depth MTP loss.
+    """
+
+    mtp_per_depth_h: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float | None = None
 
 
 def build_glm5_next_moe_config(
@@ -298,6 +322,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         supports_pp: bool = True
         supports_ep: bool = True
         supports_thd: bool = True
+        supports_mtp_cp: bool = True
 
     @classmethod
     def from_config(
@@ -328,6 +353,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         config: Glm5NextConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        mtp_loss_scaling_factor: float = 0.1,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -359,6 +385,17 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             dtype=dtype,
         )
         self.vocab_size = text_config.vocab_size
+        num_mtp_layers = int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)
+        self.mtp_config = MTPConfig(
+            num_layers=num_mtp_layers,
+            layer_pattern="*" if num_mtp_layers > 0 else "",
+            loss_scaling_factor=mtp_loss_scaling_factor,
+        )
+        self.mtp = (
+            Glm5NextMTP(text_config, self.mtp_config, self.model.language_model.moe_config, self.backend, dtype)
+            if self.mtp_config.enabled
+            else None
+        )
         if self.backend.enable_hf_state_dict_adapter:
             from nemo_automodel.components.models.glm5_next.state_dict_adapter import Glm5NextStateDictAdapter
 
@@ -476,7 +513,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         output_hidden_states: bool | None = None,
         glm5_next_packed_context: Glm5NextPackedContext | tuple[torch.Tensor, int, int, int] | None = None,
         **kwargs: Any,
-    ) -> CausalLMOutputWithPast | torch.Tensor:
+    ) -> Glm5NextCausalLMOutputWithPast | torch.Tensor:
         """Decode ids ``[B,S]`` or a PP activation ``[B,Slocal,hc_mult,H]``.
 
         Vision splice and CP slicing run only on the embedding stage. Packed
@@ -537,10 +574,22 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             ``logits_to_keep`` is nonzero); on a stage without ``lm_head`` it
             carries the stream activation unchanged. ``hidden_states`` holds
             the [microbatch, local_sequence, hidden] final states when
-            requested, else None.
+            requested, else None. With the MTP head enabled in training it also
+            carries ``mtp_per_depth_h`` and ``mtp_loss_scaling_factor``.
+
+        Raises:
+            ValueError: If the MTP head is enabled while the model is split into
+                pipeline stages.
         """
         del position_ids
+        for key in ("mtp_per_depth_input_ids", "mtp_per_depth_position_ids", "mtp_per_depth_valid_masks"):
+            kwargs.pop(key, None)
         first_stage = self.language_model.embed_tokens is not None
+        if self.mtp_config.enabled and (not first_stage or self.lm_head is None):
+            raise ValueError(
+                "GLM-5.3 MTP is not supported with pipeline parallelism: set pp_size to 1 or "
+                "num_nextn_predict_layers to 0"
+            )
         if not first_stage:
             inputs_embeds, input_ids = input_ids if inputs_embeds is None else inputs_embeds, None
         elif self._vlm_chunk_idx is not None:
@@ -581,6 +630,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                 kwargs.get("_packed_seq_ids"),
             )
 
+        mtp_embed_inputs = None
         if first_stage:
             if inputs_embeds is None:
                 inputs_embeds = self._embed_and_splice(input_ids, pixel_values, image_grid_thw)
@@ -593,6 +643,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                     inputs_embeds.shape[0], padded_length - inputs_embeds.shape[1], inputs_embeds.shape[2]
                 )
                 inputs_embeds = torch.cat((inputs_embeds, pad), dim=1)
+            if self.mtp is not None and self.training:
+                mtp_embed_inputs = self._mtp_embed_inputs(inputs_embeds, context)
             local_length = context.local_seq_len
             if inputs_embeds.shape[1] != local_length or context.seq_start:
                 inputs_embeds = inputs_embeds[:, context.seq_start : context.seq_start + local_length].contiguous()
@@ -607,17 +659,86 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         )
         if self._pp_return_hidden_states:
             return hidden
+        mtp_per_depth_h = None
+        if mtp_embed_inputs is not None:
+            mtp_per_depth_h = self.mtp(
+                hidden,
+                embed_inputs=mtp_embed_inputs,
+                packed_context=context,
+                padding_mask=padding_mask,
+            )
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else bool(getattr(self.config.text_config, "output_hidden_states", False))
         )
-        return compute_lm_head_logits(
+        output = compute_lm_head_logits(
             self.lm_head,
             hidden,
             logits_to_keep,
             is_thd=is_thd,
             output_hidden_states=output_hidden_states,
+        )
+        return Glm5NextCausalLMOutputWithPast(
+            logits=output.logits,
+            hidden_states=output.hidden_states,
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None,
+        )
+
+    def _mtp_embed_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        context: Glm5NextPackedContext,
+    ) -> tuple[torch.Tensor, ...]:
+        """Shift the full-sequence embeddings once per MTP depth and keep this rank's slice.
+
+        Args:
+            inputs_embeds: Spliced embeddings ``[batch, padded_sequence, hidden]``
+                covering the whole (CP-padded) sequence.
+            context: Document map whose ``doc_ids`` are ``[batch, padded_sequence]``.
+
+        Returns:
+            One ``[batch, local_sequence, hidden]`` tensor per depth; position ``t``
+            holds the embedding at ``t + depth`` when it is in the same document,
+            otherwise zeros.
+        """
+        if inputs_embeds.shape[:2] != context.doc_ids.shape:
+            raise ValueError(
+                "GLM-5.3 MTP needs the full-sequence embeddings: got "
+                f"{tuple(inputs_embeds.shape[:2])} for a document map of {tuple(context.doc_ids.shape)}"
+            )
+        start, end = context.seq_start, context.seq_start + context.local_seq_len
+        return tuple(
+            shift_packed_tensor(inputs_embeds, depth=depth, seq_idx=context.doc_ids)[:, start:end].contiguous()
+            for depth in range(1, self.mtp_config.num_layers + 1)
+        )
+
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
+        """Shift MTP targets globally with the same document map the GLM CP sharder uses.
+
+        Args:
+            batch: Unsharded batch with ``input_ids`` and ``labels`` of shape
+                ``[batch, sequence]`` (or ``[sequence]`` from THD collaters) and
+                the packing metadata read by the GLM CP sharder.
+            ignore_index: Target fill value past each document end.
+
+        Returns:
+            Global per-depth token ids, position ids, targets and validity masks of
+            shape ``[batch, sequence]``. Only the targets reach the model's loss;
+            the forward shifts the spliced embeddings itself.
+        """
+        _normalize_batch_axis(batch)
+        input_ids = batch["input_ids"]
+        mtp_batch = {
+            "input_ids": input_ids,
+            "labels": batch["labels"],
+            "seq_idx": _global_doc_ids_from_batch(batch, input_ids.shape[1]),
+        }
+        return prepare_mtp_context_parallel_inputs(
+            mtp_batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
         )
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
@@ -633,6 +754,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     def update_moe_gate_bias(self) -> None:
         """Update no-aux-loss router correction biases after an optimizer step."""
         self.model.language_model.update_moe_gate_bias()
+        if self.mtp is not None:
+            self.mtp.update_moe_gate_bias()
 
     @torch.no_grad()
     def initialize_weights(
@@ -647,6 +770,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         self.model.language_model.init_weights(buffer_device)
         if self.model.visual is not None:
             self.model.visual.init_weights(buffer_device, self.config.text_config.initializer_range)
+        if self.mtp is not None:
+            self.mtp.init_weights(buffer_device, self.config.text_config.initializer_range)
         final_std = self.config.text_config.hidden_size**-0.5
         if self.lm_head is not None:
             with buffer_device:
@@ -659,6 +784,7 @@ Glm5NextForConditionalGeneration.parallelizer = PARALLELIZER
 ModelClass = Glm5NextForConditionalGeneration
 
 __all__ = [
+    "Glm5NextCausalLMOutputWithPast",
     "Glm5NextForConditionalGeneration",
     "Glm5NextModel",
     "Glm5NextTextModel",
