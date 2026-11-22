@@ -778,6 +778,11 @@ class TestQwen3_5MoeModelVLPath:
         """Both media and text-only paths must invoke embed_tokens exactly once
         before language_model so FSDP2 collectives match even with
         reshard_after_forward=True."""
+        vl_config.image_token_id = 10
+        vl_config.video_token_id = 11
+        vl_config.vision_start_token_id = 12
+        vl_config.vision_end_token_id = 13
+
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         core = model.model
         model_dtype = next(model.parameters()).dtype
@@ -787,7 +792,8 @@ class TestQwen3_5MoeModelVLPath:
         media_input_ids = torch.tensor([[1, image_token_id, image_token_id, 2]], device=device)
         text_input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
         pixel_values = torch.randn(4, 3 * 2 * 16 * 16, device=device, dtype=model_dtype)
-        image_grid_thw = torch.tensor([[1, 2, 2]], device=device)
+        image_grid_thw = torch.tensor([[1, 1, 2]], device=device)
+        mm_token_type_ids = torch.tensor([[0, 1, 1, 0]], device=device, dtype=torch.int32)
 
         fake_image_embeds = torch.randn(2, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
         fake_lm_output = Qwen3_5MoeModelOutputWithPast(
@@ -822,6 +828,7 @@ class TestQwen3_5MoeModelVLPath:
             input_ids=media_input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
         )
         text_order = _run_and_record(input_ids=text_input_ids)
 
