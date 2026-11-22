@@ -31,12 +31,12 @@ from nemo_automodel._transformers.capabilities import attach_capabilities_and_va
 from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
-from nemo_automodel.components.datasets.loader import ThdPackingConfig
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.ernie5_5 import dsa as dsa_module
 from nemo_automodel.components.models.ernie5_5 import model as model_module
 from nemo_automodel.components.models.ernie5_5.config import Ernie5_5Config, main_rope_theta
 from nemo_automodel.components.models.ernie5_5.dsa import Ernie5_5DSAAttention
@@ -50,6 +50,7 @@ from nemo_automodel.components.models.ernie5_5.model import (
 from nemo_automodel.components.moe import layers as shared_moe_layers
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.moe.parallelizer import apply_ac
 from nemo_automodel.components.utils import model_utils
 from tests.unit_tests.models.ernie5_5.conftest import checkpoint_config, checkpoint_style_config
 
@@ -156,9 +157,9 @@ def test_registered_class_declares_capabilities_and_tie_support_itself():
     assert "tie_word_embeddings_support" in Ernie5_5_MoeForCausalLM.__dict__
     assert Ernie5_5_MoeForCausalLM.tie_word_embeddings_support is TieSupport.UNTIED_ONLY
     capabilities = Ernie5_5_MoeForCausalLM.ModelCapabilities()
-    assert capabilities.supports_ep
-    assert not (capabilities.supports_tp or capabilities.supports_cp or capabilities.supports_pp)
-    assert not capabilities.supports_thd
+    assert capabilities.supports_ep and capabilities.supports_cp and capabilities.supports_thd
+    assert not (capabilities.supports_tp or capabilities.supports_pp)
+    assert Ernie5_5_MoeForCausalLM._owns_cp_attention and Ernie5_5_MoeForCausalLM._owns_packed_attention
     assert issubclass(Ernie5_5_MoeForCausalLM, (HFCheckpointingMixin, MoEFSDPSyncMixin))
     package = model_module.__name__.rpartition(".")[0]
     assert [cls for cls in Ernie5_5_MoeForCausalLM.__mro__ if cls.__module__.startswith(package)] == [
@@ -262,6 +263,80 @@ def test_checkpoint_style_config_with_mtp_disabled_builds_the_decoder_and_its_ke
         )
 
 
+def test_generation_config_is_initialized_from_model_config():
+    from transformers.generation import GenerationConfig
+
+    with torch.device("meta"):
+        model = Ernie5_5_MoeForCausalLM(_tiny_config(bos_token_id=1, eos_token_id=2), _eager_backend())
+
+    assert isinstance(model.generation_config, GenerationConfig)
+    assert model.generation_config.eos_token_id == 2
+    assert model.generation_config.bos_token_id == 1
+    assert model.generation_config.pad_token_id == 0
+
+
+def _export_metadata_of_a_pretrained_build(tmp_path, generation_config: dict | None):
+    """Build the tiny model from a hand-written checkpoint directory as the loader does and export its metadata."""
+    from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    config = _tiny_config(bos_token_id=1, eos_token_id=2)
+    config.architectures = ["Ernie5_5_MoeForCausalLM"]
+    config.save_pretrained(checkpoint_dir)
+    if generation_config is not None:
+        (checkpoint_dir / "generation_config.json").write_text(json.dumps(generation_config))
+
+    with torch.device("meta"):
+        custom, model = model_init._init_model(
+            object, str(checkpoint_dir), None, torch.float32, None, False, backend=_eager_backend()
+        )
+    assert custom and type(model) is Ernie5_5_MoeForCausalLM
+
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(export_dir),
+        fqn_to_file_index_mapping={},
+        tokenizer=None,
+        original_model_path=str(checkpoint_dir),
+        v4_compatible=False,
+    )
+    return export_dir
+
+
+def test_pretrained_build_preserves_generation_config_in_export(tmp_path):
+    """The end-of-sequence ids of the checkpoint's generation_config.json reach the export."""
+    from transformers.generation import GenerationConfig
+
+    export_dir = _export_metadata_of_a_pretrained_build(
+        tmp_path, {"bos_token_id": 1, "eos_token_id": [2, 8], "pad_token_id": 0}
+    )
+
+    assert (export_dir / "generation_config.json").is_file()
+    exported = GenerationConfig.from_pretrained(export_dir)
+    assert exported.eos_token_id == [2, 8]
+    assert exported.bos_token_id == 1
+    assert exported.pad_token_id == 0
+
+
+def test_pretrained_build_without_generation_config_exports_the_ids_of_the_model_config(tmp_path):
+    """Without a generation_config.json in the checkpoint, loaders resolve the same ids as from config.json."""
+    from transformers.generation import GenerationConfig
+
+    export_dir = _export_metadata_of_a_pretrained_build(tmp_path, None)
+
+    assert (export_dir / "generation_config.json").is_file()
+    exported = GenerationConfig.from_pretrained(export_dir)
+    from_model_config = GenerationConfig.from_pretrained(
+        export_dir, config_file_name="config.json", _from_model_config=True
+    )
+    assert exported.eos_token_id == from_model_config.eos_token_id == 2
+    assert exported.bos_token_id == from_model_config.bos_token_id == 1
+    assert exported.pad_token_id == from_model_config.pad_token_id == 0
+
+
 def test_default_configuration_with_a_schedule_builds_without_an_override():
     decoder_ratios = checkpoint_style_config()["compress_ratios"][:43]
     config = Ernie5_5Config(compress_ratios=decoder_ratios, rope_interleave=True)
@@ -337,17 +412,19 @@ def test_eager_backend_names_select_the_eager_path_in_both_attention_kinds(attn)
     with torch.device("meta"):
         model = Ernie5_5_MoeForCausalLM(_tiny_config(), _eager_backend(attn))
     hca, dsa = model.model.layers[0].attention, model.model.layers[2].attention
-    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == "eager"
+    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == attn
     assert isinstance(dsa, Ernie5_5DSAAttention) and not dsa.uses_cudnn
+    assert not model.model.dsa_uses_cudnn
 
 
-def test_cudnn_backend_selects_cudnn_dsa_and_eager_hca():
+def test_cudnn_backend_reaches_both_attention_kinds():
     with torch.device("meta"):
         model = Ernie5_5_MoeForCausalLM(_two_layer_checkpoint_config(ratios=(128, -2)), _cudnn_backend())
     hca, dsa = model.model.layers[0].attention, model.model.layers[1].attention
-    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == "eager"
+    # An HCA layer runs the kernels for packed rows only; a row that holds one document keeps the eager path.
+    assert isinstance(hca, Ernie5_5HCAAttention) and hca.backend.attn == "cudnn"
     assert isinstance(dsa, Ernie5_5DSAAttention) and dsa.uses_cudnn
-    assert model.backend.attn == "cudnn"
+    assert model.backend.attn == "cudnn" and model.model.dsa_uses_cudnn
 
 
 @pytest.mark.parametrize("attn", ["te", "flex", "tilelang", "fa4", "magi"])
@@ -581,8 +658,8 @@ def test_block_registers_the_feed_forward_under_its_native_name(layer_index, chi
 
     # A module installed in place of the child, as activation checkpointing does, is used by the next forward.
     class _Zero(nn.Module):
-        def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-            """Return zeros with the shape [batch, sequence, hidden] of the input."""
+        def forward(self, hidden: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+            """Return zeros of the shape [batch, sequence, hidden] of ``hidden``; the mask is not read."""
             return torch.zeros_like(hidden)
 
     tokens = _tokens(5)
@@ -659,10 +736,11 @@ def test_each_attention_kind_receives_the_inputs_of_its_path():
     cudnn = Ernie5_5Model(config, _cudnn_backend(), eager.moe_config)
     assert cudnn.layers[2].attention.uses_cudnn
     packed = _capture_attention_call(cudnn, 2, tokens)
-    assert set(packed) == {"position_ids", "cu_seqlens", "max_seqlen"}
+    assert set(packed) == {"position_ids", "cu_seqlens", "max_seqlen", "metadata"}
     assert torch.equal(packed["position_ids"], torch.tensor([[0, 1, 2, 3]]))
     assert torch.equal(packed["cu_seqlens"], torch.tensor([0, 4], dtype=torch.int32))
     assert packed["max_seqlen"] == 4
+    assert packed["metadata"] is None
 
 
 def test_attention_inputs_use_the_window_captured_at_construction():
@@ -743,29 +821,39 @@ def test_rejects_padding_packed_rows_restarted_positions_and_a_cache(hca_model, 
         hca_model(torch.tensor([[4, 2, 9]]), **kwargs)
 
 
-def test_forward_declares_no_packed_sequence_or_context_parallel_input(hca_model):
+def test_forward_declares_the_packed_sequence_inputs(hca_model):
     parameters = inspect.signature(Ernie5_5_MoeForCausalLM.forward).parameters
-    assert list(parameters) == ["self", "input_ids", "attention_mask", "padding_mask", "position_ids", "use_cache"]
-    assert parameters["use_cache"].kind is inspect.Parameter.KEYWORD_ONLY
-    # The framework probes the signature for ``seq_lens``; without it THD packing is refused at loader construction.
-    assert not model_utils._supports_seq_lens(hca_model)
-    assert not capabilities._supports_seq_lens(hca_model)
-    with pytest.raises(ValueError, match="THD packing requires a model that consumes seq_lens"):
-        ThdPackingConfig(packed_sequence_size=8).build([], supports_seq_lens=model_utils._supports_seq_lens(hca_model))
+    assert list(parameters) == [
+        "self",
+        "input_ids",
+        "attention_mask",
+        "padding_mask",
+        "position_ids",
+        "packed_seq_ids",
+        "seq_lens",
+        "seq_lens_padded",
+        "use_cache",
+    ]
+    assert parameters["packed_seq_ids"].kind is inspect.Parameter.KEYWORD_ONLY
+    # The framework probes the signature for ``seq_lens`` before it builds a THD loader.
+    assert model_utils._supports_seq_lens(hca_model)
+    assert capabilities._supports_seq_lens(hca_model)
     # Batch keys that the signature does not declare are dropped by the recipe before the call.
     batch = {
         "input_ids": torch.tensor([[4, 2, 9]]),
         "seq_lens": torch.tensor([[3]]),
         "labels": torch.tensor([[2, 9, 1]]),
+        "qkv_format": "thd",
+        "cp_group": None,
     }
-    assert set(model_utils.filter_forward_kwargs(hca_model, batch)) == {"input_ids"}
+    assert set(model_utils.filter_forward_kwargs(hca_model, batch)) == {"input_ids", "seq_lens"}
 
 
 def test_rejects_the_padding_token_and_unknown_inputs(hca_model):
     assert hca_model.config.pad_token_id == 0
     with pytest.raises(ValueError, match="pad_token_id=0"):
         hca_model(torch.tensor([[1, 0, 2]]))
-    for name in ("packed_seq_params", "seq_lens", "cu_seqlens", "cp_group", "past_key_values"):
+    for name in ("packed_seq_params", "cu_seqlens", "cp_group", "past_key_values"):
         with pytest.raises(TypeError, match=name):
             hca_model(torch.tensor([[4, 2, 9]]), **{name: None})
 
@@ -967,3 +1055,41 @@ def test_initialize_weights_overwrites_poisoned_values_and_depends_on_the_seed()
     assert not torch.equal(
         other["model.layers.1.moe.experts.gate_and_up_projs"], first["model.layers.1.moe.experts.gate_and_up_projs"]
     )
+
+
+def test_recomputation_of_a_checkpointed_dsa_layer_reuses_the_key_selection(monkeypatch):
+    """The selector drops the remote keys on every second call, as equal scores at the cutoff can change them."""
+    select, calls = dsa_module.select_window_and_remote, []
+
+    def changing(scores: torch.Tensor, document_ids: torch.Tensor, **kwargs: torch.Tensor | int | None) -> torch.Tensor:
+        """Select from ``scores`` of shape [batch, queries, keys] as the real selector does, on odd calls only."""
+        calls.append(kwargs["remote_topk"])
+        return select(scores, document_ids, **{**kwargs, "remote_topk": kwargs["remote_topk"] * (len(calls) % 2)})
+
+    monkeypatch.setattr(dsa_module, "select_window_and_remote", changing)
+
+    def gradients(saved_routing: bool | None) -> dict[str, torch.Tensor]:
+        """Return the gradients without checkpointing (None), or with it and with or without saved top-k outputs."""
+        calls.clear()
+        model, tokens = _tiny_model(sliding_window=4), _tokens(24)
+        if saved_routing is not None:
+            apply_ac(model, ignore_router=saved_routing)
+        F.cross_entropy(model(tokens).logits[0], tokens[0], reduction="sum").backward()
+        return {
+            name.replace("._checkpoint_wrapped_module", ""): parameter.grad
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+
+    expected = gradients(None)
+    assert len(calls) == 1
+    for saved_routing in (True, False):
+        replayed = gradients(saved_routing)
+        assert len(calls) == 1 and replayed.keys() == expected.keys()
+        for name, gradient in expected.items():
+            torch.testing.assert_close(replayed[name], gradient, msg=name)
+    # Without the hook of the block the recomputation selects again and returns other gradients.
+    monkeypatch.setattr(Ernie5_5Block, "nemo_checkpoint_context_fn", lambda self, context_fn: context_fn)
+    recomputed = gradients(False)
+    assert len(calls) == 2
+    assert any(not torch.allclose(recomputed[name], gradient) for name, gradient in expected.items())

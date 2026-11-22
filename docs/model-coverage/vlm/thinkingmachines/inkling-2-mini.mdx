@@ -1,0 +1,159 @@
+---
+title: "Inkling-2-Mini"
+description: "Fine-tune Inkling-2-Mini with NeMo AutoModel: MedPix full SFT, MedPix LoRA, and 128K packed Tulu 3 SFT with context parallelism on one node with 4 GB200 GPUs."
+slug: model-coverage/vision-language-models/thinkingmachines/Inkling-2-Mini
+---
+
+NeMo AutoModel supports fine-tuning [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), a
+vision-language Mixture-of-Experts (MoE) model from Thinking Machines Lab with 26B total and 5B active
+parameters. It accepts text and image inputs, generates text, and supports a context window of up to 1M tokens. It is
+a looped Inkling 2 model: 12 of its 24 decoder layers run three times for every token, and the
+active-parameter count includes every pass.
+NeMo AutoModel provides two image-text recipes (`Inkling2ForConditionalGeneration`) and a text recipe
+(`Inkling2ForCausalLM`) for the released checkpoint. Each recipe runs on one node with 4 GPUs.
+
+<Note>
+The training loader dequantizes the NVFP4 and MXFP8 expert weights into floating-point storage, and the
+recipes train the experts in BF16. The checkpoint's auxiliary multi-token prediction module is outside
+the training scope of these recipes.
+
+</Note>
+
+## Fine-Tune Inkling-2-Mini
+
+Follow the [installation instructions](/get-started/installation), and then run a recipe from the
+repository root on a node with 4 GB200 GPUs. For example, launch the LoRA recipe:
+
+```bash
+automodel examples/vlm_finetune/inkling2/inkling2_mini_medpix_lora_ep4.yaml --nproc-per-node 4
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Full image-text SFT on MedPix | [inkling2_mini_medpix_sft_ep4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_mini_medpix_sft_ep4.yaml) |
+| Image-text LoRA on MedPix | [inkling2_mini_medpix_lora_ep4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_mini_medpix_lora_ep4.yaml) |
+| 128K packed text SFT on Tulu 3 with context parallelism | [inkling2_mini_tulu3_packed128k_ep4_cp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_mini_tulu3_packed128k_ep4_cp4.yaml) |
+| Prepare your environment | [Installation instructions](/get-started/installation) |
+
+### Configuration
+
+| Setting | MedPix SFT | MedPix LoRA | Tulu 3 128K SFT |
+| --- | --- | --- | --- |
+| Model | `Inkling2ForConditionalGeneration` | `Inkling2ForConditionalGeneration` | `Inkling2ForCausalLM`, text only |
+| GPUs | 4 GB200, one node | 4 GB200, one node | 4 GB200, one node |
+| Parallelism | EP4, TP1; FSDP2 | EP4, TP1; FSDP2 | EP4, CP4, TP1; FSDP2 |
+| Sequence | Nonpacked, up to 4,097 tokens | Nonpacked, up to 4,097 tokens | Packed THD, 131,072 tokens |
+| Batch | Global 16, local 4 | Global 16, local 4 | Global 1, local 1 |
+| Trained weights | Language model | LoRA rank 8, alpha 32, on attention projections and routed experts | Language model |
+| Weights and optimizer | BF16 weights; FusedAdam with FP32 master weights and BF16 moments | BF16 weights; FusedAdam with FP32 master weights and BF16 moments | BF16 weights; FusedAdam with FP32 master weights and BF16 moments |
+| Learning rate | 5e-6, constant | 1e-4, constant | 5e-6, constant |
+| Steps | 100 | 100 | 100 |
+
+All three recipes load `thinkingmachines/Inkling-2-Mini` and dequantize its NVFP4 and MXFP8 expert
+weights at load time (`checkpoint.dequantize_base_checkpoint: true`). They use FlexAttention,
+`torch_mm` experts with the HybridEP dispatcher and FP32 router gates, and full activation
+checkpointing. The output loss, `Inkling2FusedLinearCrossEntropy`, applies the logit soft cap of 30
+over the 200,058 usable vocabulary rows.
+
+The text recipe builds `Inkling2ForCausalLM` from the image-text checkpoint through
+`model.config.architectures`, without the vision tower. Both MedPix recipes freeze the vision tower.
+
+W&B is opt-in: set `wandb.enable: true` and configure your entity and project when launching.
+
+The following table shows measurements of the three recipes over 100 steps on one node with 4
+GB200 GPUs:
+
+| Recipe | First Loss | Mean Loss of the Last 10 Steps | Time per Step | Peak Memory per GPU |
+| --- | --- | --- | --- | --- |
+| MedPix SFT | 1.93 | 1.40 | 6.3 s | 94 GiB |
+| MedPix LoRA | 1.93 | 1.43 | 4.5 s | 44 GiB |
+| Tulu 3 128K SFT | 0.67 | 0.62 | 18.9 s | 116 GiB |
+
+The checkpoint loads in under one minute. The first step takes 11 to 14 minutes while FlexAttention
+compiles.
+
+## Packed Sequences and Context Parallelism
+
+The text recipe trains on Tulu 3 rows of 131,072 tokens with `cp_size: 4`:
+
+```bash
+automodel examples/llm_finetune/inkling2/inkling2_mini_tulu3_packed128k_ep4_cp4.yaml --nproc-per-node 4
+```
+
+The recipe reads `allenai/tulu-3-sft-mixture` from the Hugging Face Hub and packs it when training
+starts. Conversations are rendered with the Inkling chat template in
+`examples/llm_finetune/inkling2/inkling2_chat_template.jinja`, shuffled with seed 1234, truncated to
+131,072 tokens, and packed into THD rows of 131,072 tokens with 64-token document alignment. Labels
+cover the assistant turns only.
+
+Each row holds many documents. Positions restart at every document, and local attention, full
+attention, and the short convolutions all stay inside a document. With context parallelism, each GPU
+holds one contiguous shard of the row, 32,768 tokens here.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Checkpoint | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) |
+| Architecture | `Inkling2LoopForConditionalGeneration` (`model_type: inkling2_loop`), loaded as `Inkling2ForConditionalGeneration`: a vision-language model with a routed Mixture-of-Experts decoder whose middle layers run three times |
+| Parameters | 26B total; 5B active per token, counting every pass through the looped layers |
+| Inputs | Text and images |
+| Context length | Up to 1M tokens |
+| Language backbone | 24 layers, hidden size 2,304; 48 layer visits per token |
+| Loop | Layers 6-17 run three times; layers 0-5 and 18-23 run once |
+| Attention | 24 query heads, 8 KV heads, head dimension 128 |
+| Attention pattern | Five local layers followed by one full layer, repeated four times |
+| Local attention window | 1,024 tokens, causal |
+| Experts | 128 routed experts per layer, top-8 sigmoid routing, intermediate size 1,152 |
+| Routing scale | 8 |
+| Vocabulary | 201,024 embedding rows; 200,058 usable token IDs |
+| Output logits | Soft cap of 30; padded vocabulary rows excluded |
+| Vision tower | 23 layers, hidden size 1,024, 16 attention heads |
+| Vision projection | Native 20-by-20 patches; neighboring 2-by-2 features merged before projection |
+| Expert weights | NVFP4 in layers 0-19, MXFP8 in layers 20-23 |
+
+### Looped Layers
+
+Inkling-2-Mini is an Inkling 2 model with one change to how the layer stack runs. Layers 6-17 run
+three times for every token with the same weights, so 24 layers of weights give 48 layer visits.
+Layers 0-5 run once before the loop, and layers 18-23 run once after it.
+
+Each later pass starts again from the state that entered layer 6 and reads the previous pass through
+messages. Every looped layer mixes a message into its attention query, key, and value inputs and
+into its expert input. A low-rank gate of rank 64 decides, per channel and per token, how much of
+the input to keep and how much of the message to add. The first pass uses no messages.
+
+Attention, short convolutions, experts, the output vocabulary, and the vision tower work as in
+[Inkling-2-Small](/model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small).
+
+## Distributed and Kernel Support
+
+The recipes use the following distributed and kernel features:
+
+- FSDP2, expert parallelism, and context parallelism with document-aware packed text.
+- PyTorch grouped experts (`experts: torch_mm`) and the shared HybridEP dispatcher
+  (`dispatcher: hybridep`).
+- FlexAttention for learned relative-position and sink gradients.
+- Activation checkpointing of whole decoder layers.
+- Shared fused linear cross entropy over usable vocabulary rows, with BF16 projection inputs, FP32
+  accumulation, and the soft cap of 30.
+
+Pipeline parallelism and tensor parallelism greater than one are not available for this model.
+Packed context-parallel training covers text. Image-text training uses the non-packed path.
+
+Refer to the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared training options.
+
+## Hugging Face Model Card
+
+View the model card for the [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) checkpoint.
+
+## Related Resources
+
+Refer to the following resources for related information:
+
+- [Multi-modal dataset guide](/datasets/multi-modal-dataset)
+- [Run on a cluster](/job-launchers/slurm-cluster)

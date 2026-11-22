@@ -25,7 +25,8 @@ This module holds the leaf layers of the ERNIE 5.5 decoder:
 * ``Ernie5_5DenseMLP``: the bias-free dense feed-forward block built on ``ernie_situ``.
 
 It also defines ``DENSE_ATTENTION_BACKENDS``, the ``backend.attn`` names that the two attention modules of the
-package, ``dsa`` and ``hca``, accept for their dense PyTorch path.
+package, ``dsa`` and ``hca``, accept for their dense PyTorch path, and ``shard_start``, the row offset of a
+context-parallel shard.
 
 Provenance: the definitions below follow the ERNIE 5.5 implementation in Megatron-Bridge (Apache License 2.0) at
 revision ``a38833622b88969564fe8bfa053c5e4e4989c6cd``.
@@ -45,6 +46,7 @@ revision ``a38833622b88969564fe8bfa053c5e4e4989c6cd``.
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -53,6 +55,16 @@ from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4HyperC
 # Values of ``backend.attn`` that select the dense PyTorch attention path of the DSA and HCA layers. The three
 # names run the same code: neither layer calls a scaled-dot-product kernel.
 DENSE_ATTENTION_BACKENDS: tuple[str, ...] = ("eager", "torch", "sdpa")
+
+
+def shard_start(cp_group: dist.ProcessGroup | None, sequence: int) -> int:
+    """Return the row offset of the first token that this context-parallel rank holds.
+
+    Args:
+        cp_group: Context-parallel group whose ranks hold consecutive shards of a row, or None.
+        sequence: Number of tokens in every shard.
+    """
+    return 0 if cp_group is None else dist.get_rank(cp_group) * sequence
 
 
 class Ernie5_5RMSNorm(nn.Module):
@@ -158,8 +170,7 @@ def virtual_head_mix(attention: torch.Tensor, u: torch.Tensor, v: torch.Tensor) 
     """Apply the low-rank head mix I + V U^T to attention output.
 
     Only the activation-dtype path is implemented: ``u`` and ``v`` are converted to the dtype of ``attention`` and
-    the mix runs in that dtype with autocast disabled. The function has not been validated under context
-    parallelism.
+    the mix runs in that dtype with autocast disabled.
 
     Args:
         attention: Tensor of shape [..., heads, channels], with arbitrary

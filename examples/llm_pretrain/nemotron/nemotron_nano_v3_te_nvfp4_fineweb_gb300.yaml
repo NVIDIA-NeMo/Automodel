@@ -1,0 +1,122 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Nemotron 3 Nano 30B-A3B pretraining from random initialization on FineWeb with NVFP4 experts through
+# Transformer Engine: 500 steps of 32 x 4096 tokens on one GB300 node (4 GPUs, EP4).
+#
+# NVFP4 covers the experts and the shared expert of the first 19 MoE layers. The attention projections, the
+# last 8 layers and lm_head stay in BF16 (te_nvfp4.exclude_fqns). The Mamba projections are torch.nn.Linear
+# and are BF16 as well. Remove te_nvfp4 for the BF16 baseline.
+#
+# Data: tokenize FineWeb with the model's tokenizer into a NanoGPT shard, then point dataset.file_pattern at it:
+#   python tools/nanogpt_data_processor.py --dataset HuggingFaceFW/fineweb --set-name sample-10BT \
+#     --max-tokens 100M --tokenizer nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 --output-dir fineweb_nemotron_nano
+#
+# Launch:
+#   automodel examples/llm_pretrain/nemotron/nemotron_nano_v3_te_nvfp4_fineweb_gb300.yaml --nproc-per-node 4
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  gc_every_steps: 5
+  global_batch_size: 32
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 500
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 4
+  activation_checkpointing: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: bfloat16
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: te
+    dispatcher: hybridep
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_fsdp_optimizations: true
+    te_nvfp4:
+      exclude_fqns:
+      - lm_head
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - layers.44.
+      - layers.45.
+      - layers.46.
+      - layers.47.
+      - layers.48.
+      - layers.49.
+      - layers.50.
+      - layers.51.
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: /path/to/fineweb_nemotron_nano_max_tokens_100M/dataset.bin  # REPLACE THIS
+  seq_len: 4096
+  shuffle_files: false
+  align_to_bos: false
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: false
+  exp_avg_dtype: float32
+  exp_avg_sq_dtype: float32
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 50
+  min_lr: 3.0e-5
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: skipped
+  recipe_owner: HuiyingLi
+  time: "00:30:00"
+  nodes: 1
+  cluster_tag: gb300
+  nproc_per_node: 4
