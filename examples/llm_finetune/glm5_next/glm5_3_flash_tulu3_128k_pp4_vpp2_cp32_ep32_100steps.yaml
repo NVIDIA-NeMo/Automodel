@@ -210,6 +210,7 @@ mfu:
 validation_dataset: null
 validation_dataloader: null
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 16
