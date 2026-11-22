@@ -333,13 +333,19 @@ class TestApplyCacheCompatibilityPatchesIntegration:
     )
     def test_restores_legacy_default_rope(self, monkeypatch: pytest.MonkeyPatch, dimensions: dict) -> None:
         """Remote v4 configs retain their original full or partial RoPE frequencies."""
-        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        import transformers.modeling_rope_utils as rope_utils
 
-        monkeypatch.delitem(ROPE_INIT_FUNCTIONS, "default", raising=False)
+        monkeypatch.setattr(
+            rope_utils,
+            "ROPE_INIT_FUNCTIONS",
+            {k: v for k, v in rope_utils.ROPE_INIT_FUNCTIONS.items() if k != "default"},
+        )
         apply_cache_compatibility_patches()
 
         config = SimpleNamespace(rope_theta=10000.0, **dimensions)
-        inv_freq, attention_factor = ROPE_INIT_FUNCTIONS["default"](config, torch.device("cpu"), seq_len=2048)
+        inv_freq, attention_factor = rope_utils.ROPE_INIT_FUNCTIONS["default"](
+            config, torch.device("cpu"), seq_len=2048
+        )
 
         torch.testing.assert_close(inv_freq, torch.tensor([1.0, 0.1, 0.01, 0.001]))
         assert inv_freq.dtype == torch.float32
@@ -347,13 +353,96 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
     def test_preserves_existing_default_rope(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An upstream default initializer remains authoritative when present."""
-        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        import transformers.modeling_rope_utils as rope_utils
 
         original = Mock()
-        monkeypatch.setitem(ROPE_INIT_FUNCTIONS, "default", original)
+        monkeypatch.setitem(rope_utils.ROPE_INIT_FUNCTIONS, "default", original)
         apply_cache_compatibility_patches()
 
-        assert ROPE_INIT_FUNCTIONS["default"] is original
+        assert rope_utils.ROPE_INIT_FUNCTIONS["default"] is original
+
+    @pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
+    def test_native_default_rope_matches_hf(
+        self, monkeypatch: pytest.MonkeyPatch, partial_rotary_factor: float
+    ) -> None:
+        """Native v5 initialization retains the reference frequencies and rotary width."""
+        import transformers.modeling_rope_utils as rope_utils
+        from transformers import Qwen3_5TextConfig
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
+
+        config = Qwen3_5TextConfig(
+            hidden_size=32,
+            num_attention_heads=2,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 500000.0,
+                "partial_rotary_factor": partial_rotary_factor,
+            },
+        )
+        expected, _ = Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters(config)
+        monkeypatch.setattr(
+            rope_utils,
+            "ROPE_INIT_FUNCTIONS",
+            {k: v for k, v in rope_utils.ROPE_INIT_FUNCTIONS.items() if k != "default"},
+        )
+        apply_cache_compatibility_patches()
+        actual, scale = rope_utils.ROPE_INIT_FUNCTIONS["default"](config)
+        torch.testing.assert_close(actual, expected)
+        assert scale == 1.0
+
+    @pytest.mark.parametrize("native_imported_first", [False, True])
+    def test_model_owned_rope_survives_init_and_reload(self, monkeypatch, tmp_path, native_imported_first):
+        """A spatially reordered default survives both import orders and checkpoint reload."""
+        import transformers.modeling_rope_utils as rope_utils
+        import transformers.modeling_utils as modeling_utils
+        from transformers.models.ernie4_5_vl_moe.configuration_ernie4_5_vl_moe import Ernie4_5_VLMoeTextConfig
+        from transformers.models.ernie4_5_vl_moe.modeling_ernie4_5_vl_moe import Ernie4_5_VLMoeTextModel
+
+        from nemo_automodel.components.utils.model_utils import skip_random_init
+
+        registry = {k: v for k, v in rope_utils.ROPE_INIT_FUNCTIONS.items() if k != "default"}
+        monkeypatch.setattr(rope_utils, "ROPE_INIT_FUNCTIONS", registry)
+        monkeypatch.setattr(modeling_utils, "ROPE_INIT_FUNCTIONS", registry)
+        config = Ernie4_5_VLMoeTextConfig(
+            hidden_size=128,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            num_hidden_layers=0,
+            vocab_size=16,
+            intermediate_size=128,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [22, 22, 20]},
+        )
+        reference = Ernie4_5_VLMoeTextModel(config)
+        reference.save_pretrained(tmp_path)
+        apply_cache_compatibility_patches()
+        if not native_imported_first:
+            # Model the alias captured by a native import after the compatibility patch.
+            monkeypatch.setattr(modeling_utils, "ROPE_INIT_FUNCTIONS", rope_utils.ROPE_INIT_FUNCTIONS)
+        patched = Ernie4_5_VLMoeTextModel(config)
+        with skip_random_init():
+            reloaded = Ernie4_5_VLMoeTextModel.from_pretrained(tmp_path)
+        hidden_states = torch.zeros(1, 5, 128)
+        position_ids = torch.arange(5).expand(3, 1, 5)
+        expected_cos, expected_sin = reference.rotary_emb(hidden_states, position_ids)
+        for model in (patched, reloaded):
+            torch.testing.assert_close(model.rotary_emb.inv_freq, reference.rotary_emb.inv_freq, rtol=0, atol=0)
+            torch.testing.assert_close(
+                model.rotary_emb.original_inv_freq, reference.rotary_emb.original_inv_freq, rtol=0, atol=0
+            )
+            cos, sin = model.rotary_emb(hidden_states, position_ids)
+            torch.testing.assert_close(cos, expected_cos, rtol=0, atol=0)
+            torch.testing.assert_close(sin, expected_sin, rtol=0, atol=0)
+
+    def test_legacy_rope_fallback_does_not_hide_unknown_types(self, monkeypatch):
+        import transformers.modeling_rope_utils as rope_utils
+
+        monkeypatch.setattr(rope_utils, "ROPE_INIT_FUNCTIONS", {})
+        apply_cache_compatibility_patches()
+        registry = rope_utils.ROPE_INIT_FUNCTIONS
+        apply_cache_compatibility_patches()
+        assert rope_utils.ROPE_INIT_FUNCTIONS is registry
+        with pytest.raises(KeyError, match="unknown-rope"):
+            registry["unknown-rope"]
 
     def test_calls_bytes_to_unicode_patch(self):
         """apply_cache_compatibility_patches invokes _patch_bytes_to_unicode."""

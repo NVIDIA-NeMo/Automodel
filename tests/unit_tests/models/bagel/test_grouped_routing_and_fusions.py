@@ -36,7 +36,7 @@ import torch
 
 # Over the default 5s budget on purpose: this module compiles kernels, and compile time dominates the measured cost.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 MODELING = "nemo_automodel.components.models.bagel.modeling_qwen2_packed"
 

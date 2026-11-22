@@ -263,7 +263,7 @@ def test_cross_encoder_from_pretrained(monkeypatch, is_causal):
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
     policy_kwargs = {} if is_causal is None else {"is_causal": is_causal}
-    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model", "eager", **policy_kwargs)
+    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model", attn_implementation="eager", **policy_kwargs)
     assert isinstance(model, DummyModel)
     assert calls["build"] == 1
     # CrossEncoder build should NOT receive pooling or l2_normalize
@@ -513,6 +513,17 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def fake_all_reduce(ranks_with_ids: torch.Tensor) -> None:
+        """Simulate the ID-presence sum when both fixture ranks supply document IDs.
+
+        Args:
+            ranks_with_ids: Scalar tensor of shape [], updated in place with the sum across two ranks.
+        """
+        assert ranks_with_ids.item() == 1
+        ranks_with_ids.mul_(2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
     gather_with_padding_calls = []
 

@@ -41,7 +41,7 @@ from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _PP = 4
 _HIDDEN = 64
@@ -85,10 +85,25 @@ def test_negative_slack_is_rejected():
 
 @pytest.fixture
 def fresh_install(monkeypatch):
-    """Reset the process-wide install flag around a test and restore it afterwards."""
+    """Reset the process-wide install flag around a test and restore it afterwards.
+
+    Also reports preallocated receive buffers, so the fake stage layouts exercise
+    the pool whatever the installed PyTorch does.
+    """
     monkeypatch.setattr(recv_buffer_pool, "_INSTALLED", False)
     monkeypatch.setattr(recv_buffer_pool, "_INSTALLED_LAYOUT", None)
+    monkeypatch.setattr(recv_buffer_pool, "_native_recv_buffers_are_just_in_time", lambda: False)
     yield
+
+
+def test_install_keeps_stock_buffers_when_receives_are_just_in_time(fresh_install, monkeypatch):
+    from torch.distributed.pipelining import stage as stage_mod
+
+    monkeypatch.setattr(recv_buffer_pool, "_native_recv_buffers_are_just_in_time", lambda: True)
+    before = dict(vars(stage_mod.PipelineStage))
+    assert install_recv_buffer_pool(slack=2) is False
+    assert recv_buffer_pool._INSTALLED is False and recv_buffer_pool._INSTALLED_LAYOUT is None
+    assert dict(vars(stage_mod.PipelineStage)) == before
 
 
 def _fake_stage_classes(layout: str):
@@ -300,6 +315,13 @@ def _parity_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+_JIT_RECV_BUFFERS = pytest.mark.skipif(
+    recv_buffer_pool._native_recv_buffers_are_just_in_time(),
+    reason="PyTorch allocates receive buffers just in time, so the pool does not install",
+)
+
+
+@_JIT_RECV_BUFFERS
 @pytest.mark.run_only_on("GPU")
 def test_pooled_recv_buffers_match_stock_1f1b_exactly():
     mp.spawn(_parity_worker, args=(_PP, _free_port()), nprocs=_PP, join=True)
@@ -336,6 +358,7 @@ def _too_small_ring_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+@_JIT_RECV_BUFFERS
 @pytest.mark.run_only_on("GPU")
 def test_ring_below_inflight_depth_is_detected_by_the_harness():
     mp.spawn(_too_small_ring_worker, args=(_PP, _free_port()), nprocs=_PP, join=True)

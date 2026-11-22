@@ -45,13 +45,13 @@ class LlamaBidirectionalConfig(LlamaConfig):
         is_causal: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Configure language attention and retrieval pooling.
+        """Configure legacy retrieval pooling, temperature, and attention mode.
 
         Args:
-            pooling: Retrieval pooling strategy.
-            temperature: Temperature for scaling retrieval logits.
+            pooling: Strategy used to pool token embeddings.
+            temperature: Divisor for retrieval scores.
             is_causal: Whether to use causal rather than bidirectional attention.
-            **kwargs: Additional Hugging Face Llama configuration options.
+            **kwargs: Additional Hugging Face Llama configuration fields.
         """
         self.pooling = pooling
         self.temperature = temperature
@@ -157,7 +157,16 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         decoder: bool | None = None,
         encoder: bool | None = None,
     ) -> PretrainedConfig:
-        """Return the language decoder config using the Transformers composite-config contract."""
+        """Resolve the language config through the Transformers composite contract.
+
+        Args:
+            decoder: Select the text-output configuration when true.
+            encoder: Select the text-input configuration when true.
+
+        Returns:
+            The language decoder config for decoder or unrestricted requests;
+            the inherited config resolution for encoder-only requests.
+        """
         if decoder or decoder == encoder:
             return self.llm_config
         return super().get_text_config(decoder=decoder, encoder=encoder)
@@ -290,7 +299,7 @@ class LlamaBidirectionalModel(LlamaModel):
 
     config_class = LlamaBidirectionalConfig
 
-    def __init__(self, config: LlamaBidirectionalConfig):
+    def __init__(self, config: LlamaBidirectionalConfig) -> None:
         super().__init__(config)
         is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
@@ -330,25 +339,24 @@ class LlamaBidirectionalModel(LlamaModel):
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
-        """Encode the language sequence using the configured attention mode.
+        """Encode tokens using the selected attention mode.
 
         Args:
-            input_ids: Integer token IDs [batch, sequence], exclusive with inputs_embeds.
-            attention_mask: Optional padding mask [batch, sequence], with zero for padding.
-            position_ids: Integer positions [batch, sequence] or [1, sequence].
-            past_key_values: Optional Transformers cache in its native layout.
-            inputs_embeds: Floating-point embeddings [batch, sequence, hidden], which
-                may include projected vision embeddings at image-token positions.
-            cache_position: Integer cache positions [sequence].
-            use_cache: Whether to populate the returned cache.
-            output_hidden_states: Whether to return intermediate hidden states.
-            **kwargs: Additional Hugging Face forward options.
+            input_ids: Integer tensor of shape [batch, sequence], mutually exclusive with inputs_embeds.
+            attention_mask: Optional padding mask of shape [batch, key_sequence], including cached tokens.
+            position_ids: Optional integer tensor of shape [batch, sequence] or [1, sequence].
+            past_key_values: Optional cache of key/value tensors of shape [batch, kv_heads, cached_sequence, head_dim].
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden], mutually exclusive with input_ids.
+            cache_position: Optional integer tensor of shape [sequence].
+            use_cache: Whether to retain attention keys and values.
+            output_hidden_states: Whether to return each layer's hidden states.
+            **kwargs: Additional arguments forwarded to the stock causal decoder.
 
         Returns:
-            Output with floating-point last_hidden_state [batch, sequence, hidden],
-            optional hidden states of the same shape, and the optional Transformers
-            cache. The hidden axis is config.hidden_size. In causal mode, optional
-            attentions follow the Hugging Face LlamaModel.forward output contract.
+            Output with last_hidden_state of shape [batch, sequence, hidden], optional
+            hidden_states containing tensors of that shape, and optional past_key_values
+            storing keys/values of shape [batch, kv_heads, key_sequence, head_dim]. The
+            causal path can also return attentions of shape [batch, heads, sequence, key_sequence].
         """
         if getattr(self.config, "is_causal", False):
             return super().forward(
@@ -545,6 +553,10 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 f"nondeterministic and incorrect image embeddings. "
                 f"Please use transformers <=4.53.x or >=4.56.0."
             )
+
+    def get_decoder(self) -> PreTrainedModel:
+        """Return the language model used as the retrieval text tower."""
+        return self.language_model
 
     def _embed_batch(self, inputs: Dict[str, Any], pool_type: str | None = None):
         """

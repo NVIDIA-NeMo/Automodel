@@ -365,23 +365,24 @@ def test_two_pipeline_stage_handoff_matches_full_model():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_handoff_at_real_twelve_layer_block_boundary_matches_forward_and_backward():
+@pytest.mark.parametrize(("num_layers", "split_layer"), [(4, 2), (24, 12)])
+def test_handoff_with_real_block_size_matches_forward_and_backward(num_layers: int, split_layer: int):
     torch.manual_seed(17)
     model = KimiK3ForCausalLM(
-        _tiny_config(num_hidden_layers=24, attn_res_block_size=12),
+        _tiny_config(num_hidden_layers=num_layers, attn_res_block_size=12),
         backend=_torch_backend(),
     )
     model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
 
     stage0 = copy.deepcopy(model)
     stage1 = copy.deepcopy(model)
-    for layer_idx in range(12, 24):
+    for layer_idx in range(split_layer, num_layers):
         del stage0.model.layers[str(layer_idx)]
     stage0.model.norm = None
     stage0.model.output_attn_res_norm = None
     stage0.model.output_attn_res_proj = None
     stage0.lm_head = None
-    for layer_idx in range(12):
+    for layer_idx in range(split_layer):
         del stage1.model.layers[str(layer_idx)]
     stage1.model.embed_tokens = None
 
@@ -396,12 +397,12 @@ def test_handoff_at_real_twelve_layer_block_boundary_matches_forward_and_backwar
     expected.float().square().mean().backward()
     actual.float().square().mean().backward()
     torch.testing.assert_close(
-        stage0.model.layers["11"].mlp.down_proj.weight.grad,
-        model.model.layers["11"].mlp.down_proj.weight.grad,
+        stage0.model.layers[str(split_layer - 1)].mlp.down_proj.weight.grad,
+        model.model.layers[str(split_layer - 1)].mlp.down_proj.weight.grad,
     )
     torch.testing.assert_close(
-        stage1.model.layers["12"].mlp.down_proj.weight.grad,
-        model.model.layers["12"].mlp.down_proj.weight.grad,
+        stage1.model.layers[str(split_layer)].mlp.down_proj.weight.grad,
+        model.model.layers[str(split_layer)].mlp.down_proj.weight.grad,
     )
 
 

@@ -116,6 +116,8 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: release
+  cluster_tag: h100
   vllm_deploy: true
   recipe_owner: akoumpa  # stanley1208 original committer
   time: "00:30:00"

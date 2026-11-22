@@ -6,133 +6,345 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
-    get_attn_implementation,
-    get_seqlens_in_batch,
-    get_unpad_data,
+    configure_packing,
+    configure_packing_for_models,
+    flatten_packed_sequence_metadata,
+    get_model_attn_implementation,
+    get_packing_capabilities,
+    get_packing_capabilities_for_models,
     validate_flash_packing_support,
 )
+from nemo_automodel.components.models.common.utils import BackendConfig
 
 # ---------------------------------------------------------------------------
-# get_seqlens_in_batch
-# ---------------------------------------------------------------------------
-
-
-class TestGetSeqlensInBatch:
-    def test_single_sequence(self):
-        mask = torch.tensor([[1, 1, 1, 0, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-    def test_packed_sequences(self):
-        mask = torch.tensor([[1, 1, 2, 2, 2, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert sorted(result.tolist()) == [2, 3]
-
-    def test_no_padding(self):
-        mask = torch.tensor([[1, 1, 1]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-
-# ---------------------------------------------------------------------------
-# get_unpad_data  (pure helper used by in-tree custom models)
-# ---------------------------------------------------------------------------
-
-
-class TestGetUnpadData:
-    def test_basic(self):
-        mask = torch.tensor([[1, 1, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert cu_seqlens.tolist() == [0, 2]
-
-    def test_packed(self):
-        mask = torch.tensor([[1, 1, 2, 2, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert indices.tolist() == [0, 1, 2, 3]
-
-
-# ---------------------------------------------------------------------------
-# get_attn_implementation
+# model-derived packing and metadata
 # ---------------------------------------------------------------------------
 
 
 class TestGetAttnImplementation:
     def test_from_backend_config(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        assert get_model_attn_implementation(model) == "te"
 
     def test_from_attn_implementation(self):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        assert get_attn_implementation(cfg) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
     def test_default_sdpa(self):
-        assert get_attn_implementation(None) == "sdpa"
+        assert get_model_attn_implementation(torch.nn.Module()) == "sdpa"
 
     def test_backend_takes_precedence(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        cfg.get = MagicMock(return_value="flash_attention_2")
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        assert get_model_attn_implementation(model) == "te"
 
-    def test_built_model_wins_over_stale_config(self):
-        """A packed run force-switches the model to flash; the config keeps saying sdpa."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+    def test_declared_hf_fa4_dispatch_takes_precedence(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+        model._uses_hf_attention = True
 
-    def test_backend_config_wins_over_built_model(self):
-        """Custom models keep naming their backend; ``te`` inits through sdpa."""
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
-        assert get_attn_implementation(cfg, model=model) == "te"
+        assert get_model_attn_implementation(model) == "flash_attention_4"
+
+    def test_declared_hf_dispatch_uses_live_hf_backend(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        model._uses_hf_attention = True
+
+        assert get_model_attn_implementation(model) == "sdpa"
+
+    def test_native_fa4_consumer_uses_typed_backend(self):
+        model = torch.nn.Module()
+        model._uses_native_fa4 = True
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+
+        assert get_model_attn_implementation(model) == "fa4"
 
     def test_reads_through_ddp_wrapper(self):
         """DDP holds the model as ``.module`` and does not proxy attribute access."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
+        inner = torch.nn.Module()
+        inner.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        wrapper = torch.nn.Module()
+        wrapper.module = inner
+        assert get_model_attn_implementation(wrapper) == "flash_attention_2"
 
     def test_kernels_hub_id_maps_back_to_mainline_flash(self):
         """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="kernels-community/flash-attn2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
-    @pytest.mark.parametrize(
-        "model",
-        [
-            SimpleNamespace(),
-            SimpleNamespace(config=SimpleNamespace()),
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
-            # A dispatch key naming no layout packing knows about must not select one.
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
-        ],
+    @pytest.mark.parametrize("implementation", ["magi", "some_future_backend"])
+    def test_preserves_live_dispatch_key(self, implementation):
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation=implementation)
+        assert get_model_attn_implementation(model) == implementation
+
+    def test_requires_built_model(self):
+        with pytest.raises(TypeError, match="built torch.nn.Module"):
+            get_model_attn_implementation(SimpleNamespace())
+
+
+# ---------------------------------------------------------------------------
+# Model input-token limits
+# ---------------------------------------------------------------------------
+
+
+def test_input_token_limit_uses_decoder_config_inside_model_wrappers():
+    from transformers import LlamaConfig, PreTrainedConfig
+
+    model = torch.nn.Module()
+    model.config = PreTrainedConfig(
+        max_position_embeddings=64,
+        text_encoder=LlamaConfig(max_position_embeddings=16384),
+        text_config=LlamaConfig(max_position_embeddings=8192),
+        vision_config=PreTrainedConfig(max_position_embeddings=256),
     )
-    def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "eager"
-        assert get_attn_implementation(cfg, model=model) == "eager"
+    compiled = torch.nn.Module()
+    compiled._orig_mod = model
+    distributed = torch.nn.Module()
+    distributed.module = compiled
+
+    assert get_packing_capabilities("sdpa", model=distributed).max_sequence_length == 8192
+    assert not model._forward_pre_hooks
+
+
+def test_input_token_limit_does_not_apply_rope_scaling_twice():
+    from transformers import LlamaConfig
+
+    model = torch.nn.Module()
+    model.config = LlamaConfig(
+        max_position_embeddings=32768,
+        rope_parameters={"rope_type": "linear", "factor": 4.0, "rope_theta": 10000.0},
+    )
+
+    assert get_packing_capabilities("sdpa", model=model).max_sequence_length == 32768
+
+
+@pytest.mark.parametrize("limit", [None, 0, -1, True, "4096", float("inf")])
+def test_missing_or_invalid_model_input_limit_stays_unknown(limit):
+    from transformers import PreTrainedConfig
+
+    model = torch.nn.Module()
+    model.config = PreTrainedConfig(max_position_embeddings=limit)
+
+    assert get_packing_capabilities("sdpa", model=model).max_sequence_length is None
+
+
+def test_pipeline_input_limit_uses_smallest_declared_stage_limit():
+    from transformers import LlamaConfig
+
+    stages = [torch.nn.Module(), torch.nn.Module(), torch.nn.Module()]
+    stages[0].config = LlamaConfig(max_position_embeddings=8192)
+    stages[1].config = LlamaConfig(max_position_embeddings=4096)
+
+    assert get_packing_capabilities_for_models(stages).max_sequence_length == 4096
+    assert get_packing_capabilities_for_models([stages[2]]).max_sequence_length is None
 
 
 # ---------------------------------------------------------------------------
-# validate_flash_packing_support
+# configure_packing
 # ---------------------------------------------------------------------------
+
+
+class TestConfigurePacking:
+    def test_flash_metadata_precedes_root_input_transfer_inside_compiled_hf_model(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        model = LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=16,
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                attn_implementation="sdpa",
+            )
+        )
+        seen = []
+
+        def input_transfer(module, args, kwargs):
+            # FSDP's root hook transfers every nested tensor to its device.
+            # Flash offsets must already exist before that hook runs.
+            seen.append(kwargs["_packed_flash_kwargs"]["cu_seq_lens_q"].tolist())
+            assert "cu_seq_lens_q" not in kwargs
+
+        model.register_forward_pre_hook(input_transfer, with_kwargs=True)
+        compiled = torch.compile(model, backend="eager")
+        configure_packing("flash_attention_2", model=compiled)
+        configure_packing("flash_attention_2", model=model)
+        decoder = model.get_decoder()
+        assert "_packed_attention_hook_handle" in decoder.__dict__
+        assert "_packed_flash_preparation_hook_handle" in model.__dict__
+        assert "_packed_attention_hook_handle" not in compiled.__dict__
+        model(torch.ones(1, 4, dtype=torch.long), _packed_seq_ids=torch.tensor([[1, 1, 2, 2]]))
+        assert seen == [[0, 2, 4]]
+
+    def test_flash_attention_map_is_resolved_after_microbatch_split(self):
+        class Capture(torch.nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return kwargs
+
+        model = Capture()
+        configure_packing("flash_attention_2", model=model)
+        configure_packing("flash_attention_2", model=model)
+        positions = torch.tensor([[0, 1, 0, 1, 0], [0, 0, 1, 2, 0]])
+        original = torch.tensor([[1, 1, 2, 2, 0], [1, 2, 2, 2, 0]])
+        combined = model(torch.ones(2, 5), _packed_seq_ids=original)
+        assert combined["cu_seq_lens_q"].tolist() == [0, 2, 4, 5, 6, 9, 10]
+        for ids, expected in ((original, [[0, 2, 4, 5], [0, 1, 4, 5]]), ((original > 0).long(), [[0, 4, 5]] * 2)):
+            for index in range(2):
+                rope = positions[index : index + 1]
+                boundaries = ids[index : index + 1]
+                output = model(
+                    torch.ones(1, 5, dtype=torch.long),
+                    position_ids=rope,
+                    _packed_seq_ids=boundaries,
+                )
+                assert output["cu_seq_lens_q"].dtype == torch.int32
+                assert output["cu_seq_lens_q"].tolist() == expected[index]
+                assert output["cu_seq_lens_k"] is output["cu_seq_lens_q"]
+                assert output["max_length_q"] == max(b - a for a, b in zip(expected[index], expected[index][1:]))
+                assert output["position_ids"] is rope
+                assert output["_packed_seq_ids"] is boundaries
+
+        direct = {"cu_seq_lens_q": torch.tensor([0, 5]), "max_length_q": 5}
+        assert model(torch.ones(1, 5), **direct) == direct
+        prepared_mask = original > 0
+        assert (
+            model(torch.ones(2, 5), _packed_seq_ids=original, attention_mask=prepared_mask)["attention_mask"]
+            is prepared_mask
+        )
+        assert model(torch.ones(2, 5), _packed_seq_ids=original, **direct)["cu_seq_lens_q"] is direct["cu_seq_lens_q"]
+
+    def test_model_semantics_select_document_ids_and_explicit_metadata(self):
+        model = SimpleNamespace(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=True,
+        )
+
+        capabilities = get_packing_capabilities("sdpa", model=model)
+
+        assert capabilities.packed_mask_type == "document_ids"
+        assert capabilities.return_packed_sequence_metadata is True
+
+    def test_fa4_requires_explicit_native_consumer_capability(self):
+        hf_dispatched_model = torch.nn.Module()
+        native_model = torch.nn.Module()
+        native_model._uses_native_fa4 = True
+
+        # Describing requirements is also used by unpacked/THD loaders and
+        # must not reject a consumer for a batched route it will never use.
+        queried = get_packing_capabilities("fa4", model=hf_dispatched_model)
+        assert not queried.uses_native_fa4
+        assert not hf_dispatched_model._forward_pre_hooks
+        with pytest.raises(ValueError, match="declaring native FA4 support"):
+            configure_packing("fa4", model=hf_dispatched_model)
+        assert not hf_dispatched_model._forward_pre_hooks
+        native_capabilities = get_packing_capabilities("fa4", model=native_model)
+
+        assert native_capabilities.return_packed_sequence_metadata is True
+        assert native_capabilities.uses_native_fa4 is True
+
+    def test_batch_major_metadata_flattens_after_microbatch_splitting(self):
+        indices, cu_seqlens = flatten_packed_sequence_metadata(
+            torch.tensor([[0, 1, 2, -1]]),
+            torch.tensor([[0, 1, 3]], dtype=torch.int32),
+            batch_size=1,
+            sequence_length=4,
+        )
+
+        assert indices.tolist() == [0, 1, 2]
+        assert cu_seqlens.tolist() == [0, 1, 3]
+
+    def test_native_fa4_flattens_metadata_once_per_model_forward(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, input_ids: torch.Tensor, **kwargs):
+                """Capture normalized packed metadata.
+
+                Args:
+                    input_ids: Token IDs of shape [batch, sequence].
+                    **kwargs: Model inputs containing packed token indices of
+                        shape [tokens] and cumulative lengths of shape
+                        [documents + 1].
+
+                Returns:
+                    The received keyword-input mapping with tensor layouts
+                    unchanged.
+                """
+                del input_ids
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+        configure_packing("fa4", model=model)
+        assert len(model._forward_pre_hooks) == 1
+        with pytest.raises(ValueError, match="FA4 THD requires token IDs"):
+            model(torch.ones(2, 4, dtype=torch.long), qkv_format="thd")
+
+        output = model(
+            torch.ones(2, 4, dtype=torch.long),
+            packed_token_indices=torch.tensor([[0, 1, 2, -1], [0, 1, -1, -1]]),
+            cu_seqlens=torch.tensor([[0, 1, 3], [0, 2, -1]], dtype=torch.int32),
+            max_seqlen=2,
+        )
+
+        assert output["packed_token_indices"].tolist() == [0, 1, 2, 4, 5]
+        assert output["cu_seqlens"].tolist() == [0, 1, 3, 5]
+
+    def test_native_fa4_rejects_incomplete_metadata_at_model_entry(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, **kwargs):
+                """Return the received model inputs unchanged.
+
+                Args:
+                    **kwargs: Optional cu_seqlens of shape [documents + 1] or
+                        [batch, max_documents + 1], supplied without token indices.
+
+                Returns:
+                    The input mapping, unchanged; the entry hook rejects this call.
+                """
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+
+        with pytest.raises(ValueError, match="must be tensors supplied together"):
+            model(cu_seqlens=torch.tensor([0, 2], dtype=torch.int32))
+
+
+def test_non_metadata_consumer_preserves_legacy_thd_boundaries():
+    class LegacyModel(torch.nn.Module):
+        def forward(self, **kwargs):
+            """Return legacy THD boundaries unchanged.
+
+            Args:
+                **kwargs: ``cu_seqlens`` of shape [documents + 1] and scalar format options.
+
+            Returns:
+                The original boundary tensor of shape [documents + 1].
+            """
+            return kwargs["cu_seqlens"]
+
+    model = LegacyModel()
+    configure_packing("sdpa", model=model)
+    boundaries = torch.tensor([0, 2, 5], dtype=torch.int32)
+    assert model(cu_seqlens=boundaries, qkv_format="thd") is boundaries
 
 
 class TestValidateFlashPackingSupport:
@@ -151,7 +363,8 @@ class TestValidateFlashPackingSupport:
         import transformers.modeling_flash_attention_utils as fa_utils
 
         original_unpad = fa_utils._get_unpad_data
-        validate_flash_packing_support("flash_attention_2")
+        contract = configure_packing("flash_attention_2")
+        assert contract.packed_mask_type == "flash_varlen"
         assert fa_utils._get_unpad_data is original_unpad
 
     def test_raises_when_varlen_kwargs_missing(self, monkeypatch):
@@ -232,3 +445,311 @@ class TestValidateFlashPackingSupport:
 
         with pytest.raises(RuntimeError, match="all four varlen"):
             validate_flash_packing_support("flash_attention_2", model=_PartialModel())
+
+
+@pytest.mark.parametrize("backend", ["sdpa", "eager"])
+def test_compact_dense_mask_materializes_at_model_owned_entry(backend):
+    class Capture(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1, dtype=torch.float64))
+
+        @property
+        def packed_metadata_entry_module(self):
+            return self
+
+        def forward(self, input_ids, **kwargs):
+            return kwargs
+
+    model = Capture()
+    configure_packing(backend, model=model)
+    ids = torch.tensor([[1, 1, 2, 2, 0]])
+    positions = torch.tensor([[0, 1, 0, 1, 0]])
+    output = model(torch.ones(1, 5, dtype=torch.long), _packed_seq_ids=ids, position_ids=positions)
+    mask = output["attention_mask"]
+    assert mask.shape == (1, 1, 5, 5)
+    assert mask.dtype == (torch.bool if backend == "sdpa" else torch.float64)
+    allowed = mask if backend == "sdpa" else mask == 0
+    assert allowed[0, 0, 3, 2] and not allowed[0, 0, 3, 1]
+    assert not allowed[..., -1].any()
+    assert output["position_ids"] is positions
+    assert output["_packed_seq_ids"] is ids
+
+
+def test_model_owned_backend_gate_runs_before_generic_flash_validation():
+    class UnsupportedVision(torch.nn.Module):
+        def validate_packed_attention_backend(self, backend):
+            if backend.startswith("flash"):
+                raise ValueError("vision requires bidirectional mask")
+
+    with pytest.raises(ValueError, match="vision requires bidirectional"):
+        configure_packing("flash_attention_2", model=UnsupportedVision())
+
+
+def test_reconfiguring_compact_consumer_replaces_instead_of_stacking_hooks():
+    class Capture(torch.nn.Module):
+        def forward(self, input_ids, **kwargs):
+            return kwargs
+
+    model = Capture()
+    ids = torch.tensor([[1, 1, 2, 2]])
+    configure_packing("sdpa", model=model)
+    assert model(ids, _packed_seq_ids=ids)["attention_mask"].dtype == torch.bool
+    configure_packing("flash_attention_2", model=model)
+    assert model(ids, _packed_seq_ids=ids)["cu_seq_lens_q"].tolist() == [0, 2, 4]
+    configure_packing("eager", model=model)
+    assert model(ids, _packed_seq_ids=ids)["attention_mask"].dtype == torch.float32
+    assert len(model._forward_pre_hooks) == 2  # unused native metadata and one attention hook
+
+
+def test_thd_requires_sequence_length_consumer_on_every_stage():
+    from nemo_automodel.components.models.common.packing import validate_thd_packing_support
+
+    class ThdStage(torch.nn.Module):
+        _supports_sdpa = True
+
+        def forward(self, input_ids, seq_lens):
+            return input_ids
+
+    class OrdinaryStage(torch.nn.Module):
+        _supports_sdpa = True
+
+        def forward(self, input_ids):
+            return input_ids
+
+    supported, unsupported = ThdStage(), OrdinaryStage()
+    validate_thd_packing_support([supported])
+    with pytest.raises(ValueError, match="OrdinaryStage.*cannot consume THD"):
+        validate_thd_packing_support([supported, unsupported])
+
+
+@pytest.mark.parametrize(
+    "attention_ids, ordinary_causal",
+    [
+        ([[1, 1, 0, 0], [7, 7, 7, 0]], True),
+        ([[0, 0, 0, 0]], True),
+        ([[1, 1, 2, 2]], False),
+        ([[0, 1, 1, 0]], False),
+        ([[1, 0, 1, 0]], False),
+    ],
+)
+def test_attention_content_selects_causal_fast_path_without_dropping_boundaries(attention_ids, ordinary_causal):
+    class Capture(torch.nn.Module):
+        def forward(self, input_ids, **kwargs):
+            return kwargs
+
+    model = Capture()
+    configure_packing("sdpa", model=model)
+    ids = torch.tensor(attention_ids)
+    positions = torch.zeros_like(ids)
+    output = model(ids, _packed_seq_ids=ids, position_ids=positions)
+    assert output["_packed_seq_ids"] is ids
+    assert output["position_ids"] is positions
+    assert output["attention_mask"].ndim == (2 if ordinary_causal else 4)
+    if ordinary_causal:
+        assert output["attention_mask"].all()
+    else:
+        valid = ids > 0
+        allowed = (ids[:, :, None] == ids[:, None, :]) & valid[:, :, None] & valid[:, None, :]
+        torch.testing.assert_close(output["attention_mask"][:, 0], allowed.tril())
+
+
+def test_hybrid_model_retains_execution_ids_after_dense_mask_preparation():
+    class HybridConsumer(torch.nn.Module):
+        requires_packed_sequence_metadata = True
+
+        def forward(self, input_ids, **kwargs):
+            return kwargs
+
+    model = HybridConsumer()
+    configure_packing("sdpa", model=model)
+    original = torch.tensor([[1, 1, 2, 2, 0]])
+    selected = original.ne(0).long()
+    result = model(input_ids=original, _packed_seq_ids=selected)
+    assert result["_packed_seq_ids"] is selected
+    assert result["attention_mask"].shape == selected.shape
+    assert result["attention_mask"].all()
+
+
+def test_model_query_combines_return_requests_without_running_packed_validators():
+    class Consumer(torch.nn.Module):
+        requires_packed_sequence_metadata = True
+
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+
+        def validate_packed_attention_backend(self, implementation: str) -> None:
+            raise ValueError("packed execution is unsupported")
+
+        def prepare_document_attention_mask(self, attention_mask, mm_token_type_ids, document_ids):
+            """Return attention IDs [batch, sequence] unchanged for this test consumer.
+
+            Args:
+                attention_mask: Integer IDs [batch, sequence].
+                mm_token_type_ids: Optional modality IDs [batch, sequence].
+                document_ids: Optional original IDs [batch, sequence].
+
+            Returns:
+                The unmodified attention IDs [batch, sequence].
+            """
+            return attention_mask
+
+    model = Consumer()
+    plain = torch.nn.Module()
+    plain.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    contract = get_packing_capabilities_for_models([plain, model])
+    assert contract.return_packed_sequence_metadata
+    assert contract.return_document_ids
+    assert contract.packed_mask_type == "flash_varlen"
+    assert not model._forward_pre_hooks and not plain._forward_pre_hooks
+    with pytest.raises(ValueError, match="packed execution is unsupported"):
+        configure_packing("flash_attention_2", model=model)
+    assert not model._forward_pre_hooks
+
+
+def test_stage_mask_agreement_is_validated_only_for_batched_setup():
+    stages = [torch.nn.Module(), torch.nn.Module()]
+    stages[0].config = SimpleNamespace(_attn_implementation="sdpa")
+    stages[1].config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    # THD and unpacked callers may query without adopting either batched mask path.
+    contract = get_packing_capabilities_for_models(stages)
+    assert contract.packed_mask_type == "block_causal"
+    with pytest.raises(ValueError, match="agree on the batched packed mask layout"):
+        configure_packing_for_models(stages)
+    assert all(not stage._forward_pre_hooks for stage in stages)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "lengths,padded,expected_indices,expected_offsets",
+    [
+        ([2, 1], [4, 3], [0, 1, 4], [0, 2, 3]),
+        ([2, 1], [2, 4], [0, 1, 2], [0, 2, 3]),
+        ([2, 2], [2, 2], [0, 1, 2, 3], [0, 2, 4]),
+        ([0, 2], [2, 2], [2, 3], [0, 0, 2]),
+        ([0, 0], [2, 3], [], [0, 0, 0]),
+    ],
+)
+def test_fa4_thd_entry_uses_authoritative_layout(
+    lengths: list[int], padded: list[int], expected_indices: list[int], expected_offsets: list[int]
+) -> None:
+    """Real pad-token IDs, gaps, absorbed tails and empty documents retain their layout."""
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    total = sum(padded)
+    batch = {
+        "input_ids": torch.zeros(1, total, dtype=torch.long),
+        "labels": torch.zeros(1, total, dtype=torch.long),
+        "position_ids": torch.arange(total)[None],
+        "seq_lens": torch.tensor([lengths]),
+        "seq_lens_padded": torch.tensor([padded]),
+    }
+    original = process_input_for_thd(batch)
+    original["qkv_format"] = "thd"
+    snapshots = {key: value.clone() for key, value in original.items() if isinstance(value, torch.Tensor)}
+    _, prepared = prepare_packed_metadata(None, (), original)
+    assert prepared["packed_token_indices"].tolist() == expected_indices
+    assert prepared["_fa4_cu_seqlens"].tolist() == expected_offsets
+    assert prepared["_fa4_cu_seqlens"].dtype == torch.int32
+    assert prepare_packed_metadata(None, (), prepared) is None
+    for key, value in snapshots.items():
+        assert prepared[key] is original[key]
+        torch.testing.assert_close(original[key], value, rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tokens,mask,offsets",
+    [
+        (6, [False] * 5, [0, 5]),
+        (5, [False] * 6, [0, 5]),
+        (5, [True, True, True, False, False], [0, 3, 2, 5]),
+        (5, [False] * 5, [1, 5]),
+        (5, [False] * 5, [0, 6]),
+        (4, [False, False, True, False], [0, 2]),
+    ],
+)
+def test_fa4_thd_entry_rejects_malformed_physical_layout(tokens: int, mask: list[bool], offsets: list[int]) -> None:
+    """Invalid layouts fail instead of silently dropping real input tokens."""
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    kwargs = {
+        "qkv_format": "thd",
+        "padding_mask": torch.tensor(mask),
+        "cu_seqlens": torch.tensor(offsets, dtype=torch.int32),
+    }
+    with pytest.raises(ValueError):
+        prepare_packed_metadata(None, (torch.zeros(tokens, dtype=torch.long),), kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("alias", [False, True])
+def test_fa4_thd_entry_preserves_boundary_alias_and_masked_trailing_storage(alias: bool) -> None:
+    """A masked trailing buffer is legal; existing boundary aliases remain intact."""
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    offsets = torch.tensor([0, 2], dtype=torch.int32)
+    kwargs = {
+        "input_ids": torch.zeros(4, dtype=torch.long),
+        "qkv_format": "thd",
+        "padding_mask": torch.tensor([False, False, True, True]),
+        "cu_seqlens": offsets,
+        "cu_seqlens_padded": offsets if alias else None,
+    }
+    _, result = prepare_packed_metadata(None, (), kwargs)
+    assert result["packed_token_indices"].tolist() == [0, 1]
+    assert result["cu_seqlens"] is offsets
+    assert result["cu_seqlens_padded"] is kwargs["cu_seqlens_padded"]
+    assert result["_fa4_cu_seqlens"] is not offsets
+
+
+@pytest.mark.cpu_only
+def test_fa4_thd_entry_rejects_float_boundaries() -> None:
+    """Floating offsets must not be truncated into integer physical indices."""
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    with pytest.raises(ValueError, match="flat sequence boundaries"):
+        prepare_packed_metadata(
+            None,
+            (torch.zeros(2, dtype=torch.long),),
+            {
+                "qkv_format": "thd",
+                "padding_mask": torch.zeros(2, dtype=torch.bool),
+                "cu_seqlens": torch.tensor([0.0, 2.0]),
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "physical,valid,expected",
+    [
+        ([0, 4, 4, 8], [True, True, False, False, True, False, False, False, False], [2, 0, 1]),
+        ([0, 4, 8], [True, False, True, False, True, False, False, False], None),
+        ([0, 4, 8], [False] * 8, None),
+    ],
+)
+def test_native_fa4_physical_prefix_metadata_preserves_public_inputs(
+    physical: list[int], valid: list[bool], expected: list[int] | None
+) -> None:
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    boundaries = torch.tensor(physical, dtype=torch.int32)
+    mask = ~torch.tensor(valid)
+    inputs = torch.arange(len(valid))
+    original = dict(qkv_format="thd", cu_seqlens=boundaries, cu_seqlens_padded=boundaries, padding_mask=mask)
+    before = {name: value.clone() for name, value in original.items() if isinstance(value, torch.Tensor)}
+    args, prepared = prepare_packed_metadata(None, (inputs,), original)
+    assert args[0] is inputs and set(original) == {"qkv_format", "cu_seqlens", "cu_seqlens_padded", "padding_mask"}
+    for name, value in before.items():
+        assert prepared[name] is original[name]
+        assert torch.equal(original[name], value)
+    assert prepared["packed_token_indices"].tolist() == torch.where(torch.tensor(valid))[0].tolist()
+    if expected is None:
+        assert "_fa4_seqused" not in prepared and "_fa4_physical_cu_seqlens" not in prepared
+    else:
+        assert prepared["_fa4_seqused"].tolist() == expected
+        assert prepared["_fa4_physical_cu_seqlens"] is boundaries
+    # A second entry sees the already prepared contract and performs no metadata rebuild.
+    assert prepare_packed_metadata(None, (inputs,), prepared) is None

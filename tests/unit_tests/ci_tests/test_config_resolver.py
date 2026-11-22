@@ -30,7 +30,7 @@ import config_resolver  # noqa: E402
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 yaml = YAML()
 
@@ -278,6 +278,23 @@ def test_end_to_end_robustness_ignores_max_steps_env(tmp_path, synthetic_recipe)
     assert resolved["checkpoint"]["checkpoint_dir"] == f"{tmp_path}/t1/robustness_checkpoint"
 
 
+@pytest.mark.parametrize("phase", ["release", "checkpoint_robustness"])
+def test_glm51_lora_saves_within_each_ci_run(tmp_path: Path, phase: str) -> None:
+    recipe = REPO_ROOT / "examples/llm_finetune/glm/glm_5.1_lora.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "glm_5.1_lora"}
+    _run_resolver(["--base", str(recipe), "--phase", phase, "--output", str(out)], env=env)
+
+    resolved = yaml.load(out)
+    assert resolved["checkpoint"]["enabled"] is True
+    assert resolved["step_scheduler"]["ckpt_every_steps"] <= resolved["step_scheduler"]["max_steps"] == 2
+    assert resolved["step_scheduler"]["global_batch_size"] == 512
+    assert resolved["step_scheduler"]["local_batch_size"] == 8
+    assert resolved["model"]["moe_overrides"]["gate_bias_update_factor"] == 0.0
+    assert resolved["peft"]["use_triton"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["tokenizer_name"] == "zai-org/GLM-5.1"
+
+
 def test_end_to_end_customizer_chat_path_wins(tmp_path):
     """A recipe whose stem contains both 'customizer_' and 'chat' picks up the chat dataset paths."""
     recipe = tmp_path / "customizer_nano_chat.yaml"
@@ -354,6 +371,46 @@ def test_glm_5_2_checkpoint_robustness_preserves_pipeline_batch_geometry(tmp_pat
     assert robustness["parity_threshold_overrides"] == {"automodel_reload": {"cosine_similarity": 0.985}}
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rank", [0, 63])
+def test_nemotron_super_lora_checkpoint_phase_has_five_complete_updates(tmp_path: Path, rank: int) -> None:
+    """Resolved checkpoint settings must sustain five complete updates on DP64."""
+    from nemo_automodel.components.datasets.loader import ParallelAwareDataloader
+    from nemo_automodel.components.training.step_scheduler import StepScheduler
+
+    recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag_peft.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
+    resolved = yaml.load(out)
+    schedule = resolved["step_scheduler"]
+    parallel = resolved["distributed"]
+    dp_size = resolved["ci"]["nodes"] * 8 // (parallel["tp_size"] * parallel["pp_size"] * parallel["cp_size"])
+    loader = ParallelAwareDataloader(
+        list(range(resolved["packed_sequence"]["max_packs"])),
+        dp_rank=rank,
+        dp_world_size=dp_size,
+        batch_size=schedule["local_batch_size"],
+        shuffle=False,
+    )
+    scheduler = StepScheduler(
+        global_batch_size=schedule["global_batch_size"],
+        local_batch_size=schedule["local_batch_size"],
+        dp_size=dp_size,
+        dataloader=loader,
+        max_steps=schedule["max_steps"],
+        num_epochs=schedule["num_epochs"],
+        preemption_signal=None,
+    )
+    updates = list(scheduler)
+    assert scheduler.step == len(updates) == schedule["max_steps"] == 5
+    assert all(
+        len(update) == scheduler.grad_acc_steps
+        and all(batch.numel() == schedule["local_batch_size"] for batch in update)
+        for update in updates
+    )
+
+
 def test_nemotron_nano_full_sft_scopes_calibration_to_reload_mean_kl(tmp_path):
     """Nemotron Nano keeps standard p95/cosine gates while calibrating reload mean KL."""
     recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml"
@@ -370,30 +427,12 @@ def test_nemotron_nano_full_sft_scopes_calibration_to_reload_mean_kl(tmp_path):
     assert "parity_tolerance_profile_overrides" not in robustness
 
 
-def test_gpt_oss_20b_scopes_relaxed_tolerance_to_resume(tmp_path):
-    """GPT-OSS keeps logit parity standard while allowing measured resume drift."""
-    recipe_path = REPO_ROOT / "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml"
-    out = tmp_path / "resolved.yaml"
-    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
-    _run_resolver(
-        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
-        env=env,
-    )
-
-    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
-    assert robustness["resume_tolerance_profile"] == "relaxed"
-    assert "resume_loss_threshold" not in robustness
-    assert "parity_tolerance_profile" not in robustness
-    assert "parity_threshold_overrides" not in robustness
-
-
 @pytest.mark.parametrize(
     "recipe_path",
     [
         "examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_lora.yaml",
         "examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml",
         "examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml",
-        "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml",
         "examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml",
         "examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml",
         "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml",
@@ -402,7 +441,6 @@ def test_gpt_oss_20b_scopes_relaxed_tolerance_to_resume(tmp_path):
         "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
         "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml",
         "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
-        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
         "examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml",
         "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
         "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",

@@ -130,3 +130,7 @@ freeze_config:
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

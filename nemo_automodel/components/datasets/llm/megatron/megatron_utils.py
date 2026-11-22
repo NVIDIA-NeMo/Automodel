@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import fcntl
 import hashlib
 import os
 import sys
@@ -21,7 +20,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import List, Tuple
 
-_HELPER_CACHE_ROOT = Path("/tmp") / f"nemo_automodel_{os.getuid()}"
+from nemo_automodel.shared.import_utils import UnavailableError, safe_import
+
+_HAS_FCNTL, fcntl = safe_import("fcntl")
+_HELPER_CACHE_ROOT = Path("/tmp") / f"nemo_automodel_{os.getuid()}" if hasattr(os, "getuid") else None
 
 
 def get_blend_from_list(
@@ -69,7 +71,7 @@ def get_blend_from_list(
 def compile_helper() -> ModuleType:
     """Load the CPU dataset helpers from a locked, node-local build cache.
 
-    Requires a C++ compiler and Ninja. Sources and build artifacts live in a
+    Requires POSIX file locking, a C++ compiler, and Ninja. Sources and build artifacts live in a
     per-user directory under ``/tmp``, independent of ``TORCH_EXTENSIONS_DIR``
     and ``TMPDIR``. Each source and Python/PyTorch environment has its own
     cache entry. An exclusive file lock covers source generation, compilation,
@@ -79,6 +81,9 @@ def compile_helper() -> ModuleType:
     Returns:
         The compiled module containing the dataset indexing functions.
     """
+    if not _HAS_FCNTL or _HELPER_CACHE_ROOT is None:
+        raise UnavailableError("Megatron dataset helper compilation requires POSIX file locking and user IDs.")
+
     import torch
     from torch.utils.cpp_extension import load_inline
 

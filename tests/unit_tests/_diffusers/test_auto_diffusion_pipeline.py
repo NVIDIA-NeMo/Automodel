@@ -214,6 +214,17 @@ def test_is_fp8_training_safe_linear_rejects_known_unsafe_cases(name, linear):
     assert not _is_fp8_training_safe_linear(name, linear)
 
 
+@pytest.mark.parametrize("name", ["blocks.0.attn.add_q_proj", "blocks.0.txt_mlp.net.2"])
+def test_is_fp8_training_safe_linear_honors_excluded_name_fragments(name):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _is_fp8_training_safe_linear
+
+    linear = torch.nn.Linear(32, 64)
+
+    assert _is_fp8_training_safe_linear(name, linear)
+    assert not _is_fp8_training_safe_linear(name, linear, fp8_exclude=("add_q_proj", "txt_mlp"))
+    assert _is_fp8_training_safe_linear("blocks.0.attn.to_q", linear, fp8_exclude=("add_q_proj", "txt_mlp"))
+
+
 def test_replace_linear_with_transformer_engine_copies_weights_and_skips_unsafe_modules():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
 
@@ -247,6 +258,25 @@ def test_replace_linear_with_transformer_engine_copies_weights_and_skips_unsafe_
     assert not module.safe.weight.requires_grad
     assert torch.allclose(module.safe.weight, safe_weight)
     assert torch.allclose(module.nested[0].weight, nested_weight)
+
+
+def test_replace_linear_with_transformer_engine_keeps_excluded_modules_in_high_precision():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
+
+    class FakeTransformerEngineLinear(torch.nn.Linear):
+        def __init__(self, in_features, out_features, bias=True, device=None, params_dtype=None):
+            super().__init__(in_features, out_features, bias=bias, device=device, dtype=params_dtype)
+
+    module = torch.nn.ModuleDict({"to_q": torch.nn.Linear(16, 16), "add_q_proj": torch.nn.Linear(16, 16)})
+    fake_transformer_engine = SimpleNamespace(pytorch=SimpleNamespace(Linear=FakeTransformerEngineLinear))
+    with patch(f"{MODULE_PATH}.safe_import_te", return_value=(True, fake_transformer_engine)):
+        converted = _replace_linear_with_transformer_engine(
+            module, "transformer", fp8_safe_only=True, fp8_exclude=("add_q_proj",)
+        )
+
+    assert converted == 1
+    assert isinstance(module["to_q"], FakeTransformerEngineLinear)
+    assert not isinstance(module["add_q_proj"], FakeTransformerEngineLinear)
 
 
 def test_replace_linear_with_transformer_engine_requires_optional_dependency():
@@ -657,6 +687,85 @@ def test_from_pretrained_components_to_load_filters_modules():
     assert mock_move.call_args[0][0] is unet
 
 
+@pytest.mark.parametrize("move_to_device", [False, True])
+@pytest.mark.parametrize(
+    "components_to_load,components_to_parallelize",
+    [(["transformer"], None), (None, ["transformer"]), (None, [])],
+)
+def test_from_pretrained_separates_device_placement_from_parallelization(
+    move_to_device, components_to_load, components_to_parallelize
+):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    modules = {name: DummyModule() for name in ("text_encoder", "transformer", "vae")}
+    pipe = DummyPipeline(modules)
+    mesh_context = SimpleNamespace(strategy_config=FSDP2Config(), cp_size=2, ep_size=1)
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline.from_pretrained", return_value=pipe),
+        patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
+        patch(f"{MODULE_PATH}._move_module_to_device") as move,
+        patch(f"{MODULE_PATH}.attach_parallelizer"),
+        patch(f"{MODULE_PATH}._enable_context_parallel") as enable_cp,
+        patch(f"{MODULE_PATH}.parallelize_model", side_effect=lambda module, context: module) as parallelize,
+        patch(f"{MODULE_PATH}.compile_parallelized_model"),
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            "dummy",
+            mesh_context=mesh_context,
+            device=torch.device("cpu"),
+            move_to_device=move_to_device,
+            components_to_load=components_to_load,
+            components_to_parallelize=components_to_parallelize,
+        )
+
+    moved_names = (components_to_load or list(modules)) if move_to_device else []
+    assert move.call_args_list == [call(modules[name], torch.device("cpu"), torch.bfloat16) for name in moved_names]
+    selected = components_to_load if components_to_parallelize is None else components_to_parallelize
+    assert parallelize.call_args_list == [call(modules[name], mesh_context) for name in selected]
+    assert enable_cp.call_args_list == [call(modules[name], name, mesh_context) for name in selected]
+
+
+def test_generation_load_pipeline_places_all_components_but_parallelizes_only_transformer():
+    import examples.diffusion.generate.generate as gen
+    from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
+
+    modules = {name: DummyModule().double() for name in ("text_encoder", "transformer", "vae")}
+    pipe = DummyPipeline(modules)
+    mesh_context = SimpleNamespace(strategy_config=FSDP2Config(), cp_size=2, ep_size=1)
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(pretrained_model_name_or_path="dummy"),
+        inference=SimpleNamespace(dtype="float32"),
+        distributed=SimpleNamespace(parallelism=object()),
+    )
+    dist_info = object()
+    with (
+        # generate.py imports the resolver from _hf_cache itself, so the module-level
+        # autouse patch on auto_diffusion_pipeline does not cover this call.
+        patch("nemo_automodel._diffusers._hf_cache.resolve_diffusion_model_dir", side_effect=lambda model_id: model_id),
+        patch.object(gen, "_build_mesh_context", return_value=mesh_context) as build_mesh,
+        patch.object(adp, "DIFFUSERS_AVAILABLE", True),
+        patch.object(adp.DiffusionPipeline, "from_pretrained", return_value=pipe),
+        patch.object(adp, "_choose_device", return_value=torch.device("cpu")),
+        patch.object(adp.torch.distributed, "is_initialized", return_value=True),
+        patch.object(adp, "_move_module_to_device", wraps=adp._move_module_to_device) as move,
+        patch.object(adp, "attach_parallelizer"),
+        patch.object(adp, "_enable_context_parallel") as enable_cp,
+        patch.object(adp, "parallelize_model", side_effect=lambda module, context: module) as parallelize,
+        patch.object(adp, "compile_parallelized_model"),
+    ):
+        assert gen.load_pipeline(cfg, dist_info) is pipe
+
+    build_mesh.assert_called_once_with(cfg.distributed.parallelism, dist_info)
+    assert move.call_args_list == [call(module, torch.device("cpu"), torch.float32) for module in modules.values()]
+    assert all(next(module.parameters()).dtype == torch.float32 for module in modules.values())
+    enable_cp.assert_called_once_with(modules["transformer"], "transformer", mesh_context)
+    parallelize.assert_called_once_with(modules["transformer"], mesh_context)
+    assert all(
+        hasattr(module, "_pre_shard_hf_state_dict_keys") == (name == "transformer") for name, module in modules.items()
+    )
+
+
 def test_from_pretrained_applies_transformer_qkv_and_te_options():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
@@ -678,10 +787,13 @@ def test_from_pretrained_applies_transformer_qkv_and_te_options():
             compact_fused_qkv_projections=True,
             transformer_engine_linear=True,
             transformer_engine_fp8_safe_only=True,
+            transformer_engine_fp8_exclude=("txt_mlp",),
         )
 
     mock_fuse.assert_called_once_with(transformer, "transformer", compact=True)
-    mock_replace_linear.assert_called_once_with(transformer, "transformer", fp8_safe_only=True)
+    mock_replace_linear.assert_called_once_with(
+        transformer, "transformer", fp8_safe_only=True, fp8_exclude=("txt_mlp",)
+    )
 
 
 def test_from_pretrained_rejects_compact_qkv_without_fusion():
@@ -1121,3 +1233,156 @@ def test_apply_parallelization_skips_cp_when_disabled(monkeypatch):
     adp._apply_parallelization(pipe, context, ["transformer"])
 
     enable_cp.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Modular checkpoint loading (modular_model_index.json, e.g. FLUX.3)
+# ---------------------------------------------------------------------------
+
+
+def _write_modular_index(tmp_path, entry=("diffusers", "FakeTransformer")):
+    import json
+
+    index = {
+        "_class_name": "Flux3ModularPipeline",
+        "_blocks_class_name": "Flux3AutoBlocks",
+        "transformer": [
+            entry[0],
+            entry[1],
+            {
+                "type_hint": list(entry),
+                "pretrained_model_name_or_path": str(tmp_path),
+                "subfolder": "transformer",
+                "variant": None,
+                "revision": None,
+            },
+        ],
+    }
+    (tmp_path / "modular_model_index.json").write_text(json.dumps(index))
+
+
+def test_from_pretrained_modular_checkpoint_loads_transformer_only(tmp_path):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    _write_modular_index(tmp_path)
+    transformer = DummyModule()
+    mock_cls = MagicMock()
+    mock_cls.from_pretrained.return_value = transformer
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}._import_diffusers_class", return_value=mock_cls) as mock_import,
+    ):
+        pipe = NeMoAutoDiffusionPipeline.from_pretrained(
+            str(tmp_path), move_to_device=False, torch_dtype=torch.bfloat16, load_for_training=True
+        )
+
+    assert isinstance(pipe, NeMoAutoDiffusionPipeline)
+    assert pipe.transformer is transformer
+    mock_import.assert_called_once_with("FakeTransformer")
+    call_args, call_kwargs = mock_cls.from_pretrained.call_args
+    assert call_args == (str(tmp_path),)
+    assert call_kwargs["subfolder"] == "transformer"
+    assert call_kwargs["torch_dtype"] == torch.bfloat16
+
+
+def test_from_pretrained_modular_forwards_config_overrides(tmp_path):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    _write_modular_index(tmp_path)
+    mock_cls = MagicMock()
+    mock_cls.from_pretrained.return_value = DummyModule()
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}._import_diffusers_class", return_value=mock_cls),
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            str(tmp_path),
+            move_to_device=False,
+            transformer_config_overrides={"gen_type": "image", "cond_type": None},
+        )
+
+    call_kwargs = mock_cls.from_pretrained.call_args[1]
+    assert call_kwargs["gen_type"] == "image"
+    assert call_kwargs["cond_type"] is None
+
+
+def test_from_pretrained_config_overrides_rejected_for_classic_checkpoint(tmp_path):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    (tmp_path / "model_index.json").write_text("{}")
+
+    with patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True):
+        with pytest.raises(ValueError, match="transformer_config_overrides is only supported for modular"):
+            NeMoAutoDiffusionPipeline.from_pretrained(
+                str(tmp_path),
+                move_to_device=False,
+                transformer_config_overrides={"gen_type": "image"},
+            )
+
+
+def test_from_pretrained_classic_checkpoint_ignores_modular_path(tmp_path):
+    # When both index files exist, the classic pipeline path wins.
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    (tmp_path / "model_index.json").write_text("{}")
+    _write_modular_index(tmp_path)
+
+    dummy_pipe = DummyPipeline({"transformer": DummyModule()})
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+    ):
+        pipe = NeMoAutoDiffusionPipeline.from_pretrained(str(tmp_path), move_to_device=False)
+
+    assert pipe is dummy_pipe
+    mock_diffusion_pipeline.from_pretrained.assert_called_once()
+
+
+def test_load_modular_transformer_missing_entry_raises(tmp_path):
+    import json
+
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _load_modular_transformer
+
+    (tmp_path / "modular_model_index.json").write_text(json.dumps({"_class_name": "Flux3ModularPipeline"}))
+
+    with pytest.raises(ValueError, match="no valid 'transformer' entry"):
+        _load_modular_transformer(str(tmp_path), torch_dtype=torch.float32)
+
+
+def test_load_modular_transformer_non_diffusers_library_raises(tmp_path):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _load_modular_transformer
+
+    _write_modular_index(tmp_path, entry=("transformers", "SomeModel"))
+
+    with pytest.raises(ValueError, match="only diffusers"):
+        _load_modular_transformer(str(tmp_path), torch_dtype=torch.float32)
+
+
+def test_modular_inference_loads_components_and_preserves_vae_precision(tmp_path):
+    """Inference must return a callable pipeline and retain its FP32 image VAE."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    _write_modular_index(tmp_path)
+    transformer = torch.nn.Linear(2, 2).to(torch.bfloat16)
+    vae = torch.nn.Linear(2, 2).to(torch.float32)
+    original_vae = vae.weight.detach().clone()
+    modular = MagicMock()
+    modular.components = {"transformer": transformer, "vae": vae}
+    modular.transformer = transformer
+    with (
+        patch("diffusers.ModularPipeline.from_pretrained", return_value=modular),
+        patch(f"{MODULE_PATH}._load_modular_transformer", return_value=NeMoAutoDiffusionPipeline(transformer)),
+    ):
+        pipe = NeMoAutoDiffusionPipeline.from_pretrained(
+            str(tmp_path), device=torch.device("cpu"), torch_dtype=torch.bfloat16
+        )
+    assert pipe is modular
+    modular.load_components.assert_called_once_with(dtype={"default": torch.bfloat16, "vae": torch.float32})
+    assert vae.weight.dtype == torch.float32
+    assert torch.equal(vae.weight, original_vae)
+    assert transformer.weight.dtype == torch.bfloat16

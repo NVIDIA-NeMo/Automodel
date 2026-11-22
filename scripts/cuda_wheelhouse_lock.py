@@ -19,6 +19,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import TypedDict
 
@@ -160,10 +161,15 @@ def cache_fingerprint(
     torch_cuda_arch_list: str,
     build_script: Path,
     helper_script: Path = Path(__file__),
+    pyproject: Path = Path("pyproject.toml"),
 ) -> str:
     """Hash the resolved packages and every wheel ABI/build input."""
+    if not re.search(r"@sha256:[0-9a-f]{64}$", cuda_container_image):
+        raise ValueError("CUDA wheelhouse image must be pinned by sha256 digest")
+    with pyproject.open("rb") as project_file:
+        project = tomllib.load(project_file)
     payload = {
-        "schema": 3,
+        "schema": 4,
         "runner_os": runner_os,
         "python_version": python_version,
         "cuda_container_image": cuda_container_image,
@@ -172,6 +178,11 @@ def cache_fingerprint(
         "locked_inputs": locked_inputs,
         "build_script_sha256": hashlib.sha256(build_script.read_bytes()).hexdigest(),
         "helper_script_sha256": hashlib.sha256(helper_script.read_bytes()).hexdigest(),
+        "manifest_script_sha256": hashlib.sha256(
+            Path(__file__).with_name("cuda_wheelhouse_manifest.py").read_bytes()
+        ).hexdigest(),
+        "uv_settings": project.get("tool", {}).get("uv", {}),
+        "build_system": project.get("build-system", {}),
     }
     serialized_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(serialized_payload).hexdigest()

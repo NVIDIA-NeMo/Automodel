@@ -1,11 +1,11 @@
 ---
-title: "Recipes and End-to-End Examples"
-description: ""
+title: "Training Recipes"
+description: "Choose a reusable NeMo AutoModel training workflow and find example configurations for fine-tuning, pretraining, distillation, retrieval, and diffusion models."
 position: 1
 ---
-## Recipes and End-to-End Examples
+Training recipes explain how to configure a workflow and adapt it to your model and data. For a walkthrough of a specific model or task, start with [Tutorials](/tutorials/overview). To check model support and available configurations, see [Model Coverage](/model-coverage/overview).
 
-NeMo Automodel is organized around two key concepts: recipes and components.
+NeMo AutoModel is organized around two key concepts: recipes and components.
 
 Recipes are executable scripts configured with YAML files. Each recipe defines its own training and validation loop, orchestrated through a `step_scheduler`. It specifies the model, dataset, loss function, optimizer, scheduler, checkpointing, and distributed training settings—allowing end-to-end training with a single command.
 
@@ -15,6 +15,23 @@ This page maps the ready-to-run recipes found in the `examples/` directory to th
 
 - Examples root: [examples/ (GitHub)](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples)
 - Getting started: [Install NeMo AutoModel](/get-started/installation)
+
+## Choose a Training Workflow
+
+| Workflow | Guide |
+| --- | --- |
+| Supervised and parameter-efficient fine-tuning | [SFT & PEFT](/recipes-e2e-examples/sft-peft) |
+| Pretraining | [Pretraining](/recipes-e2e-examples/pretraining) |
+| Teacher-student training | [Knowledge Distillation](/recipes-e2e-examples/knowledge-distillation) |
+| Classification | [Sequence Classification](/recipes-e2e-examples/sequence-classification) |
+| Embedding and reranker training | [Retrieval Fine-Tuning](/recipes-e2e-examples/retrieval-finetune) |
+| Large mixture-of-experts models | [Large MoE Fine-Tuning](/recipes-e2e-examples/large-moe-fine-tuning) |
+| Image and video diffusion models | [Diffusion Fine-Tuning](/recipes-e2e-examples/diffusion-fine-tuning) |
+| Diffusion language models | [dLLM Fine-Tuning](/recipes-e2e-examples/dllm-fine-tuning) |
+| Quantization-aware training | [QAT](/recipes-e2e-examples/qat) |
+| Speculative drafter training | [EAGLE](/recipes-e2e-examples/eagle-speculative-decoding), [DFlash](/recipes-e2e-examples/dflash-speculative-decoding), [DSpark](/recipes-e2e-examples/dspark-speculative-decoding) |
+
+The sections below link to example configurations by model type. For help choosing an execution environment, see [Run Jobs](/job-launchers/overview).
 
 ## Large Language Models (LLM)
 This section provides practical recipes and configurations for working with large language models across three core workflows: fine-tuning, pretraining, and knowledge distillation.
@@ -61,7 +78,7 @@ Fine-tuning recipes for VLMs.
 
 - Folder: [examples/vlm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune)
 - Representative family: Gemma 3 (various configurations)
-- How-to guide: [Gemma 3n: Efficient multimodal fine-tuning](/recipes-e2e-examples/gemma-3-3n)
+- Tutorial: [Fine-Tune Gemma 3 and Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
 
 ### Generation
 
@@ -79,7 +96,7 @@ End-to-end ASR fine-tuning of `Qwen3-Omni-30B-A3B-Instruct` on any HuggingFace a
 
 - Folder: [examples/audio_finetune/qwen3_omni_asr](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/audio_finetune/qwen3_omni_asr)
 - Representative model: Qwen3-Omni-30B-A3B-Instruct
-- How-to guide: [Fine-tune Qwen3-Omni for ASR](/recipes-e2e-examples/qwen3-omni-asr)
+- Tutorial: [Fine-Tune Qwen3-Omni for ASR](/recipes-e2e-examples/qwen3-omni-asr)
 
 ## Diffusion Models (Text-to-Image & Text-to-Video)
 

@@ -27,6 +27,8 @@ from nemo_automodel.components.datasets.llm.megatron import megatron_utils
 from nemo_automodel.components.datasets.llm.megatron.helpers import build_sample_idx
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(scope="module")
 def helpers(tmp_path_factory):
@@ -173,3 +175,23 @@ def test_cache_stays_node_local(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
         assert not (tmp_path / "shared-tmp").exists()
     finally:
         compile_helper.cache_clear()
+
+
+def test_import_without_posix_apis() -> None:
+    script = """
+import os
+import sys
+sys.modules["fcntl"] = None
+if hasattr(os, "getuid"):
+    del os.getuid
+from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
+from nemo_automodel.shared.import_utils import UnavailableError
+assert get_blend_from_list(["corpus"]) == (["corpus"], None)
+try:
+    compile_helper()
+except UnavailableError as exc:
+    assert "POSIX" in str(exc)
+else:
+    raise AssertionError("Compilation must reject platforms without POSIX APIs")
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True, timeout=30)

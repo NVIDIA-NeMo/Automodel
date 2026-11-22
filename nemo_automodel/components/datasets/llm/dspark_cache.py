@@ -24,6 +24,7 @@ precompute job write those tensors once and lets training stream them later via
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -80,6 +81,12 @@ def compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, tor
 def tokenizer_chat_template_sha256(tokenizer) -> str:
     """Return a stable identity for the tokenizer's effective (post-override) chat template."""
     template = getattr(tokenizer, "chat_template", None) or ""
+    if not isinstance(template, str):
+        # Tokenizers with several named templates (e.g. default / tool_use) expose a dict.
+        # Without a "default" entry, format_chat_template reads the generation-mask setting from the first
+        # entry, so the order can change the cached loss mask and is kept in the hash. With a "default"
+        # entry the order has no effect, so the keys are sorted.
+        template = json.dumps(template, sort_keys="default" in template)
     return hashlib.sha256(template.encode("utf-8")).hexdigest()
 
 
@@ -99,6 +106,7 @@ def build_cache_manifest(
     mask_reasoning_content: bool,
     chat_template_sha256: str,
     mask_generation_prompt: bool = False,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the DSpark cache manifest.
 
@@ -108,9 +116,9 @@ def build_cache_manifest(
 
     Beyond the tensor-shaping target/cache settings, the manifest records the
     *input identity* of the run (dataset path/split, shuffle seed, masking
-    settings, effective chat template): a rerun into an existing directory with
-    a different input therefore fails the manifest-compatibility check instead
-    of silently interleaving old and new supervision shard by shard.
+    settings, effective chat template and its kwargs): a rerun into an existing
+    directory with a different input therefore fails the manifest-compatibility
+    check instead of silently interleaving old and new supervision shard by shard.
     """
     hidden_size = int(target_text_config.hidden_size)
     return {
@@ -132,6 +140,7 @@ def build_cache_manifest(
         "mask_reasoning_content": bool(mask_reasoning_content),
         "mask_generation_prompt": bool(mask_generation_prompt),
         "chat_template_sha256": chat_template_sha256,
+        "chat_template_kwargs": dict(chat_template_kwargs or {}),
     }
 
 
@@ -139,19 +148,41 @@ _IDENTITY_EXEMPT_FIELDS = ("format_version", "complete")
 # Manifest fields added after the first release, with the value a producer that
 # predates them effectively used; ``read_manifest`` fills them in so older
 # caches compare and train as if they recorded it.
-MANIFEST_DEFAULTS: dict[str, Any] = {"mask_reasoning_content": False, "mask_generation_prompt": False}
+MANIFEST_DEFAULTS: dict[str, Any] = {
+    "mask_reasoning_content": False,
+    "mask_generation_prompt": False,
+    "chat_template_kwargs": {},
+}
+
+
+def manifest_value_identity(value: Any) -> str:
+    """Return the type- and order-sensitive JSON form manifest values are compared by.
+
+    Python equality treats ``False == 0`` and ``1 == 1.0`` as equal and ignores mapping
+    order, recursively, but a chat template observes both: ``tojson`` renders ``false`` vs
+    ``0``, and ``options.items()`` iterates a nested mapping in insertion order. JSON keeps
+    the types and the nested order. Only a top-level mapping's keys are sorted: those are the
+    named template arguments, which a template reads by name, so their order cannot change
+    a render.
+    """
+    if isinstance(value, dict):
+        value = dict(sorted(value.items()))
+    return json.dumps(value)
 
 
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
     """Return the manifest keys whose values differ, ignoring bookkeeping fields.
 
-    ``format_version`` and the ``complete`` marker describe the on-disk state,
-    not the run configuration, so they never count as a mismatch.
+    Values are compared in their JSON form (``manifest_value_identity``), so ``False`` and
+    ``0`` differ, and so does a nested mapping in another order. ``format_version`` and the
+    ``complete`` marker describe the on-disk state, not the run configuration, so they never
+    count as a mismatch.
     """
     return sorted(
         k
         for k in recorded.keys() | manifest.keys()
-        if k not in _IDENTITY_EXEMPT_FIELDS and recorded.get(k) != manifest.get(k)
+        if k not in _IDENTITY_EXEMPT_FIELDS
+        and manifest_value_identity(recorded.get(k)) != manifest_value_identity(manifest.get(k))
     )
 
 
@@ -287,6 +318,7 @@ __all__ = [
     "existing_shard_indices",
     "manifest_mismatch_fields",
     "manifest_path",
+    "manifest_value_identity",
     "read_manifest",
     "read_target_weight_modules",
     "shard_path",

@@ -14,8 +14,10 @@
 
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
+import logging
 import os
 import types
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,7 +32,7 @@ from nemo_automodel._transformers.model_init import (
     _get_bnb_modules_to_not_convert,
     _has_safetensors,
     _init_model,
-    _load_config_with_layer_types_fix,
+    _log_attention_selection,
     _prepopulate_remote_code_cache,
     _propagate_torch_dtype_to_subconfigs,
     _resolve_model_dir,
@@ -40,7 +42,73 @@ from nemo_automodel._transformers.model_init import (
     _try_get_remote_code_model_cls,
     get_hf_config,
 )
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.utils import BackendConfig, generation_config_from_model_config
+
+
+class TestAttentionSelectionLogging:
+    def _model(self, *, native=None, hf="flash_attention_4", vision=None, uses_hf=False):
+        model = nn.Module()
+        model.config = PretrainedConfig(attn_implementation=hf)
+        if native is not None:
+            # Do not let CUDA-dependent RoPE setup warnings pollute attention-log assertions.
+            model.backend = BackendConfig(attn=native, rope_fusion=False)
+        if vision is not None:
+            model.config.vision_config = PretrainedConfig(attn_implementation=vision)
+        if uses_hf:
+            model._uses_hf_attention = True
+        return model
+
+    def test_native_sdpa_and_hf_fa4_are_visible_without_changing_selection(self, caplog):
+        model = self._model(native="sdpa", vision="flash_attention_4")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert "primary text/BSHD=sdpa" in caplog.text
+        assert "HF vision-config dispatch=flash_attention_4" in caplog.text
+        warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "backend.attn='sdpa'" in warnings[0]
+        assert "does not override it" in warnings[0]
+        assert "backend.attn='fa4'" in warnings[0]
+        assert model.backend.attn == "sdpa"
+        assert model.config._attn_implementation == "flash_attention_4"
+
+    @pytest.mark.parametrize("native", ["te", "fa4"])
+    def test_accelerated_native_with_hf_vision_is_not_warned(self, caplog, native):
+        model = self._model(native=native, vision="flash_attention_4")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert f"primary text/BSHD={native}" in caplog.text
+        assert "HF vision-config dispatch=flash_attention_4" in caplog.text
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
+
+    @pytest.mark.parametrize("hf", ["sdpa", "flash_attention_4"])
+    def test_model_owned_hf_attention_wins_even_with_native_backend(self, caplog, hf):
+        model = self._model(native="sdpa", hf=hf, uses_hf=True)
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert f"primary text/BSHD={hf}" in caplog.text
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
+
+    def test_hf_model_logs_live_fallback_without_native_override_warning(self, caplog):
+        model = self._model(hf="sdpa")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert "primary text/BSHD=sdpa" in caplog.text
+        assert "HF vision-config" not in caplog.text
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
+
+    @pytest.mark.parametrize("explicit_backend, requested", [(False, "flash_attention_4"), (True, "sdpa")])
+    def test_warning_requires_explicit_native_backend_and_flash_request(self, caplog, explicit_backend, requested):
+        model = self._model(native="sdpa")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention=requested, explicit_backend=explicit_backend)
+
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
 
 
 class TestBackendModuleOverrides:
@@ -511,7 +579,8 @@ class TestCustomModelGenerationConfig:
     ):
         """The restore is gated on a real GenerationConfig, so a model that cannot generate never touches the hub."""
         GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path)
-        placeholder = MagicMock()
+        placeholder = nn.Module()
+        placeholder.generation_config = None
         mock_resolve_cls.return_value = lambda config, **kwargs: placeholder
         mock_get_hf_config.return_value = self._make_config()
 
@@ -559,15 +628,28 @@ class TestBackendDictCoercion:
         config.name_or_path = "fake/model"
         return config
 
-    def _run_init_model(self, mock_resolve_cls, backend_config_resolver=None, **extra_kwargs):
+    def _run_init_model(
+        self,
+        mock_resolve_cls,
+        backend_config_resolver=None,
+        attn_implementation="flash_attention_2",
+        uses_native_fa4=False,
+        **extra_kwargs,
+    ):
         """Helper to call _init_model with a fake model class and capture kwargs."""
         captured_kwargs = {}
 
         def fake_model_cls(config, **kwargs):
             captured_kwargs.update(kwargs)
-            return MagicMock()
+            model = nn.Module()
+            model.config = config
+            if "backend" in kwargs:
+                model.backend = kwargs["backend"]
+            return model
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        if uses_native_fa4:
+            fake_model_cls._uses_native_fa4 = True
         if backend_config_resolver is not None:
             fake_model_cls.backend_config_resolver = backend_config_resolver
         mock_resolve_cls.return_value = fake_model_cls
@@ -575,7 +657,7 @@ class TestBackendDictCoercion:
         _init_model(
             cls=MagicMock(),
             pretrained_model_name_or_path_or_config=self._make_config(),
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             torch_dtype="auto",
             quantization_config=None,
             force_hf=False,
@@ -598,6 +680,101 @@ class TestBackendDictCoercion:
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_preserves_explicit_native_backend(self, mock_resolve_cls, _mock_download, caplog):
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation="flash_attention_4",
+            uses_native_fa4=True,
+            backend={"attn": "sdpa"},
+        )
+
+        assert isinstance(captured["backend"], BackendConfig)
+        assert captured["backend"].attn == "sdpa"
+        assert "backend.attn='sdpa'" in caplog.text
+        assert "does not override it" in caplog.text
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_does_not_mutate_typed_backend(self, mock_resolve_cls, _mock_download):
+        original = BackendConfig(attn="sdpa", linear="torch")
+        with patch("nemo_automodel._transformers.model_init._apply_backend_module_overrides") as apply_overrides:
+            captured = self._run_init_model(
+                mock_resolve_cls,
+                attn_implementation="flash_attention_4",
+                uses_native_fa4=True,
+                backend=original,
+            )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "sdpa"
+        assert original.attn == "sdpa"
+        assert apply_overrides.call_args.args[1] is captured["backend"]
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_config_node_stays_at_instantiation_boundary(self, mock_resolve_cls, _mock_download):
+        cfg_model = ConfigNode(
+            {
+                "_target_": lambda **kwargs: self._run_init_model(
+                    mock_resolve_cls,
+                    uses_native_fa4=True,
+                    **kwargs,
+                ),
+                "attn_implementation": "flash_attention_4",
+                "backend": {"_target_": BackendConfig, "attn": "sdpa"},
+            }
+        )
+
+        captured = cfg_model.instantiate()
+
+        assert cfg_model.backend.attn == "sdpa"
+        assert captured["backend"].attn == "sdpa"
+
+    @pytest.mark.parametrize("extra_kwargs", [{}, {"backend": None}])
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_resolves_default_native_backend(self, mock_resolve_cls, _mock_download, extra_kwargs):
+        captured = self._run_init_model(
+            mock_resolve_cls, attn_implementation="flash_attention_4", uses_native_fa4=True, **extra_kwargs
+        )
+        assert isinstance(captured["backend"], BackendConfig)
+        assert captured["backend"].attn == "fa4"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_preserves_backend_without_native_consumer(self, mock_resolve_cls, _mock_download):
+        original = BackendConfig(attn="sdpa")
+
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation="flash_attention_4",
+            backend=original,
+        )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "sdpa"
+
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_2", "flash_attention_3"])
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_attention_without_native_alias_preserves_backend(
+        self,
+        mock_resolve_cls,
+        _mock_download,
+        attn_implementation,
+    ):
+        original = BackendConfig(attn="te")
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation=attn_implementation,
+            backend=original,
+        )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "te"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_model_specific_backend_resolver_takes_precedence(self, mock_resolve_cls, _mock_download):
         """Custom models may merge partial mappings onto model-specific stable defaults."""
         resolved_backend = object()
@@ -609,6 +786,7 @@ class TestBackendDictCoercion:
         captured = self._run_init_model(
             mock_resolve_cls,
             backend_config_resolver=_resolve_backend,
+            attn_implementation="flash_attention_4",
             backend={"rms_norm": "te"},
         )
 
@@ -627,7 +805,7 @@ class TestBackendDictCoercion:
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_no_backend_kwarg_unchanged(self, mock_resolve_cls, _mock_download):
         """When no backend is provided, kwargs should not gain one."""
-        captured = self._run_init_model(mock_resolve_cls)
+        captured = self._run_init_model(mock_resolve_cls, attn_implementation="flash_attention_4")
 
         assert "backend" not in captured
 
@@ -689,6 +867,7 @@ def test_remote_code_cache_serialization_uses_model_process_group(tmp_path):
     first_rank.assert_called_once_with(group=process_group)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigNestedKwargs:
     """get_hf_config should filter nested dict kwargs from AutoConfig.from_pretrained."""
 
@@ -733,6 +912,7 @@ class TestGetHfConfigNestedKwargs:
         assert "config" not in call_kwargs
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigCustomRegistry:
     """get_hf_config should prefer Automodel's config registry over Transformers AutoConfig."""
 
@@ -819,6 +999,7 @@ class TestResolveCustomConfigRegistry:
         assert reg.resolve_custom_config_cls("bert") is FakeConfig
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestDictConfigOverrideKeepsCustomPath:
     """NVBugs 6259955 Defect 2: --model.config.* overrides must not flip dispatch off the
     custom model path, and the dict ``config`` must not reach the model constructor."""
@@ -843,7 +1024,9 @@ class TestDictConfigOverrideKeepsCustomPath:
         def fake_model_cls(config, **kwargs):
             captured_args["config"] = config
             captured_kwargs.update(kwargs)
-            return MagicMock()
+            model = nn.Module()
+            model.config = config
+            return model
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
         mock_resolve_cls.return_value = fake_model_cls
@@ -874,13 +1057,14 @@ class TestDictConfigOverrideKeepsCustomPath:
         self, mock_resolve_cls, mock_get_hf_config, mock_download, mock_restore
     ):
         hf_config = self._make_config()
-        hf_config._commit_hash = "a" * 40
         mock_get_hf_config.return_value = hf_config
         captured_kwargs = {}
 
         def fake_model_cls(config, **kwargs):
             captured_kwargs.update(kwargs)
-            return MagicMock()
+            model = nn.Module()
+            model.config = config
+            return model
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
         mock_resolve_cls.return_value = fake_model_cls
@@ -898,6 +1082,7 @@ class TestDictConfigOverrideKeepsCustomPath:
             force_download=True,
             subfolder="nested",
             code_revision="code-main",
+            revision="a" * 40,
         )
 
         assert is_custom is True
@@ -909,7 +1094,6 @@ class TestDictConfigOverrideKeepsCustomPath:
                 "force_download",
                 "subfolder",
                 "revision",
-                "_commit_hash",
                 "code_revision",
             }
             & captured_kwargs.keys()
@@ -1255,141 +1439,21 @@ class TestStreamingBnbSupported:
         assert _streaming_bnb_supported(cls, cfg_type()) is True
 
 
-class TestLayerTypesFix:
-    """_load_config_with_layer_types_fix must truncate layer_types and resolve the right config class."""
-
-    def _config_dict(self, n_layers=45, n_layer_types=48):
-        return {
-            "model_type": "step3p5",
-            "num_hidden_layers": n_layers,
-            "layer_types": ["full_attention"] + ["sliding_attention"] * (n_layer_types - 1),
-            "hidden_size": 4096,
-            "auto_map": {"AutoConfig": "configuration_step3p5.Step3p5Config"},
-        }
-
-    @patch("transformers.dynamic_module_utils.get_class_from_dynamic_module")
-    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
-    def test_truncates_layer_types_via_dynamic_module(self, mock_get_dict, mock_get_cls):
-        mock_get_dict.return_value = (self._config_dict(), {})
-        built = MagicMock()
-        fake_cls = MagicMock()
-        fake_cls.from_dict.return_value = built
-        mock_get_cls.return_value = fake_cls
-
-        result = _load_config_with_layer_types_fix("stepfun-ai/Step-3.5-Flash", "sdpa", trust_remote_code=True)
-
-        assert result is built
-        passed_dict = fake_cls.from_dict.call_args[0][0]
-        assert len(passed_dict["layer_types"]) == 45
-        assert passed_dict["layer_types"][0] == "full_attention"
-        assert fake_cls.from_dict.call_args[1]["attn_implementation"] == "sdpa"
-        mock_get_cls.assert_called_once_with("configuration_step3p5.Step3p5Config", "stepfun-ai/Step-3.5-Flash")
-
-    @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
-    def test_resolves_via_config_mapping_when_not_trust_remote_code(self, mock_get_dict, mock_mapping):
-        cfg_dict = self._config_dict()
-        cfg_dict.pop("auto_map")
-        mock_get_dict.return_value = (cfg_dict, {})
-
-        fake_cls = MagicMock()
-        fake_cls.from_dict.return_value = "built"
-        mock_mapping.get.side_effect = lambda k: fake_cls if k == "step3p5" else None
-
-        result = _load_config_with_layer_types_fix("some/model", "flash_attention_2", trust_remote_code=False)
-
-        assert result == "built"
-        passed_dict = fake_cls.from_dict.call_args[0][0]
-        assert len(passed_dict["layer_types"]) == 45
-        mock_mapping.get.assert_called_once_with("step3p5")
-
-    @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
-    def test_matching_lengths_leaves_layer_types_untouched(self, mock_get_dict, mock_mapping):
-        cfg_dict = self._config_dict(n_layers=45, n_layer_types=45)
-        original = list(cfg_dict["layer_types"])
-        mock_get_dict.return_value = (cfg_dict, {})
-
-        fake_cls = MagicMock()
-        fake_cls.from_dict.return_value = MagicMock()
-        mock_mapping.get.return_value = fake_cls
-
-        _load_config_with_layer_types_fix("some/model", "sdpa", trust_remote_code=False)
-
-        passed_dict = fake_cls.from_dict.call_args[0][0]
-        assert passed_dict["layer_types"] == original
-
-    @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
-    def test_raises_when_config_class_cannot_be_resolved(self, mock_get_dict, mock_mapping):
-        cfg_dict = self._config_dict()
-        cfg_dict.pop("auto_map")
-        cfg_dict["model_type"] = "definitely_not_a_real_model_type_xyz"
-        mock_get_dict.return_value = (cfg_dict, {})
-        mock_mapping.get.return_value = None
-
-        with pytest.raises(ValueError, match="Could not resolve config class"):
-            _load_config_with_layer_types_fix("some/model", "sdpa", trust_remote_code=False)
-
-
-class TestGetHfConfigLayerTypesRetry:
-    """get_hf_config should retry via the layer_types fix helper when AutoConfig raises."""
-
-    @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
-    @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=True)
-    @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
-    def test_retry_on_layer_types_mismatch(self, mock_from_pretrained, _mock_trust, mock_fix):
-        mock_from_pretrained.side_effect = ValueError(
-            "`num_hidden_layers` (45) must be equal to the number of layer types (48)."
-        )
-        fixed_cfg = MagicMock()
-        mock_fix.return_value = fixed_cfg
-
-        result = get_hf_config("stepfun-ai/Step-3.5-Flash", "sdpa")
-
-        assert result is fixed_cfg
-        mock_fix.assert_called_once()
-        call_kwargs = mock_fix.call_args[1]
-        assert call_kwargs["trust_remote_code"] is True
-
-    @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
-    @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=True)
-    @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
-    def test_retry_on_strict_dataclass_validation_error(self, mock_from_pretrained, _mock_trust, mock_fix):
-        """huggingface_hub wraps the validator ValueError in a non-ValueError error type."""
-        from huggingface_hub.errors import StrictDataclassClassValidationError
-
-        cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
-        mock_from_pretrained.side_effect = StrictDataclassClassValidationError(
-            validator="validate_layer_type", cause=cause
-        )
-        fixed_cfg = MagicMock()
-        mock_fix.return_value = fixed_cfg
-
-        result = get_hf_config("stepfun-ai/Step-3.5-Flash", "sdpa")
-
-        assert result is fixed_cfg
-        mock_fix.assert_called_once()
-
-    @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
+@pytest.mark.usefixtures("mock_hub_revision")
+class TestGetHfConfigErrors:
     @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
     @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
-    def test_unrelated_value_error_is_reraised(self, mock_from_pretrained, _mock_trust, mock_fix):
+    def test_unrelated_value_error_is_reraised(self, mock_from_pretrained, _mock_trust):
         mock_from_pretrained.side_effect = ValueError("some totally unrelated failure")
-
         with pytest.raises(ValueError, match="totally unrelated failure"):
             get_hf_config("fake/model", "sdpa")
-        mock_fix.assert_not_called()
 
-    @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
     @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
     @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
-    def test_unrecognized_architecture_still_raises_helpful_error(self, mock_from_pretrained, _mock_trust, mock_fix):
+    def test_unrecognized_architecture_still_raises_helpful_error(self, mock_from_pretrained, _mock_trust):
         mock_from_pretrained.side_effect = ValueError("Unknown model (fake/model) does not recognize this architecture")
-
         with pytest.raises(ValueError, match="pip install --upgrade nemo_automodel"):
             get_hf_config("fake/model", "sdpa")
-        mock_fix.assert_not_called()
 
 
 class TestTryGetRemoteCodeModelCls:
@@ -1516,9 +1580,9 @@ def test_direct_config_and_weights_keep_one_revision(hf_config_hub, monkeypatch)
     from nemo_automodel._transformers import model_init
 
     root, cache, ref, requests = hf_config_hub
-    config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
+    revision = model_init.AutoConfig.resolve_revision("test/config-race", cache_dir=str(root))
+    config = get_hf_config("test/config-race", "eager", cache_dir=str(root), revision=revision)
     assert config.n_embd == 64
-    assert config._commit_hash == "b" * 40
     # Another caller advances or rewrites main after this model chose its config.
     ref.write_text("a" * 40)
     selected = []
@@ -1529,7 +1593,9 @@ def test_direct_config_and_weights_keep_one_revision(hf_config_hub, monkeypatch)
         return path
 
     monkeypatch.setattr(model_init, "snapshot_download", download)
-    model_init._download_model_weights(config, "test/config-race", cache_dir=str(root), local_files_only=True)
+    model_init._download_model_weights(
+        config, "test/config-race", revision=revision, cache_dir=str(root), local_files_only=True
+    )
     assert selected == [str(cache / "snapshots" / ("b" * 40))]
     assert ref.read_text() == "a" * 40
 
@@ -1544,10 +1610,49 @@ def test_registered_config_keeps_resolved_commit(hf_config_hub, monkeypatch):
     config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
     assert isinstance(config, GPT2Config)
     assert config.n_embd == 64
-    assert config._commit_hash == "b" * 40
+    assert not hasattr(config, "_commit_hash")
 
 
 def test_streaming_directory_uses_config_snapshot_and_subfolder(hf_config_hub):
     root, cache, _, _ = hf_config_hub
     result = _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root), subfolder="nested")
     assert result == str(cache / "snapshots" / ("b" * 40) / "nested")
+
+
+def test_model_owned_metadata_reads_keep_explicit_revision(hf_config_hub, monkeypatch):
+    import json
+    from pathlib import Path
+
+    from huggingface_hub import hf_hub_download
+
+    from nemo_automodel._transformers import model_init
+
+    root, _, ref, _ = hf_config_hub
+    revision = model_init.AutoConfig.resolve_revision("test/config-race", cache_dir=root)
+    config = get_hf_config("test/config-race", "eager", cache_dir=root, revision=revision)
+    ref.write_text("a" * 40)
+
+    config.architectures = ["MetadataModel"]
+
+    class MetadataModel(nn.Module):
+        def __init__(self, config, *, revision):
+            super().__init__()
+            self.config = config
+            metadata = hf_hub_download("test/config-race", "config.json", revision=revision, cache_dir=root)
+            self.width = json.loads(Path(metadata).read_text())["n_embd"]
+
+    monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda *args: MetadataModel)
+    is_custom, model = _init_model(
+        cls=MagicMock(),
+        pretrained_model_name_or_path_or_config=config,
+        attn_implementation="eager",
+        torch_dtype="auto",
+        quantization_config=None,
+        force_hf=False,
+        revision=revision,
+        cache_dir=root,
+        local_files_only=True,
+    )
+    assert is_custom
+    assert model.width == config.n_embd == 64
+    assert ref.read_text() == "a" * 40

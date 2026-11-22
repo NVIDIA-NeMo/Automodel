@@ -32,6 +32,7 @@ from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, Ro
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallelizer import apply_fsdp2_sharding_recursively
+from nemo_automodel.shared.import_utils import safe_import_te
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,8 @@ class WanModelParallelizer(ModelParallelizer):
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
+                output_dtype=None,
+                cast_forward_inputs=False,
             )
         if reapply_trainability is not None:
             reapply_trainability(model)
@@ -150,7 +152,8 @@ class HunyuanModelParallelizer(ModelParallelizer):
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                output_dtype=torch.bfloat16,
+                output_dtype=None,
+                cast_forward_inputs=False,
             )
         if activation_checkpointing:
             for index in range(len(model.transformer_blocks)):
@@ -200,13 +203,30 @@ def _validate_qwen_transformer_blocks(model: nn.Module) -> nn.ModuleList:
     return blocks
 
 
+def _te_checkpoint_fn(model: nn.Module) -> Callable | None:
+    """Return Transformer Engine's checkpoint function when ``model`` holds TE linears (FP8 training).
+
+    torch's checkpoint recomputes during backward, after the forward's FP8 autocast has exited, so the recompute takes
+    the bf16 path and its saved-tensor metadata no longer matches (``CheckpointError``). TE's checkpoint replays the
+    FP8 state during the recompute.
+    """
+    has_te, te = safe_import_te()
+    if not has_te or not any(isinstance(module, te.pytorch.Linear) for module in model.modules()):
+        return None
+    return te.pytorch.distributed.checkpoint
+
+
 def _apply_qwen_block_activation_checkpointing(model: nn.Module) -> None:
     blocks = _validate_qwen_transformer_blocks(model)
+    te_checkpoint = _te_checkpoint_fn(model)
     wrapped_count = 0
     for index, block in enumerate(blocks):
         if isinstance(block, CheckpointWrapper):
             continue
-        blocks[index] = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+        if te_checkpoint is not None:
+            blocks[index] = checkpoint_wrapper(block, checkpoint_fn=te_checkpoint, use_reentrant=False)
+        else:
+            blocks[index] = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
         wrapped_count += 1
     logger.info("Applied whole-block activation checkpointing to %d Qwen image transformer blocks", wrapped_count)
 

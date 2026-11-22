@@ -84,6 +84,8 @@ from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from nemo_automodel.components.distributed.mesh import MeshContext
 
 __all__ = [
@@ -177,78 +179,6 @@ def _get_input_output_embeddings(model: nn.Module) -> tuple[nn.Module | None, nn
     return _resolve("get_input_embeddings"), _resolve("get_output_embeddings")
 
 
-def _fully_shard_untied_input_output_embeddings(
-    model: nn.Module,
-    *,
-    mesh: DeviceMesh,
-    mp_policy: MixedPrecisionPolicy,
-    offload_policy: OffloadPolicy | None,
-    input_reshard_after_forward: bool,
-    shard_module: Callable[..., nn.Module],
-) -> None:
-    """Give large trainable untied embedding tables independent FSDP buffers.
-
-    The generic dense path otherwise leaves both tables in the root FSDP unit.
-    With fp32 gradient reduction, that unit allocates one contiguous
-    reduce-scatter input containing both gradients. Keeping the two trainable
-    leaf modules in separate FSDP units bounds that allocation by the larger
-    table instead of their sum. This pass skips tied tables to preserve aliasing,
-    and frozen tables because they have no gradient communication buffer
-    to split. Tables already wrapped as FSDP units retain their existing
-    reshard policy. With an explicit ``reshard_after_forward=True``, a
-    container-hosted head reshards while a newly split top-level head stays
-    gathered. FusedLinearCrossEntropy handles the sharded weight with correct
-    gradients, at the cost of an extra all-gather.
-
-    Args:
-        model: Model whose input and output embedding modules may be sharded.
-        mesh: Device mesh that owns the FSDP shards.
-        mp_policy: Mixed-precision policy used by the surrounding FSDP units.
-        offload_policy: Optional offload policy used by the surrounding FSDP
-            units.
-        input_reshard_after_forward: Whether the input embedding unit reshards
-            its parameters after forward.
-        shard_module: Model sidecar's FSDP sharding primitive.
-    """
-    weights_are_tied = ensure_tied_lm_head(model)
-    input_embeddings, output_embeddings = _get_input_output_embeddings(model)
-    input_weight = getattr(input_embeddings, "weight", None)
-    output_weight = getattr(output_embeddings, "weight", None)
-    weights_are_physically_tied = input_embeddings is not None and (
-        input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
-    )
-    if weights_are_tied or weights_are_physically_tied:
-        logger.info("Skipping independent sharding of tied input/output embeddings")
-        return
-
-    seen: set[int] = set()
-    for role, module, module_reshard_after_forward in (
-        ("input embedding", input_embeddings, input_reshard_after_forward),
-        # The output projection is the last compute unit. Keep it gathered until
-        # backward, matching the old root-owned behavior and allowing
-        # FusedLinearCrossEntropy to consume its mixed-precision compute weight
-        # outside the module's forward.
-        ("output embedding", output_embeddings, False),
-    ):
-        if module is None or id(module) in seen:
-            continue
-        seen.add(id(module))
-        # Skip tables that are themselves FSDP units (e.g. ModuleDict children).
-        # This does not detect ownership by an ancestor FSDP unit.
-        if isinstance(module, FSDPModule):
-            continue
-        if not any(param.requires_grad for param in module.parameters()):
-            continue
-        shard_module(
-            module,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=module_reshard_after_forward,
-            offload_policy=offload_policy,
-        )
-        logger.info("Sharded %s as an independent FSDP unit", role)
-
-
 class ModelParallelizer:
     """Single model-owned parallelization sidecar contract."""
 
@@ -263,11 +193,111 @@ class ModelParallelizer:
         """Apply every requested parallelism and return the parallelized model."""
         from nemo_automodel.components.distributed.model_parallelizer import _apply_model_parallelizer
 
+        self._prepare_model(model, mesh_context)
         return _apply_model_parallelizer(self, model, mesh_context)
+
+    def _prepare_model(self, model: nn.Module, mesh_context: "MeshContext") -> None:
+        """Validate model constraints and install runtime mesh state before strategy dispatch.
+
+        A sidecar can reject unsupported topologies or set model-owned context-parallel
+        state here, before any executor changes parameter ownership. The default needs
+        no preparation; all sidecars retain the inherited public entry point.
+        """
+
+    def _apply_moe(self, model: nn.Module, mesh_context: "MeshContext") -> nn.Module:
+        """Apply the expert-parallel flow selected by ``mesh_context.ep_size > 1``.
+
+        The shared flow walks one decoder ``layers`` stack. A model whose MoE blocks live
+        in several towers overrides this hook and shards them itself.
+        """
+        from nemo_automodel.components.distributed import model_parallelizer
+
+        return model_parallelizer._parallelize_moe(model, mesh_context, parallelizer=self)
+
+    def _apply_unsharded(self, model: nn.Module, mesh_context: "MeshContext") -> nn.Module:
+        """Prepare ``model`` for FSDP2 when the mesh has no sharding dimension (one data-parallel rank).
+
+        The shared flow skips ``fully_shard``, installs activation checkpointing on one decoder
+        ``layers`` stack and wraps the forward in autocast. A model whose blocks live in several
+        towers overrides this hook.
+        """
+        from nemo_automodel.components.distributed import model_parallelizer
+
+        return model_parallelizer._parallelize_unsharded_fsdp2(model, mesh_context, parallelizer=self)
 
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
         """Apply the FSDP2 primitive used by this model sidecar."""
         return fully_shard(module, **kwargs)
+
+    def _fully_shard_untied_input_output_embeddings(
+        self,
+        model: nn.Module,
+        *,
+        mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None,
+        offload_policy: OffloadPolicy | None,
+        input_reshard_after_forward: bool,
+    ) -> None:
+        """Give large trainable untied embedding tables independent FSDP buffers.
+
+        The generic dense path otherwise leaves both tables in the root FSDP unit.
+        With fp32 gradient reduction, that unit allocates one contiguous
+        reduce-scatter input containing both gradients. Keeping the two trainable
+        leaf modules in separate FSDP units bounds that allocation by the larger
+        table instead of their sum. This pass skips tied tables to preserve aliasing,
+        and frozen tables because they have no gradient communication buffer
+        to split. Tables already wrapped as FSDP units retain their existing
+        reshard policy. With an explicit ``reshard_after_forward=True``, a
+        container-hosted head reshards while a newly split top-level head stays
+        gathered. FusedLinearCrossEntropy handles the sharded weight with correct
+        gradients, at the cost of an extra all-gather.
+
+        Args:
+            model: Model whose input and output embedding modules may be sharded.
+            mesh: Device mesh that owns the FSDP shards.
+            mp_policy: Mixed-precision policy used by the surrounding FSDP units.
+            offload_policy: Optional offload policy used by the surrounding FSDP
+                units.
+            input_reshard_after_forward: Whether the input embedding unit reshards
+                its parameters after forward.
+        """
+        weights_are_tied = ensure_tied_lm_head(model)
+        input_embeddings, output_embeddings = _get_input_output_embeddings(model)
+        input_weight = getattr(input_embeddings, "weight", None)
+        output_weight = getattr(output_embeddings, "weight", None)
+        weights_are_physically_tied = input_embeddings is not None and (
+            input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
+        )
+        if weights_are_tied or weights_are_physically_tied:
+            logger.info("Skipping independent sharding of tied input/output embeddings")
+            return
+
+        seen: set[int] = set()
+        for role, module, module_reshard_after_forward in (
+            ("input embedding", input_embeddings, input_reshard_after_forward),
+            # The output projection is the last compute unit. Keep it gathered until
+            # backward, matching the old root-owned behavior and allowing
+            # FusedLinearCrossEntropy to consume its mixed-precision compute weight
+            # outside the module's forward.
+            ("output embedding", output_embeddings, False),
+        ):
+            if module is None or id(module) in seen:
+                continue
+            seen.add(id(module))
+            # Skip tables that are themselves FSDP units (e.g. ModuleDict children).
+            # This does not detect ownership by an ancestor FSDP unit.
+            if isinstance(module, FSDPModule):
+                continue
+            if not any(param.requires_grad for param in module.parameters()):
+                continue
+            self._fully_shard_module(
+                module,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=module_reshard_after_forward,
+                offload_policy=offload_policy,
+            )
+            logger.info("Sharded %s as an independent FSDP unit", role)
 
     def _validate_tp_mesh(self, model: nn.Module, tp_mesh: DeviceMesh) -> None:
         """Validate the model's attention topology against its TP mesh."""
@@ -433,7 +463,8 @@ class ModelParallelizer:
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
+                output_dtype=None,
+                cast_forward_inputs=False,
             )
 
         # Install this only when NeMo actually enters FSDP2 sharding.
@@ -475,13 +506,12 @@ class ModelParallelizer:
         input_embedding_reshard_after_forward = (
             reshard_after_forward if reshard_after_forward is not None else not pp_enabled
         )
-        _fully_shard_untied_input_output_embeddings(
+        self._fully_shard_untied_input_output_embeddings(
             model,
             mesh=dp_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             input_reshard_after_forward=input_embedding_reshard_after_forward,
-            shard_module=self._fully_shard_module,
         )
 
         # Apply FSDP to the root model
@@ -1005,7 +1035,7 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
 
 def _attention_config(model: nn.Module):
     """Resolve the language-model config structurally for TP validation."""
-    candidates: list[tuple[int, object]] = []
+    candidates: list[tuple[int, PretrainedConfig]] = []
     named_modules = getattr(model, "named_modules", None)
     modules = named_modules() if callable(named_modules) else (("", model),)
     for name, module in modules:
@@ -1460,7 +1490,7 @@ def _get_parallel_plan(
                     model_cls.__name__,
                     tp_size,
                 )
-            base_model_tp_plan = {
+            base_model_tp_plan: dict[str, ParallelStyle] = {
                 "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.k_proj": ColwiseParallel(),

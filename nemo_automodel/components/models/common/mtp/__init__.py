@@ -30,6 +30,7 @@ from nemo_automodel.components.models.common.mtp.mtp import (
     MTPModule,
     get_mtp_loss_scaling_factor,
     prepare_mtp_context_parallel_inputs,
+    resolve_mtp_seq_idx,
     roll_tensor,
     shift_packed_tensor,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "MTPModule",
     "get_mtp_loss_scaling_factor",
     "prepare_mtp_context_parallel_inputs",
+    "resolve_mtp_seq_idx",
     "roll_tensor",
     "shift_packed_tensor",
 ]

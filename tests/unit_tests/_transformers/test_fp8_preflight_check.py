@@ -22,6 +22,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 from nemo_automodel._transformers import model_init
@@ -395,6 +396,7 @@ class TestCheckFp8DequantizeWillFit:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestForceHfBranchWiring:
     def test_force_hf_invokes_preflight_before_loader(self, monkeypatch):
         """Drive _init_model with force_hf=True and a sentinel-raising preflight.
@@ -508,7 +510,7 @@ class TestConfigOnlyInitSkipsPreflight:
             name_or_path="fake/config-only",
         )
 
-    class _DummyModel:
+    class _DummyModel(torch.nn.Module):
         pass
 
     def test_force_hf_config_only_does_not_preflight(self, monkeypatch):

@@ -60,3 +60,7 @@ checkpoint:
   checkpoint_dir: /data/runs/vispec_qwen2_5_vl_stage1/checkpoints
   model_save_format: safetensors
   save_consolidated: final
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

@@ -242,6 +242,20 @@ def _load_image(value: Image.Image | str | Path | bytes | _ImageRecord) -> Image
     raise TypeError(f"Unsupported DeepSeek-V4.1 image source: {type(value).__name__}")
 
 
+def _image_size(value: Image.Image | str | Path | bytes | _ImageRecord) -> tuple[int, int]:
+    """Read image dimensions without decoding pixels."""
+    if isinstance(value, Image.Image):
+        return value.size
+    if isinstance(value, dict):
+        for key in ("bytes", "path", "image"):
+            if value.get(key) is not None:
+                return _image_size(value[key])
+        raise ValueError("Image records must contain bytes, path, or image")
+    source = io.BytesIO(value) if isinstance(value, bytes) else value
+    with Image.open(source) as image:
+        return image.size
+
+
 def _preprocess_image(
     value: Image.Image | str | Path | bytes | _ImageRecord,
     config: DeepseekV41VisionConfig,
@@ -323,6 +337,8 @@ class DeepseekV41Processor(ProcessorMixin):
         text: str | list[str],
         images: Image.Image | list[Image.Image] | list[list[Image.Image]] | None = None,
         *,
+        videos: None = None,
+        do_sample_frames: bool = False,
         return_tensors: str | None = None,
         padding: bool | str = False,
         truncation: bool = False,
@@ -334,6 +350,8 @@ class DeepseekV41Processor(ProcessorMixin):
         Args:
             text: Rendered prompt or prompts containing one image placeholder per image.
             images: PIL images grouped per prompt, or one prompt's flat image list.
+            videos: Must be None or empty; video inputs are not supported.
+            do_sample_frames: Native image-collator option; no frames are sampled.
             return_tensors: ``"pt"`` for PyTorch token tensors or None for token lists.
             padding: False, True/``"longest"``, or ``"max_length"``; padding is on the right.
             truncation: Whether max_length removes trailing text and complete trailing images.
@@ -346,6 +364,8 @@ class DeepseekV41Processor(ProcessorMixin):
             pixel_values [all_patches, 3, patch_size, patch_size] and integer
             image_grid_hws [images, 2] when retained image spans are present.
         """
+        if videos:
+            raise ValueError("DeepSeek V4.1 supports images, not video inputs")
         if return_tensors not in (None, "pt"):
             raise ValueError("DeepSeek-V4.1 processor supports return_tensors=None or 'pt'")
         texts = [text] if isinstance(text, str) else list(text)
@@ -428,6 +448,27 @@ class DeepseekV41Processor(ProcessorMixin):
             data["image_grid_hws"] = torch.tensor(all_grids, dtype=torch.long)
         return BatchFeature(data=data, tensor_type=return_tensors)
 
+    def estimate_packed_tokens(self, conversation: Sequence[dict[str, Any]]) -> tuple[int, int]:
+        """Count unshifted chat and image tokens without decoding image pixels.
+
+        Args:
+            conversation: The same ordered chat messages consumed by
+                apply_chat_template, with local image sources in content blocks.
+
+        Returns:
+            Exact unshifted sequence length and number of image-span tokens.
+            Image counts include row separators and learned start/end tokens.
+        """
+        text, images = self._render_chat(conversation, add_generation_prompt=True)
+        ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        if ids.count(self.config.image_token_id) != len(images):
+            raise ValueError("Image placeholders must match the supplied images")
+        media_tokens = 0
+        for image in images:
+            grid = _plan_image_grid(*_image_size(image), self.config.vision_config)
+            media_tokens += grid.llm_height * (grid.llm_width + 1) + 2
+        return len(ids) - len(images) + media_tokens, media_tokens
+
     def apply_chat_template(
         self,
         conversation: Sequence[dict[str, Any]] | Sequence[Sequence[dict[str, Any]]],
@@ -483,7 +524,7 @@ class DeepseekV41Processor(ProcessorMixin):
 
     def _render_chat(
         self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool
-    ) -> tuple[str, list[Image.Image]]:
+    ) -> tuple[str, list[Image.Image | str | Path | bytes | _ImageRecord]]:
         """Render the standard-chat subset of DeepSeek's released encoding.py."""
         normalized: list[tuple[str, str, bool]] = []
         images = []
@@ -513,7 +554,9 @@ class DeepseekV41Processor(ProcessorMixin):
                             value = value["url"]
                         if value is None:
                             raise ValueError("Image content blocks require an image, path, or image_url")
-                        images.append(_load_image(value))
+                        # Rendering/length planning only needs the source.
+                        # Decode once when __call__ materializes image patches.
+                        images.append(value)
                         parts.append(IMAGE_PLACEHOLDER)
                     else:
                         raise ValueError("Only text and image content blocks are supported by standard chat")

@@ -100,7 +100,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             "mlp.experts.gate_up_proj": "mlp.experts.gate_and_up_projs",
             "mlp.experts.down_proj": "mlp.experts.down_projs",
         }
-        if self.backend.attn == "te":
+        if self.backend.attn in ("te", "fa4"):
             self.hf_to_internal_map["self_attn.sinks"] = "self_attn.attn_module.softmax_offset"
 
         # Reverse mapping for to_hf conversion
@@ -297,8 +297,25 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         dtype: torch.dtype = torch.bfloat16,
         rows_per_chunk: int = 32768 * 1024,
     ) -> torch.Tensor:
-        """
-        Convert the mxfp4 weights to bfloat16.
+        """Decode packed MXFP4 expert weights into independent floating-point storage.
+
+        Args:
+            blocks: Uint8 tensor of shape [experts, output_features, groups, packed_bytes], where each group stores
+                ``packed_bytes`` pairs of FP4 values, low nibble first. Checkpoints use 16 bytes per group.
+                DTensor inputs may shard the expert axis on at most one mesh axis, with the expert count divisible
+                by that axis's size; all other placements must replicate. ``scales`` must use the same mesh and
+                placements. These are global shapes; each rank decodes its local expert rows. CPU inputs may move
+                to CUDA when distributed execution has more than one rank.
+            scales: Uint8 tensor of shape [experts, output_features, groups], with one biased base-2 exponent per
+                group. The decoded values are multiplied by ``2 ** (scales - 127)``. Must share ``blocks``' device.
+            dtype: Floating-point output dtype.
+            rows_per_chunk: Maximum number of flattened rank-local [packed_bytes] rows decoded per chunk.
+
+        Returns:
+            Tensor of shape [experts, input_features, output_features], where
+            ``input_features = groups * packed_bytes * 2``, in ``dtype`` with independent storage. Inputs are not
+            mutated. For DTensors, the returned global shape uses expert-axis sharding on ``ep``, input-feature
+            sharding on ``ep_shard``, and replication on other named mesh axes when either axis is present.
 
         Source: https://github.com/huggingface/transformers/blob/869735d37d0f929311ac6611728c482a4414ba8c/src/transformers/integrations/mxfp4.py#L77
         """
@@ -331,17 +348,19 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         else:
             out = torch.empty((rows_total, B * 2), dtype=dtype, device=blocks.device)
 
-        for r0 in range(0, rows_total, rows_per_chunk):
-            r1 = min(r0 + rows_per_chunk, rows_total)
+        # A partial slice of a sharded DTensor can redistribute into fresh
+        # storage. Mutating that slice's local tensor would leave ``out``
+        # uninitialized. Chunk the rank-local storage instead, preserving the
+        # block/scale/output row alignment and writing into the final buffer.
+        local_blocks = blocks.to_local() if hasattr(blocks, "to_local") else blocks
+        local_scales = scales.to_local() if hasattr(scales, "to_local") else scales
+        local_out = out.to_local() if hasattr(out, "to_local") else out
+        for r0 in range(0, local_blocks.shape[0], rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, local_blocks.shape[0])
 
-            blk = blocks[r0:r1]
-            exp = scales[r0:r1]
-            sub = out[r0:r1]
-
-            # Work on local shards to avoid DTensor advanced indexing
-            blk_local = blk.to_local() if hasattr(blk, "to_local") else blk
-            sub_local = sub.to_local() if hasattr(sub, "to_local") else sub
-            exp_local = exp.to_local() if hasattr(exp, "to_local") else exp
+            blk_local = local_blocks[r0:r1]
+            exp_local = local_scales[r0:r1]
+            sub_local = local_out[r0:r1]
 
             # Ensure uint8 for nibble extraction
             blk_local = blk_local.to(torch.uint8)
@@ -354,14 +373,15 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             sub_local[:, 1::2] = lut[idx_hi_local]
 
             torch.ldexp(sub_local, exp_local, out=sub_local)
-            del idx_lo_local, idx_hi_local, blk_local, exp_local, sub_local, blk, exp, sub
+            del idx_lo_local, idx_hi_local, blk_local, exp_local, sub_local
 
         out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
-        del blocks, scales, lut
+        del blocks, scales, lut, local_blocks, local_scales, local_out
 
         # Final logical layout is (n_experts, 2880, hidden_dim) after transpose.
         out = out.transpose(1, 2).contiguous()
-        # Restore desired DTensor sharding: shard experts (dim 0) by 'ep' and hidden dim (dim 2) by 'ep_shard'.
+        # Match native [experts, input, output] storage: EP shards experts and
+        # FSDP shards input features, including TE's transposed per-expert weights.
         if isinstance(out, torch.distributed.tensor.DTensor):
             mesh_dim_names = out.device_mesh.mesh_dim_names
             if "ep" in mesh_dim_names or "ep_shard" in mesh_dim_names:
@@ -370,7 +390,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                     if dim_name == "ep":
                         placements.append(torch.distributed.tensor.Shard(0))
                     elif dim_name == "ep_shard":
-                        placements.append(torch.distributed.tensor.Shard(2))
+                        placements.append(torch.distributed.tensor.Shard(1))
                     else:
                         placements.append(torch.distributed.tensor.Replicate())
                 if placements != out.placements:

@@ -33,7 +33,7 @@ distributed:
   sequence_parallel: false
 
 dataset:
-  _target_: nemo_automodel/components/datasets/llm/mock_seq_cls.py:MockSequenceClassificationDataset
+  _target_: nemo_automodel.components.datasets.llm.mock_seq_cls.MockSequenceClassificationDataset
   num_samples: 32
   num_labels: 2
   vocab_size: 256
@@ -45,7 +45,7 @@ dataloader:
   shuffle: false
 
 validation_dataset:
-  _target_: nemo_automodel/components/datasets/llm/mock_seq_cls.py:MockSequenceClassificationDataset
+  _target_: nemo_automodel.components.datasets.llm.mock_seq_cls.MockSequenceClassificationDataset
   num_samples: 8
   num_labels: 2
   vocab_size: 256

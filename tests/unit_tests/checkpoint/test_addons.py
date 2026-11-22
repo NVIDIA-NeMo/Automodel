@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,16 +22,23 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.addons import (
     ConsolidatedHFAddon,
+    _check_modules_to_save_cover_exported_tensors,
+    _extract_modules_to_save,
     _extract_target_modules,
+    _get_automodel_peft_metadata,
+    _get_hf_peft_config,
     _group_barrier,
     _is_group_rank_0,
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
+    load_automodel_peft_config_dict,
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, validate_peft_trainable_modules
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
 
 def test_group_barrier_uses_model_process_group():
@@ -105,7 +113,10 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
 
 
 @pytest.mark.parametrize("use_ddp", [False, True])
-def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, use_ddp):
+@pytest.mark.parametrize("v4_compatible", [False, True])
+def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(
+    tmp_path: Path, use_ddp: bool, v4_compatible: bool
+) -> None:
     metadata_dir = tmp_path / "metadata"
     metadata_dir.mkdir()
     exporter = SimpleNamespace(validate=MagicMock(), save=MagicMock())
@@ -123,7 +134,7 @@ def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, us
         fqn_to_file_index_mapping={"w": 1},
         fqn_to_dtype_mapping=None,
         original_model_path="/source",
-        v4_compatible=True,
+        v4_compatible=v4_compatible,
     )
 
     exporter.validate.assert_called_once_with(tokenizer=tokenizer, original_model_path="/source")
@@ -131,6 +142,7 @@ def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, us
         hf_metadata_dir=str(metadata_dir),
         tokenizer=tokenizer,
         original_model_path="/source",
+        v4_compatible=v4_compatible,
     )
 
 
@@ -551,3 +563,345 @@ class TestParamWrapperLayoutHintPlumbing:
 
         assert seen["hint"] == "peft-0.18"
         assert model.state_dict_adapter._paramwrapper_layout_hint is None
+
+
+@pytest.mark.parametrize("legacy_defaults", [False, True])
+def test_load_automodel_peft_config_dict_round_trips_the_saved_metadata(tmp_path, legacy_defaults: bool):
+    import json
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+
+    peft = PeftConfig(
+        target_modules=["*.qkv_proj"], dim=16, alpha=8, lora_dtype=torch.bfloat16, use_memory_efficient_lora=False
+    )
+    metadata = _get_automodel_peft_metadata(peft)
+    assert "dim" not in metadata and "alpha" not in metadata
+    assert metadata["use_memory_efficient_lora"] is False
+    metadata.update({"paramwrapper_layout": "peft-0.19.1+", "future_checkpoint_field": True})
+    if legacy_defaults:
+        metadata.pop("use_memory_efficient_lora")
+    (tmp_path / "automodel_peft_config.json").write_text(json.dumps(metadata))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 8}))
+    kwargs = load_automodel_peft_config_dict(str(tmp_path))
+    assert "paramwrapper_layout" not in kwargs and "future_checkpoint_field" not in kwargs
+    loaded = PeftConfig(**kwargs)
+    assert loaded.target_modules == ["*.qkv_proj"] and (loaded.dim, loaded.alpha) == (16, 8)
+    assert loaded.lora_dtype == "torch.bfloat16"
+    assert loaded.use_memory_efficient_lora is legacy_defaults
+
+
+# ----------------------------------------------- PEFT with modules trained in full
+
+
+@pytest.fixture
+def single_rank_process_group(tmp_path):
+    """DCP's full-state-dict collection, used by the PEFT save path, needs a process group."""
+    torch.distributed.init_process_group("gloo", init_method=f"file://{tmp_path}/rendezvous", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class _TinyEncoderClassifier(nn.Module):
+    """LoRA targets in the encoder, a two-layer classification head, and buffers.
+
+    The head owns a persistent and a non-persistent buffer; the root owns a persistent one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Module()
+        self.encoder.query = nn.Linear(4, 4)
+        self.encoder.value = nn.Linear(4, 4)
+        self.encoder.norm = nn.LayerNorm(4)
+        self.classifier = nn.Module()
+        self.classifier.dense = nn.Linear(4, 4)
+        self.classifier.out_proj = nn.Linear(4, 2)
+        self.classifier.register_buffer("label_bias", torch.full((2,), 0.5))
+        self.classifier.register_buffer("scratch", torch.zeros(2), persistent=False)
+        self.register_buffer("position_ids", torch.arange(4))
+
+
+_LORA_KEYS = {
+    f"base_model.model.encoder.{name}.lora_{side}.weight" for name in ("query", "value") for side in ("A", "B")
+}
+_PEFT = PeftConfig(target_modules=["*.query", "*.value"], dim=2, alpha=4, use_triton=False)
+
+
+def _peft_model(unfreeze_modules: list[str]) -> _TinyEncoderClassifier:
+    """The tiny model with LoRA on the encoder and ``unfreeze_modules`` trained in full."""
+    model = _TinyEncoderClassifier()
+    assert apply_lora_to_linear_modules(model, _PEFT) == 2
+    if unfreeze_modules:
+        apply_parameter_freezing(model, {"unfreeze_modules": [{"path": path} for path in unfreeze_modules]})
+    return model
+
+
+_FULL_MODULE_KEYS = {
+    f"base_model.model.{name}"
+    for name in (
+        "classifier.dense.weight",
+        "classifier.dense.bias",
+        "classifier.out_proj.weight",
+        "classifier.out_proj.bias",
+        "classifier.label_bias",
+        "encoder.norm.weight",
+        "encoder.norm.bias",
+    )
+}
+
+
+@pytest.mark.parametrize("local_collection", [False, True], ids=["dcp", "local"])
+def test_peft_model_state_keeps_fully_trained_modules_with_their_persistent_buffers(
+    single_rank_process_group, local_collection: bool
+):
+    """A PEFT checkpoint holds every trainable parameter and the full modules' persistent buffers.
+
+    HF PEFT restores a ``modules_to_save`` module from all of its state-dict entries, so the
+    head's persistent buffer goes with it. Non-persistent buffers and buffers of other modules
+    stay out. The local collection serves pipeline-parallel, expert-parallel and quantized models.
+    """
+    model = _peft_model(["classifier", "encoder.norm"])
+    pp_group = torch.distributed.group.WORLD if local_collection else None
+
+    state = ModelState(model, is_peft=True, pp_group=pp_group).state_dict()
+
+    assert set(state) == _LORA_KEYS | _FULL_MODULE_KEYS
+    expected = model.state_dict()
+    for key in _FULL_MODULE_KEYS:
+        torch.testing.assert_close(state[key], expected[key.removeprefix("base_model.model.")], rtol=0, atol=0)
+
+
+def _wrap_ddp(model: nn.Module) -> nn.Module:
+    return DistributedDataParallel(model)
+
+
+def _wrap_head_for_activation_checkpointing(model: nn.Module) -> nn.Module:
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    model.classifier = checkpoint_wrapper(model.classifier)
+    return model
+
+
+def _compile_head(model: nn.Module) -> nn.Module:
+    model.classifier = torch.compile(model.classifier, backend="eager")
+    return model
+
+
+@pytest.mark.parametrize(
+    ("wrap", "local_collection"),
+    [
+        pytest.param(_wrap_ddp, False, id="ddp"),
+        pytest.param(_wrap_head_for_activation_checkpointing, False, id="activation-checkpoint-dcp"),
+        pytest.param(_wrap_head_for_activation_checkpointing, True, id="activation-checkpoint-local"),
+        pytest.param(_compile_head, False, id="torch-compile-dcp"),
+        pytest.param(_compile_head, True, id="torch-compile-local"),
+    ],
+)
+def test_peft_export_names_ignore_training_wrappers(single_rank_process_group, wrap, local_collection: bool):
+    """Wrappers training adds around modules do not change the exported names or modules_to_save.
+
+    A trainable parameter whose name does not match its state-dict key fails the save, so the
+    names have to follow DCP's normalization through DDP, activation checkpointing and torch.compile.
+    """
+    model = wrap(_peft_model(["classifier", "encoder.norm"]))
+    pp_group = torch.distributed.group.WORLD if local_collection else None
+
+    state = ModelState(model, is_peft=True, pp_group=pp_group).state_dict()
+    config = _get_hf_peft_config(_PEFT, ModelState(model, is_peft=True, pp_group=pp_group))
+
+    assert set(state) == _LORA_KEYS | _FULL_MODULE_KEYS
+    assert config["modules_to_save"] == ["classifier", "encoder.norm"]
+
+
+def test_lora_only_peft_model_state_is_unchanged(single_rank_process_group):
+    """Without modules trained in full, the adapter keeps exactly the LoRA weights."""
+    assert set(ModelState(_peft_model([]), is_peft=True).state_dict()) == _LORA_KEYS
+
+
+def test_peft_model_state_refuses_to_drop_a_trainable_parameter(single_rank_process_group):
+    """A trainable parameter missing from the DCP state dict fails the save instead of vanishing."""
+    model = _peft_model(["classifier"])
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+    def renamed_state_dict(module, options=None):
+        # Stands in for a wrapper whose prefix DCP keeps, so the names no longer match.
+        state = get_model_state_dict(module, options=options)
+        return {f"wrapper.{key}" if key.startswith("classifier.") else key: value for key, value in state.items()}
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict", side_effect=renamed_state_dict
+    ):
+        with pytest.raises(RuntimeError, match="would drop trainable parameters"):
+            ModelState(model, is_peft=True).state_dict()
+
+
+@pytest.mark.parametrize(
+    "wrap", [pytest.param(lambda model: model, id="plain"), pytest.param(_compile_head, id="torch-compile")]
+)
+def test_peft_load_without_dcp_restores_the_buffers_of_modules_stored_whole(single_rank_process_group, wrap):
+    """The expert-parallel save and load paths, which bypass DCP, restore the tensors the checkpoint stores.
+
+    A module trained in full comes back with its persistent buffers, for example an MoE router's
+    score-correction bias, as it does on the DCP path. Buffers outside those modules are left alone.
+    Both paths name tensors as DCP does, so a compiled module round-trips too.
+    """
+    trained = wrap(_peft_model(["classifier", "encoder.norm"]))
+    with torch.no_grad():
+        trained.classifier.label_bias.add_(1.0)
+        for parameter in trained.parameters():
+            if parameter.requires_grad:
+                parameter.add_(torch.randn_like(parameter))
+    state = ModelState(trained, is_peft=True, pp_group=torch.distributed.group.WORLD).state_dict()
+    assert set(state) == _LORA_KEYS | _FULL_MODULE_KEYS
+    state["base_model.model.position_ids"] = torch.full((4,), 7)
+    resumed = wrap(_peft_model(["classifier", "encoder.norm"]))
+
+    ModelState(resumed, is_peft=True, has_expert_parallelism=True).load_state_dict(state)
+
+    torch.testing.assert_close(resumed.classifier.label_bias, trained.classifier.label_bias, rtol=0, atol=0)
+    resumed_parameters = dict(resumed.named_parameters())
+    for name, parameter in trained.named_parameters():
+        if parameter.requires_grad:
+            torch.testing.assert_close(resumed_parameters[name], parameter, rtol=0, atol=0)
+    torch.testing.assert_close(resumed.position_ids, torch.arange(4), rtol=0, atol=0)
+
+
+def test_hf_peft_config_lists_the_largest_fully_trained_modules():
+    """modules_to_save names whole trained modules, which is what HF PEFT wraps and restores.
+
+    Listing ``classifier.dense`` and ``classifier.out_proj`` instead of ``classifier`` breaks
+    loading a sequence-classification adapter, because PEFT always wraps ``classifier`` too.
+    """
+    model = _peft_model(["classifier", "encoder.norm"])
+
+    config = _get_hf_peft_config(_PEFT, ModelState(model, is_peft=True))
+
+    assert config["modules_to_save"] == ["classifier", "encoder.norm"]
+    assert config["target_modules"] == ["encoder.query", "encoder.value"]
+
+
+def test_lora_only_hf_peft_config_has_no_modules_to_save():
+    """Adapters without modules trained in full keep the previous adapter_config.json."""
+    assert "modules_to_save" not in _get_hf_peft_config(_PEFT, ModelState(_peft_model([]), is_peft=True))
+
+
+def test_modules_to_save_split_combined_projections_and_follow_adapter_renames():
+    """modules_to_save uses the same HF names as target_modules and the exported tensors."""
+
+    class _RenamingAdapter(_StubStateDictAdapter):
+        def map_peft_target_module_to_hf(self, name, *, v4_compatible=False):
+            return f"language_model.{name}"
+
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].qkv_proj = nn.Linear(4, 12)
+    model.layers[0].o_proj = nn.Linear(4, 4)
+    model.layers[0].o_proj.requires_grad_(False)
+    model.state_dict_adapter = _RenamingAdapter()
+
+    assert _extract_modules_to_save([model]) == [
+        "language_model.layers.0.k_proj",
+        "language_model.layers.0.q_proj",
+        "language_model.layers.0.v_proj",
+    ]
+
+
+def _model_with_blocks_in(container: type[nn.Module]) -> nn.Module:
+    """LoRA on the head only, and a backbone whose two blocks sit in ``container`` next to a norm."""
+    model = nn.Module()
+    model.backbone = nn.Module()
+    blocks = [nn.LayerNorm(4), nn.LayerNorm(4)]
+    model.backbone.layers = (
+        nn.ModuleDict({str(index): block for index, block in enumerate(blocks)})
+        if container is nn.ModuleDict
+        else nn.ModuleList(blocks)
+    )
+    model.backbone.norm = nn.LayerNorm(4)
+    model.head = nn.Linear(4, 2)
+    assert apply_lora_to_linear_modules(model, PeftConfig(target_modules=["head"], dim=2, alpha=4)) == 1
+    return model
+
+
+@pytest.mark.parametrize("container", [nn.ModuleList, nn.ModuleDict], ids=["module-list", "module-dict"])
+@pytest.mark.parametrize(
+    ("unfreeze_modules", "modules_to_save"),
+    [
+        pytest.param(["backbone.layers"], ["backbone.layers.0", "backbone.layers.1"], id="whole-container"),
+        pytest.param(["backbone.layers.1"], ["backbone.layers.1"], id="one-block"),
+        pytest.param(["backbone"], ["backbone"], id="enclosing-module"),
+    ],
+)
+def test_modules_to_save_never_names_a_module_container(container, unfreeze_modules, modules_to_save):
+    """HF PEFT refuses to wrap a ModuleList or ModuleDict, so a trained one is listed through its blocks.
+
+    A trained enclosing module is still listed whole, the same way a trained classifier is.
+    """
+    model = _model_with_blocks_in(container)
+    apply_parameter_freezing(model, {"unfreeze_modules": [{"path": path} for path in unfreeze_modules]})
+
+    validate_peft_trainable_modules(model)
+    assert _extract_modules_to_save([model]) == modules_to_save
+
+
+def _add_a_trained_parameter_list(model: nn.Module) -> None:
+    model.encoder.scales = nn.ParameterList([nn.Parameter(torch.ones(4))])
+
+
+def _tie_classifier_to_a_second_head(model: nn.Module) -> None:
+    model.head = nn.Linear(4, 2)
+    model.head.weight = model.classifier.out_proj.weight
+
+
+def _add_root_parameter(model: nn.Module) -> None:
+    model.register_parameter("logit_scale", nn.Parameter(torch.ones(1)))
+
+
+def _unfreeze_only_the_norm_bias(model: nn.Module) -> None:
+    apply_parameter_freezing(model, {"unfreeze_parameters": ["encoder.norm.bias"]})
+
+
+def _freeze_the_head_output_bias(model: nn.Module) -> None:
+    apply_parameter_freezing(model, {"freeze_parameters": ["classifier.out_proj.bias"]})
+
+
+@pytest.mark.parametrize(
+    ("unfreeze_modules", "modify", "message"),
+    [
+        pytest.param(["encoder.query"], None, "module also holds LoRA adapters", id="lora-module-base-weight"),
+        pytest.param(["encoder"], None, "module also holds LoRA adapters", id="module-around-lora"),
+        pytest.param(["classifier"], _tie_classifier_to_a_second_head, "registered under several names", id="tied"),
+        pytest.param([], _add_root_parameter, "belong to the root module", id="root-parameter"),
+        pytest.param([], _unfreeze_only_the_norm_bias, "also have frozen parameters", id="unfreeze-part-of-a-module"),
+        pytest.param(
+            ["classifier"], _freeze_the_head_output_bias, "also have frozen parameters", id="freeze-part-of-a-module"
+        ),
+        pytest.param([], _add_a_trained_parameter_list, "belong to a ParameterList", id="parameter-list"),
+    ],
+)
+def test_peft_rejects_trainable_modules_hf_peft_cannot_restore(unfreeze_modules, modify, message):
+    """Layouts the adapter checkpoint cannot restore fail at startup and on save, never silently."""
+    model = _peft_model(unfreeze_modules)
+    if modify is not None:
+        modify(model)
+
+    with pytest.raises(ValueError, match=message):
+        validate_peft_trainable_modules(model)
+    with pytest.raises(ValueError, match=message):
+        _get_hf_peft_config(_PEFT, ModelState(model, is_peft=True))
+
+
+def test_modules_to_save_must_cover_the_exported_full_weights():
+    """The save path rejects an export whose modules_to_save and tensors name different modules."""
+    exported = [
+        "base_model.model.model.norm_f.weight",
+        "base_model.model.model.layers.0.q_proj.lora_A.weight",
+        "base_model.model.model.layers.0.q_proj.lora_B.weight",
+    ]
+    _check_modules_to_save_cover_exported_tensors(["model.norm_f"], exported)
+
+    with pytest.raises(ValueError, match="tensors outside modules_to_save: \\['model.norm_f.weight'\\]"):
+        _check_modules_to_save_cover_exported_tensors(["model.norm"], exported)
+    with pytest.raises(ValueError, match="entries without tensors: \\['lm_head'\\]"):
+        _check_modules_to_save_cover_exported_tensors(["model.norm_f", "lm_head"], exported)

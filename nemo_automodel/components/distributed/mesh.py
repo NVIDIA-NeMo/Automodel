@@ -31,13 +31,13 @@ YAML / dict parsing belongs in the recipe layer — see
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
-    from torch import nn
+    from torch import device, nn
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -120,6 +120,7 @@ class MeshContext:
         cp_ring_degree: Ring-attention factor of the context-parallel axis.
         cp_ulysses_degree: Ulysses factor of the context-parallel axis. ``None``
             lets the consumer use the full context-parallel axis.
+        ddp_device: Explicit DDP placement override. None uses the distributed device resolver.
     """
 
     # Runtime topology.
@@ -138,6 +139,7 @@ class MeshContext:
     # and Ulysses dimensions. ``None`` means pure Ulysses over the full CP axis.
     cp_ring_degree: int = 1
     cp_ulysses_degree: int | None = None
+    ddp_device: "device | None" = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         _validate_mesh_axis_names(self)
@@ -196,14 +198,14 @@ class MeshContext:
         return (MeshAxisName.DP_SHARD_CP,)
 
     # @akoumpa: we will deprecate `pipeline_axis_kwargs` in 26.04.
-    def pipeline_axis_kwargs(self) -> Dict[str, object]:
+    def pipeline_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
         """Axis-name kwargs for ``AutoPipeline``."""
         return {
             "pp_axis_name": MeshAxisName.PP,
         } | self.parallelize_axis_kwargs()
 
     # @akoumpa: we will deprecate `parallelize_axis_kwargs` in 26.04.
-    def parallelize_axis_kwargs(self) -> Dict[str, object]:
+    def parallelize_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
         """Axis-name kwargs for ``parallelize_fn`` (EP/FSDP, no ``pp_axis_name``)."""
         return {
             "dp_axis_names": self._dp_axis_names(),

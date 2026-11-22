@@ -72,3 +72,7 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: true
   dequantize_base_checkpoint: true
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

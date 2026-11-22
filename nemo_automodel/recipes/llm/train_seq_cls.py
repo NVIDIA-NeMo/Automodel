@@ -35,9 +35,8 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -86,6 +85,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         self._log_experiment_details()
         self._log_library_versions()
 
@@ -116,6 +122,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             # Preserve the pre-freeze_config behavior for existing PEFT sequence
             # classification recipes; new configs declare this selector directly.
             freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
+            logging.info(
+                "freeze_config is not set: training the classifier in full next to the LoRA adapters "
+                "(unfreeze_modules: [{glob: '*classifier'}]). Keep the classifier out of the PEFT targets."
+            )
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,
@@ -125,6 +135,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             cfg_freeze=freeze_config,
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
@@ -139,15 +150,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         def materialize_loader(config):
             build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
-            with ScopedRNG(seed=config.seed, ranked=True):
-                return config.build(
-                    tokenizer=self.tokenizer,
-                    dataset_build_context=build_context,
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                    pp_enabled=False,
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
-                )
+            return config.build(
+                tokenizer=self.tokenizer,
+                dataset_build_context=build_context,
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                pp_enabled=False,
+                cp_size=self.cfg.get("distributed.cp_size", 1),
+            )
 
         self.dataloader = materialize_loader(self.cfg.dataloader)
 
@@ -311,37 +321,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 scheduler.step(1)
 
         # Calculate throughput (tokens per second)
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
-
-        mfu = None
-        mfu_calculator = getattr(self, "mfu_calculator", None)
-        if batches and mfu_calculator is not None:
-            step_flops = 0.0
-            flops_supported = True
-            for batch in batches:
-                input_ids = batch.get("input_ids")
-                if input_ids is None:
-                    flops_supported = False
-                    break
-                batch_flops = mfu_calculator.get_flops(input_ids)
-                if batch_flops is None:
-                    flops_supported = False
-                    break
-                step_flops += float(batch_flops)
-
-            if flops_supported:
-                step_flops = self._dp_allreduce(
-                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
-                ).item()
-                mfu = calculate_mfu(
-                    step_flops / 1e12,
-                    self.dist_env.world_size,
-                    time_delta,
-                    reference_mfu=mfu_calculator.reference_mfu,
-                )
+        tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
 
         # Global summed loss over every micro-batch and DP rank, divided by the
         # same global label count as the gradient. Dividing by len(batches)
@@ -385,14 +365,24 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 out = model(**batch)
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
-            total_loss += loss.detach()
+            # Summed, not the batch mean: the last batch of a shard is usually
+            # short, so batch means cannot be averaged with equal weight. In FP32,
+            # so a half-precision loss cannot overflow while the sum grows.
+            total_loss += loss.detach().float() * labels.numel()
 
             # Collect predictions for accuracy
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds)
             all_labels.append(labels.view(-1))
-            count += 1
+            count += labels.numel()
 
+        # Each DP rank validates a disjoint shard; reduce like the accuracy below.
+        if self._get_dp_group_size(include_cp=True) > 1:
+            device = self.dist_env.device
+            total_loss = self._dp_allreduce(
+                torch.as_tensor(total_loss, dtype=torch.float32, device=device), include_cp=True
+            )
+            count = self._dp_allreduce(torch.tensor(count, dtype=torch.float32, device=device), include_cp=True).item()
         total_loss = total_loss if count == 0 else total_loss / count
 
         # Calculate accuracy
@@ -443,6 +433,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
         self.metric_logger_valid.log(log_data)
@@ -476,10 +469,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB) according to step_scheduler frequency
+        # Log to remote services (WandB, Trackio) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)

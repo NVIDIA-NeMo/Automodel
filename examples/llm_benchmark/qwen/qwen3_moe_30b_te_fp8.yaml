@@ -114,6 +114,8 @@ optimizer:
   foreach: false
 
 ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100
   time: "00:15:00"
   nodes: 1
   known_issue_id: AM-150

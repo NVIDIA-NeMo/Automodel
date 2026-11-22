@@ -40,19 +40,35 @@ _HAS_FLASH_MLA, _FLASH_MLA_SPARSE_FWD = safe_import_from(
 _SUPPORTED_ATTENTION_HEAD_DIMS = (512, 576)
 _VALUE_HEAD_DIM = 512
 _FLASH_MLA_TOPK_ALIGNMENT = 512
+# cuDNN Frontend >= 1.29 ships its own SM100 sparse-prefill forward (``sparse_attention_forward_wrapper``); it stands
+# in for FlashMLA when that package is absent. Resolved lazily so tests can patch ``_CUDNN_DSA``. The kernel rejects
+# other architectures, so SM90 still needs FlashMLA for the forward.
+
+
+def _on_sm100_family() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
+
+def _cudnn_forward_available() -> bool:
+    return (
+        bool(_HAS_CUDNN_DSA)
+        and callable(getattr(_CUDNN_DSA, "sparse_attention_forward_wrapper", None))
+        and _on_sm100_family()
+    )
 
 
 def is_cudnn_sparse_attention_available() -> bool:
-    """Return whether the cuDNN backward and FlashMLA forward runtimes import."""
-    return bool(_HAS_CUDNN_DSA and _HAS_FLASH_MLA)
+    """Return whether the cuDNN backward and a sparse forward (FlashMLA, or cuDNN >= 1.29 on SM100) are usable."""
+    return bool(_HAS_CUDNN_DSA) and (bool(_HAS_FLASH_MLA) or _cudnn_forward_available())
 
 
 def _require_available() -> None:
-    """Raise when either optional sparse-attention runtime is unavailable."""
+    """Raise when the optional sparse-attention runtimes are unavailable."""
     if not is_cudnn_sparse_attention_available():
         raise RuntimeError(
-            "cuDNN sparse attention requires both nvidia-cudnn-frontend[cutedsl] "
-            "and FlashMLA with flash_mla_sparse_fwd."
+            "cuDNN sparse attention requires nvidia-cudnn-frontend[cutedsl] (>= 1.29 for its forward kernel, "
+            "which runs only on SM100-family GPUs, or any version with the backward kernel plus FlashMLA's "
+            "flash_mla_sparse_fwd, which also covers SM90)."
         )
 
 
@@ -92,23 +108,51 @@ def _compact_and_sort_indices(indices: torch.Tensor, key_count: int) -> tuple[to
     """
     valid = (indices >= 0) & (indices < key_count)
     topk_length = valid.sum(dim=-1, dtype=torch.int32)
-    positions = torch.arange(indices.size(-1), device=indices.device).view(1, -1)
-    compact_order = torch.where(valid, positions, torch.full_like(positions, indices.size(-1))).argsort(dim=-1)
-    indices = torch.gather(indices, -1, compact_order)
-    compact_valid = torch.gather(valid, -1, compact_order)
-    indices = indices.masked_fill(~compact_valid, -1)
+    # One sort does both jobs: valid coordinates ascend, and the key_count sentinel
+    # (strictly above every valid coordinate) pushes invalid entries behind them.
+    # Sorting int32 values directly halves the radix passes of an int64 argsort and
+    # removes the two gathers of the previous compact-then-sort implementation.
+    sort_key = torch.where(valid, indices, key_count).to(torch.int32)
+    sorted_key, _ = sort_key.sort(dim=-1)
+    return sorted_key.masked_fill(sorted_key == key_count, -1).contiguous(), topk_length.contiguous()
 
-    prefix = positions < topk_length.unsqueeze(-1)
-    sort_key = torch.where(prefix, indices, torch.full_like(indices, key_count))
-    sort_order = sort_key.argsort(dim=-1)
-    indices = torch.gather(indices, -1, sort_order)
-    sorted_valid = torch.gather(prefix.expand_as(indices), -1, sort_order)
-    return indices.masked_fill(~sorted_valid, -1).to(torch.int32).contiguous(), topk_length.contiguous()
+
+def _pad_to_topk_alignment(indices: torch.Tensor) -> torch.Tensor:
+    """Pad the sparse width of ``[query_tokens, sparse_width]`` indices to the FlashMLA alignment with ``-1``."""
+    padded_topk = math.ceil(indices.shape[-1] / _FLASH_MLA_TOPK_ALIGNMENT) * _FLASH_MLA_TOPK_ALIGNMENT
+    if padded_topk == indices.shape[-1]:
+        return indices
+    return torch.nn.functional.pad(indices, (0, padded_topk - indices.shape[-1]), value=-1)
+
+
+def plan_sparse_indices(indices: torch.Tensor, key_count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Canonicalize sparse indices once for every call that will consume them.
+
+    :func:`cudnn_sparse_attention` derives this per call when ``topk_length`` is ``None``: the compact
+    ascending valid prefix, padded to the FlashMLA alignment, and the valid-prefix lengths. A model whose
+    layers share one selection (DeepSeek-V4.1's CSA2 lineages) builds the plan once and passes
+    ``topk_length`` precomputed, so the sort and its prologue run once per selection instead of once per layer.
+
+    Args:
+        indices: Integer tensor of shape ``[query_tokens, sparse_width]`` with global K/V coordinates and
+            negative invalid entries.
+        key_count: Number of rows in the flattened K/V tensor.
+
+    Returns:
+        Contiguous int32 indices of shape ``[query_tokens, padded_width]`` (ascending valid prefix, ``-1``
+        suffix, ``padded_width`` a multiple of 512) and contiguous int32 valid-prefix lengths of shape
+        ``[query_tokens]``.
+    """
+    sorted_indices, topk_length = _compact_and_sort_indices(indices, key_count)
+    return _pad_to_topk_alignment(sorted_indices).contiguous(), topk_length
 
 
 def _padded_head_count(num_heads: int, major: int) -> int:
     """Return the FlashMLA-supported query-head count for one SM generation."""
     if major >= 10:
+        # FlashMLA rejects H96, but accepts its zero-padded H128 forward.
+        if num_heads == 96:
+            return 128
         for padded in (64, 128):
             if num_heads == padded or (num_heads < padded and padded % num_heads == 0):
                 return padded
@@ -160,8 +204,9 @@ class _CudnnSparseAttention(torch.autograd.Function):
         topk_length: torch.Tensor | None,
         all_rows_nonempty: bool,
         valid_row_indices: torch.Tensor | None,
+        attn_sink: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run FlashMLA forward and save tensors required by cuDNN backward.
+        """Run the sparse forward (FlashMLA, else cuDNN) and save tensors required by cuDNN backward.
 
         Args:
             ctx: Autograd context used to save forward tensors and scalar metadata.
@@ -175,31 +220,45 @@ class _CudnnSparseAttention(torch.autograd.Function):
             all_rows_nonempty: Whether every query has a positive valid prefix.
             valid_row_indices: Optional int64 indices of nonempty queries with shape
                 ``[valid_query_tokens]``.
+            attn_sink: Optional FP32 per-head attention-sink logits of shape ``[heads]``
+                (DeepSeek-V4.1); ``None`` keeps the sink disabled (``-inf``).
 
         Returns:
             CUDA BF16 latent values of shape ``[query_tokens, heads, 512]``.
         """
         kv = kv_latent.squeeze(1).contiguous()
         if topk_length is None:
-            indices, topk_length = _compact_and_sort_indices(topk_indices.squeeze(1), kv.shape[0])
+            indices, topk_length = plan_sparse_indices(topk_indices.squeeze(1), kv.shape[0])
         else:
-            indices = topk_indices.squeeze(1).contiguous()
-        padded_topk = math.ceil(indices.shape[-1] / _FLASH_MLA_TOPK_ALIGNMENT) * _FLASH_MLA_TOPK_ALIGNMENT
-        if padded_topk != indices.shape[-1]:
-            indices = torch.nn.functional.pad(indices, (0, padded_topk - indices.shape[-1]), value=-1)
+            indices = _pad_to_topk_alignment(topk_indices.squeeze(1).contiguous())
 
-        attn_sink = torch.full((q.shape[1],), float("-inf"), dtype=torch.float32, device=q.device)
+        has_sink = attn_sink is not None
+        if attn_sink is None:
+            attn_sink = torch.full((q.shape[1],), float("-inf"), dtype=torch.float32, device=q.device)
+        attn_sink = attn_sink.detach().to(torch.float32).contiguous()
         q_kernel, sink_kernel = _pad_attention_heads(q.contiguous(), attn_sink, padded_heads)
-        out_kernel, _max_logits, lse_kernel = _FLASH_MLA_SPARSE_FWD(
-            q_kernel,
-            kv.unsqueeze(1),
-            indices.unsqueeze(1),
-            softmax_scale,
-            d_v=_VALUE_HEAD_DIM,
-            attn_sink=sink_kernel,
-            topk_length=topk_length,
-            indexer_topk=0,
-        )
+        if _HAS_FLASH_MLA:
+            out_kernel, _max_logits, lse_kernel = _FLASH_MLA_SPARSE_FWD(
+                q_kernel,
+                kv.unsqueeze(1),
+                indices.unsqueeze(1),
+                softmax_scale,
+                d_v=_VALUE_HEAD_DIM,
+                attn_sink=sink_kernel,
+                topk_length=topk_length,
+                indexer_topk=0,
+            )
+        else:
+            # cuDNN >= 1.29 sparse-prefill forward; same layouts as the backward wrapper (Q [S,H,D], KV [S_kv,D]).
+            fwd = _CUDNN_DSA.sparse_attention_forward_wrapper(
+                q_kernel,
+                kv,
+                indices,
+                attn_sink=sink_kernel,
+                topk_length=topk_length,
+                softmax_scale=softmax_scale,
+            )
+            out_kernel, lse_kernel = fwd["out"], fwd["lse"]
         out = out_kernel[:, : q.shape[1]].contiguous()
         lse = lse_kernel[:, : q.shape[1]].contiguous()
         if not all_rows_nonempty:
@@ -212,6 +271,7 @@ class _CudnnSparseAttention(torch.autograd.Function):
         ctx.padded_heads = padded_heads
         ctx.all_rows_nonempty = all_rows_nonempty
         ctx.has_cached_valid_rows = valid_row_indices is not None
+        ctx.has_sink = has_sink
         return out
 
     @staticmethod
@@ -224,10 +284,11 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 ``[query_tokens, heads, 512]``.
 
         Returns:
-            Gradients for the eight forward inputs: query tensor of shape
+            Gradients for the nine forward inputs: query tensor of shape
             ``[query_tokens, heads, head_dim]``, latent K/V tensor of shape
-            ``[key_tokens, 1, head_dim]``, then ``None`` for scalar and metadata
-            inputs.
+            ``[key_tokens, 1, head_dim]``, ``None`` for scalar and metadata
+            inputs, and the FP32 sink gradient of shape ``[heads]`` when a sink
+            was given (``None`` otherwise).
         """
         q, kv, out, lse, attn_sink, indices, topk_length, cached_valid_rows = ctx.saved_tensors
         valid_row_indices = None
@@ -250,7 +311,9 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 used_dummy = True
                 q_input = torch.zeros_like(q[:1])
                 out_input = torch.zeros_like(out[:1])
-                grad_input = torch.zeros_like(grad_output[:1])
+                # zeros_like preserves a head-major gradient's ambiguous size-one stride;
+                # cuDNN's CuTe conversion requires a canonical contiguous dummy layout.
+                grad_input = grad_output.new_zeros((1, *grad_output.shape[1:]))
                 lse_input = torch.zeros_like(lse[:1])
                 indices_kernel = torch.zeros_like(indices[:1])
                 topk_length_kernel = torch.ones_like(topk_length[:1])
@@ -262,17 +325,19 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 indices_kernel = indices.index_select(0, valid_row_indices)
                 topk_length_kernel = topk_length.index_select(0, valid_row_indices)
 
-        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, ctx.padded_heads)
-        if ctx.padded_heads == q.shape[1]:
+        # cuDNN supports native H96 (including D576); only FlashMLA forward needs head padding.
+        backward_heads = 96 if q.shape[1] == 96 else ctx.padded_heads
+        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, backward_heads)
+        if backward_heads == q.shape[1]:
             out_kernel = out_input
             grad_kernel = grad_input.contiguous()
             lse_kernel = lse_input
         else:
-            out_kernel = out_input.new_zeros((out_input.shape[0], ctx.padded_heads, out_input.shape[2]))
+            out_kernel = out_input.new_zeros((out_input.shape[0], backward_heads, out_input.shape[2]))
             out_kernel[:, : out_input.shape[1]] = out_input
-            grad_kernel = grad_input.new_zeros((grad_input.shape[0], ctx.padded_heads, grad_input.shape[2]))
+            grad_kernel = grad_input.new_zeros((grad_input.shape[0], backward_heads, grad_input.shape[2]))
             grad_kernel[:, : grad_input.shape[1]] = grad_input
-            lse_kernel = lse_input.new_zeros((lse_input.shape[0], ctx.padded_heads))
+            lse_kernel = lse_input.new_zeros((lse_input.shape[0], backward_heads))
             lse_kernel[:, : lse_input.shape[1]] = lse_input
 
         result = _CUDNN_DSA.sparse_attention_backward_wrapper(
@@ -293,7 +358,13 @@ class _CudnnSparseAttention(torch.autograd.Function):
             grad_q = torch.zeros_like(q)
             grad_q.index_copy_(0, valid_row_indices, grad_q_valid)
         grad_kv = result["dkv"].unsqueeze(1).contiguous()
-        return grad_q, grad_kv, None, None, None, None, None, None
+        grad_sink = None
+        if ctx.has_sink and ctx.needs_input_grad[8]:
+            d_sink = result.get("d_sink") if hasattr(result, "get") else None
+            if d_sink is None:
+                raise RuntimeError("cuDNN sparse attention backward did not return d_sink for the attention sink.")
+            grad_sink = d_sink[: q.shape[1]].to(torch.float32).contiguous()
+        return grad_q, grad_kv, None, None, None, None, None, None, grad_sink
 
 
 def cudnn_sparse_attention(
@@ -304,6 +375,7 @@ def cudnn_sparse_attention(
     topk_length: torch.Tensor | None = None,
     all_rows_nonempty: bool = False,
     valid_row_indices: torch.Tensor | None = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse latent attention with FlashMLA forward and cuDNN backward.
 
@@ -322,6 +394,8 @@ def cudnn_sparse_attention(
         all_rows_nonempty: Whether every query has a positive valid-prefix length.
         valid_row_indices: Optional contiguous CUDA int64 indices of nonempty queries
             with shape ``[valid_query_tokens]``.
+        attn_sink: Optional FP32 per-head attention-sink logits of shape ``[heads]``
+            (DeepSeek-V4.1's learnable sink). Differentiable; ``None`` disables the sink.
 
     Returns:
         Contiguous CUDA BF16 latent output tensor of shape
@@ -385,6 +459,13 @@ def cudnn_sparse_attention(
             raise ValueError("valid_row_indices cannot contain more entries than query rows.")
 
     padded_heads = _padded_head_count(q.shape[1], major)
+    if attn_sink is not None:
+        if attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32 or attn_sink.device != q.device:
+            raise ValueError(
+                "attn_sink must be an FP32 tensor on the query device with shape "
+                f"{(q.shape[1],)}, got shape={tuple(attn_sink.shape)}, dtype={attn_sink.dtype}, device={attn_sink.device}."
+            )
+        attn_sink = attn_sink.contiguous()
     return _CudnnSparseAttention.apply(
         q.contiguous(),
         kv_latent.contiguous(),
@@ -394,7 +475,8 @@ def cudnn_sparse_attention(
         topk_length,
         all_rows_nonempty,
         valid_row_indices,
+        attn_sink,
     )
 
 
-__all__ = ["cudnn_sparse_attention", "is_cudnn_sparse_attention_available"]
+__all__ = ["cudnn_sparse_attention", "is_cudnn_sparse_attention_available", "plan_sparse_indices"]

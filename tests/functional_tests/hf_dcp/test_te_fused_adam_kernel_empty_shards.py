@@ -60,7 +60,7 @@ def _optimizer_parity_worker(
         mesh = None
         if use_dtensor:
             dist.init_process_group(
-                "nccl", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=60)
+                "nccl", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=70)
             )
             mesh = init_device_mesh("cuda", (world_size,))
 

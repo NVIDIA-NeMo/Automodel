@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -27,6 +27,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_automodel.components.distributed.tp_replicas import exclude_from_tp_replica_sync
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
@@ -79,6 +80,55 @@ QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS = (
 QWEN3_8_FLASH_NEXT_NGRAM_PADDED_ROWS = 320001536
 
 
+_CAPACITY_MARGIN = 1.25  # capacity mode: padded rows per peer = ceil(calibrated max count x margin), aligned
+_CAPACITY_ALIGN = 64
+_UNTOUCHED = (
+    -2
+)  # receive-buffer fill: distinct from the -1 padding senders write, so an a2a that returns without writing is caught
+
+
+def _segment_rows(
+    split_sizes: tuple[int, ...], capacity: int, device: torch.device, counts: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Row of every compact row inside the ``[world_size * capacity, ...]`` padded exchange buffer.
+
+    Compact rows are ordered by peer rank; peer ``r``'s segment starts at row ``r * capacity`` of the padded buffer.
+    Built on the device from the caller's count tensor (the AllGather row / column: no host round trip) so the
+    packing is a single ``index_copy_`` and the unpacking a single ``index_select`` instead of one ``copy_`` launch
+    per rank — 2 x world_size ``cudaMemcpyAsync`` per exchange, forward and backward (1280 per step at EP64 on the
+    16-node profile). The id exchange builds the send-side and receive-side maps once per lookup; the value
+    exchange reuses them forward (swapped) and backward (swapped back).
+    """
+    total = sum(split_sizes)
+    if counts is None:
+        # no device copy of the counts at hand (tests, CPU): one small host->device copy
+        counts = torch.tensor(split_sizes, dtype=torch.long, device=device)
+    else:
+        counts = counts.to(device=device, dtype=torch.long)  # the caller's AllGather row / column: no host round trip
+    starts = torch.cumsum(counts, 0) - counts
+    rank_of_row = torch.repeat_interleave(torch.arange(len(split_sizes), device=device), counts, output_size=total)
+    rows = torch.arange(total, device=device)
+    return rank_of_row * capacity + (rows - starts[rank_of_row])
+
+
+def _segment_rows_from_counts(counts: torch.Tensor, capacity: int, total: int) -> torch.Tensor:
+    """Row of every compact row inside the ``[world_size * capacity, ...]`` padded buffer, from device-side counts only.
+
+    ``total`` (= ``counts.sum()``) is the one host integer; it is the caller's own row count, so no device-to-host read
+    is needed. Used by the capacity-mode lookup for its send side (pack and unpack).
+    """
+    counts = counts.to(dtype=torch.long)
+    starts = torch.cumsum(counts, 0) - counts
+    rank_of_row = torch.repeat_interleave(torch.arange(counts.numel(), device=counts.device), counts, output_size=total)
+    rows = torch.arange(total, device=counts.device)
+    return rank_of_row * capacity + (rows - starts[rank_of_row])
+
+
+def _aligned_capacity(max_count: int) -> int:
+    """Padded rows per peer for a measured maximum count: margin for drift, aligned, never zero."""
+    return max(_CAPACITY_ALIGN, -(-int(math.ceil(max_count * _CAPACITY_MARGIN)) // _CAPACITY_ALIGN) * _CAPACITY_ALIGN)
+
+
 def _fixed_capacity_all_to_all(
     input_tensor: torch.Tensor,
     input_split_sizes: tuple[int, ...],
@@ -87,6 +137,8 @@ def _fixed_capacity_all_to_all(
     process_group: dist.ProcessGroup,
     *,
     fill_value: int | float,
+    input_rows: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exchange compact rank segments through an equal-split All-to-All.
 
@@ -104,6 +156,9 @@ def _fixed_capacity_all_to_all(
         capacity: Globally agreed maximum of every source/destination count.
         process_group: Process group whose rank order defines both count tuples.
         fill_value: Value used for padded and initially untouched output rows.
+        input_rows: Optional precomputed ``_segment_rows(input_split_sizes, capacity, …)``
+            so the packing issues no row-map kernels of its own; ``output_rows`` likewise
+            for the unpacking. Built here from the host tuples when absent.
 
     Returns:
         A compact tensor of shape ``[sum(output_split_sizes), ...]`` whose
@@ -131,34 +186,38 @@ def _fixed_capacity_all_to_all(
 
     padded_shape = (world_size, capacity, *input_tensor.shape[1:])
     padded_input = input_tensor.new_full(padded_shape, fill_value)
-    input_offset = 0
-    for destination_rank, count in enumerate(input_split_sizes):
-        if count:
-            padded_input[destination_rank, :count].copy_(input_tensor[input_offset : input_offset + count])
-        input_offset += count
+    if input_tensor.shape[0]:
+        if input_rows is None:
+            input_rows = _segment_rows(input_split_sizes, capacity, input_tensor.device)
+        padded_input.view(world_size * capacity, *input_tensor.shape[1:]).index_copy_(0, input_rows, input_tensor)
 
     # A sentinel-initialized receive buffer makes a transport that returns
     # without writing deterministic.  The ID route validates these sentinels
     # before local indexing; padding itself is never exposed in compact output.
     padded_output = input_tensor.new_full(padded_shape, fill_value)
     contiguous_input = padded_input.contiguous()
-    if contiguous_input.is_cuda:
-        torch.cuda.synchronize(contiguous_input.device)
+    # The collective is stream-ordered after the packing copies above, and the
+    # unpacking copies below are ordered after it; no device-wide synchronisation
+    # is needed (each one drained every stream on every Engram exchange).
     dist.all_to_all_single(padded_output, contiguous_input, group=process_group)
-    if padded_output.is_cuda:
-        torch.cuda.synchronize(padded_output.device)
 
-    compact_output = input_tensor.new_empty(output_shape)
-    output_offset = 0
-    for source_rank, count in enumerate(output_split_sizes):
-        if count:
-            compact_output[output_offset : output_offset + count].copy_(padded_output[source_rank, :count])
-        output_offset += count
-    return compact_output
+    if output_shape[0] == 0:
+        return input_tensor.new_empty(output_shape)
+    if output_rows is None:
+        output_rows = _segment_rows(output_split_sizes, capacity, input_tensor.device)
+    return padded_output.view(world_size * capacity, *input_tensor.shape[1:]).index_select(0, output_rows)
 
 
 class _FixedCapacityAllToAll(torch.autograd.Function):
-    """Autograd-aware equal-split All-to-All for compact routed values."""
+    """Autograd-aware equal-split All-to-All for compact routed values.
+
+    The backward routes every requester's gradient back to the owner and divides
+    it by the owner-group size, so the owner accumulates the mean of the
+    per-rank contributions: the same average the data-parallel gradient
+    reduction gives every other parameter. Summing per-micro-batch means equals
+    the mean of the accumulated sum, so gradient accumulation needs no further
+    scaling.
+    """
 
     @staticmethod
     def forward(
@@ -168,6 +227,8 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
         output_split_sizes: tuple[int, ...],
         capacity: int,
         process_group: dist.ProcessGroup,
+        input_rows: torch.Tensor | None = None,
+        output_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Exchange compact rows through fixed-capacity peer segments.
 
@@ -190,6 +251,8 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
         ctx.capacity = capacity
+        ctx.input_rows = input_rows
+        ctx.output_rows = output_rows
         return _fixed_capacity_all_to_all(
             input_tensor,
             input_split_sizes,
@@ -197,14 +260,16 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
             capacity,
             process_group,
             fill_value=0,
+            input_rows=input_rows,
+            output_rows=output_rows,
         )
 
     @staticmethod
     def backward(
         ctx: Any,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None]:
-        """Route output gradients back to the ranks that supplied the rows.
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+        """Route output gradients back to the ranks that supplied the rows, averaged over the group.
 
         Args:
             ctx: PyTorch autograd context populated by :meth:`forward`.
@@ -212,8 +277,9 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
                 source-rank segmentation as the forward output.
 
         Returns:
-            A gradient tensor of shape ``[input_rows, ...]`` followed by four
-            ``None`` entries for the non-tensor split and process-group inputs.
+            A gradient tensor of shape ``[input_rows, ...]``, divided by the
+            process-group size, followed by six ``None`` entries for the
+            non-tensor split, process-group and row-map inputs.
         """
         grad_input = _fixed_capacity_all_to_all(
             grad_output,
@@ -222,8 +288,35 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
             ctx.capacity,
             ctx.process_group,
             fill_value=0,
+            input_rows=ctx.output_rows,
+            output_rows=ctx.input_rows,
         )
-        return grad_input, None, None, None, None
+        grad_input.div_(dist.get_world_size(ctx.process_group))
+        return grad_input, None, None, None, None, None, None
+
+
+class _PaddedAllToAll(torch.autograd.Function):
+    """Equal-split All-to-All of an already padded ``[world_size * capacity, ...]`` buffer, both directions.
+
+    The capacity-mode lookup keeps the owner side in the padded layout, so the value exchange and its backward are the
+    same symmetric collective on identically shaped buffers; nothing is read on the host. As in
+    :class:`_FixedCapacityAllToAll`, the backward divides the routed gradient by the process-group size so the owner
+    accumulates the mean of the per-rank contributions.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, padded: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
+        ctx.process_group = process_group
+        out = torch.empty_like(padded)
+        dist.all_to_all_single(out, padded.contiguous(), group=process_group)
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        grad_input = torch.empty_like(grad_output)
+        dist.all_to_all_single(grad_input, grad_output.contiguous(), group=ctx.process_group)
+        grad_input.div_(dist.get_world_size(ctx.process_group))
+        return grad_input, None
 
 
 @dataclass(frozen=True)
@@ -236,11 +329,34 @@ class Qwen3_8_FlashNextEngramTableConfig:
         embedding_dim: Number of values stored in each row.
         initializer_range: Standard deviation for checkpoint-free normal
             initialization.
+        strict_validation: Validate every lookup on the host with cross-rank
+            agreement (the default and the original behaviour): each lookup
+            costs about twenty device-to-host synchronisations and seven small
+            collectives, which stall the issuing thread on every Engram layer,
+            forward and recompute. ``False`` keeps the same invariants as
+            device-side asserts (``torch._assert_async``) on CUDA inputs and
+            reads the route metadata (the count matrix) back once per lookup;
+            a violated invariant then surfaces as a CUDA device-side assertion
+            instead of a symmetric Python exception. DeepSeek-V4.1 opts out
+            through ``text_config.engram_strict_validation`` (default False).
+            CPU inputs are always validated on the host. The validation path is
+            chosen per table (device and this flag), never per request count, so
+            an empty requester takes the same collectives as its peers.
+        capacity_mode: Opt-in for bounded workloads. The padded exchange is
+            sized once, by the first lookup (its per-peer count maximum x 1.25,
+            aligned), read back to the host that one time and fixed from then
+            on, so no later lookup synchronises; a lookup whose per-peer count
+            exceeds that calibration aborts with a device-side assertion. Keep
+            it off (the default, the exact-count path) for ordinary inputs —
+            growing sequence lengths, local-batch padding, distribution shifts —
+            which it would reject; fixed-shape benchmark batches qualify.
     """
 
     num_embeddings: int
     embedding_dim: int
     initializer_range: float = 0.02
+    strict_validation: bool = True
+    capacity_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.num_embeddings <= 0:
@@ -256,6 +372,7 @@ class Qwen3_8_FlashNextEngramTableConfig:
         process_group: dist.ProcessGroup | None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        bind_owner_group_later: bool = False,
     ) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
         """Build a local or row-owner-sharded embedding table.
 
@@ -267,6 +384,11 @@ class Qwen3_8_FlashNextEngramTableConfig:
             device: Device on which the rank-local weight of shape
                 ``[local_rows, embedding_dim]`` is allocated.
             dtype: Data type of the rank-local weight tensor.
+            bind_owner_group_later: Build the table without an owner group and
+                without row storage. The parallelizer binds the owner group
+                through :meth:`Qwen3_8_FlashNextOwnerShardedEmbedding.parallelize_weight`
+                once the FSDP mesh of the pipeline stage that holds the table is
+                known. ``process_group`` must be ``None`` in this mode.
 
         Returns:
             An embedding whose input has shape ``[...]`` and whose output has
@@ -278,6 +400,7 @@ class Qwen3_8_FlashNextEngramTableConfig:
             process_group=process_group,
             device=device,
             dtype=dtype,
+            bind_owner_group_later=bind_owner_group_later,
         )
 
 
@@ -288,7 +411,10 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
     request rank groups global row IDs by owner and sends them in the first
     All-to-All. Owners perform a local embedding lookup. An autograd-aware
     second All-to-All returns values to request ranks and reverses direction in
-    backward, so only the owner accumulates and updates a row's gradient.
+    backward, so only the owner accumulates and updates a row's gradient. That
+    backward divides the routed gradient by the owner-group size, so the owner
+    row holds the mean of the per-rank contributions and the training loop
+    treats the table like any other data-parallel parameter.
 
     Args:
         config: Global table shape and initialization settings.
@@ -297,6 +423,10 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         device: Device for the local weight of shape
             ``[num_embeddings / owner_world_size, embedding_dim]``.
         dtype: Data type of the local weight tensor.
+        bind_owner_group_later: Leave the owner group unbound. The weight is a
+            ``[0, embedding_dim]`` placeholder until :meth:`parallelize_weight`
+            binds the FSDP mesh of the pipeline stage that holds the table, so
+            the row range is never sized for ranks that end up on another stage.
     """
 
     def __init__(
@@ -306,11 +436,53 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         process_group: dist.ProcessGroup | None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        bind_owner_group_later: bool = False,
     ) -> None:
         super().__init__()
+        if bind_owner_group_later and process_group is not None:
+            raise ValueError("bind_owner_group_later requires process_group=None; the mesh binds the group later")
         self.num_embeddings = config.num_embeddings
         self.embedding_dim = config.embedding_dim
         self.initializer_range = config.initializer_range
+        self.strict_validation = config.strict_validation
+        # Capacity mode (opt-in, bounded workloads): the padded exchange is sized once from the first lookup and
+        # fixed afterwards; every rank sees the same count matrix, so every rank derives the same capacity without
+        # a collective on the host value, and a checkpointed forward and its recomputation agree by construction.
+        self.capacity_mode = bool(config.capacity_mode)
+        self._capacity: int | None = None
+        self.owner_group_pending = bind_owner_group_later
+        if bind_owner_group_later:
+            self.process_group = None
+            self.owner_world_size = 0
+            self.owner_rank = 0
+            self.num_embeddings_per_rank = 0
+        else:
+            self._set_owner_geometry(process_group)
+        self.weight = self._new_local_shard(device=device, dtype=dtype, requires_grad=True)
+        self.reset_parameters()
+
+    def _new_local_shard(
+        self,
+        *,
+        device: torch.device | str | None,
+        dtype: torch.dtype | None,
+        requires_grad: bool,
+    ) -> nn.Parameter:
+        """Allocate an uninitialized ``[num_embeddings_per_rank, embedding_dim]`` parameter.
+
+        A pending table has no rows yet, so its shard is the ``[0, embedding_dim]`` placeholder.
+        """
+        return nn.Parameter(
+            torch.empty(self.num_embeddings_per_rank, self.embedding_dim, device=device, dtype=dtype),
+            requires_grad=requires_grad,
+        )
+
+    def _set_owner_geometry(self, process_group: dist.ProcessGroup | None) -> None:
+        """Record the owner group and this rank's contiguous global row range.
+
+        Args:
+            process_group: Owner group, or ``None`` for one rank holding every row.
+        """
         self.process_group = process_group
         if process_group is None:
             self.owner_world_size = 1
@@ -332,46 +504,27 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         self.global_row_end = self.vocab_end_index
         self.local_row_start = 0
         self.local_row_end = self.num_embeddings_per_rank
-        self.weight = nn.Parameter(
-            torch.empty(
-                self.num_embeddings_per_rank,
-                self.embedding_dim,
-                device=device,
-                dtype=dtype,
-            )
-        )
-        self.mark_sharding_contract()
-        self.reset_parameters()
 
-    def _apply(
-        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
-    ) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
-        """Restore ownership metadata after a module device or dtype conversion.
+    def bind_owner_group(self, process_group: dist.ProcessGroup) -> None:
+        """Bind a pending table to its owner group and allocate the local row shard.
+
+        The placeholder weight keeps its device and dtype; a meta placeholder
+        yields a meta shard that the usual materialization fills later, a real
+        placeholder is replaced by a freshly initialized shard.
 
         Args:
-            fn: Tensor conversion applied by ``Module.to`` or ``Module.to_empty``.
-            recurse: Whether to convert child modules as well.
-
-        Returns:
-            This module after the normal PyTorch conversion, with the current
-            row-sharded weight marked for owner-gradient averaging. Shapes,
-            placements and values follow ``fn`` without an additional copy.
+            process_group: Owner group whose ranks hold contiguous row ranges.
         """
-        result = super()._apply(fn, recurse=recurse)
-        self.mark_sharding_contract()
-        return result
-
-    def mark_sharding_contract(self) -> None:
-        """Stamp the model-owned contract on the current weight.
-
-        DTensor conversion can discard custom attributes even when PyTorch
-        preserves the Parameter identity. Ordinary module conversions restore
-        the marker through ``_apply``. Custom parameter-only materialization
-        bypasses that method, so model initialization stamps it afterwards.
-        The single-rank reference table needs no contract.
-        """
-        if isinstance(self.weight, DTensor):
-            self.weight._nemo_model_owned_grad_divisor = float(self.owner_world_size)
+        if not self.owner_group_pending:
+            raise RuntimeError("The Engram owner group is already bound")
+        self._set_owner_geometry(process_group)
+        placeholder = self.weight
+        self.weight = self._new_local_shard(
+            device=placeholder.device, dtype=placeholder.dtype, requires_grad=placeholder.requires_grad
+        )
+        self.owner_group_pending = False
+        if placeholder.device.type != "meta":
+            self.reset_parameters()
 
     def parallelize_weight(self, fsdp_mesh: DeviceMesh) -> nn.Parameter:
         """Represent the already-local owner shard as one global DTensor.
@@ -380,20 +533,26 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         method uses :meth:`DTensor.from_local` rather than redistributing or
         slicing it again.  It runs before FSDP records its ignored parameters;
         the returned parameter identity must be passed unchanged to every FSDP
-        unit containing the table.
+        unit containing the table. The module is also excluded from tensor-
+        parallel replica synchronization: its local tensor is an owner shard,
+        not a replica.
 
         Args:
-            fsdp_mesh: One-dimensional FSDP shard/CP mesh. Its rank order must
-                exactly match the PLE owner process group.
+            fsdp_mesh: One-dimensional FSDP shard/CP mesh of the pipeline stage
+                that holds the table. A pending table binds this mesh's group
+                as its owner group; an already bound table requires the same
+                rank order.
 
         Returns:
             The registered global ``[num_embeddings, embedding_dim]`` DTensor
             parameter with placement ``Shard(0)``.
         """
-        if self.process_group is None:
-            raise RuntimeError("A single-rank reference Engram table must remain an ordinary Parameter")
         if fsdp_mesh.ndim != 1:
             raise ValueError(f"The Engram DTensor requires a one-dimensional owner mesh, got ndim={fsdp_mesh.ndim}")
+        if self.owner_group_pending:
+            self.bind_owner_group(fsdp_mesh.get_group())
+        if self.process_group is None:
+            raise RuntimeError("A single-rank reference Engram table must remain an ordinary Parameter")
         if fsdp_mesh.size() != self.owner_world_size:
             raise ValueError(
                 "The Engram owner group and FSDP mesh must have the same size: "
@@ -427,26 +586,22 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
                     "Engram DTensor is already attached to a different mesh: "
                     f"current={current_mesh_ranks}, requested={mesh_ranks}"
                 )
-            self.mark_sharding_contract()
-            return self.weight
-
-        if tuple(self.weight.shape) != expected_local_shape:
-            raise ValueError(
-                "Engram local weight shape does not match its contiguous owner range: "
-                f"{tuple(self.weight.shape)} != {expected_local_shape}"
+        else:
+            if tuple(self.weight.shape) != expected_local_shape:
+                raise ValueError(
+                    "Engram local weight shape does not match its contiguous owner range: "
+                    f"{tuple(self.weight.shape)} != {expected_local_shape}"
+                )
+            distributed_weight = DTensor.from_local(
+                self.weight.detach(),
+                device_mesh=fsdp_mesh,
+                placements=(Shard(0),),
+                run_check=False,
+                shape=torch.Size(expected_global_shape),
+                stride=(self.embedding_dim, 1),
             )
-        local_weight = self.weight.detach()
-        requires_grad = self.weight.requires_grad
-        distributed_weight = DTensor.from_local(
-            local_weight,
-            device_mesh=fsdp_mesh,
-            placements=(Shard(0),),
-            run_check=False,
-            shape=torch.Size(expected_global_shape),
-            stride=(self.embedding_dim, 1),
-        )
-        self.weight = nn.Parameter(distributed_weight, requires_grad=requires_grad)
-        self.mark_sharding_contract()
+            self.weight = nn.Parameter(distributed_weight, requires_grad=self.weight.requires_grad)
+        exclude_from_tp_replica_sync(self)
         return self.weight
 
     @torch.no_grad()
@@ -454,6 +609,97 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         """Initialize the rank-local weight with a finite normal distribution."""
         local_weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
         nn.init.normal_(local_weight, mean=0.0, std=self.initializer_range)
+
+    def _use_capacity_mode(self) -> bool:
+        """Whether lookups run without a device-to-host read (capacity mode): a per-table opt-in, never automatic."""
+        return self.process_group is not None and not self.strict_validation and self.capacity_mode
+
+    def _capacity_for(self, count_matrix: torch.Tensor) -> int:
+        """Padded rows per peer: calibrated by the first lookup, fixed from then on.
+
+        The first lookup reads the matrix maximum synchronously (one calibration per table, like HybridEP's
+        capacity mode). Every later lookup only asserts on the device that its own maximum fits. Nothing about the
+        padded layout depends on what ran in between, so a checkpointed forward and its recomputation size the
+        exchange identically; a per-peer count beyond the calibration aborts the step instead of corrupting the
+        exchange — that is the bounded-workload contract of ``capacity_mode``.
+        """
+        max_dev = count_matrix.max()
+        if self._capacity is None:
+            self._capacity = _aligned_capacity(int(max_dev.item()))
+        torch._assert_async(
+            max_dev <= self._capacity,
+            "Engram capacity mode: a lookup exceeded the calibrated padded capacity (capacity_mode is an opt-in for "
+            "bounded workloads; the exact-count path follows any request size)",
+        )
+        return self._capacity
+
+    def _validate_padded_received_ids(self, received_ids: torch.Tensor, capacity: int) -> None:
+        """Validate owner membership of a padded ``[world_size * capacity]`` receive buffer.
+
+        Rows equal to -1 are the senders' padding and legitimate; ``_UNTOUCHED`` rows mean the exchange never wrote
+        the slot and count as bad. On CUDA this is one device-side assert; on the host path the non-padding rows are
+        handed to the compact diagnostics in source-rank order.
+        """
+        if self.process_group is None:
+            return
+        padding = received_ids == -1
+        bad_mask = (~padding) & ((received_ids < self.vocab_start_index) | (received_ids >= self.vocab_end_index))
+        if not self._validate_on_host(received_ids):
+            torch._assert_async(
+                bad_mask.sum(dtype=torch.int64) == 0, "Engram received a row ID outside this owner's range"
+            )
+            return
+        keep = (~padding).view(self.owner_world_size, capacity)
+        sizes = tuple(int(count) for count in keep.sum(dim=1).tolist())
+        compact = received_ids.view(self.owner_world_size, capacity)[keep]
+        self._validate_received_ids(compact, sizes)
+
+    def _lookup_capacity_mode(
+        self,
+        sorted_global_ids: torch.Tensor,
+        send_counts: torch.Tensor,
+        unsort_indices: torch.Tensor,
+        original_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Owner-sharded lookup with no device-to-host read: padded exchange sized by the calibrated capacity.
+
+        Senders pack their owner-sorted IDs with a device-side row map (only their own counts and row total), owners
+        look rows up in the padded layout (padding masked to zero), and the value return is the symmetric equal-split
+        All-to-All, unpacked with the same send-row map. The 64 x 64 count AllGather stays; its result is consumed on
+        the device.
+        """
+        world = self.owner_world_size
+        gathered_counts = send_counts.new_empty(world * world)
+        dist.all_gather_into_tensor(gathered_counts, send_counts, group=self.process_group)
+        count_matrix = gathered_counts.view(world, world)
+        capacity = self._capacity_for(count_matrix)
+        rows = sorted_global_ids.numel()
+        send_rows = _segment_rows_from_counts(send_counts, capacity, rows)
+        padded_ids = sorted_global_ids.new_full((world * capacity,), -1)
+        if rows:
+            padded_ids.index_copy_(0, send_rows, sorted_global_ids)
+        received_ids = torch.full_like(padded_ids, _UNTOUCHED)
+        dist.all_to_all_single(received_ids, padded_ids, group=self.process_group)
+        self._validate_padded_received_ids(received_ids, capacity)
+        valid = (received_ids >= 0).unsqueeze(-1)
+        local_ids = (received_ids - self.vocab_start_index).clamp_(0, self.num_embeddings_per_rank - 1)
+        local_weight = self.weight.to_local(grad_placements=self.weight.placements)
+        owned_values = F.embedding(local_ids, local_weight) * valid.to(local_weight.dtype)
+        returned_padded = _PaddedAllToAll.apply(owned_values, self.process_group)
+        returned_values = returned_padded.index_select(0, send_rows)
+        return returned_values[unsort_indices].reshape(*original_shape, self.embedding_dim)
+
+    def _validate_on_host(self, tensor: torch.Tensor) -> bool:
+        """Return whether a lookup is validated with host-side, cross-rank-symmetric checks.
+
+        Args:
+            tensor: A tensor of the lookup being validated; its device decides.
+
+        Returns:
+            True under ``strict_validation`` or for CPU tensors (no synchronisation
+            cost), False when the same invariants are enforced as device-side asserts.
+        """
+        return self.strict_validation or not tensor.is_cuda
 
     def _validate_global_ids(self, global_ids: torch.Tensor) -> None:
         """Validate IDs symmetrically before any variable-sized collective.
@@ -469,6 +715,18 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             torch.int64,
             torch.uint8,
         }
+        if not self._validate_on_host(global_ids):
+            # Device path: no device-to-host read and no validity collective. Chosen by device and
+            # strict_validation alone, so an empty requester never joins a collective its peers skip; the
+            # dtype is a program invariant and fails the same way on every rank.
+            if not is_integer:
+                raise ValueError(f"Engram row IDs must use an integer dtype, got {global_ids.dtype}")
+            if global_ids.numel() > 0:
+                torch._assert_async(
+                    (global_ids.min() >= 0) & (global_ids.max() < self.num_embeddings),
+                    f"Engram row IDs must lie in [0, {self.num_embeddings})",
+                )
+            return
         in_range = is_integer
         if is_integer and global_ids.numel() > 0:
             in_range = bool((global_ids.min() >= 0).item() and (global_ids.max() < self.num_embeddings).item())
@@ -503,12 +761,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         """
         if self.process_group is None:
             counts = (sorted_global_ids.numel(),)
-            return sorted_global_ids, counts, counts, sorted_global_ids.numel()
-        # Split sizes are Python host metadata used to pack compact segments.
-        # Make the CUDA-to-host boundary explicit before materializing them.
-        if send_counts.is_cuda:
-            torch.cuda.synchronize(send_counts.device)
-        input_split_sizes = tuple(int(count) for count in send_counts.cpu().tolist())
+            return sorted_global_ids, counts, counts, sorted_global_ids.numel(), None, None
 
         # AllGather exposes one send-count row from every request rank.  Each
         # owner reads its column to obtain source-ordered receive splits.  At
@@ -516,9 +769,34 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         # (32 KiB/rank).
         gathered_counts = send_counts.new_empty(self.owner_world_size * self.owner_world_size)
         dist.all_gather_into_tensor(gathered_counts, send_counts, group=self.process_group)
-        if gathered_counts.is_cuda:
-            torch.cuda.synchronize(gathered_counts.device)
         count_matrix = gathered_counts.view(self.owner_world_size, self.owner_world_size)
+
+        if not self.strict_validation:
+            # One device-to-host read serves all three pieces of host metadata:
+            # this rank's row is its send counts, its column the receive counts,
+            # and the matrix maximum the agreed capacity.
+            host_matrix = count_matrix.cpu()
+            input_split_sizes = tuple(int(count) for count in host_matrix[self.owner_rank].tolist())
+            output_split_sizes = tuple(int(count) for count in host_matrix[:, self.owner_rank].tolist())
+            capacity = int(host_matrix.max())
+            device = sorted_global_ids.device
+            send_rows = _segment_rows(input_split_sizes, capacity, device, count_matrix[self.owner_rank])
+            receive_rows = _segment_rows(output_split_sizes, capacity, device, count_matrix[:, self.owner_rank])
+            received_ids = _fixed_capacity_all_to_all(
+                sorted_global_ids,
+                input_split_sizes,
+                output_split_sizes,
+                capacity,
+                self.process_group,
+                fill_value=-1,
+                input_rows=send_rows,
+                output_rows=receive_rows,
+            )
+            return received_ids, input_split_sizes, output_split_sizes, capacity, send_rows, receive_rows
+
+        # Strict mode: split sizes are Python host metadata used to pack compact
+        # segments; materialise this rank's row before the consistency checks.
+        input_split_sizes = tuple(int(count) for count in send_counts.cpu().tolist())
 
         # Validate both the rank-local contribution and cross-rank agreement
         # before count metadata can size a payload buffer.  MIN/MAX reductions
@@ -544,6 +822,9 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         receive_counts = count_matrix[:, self.owner_rank].contiguous()
         output_split_sizes = tuple(int(count) for count in receive_counts.cpu().tolist())
         capacity = int(maximum_count_matrix.max().item())
+        device = sorted_global_ids.device
+        send_rows = _segment_rows(input_split_sizes, capacity, device, send_counts)
+        receive_rows = _segment_rows(output_split_sizes, capacity, device, receive_counts)
         received_ids = _fixed_capacity_all_to_all(
             sorted_global_ids,
             input_split_sizes,
@@ -551,8 +832,10 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             capacity,
             self.process_group,
             fill_value=-1,
+            input_rows=send_rows,
+            output_rows=receive_rows,
         )
-        return received_ids, input_split_sizes, output_split_sizes, capacity
+        return received_ids, input_split_sizes, output_split_sizes, capacity, send_rows, receive_rows
 
     def _validate_sorted_send_ids(
         self,
@@ -573,13 +856,24 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         """
         if self.process_group is None:
             return
-        if sorted_global_ids.is_cuda:
-            torch.cuda.synchronize(sorted_global_ids.device)
+        actual_owners = torch.div(sorted_global_ids, self.num_embeddings_per_rank, rounding_mode="floor")
+        if not self._validate_on_host(sorted_global_ids):
+            # ``output_size`` keeps repeat_interleave from reading the counts back to
+            # the host; the segment lengths sum to the request count by construction.
+            expected_owners = torch.repeat_interleave(
+                torch.arange(self.owner_world_size, device=sorted_global_ids.device, dtype=torch.long),
+                send_counts,
+                output_size=sorted_global_ids.numel(),
+            )
+            torch._assert_async(
+                (expected_owners == actual_owners).all(),
+                "Engram sorted ID segments do not match their destination owners",
+            )
+            return
         expected_owners = torch.repeat_interleave(
             torch.arange(self.owner_world_size, device=sorted_global_ids.device, dtype=torch.long),
             send_counts,
         )
-        actual_owners = torch.div(sorted_global_ids, self.num_embeddings_per_rank, rounding_mode="floor")
         locally_valid = expected_owners.shape == actual_owners.shape and torch.equal(expected_owners, actual_owners)
         valid_tensor = torch.tensor(int(locally_valid), device=sorted_global_ids.device, dtype=torch.int32)
         dist.all_reduce(valid_tensor, op=dist.ReduceOp.MIN, group=self.process_group)
@@ -617,6 +911,9 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
 
         bad_mask = (received_ids < self.vocab_start_index) | (received_ids >= self.vocab_end_index)
         local_bad_count = bad_mask.sum(dtype=torch.int64)
+        if not self._validate_on_host(received_ids):
+            torch._assert_async(local_bad_count == 0, "Engram received a row ID outside this owner's range")
+            return
         global_bad_count = local_bad_count.clone()
         dist.all_reduce(global_bad_count, op=dist.ReduceOp.SUM, group=self.process_group)
         if int(global_bad_count.item()) == 0:
@@ -652,7 +949,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             segment = received_ids[offset : offset + split_size]
             segment_bad_mask = bad_mask[offset : offset + split_size]
             source_bad_counts[source_rank] = segment_bad_mask.sum(dtype=torch.int64)
-            source_untouched_counts[source_rank] = (segment == -1).sum(dtype=torch.int64)
+            source_untouched_counts[source_rank] = ((segment == -1) | (segment == _UNTOUCHED)).sum(dtype=torch.int64)
             offset += split_size
         diagnostics[base_diagnostic_size : base_diagnostic_size + self.owner_world_size] = source_sizes
         diagnostics[base_diagnostic_size + self.owner_world_size : base_diagnostic_size + 2 * self.owner_world_size] = (
@@ -710,6 +1007,11 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             order. The returned tensor does not alias ``global_ids`` or the
             rank-local table weight.
         """
+        if self.owner_group_pending:
+            raise RuntimeError(
+                "The Engram table was used before its owner group was bound; "
+                "apply the model's distributed parallelization first"
+            )
         self._validate_global_ids(global_ids)
         original_shape = global_ids.shape
         flattened_ids = global_ids.reshape(-1).to(dtype=torch.long)
@@ -724,14 +1026,20 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             )
 
         owners = torch.div(flattened_ids, self.num_embeddings_per_rank, rounding_mode="floor")
-        send_counts = torch.bincount(owners, minlength=self.owner_world_size).to(torch.int64)
+        # scatter_add_ instead of bincount: bincount sizes its output from the data
+        # and therefore reads the maximum back to the host on every call.
+        send_counts = torch.zeros(self.owner_world_size, dtype=torch.int64, device=owners.device).scatter_add_(
+            0, owners, torch.ones_like(owners, dtype=torch.int64)
+        )
         sort_indices = torch.argsort(owners, stable=True)
         sorted_global_ids = flattened_ids[sort_indices]
         unsort_indices = torch.empty_like(sort_indices)
         unsort_indices[sort_indices] = torch.arange(sort_indices.numel(), device=sort_indices.device)
         self._validate_sorted_send_ids(sorted_global_ids, send_counts)
+        if self._use_capacity_mode():
+            return self._lookup_capacity_mode(sorted_global_ids, send_counts, unsort_indices, original_shape)
 
-        received_ids, input_split_sizes, output_split_sizes, capacity = self._exchange_ids(
+        received_ids, input_split_sizes, output_split_sizes, capacity, send_rows, receive_rows = self._exchange_ids(
             sorted_global_ids,
             send_counts,
         )
@@ -745,6 +1053,8 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             input_split_sizes,
             capacity,
             self.process_group,
+            receive_rows,  # owner -> requester: the id exchange's splits and row maps, swapped
+            send_rows,
         )
         return returned_values[unsort_indices].reshape(*original_shape, self.embedding_dim)
 
@@ -822,12 +1132,18 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
             persistent=True,
         )
 
-    def _shift_right_after_eos(self, input_ids: torch.Tensor, shift: int) -> torch.Tensor:
-        """Read an earlier token without crossing an EOS boundary.
+    def _shift_right_after_eos(
+        self,
+        input_ids: torch.Tensor,
+        shift: int,
+        sequence_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Read an earlier token without crossing an EOS or packed-segment boundary.
 
         Args:
             input_ids: Raw tokenizer IDs of shape ``[batch, sequence]``.
             shift: Number of preceding positions to read.
+            sequence_ids: Optional packed segment IDs with the shape of ``input_ids``.
 
         Returns:
             Raw IDs of shape ``[batch, sequence]``. Positions lacking valid
@@ -848,13 +1164,17 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
         gather_positions = source_positions.clamp_min(0).unsqueeze(0).expand(batch_size, -1)
         shifted_ids = input_ids.gather(dim=1, index=gather_positions)
         valid = (positions_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
+        if sequence_ids is not None:
+            valid = valid & (sequence_ids.gather(dim=1, index=gather_positions) == sequence_ids)
         return torch.where(valid, shifted_ids, input_ids.new_full((), self.eos_token_id))
 
-    def _hash_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _hash_input_ids(self, input_ids: torch.Tensor, sequence_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Compute packed global table rows for every n-gram head.
 
         Args:
             input_ids: Raw integer tokenizer IDs of shape ``[batch, sequence]``.
+            sequence_ids: Optional packed segment IDs of shape ``[batch, sequence]``;
+                n-gram history stays inside a segment.
 
         Returns:
             Global table IDs of shape ``[batch, sequence, ngram_heads]``. Heads
@@ -871,7 +1191,9 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
         }:
             raise ValueError(f"input_ids must have an integer dtype, got {input_ids.dtype}")
         input_ids = input_ids.to(dtype=torch.long)
-        shifted_tokens = [self._shift_right_after_eos(input_ids, shift) for shift in range(self.ngram_size)]
+        shifted_tokens = [
+            self._shift_right_after_eos(input_ids, shift, sequence_ids) for shift in range(self.ngram_size)
+        ]
         blocks = []
         for ngram_order in range(2, self.ngram_size + 1):
             head_start = (ngram_order - 2) * self.heads_per_ngram
@@ -888,17 +1210,18 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
             blocks.append(block_ids)
         return torch.cat(blocks, dim=-1)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, sequence_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Return concatenated PLE table values for raw token IDs.
 
         Args:
             input_ids: Raw integer tokenizer IDs of shape ``[batch, sequence]``.
+            sequence_ids: Optional packed segment IDs ``[batch, sequence]``.
 
         Returns:
             Tensor of shape ``[batch, sequence, ngram_heads * head_dim]``. The
             final axis concatenates bigram heads before trigram heads.
         """
-        ngram_ids = self._hash_input_ids(input_ids)
+        ngram_ids = self._hash_input_ids(input_ids, sequence_ids)
         return self._lookup_ngram_ids(ngram_ids)
 
     def _lookup_ngram_ids(self, ngram_ids: torch.Tensor) -> torch.Tensor:
@@ -928,6 +1251,7 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
         *,
         sequence_start: int,
         sequence_end: int,
+        global_sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Hash a complete raw sequence, then look up only one local slice.
 
@@ -937,6 +1261,7 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
                 preceding raw tokens and EOS resets at a CP boundary.
             sequence_start: Inclusive global position of the requested shard.
             sequence_end: Exclusive global position of the requested shard.
+            global_sequence_ids: Optional replicated packed segment IDs ``[batch, global_sequence]``.
 
         Returns:
             Local PLE values of shape ``[batch, local_sequence,
@@ -948,7 +1273,7 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
                 "Invalid Qwen3.8-Flash-Next PLE global slice "
                 f"[{sequence_start}, {sequence_end}) for sequence length {global_input_ids.shape[1]}"
             )
-        global_ngram_ids = self._hash_input_ids(global_input_ids)
+        global_ngram_ids = self._hash_input_ids(global_input_ids, global_sequence_ids)
         return self._lookup_ngram_ids(global_ngram_ids[:, sequence_start:sequence_end])
 
 
@@ -1063,6 +1388,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the PLE causal depthwise convolution with left zero history.
 
@@ -1072,6 +1398,10 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
             cp_context: Optional contiguous CP metadata. Under CP, ``sequence``
                 is local and the method exchanges only the preceding nine-token
                 boundary required by the released dilation/kernel settings.
+            sequence_ids: Optional packed segment IDs of shape ``[batch,
+                local_sequence]`` without CP, or replicated ``[batch,
+                global_sequence]`` under CP. Each segment then starts with zero
+                history, as at the start of a row.
 
         Returns:
             Tensor of shape ``[batch, sequence, hc_count * hidden_size]``.
@@ -1082,6 +1412,8 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         else:
             left_halo = qwen3_8_flash_next_cp_left_halo(hidden_states, cp_context, history=left_padding)
             channels_first = torch.cat((left_halo, hidden_states), dim=1).transpose(1, 2)
+        if sequence_ids is not None:
+            return F.silu(self._segmented_conv(channels_first.transpose(1, 2), cp_context, sequence_ids))
         convolved = F.conv1d(
             channels_first,
             self.conv1d.weight,
@@ -1091,12 +1423,56 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         )
         return F.silu(convolved.transpose(1, 2))
 
+    def _segmented_conv(
+        self,
+        padded: torch.Tensor,
+        cp_context: Qwen3_8_FlashNextCPContext | None,
+        sequence_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the convolution over every packed segment as if it started a fresh row.
+
+        Each run of one segment in ``padded`` gets ``history`` zeros ahead of it and
+        its own ``F.conv1d``, so every tap reads its own segment or zeros.
+
+        Args:
+            padded: Left history followed by the local sequence, ``[batch, history + sequence, channels]``.
+            cp_context: Optional contiguous CP metadata.
+            sequence_ids: Packed segment IDs ``[batch, sequence]``, or ``[batch, global_sequence]`` under CP.
+
+        Returns:
+            Pre-activation output ``[batch, sequence, channels]``.
+        """
+        history = (self.conv_kernel_size - 1) * self.short_conv_dilation
+        length = padded.shape[1]
+        start = 0 if cp_context is None else cp_context.local_sequence_start
+        positions = torch.arange(start - history, start + length - history, device=padded.device)
+        # Segment of every row; -1 marks history before the global row start.
+        segment = torch.where(positions >= 0, sequence_ids[:, positions.clamp_min(0)], -1)
+        rows = []
+        for row, row_segment in zip(padded, segment):
+            _, run_lengths = torch.unique_consecutive(row_segment, return_counts=True)
+            runs = [
+                F.conv1d(
+                    F.pad(run.t(), (history, 0)),
+                    self.conv1d.weight,
+                    bias=None,
+                    dilation=self.short_conv_dilation,
+                    groups=self.hc_hidden_size,
+                ).t()
+                for run in row.split(run_lengths.tolist())
+            ]
+            # The outputs for the left history are dropped.
+            rows.append(torch.cat(runs)[history:])
+        # A packed micro-batch has one row; skip the copy that stacking would make.
+        return rows[0].unsqueeze(0) if len(rows) == 1 else torch.stack(rows)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         *,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute the PLE delta injected before the layer's attention HC read.
 
@@ -1108,6 +1484,11 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
                 ``global_input_ids`` and ``global_padding_mask`` fields have
                 shape ``[batch, global_sequence]``; ``hidden_states`` and
                 ``input_ids`` remain local ``[batch, sequence, ...]`` tensors.
+            sequence_ids: Optional packed segment IDs ``[batch, sequence]``, or
+                ``[batch, global_sequence]`` under CP: one ID per packed sample, then one
+                each for the pack's tail padding and the CP padding, if present. The hash
+                and the convolution then never read across segments; ``None`` keeps the
+                unpacked path.
 
         Returns:
             PLE delta of shape
@@ -1131,7 +1512,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
             )
 
         if cp_context is None:
-            embeddings = self.ple_embedding(input_ids)
+            embeddings = self.ple_embedding(input_ids, sequence_ids)
         else:
             if hidden_states.shape[1] != cp_context.local_sequence_length:
                 raise ValueError(
@@ -1142,6 +1523,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
                 cp_context.global_input_ids,
                 sequence_start=cp_context.local_sequence_start,
                 sequence_end=cp_context.local_sequence_end,
+                global_sequence_ids=sequence_ids,
             )
         if embeddings.shape != (*hidden_states.shape[:2], self.ple_embed_dim):
             raise RuntimeError(
@@ -1167,7 +1549,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         normalized_gated_value = self._apply_branch_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(start_dim=-2)
         normalized_gated_value = normalized_gated_value.flatten(start_dim=-2)
-        return gated_value + self._causal_short_conv(normalized_gated_value, cp_context=cp_context)
+        return gated_value + self._causal_short_conv(normalized_gated_value, cp_context, sequence_ids)
 
     @torch.no_grad()
     def init_weights(self, initializer_range: float = 0.02) -> None:

@@ -26,6 +26,20 @@ See the [Launcher Guide](/job-launchers/slurm-cluster) for cluster-specific
 setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
 for the full multi-node environment setup.
 
+### Notes for Cold Starts and Large Rank Counts
+
+- **First step is long.** On 64 H100 nodes a cold start spends 38-40 minutes before step 0:
+  each rank JIT-compiles its HybridEP and TileLang kernels, and pipeline parallelism runs those
+  compiles stage after stage. The recipes therefore set `dist_env.timeout_minutes: 120`.
+  Point `NEMO_HYBRIDEP_JIT_CACHE` at a shared directory to reuse the HybridEP kernels
+  across runs.
+- **Resolve the Hub once, not 512 times.** With hundreds of ranks resolving
+  `deepseek-ai/DeepSeek-V4-Pro` and the dataset online at start-up, the anonymous Hugging Face
+  rate limit (HTTP 429) is hit and `huggingface_hub` retries with long back-offs. Pre-download the
+  snapshot and the dataset once (`huggingface_hub.snapshot_download`, `datasets.load_dataset`)
+  into a shared `HF_HOME` and run with `HF_HUB_OFFLINE=1`; the recipe then starts with zero Hub
+  requests.
+
 ## Model Reference
 
 ### Model Architecture

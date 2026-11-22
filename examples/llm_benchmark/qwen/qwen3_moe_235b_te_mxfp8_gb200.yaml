@@ -111,7 +111,11 @@ optimizer:
 
 
 ci:
+  nemo_ci_schedule: skipped
   time: "01:00:00"
   nodes: 8
   cluster_tag: gb200
   ep_size: 32
+  env_vars:
+    # Keep each worker on the CPUs local to its GPU across NCCL runtime versions.
+    TORCHRUN_NUMA_BINDING: "node"

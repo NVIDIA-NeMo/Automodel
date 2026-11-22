@@ -24,6 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
@@ -44,6 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
+from nemo_automodel.components.checkpoint.stateful_wrappers import validate_peft_trainable_modules
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedStrategyConfig,
@@ -51,6 +53,7 @@ from nemo_automodel.components.distributed.config import (
     MegatronFSDPConfig,
     MoEParallelizerConfig,
 )
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.megatron_fsdp import (
     restore_distributed_param_attrs,
@@ -65,8 +68,21 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
-from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
+from nemo_automodel.components.models.common.utils import (
+    cast_frozen_modules_to_compute_dtype,
+    prepare_frozen_parameters_for_sharding,
+)
+from nemo_automodel.components.models.kimi_k3.model import freeze_kimi_k3_indexer_params
+from nemo_automodel.components.moe.experts import GroupedExpertsTE
+from nemo_automodel.components.moe.quantized_experts import (
+    apply_mxfp4_to_moe_experts,
+    apply_nvfp4_to_moe_experts,
+    packed_expert_parameters,
+    select_nvfp4_expert_storage_format,
+    validate_nvfp4_checkpoint_config,
+    validate_nvfp4_resident_experts,
+    validate_packed_expert_topology,
+)
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
@@ -83,7 +99,9 @@ from nemo_automodel.components.utils.model_utils import (
     parse_freeze_config,
     print_trainable_parameters,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
@@ -148,6 +166,23 @@ def _verify_safe_moe_tp_weights_loaded(model, *, checkpoint_loaded: bool) -> Non
 
 
 #  PEFT / quantization helpers
+def _validate_nvfp4_checkpoint(pretrained_model_name_or_path: str, cache_dir: str | None) -> None:
+    """Check a pretrained checkpoint's quantization metadata before its NVFP4 experts are loaded packed.
+
+    A local directory is read in place; a Hub repository contributes only its ``hf_quant_config.json`` /
+    ``config.json`` (the base load fetches the weights later).
+    """
+    if os.path.isdir(pretrained_model_name_or_path):
+        checkpoint_dir = pretrained_model_name_or_path
+    else:
+        from huggingface_hub import snapshot_download
+
+        checkpoint_dir = snapshot_download(
+            pretrained_model_name_or_path, cache_dir=cache_dir, allow_patterns=["hf_quant_config.json", "config.json"]
+        )
+    validate_nvfp4_checkpoint_config(checkpoint_dir)
+
+
 def _apply_peft_and_lower_precision(
     model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
 ):
@@ -163,6 +198,8 @@ def _apply_peft_and_lower_precision(
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
         if peft_config.expert_weight_format == "mxfp4":
             model = apply_mxfp4_to_moe_experts(model)
+        elif peft_config.expert_weight_format == "nvfp4":
+            model = apply_nvfp4_to_moe_experts(model)
 
     # FP8
     if fp8_config is not None:
@@ -476,6 +513,53 @@ def _apply_trainability_policy(
     freeze_unused_kv_sharing_params(model)
     freeze_deepseek_v4_indexer_params(model)
     freeze_minimax_m3_indexer_params(model)
+    freeze_kimi_k3_indexer_params(model)
+
+
+def _prepare_trainability_before_sharding(
+    model: torch.nn.Module,
+    *,
+    peft_enabled: bool,
+    freeze_config: FreezeConfig | None,
+    frozen_compute_dtype: torch.dtype | None,
+    strict: bool,
+) -> None:
+    """Resolve trainability and prepare parameter-freezing storage before FSDP capture."""
+    _apply_trainability_policy(model, peft_enabled=peft_enabled, freeze_config=freeze_config, strict=strict)
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and frozen_compute_dtype is not None
+    ):
+        prepare_frozen_parameters_for_sharding(
+            model, frozen_compute_dtype, keep_storage=packed_expert_parameters(model)
+        )
+
+
+def _validate_parameter_freezing_backend(
+    model: torch.nn.Module, mesh: MeshContext, freeze_config: FreezeConfig | None
+) -> None:
+    """Reject exact parameter exclusions across unsupported TE expert renumbering."""
+    if freeze_config is None:
+        return
+    selected_names = set(freeze_config.freeze_parameters or ()) | set(freeze_config.unfreeze_parameters or ())
+    if not selected_names:
+        return
+    if mesh.ep_size <= 1:
+        return
+    frozen_ids = {
+        id(parameter)
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+        if canonical_parameter_fqn(name).replace("_orig_mod.", "") in selected_names
+    }
+    for module in model.modules():
+        if isinstance(module, GroupedExpertsTE) and any(
+            id(parameter) in frozen_ids for parameter in module.parameters()
+        ):
+            raise ValueError(
+                "freeze_config exact parameter selectors cannot name TE expert parameters with expert parallelism; "
+                "select their owning module instead"
+            )
 
 
 def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
@@ -483,6 +567,31 @@ def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
     if isinstance(model_wrapper, MeshContext):
         return model_wrapper.strategy_config
     return getattr(model_wrapper, "config", None)
+
+
+def _get_frozen_storage_compute_dtype(
+    strategy_config: DistributedStrategyConfig | None, mesh: MeshContext | None
+) -> torch.dtype | None:
+    """Resolve a safe model-wide compute dtype for frozen storage preparation.
+
+    MoE can override the FSDP2 parameter compute dtype for transformer blocks.
+    Since storage preparation currently accepts one dtype for the whole model,
+    skip it when that override differs from the root policy.
+    """
+    compute_dtype = getattr(getattr(strategy_config, "mp_policy", None), "param_dtype", None)
+    moe_config = getattr(mesh, "moe_parallel_config", None)
+    moe_policy = getattr(moe_config, "mp_policy", None)
+    if moe_policy is not None and getattr(moe_policy, "param_dtype", None) != compute_dtype:
+        return None
+    lm_head_precision = getattr(moe_config, "lm_head_precision", None)
+    if isinstance(lm_head_precision, str):
+        lm_head_precision = dtype_from_str(lm_head_precision, default=None)
+    if lm_head_precision == torch.float32:
+        # The head is sharded in FP32 independently of the root/MoE policy.
+        # This helper currently prepares one model-wide storage dtype, so keep
+        # source precision for all frozen params in this configuration.
+        return None
+    return compute_dtype
 
 
 #  apply_model_infrastructure  --  the main post-init orchestration function
@@ -506,6 +615,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    load_metadata_with_gloo: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -544,6 +654,7 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
+        load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -552,6 +663,15 @@ def apply_model_infrastructure(
     if mesh is None:
         mesh = MeshContext()
     strategy_config = _get_strategy_config(model_wrapper)
+
+    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
+    _validate_parameter_freezing_backend(model, mesh, freeze_config)
+    fsdp2_active = (
+        isinstance(strategy_config, FSDP2Config)
+        and mesh.device_mesh is not None
+        and fsdp2_sharding_enabled(mesh.device_mesh)
+    )
+    frozen_compute_dtype = _get_frozen_storage_compute_dtype(strategy_config, mesh) if fsdp2_active else None
 
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
@@ -563,6 +683,7 @@ def apply_model_infrastructure(
         model_repo_id=pretrained_model_name_or_path,
         save_consolidated=False,
         is_peft=peft_config is not None,
+        load_metadata_with_gloo=load_metadata_with_gloo,
     )
     checkpointer = Checkpointer(
         ckpt_config,
@@ -576,11 +697,35 @@ def apply_model_infrastructure(
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
     # This allows copy operations between meta tensors to succeed (they're no-ops)
+    if peft_config is not None:
+        # Packed-expert storage (mxfp4 / nvfp4) is sharded along the expert axis only: refuse the layouts
+        # FSDP would otherwise apply to the packed tensors before any module is replaced.
+        expert_weight_format = getattr(peft_config, "expert_weight_format", "unquantized")
+        validate_packed_expert_topology(
+            expert_weight_format,
+            world_size=get_world_size_safe(),
+            ep_size=mesh.ep_size,
+            pp_size=mesh.pp_size,
+        )
+        if expert_weight_format == "nvfp4" and pretrained_model_name_or_path and load_base_model:
+            # The packed experts are filled by the base load through the state-dict adapter; only a ModelOpt
+            # NVFP4 (16-column block) export has the layout the adapter maps onto them.
+            _validate_nvfp4_checkpoint(pretrained_model_name_or_path, cache_dir)
     peft_ctx = init_empty_weights() if is_meta_device else nullcontext()
     with peft_ctx:
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+    validate_nvfp4_resident_experts(
+        model,
+        device_mesh=mesh.device_mesh,
+        ep_size=mesh.ep_size,
+        pp_size=mesh.pp_size,
+        loads_base_checkpoint=bool(pretrained_model_name_or_path and load_base_model),
+    )
+    # Experts that hold packed NVFP4 placeholders (te_nvfp4.resident_weights, or the PEFT conversion
+    # above) are filled by the base load with the checkpoint packed expert tensors, unchanged.
+    select_nvfp4_expert_storage_format(model)
 
     # Inject TE attention into HF models when requested.
     # Done after PEFT (so projection shapes are final) and before sharding
@@ -589,6 +734,16 @@ def apply_model_infrastructure(
         from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
 
         _inject_te(model)
+
+    # Resolve exact parameter names while the complete, unwrapped model is still present.
+    # Storage must be prepared before either loading branch can copy checkpoint values.
+    _prepare_trainability_before_sharding(
+        model,
+        peft_enabled=peft_config is not None,
+        freeze_config=freeze_config,
+        frozen_compute_dtype=frozen_compute_dtype,
+        strict=True,
+    )
 
     # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
     # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks
@@ -611,24 +766,29 @@ def apply_model_infrastructure(
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        if weights_already_loaded:
-            # HF's from_pretrained already populated the weights during model init.
-            # Still call load_base_model with load_base_model=False to
-            # handle weight tying
-            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
-        else:
-            # Only meta-device models need their parameter shells materialized first.
-            if is_meta_device:
-                lora_a_init = getattr(peft_config, "lora_A_init", None)
-                checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
-            checkpointer.load_base_model(
-                model,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
-        checkpoint_already_loaded = True
+        try:
+            if weights_already_loaded:
+                # HF's from_pretrained already populated the weights during model init.
+                # Still call load_base_model with load_base_model=False to
+                # handle weight tying
+                checkpointer.load_base_model(
+                    model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False
+                )
+            else:
+                # Only meta-device models need their parameter shells materialized first.
+                if is_meta_device:
+                    lora_a_init = getattr(peft_config, "lora_A_init", None)
+                    checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+                checkpointer.load_base_model(
+                    model,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+            checkpoint_already_loaded = True
+        finally:
+            checkpointer.close()
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     state_dict_adapter = getattr(model, "state_dict_adapter", None)
@@ -642,19 +802,18 @@ def apply_model_infrastructure(
             if not key.endswith("_extra_state")
         ]
 
-    # Validate selectors on the complete pre-parallelization hierarchy. The
-    # same policy is rebound after model surgery and before DDP/FSDP capture.
-    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
-    _apply_trainability_policy(
-        model,
-        peft_enabled=peft_config is not None,
-        freeze_config=freeze_config,
-        strict=True,
-    )
+    # Rebind trainability after model surgery and before DDP/FSDP capture.
+    if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
+        prepare_frozen_parameters_for_sharding(
+            model,
+            _get_frozen_storage_compute_dtype(strategy_config, mesh),
+            keep_storage=packed_expert_parameters(model),
+        )
     reapply_trainability = partial(
-        _apply_trainability_policy,
+        _prepare_trainability_before_sharding,
         peft_enabled=peft_config is not None,
         freeze_config=freeze_config,
+        frozen_compute_dtype=frozen_compute_dtype,
         strict=False,
     )
 
@@ -738,15 +897,18 @@ def apply_model_infrastructure(
     # decision so that changes to the meta-device policy cannot silently skip loading.
     should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
-        model_parts = model.parts if hasattr(model, "parts") else [model]
-        for mp in model_parts:
-            checkpointer.load_base_model(
-                mp,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
+        try:
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                checkpointer.load_base_model(
+                    mp,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+        finally:
+            checkpointer.close()
 
     _verify_safe_moe_tp_weights_loaded(
         model,
@@ -763,13 +925,18 @@ def apply_model_infrastructure(
     else:
         trainability_models = [model]
     for mp in trainability_models:
-        reapply_trainability(mp)
+        _apply_trainability_policy(mp, peft_enabled=peft_config is not None, freeze_config=freeze_config, strict=False)
     if peft_config is not None or freeze_config is not None:
         if not any(param.requires_grad for mp in trainability_models for param in mp.parameters()):
             logger.warning(
                 "The configured trainability policy left no trainable parameters; "
                 "check freeze_config and the PEFT configuration."
             )
+    if peft_config is not None:
+        # Modules freeze_config unfreezes next to LoRA are saved whole with the adapter;
+        # reject layouts the adapter checkpoint cannot restore before training starts.
+        for mp in trainability_models:
+            validate_peft_trainable_modules(mp)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
@@ -855,9 +1022,17 @@ def apply_model_infrastructure(
     if mp_policy is None:
         mp_policy = getattr(model_wrapper, "mp_policy", None)
     compute_dtype = getattr(mp_policy, "param_dtype", None)
+    # One-rank FSDP2 has no mixed-precision wrappers: retain uniform storage for
+    # explicit parameter freezes instead of introducing a plain-tensor dtype seam.
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and not fsdp2_active
+    ):
+        compute_dtype = None
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
-            cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
+            cast_frozen_modules_to_compute_dtype(mp, compute_dtype, keep_storage=packed_expert_parameters(mp))
 
     # Re-apply the Megatron-FSDP per-parameter state dropped by the lm-head re-tie and
     # post-wrap checkpoint reload, so the deferred optimizer registration and first

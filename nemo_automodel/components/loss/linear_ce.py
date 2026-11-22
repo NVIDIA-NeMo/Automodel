@@ -172,7 +172,8 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
 
         Args:
             hidden_states: Rank-local hidden states with shape
-                ``[batch, sequence, hidden]``.
+                ``[batch, sequence, hidden]`` or packed THD ``[tokens, hidden]`` /
+                ``[1, tokens, hidden]``. Token order must match flattened labels.
             labels: Rank-local target token IDs with shape ``[batch, sequence]``.
             lm_weight: LM-head weight with global shape ``[vocab, hidden]``.
                 It may be a regular tensor or an FSDP-sharded DTensor.
@@ -204,6 +205,31 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
             lm_weight,
             grad_reduce_group=grad_reduce_group,
         )
+        if self.impl == "cce" and hidden_states.is_cuda:
+            # The cce backward kernel only accepts bf16/fp16 operands, so an fp32
+            # lm_head (``fp32_lm_head`` models, ``distributed.moe.lm_head_precision``)
+            # cannot train through it; fail here with the alternatives instead of
+            # inside the Triton kernel.
+            for name, tensor in (("hidden_states", hidden_states), ("lm_weight", lm_weight)):
+                if tensor.dtype not in (torch.bfloat16, torch.float16):
+                    raise ValueError(
+                        f"FusedLinearCrossEntropy(impl='cce') requires bf16/fp16 {name}, got {tensor.dtype}. "
+                        "An fp32 lm_head is not supported by the cce kernel; use MaskedCrossEntropy or "
+                        "ChunkedCrossEntropy instead."
+                    )
+        if hidden_states.dtype != lm_weight.dtype:
+            # Project in the dtype of the weight the loss actually consumes, as the model's own lm_head
+            # (``compute_lm_head_logits``) and ChunkedCrossEntropy do: the backbone hands its activations
+            # out unchanged, so a bf16 backbone with an fp32 head (DeepSeek V4.1, ``lm_head_precision:
+            # float32``) is promoted once here, and an FSDP head whose master weight is gathered after
+            # resharding meets hidden states of the same dtype. The projection ``e @ c.T`` inside
+            # cut-cross-entropy does not align dtypes itself.
+            hidden_states = hidden_states.to(lm_weight.dtype)
+
+        # Native THD models flatten packed rows while labels retain [B, S].
+        # Restore the target layout without changing token order; CCE requires
+        # every leading activation dimension to match targets before flattening.
+        hidden_states = hidden_states.reshape(*labels.shape, hidden_states.shape[-1])
 
         # First compute loss with sum reduction to handle normalization ourselves
         softcap = None if self.logit_softcapping == 0 else self.logit_softcapping

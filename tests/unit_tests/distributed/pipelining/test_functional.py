@@ -14,10 +14,12 @@
 
 import importlib
 import types
+from collections.abc import Iterator
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
     PipelineScheduleMulti,
     PipelineScheduleSingle,
@@ -477,8 +479,91 @@ class TestSplitModelIntoStages:
                 assert "language_model.lm_head" in call_kwargs["lm_head_fqn"]
 
 
+@pytest.fixture
+def one_rank_gloo_group() -> Iterator[None]:
+    """Initialize a one-rank Gloo process group and destroy it after the test."""
+    torch.distributed.init_process_group("gloo", rank=0, world_size=1, store=torch.distributed.HashStore())
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class _StepRecordingSchedule(PipelineScheduleSingle):
+    """Schedule stub that records the keyword arguments its ``step()`` receives."""
+
+    def __init__(self, *args, **kwargs):
+        self.step_kwargs = []
+
+    def step(self, **kwargs: bool) -> None:
+        self.step_kwargs.append(kwargs)
+
+    def _step_microbatches(self, *args, **kwargs):
+        pass
+
+
 class TestBuildPipelineSchedule:
     """Test build_pipeline_schedule function."""
+
+    @pytest.mark.cpu_only
+    # 1F1B runs PipelineScheduleSingle.step(); interleaved 1F1B runs PipelineScheduleMulti.step().
+    @pytest.mark.parametrize("schedule_name", ["1f1b", "interleaved1f1b"])
+    def test_last_stage_outputs_are_not_kept_or_returned_by_default(
+        self, one_rank_gloo_group: None, schedule_name: str
+    ) -> None:
+        # One stage on one rank is both the first and the last stage.
+        model = torch.nn.Linear(4, 6)
+        stage = PipelineStage(model, stage_index=0, num_stages=1, device=torch.device("cpu"))
+        schedule = build_pipeline_schedule(
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule=schedule_name,
+            microbatch_size=2,
+            local_batch_size=8,
+            stages=[stage],
+            loss_fn=torch.nn.MSELoss(),
+        )
+        inputs = torch.randn(8, 4)
+        target = torch.randn(8, 6)
+
+        for run in (schedule.step, schedule.eval):
+            losses = []
+            assert run(inputs, target=target, losses=losses) is None
+            assert stage.output_chunks == []
+            assert len(losses) == 4
+
+        merged = schedule.step(inputs, target=target, losses=[], return_outputs=True)
+        assert len(stage.output_chunks) == 4
+        torch.testing.assert_close(merged, model(inputs))
+
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize(
+        ("call_kwargs", "received_kwargs"),
+        [
+            ({}, {"return_outputs": False}),
+            ({"return_outputs": True}, {"return_outputs": True}),
+        ],
+    )
+    def test_step_return_outputs_default(
+        self,
+        call_kwargs: dict[str, bool],
+        received_kwargs: dict[str, bool],
+    ) -> None:
+        with patch(
+            "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
+            return_value=_StepRecordingSchedule,
+        ):
+            schedule = build_pipeline_schedule(
+                pipeline_parallel_schedule_csv=None,
+                pipeline_parallel_schedule="1f1b",
+                microbatch_size=2,
+                local_batch_size=8,
+                stages=[Mock()],
+                loss_fn=Mock(),
+            )
+
+        schedule.step(**call_kwargs)
+
+        assert schedule.step_kwargs == [received_kwargs]
 
     @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
     def test_build_schedule_single(self, mock_get_schedule):
@@ -575,6 +660,7 @@ class TestBuildPipelineSchedule:
                 self.n_microbatches = kwargs.get("n_microbatches", 0)
                 self.loss_fn = kwargs.get("loss_fn", None)
                 self._load_csv = Mock()
+                self.step = Mock()
                 self._mock_instance = self  # Store reference for assertions
 
         # Patch _PipelineScheduleRuntime with our mock class
@@ -784,7 +870,8 @@ class TestPrecomputeStageShapes:
         assert stage._user_meta.inputs[1].requires_grad is True
         assert stage._user_meta.outputs[0].requires_grad is True
 
-    def test_unsupported_pipeline_stage_api_uses_dynamic_metadata_inference(self):
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_unsupported_pipeline_stage_api_uses_dynamic_metadata_inference(self, reset):
         """PipelineStage APIs without a static metadata hook retain the dynamic fallback."""
 
         class _Submod:
@@ -793,8 +880,12 @@ class TestPrecomputeStageShapes:
         stage = types.SimpleNamespace(is_first=True, submod=_Submod())
         config = self._make_config(hidden_size=64, vocab_size=128)
 
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+        if reset:
+            num_tokens = reset_pp_stage_shapes(types.SimpleNamespace(), [stage], config, microbatch_size=2, seq_len=16)
+        else:
+            num_tokens = _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
 
+        assert num_tokens == 32
         assert not hasattr(stage, "inputs_meta")
         assert not hasattr(stage, "_outputs_meta")
 
@@ -816,6 +907,43 @@ class TestPrecomputeStageShapes:
         assert len(out_call) == 1
         assert out_call[0].shape == (2, 16, 64)
         assert out_call[0].dtype == torch.bfloat16
+
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_empty_stages_return_global_token_fallback(self, reset):
+        config = self._make_config()
+        if reset:
+            num_tokens = reset_pp_stage_shapes(types.SimpleNamespace(), [], config, 3, 17)
+        else:
+            num_tokens = _precompute_stage_shapes([], config, 3, 17)
+        assert num_tokens == 51
+
+    @pytest.mark.parametrize("reset", [False, True])
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_returns_maximum_local_stage_token_count(self, reset, reverse):
+        class LocalStageModel(torch.nn.Module):
+            def __init__(self, shape):
+                super().__init__()
+                self.shape = shape
+
+            def get_pipeline_stage_metas(self, **kwargs):
+                output = torch.empty(self.shape, device="meta", dtype=kwargs["dtype"])
+                return (output,), (output,)
+
+        # Include ordinary batch-major and hyper-connection layouts. The maximum
+        # (18) differs from the first/last value, their sum, and the global count.
+        shapes = [(2, 3, 64), (2, 9, 4, 64), (2, 5, 64)]
+        if reverse:
+            shapes.reverse()
+        stages = [
+            types.SimpleNamespace(is_first=False, submod=LocalStageModel(shape), _configure_outputs_meta=Mock())
+            for shape in shapes
+        ]
+        config = self._make_config()
+        if reset:
+            num_tokens = reset_pp_stage_shapes(types.SimpleNamespace(), stages, config, 2, 32)
+        else:
+            num_tokens = _precompute_stage_shapes(stages, config, 2, 32)
+        assert num_tokens == 18
 
     def test_middle_stage_shapes(self):
         """Middle stage input/output should be [mb, seq_len, hidden]."""
@@ -1889,3 +2017,50 @@ class TestPreserveGradsAcrossStageReinit:
         _preserve_grads_across_stage_reinit([stage])
 
         assert not hasattr(stage, "_post_metadata_inference_cleanup")
+
+
+def test_explicit_partition_must_list_every_decoder_layer_once():
+    from nemo_automodel.components.distributed.pipelining.functional import _check_partition_lists_every_layer_once
+
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.layers.0", "model.layers.1"], ["model.layers.2", "model.lm_head"]], "model.", 3
+    )
+    with pytest.raises(ValueError, match=r"missing \[1\]"):
+        _check_partition_lists_every_layer_once([["model.layers.0"], ["model.layers.2"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[1\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers.0", "model.layers.1"], ["model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    with pytest.raises(ValueError, match=r"beyond the model \[3\]"):
+        _check_partition_lists_every_layer_once([[f"model.layers.{i}" for i in range(4)]], "model.", 3)
+    # A listed ancestor retains the whole container, as the splitter does.
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.rotary_emb", "model.layers"], ["model.norm", "lm_head"]], "model.", 3
+    )
+    _check_partition_lists_every_layer_once([["model"], ["lm_head"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[0, 1, 2\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers"], ["model.layers.0", "model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    # Only the canonical decimal key retains a ModuleDict layer: "04" is not "4".
+    with pytest.raises(ValueError, match=r"missing \[4\]"):
+        _check_partition_lists_every_layer_once(
+            [[f"model.layers.{i}" for i in range(4)], ["model.layers.04", "model.layers.5"]], "model.", 6
+        )
+    # The whole FQN must match: with a trailing newline it is another string than the ModuleDict key.
+    with pytest.raises(ValueError, match=r"missing \[4\]"):
+        _check_partition_lists_every_layer_once(
+            [[f"model.layers.{i}" for i in range(4)], ["model.layers.4\n", "model.layers.5"]], "model.", 6
+        )
+    # Stages must own increasing layer ranges: [0,4), [5,6), [4,5), [6,8) covers every layer once but reorders.
+    with pytest.raises(ValueError, match=r"increasing order.*\(0, 3\), \(5, 5\), \(4, 4\), \(6, 7\)"):
+        _check_partition_lists_every_layer_once(
+            [
+                [f"model.layers.{i}" for i in range(0, 4)],
+                ["model.layers.5"],
+                ["model.layers.4"],
+                [f"model.layers.{i}" for i in range(6, 8)],
+            ],
+            "model.",
+            8,
+        )

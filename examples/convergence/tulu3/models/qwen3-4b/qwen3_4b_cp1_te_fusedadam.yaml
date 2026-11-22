@@ -103,3 +103,7 @@ optimizer:
   store_param_remainders: true
   exp_avg_dtype: torch.float32
   exp_avg_sq_dtype: torch.float32
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

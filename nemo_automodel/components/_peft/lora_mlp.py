@@ -29,21 +29,28 @@ The SwiGLU activation/gradient are computed by elementwise Triton kernels (``_sw
 a pure-torch fallback is used when Triton is unavailable. The matmuls stay on cuBLAS.
 """
 
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import TypeGuard
+
 import torch
 import torch.nn.functional as F
 from packaging import version
+from torch.autograd.function import BackwardCFunction
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.shared.import_utils import null_decorator
 
 try:
     import triton
     import triton.language as tl
 
-    HAVE_TRITON = bool(version.parse(triton.__version__) >= version.parse("2.0.0"))
+    if version.parse(triton.__version__) < version.parse("2.0.0"):
+        raise ImportError("Installed Triton version is unsupported")
+    HAVE_TRITON = True
 except ImportError:  # pragma: no cover
     HAVE_TRITON = False
-if not HAVE_TRITON:  # pragma: no cover
     from unittest.mock import MagicMock
 
     triton = MagicMock()
@@ -52,7 +59,9 @@ if not HAVE_TRITON:  # pragma: no cover
 
 
 @triton.jit
-def _swiglu_fwd_kernel(e_ptr, g_ptr, h_ptr, n_elements, BLOCK: tl.constexpr):
+def _swiglu_fwd_kernel(
+    e_ptr: tl.tensor, g_ptr: tl.tensor, h_ptr: tl.tensor, n_elements: int, BLOCK: tl.constexpr
+) -> None:
     """h = silu(e) * g, elementwise. Avoids a separate silu activation buffer."""
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_elements
@@ -63,7 +72,9 @@ def _swiglu_fwd_kernel(e_ptr, g_ptr, h_ptr, n_elements, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _swiglu_bwd_kernel(dh_ptr, e_ptr, g_ptr, n_elements, BLOCK: tl.constexpr):
+def _swiglu_bwd_kernel(
+    dh_ptr: tl.tensor, e_ptr: tl.tensor, g_ptr: tl.tensor, n_elements: int, BLOCK: tl.constexpr
+) -> None:
     """In-place SwiGLU backward (h = silu(e)*g). Reads (d_h, e, g) and overwrites the SAME three
     buffers with (h, d_g, d_e) — zero new allocations. Safe for a single backward: the saved
     ``e``/``g`` are dead afterward (no double-backward in LoRA SFT)."""
@@ -81,7 +92,7 @@ def _swiglu_bwd_kernel(dh_ptr, e_ptr, g_ptr, n_elements, BLOCK: tl.constexpr):
     tl.store(g_ptr + offs, de.to(g_ptr.dtype.element_ty), mask=mask)  # g buffer  <- d_e
 
 
-def _use_triton(*tensors) -> bool:
+def _use_triton(*tensors: torch.Tensor) -> bool:
     return HAVE_TRITON and all(t.is_cuda and t.is_contiguous() for t in tensors)
 
 
@@ -125,7 +136,7 @@ def _like_input(grad: torch.Tensor, inp: torch.Tensor) -> torch.Tensor:
     return grad.to(device=inp.device, dtype=inp.dtype)
 
 
-def _swiglu_fwd(e, g):
+def _swiglu_fwd(e: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
     """h = silu(e) * g."""
     if not _use_triton(e, g):
         return F.silu(e) * g
@@ -135,7 +146,9 @@ def _swiglu_fwd(e, g):
     return h
 
 
-def _swiglu_bwd_inplace(dh, e, g):
+def _swiglu_bwd_inplace(
+    dh: torch.Tensor, e: torch.Tensor, g: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """In-place: overwrite (dh, e, g) with (h, d_g, d_e) for h = silu(e)*g. Returns the aliases.
 
     No new ``tokens x intermediate`` buffers (the Triton path), so backward activation memory stays
@@ -156,6 +169,24 @@ def _swiglu_bwd_inplace(dh, e, g):
     return dh, e, g
 
 
+@dataclass(frozen=True)
+class _SwiGLUState:
+    """Base weights, scales, and input shape owned by a SwiGLU autograd invocation."""
+
+    bases: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    scales: tuple[float, float, float]
+    orig_shape: torch.Size
+
+
+@dataclass(frozen=True)
+class _ReLU2State:
+    """Base weights, scales, and input shape owned by a ReLU-squared autograd invocation."""
+
+    bases: tuple[torch.Tensor, torch.Tensor]
+    scales: tuple[float, float]
+    orig_shape: torch.Size
+
+
 class LoRASwiGLUMLPFunction(torch.autograd.Function):
     """Fused ``down(silu(gate(x)) * up(x))`` with LoRA on all three projections.
 
@@ -170,7 +201,22 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, gW, gA, gB, gS, uW, uA, uB, uS, dW, dA, dB, dS):
+    def forward(
+        ctx: BackwardCFunction,
+        x: torch.Tensor,
+        gW: torch.Tensor,
+        gA: torch.Tensor,
+        gB: torch.Tensor,
+        gS: float,
+        uW: torch.Tensor,
+        uA: torch.Tensor,
+        uB: torch.Tensor,
+        uS: float,
+        dW: torch.Tensor,
+        dA: torch.Tensor,
+        dB: torch.Tensor,
+        dS: float,
+    ) -> torch.Tensor:
         """Compute the fused SwiGLU MLP output, saving only x, gate_out, up_out for backward."""
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
@@ -192,23 +238,43 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
 
         # Save only x / gate_out / up_out; the SwiGLU activation and down-input are recomputed.
         ctx.save_for_backward(x2, e, g, gA, gB, uA, uB, dA, dB)
-        ctx.bases = (gW, uW, dW)
-        ctx.scales = (gS, uS, dS)
-        ctx.orig_shape = orig_shape
+        setattr(ctx, "_lora_mlp_state", _SwiGLUState((gW, uW, dW), (gS, uS, dS), orig_shape))
         return out.view(*orig_shape[:-1], dW.shape[0])
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx: BackwardCFunction, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         """Recompute SwiGLU + down-input, then backprop to x and the six LoRA matrices.
 
         The SwiGLU backward overwrites the saved ``e``/``g`` and the ``d_h`` buffers in place
         (``h``, ``d_g``, ``d_e``), so the only new ``tokens x intermediate`` buffer is ``d_h``.
         Safe for single backward (no double-backward in LoRA SFT); ``grad_out`` and the LoRA
         ``A``/``B`` are never mutated.
+
+        Args:
+            ctx: Context saved by forward.
+            grad_outputs: Exactly one Tensor of shape [..., out_features], with arbitrary leading
+                dimensions matching forward's x and the forward output's dtype and device.
+
+        Returns:
+            Thirteen gradients in forward-input order:
+            (dx, None, dgA, dgB, None, None, duA, duB, None, None, ddA, ddB, None).
+            dx is None or Tensor of shape [..., in_features], restoring x's leading dimensions.
+            dgA and dgB have shapes [gate_rank, in_features] and [intermediate, gate_rank];
+            duA and duB have shapes [up_rank, in_features] and [intermediate, up_rank];
+            ddA and ddB have shapes [down_rank, intermediate] and [out_features, down_rank].
+            intermediate is the gate/up projection width; gate_rank, up_rank, and down_rank are
+            the corresponding adapter ranks. Tensor gradients match their input's dtype and device.
         """
-        x, e, g, gA, gB, uA, uB, dA, dB = ctx.saved_tensors
-        gW, uW, dW = ctx.bases
-        gS, uS, dS = ctx.scales
+        if len(grad_outputs) != 1:
+            raise TypeError("SwiGLU backward requires exactly one output gradient")
+        (grad_out,) = grad_outputs
+        state = getattr(ctx, "_lora_mlp_state", None)
+        if not isinstance(state, _SwiGLUState):
+            raise TypeError("SwiGLU backward requires state saved by its forward")
+        # PyTorch annotates saved_tensors as a one-element tuple; its runtime length is variable.
+        x, e, g, gA, gB, uA, uB, dA, dB = tuple(iter(ctx.saved_tensors))
+        gW, uW, dW = state.bases
+        gS, uS, dS = state.scales
         dY = grad_out.reshape(-1, grad_out.shape[-1])
         needs_x = ctx.needs_input_grad[0]
 
@@ -258,7 +324,7 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
             # eager cast would burn that memory on every backward that does not need d_x.
             gW, uW = _cast(compute_dtype, gW, uW)
             d_x = torch.addmm(d_e @ gW, d_R, gAc)
-            d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uAc).view(ctx.orig_shape)
+            d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uAc).view(state.orig_shape)
 
         # Hand every gradient back on its input's device and in its input's dtype (see _like_input).
         d_gA, d_gB = _like_input(d_gA, gA), _like_input(d_gB, gB)
@@ -271,22 +337,25 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         return (d_x, None, d_gA, d_gB, None, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
 
 
-def _fusible(module) -> bool:
+def _fusible(module: torch.nn.Module | torch.Tensor) -> TypeGuard[LinearLoRA]:
     """A LoRA linear is fusible when it is a plain materialized adapter."""
-    lora_A = getattr(module, "lora_A", None)
-    lora_B = getattr(module, "lora_B", None)
-    if lora_A is None or lora_B is None:
+    if not isinstance(module, LinearLoRA):
         return False
-    if not getattr(module, "use_memory_efficient_lora", False):
+    lora_A, lora_B = module.lora_A, module.lora_B
+    if not module.use_memory_efficient_lora:
         return False
-    if getattr(module, "use_dora", False):
+    if module.use_dora:
         return False
-    if getattr(module, "dropout_p", 0.0) and module.training:
+    if module.dropout_p and module.training:
+        return False
+    # A per-token gate (``lora_token_gate``) is applied only by the per-linear path. Only ``LinearLoRA`` carries
+    # ``lora_A``/``lora_B``, so the class default ``_lora_token_gate = None`` is always present here.
+    if module._lora_token_gate is not None:
         return False
     # The fused forward calls ``F.linear(x, base_weight)`` with no bias term, so a biased base
     # projection would train on silently wrong math. Models plumb this from the HF config
     # (``nn.Linear(..., bias=config.mlp_bias)``), so decline and let the per-linear path add it.
-    if getattr(module, "bias", None) is not None:
+    if module.bias is not None:
         return False
     # QLoRA / quantized base weights are stored as packed buffers (e.g. bitsandbytes 4-bit
     # carries a ``quant_state`` and a flattened weight shaped like ``(1, out*in/2)`` rather than
@@ -296,9 +365,7 @@ def _fusible(module) -> bool:
     base_w = module.weight
     if getattr(base_w, "quant_state", None) is not None or getattr(module, "quant_state", None) is not None:
         return False
-    out_features = getattr(module, "out_features", None)
-    in_features = getattr(module, "in_features", None)
-    if out_features is not None and in_features is not None and tuple(base_w.shape) != (out_features, in_features):
+    if tuple(base_w.shape) != (module.out_features, module.in_features):
         return False
     for w in (base_w, lora_A.weight, lora_B.weight):
         if isinstance(w, DTensor):
@@ -308,7 +375,12 @@ def _fusible(module) -> bool:
     return True
 
 
-def fused_lora_swiglu_mlp(gate, up, down, x):
+def fused_lora_swiglu_mlp(
+    gate: torch.nn.Module | torch.Tensor,
+    up: torch.nn.Module | torch.Tensor,
+    down: torch.nn.Module | torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor | None:
     """Run ``down(silu(gate(x)) * up(x))`` through the fused LoRA autograd function.
 
     ``gate``/``up``/``down`` are ``LinearLoRA`` modules. Returns the MLP output, or ``None`` if the
@@ -347,7 +419,18 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, uW, uA, uB, uS, dW, dA, dB, dS):
+    def forward(
+        ctx: BackwardCFunction,
+        x: torch.Tensor,
+        uW: torch.Tensor,
+        uA: torch.Tensor,
+        uB: torch.Tensor,
+        uS: float,
+        dW: torch.Tensor,
+        dA: torch.Tensor,
+        dB: torch.Tensor,
+        dS: float,
+    ) -> torch.Tensor:
         """Compute the fused ReLU² MLP output, saving only x and up_out for backward."""
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1])
@@ -360,17 +443,37 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         out = F.linear(f, dW)
         out.addmm_(*_cast(out.dtype, F.linear(f, dA) * dS, dB.t()))
         ctx.save_for_backward(x2, e, uA, uB, dA, dB)
-        ctx.bases = (uW, dW)
-        ctx.scales = (uS, dS)
-        ctx.orig_shape = orig_shape
+        setattr(ctx, "_lora_mlp_state", _ReLU2State((uW, dW), (uS, dS), orig_shape))
         return out.view(*orig_shape[:-1], dW.shape[0])
 
     @staticmethod
-    def backward(ctx, grad_out):
-        """Recompute ReLU² + down-input, then backprop to x, up-LoRA, and down-LoRA."""
-        x, e, uA, uB, dA, dB = ctx.saved_tensors
-        uW, dW = ctx.bases
-        uS, dS = ctx.scales
+    def backward(ctx: BackwardCFunction, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        """Recompute ReLU² + down-input, then backprop to x, up-LoRA, and down-LoRA.
+
+        Args:
+            ctx: Context saved by forward.
+            grad_outputs: Exactly one Tensor of shape [..., out_features], with arbitrary leading
+                dimensions matching forward's x and the forward output's dtype and device.
+
+        Returns:
+            Nine gradients in forward-input order:
+            (dx, None, duA, duB, None, None, ddA, ddB, None).
+            dx is None or Tensor of shape [..., in_features], restoring x's leading dimensions.
+            duA and duB have shapes [up_rank, in_features] and [intermediate, up_rank];
+            ddA and ddB have shapes [down_rank, intermediate] and [out_features, down_rank].
+            intermediate is the up-projection width; up_rank and down_rank are the corresponding
+            adapter ranks. Tensor gradients match their input's dtype and device.
+        """
+        if len(grad_outputs) != 1:
+            raise TypeError("ReLU-squared backward requires exactly one output gradient")
+        (grad_out,) = grad_outputs
+        state = getattr(ctx, "_lora_mlp_state", None)
+        if not isinstance(state, _ReLU2State):
+            raise TypeError("ReLU-squared backward requires state saved by its forward")
+        # PyTorch annotates saved_tensors as a one-element tuple; its runtime length is variable.
+        x, e, uA, uB, dA, dB = tuple(iter(ctx.saved_tensors))
+        uW, dW = state.bases
+        uS, dS = state.scales
         dY = grad_out.reshape(-1, grad_out.shape[-1])
         needs_x = ctx.needs_input_grad[0]
 
@@ -404,7 +507,7 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         d_x = None
         if needs_x:
             (uW,) = _cast(compute_dtype, uW)  # read only here; see LoRASwiGLUMLPFunction.backward
-            d_x = torch.addmm(d_e @ uW, d_Q, uAc).view(ctx.orig_shape)
+            d_x = torch.addmm(d_e @ uW, d_Q, uAc).view(state.orig_shape)
 
         # Hand every gradient back on its input's device and in its input's dtype (see _like_input).
         d_uA, d_uB = _like_input(d_uA, uA), _like_input(d_uB, uB)
@@ -416,7 +519,9 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         return (d_x, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
 
 
-def fused_lora_relu2_mlp(up, down, x):
+def fused_lora_relu2_mlp(
+    up: torch.nn.Module | torch.Tensor, down: torch.nn.Module | torch.Tensor, x: torch.Tensor
+) -> torch.Tensor | None:
     """Run ``down(relu(up(x)) ** 2)`` through the fused LoRA autograd function.
 
     ``up``/``down`` are ``LinearLoRA`` modules. Returns the MLP output, or ``None`` if either is not
@@ -437,7 +542,7 @@ def fused_lora_relu2_mlp(up, down, x):
     )
 
 
-def _is_silu(act_fn) -> bool:
+def _is_silu(act_fn: Callable[[torch.Tensor], torch.Tensor] | None) -> bool:
     """Detect a SiLU/Swish activation robustly across implementations.
 
     Covers ``nn.SiLU``, HF's ``SiLUActivation`` / ``ACT2FN["silu"]`` (whose class is *not*
@@ -455,7 +560,7 @@ def _is_silu(act_fn) -> bool:
         return False
 
 
-def _is_silu_swiglu_mlp(module) -> bool:
+def _is_silu_swiglu_mlp(module: torch.nn.Module) -> bool:
     """Return True if ``module`` is a SiLU-gated SwiGLU MLP with separate gate/up/down projections.
 
     Matches AutoModel's ``moe.layers.MLP`` (``activation == "swiglu"``) and HF-style MLPs whose
@@ -472,7 +577,7 @@ def _is_silu_swiglu_mlp(module) -> bool:
     return _is_silu(getattr(module, "act_fn", None))  # HF-style MLP
 
 
-def _is_relu2_mlp(module) -> bool:
+def _is_relu2_mlp(module: torch.nn.Module) -> bool:
     """Return True if ``module`` is a non-gated ReLU² MLP (``up_proj``/``down_proj``, no gate).
 
     Matches AutoModel's ``moe.layers.MLP`` with ``activation == "relu2"`` (e.g. Nemotron-H's dense
@@ -485,27 +590,31 @@ def _is_relu2_mlp(module) -> bool:
     return getattr(module, "activation", None) == "relu2"
 
 
-def _projs_are_fusible(module, projs) -> bool:
+def _projs_are_fusible(module: torch.nn.Module, projs: Sequence[str]) -> bool:
     return all(_fusible(getattr(module, proj)) for proj in projs)
 
 
-def _swiglu_forward(mod, orig_forward):
-    def forward(x):
+def _swiglu_forward(
+    mod: torch.nn.Module, orig_forward: Callable[[torch.Tensor], torch.Tensor]
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def forward(x: torch.Tensor) -> torch.Tensor:
         out = fused_lora_swiglu_mlp(mod.gate_proj, mod.up_proj, mod.down_proj, x)
         return out if out is not None else orig_forward(x)
 
     return forward
 
 
-def _relu2_forward(mod, orig_forward):
-    def forward(x):
+def _relu2_forward(
+    mod: torch.nn.Module, orig_forward: Callable[[torch.Tensor], torch.Tensor]
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def forward(x: torch.Tensor) -> torch.Tensor:
         out = fused_lora_relu2_mlp(mod.up_proj, mod.down_proj, x)
         return out if out is not None else orig_forward(x)
 
     return forward
 
 
-def install_fused_lora_mlp(model) -> int:
+def install_fused_lora_mlp(model: torch.nn.Module) -> int:
     """Swap each LoRA-applied SwiGLU or ReLU² MLP's ``forward`` to the fused path (with fallback).
 
     Intended to be called by the LoRA matcher after the projections have been patched to
@@ -529,6 +638,6 @@ def install_fused_lora_mlp(model) -> int:
             mlp.forward = _relu2_forward(mlp, mlp.forward)
         else:
             continue
-        mlp._lora_mlp_fused = True
+        setattr(mlp, "_lora_mlp_fused", True)
         count += 1
     return count

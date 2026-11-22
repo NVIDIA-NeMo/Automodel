@@ -1,0 +1,7 @@
+__pycache__/
+.ipynb_checkpoints/
+.pytest_cache/
+runs/
+
+# Keep the small fictional source fixture despite repository-wide JSONL ignores.
+!fixtures/smoke/*.jsonl

@@ -16,18 +16,20 @@ import glob
 import json
 import os
 import shutil
+from collections.abc import Collection, Sequence
+from dataclasses import fields
 from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, fully_trained_peft_modules
+from nemo_automodel.components.checkpoint.utils import unwrap_ddp_model
 from nemo_automodel.components.moe.state_dict_mixin import (
     _PARAMWRAPPER_LAYOUT_LEGACY,
     _PARAMWRAPPER_LAYOUT_METADATA_KEY,
@@ -35,10 +37,12 @@ from nemo_automodel.components.moe.state_dict_mixin import (
     MoESplitExpertsStateDictMixin,
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
 
 if TYPE_CHECKING:
     from peft import PeftConfig
     from torch.distributed import ProcessGroup
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 
 _MOE_LORA_PARAMETER_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
@@ -51,13 +55,6 @@ def _is_group_rank_0(process_group: "ProcessGroup | None") -> bool:
 def _group_barrier(process_group: "ProcessGroup | None") -> None:
     if torch.distributed.is_initialized():
         torch.distributed.barrier(group=process_group)
-
-
-def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
-    """Return the module that owns export metadata hidden by DDP."""
-    if isinstance(model, DistributedDataParallel):
-        return model.module
-    return model
 
 
 def _save_generated_hf_assets(
@@ -127,7 +124,9 @@ class CheckpointAddon(Protocol):
 class _ConsolidatedHFMetadataExporter(Protocol):
     """Model-provided writer for consolidated Hugging Face metadata."""
 
-    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+    def validate(
+        self, *, tokenizer: "PreTrainedTokenizerBase | ProcessorMixin | None", original_model_path: str | None
+    ) -> None:
         """Validate exporter inputs before any distributed rank writes files."""
         ...
 
@@ -135,10 +134,11 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         self,
         *,
         hf_metadata_dir: str,
-        tokenizer: object,
+        tokenizer: "PreTrainedTokenizerBase | ProcessorMixin | None",
         original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
-        """Write model-specific metadata into the shared Hugging Face metadata directory."""
+        """Write model-specific metadata, honoring the requested v4 config layout."""
         ...
 
 
@@ -161,6 +161,7 @@ class ConsolidatedHFAddon:
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
             original_model_path (str | None): Authoritative source checkpoint snapshot.
+            v4_compatible (bool): Preserve the source config beside the generated v5 config when available.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -171,7 +172,7 @@ class ConsolidatedHFAddon:
         original_model_path = kwargs["original_model_path"]
         process_group = kwargs.get("process_group")
 
-        export_model = _unwrap_ddp_model(model_part)
+        export_model = unwrap_ddp_model(model_part)
         get_metadata_exporter = getattr(export_model, "_get_consolidated_hf_metadata_exporter", None)
         metadata_exporter: _ConsolidatedHFMetadataExporter | None = (
             get_metadata_exporter(
@@ -194,6 +195,7 @@ class ConsolidatedHFAddon:
                     hf_metadata_dir=hf_metadata_dir,
                     tokenizer=tokenizer,
                     original_model_path=original_model_path,
+                    v4_compatible=kwargs.get("v4_compatible", False),
                 )
             else:
                 _save_generated_hf_assets(
@@ -263,6 +265,9 @@ class PeftAddon:
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             model_state (ModelState): Wrapper holding the model parts.
             peft_config (PeftConfig): PEFT configuration for serialization.
+            exported_tensor_names (Collection[str]): Keys of the adapter state dict this
+                save writes, after Hugging Face conversion. Empty on ranks that do not hold
+                the materialized adapter.
         """
         model_path = kwargs["model_path"]
         tokenizer = kwargs.get("tokenizer", None)
@@ -272,8 +277,13 @@ class PeftAddon:
         v4_compatible = kwargs.get("v4_compatible", False)
         process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
+        modules_to_save = hf_peft_config.get("modules_to_save")
+        exported_tensor_names = kwargs.get("exported_tensor_names", ())
+        if modules_to_save and exported_tensor_names:
+            # LoRA-only exports are unchanged; check the modules this save stores in full.
+            _check_modules_to_save_cover_exported_tensors(modules_to_save, exported_tensor_names)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
-        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         layout_stamp = _get_paramwrapper_layout_stamp(
             adapter, v4_compatible, kwargs.get("legacy_paramwrapper_layout", False)
         )
@@ -331,14 +341,23 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     pp_group = getattr(model_state, "pp_group", None)
     target_modules = _extract_target_modules(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
     target_parameters = _extract_target_parameters(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
-    try:
-        arch_name = model_part.config.architectures[0]
-        # "LlamaForCausalLM".split("For") → ["Llama", "CausalLM"]
-        # "LlamaBidirectionalModel".split("For") → ["LlamaBidirectionalModel"]
-        parts = arch_name.split("For")
-        model_task = parts[-1] if len(parts) > 1 else "FeatureExtraction"
-    except (AttributeError, IndexError, TypeError):
-        model_task = "N/A"
+    # The adapter belongs to the model being trained, and its class names the task
+    # (FSDP2 prefixes the class name, e.g. FSDPBertForSequenceClassification).
+    # config.architectures can instead name the base checkpoint's class, such as
+    # RobertaForMaskedLM for a roberta-large sequence classifier, or be missing for a
+    # model built from a config; HF PEFT cannot load a classifier adapter typed CAUSAL_LM.
+    class_task = type(unwrap_ddp_model(model_part)).__name__.rpartition("For")[2]
+    if class_task in MODEL_TYPE_TO_PEFT_TASK_TYPE:
+        model_task = class_task
+    else:
+        try:
+            arch_name = model_part.config.architectures[0]
+            # "LlamaForCausalLM".split("For") → ["Llama", "CausalLM"]
+            # "LlamaBidirectionalModel".split("For") → ["LlamaBidirectionalModel"]
+            parts = arch_name.split("For")
+            model_task = parts[-1] if len(parts) > 1 else "FeatureExtraction"
+        except (AttributeError, IndexError, TypeError):
+            model_task = "N/A"
 
     try:
         name_or_path = model_part.config.name_or_path
@@ -362,7 +381,96 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     }
     if target_parameters:
         config["target_parameters"] = target_parameters
+    modules_to_save = _extract_modules_to_save(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
+    if modules_to_save:
+        config["modules_to_save"] = modules_to_save
     return config
+
+
+# Combined projections and the HF projection modules their weights are split into.
+_COMBINED_TO_SPLIT = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
+
+
+def _split_combined_projection(module_name: str) -> list[str]:
+    """Return the HF module names for ``module_name``, splitting a combined projection.
+
+    adapter_config.json names modules as the HF model and its consumers (HF PEFT,
+    vLLM, TensorRT-LLM) see them, so ``layers.0.self_attn.qkv_proj`` becomes the
+    ``q_proj``, ``k_proj`` and ``v_proj`` modules next to it.
+    """
+    parent, _, last_component = module_name.rpartition(".")
+    if last_component not in _COMBINED_TO_SPLIT:
+        return [module_name]
+    return [f"{parent}.{split_name}" if parent else split_name for split_name in _COMBINED_TO_SPLIT[last_component]]
+
+
+def _extract_modules_to_save(
+    model_parts: Sequence[nn.Module],
+    *,
+    v4_compatible: bool = False,
+    pp_group: "ProcessGroup | None" = None,
+) -> list[str]:
+    """Return the HF names of the modules a PEFT checkpoint stores whole, for ``modules_to_save``.
+
+    Args:
+        model_parts: This rank's model or pipeline-stage parts.
+        v4_compatible: Whether the export targets the legacy Transformers v4 layout.
+        pp_group: Pipeline-parallel process group, or None without pipeline parallelism.
+
+    Returns:
+        Sorted module names in the Hugging Face layout, with the same combined-projection splits and
+        adapter renames as ``target_modules``. Empty when only LoRA weights train.
+
+    Raises:
+        ValueError: If a trainable non-LoRA parameter cannot be restored by Hugging Face PEFT;
+            see ``fully_trained_peft_modules``.
+    """
+    modules = {
+        split_name
+        for module in fully_trained_peft_modules(model_parts, pp_group=pp_group)
+        for split_name in _split_combined_projection(module)
+    }
+    # Same renames as target_modules: the names must match the exported tensors.
+    adapter = getattr(unwrap_ddp_model(model_parts[0]), "state_dict_adapter", None)
+    if isinstance(adapter, StateDictAdapter):
+        modules = {adapter.map_peft_target_module_to_hf(name, v4_compatible=v4_compatible) for name in modules}
+    return sorted(modules)
+
+
+def _check_modules_to_save_cover_exported_tensors(
+    modules_to_save: Collection[str], exported_tensor_names: Collection[str]
+) -> None:
+    """Check that ``modules_to_save`` and the exported full-weight tensors name the same modules.
+
+    PEFT loads every parameter of a listed module from the adapter file and ignores
+    full-weight tensors outside the listed modules. A mismatch, for example a model
+    adapter that renames a module in the tensors but not in ``modules_to_save``, would
+    write an adapter that fails to load or silently loads base weights.
+
+    Args:
+        modules_to_save: Module names written to ``adapter_config.json``.
+        exported_tensor_names: Keys of the exported adapter state dict, with the
+            ``base_model.model.`` prefix.
+
+    Raises:
+        ValueError: If a full-weight tensor lies outside every listed module, or a listed
+            module has no exported tensor.
+    """
+    full_weights = sorted(
+        name.removeprefix("base_model.model.") for name in exported_tensor_names if "lora_" not in name
+    )
+    uncovered = [name for name in full_weights if not any(name.startswith(f"{m}.") for m in modules_to_save)]
+    unbacked = sorted(m for m in modules_to_save if not any(name.startswith(f"{m}.") for name in full_weights))
+    if uncovered or unbacked:
+        raise ValueError(
+            "The PEFT adapter export is inconsistent: modules_to_save and the exported full-weight tensors "
+            f"name different modules (tensors outside modules_to_save: {uncovered[:10]}; modules_to_save "
+            f"entries without tensors: {unbacked[:10]}). The model's state-dict adapter likely renames these "
+            "modules in to_hf but not in map_peft_target_module_to_hf."
+        )
 
 
 def _get_paramwrapper_layout_stamp(adapter, v4_compatible: bool, legacy_paramwrapper_layout: bool) -> "str | None":
@@ -378,7 +486,7 @@ def _get_paramwrapper_layout_stamp(adapter, v4_compatible: bool, legacy_paramwra
     return _PARAMWRAPPER_LAYOUT_LEGACY if legacy_paramwrapper_layout else _PARAMWRAPPER_LAYOUT_MODERN
 
 
-def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
+def _get_automodel_peft_metadata(peft_config: _AutomodelPeftConfig) -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
 
@@ -391,13 +499,36 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     """
     PEFT_KEYS = {"dim", "alpha"}
     result = {}
-    for k, v in peft_config.to_dict().items():
-        if k in PEFT_KEYS:
+    for config_field in fields(peft_config):
+        if config_field.name in PEFT_KEYS:
             continue
+        v = getattr(peft_config, config_field.name)
         if isinstance(v, torch.dtype):
             v = str(v)
-        result[k] = v
+        result[config_field.name] = v
     return result
+
+
+def load_automodel_peft_config_dict(model_path: str) -> dict:
+    """Read back the PEFT configuration ``PeftAddon`` saved in a ``model/`` checkpoint directory.
+
+    ``automodel_peft_config.json`` holds every ``PeftConfig`` field except ``dim`` and ``alpha``, which are taken
+    from the PEFT ``adapter_config.json`` (``r`` / ``lora_alpha``).
+
+    Args:
+        model_path: The checkpoint's ``model/`` directory.
+
+    Returns:
+        Constructor kwargs for ``PeftConfig``, excluding checkpoint-only metadata
+        such as the expert ParamWrapper layout stamp.
+    """
+    with open(os.path.join(model_path, "automodel_peft_config.json")) as f:
+        metadata = json.load(f)
+    with open(os.path.join(model_path, "adapter_config.json")) as f:
+        hf_config = json.load(f)
+    config_fields = {field.name for field in fields(_AutomodelPeftConfig)}
+    config = {key: value for key, value in metadata.items() if key in config_fields}
+    return {**config, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
 
 
 def _has_trainable_moe_lora_parameters(
@@ -480,12 +611,6 @@ def _extract_target_modules(
     covers every rank's layers too.
     """
     model_parts = model if isinstance(model, (list, tuple)) else [model]
-    # Mapping from combined projection names to their HF-compatible split names.
-    _COMBINED_TO_SPLIT = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-
     final_target_modules = set()
     for _mp in model_parts:
         for name, _ in _mp.named_modules():
@@ -494,16 +619,7 @@ def _extract_target_modules(
                 if target_name.startswith("_orig_mod."):
                     target_name = target_name[len("_orig_mod.") :]
                 target_name = canonical_parameter_fqn(target_name)
-
-                # Expand combined projection names to individual HF projection names
-                last_component = target_name.rsplit(".", 1)[-1]
-                if last_component in _COMBINED_TO_SPLIT:
-                    parent = target_name.rsplit(".", 1)[0] if "." in target_name else ""
-                    for split_name in _COMBINED_TO_SPLIT[last_component]:
-                        expanded = f"{parent}.{split_name}" if parent else split_name
-                        final_target_modules.add(expanded)
-                else:
-                    final_target_modules.add(target_name)
+                final_target_modules.update(_split_combined_projection(target_name))
 
     # MoE expert LoRA: adapter weights are nn.Parameter (not nn.Module) so
     # they don't appear in named_modules(). Expand to per-expert HF names,
@@ -546,23 +662,14 @@ def _extract_target_modules(
                                 final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
                         break
 
-    # Strip "model." prefix for encoder adapters so adapter_config.json
-    # is compatible with HF PEFT / merge_lora.
-    adapter = getattr(model_parts[0], "state_dict_adapter", None)
-    if adapter is not None:
-        from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
-
-        if isinstance(adapter, EncoderStateDictAdapter):
-            final_target_modules = {
-                name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
-            }
-
     # Adapters whose HF checkpoint layout renames modules (e.g. Kimi K3's
-    # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1) convert the
-    # state-dict keys on save, so adapter_config.json's target_modules must get
-    # the same treatment or PEFT can't resolve them against the real model.
+    # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1, or the
+    # encoder wrapper's model. prefix) convert the state-dict keys on save, so
+    # adapter_config.json's target_modules must get the same treatment or PEFT
+    # can't resolve them against the real model.
     # The base method defaults to the identity; legacy adapters that don't
     # subclass StateDictAdapter (e.g. kimivl) skip it, as before.
+    adapter = getattr(model_parts[0], "state_dict_adapter", None)
     if isinstance(adapter, StateDictAdapter):
         final_target_modules = {
             adapter.map_peft_target_module_to_hf(name, v4_compatible=v4_compatible) for name in final_target_modules
@@ -696,8 +803,11 @@ def _maybe_save_custom_model_code(
     hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
     code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
     consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
-    ``trust_remote_code=True``.
+    ``trust_remote_code=True``. Models marked for stock export intentionally skip this copy.
     """
+    if model_part is not None and getattr(model_part, "_export_as_stock_model", False):
+        return
+
     copied: set[str] = set()
 
     def _copy_py_tree(src_dir: str) -> None:

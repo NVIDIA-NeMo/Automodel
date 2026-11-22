@@ -137,7 +137,7 @@ def _to_safetensors_dtype_str(dtype: torch.dtype) -> str:
 
 class _TensorLoader(ABC):
     @abstractmethod
-    def add(self, size: int, obj: object) -> None:
+    def add(self, size: int, obj: WriteItem) -> None:
         pass
 
     @abstractmethod
@@ -145,22 +145,22 @@ class _TensorLoader(ABC):
         pass
 
     @abstractmethod
-    def values(self) -> Iterator[tuple[torch.Tensor, object]]:
+    def values(self) -> Iterator[tuple[torch.Tensor, WriteItem]]:
         pass
 
 
 class _SerialCpuLoader(_TensorLoader):
     def __init__(self, resolve_fun: Callable) -> None:
         self.resolve_fun = resolve_fun
-        self.items: list[tuple[int, object]] = []
+        self.items: list[tuple[int, WriteItem]] = []
 
-    def add(self, size: int, obj: object) -> None:
+    def add(self, size: int, obj: WriteItem) -> None:
         self.items.append((size, obj))
 
     def start_loading(self) -> None:
         pass
 
-    def values(self) -> Iterator[tuple[torch.Tensor, object]]:
+    def values(self) -> Iterator[tuple[torch.Tensor, WriteItem]]:
         for _, obj in self.items:
             tensor = self.resolve_fun(obj).detach()
             tensor = tensor.cpu()
@@ -180,7 +180,7 @@ class _OverlappingCpuLoader(_TensorLoader):
         inflight_threshhold: int = 1_000_000,
     ) -> None:
         self.resolve_fun = resolve_fun
-        self.items: list[tuple[int, object]] = []
+        self.items: list[tuple[int, WriteItem]] = []
         self.inflight_threshhold = inflight_threshhold
         self.in_flight_data = 0
         self.current_items: collections.deque = collections.deque()
@@ -196,7 +196,7 @@ class _OverlappingCpuLoader(_TensorLoader):
     def _done(self) -> bool:
         return self.idx >= len(self.items)
 
-    def _drain(self) -> list[tuple[torch.Tensor, object]]:
+    def _drain(self) -> list[tuple[torch.Tensor, WriteItem]]:
         drained = []
         if self.in_flight_data >= self.inflight_threshhold:
             self.stream.synchronize()
@@ -227,13 +227,13 @@ class _OverlappingCpuLoader(_TensorLoader):
                 )
                 self.in_flight_data += tensor.numel() * tensor.element_size()
 
-    def _finish(self) -> Iterable[tuple[torch.Tensor, object]]:
+    def _finish(self) -> Iterable[tuple[torch.Tensor, WriteItem]]:
         assert self._done
         if len(self.current_items) > 0:
             self.stream.synchronize()
         return self.current_items
 
-    def add(self, size: int, obj: object) -> None:
+    def add(self, size: int, obj: WriteItem) -> None:
         if self.started:
             raise RuntimeError("cannot add items after loading started")
         self.items.append((size, obj))
@@ -245,7 +245,7 @@ class _OverlappingCpuLoader(_TensorLoader):
         self.items.sort(key=operator.itemgetter(0))
         self._refill()
 
-    def values(self) -> Iterator[tuple[torch.Tensor, object]]:
+    def values(self) -> Iterator[tuple[torch.Tensor, WriteItem]]:
         self.start_loading()
         while not self._done:
             drained = self._drain()

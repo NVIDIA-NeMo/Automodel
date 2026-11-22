@@ -519,6 +519,11 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @property
+    def _uses_hf_attention(self) -> bool:
+        """BSHD and NEAT use HF dispatch; TE handles only pre-packed THD."""
+        return True
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -569,7 +574,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         # Transformers v5 does not reliably tie this custom model from the
         # dict-shaped _tied_weights_keys alone; honor the config flag explicitly
         # (mirrors LlamaForCausalLM).

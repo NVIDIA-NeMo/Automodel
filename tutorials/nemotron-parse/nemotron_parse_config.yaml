@@ -61,6 +61,7 @@ loss_fn:
   ignore_index: -100
   fp32_upcast: true
 
+# invoice_dataset.py is loaded by path, which runs it: launch with NEMO_ENABLE_USER_MODULES=1.
 dataset:
   _target_: invoice_dataset.py:make_invoice_dataset
   path_or_dataset: katanaml-org/invoices-donut-data-v1

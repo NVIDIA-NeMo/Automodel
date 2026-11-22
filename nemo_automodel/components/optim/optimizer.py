@@ -42,16 +42,17 @@ import functools
 import importlib
 import inspect
 import logging
+import math
 import re
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict, cast
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
+from nemo_automodel.components.optim.dion import build_dion_optimizer, get_dion_mesh, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -60,6 +61,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
+    from nemo_automodel.components.optim.gradient_sketch import SketchSettings
     from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 logger = logging.getLogger(__name__)
@@ -79,7 +81,7 @@ _NON_CONSTRUCTOR_FIELDS = frozenset({"param_group_overrides"})
 
 @dataclass
 class ParamGroupOverride:
-    """Per-parameter-group learning-rate / weight-decay override.
+    """Per-parameter-group learning-rate and weight-decay override.
 
     Parameters whose (module-qualified) name matches :attr:`pattern` are placed
     in their own optimizer parameter group carrying :attr:`lr_mult` /
@@ -99,6 +101,10 @@ class ParamGroupOverride:
     pattern: str
     lr_mult: float = 1.0
     wd_mult: float = 1.0
+
+    def __post_init__(self) -> None:
+        if any(not math.isfinite(value) or value < 0 for value in (self.lr_mult, self.wd_mult)):
+            raise ValueError("param_group_overrides LR/WD multipliers must be finite and nonnegative.")
 
 
 def _coerce_param_group_overrides(overrides: list[Any]) -> list[ParamGroupOverride]:
@@ -197,8 +203,7 @@ class OptimizerConfig:
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
-    # and the factory path). Dion-family configs do their own grouping and warn if
-    # this is set.
+    # and the factory path). Dion-family configs preserve their layout groups.
     param_group_overrides: list[ParamGroupOverride] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -236,7 +241,9 @@ class OptimizerConfig:
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         """Construct a single optimizer for ``params`` (one model part)."""
         raise NotImplementedError(f"{type(self).__name__} must implement _build_optimizer()")
 
@@ -265,7 +272,9 @@ class AdamConfig(OptimizerConfig):
     eps: float = 1e-8
     amsgrad: bool = False
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         return torch.optim.Adam(
             params,
             **self._constructor_kwargs(),
@@ -284,7 +293,9 @@ class AdamWConfig(OptimizerConfig):
     amsgrad: bool = False
     fused: bool = False
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
             params,
             **self._constructor_kwargs(),
@@ -306,7 +317,9 @@ class FusedAdamConfig(OptimizerConfig):
     master_weights: bool = True
     master_weight_dtype: str | None = None
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         from transformer_engine.pytorch.optimizers import FusedAdam
 
         kwargs = self._constructor_kwargs()
@@ -326,26 +339,137 @@ class FlashAdamWConfig(OptimizerConfig):
     eps: float = 1e-8
     master_weight_bits: int = 24
 
-    def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:
         from flashoptim import FlashAdamW
 
-        return FlashAdamW(params, **self._constructor_kwargs())
+        # FlashAdamW forwards params unchanged to torch's Optimizer, including
+        # parameter-group dicts, but its upstream annotation only names tensors.
+        return FlashAdamW(cast(list[torch.Tensor], params), **self._constructor_kwargs())
 
 
-# Fields consumed by build_dion_optimizer for parameter grouping; these are NOT dion
+@dataclass
+class GradientSketchConfig(OptimizerConfig):
+    """LoGRA-style gradient sketching: rank-``r`` sketches for selected linear weights.
+
+    ``native`` configures the optimizer for every parameter that is not a sketch
+    target. Sketch targets never hold a dense gradient or Adam moments; see
+    :mod:`nemo_automodel.components.optim.gradient_sketch`.
+    """
+
+    supports_megatron_fsdp_sharding: ClassVar[bool] = False
+
+    native: OptimizerConfig | dict[str, Any] = field(default_factory=AdamWConfig)
+    rank: int = 256
+    seed: int = 42
+    distribution: str = "rademacher"
+    refresh: bool = True
+    optimizer: str = "row_adam"
+    beta2: float = 0.95
+    epsilon: float = 1e-8
+    target_modules: list[str] = field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
+    target_parameters: list[str] = field(default_factory=list)
+    target_prefixes: list[str] = field(default_factory=list)
+    freeze_non_target: bool = False
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.param_group_overrides:
+            raise ValueError("gradient_sketch does not support param_group_overrides")
+        if isinstance(self.native, dict):
+            native = dict(self.native)
+            target = native.pop("_target_", "adamw")
+            self.native = build_optimizer_config(target, native)
+        if self.native.param_group_overrides:
+            raise ValueError("gradient_sketch does not support param_group_overrides on the native optimizer")
+        self.settings()  # validate eagerly so YAML mistakes fail at config time
+
+    def settings(self) -> SketchSettings:
+        """Return the validated :class:`SketchSettings` for this config."""
+        # Local import keeps optimizer.py importable without the sketch package's dependencies at module load.
+        from nemo_automodel.components.optim.gradient_sketch import SketchSettings
+
+        return SketchSettings(
+            rank=self.rank,
+            seed=self.seed,
+            distribution=self.distribution,
+            refresh=self.refresh,
+            optimizer=self.optimizer,
+            beta2=self.beta2,
+            epsilon=self.epsilon,
+            target_modules=tuple(self.target_modules),
+            target_parameters=tuple(self.target_parameters),
+            target_prefixes=tuple(self.target_prefixes),
+            freeze_non_target=self.freeze_non_target,
+        )
+
+    def build(
+        self,
+        model: torch.nn.Module,
+        *,
+        device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
+    ) -> list[torch.optim.Optimizer]:
+        """Build a :class:`GradientSketchOptimizer` wrapping the native optimizer.
+
+        Args:
+            model: Model to optimize (a single part; pipeline parallelism is unsupported).
+            device_mesh: Device mesh used for tensor/data parallelism.
+            is_peft: Must be ``False``; gradient sketching cannot be combined with PEFT.
+
+        Returns:
+            A one-element list holding the sketch optimizer.
+
+        Raises:
+            NotImplementedError: If ``model`` has several pipeline-parallel parts.
+            ValueError: If PEFT is enabled, or ``device_mesh`` uses HSDP or tensor parallelism.
+        """
+        # Local import keeps optimizer.py importable without the sketch package's dependencies at module load.
+        from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
+
+        if len(getattr(model, "parts", [model])) != 1:
+            raise NotImplementedError("gradient_sketch does not support pipeline-parallel model parts")
+        if is_peft:
+            raise ValueError("gradient_sketch cannot be combined with PEFT adapters")
+        if device_mesh is not None:
+            # Context parallelism is supported. Expert parallelism lives on the separate MoE mesh,
+            # which this config never sees; ``clip_grads_for_optimizers`` rejects it at the first step.
+            mesh_names = device_mesh.mesh_dim_names or ()
+            if "dp_replicate" in mesh_names and device_mesh["dp_replicate"].size() > 1:
+                raise ValueError("gradient sketch does not support HSDP")
+            if "tp" in mesh_names and device_mesh["tp"].size() > 1:
+                raise ValueError("gradient sketch does not support tensor parallelism")
+        (native,) = cast(OptimizerConfig, self.native).build(model, device_mesh=device_mesh, is_peft=False)
+        return [GradientSketchOptimizer(model, native, self.settings())]
+
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:  # pragma: no cover - build() is overridden
+        raise NotImplementedError("GradientSketchConfig builds from the model, not from a parameter list")
+
+
+# Fields used only for Dion-family parameter grouping; these are NOT dion
 # constructor kwargs, so they are stripped from asdict(self) before instantiating the optimizer.
-_DION_GROUPING_FIELDS = frozenset({"scalar_opt", "scalar_betas", "scalar_eps", "scalar_lr", "embed_lr", "lm_head_lr"})
+_DION_GROUPING_FIELDS = frozenset(
+    {"scalar_opt", "scalar_betas", "scalar_eps", "scalar_lr", "embed_lr", "lm_head_lr", "adamw_param_patterns"}
+)
 
 
 @dataclass
 class _DionConfigBase(OptimizerConfig):
-    """Shared base for the dion-family typed configs (Muon / NorMuon / Dion2 / Dion).
+    """Shared base for the dion-family typed configs (Muon / Muown / NorMuon / Dion2 / Dion).
 
     Dion optimizers need Dion's parameter grouping (built from the model) and the
     device mesh rather than a flat parameter list, so :meth:`build` runs grouping
-    per model part.  The grouping-only fields below (``scalar_*`` / ``*_lr``) are
-    consumed by :func:`build_dion_optimizer` and stripped from the constructor
-    kwargs.  Dion is incompatible with Megatron-FSDP optimizer sharding; this is
+    per model part. Grouping-only fields (``scalar_*`` / ``*_lr`` and
+    ``adamw_param_patterns``) are stripped from the constructor kwargs.
+    ``adamw_param_patterns`` selects trainable parameters for auxiliary AdamW
+    by regex on canonical parameter names; an empty list keeps default routing.
+    LR/WD overrides apply after this selection.
+    Dion is incompatible with Megatron-FSDP optimizer sharding; this is
     enforced at the recipe layer (``supports_megatron_fsdp_sharding = False``
     drives an ``allow=False`` sharding call that asserts rather than silently
     returning an unsharded optimizer).
@@ -353,6 +477,12 @@ class _DionConfigBase(OptimizerConfig):
 
     # Dion optimizers are incompatible with Megatron-FSDP optimizer sharding.
     supports_megatron_fsdp_sharding: ClassVar[bool] = False
+    use_matrix_layout: ClassVar[bool] = False
+
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Whether 3D+ weights go to the matrix optimizer; Dion treats them as scalars."""
+        return False
 
     lr: float = 5e-4
     weight_decay: float = 0.0
@@ -362,6 +492,7 @@ class _DionConfigBase(OptimizerConfig):
     scalar_lr: float | None = None
     embed_lr: float | None = None
     lm_head_lr: float | None = None
+    adamw_param_patterns: list[str] = field(default_factory=list)
 
     # Name of the dion constructor argument that receives the resolved device mesh.
     _mesh_kwarg: ClassVar[str] = "distributed_mesh"
@@ -377,13 +508,15 @@ class _DionConfigBase(OptimizerConfig):
         device_mesh: DeviceMesh | None = None,
         is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
-        if self.param_group_overrides:
-            logger.warning("param_group_overrides is ignored by Dion-family optimizers, which do their own grouping")
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
             param_groups, mesh_kwargs = build_dion_optimizer(
                 self, part, device_mesh=device_mesh, mesh_kwarg=self._mesh_kwarg
             )
+            if self.adamw_param_patterns:
+                param_groups = self._apply_adamw_param_patterns(part, param_groups)
+            if self.param_group_overrides or self.adamw_param_patterns:
+                param_groups = self._apply_param_group_overrides(part, param_groups)
             ctor_kwargs = {
                 k: v
                 for k, v in asdict(self).items()
@@ -393,10 +526,144 @@ class _DionConfigBase(OptimizerConfig):
             optimizers.append(opt)
         return optimizers
 
+    def _apply_adamw_param_patterns(self, model: torch.nn.Module, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Route matching trainable parameters to Dion's auxiliary AdamW.
+
+        Args:
+            model: Model whose canonical parameter names are matched by regex.
+            groups: Dion parameter-group dictionaries. Each ``params`` list
+                contains parameters of arbitrary shape, including DTensors whose
+                global shapes and placements are preserved.
+
+        Returns:
+            Split parameter-group dictionaries containing the original parameters,
+            without copying or modifying their tensors. Existing auxiliary LR/WD
+            settings are preserved; newly selected matrices use ``scalar_lr``.
+        """
+        patterns = [re.compile(pattern) for pattern in self.adamw_param_patterns]
+        selected: set[int] = set()
+        matched: set[int] = set()
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            name = canonical_parameter_fqn(name)
+            for index, pattern in enumerate(patterns):
+                if pattern.search(name):
+                    selected.add(id(param))
+                    matched.add(index)
+        for index, pattern in enumerate(self.adamw_param_patterns):
+            if index not in matched:
+                logger.warning("adamw_param_patterns pattern %r matched no parameters; skipping", pattern)
+
+        result = []
+        for source in groups:
+            remaining, adamw_params = [], []
+            for param in source["params"]:
+                (adamw_params if id(param) in selected else remaining).append(param)
+            if remaining:
+                result.append({**source, "params": remaining})
+            if adamw_params:
+                group = dict(
+                    source,
+                    params=adamw_params,
+                    algorithm="adamw",
+                    beta1=self.scalar_betas[0],
+                    beta2=self.scalar_betas[1],
+                    epsilon=self.scalar_eps,
+                )
+                if "algorithm" not in source:
+                    group["lr"] = self.scalar_lr if self.scalar_lr is not None else self.lr
+                group.pop("matrix_transposed", None)
+                result.append(group)
+        return result
+
+    def _apply_param_group_overrides(
+        self, model: torch.nn.Module, groups: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Split Dion's layout groups by the first matching parameter-name rule.
+
+        Multipliers apply to the selected algorithm's base LR/WD, including
+        without a scheduler. Store their ratio to the matrix base for the
+        shared scheduler, which otherwise overwrites auxiliary learning rates.
+        Empty groups are omitted so flattened DCP loads never need to index
+        a missing first parameter. Scheduler construction uses optimizer defaults
+        for the matrix base LR/WD even when all matrices are overridden.
+        """
+        patterns = [re.compile(override.pattern) for override in self.param_group_overrides]
+        matched: dict[int, int] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                for index, pattern in enumerate(patterns):
+                    if pattern.search(canonical_parameter_fqn(name)):
+                        matched[id(param)] = index
+                        break
+        for index, override in enumerate(self.param_group_overrides):
+            if index not in matched.values():
+                logger.warning("param_group_overrides pattern %r matched no parameters; skipping", override.pattern)
+
+        result, overridden = [], []
+        for source in groups:
+            buckets: dict[int | None, list[torch.nn.Parameter]] = {None: []}
+            for param in source["params"]:
+                buckets.setdefault(matched.get(id(param)), []).append(param)
+            for index, params in buckets.items():
+                if not params:
+                    continue
+                group = {**source, "params": params}
+                lr = source.get("lr", self.lr)
+                wd = source.get("weight_decay", self.weight_decay)
+                lr_mult = wd_mult = 1.0
+                if index is not None:
+                    override = self.param_group_overrides[index]
+                    lr_mult, wd_mult = override.lr_mult, override.wd_mult
+                if self.lr == 0 and lr * lr_mult != 0:
+                    raise ValueError("Dion param_group_overrides requires positive base lr for nonzero auxiliary LR.")
+                group.update(
+                    lr=lr * lr_mult,
+                    weight_decay=wd * wd_mult,
+                    lr_mult=(lr / self.lr if self.lr else 1.0) * lr_mult,
+                    wd_mult=(wd / self.weight_decay if self.weight_decay else float(wd != 0)) * wd_mult,
+                )
+                (result if index is None else overridden).append(group)
+        if not result and not overridden:
+            raise ValueError("optimizer received no trainable parameters")
+        return result + overridden
+
+
+class _DionParamGroup(TypedDict, total=False):
+    """Parameter group handed to a Dion-family optimizer.
+
+    ``params`` is always present. Layout groups built by
+    :func:`~nemo_automodel.components.optim.dion._separate_param_groups` carry ``matrix_transposed``; scalar groups
+    carry ``algorithm`` with their own ``lr``, ``weight_decay`` and Adam/Lion hyperparameters.
+    :meth:`_DionConfigBase._apply_param_group_overrides` adds ``lr_mult`` / ``wd_mult`` and
+    :meth:`MuonConfig._spectral_norm_groups` sets ``adjust_lr``.
+    """
+
+    params: Required[list[torch.Tensor]]
+    algorithm: str
+    lr: float
+    weight_decay: float
+    beta1: float
+    beta2: float
+    epsilon: float
+    matrix_transposed: bool
+    adjust_lr: str | None
+    lr_mult: float
+    wd_mult: float
+
 
 @dataclass
 class MuonConfig(_DionConfigBase):
-    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D."""
+    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D.
+
+    Grouped MoE experts are trained as batches of matrices. Their ``[expert, in, out]``
+    storage is orthogonalized as is (Newton–Schulz is transpose-equivariant), but
+    dion.Muon's spectral-norm LR scale reads the last two dims as ``[out, in]``, so
+    :meth:`_make_optimizer` folds the correct per-shape scale into those groups.
+    """
+
+    use_matrix_layout: ClassVar[bool] = True
 
     mu: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
@@ -406,10 +673,130 @@ class MuonConfig(_DionConfigBase):
     flatten: bool = False
     use_triton: bool = False
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Route 3D+ weights to Muon unless ``flatten`` would merge their batch axis into each matrix."""
+        return not self.flatten
+
+    def build(
+        self,
+        model: torch.nn.Module,
+        *,
+        device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
+    ) -> list[torch.optim.Optimizer]:
+        """Build dion.Muon per model part and reject batched matrices it cannot update.
+
+        dion.Muon gathers sharded matrix axes only over its own data-parallel mesh. A 3D+ weight (for example grouped
+        experts with ``1 < ep_size < dp_size``) whose matrix axis is sharded over another mesh fails at the first
+        step, so this raises at build time instead.
+
+        Raises:
+            ValueError: If a Muon-updated 3D+ DTensor has a matrix axis sharded over a mesh other than Muon's.
+        """
+        optimizers = super().build(model, device_mesh=device_mesh, is_peft=is_peft)
+        dion_mesh = get_dion_mesh(device_mesh)
+        process_group = dion_mesh.get_group() if dion_mesh is not None else None
+        names = {id(p): n for part in getattr(model, "parts", [model]) for n, p in part.named_parameters()}
+        muon_params = [
+            param
+            for optimizer in optimizers
+            for group in optimizer.param_groups
+            if group["algorithm"] == "muon"
+            for param in group["params"]
+            if param.ndim > 2 and isinstance(param, DTensor)
+        ]
+        for param in muon_params:
+            foreign_matrix_shards = [
+                placement.dim
+                for i, placement in enumerate(param.placements)
+                if isinstance(placement, Shard)
+                and placement.dim % param.ndim >= param.ndim - 2
+                and param.device_mesh.size(i) > 1
+                and param.device_mesh.get_group(i) != process_group
+            ]
+            if foreign_matrix_shards:
+                raise ValueError(
+                    f"MuonConfig cannot update {names.get(id(param), 'a 3D parameter')}: its matrix axis "
+                    f"{foreign_matrix_shards[0]} is sharded over mesh {param.device_mesh} (placements "
+                    f"{param.placements}), not dion.Muon's data-parallel mesh. For grouped experts use ep_size equal "
+                    "to the data-parallel size, ep_size 1, or MuownConfig, which handles per-parameter meshes."
+                )
+        return optimizers
+
+    def _make_optimizer(
+        self, param_groups: list[_DionParamGroup], ctor_kwargs: dict[str, Any]
+    ) -> torch.optim.Optimizer:
         from dion import Muon
 
+        if self.adjust_lr == "spectral_norm":
+            # torch's ParamsT takes plain dicts, so the typed groups are copied at this boundary.
+            groups = [dict(split) for group in param_groups for split in self._spectral_norm_groups(group)]
+            return Muon(groups, **ctor_kwargs)
         return Muon(param_groups, **ctor_kwargs)
+
+    def _spectral_norm_groups(self, group: _DionParamGroup) -> list[_DionParamGroup]:
+        """Split a transposed ``[..., in, out]`` matrix group by shape and fold the spectral-norm scale into its LR.
+
+        dion.Muon would scale by ``sqrt(shape[-2] / shape[-1])``, the inverse of the correct ``sqrt(out / in)`` for
+        this layout. Each shape gets ``adjust_lr=None`` with ``lr`` (and any ``lr_mult``) multiplied by the correct
+        scale; ``weight_decay`` (and any ``wd_mult``) is divided by it because Muon decays with ``lr * weight_decay``.
+
+        Args:
+            group: Dion param group. When ``matrix_transposed`` is set, ``params`` are tensors of shape
+                ``[..., in, out]`` with arbitrary leading batch (expert) dimensions; DTensor shapes are global.
+
+        Returns:
+            ``[group]`` unchanged when it is not a transposed matrix group, otherwise one group per distinct
+            ``(in, out)`` with the same parameter objects (no copies).
+        """
+        if not group.get("matrix_transposed"):
+            return [group]
+        by_shape: dict[tuple[int, int], list[torch.Tensor]] = {}
+        for param in group["params"]:
+            fan_in, fan_out = param.shape[-2:]
+            by_shape.setdefault((fan_in, fan_out), []).append(param)
+        lr = group.get("lr", self.lr)
+        weight_decay = group.get("weight_decay", self.weight_decay)
+        splits: list[_DionParamGroup] = []
+        for (fan_in, fan_out), params in by_shape.items():
+            scale = math.sqrt(fan_out / fan_in)
+            split = group.copy()
+            split.update(params=params, adjust_lr=None, lr=lr * scale, weight_decay=weight_decay / scale)
+            if "lr_mult" in group:
+                split["lr_mult"] = group["lr_mult"] * scale
+            if "wd_mult" in group:
+                split["wd_mult"] = group["wd_mult"] / scale
+            splits.append(split)
+        return splits
+
+
+@dataclass
+class MuownConfig(_DionConfigBase):
+    """Muown: per-neuron Adam magnitudes and Dion Muon directions, including MoE."""
+
+    use_matrix_layout: ClassVar[bool] = True
+
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Muown updates every expert of a grouped weight as its own matrix."""
+        return True
+
+    lr: float = 3e-4
+    mu: float = 0.95
+    betas: tuple[float, float] = (0.9, 0.95)
+    epsilon: float = 1e-8
+    nesterov: bool = True
+    ns_steps: int = 5
+    ns_epsilon: float = 1e-7
+    muon_update_scale: float = 1.0
+    use_triton: bool = False
+
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
+        """Construct Muown using the tensor-layout contract documented on Muown."""
+        from nemo_automodel.components.optim.muown import Muown
+
+        return Muown(param_groups, **ctor_kwargs)
 
 
 @dataclass
@@ -422,7 +809,7 @@ class NorMuonConfig(_DionConfigBase):
     epsilon: float = 1e-8
     adjust_lr: str = "spectral_norm"
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
         from dion import NorMuon
 
         return NorMuon(param_groups, **ctor_kwargs)
@@ -438,7 +825,7 @@ class Dion2Config(_DionConfigBase):
     epsilon: float = 1e-8
     adjust_lr: str = "spectral_norm"
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
         from dion import Dion2
 
         return Dion2(param_groups, **ctor_kwargs)
@@ -462,7 +849,7 @@ class DionConfig(_DionConfigBase):
 
     _mesh_kwarg: ClassVar[str] = "outer_shard_mesh"
 
-    def _make_optimizer(self, param_groups, ctor_kwargs):
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
         from dion import Dion
 
         return Dion(param_groups, **ctor_kwargs)
@@ -629,8 +1016,12 @@ class LRSchedulerConfig:
             optimizers = list(optimizer)
         schedulers = []
         for opt in optimizers:
-            base_lr = opt.param_groups[0]["lr"]
-            base_wd = opt.param_groups[0].get("weight_decay", 0.0)
+            # Dion's first nonempty group can be an auxiliary group after name
+            # overrides. Its LR/WD already includes the selected algorithm's
+            # settings; scheduling must start from the matrix base instead.
+            base_group = opt.defaults if is_dion_optimizer(type(opt)) else opt.param_groups[0]
+            base_lr = base_group["lr"]
+            base_wd = base_group.get("weight_decay", 0.0)
             schedulers.append(
                 OptimizerParamScheduler(
                     optimizer=opt,
@@ -815,7 +1206,9 @@ OPTIMIZER_CONFIG_REGISTRY: dict[str, type[OptimizerConfig]] = {
     "adamw": AdamWConfig,
     "fused_adam": FusedAdamConfig,
     "flash_adamw": FlashAdamWConfig,
+    "gradient_sketch": GradientSketchConfig,
     "muon": MuonConfig,
+    "muown": MuownConfig,
     "normuon": NorMuonConfig,
     "dion": DionConfig,
     "dion2": Dion2Config,
@@ -825,6 +1218,7 @@ OPTIMIZER_CONFIG_REGISTRY: dict[str, type[OptimizerConfig]] = {
 # typed config that performs Dion's parameter grouping.  Keyed by ``cls.__name__``.
 _DION_CONFIG_FOR: dict[str, type[OptimizerConfig]] = {
     "Muon": MuonConfig,
+    "Muown": MuownConfig,
     "NorMuon": NorMuonConfig,
     "Dion2": Dion2Config,
     "Dion": DionConfig,
@@ -969,8 +1363,10 @@ __all__ = [
     "DionConfig",
     "FlashAdamWConfig",
     "FusedAdamConfig",
+    "GradientSketchConfig",
     "LRSchedulerConfig",
     "MuonConfig",
+    "MuownConfig",
     "NorMuonConfig",
     "OptimizerConfig",
     "OptimizerFromFactoryConfig",

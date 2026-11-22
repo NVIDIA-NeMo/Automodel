@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+from typing import TypedDict, Unpack
 
 import torch
 import torch.distributed as dist
@@ -36,6 +37,7 @@ from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelS
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
@@ -47,10 +49,32 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     qsa_gqa_attention,
     qsa_route_replay,
     qsa_route_selection_region,
+    select_qsa_cuda_kernel,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+class _AttentionKwargs(TypedDict, total=False):
+    """Packed attention metadata forwarded by the owning text model."""
+
+    cu_seqlens: torch.Tensor | None
+    cu_seqlens_q: torch.Tensor | None
+    cu_seqlens_kv: torch.Tensor | None
+    cu_seqlens_padded: torch.Tensor | None
+    cu_seqlens_q_padded: torch.Tensor | None
+    cu_seqlens_kv_padded: torch.Tensor | None
+    seq_lens: torch.Tensor | None
+    seq_lens_padded: torch.Tensor | None
+    packed_seq_ids: torch.Tensor | None
+    _packed_seq_ids: torch.Tensor | None
+    indices: torch.Tensor | None
+    max_seqlen: int | None
+    max_seqlen_q: int | None
+    max_seqlen_kv: int | None
+    qkv_format: str | None
 
 
 def _rms_norm_gated_fp32(
@@ -140,7 +164,7 @@ class Qwen3_8_FlashNextRMSNormGated(nn.Module):
 class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
     """CP-aware GatedDeltaNet with Qwen3.8-Flash-Next's sigmoid output gate."""
 
-    def __init__(self, config: object, layer_idx: int) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
         output_gate_type = str(getattr(config, "output_gate_type", "sigmoid"))
         self._packed_global_cu_seqlens: torch.Tensor | None = None
@@ -158,20 +182,62 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
         unchanged. With an active CP mesh the boundaries describe the global
         packed row, so they are stashed for :meth:`_forward_with_cp` and the
         inherited dispatcher sees no ``cu_seqlens``.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden]. Packed
+                non-CP inputs have one physical row; a padded tail must be its own segment.
+            **kwargs: Arguments with the tensor layouts documented by
+                :meth:`CPAwareGatedDeltaNet.forward`. ``cu_seqlens`` contains
+                document boundaries of shape [documents + 1], global under CP;
+                ``attention_mask`` has shape [batch, sequence], with document-ID
+                change points matching ``cu_seqlens``. IDs and ``indices`` are
+                normalized to consecutive documents covering the full row.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+
+        Raises:
+            ValueError: If non-CP boundaries do not strictly partition one row
+                or the supplied document mask disagrees with those boundaries.
         """
         cu_seqlens = kwargs.pop("cu_seqlens", None)
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
         if not cp_active or cu_seqlens is None:
-            if cu_seqlens is not None and kwargs.get("attention_mask") is None:
-                # The inherited packed conv path reads per-token document IDs
-                # from ``attention_mask``. Synthesize them from the boundaries
-                # for cu_seqlens-only packed batches.
-                boundaries = cu_seqlens.reshape(-1).to(device=hidden_states.device, dtype=torch.long)
-                document_ids = torch.repeat_interleave(
-                    torch.arange(boundaries.numel() - 1, device=hidden_states.device),
-                    boundaries.diff(),
+            if cu_seqlens is not None:
+                boundaries = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
+                if (
+                    hidden_states.shape[0] != 1
+                    or boundaries.ndim != 1
+                    or boundaries.numel() < 2
+                    or int(boundaries[0]) != 0
+                    or int(boundaries[-1]) != hidden_states.shape[1]
+                    or bool((boundaries.diff() <= 0).any())
+                ):
+                    raise ValueError(
+                        "Packed Qwen3.8 GDN cu_seqlens must strictly partition one unpadded row "
+                        "from zero through the full sequence length."
+                    )
+                document_ids = (
+                    torch.repeat_interleave(
+                        torch.arange(boundaries.numel() - 1, device=hidden_states.device),
+                        boundaries.diff(),
+                    )
+                    .unsqueeze(0)
+                    .to(torch.int32)
                 )
-                kwargs["attention_mask"] = document_ids.unsqueeze(0).to(torch.int32)
+                attention_mask = kwargs.get("attention_mask")
+                if attention_mask is not None and (
+                    attention_mask.shape != document_ids.shape
+                    or not torch.equal(
+                        attention_mask[:, 1:] != attention_mask[:, :-1],
+                        document_ids[:, 1:] != document_ids[:, :-1],
+                    )
+                ):
+                    raise ValueError("Packed Qwen3.8 GDN attention_mask document boundaries must match cu_seqlens.")
+                # Kernels compare document IDs for equality inside their convolution
+                # window. Canonical IDs prevent reused labels joining disjoint documents.
+                kwargs["attention_mask"] = document_ids
+                kwargs["indices"] = torch.arange(hidden_states.shape[1], device=hidden_states.device)
             return super().forward(hidden_states, cu_seqlens=cu_seqlens, **kwargs)
         self._packed_global_cu_seqlens = cu_seqlens
         try:
@@ -493,27 +559,32 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     The main query/key/value, output gate, and output projection retain the
     Qwen3-Next equations.  A separate frozen indexer returns logical token IDs,
     then the model-owned QSA dispatcher evaluates only those IDs. CUDA BF16
-    training selects FlexAttention or SM90 CuTe through backend.attn; CPU and
+    training selects FlexAttention, SM90 CuTe, or Blackwell cuDNN through backend.attn; CPU and
     explicit reference backends use the PyTorch oracle. Main Q/K/V remain
     differentiable.
     """
 
-    def __init__(self, config: object, layer_idx: int, backend: BackendConfig) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         # QSA owns its sparse-attention dispatch. The inherited constructor is
         # reused only for projections/norms, but its generic attention factory
-        # does not implement ``flex`` or ``cute``. Give it an isolated SDPA
+        # does not implement ``flex``, ``fa4`` or ``cudnn``. Give it an isolated SDPA
         # copy, then discard the unused callable and retain the real backend.
         parent_backend = replace(backend, attn="sdpa")
         super().__init__(config, layer_idx, parent_backend)
         self.backend = backend
         self.attn_module = None
         self.attn_func = None
+        self.qsa_cuda_kernel = select_qsa_cuda_kernel(backend.attn)
         self._cp_mesh: DeviceMesh | None = None
         self.indexer = Qwen3_8_FlashNextQSAIndexer(config, backend)
+        if backend.attn == "cudnn" and (self.indexer.compress_ratio != 4 or self.indexer.token_budget > 2048):
+            raise ValueError("cuDNN QSA requires indexer_compress_ratio=4 and indexer_budget<=2048")
         self.reuse_routes_on_recompute = bool(getattr(config, "qsa_reuse_routes_on_recompute", True))
 
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
         """Install the contiguous CP mesh used for QSA K/V exchange."""
+        if self.backend.attn == "cudnn" and cp_mesh.size() > 1:
+            raise ValueError("cuDNN QSA does not support context parallelism; use backend.attn='flex' for CP")
         self._cp_mesh = cp_mesh
 
     def forward(
@@ -523,7 +594,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
-        **attn_kwargs: object,
+        **attn_kwargs: Unpack[_AttentionKwargs],
     ) -> torch.Tensor:
         """Select compressed blocks and run model-owned sparse GQA.
 
@@ -611,15 +682,15 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             key = qwen3_8_flash_next_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
             value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
-        # One dispatcher serves dense, packed, and CP layouts: routes are
-        # global K/V coordinates and both CUDA backends accept S_q != S_kv, so
-        # packed rows need no dedicated kernel path. CPU keeps the oracle.
+        # Routes use global K/V coordinates for dense, packed, and CP layouts.
+        # Flex/FA4 support unequal Q/KV extents; cuDNN rejects CP at setup.
+        # Packed rows need no dedicated dispatcher. CPU keeps the oracle.
         attn_output = qsa_gqa_attention(
             query,
             key,
             value,
             selected_token_ids,
-            backend=self.backend.attn,
+            cuda_kernel=self.qsa_cuda_kernel,
             softmax_scale=self.scaling,
             flex_mask=flex_mask,
         )
@@ -710,8 +781,8 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
     def __init__(
         self,
         layer_idx: int,
-        config: object,
-        moe_config: object,
+        config: Qwen3_8_FlashNextTextConfig,
+        moe_config: MoEConfig,
         backend: BackendConfig,
         *,
         ple: nn.Module | None = None,
@@ -804,7 +875,7 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
-        **attn_kwargs: object,
+        **attn_kwargs: Unpack[_AttentionKwargs],
     ) -> torch.Tensor:
         """Run PLE, attention/GDN, and top-10 MoE updates.
 
@@ -836,7 +907,10 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
 
         hidden_states = self._expand_initial_streams(hidden_states)
         if self.ple is not None:
-            hidden_states = hidden_states + self.ple(hidden_states, input_ids, cp_context=cp_context)
+            sequence_ids = self._ple_sequence_ids(input_ids, cp_context, attn_kwargs.get("cu_seqlens"))
+            hidden_states = hidden_states + self.ple(
+                hidden_states, input_ids, cp_context=cp_context, sequence_ids=sequence_ids
+            )
 
         attn_input, attn_residual = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
@@ -871,6 +945,36 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         mlp_output = self.mlp(mlp_input, padding_mask)
         return self.mlp_hyper_connection.combine(mlp_output, mlp_residual)
 
+    @staticmethod
+    def _ple_sequence_ids(
+        input_ids: torch.Tensor,
+        cp_context: Qwen3_8_FlashNextCPContext | None,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Return packed segment IDs for PLE, or ``None`` for an unpacked batch.
+
+        Args:
+            input_ids: Local raw IDs of shape ``[batch, sequence]``.
+            cp_context: Optional contiguous CP metadata. Its ``global_cu_seqlens``
+                bound the full, unsharded packed row.
+            cu_seqlens: Non-CP boundaries ``[segments + 1]`` of the local packed row,
+                built from the loader ``seq_lens``, if any.
+
+        Returns:
+            Segment IDs ``[1, sequence]``, or ``[1, global_sequence]`` under CP: one per
+            packed sample, then one each for the pack's tail padding and the CP padding,
+            if present.
+        """
+        boundaries = cu_seqlens if cp_context is None else cp_context.global_cu_seqlens
+        if boundaries is None:
+            return None
+        if input_ids.shape[0] != 1:
+            raise ValueError("Packed Qwen3.8-Flash-Next PLE expects one physical row per micro-batch")
+        total_tokens = input_ids.shape[1] if cp_context is None else cp_context.global_input_ids.shape[1]
+        positions = torch.arange(total_tokens, device=input_ids.device)
+        boundaries = boundaries.to(device=input_ids.device, dtype=torch.long)
+        return torch.searchsorted(boundaries[1:], positions, right=True).unsqueeze(0)
+
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         """Initialize this decoder layer for training from scratch.
@@ -884,6 +988,8 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         else:
             self.linear_attn.dt_bias.fill_(1.0)
             self.linear_attn.A_log.uniform_(0, 16).log_()
+            # Match HF's PreTrainedModel._init_weights for this nn.Conv1d (normal), not torch's default
+            nn.init.normal_(self.linear_attn.conv1d.weight, mean=0.0, std=init_std)
             for linear in (
                 self.linear_attn.in_proj_qkv,
                 self.linear_attn.in_proj_z,

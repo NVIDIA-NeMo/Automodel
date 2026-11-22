@@ -15,6 +15,8 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
+python -m tests.functional_tests.llm_pretrain_and_kd.run_kd_chunk_parity
+
 # Run knowledge distillation finetune flow on small, offline fixtures.
 TRANSFORMERS_OFFLINE=1 coverage run \
 examples/llm_kd/kd.py \

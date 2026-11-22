@@ -45,6 +45,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import patch
 
 if TYPE_CHECKING:
+    from peft import PeftModel
+
     from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 import datasets
@@ -616,11 +618,38 @@ def _peft_adapter_load_kwargs(hf_kwargs: dict[str, object]) -> dict[str, object]
 
     AutoModel already saves adapter keys in the final HF namespace. Disable the
     base checkpoint's conversion map so PEFT does not remap those keys again.
+    Keep PEFT's default fp32 adapter promotion: disabling it copies saved fp32
+    values into lower-precision base-layer storage and irreversibly rounds them.
     """
     return {
         "key_mapping": {},
+        "autocast_adapter_dtype": True,
         **{key: hf_kwargs[key] for key in ("device_map", "max_memory") if key in hf_kwargs},
     }
+
+
+def _redispatch_peft_model(model: PeftModel) -> None:
+    """Restore input placement on adapter wrappers spanning multiple GPUs.
+
+    PEFT replaces dispatched linear layers with adapter wrappers, leaving the
+    original Accelerate hooks on their base layers. At a GPU boundary, only the
+    base-layer input moves; the adapter still receives the previous GPU's input.
+    Reapply the existing device map to attach hooks to the new wrappers, without
+    changing the chosen placement. PEFT already redispatches CPU/disk offloads.
+
+    Args:
+        model: Reloaded PEFT model whose base model may have an HF device map.
+    """
+    base_model = model.get_base_model()
+    device_map = getattr(base_model, "hf_device_map", None)
+    if not device_map or len(set(device_map.values())) < 2:
+        return
+    if any(str(device) in {"cpu", "disk"} for device in device_map.values()):
+        return
+
+    from accelerate import dispatch_model
+
+    dispatch_model(base_model, device_map=device_map)
 
 
 def _patch_remote_masking_api_compatibility() -> None:
@@ -1029,7 +1058,7 @@ def _assert_peft_adapter_matches_checkpoint(
     adapter_path: Path,
     ignored_key_prefix: str | None = None,
 ) -> tuple[int, int]:
-    """Verify that vanilla PEFT loaded every HF-supported adapter tensor exactly."""
+    """Verify exact adapter values, allowing PEFT's lossless fp16/bf16-to-fp32 promotion."""
     from peft import get_peft_model_state_dict
     from safetensors import safe_open
 
@@ -1063,11 +1092,16 @@ def _assert_peft_adapter_matches_checkpoint(
         mismatches = []
         matched_keys = expected_keys - set(ignored_missing)
         for key in sorted(matched_keys):
-            expected_digest = _tensor_digest(saved_adapter.get_tensor(key))
+            expected_tensor = saved_adapter.get_tensor(key)
             loaded_tensor = loaded_adapter[key]
             if loaded_tensor.is_meta:
                 assert key in normalized_parameter_names, f"No PEFT parameter found for meta adapter tensor {key}"
                 loaded_tensor = _accelerate_offloaded_tensor(peft_model, normalized_parameter_names[key])
+            # Widen the reference only; casting the loaded values down could hide
+            # corruption. Saved fp32 tensors still require exact fp32 restoration.
+            if expected_tensor.dtype in (torch.float16, torch.bfloat16) and loaded_tensor.dtype == torch.float32:
+                expected_tensor = expected_tensor.float()
+            expected_digest = _tensor_digest(expected_tensor)
             loaded_digest = _tensor_digest(loaded_tensor)
             if expected_digest != loaded_digest:
                 mismatches.append(f"{key}: checkpoint={expected_digest}, loaded={loaded_digest}")
@@ -2914,9 +2948,9 @@ def _run_vanilla_hf_reload(
                 peft_model = PeftModel.from_pretrained(
                     base_model,
                     str(ckpt_step_dir / "model"),
-                    autocast_adapter_dtype=False,
                     **_peft_adapter_load_kwargs(hf_kwargs),
                 )
+            _redispatch_peft_model(peft_model)
             adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
             matched_adapter_tensors, ignored_adapter_tensors = _assert_peft_adapter_matches_checkpoint(
                 peft_model,

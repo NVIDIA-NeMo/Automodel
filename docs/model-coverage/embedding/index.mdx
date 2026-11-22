@@ -17,7 +17,7 @@ Embedding models use bi-encoders to produce dense representations for queries an
 | Owner | Model | Architecture | Auto Class | Tasks |
 |---|---|---|---|---|
 | NVIDIA | [Llama (Bidirectional)](/model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
-| NVIDIA | [Llama Nemotron VL](/model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b) | `LlamaNemotronVLModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| NVIDIA | [Llama Nemotron VL](/model-coverage/embedding-models/nvidia/llama-nemotron-embed-vl-1b-v2) | `LlamaNemotronVLModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
 | Mistral AI | [Ministral3](/model-coverage/embedding-models/mistralai/Ministral-3-3B-Base-2512) | `Ministral3Model` with configurable attention | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
 
 The stock `ministral3` path is preferred. The `ministral3_bidirec` model type remains available for compatibility with legacy checkpoints and resolves to the custom `Ministral3BidirectionalModel`.
@@ -32,9 +32,10 @@ Composite backbones must expose matching text configuration and decoder objects 
 
 | Recipe | Description |
 |---|---|
-| [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) | Bi-encoder, Llama 3.2 1B embedding model |
-| [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) | Bi-encoder, Llama-Embed-Nemotron-8B reproduction recipe |
-| [ministral3_3b_instruct.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml) | Bi-encoder Ministral3-3B recipe |
+| [Nemotron end-to-end text bi-encoder recipe](https://github.com/NVIDIA-NeMo/Nemotron/tree/main/docs/nemotron/embed) | Adapt an embedding model to your domain-specific data with a complete multi-stage pipeline, from synthetic data generation and data preparation to model fine-tuning, evaluation, export, and deployment. |
+| [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) | Llama-3.2-1B based text embedding model training recipe. |
+| [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) | [Llama-Embed-Nemotron-8B](https://huggingface.co/nvidia/llama-embed-nemotron-8b) text embedding model reproduction recipe. |
+| [ministral3_3b_instruct.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml) | Ministral3-3B based text embedding model training recipe. |
 
 ## Supported Models
 
@@ -56,3 +57,5 @@ Retrieval fine-tuning requires query-document pairs: each example is a query pai
 ## Train Embedding Models
 
 For a complete walkthrough of training configuration, model-specific settings, and launch commands, see the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune).
+
+For a hands-on notebook walkthrough of dataset preparation, Ministral-3-3B recipe configuration, training dynamics, and similarity evaluation, see [Text Embedding Model Fine-Tuning with NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/embedding-biencoder/finetune.ipynb).

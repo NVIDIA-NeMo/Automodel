@@ -539,6 +539,11 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @property
+    def _uses_hf_attention(self) -> bool:
+        """BSHD and NEAT use HF dispatch; TE handles only pre-packed THD."""
+        return True
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -600,7 +605,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 

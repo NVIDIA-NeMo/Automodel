@@ -169,11 +169,19 @@ def test_peft_adapter_load_reuses_base_model_placement_constraints_without_key_c
         }
     )
 
-    assert load_kwargs == {"key_mapping": {}, "device_map": "auto", "max_memory": max_memory}
+    assert load_kwargs == {
+        "key_mapping": {},
+        "autocast_adapter_dtype": True,
+        "device_map": "auto",
+        "max_memory": max_memory,
+    }
 
 
 def test_peft_adapter_load_disables_key_conversion_without_a_base_device_map():
-    assert _peft_adapter_load_kwargs({"torch_dtype": torch.bfloat16}) == {"key_mapping": {}}
+    assert _peft_adapter_load_kwargs({"torch_dtype": torch.bfloat16}) == {
+        "key_mapping": {},
+        "autocast_adapter_dtype": True,
+    }
 
 
 def test_peft_adapter_fingerprints_match_saved_safetensors(tmp_path):
@@ -298,6 +306,81 @@ def test_peft_adapter_fingerprints_report_tensor_mismatch(tmp_path):
 
     with (
         patch("peft.get_peft_model_state_dict", return_value={key: torch.tensor([[1.0, 3.0]], dtype=torch.bfloat16)}),
+        pytest.raises(AssertionError, match="adapter tensor mismatch"),
+    ):
+        _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+
+@pytest.mark.parametrize("base_dtype", [torch.float16, torch.bfloat16])
+def test_peft_reload_preserves_mixed_precision_adapter_values(tmp_path: Path, base_dtype: torch.dtype) -> None:
+    """Load real mixed-precision adapter files without rounding their fp32 values."""
+    from collections import OrderedDict
+
+    from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    torch.manual_seed(42)
+    base = torch.nn.Sequential(
+        OrderedDict((name, torch.nn.Linear(4, 4, bias=False, dtype=base_dtype)) for name in ("wide", "narrow"))
+    )
+    reload_base = deepcopy(base)
+    source = get_peft_model(
+        base, LoraConfig(target_modules=["wide", "narrow"], r=2, lora_alpha=2), autocast_adapter_dtype=False
+    )
+    with torch.no_grad():
+        for side in ("lora_A", "lora_B"):
+            getattr(source.base_model.model.wide, side)["default"].float()
+        for name, parameter in source.named_parameters():
+            if ".lora_" in name:
+                parameter.normal_(std=0.1)
+    source.save_pretrained(tmp_path, save_embedding_layers=False)
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    saved = load_file(str(adapter_path))
+    assert {value.dtype for value in saved.values()} == {base_dtype, torch.float32}
+
+    # The old harness disabled PEFT's default promotion and rounded fp32 adapters
+    # into the base model's lower precision before checking the exported values.
+    rounded = PeftModel.from_pretrained(deepcopy(reload_base), tmp_path, autocast_adapter_dtype=False)
+    with pytest.raises(AssertionError, match="adapter tensor mismatch"):
+        _assert_peft_adapter_matches_checkpoint(rounded, adapter_path)
+
+    loaded = PeftModel.from_pretrained(reload_base, tmp_path, **_peft_adapter_load_kwargs({}))
+    loaded_state = get_peft_model_state_dict(loaded, save_embedding_layers=False)
+    assert set(loaded_state) == set(saved)
+    for name, value in saved.items():
+        assert loaded_state[name].dtype == torch.float32
+        torch.testing.assert_close(loaded_state[name], value.float(), rtol=0, atol=0)
+    assert _assert_peft_adapter_matches_checkpoint(loaded, adapter_path) == (len(saved), 0)
+
+
+@pytest.mark.parametrize("rounding_dtype", [torch.float16, torch.bfloat16])
+def test_peft_adapter_fingerprints_reject_rounding_even_after_upcast(tmp_path: Path, rounding_dtype: torch.dtype) -> None:
+    from safetensors.torch import save_file
+
+    key = "base_model.model.layer.lora_A.weight"
+    original = torch.tensor([[1.234567, -0.1234567]])
+    rounded = original.to(rounding_dtype).float()
+    assert not torch.equal(original, rounded)
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    save_file({key: original}, adapter_path)
+    with (
+        patch("peft.get_peft_model_state_dict", return_value={key: rounded}),
+        pytest.raises(AssertionError, match="adapter tensor mismatch"),
+    ):
+        _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+
+def test_peft_adapter_fingerprints_reject_changes_below_saved_dtype_resolution(tmp_path: Path) -> None:
+    from safetensors.torch import save_file
+
+    key = "base_model.model.layer.lora_A.weight"
+    original = torch.ones(1, 2, dtype=torch.bfloat16)
+    changed = torch.nextafter(original.float(), torch.full((1, 2), float("inf")))
+    assert torch.equal(changed.bfloat16(), original)
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    save_file({key: original}, adapter_path)
+    with (
+        patch("peft.get_peft_model_state_dict", return_value={key: changed}),
         pytest.raises(AssertionError, match="adapter tensor mismatch"),
     ):
         _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)

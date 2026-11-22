@@ -37,8 +37,9 @@ Usage:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -54,8 +55,8 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 # Type aliases for API signatures.
-ActivationCheckpointingMode = Union[bool, Literal["full", "selective"]]
-ActivationCheckpointingScope = Union[str, List[str], Tuple[str, ...]]
+ActivationCheckpointingMode = Union[bool, Literal["full", "selective", "moe"]]
+ActivationCheckpointingScope = Union[str, Sequence[str]]
 DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 # Backwards-compatible alias for external / type-checking references.
 DistributedConfig = DistributedStrategyConfig
@@ -63,7 +64,7 @@ DistributedConfig = DistributedStrategyConfig
 _VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal"}
 
 
-def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:
+def normalize_activation_checkpointing_scope(value: str | Sequence[str] | None) -> tuple[str, ...]:
     """Validate and normalize activation-checkpointing scope values."""
     if value is None:
         return ("all",)
@@ -266,7 +267,8 @@ class FSDP2Config:
             (position_ids that reset to 0 mid-sequence). Default ``False``.
         mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2.
             If ``None`` (default), uses bf16 forward/backward compute with fp32
-            gradient reduction. Pair this with ``model.torch_dtype: float32`` for
+            gradient reduction, preserving the dtypes of module inputs and outputs.
+            Pair this with ``model.torch_dtype: float32`` for
             the Megatron-style fp32 master-weights pattern. Override from YAML
             using the ``_target_`` pattern::
 
@@ -274,7 +276,8 @@ class FSDP2Config:
                   _target_: torch.distributed.fsdp.MixedPrecisionPolicy
                   param_dtype: bfloat16
                   reduce_dtype: float32
-                  output_dtype: bfloat16
+                  output_dtype: null
+                  cast_forward_inputs: false
 
             See ``docs/guides/mixed-precision-training.md`` for the full set of recommended
             patterns and the bf16-storage trap.
@@ -284,9 +287,10 @@ class FSDP2Config:
             ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
             while running matmuls in lower precision.  Set to ``None`` to disable.
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
-        activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
+        activation_checkpointing (bool | "full" | "selective" | "moe"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
-            blocks with PyTorch selective activation checkpointing.
+            blocks with PyTorch selective activation checkpointing. ``"moe"`` (expert-parallel models only)
+            checkpoints just each decoder block's MoE sub-block and keeps the other activations.
         activation_checkpointing_scope (str | list[str]): Which extracted
             layer groups activation checkpointing should wrap. ``"all"``
             selects every extracted group. Scoped values such as
@@ -327,8 +331,8 @@ class FSDP2Config:
         default_factory=lambda: MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
-            output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
+            output_dtype=None,
+            cast_forward_inputs=False,
         )
     )
     offload_policy: CPUOffloadPolicy | None = None
@@ -352,8 +356,8 @@ class FSDP2Config:
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                output_dtype=torch.bfloat16,
-                cast_forward_inputs=True,
+                output_dtype=None,
+                cast_forward_inputs=False,
             )
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
@@ -439,9 +443,10 @@ class DDPConfig:
     Only dp_size is relevant (inferred from world_size).
 
     Attributes:
-        activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
+        activation_checkpointing (bool | "full" | "selective" | "moe"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
-            blocks with PyTorch selective activation checkpointing.
+            blocks with PyTorch selective activation checkpointing. ``"moe"`` (expert-parallel models only)
+            checkpoints just each decoder block's MoE sub-block and keeps the other activations.
         activation_checkpointing_scope (str | list[str]): Which extracted
             layer groups activation checkpointing should wrap. ``"all"``
             selects every extracted group. Scoped values such as
@@ -467,7 +472,7 @@ class DDPConfig:
     gradient_as_bucket_view: bool = False
     autocast_dtype: torch.dtype | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
         )

@@ -107,6 +107,8 @@ optimizer:
 
 
 ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100
   time: "00:45:00"
   nodes: 32
   env_vars:

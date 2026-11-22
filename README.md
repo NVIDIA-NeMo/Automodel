@@ -9,7 +9,7 @@
 <!-- [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) -->
 [![codecov](https://codecov.io/github/NVIDIA-NeMo/Automodel/graph/badge.svg?token=4NMKZVOW2Z)](https://codecov.io/github/NVIDIA-NeMo/Automodel)
 [![CICD NeMo](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml/badge.svg)](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/release/python-3110/)
 [![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
@@ -21,6 +21,26 @@
 </div>
 
 ## 📣 News and Discussions
+- [11/20/2026][**Inkling-2-Mini**](https://huggingface.co/thinkingmachines/Inkling-2-Mini) Fine-tune Thinking Machines' 26B-A5B looped vision-language MoE model on one GB200 node. See the [model card](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/thinkingmachines/inkling-2-mini.mdx) and the [MedPix SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_mini_medpix_sft_ep4.yaml), [MedPix LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_mini_medpix_lora_ep4.yaml), and [128K packed SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_mini_tulu3_packed128k_ep4_cp4.yaml) recipes.
+- [11/19/2026][**ERNIE 5.5 Flash**](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base-BF16) Fine-tune Baidu's 280B MoE model on GB200, many thanks to [@linmuchuiyang](https://github.com/linmuchuiyang). See the [model card](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/baidu/ernie-5-5-flash-base-bf16.mdx) and the [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep.yaml), [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml), [128K packed SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_tulu3_packed128k_cp8.yaml), and [128K packed LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml) recipes.
+- [11/17/2026][**LFM3**](https://huggingface.co/LiquidAI/LFM3-1.7B) Fine-tune Liquid AI's LFM3-1.7B and LFM3-VL-2B, many thanks to [@billxbf](https://github.com/billxbf). See the [LFM3-1.7B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/liquidai/lfm3-1-7b.mdx) and [LFM3-VL-2B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/liquidai/lfm3-vl-2b.mdx) model cards and the [SQuAD SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/lfm3/lfm3_1p7b_squad.yaml), [128K packed SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/lfm3/lfm3_1p7b_tulu3_packed128k_cp8.yaml), and [MedPix SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/lfm3/lfm3_vl_2b_medpix.yaml) recipes.
+- [11/12/2026][**Inkling-2-Small**](https://huggingface.co/thinkingmachines/Inkling-2-Small) We added fine-tuning recipes for Thinking Machines' 594B-parameter, 17B-active vision-language MoE model on GB200. Check out the [128K packed Tulu 3 SFT EP32/PP2/CP32](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml), [MedPix LoRA EP32](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml), and [MedPix SFT EP64/PP4](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_sft_ep64_pp4.yaml) recipes and the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/thinkingmachines/inkling2.mdx).
+- [11/04/2026][**REINFORCE-Zero**](https://github.com/hijkzzz/REINFORCE-Zero) We added a [train-inference consistency skill](https://github.com/NVIDIA-NeMo/Automodel/blob/main/.agents/contributor-skills/train-inference-consistency/SKILL.md): the trainer calls the rollout engine's own kernels, so its logprobs match vLLM's bitwise and the train-inference mismatch is exactly 0 (`mismatch` 0, `vllm_kl` 0). [labs-molt](https://github.com/NVIDIA-NeMo/labs-molt) has the end-to-end implementation and an example. It follows REINFORCE-Zero by [@hijkzzz](https://github.com/hijkzzz): with aligned kernels, asynchronous RL stays stable with plain importance sampling, no clipping.
+- [11/07/2026][**Kimi K3.1 Pro**](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) We now support full-parameter fine-tuning for Moonshot AI's 2.8T-parameter, 104B-active MoE vision-language model with hybrid KDA and gated DSA attention on NVIDIA GB200, many thanks to [@Khazic](https://github.com/khazic). Check out the [MedPix EP32/PP8 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/k31_medpix_nonpacked.yaml) on 256 GB200 and the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/moonshotai/kimi-k31-pro.mdx).
+- [11/01/2026][**Muown optimizer**](https://arxiv.org/abs/2605.10797) We now support the Muown optimizer for dense and MoE models with FSDP2 and expert parallelism. Check out the [Qwen3-30B-A3B recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_tulu3_muown.yaml).
+- [10/29/2026][**Mistral Large 4**](https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B) Fine-tune Mistral AI's 1T-A52B multimodal MoE model with expert, pipeline, and context parallelism. See the [model card](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/mistralai/mistral-large-4.mdx). Explore the [MedPix SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/mistral_large4_medpix_ep64_pp2.yaml) and [128K long-context packed SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/mistral_large4_tulu3_packed128k_ep64_pp2_cp32_tilelang.yaml) recipes.
+- [10/25/2026][**Nanbeige4.3-33B**](https://huggingface.co/Nanbeige/Nanbeige4.3-33B) Fine-tune Nanbeige's dense 33B agentic model on 128K packed sequences with context parallelism. See the [model card](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/nanbeige/nanbeige4-3-33b.mdx). Explore the [128K SFT CP16](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nanbeige/nanbeige4_3_33b_tulu3_packed128k_cp16.yaml) and [128K LoRA CP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nanbeige/nanbeige4_3_33b_tulu3_packed128k_cp8_lora.yaml) recipes.
+- [10/23/2026][**NVIDIA Nemotron 3.5 Bolt**](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16) Fine-tune [NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16) with the [MedPix full-parameter SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e4b.yaml) and [MedPix LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e4b_peft.yaml) recipes, and [NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16) with the [CORD-v2 LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_cord_v2_lora.yaml). See the [E4B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/nvidia/nvidia-nemotron-3-5-bolt-e4b-4gb-bf16.mdx) and [74B-A9B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/nvidia/nvidia-nemotron-3-5-bolt-74b-a9b-bf16.mdx) model coverage pages.
+- [10/23/2026][**MiniMax-M3.1-Flash**](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) We now support fine-tuning MiniMax AI's MoE vision-language model, loading its NVFP4 and MXFP8 checkpoint directly. Check out the [MedPix SFT EP128 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_1_vl_sft_medpix_ep128_100steps.yaml) and the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/MiniMaxAI/minimax-m3-1-flash.mdx).
+- [10/21/2026][**Flint**](https://huggingface.co/RecursiveSI/flint) Fine-tune Recursive's 39.8B-A2.5B MoE model with expert and context parallelism. See the [model card](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/recursivesi/flint.mdx). Explore the [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_sft.yaml), [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_lora.yaml), [128K packed TE](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_packed128k_te.yaml), and [128K packed MagiAttention (H100)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_packed128k_magi_h100.yaml) recipes.
+- [10/21/2026][**EAGLE-4**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/speculative/eagle.mdx) We now support training EAGLE-4 drafters: the EAGLE-3.1 draft with a sliding-window layer and a low-rank candidate head over the full vocabulary, trained in two stages and exported to the `LlamaForCausalLMEagle4` serving layout, many thanks to [@Khazic](https://github.com/khazic). Check out the Qwen3-8B [draft](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle4/qwen3_8b_eagle4.yaml) and [candidate-head](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle4/qwen3_8b_eagle4_candidate_head.yaml) recipes and the [speculative decoding overview](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/README.md).
+- [10/16/2026][**Beam-1.0-501B-A23B**](https://huggingface.co/reflection/Beam-1.0-501B-A23B) We now support LoRA and full-parameter fine-tuning for Reflection AI's 501B-A23B sparse MoE with mixed sliding-window and full attention, using FSDP2, expert parallelism, and packed sequences. Check out the [Tulu3 LoRA EP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml) and [Tulu3 SFT EP64 8-node](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml) recipes and the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/reflection/beam-1-0-501b-a23b.mdx).
+- [10/15/2026][**Muse Spark Open**](https://huggingface.co/meta-models/Muse-Spark-open-816B-A42B) Fine-tune Meta's MoE model with expert, pipeline, and context parallelism. See the [model card](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm/muse/muse_spark_open.mdx). Explore the [image-text SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/9c9c4cfdb27461da359263bb342a086307ecaba7/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_ep64_pp4_100steps.yaml), [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/9c9c4cfdb27461da359263bb342a086307ecaba7/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml), and [128K long-context packed SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/9c9c4cfdb27461da359263bb342a086307ecaba7/examples/llm_finetune/muse_spark/muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi.yaml) recipes.
+- [10/15/2026][**NVIDIA Nemotron 3.5 Super VL**](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) Fine-tune the 120B-A12B vision-language model with [CORD-v2 SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml), [CORD-v2 PEFT (LoRA)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml), [256K packed SFT (GB200)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml). See the [CORD-v2 tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/nemotron-3-5-super-vl.mdx) for data preparation, training, and evaluation.
+- [10/14/2026][**Step-5-Preview-BF16**](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16) We now support StepFun's 600B-A27B sliding-window and sparse-attention MoE with FSDP2, expert, pipeline and context parallelism. Check out the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/stepfun-ai/step-5-preview-bf16.mdx) and the [Tulu3 SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml), [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_lora.yaml), and [128K long-context CP32](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_packed128k_cp32.yaml) recipes.
+
+- [10/12/2026][**FLUX 3 Image Klein Base**](https://docs.nvidia.com/nemo/automodel/nightly/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base) We added text-to-image and image-editing LoRA fine-tuning for Black Forest Labs' base image model. See the [T2I LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) and [model guide](https://docs.nvidia.com/nemo/automodel/nightly/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base) for checkpoint setup and the 100-step validation scope.
+- [10/04/2026][**HunyuanImage-3.0**](https://huggingface.co/tencent/HunyuanImage-3.0) We now support text-to-image full fine-tuning and LoRA for Tencent's 80B-A13B MoE multimodal decoder with FSDP2 and expert parallelism, many thanks to [@Khazic](https://github.com/khazic). Check out the [full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml) and [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) recipes and the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/diffusion/tencent/hunyuan-image-3.mdx).
 - [09/28/2026][**Qwen-Image-2.1**](https://huggingface.co/Qwen/Qwen-Image-2.1) We now support text-to-image full fine-tuning and LoRA for Qwen's 7B single-stream DiT conditioned on Qwen3-VL. Check out the [full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) and [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow_lora.yaml) recipes and the [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/diffusion/qwen/qwen-image-2-1.mdx).
 - [09/26/2026][**MiMo-V2.5-Pro**](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) We now support full-parameter fine-tuning for Xiaomi's hybrid full and sliding-window attention Mixture-of-Experts model from its FP8 checkpoint. Check out the [HellaSwag PP18/EP8 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) and [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/xiaomimimo/mimo-v2-5-pro.mdx).
 - [09/22/2026][**MiMo-V2.6-Flash-RL**](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) We now support full-parameter fine-tuning for Xiaomi's multimodal Mixture-of-Experts model with expert, pipeline, and context parallelism. Check out the [packed Tulu3 EP64/CP2 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml), [non-packed MedPix EP64 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml), and [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx).
@@ -39,6 +59,10 @@
 - [07/21/2026][**Laguna S 2.1**](https://huggingface.co/poolside/Laguna-S-2.1) We now support finetuning Poolside's 118B-A8B Laguna S 2.1 MoE model. Check out our [HellaSwag EP16 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml).
 - [07/18/2026][**Inkling VLM MoE**](https://huggingface.co/thinkingmachines/Inkling) We now support finetuning Inkling. Check out our [MedPix recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml).
 - [06/27/2026] <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/docs/assets/speculative-decoding-spark.svg" width="136" height="24" alt="animated speculative decoding marker" /> [**Speculative decoding in NeMo AutoModel**](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/speculative/eagle.mdx) Train target-aligned drafters end to end: EAGLE-1/2/3, P-EAGLE, DFlash, and DeepSeek's newly released [DSpark](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/qwen3_0.6b_dspark.yaml). Huge thanks to [@Khazic](https://github.com/khazic) for the speculative decoding stack and [@kashif](https://github.com/kashif) for DSpark support.
+
+<details>
+<summary>Previous News</summary>
+
 - [06/21/2026][**GLM-5.2**](https://huggingface.co/zai-org/GLM-5.2) We now support finetuning `zai-org/GLM-5.2` with IndexShare DSA, optional TileLang sparse kernels, and long-context CP recipes. Check out our [32K long-context recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) and [model coverage page](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm/thudm/glm5-moe-dsa.mdx).
 - [06/15/2026][**DiffusionGemma**](https://huggingface.co/google/diffusiongemma-26B-A4B-it). We now support fine-tuning the `google/diffusiongemma-26B-A4B-it` model. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/dllm/diffusiongemma.mdx).
 - [06/12/2026][**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) We now support finetuning MiniMax's MiniMax-M3. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/minimax-m3.mdx).
@@ -50,7 +74,7 @@
 - [04/29/2026][**Mistral Medium 3.5**](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) We now support finetuning Mistral AI's 128B FP8-native VLM Mistral Medium 3.5. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/mistral-medium-3-5.md).
 - [04/28/2026][**Nemotron-3-Nano-Omni**](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16) We now support finetuning `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16`, NVIDIA's 30B-A3B omnimodal MoE (text · image · audio) with NemotronH hybrid Mamba+Attention backbone. Check out our [SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml), [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2_peft.yaml), and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/nemotron-omni.md).
 - [04/28/2026][**Hy3-preview**](https://huggingface.co/tencent/Hy3-preview) We now support finetuning `tencent/Hy3-preview`, thanks to [@Khazic](https://github.com/khazic). Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml).
-- [04/25/2026][**DeepSeek V4 Flash**](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) We now support finetuning `deepseek-ai/DeepSeek-V4-Flash`, thanks to [@Khazic](https://github.com/khazic). Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/dsv4-flash.md).
+- [04/25/2026][**DeepSeek V4 Flash**](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) We now support finetuning `deepseek-ai/DeepSeek-V4-Flash`, thanks to [@Khazic](https://github.com/khazic). Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/dsv4-flash.md).
 - [04/22/2026][**Qwen3.6-27B**](https://huggingface.co/Qwen/Qwen3.6-27B) We now support finetuning `Qwen/Qwen3.6-27B`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml).
 - [04/20/2026][**Qwen-Image**](https://huggingface.co/Qwen/Qwen-Image) We now support finetuning `Qwen/Qwen-Image`, thanks to [@harshareddy832](https://github.com/harshareddy832). Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml).
 - [04/16/2026][**Qwen3.6 MoE**](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) We now support finetuning `Qwen/Qwen3.6-35B-A3B`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml).
@@ -64,10 +88,6 @@
 - [03/11/2026][**GLM-5**](https://huggingface.co/zai-org/GLM-5) We now support finetuning `zai-org/GLM-5`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml).
 - [03/02/2026][**Qwen3.5 small models**](https://huggingface.co/collections/Qwen/qwen35) We support finetuning for Qwen3.5 small models 0.8B, 2B, 4B ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml)) and 9B ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml))
 - [02/16/2026][**Qwen3.5 MoE**](https://huggingface.co/collections/Qwen/qwen35) We support finetuning for `Qwen/Qwen3.5-397B-A17B` ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml)) and `Qwen/Qwen3.5-35B-A3B` ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml))
-
-<details>
-<summary>Previous News</summary>
-    
 - [02/13/2026] [**MiniMax-M2.5**](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) We support finetuning for `MiniMaxAI/MiniMax-M2.5`. Checkout our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml)
 - [02/11/2026] [**GLM-4.7-Flash**](https://huggingface.co/zai-org/GLM-4.7-Flash) We now support finetuning GLM-4.7-Flash. Checkout our [packed sequence recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml)
 - [02/09/2026] [**MiniMax-M2**](https://huggingface.co/MiniMaxAI/MiniMax-M2) We support finetuning for `MiniMaxAI/MiniMax-M2`. Checkout our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/5f63eb428bacf4146e9a5ae9949d58c5751df7b9/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml)
@@ -155,7 +175,9 @@ What you can expect:
 
 ## Feature Roadmap
 
-✅ _Available now ([v0.5.0](https://pypi.org/project/nemo-automodel/0.5.0/) / [26.06 container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.06.00))_ | 🔜 _Planned for 26.08_
+✅ _Implemented on `main`_ | 🔜 _Planned_
+
+For released features, see the [release notes](https://github.com/NVIDIA-NeMo/Automodel/releases). Docker examples target the [26.10 container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.10.00).
 
 High-throughput scalable training
 - ✅ **PyTorch DTensor-native SPMD training** Same training script can scale from 1 GPU to large multi-node jobs by changing the device mesh/config.
@@ -170,7 +192,7 @@ High-throughput scalable training
 - ✅ **FlashAttention packed-sequence support** - Packed masks can feed variable-length FlashAttention paths using per-document cu_seqlens.
 - ✅ **DCP** - Supports PyTorch DCP and SafeTensors, sharded and consolidated layouts, merge/reshard utilities, and Hugging Face-compatible outputs.
 - ✅ **Async checkpointing** - Can write checkpoints in the background to reduce training stalls caused by I/O.
-- ✅ **Dion and Muon optimizers** - Distributed optimizer integrations with typed recipe configuration.
+- ✅ **Dion, Muon, and Muown optimizers** - Distributed optimizer integrations with typed recipe configuration.
 - ✅ **Environment Support** - SLURM, interactive, SkyPilot, and Kubernetes (via SkyPilot) launchers.
 
 SOTA algorithms
@@ -178,14 +200,14 @@ SOTA algorithms
 - ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), PEFT (LoRA, QLoRA), and QAT (Quantization-Aware Training).
 - ✅ **Knowledge distillation** - Support for knowledge distillation with LLMs.
 - ✅ **VLM knowledge distillation** - Chunked KD loss and a Qwen3.5-VL teacher-student recipe.
-- ✅ **Speculative decoding training** - Train target-aligned EAGLE-1/2/3, P-EAGLE, DFlash, DFlash 2, and DSpark drafters for faster verified generation.
+- ✅ **Speculative decoding training** - Train target-aligned EAGLE-1/2/3/4, P-EAGLE, DFlash, DFlash 2, and DSpark drafters for faster verified generation.
 
 Model Coverage and 🤗 Ecosystem compatibility
 - ✅ **Transformers v5 🤗** - Built on latest transformers with device-mesh driven parallelism.
 - ✅ **🤗 HuggingFace Integration** - Works with dense models (e.g., Qwen, Llama3, etc) and large MoEs (e.g., DSv3, DSv4).
 - ✅ **VLM** - Finetuning for VLMs (Qwen2.5/3/3.5/3.6 VL, Gemma-3/3n/4 VL, Mistral 3.5/4, LLaVA-OneVision-1.5, Kimi-VL, etc.).
 - ✅ **Omnimodal** - Finetuning for omnimodal MoE models (Nemotron-3-Nano-Omni, Qwen3-Omni).
-- ✅ **Diffusion** - Pretraining and LoRA finetuning for image/video diffusion models (Qwen-Image, Qwen-Image-2.1, FLUX, Wan2.1, Wan2.2-T2V-A14B, Hunyuan).
+- ✅ **Diffusion** - Pretraining and LoRA finetuning for image/video diffusion models (Qwen-Image, Qwen-Image-2.1, FLUX, [FLUX 3 Image Klein Base](https://docs.nvidia.com/nemo/automodel/nightly/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base), Wan2.1, Wan2.2-T2V-A14B, Hunyuan).
 - ✅ **dLLM** - Discrete diffusion LM finetuning (LLaDA, LLaDA2, Nemotron-Labs-Diffusion, DiffusionGemma).
 - ✅ **Retrieval** - Bi-encoder and cross-encoder training with in-batch negative sampling.
 - ✅ **Extended MoE support** - GPT-OSS, Kimi K3, Qwen3 / Qwen3.5 / Qwen3.6 MoE, Qwen-next, MiniMax-M2.x, GLM-4.7 / GLM-5 / GLM-5.1 / GLM-5.2 / GLM-5.3 / GLM-5.3-Flash, DeepSeek V3.2 / V4 / V4-Flash, ERNIE 4.5, MiMo-V2-Flash / MiMo-V2.5-Pro, Ling 2.0, Hy3-preview.
@@ -193,7 +215,7 @@ Model Coverage and 🤗 Ecosystem compatibility
 Agentic Development and UX
 - ✅ **Agent-friendly skills** - Curated [`skills/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/skills) for common dev tasks (recipe runs, model onboarding, CI).
 
-Planned for 26.08
+Planned
 - 🔜 **Unified Engine API and recipes** - Introduce a common engine and consolidate the LLM and VLM recipe paths.
 - 🔜 **Composable component configuration** - Complete the typed config and `.build()` refactor across data and remaining components.
 - 🔜 **Packed long-context training with CP** - Combine THD sequence packing with context parallelism, including DeepSeek V4 coverage.
@@ -206,7 +228,21 @@ Planned for 26.08
 
 ## Getting Started
 
-We recommend using **uv** for reproducible Python environments.
+Run a 10-step Qwen3-0.6B fine-tuning example on two GPUs with the container:
+
+```bash
+mkdir -p checkpoints
+docker run --gpus all -it --rm --shm-size=8g \
+  -v "$PWD/checkpoints:/opt/Automodel/checkpoints" \
+  nvcr.io/nvidia/nemo-automodel:26.10.00 \
+  automodel /opt/Automodel/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml \
+  --nproc-per-node 2 \
+  --step_scheduler.max_steps 10
+```
+
+The model and HellaSwag dataset are public; no Hugging Face token is required. Checkpoints are saved to the mounted `checkpoints` directory.
+
+For source installation, use **uv** for reproducible Python environments.
 
 ```bash
 # Setup environment before running any recipes
@@ -231,14 +267,14 @@ uv run python -c "import nemo_automodel; print('NeMo AutoModel ready')"
 ### Run a Recipe
 All recipes are launched via the `automodel` CLI (or its short alias `am`). Each YAML config specifies the recipe class and all training parameters:
 ```bash
-# LLM example: multi-GPU fine-tuning with FSDP2
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
+# LLM example: multi-GPU fine-tuning of Qwen3-0.6B with FSDP2 (no HF token required)
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-per-node 8
 
 # VLM example: single-GPU fine-tuning (Gemma-3-VL) with LoRA
 automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
 
 # Both commands also work with uv run:
-uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
+uv run automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-per-node 8
 ```
 
 > [!TIP]
@@ -255,7 +291,7 @@ automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
 <!-- ### LLM Pre-training Multi Node -->
 
 ## LLM Supervised Fine-Tuning (SFT)
-We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar.github.io/SQuAD-explorer/).
+We provide an example SFT experiment using the [HellaSwag dataset](https://rowanzellers.com/hellaswag/).
 
 <!-- Refer to `examples/llm_finetune/annotated.yaml` for a full list of parameters that can be overridden. -->
 
@@ -264,15 +300,15 @@ We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar
 The default SFT configuration is set to run on a single GPU. To start the experiment:
 
 ```sh
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
 ```
 
-This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using a single GPU.
+This fine-tunes [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) on HellaSwag using a single GPU. The model and dataset are public; no Hugging Face token is required.
 
 To use multiple GPUs on a single node, add the `--nproc-per-node` argument:
 
 ```sh
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-per-node 8
 ```
 
 ### LLM SFT Multi Node
@@ -294,10 +330,10 @@ We provide a PEFT example using the [HellaSwag dataset](https://rowanzellers.com
 ### LLM PEFT Single Node
 ```bash
 # Memory-efficient SFT with LoRA
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag_peft.yaml
 
 # Override any YAML parameter via the command line:
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag_peft.yaml \
   --step_scheduler.local_batch_size 16
 ```
 
@@ -331,7 +367,7 @@ NeMo AutoModel provides native support for a wide range of models available on t
 
 | Domain | Model Family | Model ID | Recipes |
 |--------|--------------|----------|---------|
-| **LLM** | **GPT-OSS** | [`GPT-OSS-20B`](https://huggingface.co/openai/gpt-oss-20b) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
+| **LLM** | **GPT-OSS** | [`GPT-OSS-20B`](https://huggingface.co/openai/gpt-oss-20b) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml) |
 |  |  | [`GPT-OSS-120B`](https://huggingface.co/openai/gpt-oss-120b) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml) |
 | **LLM** | **DeepSeek** | [`DeepSeek-V3`](https://huggingface.co/deepseek-ai/DeepSeek-V3) | [Pretrain](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/deepseekv3_pretrain.yaml) |
 | **LLM** | **Kimi K3** | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) |
@@ -366,10 +402,13 @@ NeMo AutoModel provides native support for a wide range of models available on t
 | **LLM** | **Seed** | [`ByteDance-Seed/Seed-Coder-8B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_hellaswag_fp8.yaml) |
 |  |  | [`ByteDance-Seed/Seed-OSS-36B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml) |
 | **LLM** | **Baichuan** | [`baichuan-inc/Baichuan2-7B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml) |
+| **VLM** | **NVIDIA Nemotron 3.5 Super VL** | [`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) | [CORD-v2 SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml), [CORD-v2 PEFT (LoRA)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml), [256K packed SFT (GB200)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml) |
 | **VLM** | **Gemma** | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml) |
 |  |  | [`google/gemma-3n-e4b-it`](https://huggingface.co/google/gemma-3n-e4b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml) |
 | **VLM** | **Ox Alpha / GLM-5.3-Flash** | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) |
+| **VLM** | **Muse Spark Open** | [`meta-models/Muse-Spark-open-816B-A42B`](https://huggingface.co/meta-models/Muse-Spark-open-816B-A42B) | [Model card](docs/model-coverage/vlm/muse/muse_spark_open.mdx), [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/9c9c4cfdb27461da359263bb342a086307ecaba7/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_ep64_pp4_100steps.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/9c9c4cfdb27461da359263bb342a086307ecaba7/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml), [128K packed SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/9c9c4cfdb27461da359263bb342a086307ecaba7/examples/llm_finetune/muse_spark/muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi.yaml) |
 | **VLM** | **North Micro Vision** | [`CohereLabs/North-Micro-Vision-Instruct`](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct) | [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml) |
+| **Embedding** | **Nemotron 3 Embed** | [`nvidia/Nemotron-3-Embed-1B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16) | [End-to-end text bi-encoder recipe](https://github.com/NVIDIA-NeMo/Nemotron/tree/main/docs/nemotron/embed) |
 
 > [!NOTE]
 > Check out more [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune) and [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune) examples. Any causal LM on Hugging Face Hub can be used with the base recipe template, just overwrite `--model.pretrained_model_name_or_path <model-id>` in the CLI or in the YAML config.

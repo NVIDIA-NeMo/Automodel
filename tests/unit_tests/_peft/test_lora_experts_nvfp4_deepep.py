@@ -1,0 +1,361 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""NVFP4-resident experts under DeepEP dispatch.
+
+The DeepEP token all-to-all is mocked (``MockDeepEPDispatcher``) so the forward path is
+exercised without a real DeepEP backend or process group — only the post-dispatch
+grouped GEMM differs between bf16 and NVFP4, and that is what these tests pin down.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+
+from nemo_automodel.components._peft.lora import patch_moe_module
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA
+from nemo_automodel.components._peft.lora_experts_nvfp4 import GroupedExpertsDeepEPLoRANVFP4
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
+from nemo_automodel.components.moe.quantized_experts import (
+    GroupedExpertsDeepEPNVFP4,
+    GroupedExpertsNVFP4,
+    apply_nvfp4_to_moe_experts,
+)
+from nemo_automodel.components.quantization.nvfp4 import dequantize_nvfp4, quantize_nvfp4
+
+
+@pytest.fixture
+def device():
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return torch.device("cpu")
+
+
+@pytest.fixture
+def moe_config():
+    # Dims divisible by 16 so both contraction dims are NVFP4-blockable.
+    return MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=64,
+        inter_dim=128,
+        moe_inter_dim=64,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.bfloat16,
+    )
+
+
+class MockDeepEPDispatcher:
+    """Mock dispatcher that returns pre-set permuted tensors (no comms)."""
+
+    def __init__(self, permuted_x, tokens_per_expert, permuted_probs):
+        self.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
+
+    def token_unpermutation(self, hidden_states):
+        return hidden_states
+
+
+def _make_representable_(experts) -> None:
+    """Replace expert weights in-place with their NVFP4 round-trip so storage is exact."""
+    with torch.no_grad():
+        for name in ("gate_and_up_projs", "down_projs"):
+            param = getattr(experts, name)
+            w_t = param.data.transpose(-2, -1).contiguous()
+            packed, scales, global_scale = quantize_nvfp4(w_t)
+            param.data.copy_(dequantize_nvfp4(packed, scales, global_scale, param.dtype).transpose(-2, -1))
+
+
+def _make_deepep(moe_config, device, *, representable=False):
+    """Build a materialized GroupedExpertsDeepEP with single-rank dispatcher state injected."""
+    orig = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        orig.init_weights(device)
+    if representable:
+        _make_representable_(orig)
+    orig.n_routed_experts = moe_config.n_routed_experts
+    orig.ep_size = 1
+    orig.ep_rank = 0
+    return orig
+
+
+def _inject_dispatcher(module, num_tokens, dim, device):
+    """Attach single-rank dispatcher state + a mock that routes all tokens to expert 0."""
+    module.n_routed_experts = 4
+    module.ep_size = 1
+    module.ep_rank = 0
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
+    permuted_x = torch.randn(num_tokens, dim, device=device, dtype=torch.bfloat16)
+    permuted_probs = torch.ones(num_tokens, device=device, dtype=torch.bfloat16)
+    module.token_dispatcher = MockDeepEPDispatcher(permuted_x, tokens_per_expert, permuted_probs)
+    return permuted_x, tokens_per_expert, permuted_probs
+
+
+# --- wiring / construction ----------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_frozen_deepep_nvfp4_packs_and_freezes(moe_config, device):
+    orig = _make_deepep(moe_config, device)
+    nv = GroupedExpertsDeepEPNVFP4(orig)
+
+    assert nv._nvfp4_resident
+    assert not hasattr(nv, "gate_and_up_projs")
+    assert not hasattr(nv, "down_projs")
+    assert nv.gate_and_up_projs_nvfp4.dtype == torch.uint8
+    assert nv.down_projs_scales.dtype == torch.float8_e4m3fn
+    # Checkpoint orientation [E, out, in/2]; e4m3 block scales [E, out, in/16]; fp32 row scales [E, out].
+    assert nv.gate_and_up_projs_nvfp4.shape == (4, 2 * moe_config.moe_inter_dim, moe_config.dim // 2)
+    assert nv.gate_and_up_projs_scales.shape == (4, 2 * moe_config.moe_inter_dim, moe_config.dim // 16)
+    assert nv.gate_and_up_projs_global.shape == (4, 2 * moe_config.moe_inter_dim)
+    assert nv.gate_and_up_projs_global.dtype == torch.float32
+    # DeepEP dispatcher knobs are carried over.
+    assert nv.dispatcher_backend == orig.dispatcher_backend
+    # Fully frozen.
+    assert [n for n, p in nv.named_parameters() if p.requires_grad] == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_deepep_nvfp4_only_lora_trainable(moe_config, device):
+    orig = _make_deepep(moe_config, device)
+    nv = GroupedExpertsDeepEPLoRANVFP4(orig, lora_dim=8, alpha=16)
+
+    assert nv._nvfp4_resident
+    assert not hasattr(nv, "gate_and_up_projs")
+    assert nv.gate_and_up_projs_nvfp4.dtype == torch.uint8
+    trainable = {n for n, p in nv.named_parameters() if p.requires_grad}
+    assert trainable == {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_patch_moe_module_deepep_nvfp4(moe_config, device):
+    orig = _make_deepep(moe_config, device)
+    patched = patch_moe_module(orig, dim=8, alpha=16, expert_weight_format="nvfp4")
+    assert isinstance(patched, GroupedExpertsDeepEPLoRANVFP4)
+
+    orig2 = _make_deepep(moe_config, device)
+    patched_bf16 = patch_moe_module(orig2, dim=8, alpha=16)
+    assert isinstance(patched_bf16, GroupedExpertsDeepEPLoRA)
+    assert not isinstance(patched_bf16, GroupedExpertsDeepEPLoRANVFP4)
+
+
+@pytest.mark.parametrize("backend_name", (None, "torch_mm", "gmm"))
+@pytest.mark.parametrize("lora", (False, True))
+def test_deepep_nvfp4_native_backends(moe_config: MoEConfig, backend_name: str | None, lora: bool) -> None:
+    """Default DeepEP and both native grouped-MM backend names accept packed storage."""
+    backend = BackendConfig(experts=backend_name) if backend_name is not None else None
+    with torch.device("meta"):
+        original = GroupedExpertsDeepEP(moe_config, backend)
+    if lora:
+        packed = GroupedExpertsDeepEPLoRANVFP4(original, lora_dim=8, alpha=16)
+    else:
+        packed = GroupedExpertsDeepEPNVFP4(original)
+
+    assert packed.gate_and_up_projs_nvfp4.shape == (4, 128, 32)
+    assert packed.down_projs_nvfp4.shape == (4, 64, 32)
+    assert packed.gate_and_up_projs_nvfp4.dtype == torch.uint8
+    assert packed.down_projs_scales.dtype == torch.float8_e4m3fn
+    assert all(param.is_meta for param in packed.parameters())
+    trainable = {name for name, param in packed.named_parameters() if param.requires_grad}
+    assert trainable == ({"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"} if lora else set())
+
+
+def test_passthrough_deepep_registers_packed_params_on_meta(moe_config):
+    with torch.device("meta"):
+        orig = GroupedExpertsDeepEP(moe_config)
+
+    nv = GroupedExpertsDeepEPNVFP4(orig)
+    assert nv._nvfp4_resident
+    assert not hasattr(nv, "gate_and_up_projs")  # never created bf16 storage
+    up_proj_dim = 2 * moe_config.moe_inter_dim  # gated
+    assert tuple(nv.gate_and_up_projs_nvfp4.shape) == (moe_config.n_routed_experts, up_proj_dim, moe_config.dim // 2)
+    assert nv.gate_and_up_projs_nvfp4.is_meta
+    assert nv.gate_and_up_projs_nvfp4.dtype == torch.uint8
+    assert [n for n, p in nv.named_parameters() if p.requires_grad] == []
+
+
+def test_apply_nvfp4_to_moe_experts_handles_deepep(moe_config):
+    import torch.nn as nn
+
+    device = torch.device("cpu")
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = _make_deepep(moe_config, device)
+
+    model = TinyModel()
+    assert apply_nvfp4_to_moe_experts(model) is model
+    assert isinstance(model.experts, GroupedExpertsDeepEPNVFP4)
+    # Not the torch-path class.
+    assert not isinstance(model.experts, GroupedExpertsNVFP4)
+    # Idempotent.
+    converted = model.experts
+    assert apply_nvfp4_to_moe_experts(model) is model
+    assert model.experts is converted
+
+
+@pytest.mark.parametrize("device", ("cpu", "meta"))
+def test_frozen_nvfp4_conversion_preserves_hybridep_settings(moe_config: MoEConfig, device: str) -> None:
+    """Non-LoRA expert conversion retains the configured HybridEP routing and tuning."""
+    backend = BackendConfig(
+        experts="torch_mm",
+        dispatcher="hybridep",
+        dispatcher_hybridep_permute_fusion=True,
+        dispatcher_hybridep_compact_routing=True,
+        dispatcher_hybridep_num_sms_preprocessing=12,
+        dispatcher_hybridep_num_blocks_permute=16,
+        dispatcher_hybridep_num_blocks_unpermute=20,
+        dispatcher_hybridep_max_tokens_per_rank=4096,
+        dispatcher_capacity_factor=1.5,
+        dispatcher_equal_token_counts=True,
+        dispatcher_recompute_cache="combine",
+    )
+    with torch.device(device), torch.no_grad():
+        original = GroupedExpertsDeepEP(moe_config, backend, dispatcher_backend=backend.dispatcher)
+        original.init_weights(torch.device(device))
+    model = torch.nn.Module()
+    model.add_module("experts", original)
+    if device == "meta":
+        model.state_dict_adapter = MagicMock()
+
+    apply_nvfp4_to_moe_experts(model)
+
+    converted = model.experts
+    assert isinstance(converted, GroupedExpertsDeepEPNVFP4)
+    assert converted.dispatcher_backend == "hybridep"
+    assert converted.dispatcher_hybridep_permute_fusion is True
+    assert converted.dispatcher_hybridep_compact_routing is True
+    assert converted.dispatcher_hybridep_num_sms_preprocessing == 12
+    assert converted.dispatcher_hybridep_num_blocks_permute == 16
+    assert converted.dispatcher_hybridep_num_blocks_unpermute == 20
+    assert converted.dispatcher_hybridep_max_tokens_per_rank == 4096
+    assert converted.dispatcher_capacity_factor == 1.5
+    assert converted.dispatcher_equal_token_counts is True
+    assert converted.dispatch_rows_never_empty is True
+    # a frozen layer next to a LoRA one must present the same cache mode to the shared dispatcher (review of #4395)
+    assert converted.dispatcher_recompute_cache == "combine"
+    assert all(not param.requires_grad for param in converted.parameters())
+    assert converted.gate_and_up_projs_nvfp4.is_meta == (device == "meta")
+
+
+# --- forward numerics (mock dispatcher) ---------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_frozen_deepep_nvfp4_forward_matches_bf16(moe_config, device):
+    """Frozen nvfp4 DeepEP forward must match the bf16 DeepEP forward on representable weights."""
+    orig = _make_deepep(moe_config, device, representable=True)
+    nv = GroupedExpertsDeepEPNVFP4(orig)
+
+    num_tokens = 8
+    permuted_x, tokens_per_expert, permuted_probs = _inject_dispatcher(nv, num_tokens, moe_config.dim, device)
+    # Share the exact same mock return on the bf16 reference.
+    orig.token_dispatcher = MockDeepEPDispatcher(permuted_x, tokens_per_expert, permuted_probs)
+
+    x = torch.randn(num_tokens, moe_config.dim, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(num_tokens, 1, device=device, dtype=torch.bfloat16)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    y_nv = nv(x, token_mask, weights, indices)
+    # GroupedExpertsDeepEP.forward calls .to_local() on plain Parameters; patch for the test.
+    with torch.no_grad(), patch.object(torch.Tensor, "to_local", new=lambda self: self, create=True):
+        y_ref = orig(x, token_mask, weights, indices)
+
+    assert y_nv.shape == (num_tokens, moe_config.dim)
+    torch.testing.assert_close(y_nv, y_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_lora_deepep_nvfp4_forward_matches_bf16(
+    moe_config: MoEConfig, device: torch.device, with_callback: bool
+) -> None:
+    """LoRA nvfp4 DeepEP forward must match the bf16 DeepEP LoRA forward with the same adapters."""
+    orig = _make_deepep(moe_config, device, representable=True)
+
+    ref = GroupedExpertsDeepEPLoRA(orig, lora_dim=8, alpha=16).to(device).to(torch.bfloat16)
+    # Pack on CPU-allocated base params, then move packed storage + adapters to device.
+    nv = GroupedExpertsDeepEPLoRANVFP4(orig, lora_dim=8, alpha=16).to(device)
+    # Give LoRA non-trivial values (B is zero-init by default) and sync both modules. The
+    # DeepEP base allocates fp32 (it relies on a later .to(bf16)); assign the bf16 ref tensor
+    # outright so the nvfp4 adapters are bf16 — .to(bf16) on the module would corrupt the
+    # uint8 packed base.
+    with torch.no_grad():
+        for name in ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"):
+            getattr(ref, name).data.normal_(0, 0.02)
+            getattr(nv, name).data = getattr(ref, name).data.clone().to(device)
+
+    num_tokens = 8
+    permuted_x, tokens_per_expert, permuted_probs = _inject_dispatcher(nv, num_tokens, moe_config.dim, device)
+    ref.token_dispatcher = MockDeepEPDispatcher(permuted_x, tokens_per_expert, permuted_probs)
+    ref.n_routed_experts = 4
+    ref.ep_size = 1
+
+    x = torch.randn(num_tokens, moe_config.dim, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(num_tokens, 1, device=device, dtype=torch.bfloat16)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    callback = torch.tanh if with_callback else None
+    y_nv = nv(x, token_mask, weights, indices, post_expert_output=callback)
+    with torch.no_grad(), patch.object(torch.Tensor, "to_local", new=lambda self: self, create=True):
+        y_ref = ref(x, token_mask, weights, indices, post_expert_output=callback)
+
+    assert y_nv.shape == (num_tokens, moe_config.dim)
+    torch.testing.assert_close(y_nv, y_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_deepep_nvfp4_no_routed_tokens(moe_config, device):
+    """The all-zero-tokens dummy path must run and keep LoRA gradients flowing."""
+    orig = _make_deepep(moe_config, device)
+    nv = GroupedExpertsDeepEPLoRANVFP4(orig, lora_dim=8, alpha=16).to(device)
+    # DeepEP base allocates fp32; make adapters bf16 to match activations (see note above).
+    with torch.no_grad():
+        for name in ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"):
+            p = getattr(nv, name)
+            p.data = p.data.to(torch.bfloat16)
+
+    num_tokens = 8
+    # tokens_per_expert all zeros -> dummy path.
+    permuted_x = torch.randn(num_tokens, moe_config.dim, device=device, dtype=torch.bfloat16)
+    permuted_probs = torch.ones(num_tokens, device=device, dtype=torch.bfloat16)
+    tokens_per_expert = torch.zeros(4, dtype=torch.long, device="cpu")
+    nv.n_routed_experts = 4
+    nv.ep_size = 1
+    nv.token_dispatcher = MockDeepEPDispatcher(permuted_x, tokens_per_expert, permuted_probs)
+
+    x = torch.randn(num_tokens, moe_config.dim, device=device, dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.ones(num_tokens, 1, device=device, dtype=torch.bfloat16)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    y = nv(x, token_mask, weights, indices)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    y.float().sum().backward()
+    assert nv.lora_gate_and_up_A.grad is not None

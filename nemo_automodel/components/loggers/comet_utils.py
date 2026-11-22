@@ -12,11 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Self
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.config.loader import ConfigNode
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +38,10 @@ class CometLogger:
         workspace: str | None = None,
         api_key: str | None = None,
         experiment_name: str | None = None,
-        tags: list | None = None,
+        tags: list[str] | None = None,
         auto_metric_logging: bool = False,
-        **kwargs,
-    ):
+        **kwargs: object,
+    ) -> None:
         """
         Initialize Comet ML logger.
 
@@ -72,7 +78,7 @@ class CometLogger:
 
             logger.info(f"Comet experiment: {self.experiment.url}")
 
-    def log_params(self, params: Dict[str, Any]) -> None:
+    def log_params(self, params: dict[str, Any]) -> None:
         """Log parameters to Comet.
 
         Args:
@@ -83,7 +89,7 @@ class CometLogger:
 
         self.experiment.log_parameters(params)
 
-    def log_metrics(self, metrics: Dict[str, float], step: int | None = None) -> None:
+    def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
         """Log metrics to Comet.
 
         Args:
@@ -113,14 +119,16 @@ class CometLogger:
             self.experiment.end()
             logger.info("Comet experiment ended successfully")
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
+    ) -> None:
         self.end()
 
 
-def build_comet(cfg) -> CometLogger:
+def build_comet(cfg: ConfigNode) -> CometLogger:
     """Build a Comet logger from a raw config object.
 
     Back-compat shim. The logger-construction logic lives in

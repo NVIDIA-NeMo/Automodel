@@ -260,6 +260,9 @@ def test_blockdiag_batch_synthesizes_and_shards_padding_mask(monkeypatch):
         "inputs_embeds": torch.randn(1, 5, 3),
         "labels": torch.arange(5).view(1, 5),
         "_packed_seq_ids": torch.tensor([[1, 1, 2, 0, 0]], dtype=torch.long),
+        "packed_token_indices": torch.tensor([[0, 1, 2, -1, -1]], dtype=torch.long),
+        "cu_seqlens": torch.tensor([[0, 2, 3]], dtype=torch.int32),
+        "max_seqlen": 2,
     }
 
     ctx, sharded, layout = bd_batch.make_cp_blockdiag_batch_and_ctx(_Mesh(), None, batch)
@@ -268,6 +271,7 @@ def test_blockdiag_batch_synthesizes_and_shards_padding_mask(monkeypatch):
     # rows [4, 8), which are the input pad token plus the synthesized pad tail.
     assert torch.equal(sharded["padding_mask"], torch.tensor([[True, True, True, True]]))
     assert torch.equal(sharded["labels"], torch.tensor([[4, -100, -100, -100]]))
+    assert not {"packed_token_indices", "cu_seqlens", "max_seqlen"} & sharded.keys()
     assert layout.original_seq_len == 5
     assert layout.padded_seq_len == 8
     with ctx():

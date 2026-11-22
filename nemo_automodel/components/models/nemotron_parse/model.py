@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Tuple, Union
@@ -44,6 +45,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # NemotronParse configuration
@@ -187,9 +190,9 @@ class NemotronParseConfig(PretrainedConfig):
         if encoder:
             radio_model_path = encoder.get("_name_or_path", "nvidia/C-RADIOv2-H")
             self.encoder = AutoConfig.from_pretrained(radio_model_path, trust_remote_code=True)
-            # Update with any overrides from encoder dict
+            # Parse checkpoints own the normalization flags; base RADIO configs lack them.
             for key, value in encoder.items():
-                if hasattr(self.encoder, key):
+                if key in ("processor_normalizes", "image_processor_normalizes") or hasattr(self.encoder, key):
                     setattr(self.encoder, key, value)
         else:
             self.encoder = PretrainedConfig()
@@ -376,7 +379,14 @@ class RadioWithNeck(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.image_processor_normalizes = bool(getattr(config, "image_processor_normalizes", False))
+        # v1.2/2.0 renamed the v1.1 flag; accept either native or HF remote configs.
+        processor_normalizes = getattr(config, "processor_normalizes", None)
+        image_processor_normalizes = getattr(config, "image_processor_normalizes", None)
+        if processor_normalizes is None:
+            processor_normalizes = image_processor_normalizes
+        elif image_processor_normalizes is not None and bool(processor_normalizes) != bool(image_processor_normalizes):
+            logger.warning("processor_normalizes and image_processor_normalizes disagree; using processor_normalizes.")
+        self.image_processor_normalizes = bool(processor_normalizes)
         self._radio_input_conditioner_externalized = False
 
         # Create RADIO encoder from config (which is now actual RADIOConfig)

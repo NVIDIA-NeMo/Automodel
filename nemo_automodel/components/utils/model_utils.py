@@ -16,11 +16,11 @@ import fnmatch
 import inspect
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar, overload
 
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -32,6 +32,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,17 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
         return dict(kwargs)
 
     allowed = set(params.keys())
+    if (
+        "_packed_seq_ids" in kwargs
+        and "_packed_seq_ids" not in allowed
+        and kwargs.get("attention_mask") is None
+        and not any(kwargs.get(key) is not None for key in ("cu_seq_lens_q", "cu_seq_lens_k"))
+        and kwargs.get("qkv_format") != "thd"
+    ):
+        raise ValueError(
+            f"{type(model).__name__}.forward cannot receive _packed_seq_ids; "
+            "packed attention requires a forward accepting **kwargs or that explicit input"
+        )
     filtered = {key: value for key, value in kwargs.items() if key in allowed}
     dropped = sorted(set(kwargs) - set(filtered))
     if dropped:
@@ -159,9 +171,13 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
 
 def get_lm_head_module(model: nn.Module) -> nn.Module | None:
     """Return the model's LM head module, if one can be found."""
-    if hasattr(model, "get_output_embeddings"):
-        lm_head = model.get_output_embeddings()
-        if lm_head is not None:
+    # ``get_output_embeddings`` is the Hugging Face head-lookup convention. ``nn.Module`` does not
+    # declare it, and native models implement it without a shared base class (some return a tied
+    # embedding or a per-stage head), so it is probed here and its result validated.
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    if callable(get_output_embeddings):
+        lm_head = get_output_embeddings()
+        if isinstance(lm_head, nn.Module):
             return lm_head
     for name, module in model.named_modules():
         if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
@@ -169,19 +185,27 @@ def get_lm_head_module(model: nn.Module) -> nn.Module | None:
     return None
 
 
+def _full_tensor(weight: torch.Tensor | nn.Module) -> torch.Tensor:
+    """Return ``weight`` as a regular tensor, gathering a DTensor; a module attribute is rejected."""
+    if isinstance(weight, DTensor):
+        return weight.full_tensor()
+    if isinstance(weight, torch.Tensor):
+        return weight
+    raise TypeError(f"LM-head weight must be a tensor, got {type(weight).__name__}")
+
+
 def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
     """Return the model's LM-head weight, materializing DTensor weights when needed."""
     lm_head = get_lm_head_module(model)
     if lm_head is not None:
-        weight = lm_head.weight
-        return weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+        return _full_tensor(lm_head.weight)
     for name, param in model.named_parameters(remove_duplicate=False):
         if "lm_head" in name and name.endswith(".weight"):
-            return param.full_tensor() if hasattr(param, "full_tensor") else param
+            return _full_tensor(param)
     raise ValueError("lm_head.weight not found in model")
 
 
-def _get_logical_numel(param) -> int:
+def _get_logical_numel(param: torch.Tensor) -> int:
     """Return the logical number of elements for a parameter,
     accounting for quantized (packed) storage.
 
@@ -216,6 +240,10 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         total_params += n
         if p.requires_grad:
             trainable_params += n
+        # Quantized parameters can store packed integer bytes. They still count
+        # above, but a norm of those bytes is neither supported nor meaningful.
+        if not (p.is_floating_point() or p.is_complex()):
+            continue
         try:
             local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
@@ -226,23 +254,29 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
 
 
 @contextmanager
-def skip_random_init():
+def skip_random_init() -> Generator[None, None, None]:
     """
     Context manager to skip random weight initialization when loading pretrained models.
+
+    Clears the module-level ``_init_weights`` flag that older transformers releases read.
+    Releases without that flag (including the pinned 5.18) are left unchanged.
     """
     try:
-        mod = __import__("transformers.initialization", fromlist=["_init_weights"])
+        import transformers.initialization as init_module
     except ImportError:
-        mod = __import__("transformers.modeling_utils", fromlist=["_init_weights"])
-    prev = getattr(mod, "_init_weights", True)
-    mod._init_weights = False
+        import transformers.modeling_utils as init_module
+    if not hasattr(init_module, "_init_weights"):
+        yield
+        return
+    previous = init_module._init_weights
+    init_module._init_weights = False
     try:
         yield
     finally:
-        mod._init_weights = prev
+        init_module._init_weights = previous
 
 
-def resolve_trust_remote_code(pretrained_model_name_or_path):
+def resolve_trust_remote_code(pretrained_model_name_or_path: str | None) -> bool:
     """
     Whitelist NVIDIA models to allow remote code execution.
 
@@ -311,7 +345,9 @@ def print_trainable_parameters(model: nn.Module, name: str = "Model") -> tuple[i
     return trainable_params, total_params
 
 
-def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
+def _freeze_module_by_attribute_and_patterns(
+    model: nn.Module, attribute_name: str | None, name_patterns: Sequence[str]
+) -> None:
     """Freeze a legacy model attribute and modules matching name substrings."""
     module = getattr(model, attribute_name, None) if attribute_name is not None else None
     if module is not None:
@@ -387,6 +423,14 @@ class FreezeConfig:
     defaults to ``True`` only for legacy-only configurations; a configuration
     that declares ``freeze_modules`` or ``unfreeze_modules`` uses
     explicit-selector semantics and does not implicitly freeze vision modules.
+
+    ``freeze_parameters`` freezes exact canonical parameter names after module
+    selectors, including module unfreezes. Unlisted parameters retain their
+    existing trainability. Shared parameters can be frozen through any alias.
+    This option changes trainability only; model ``dtype`` owns trainable storage.
+    ``unfreeze_parameters`` enables exact parameters after module selectors and
+    before exact exclusions. Combined with a whole-model module freeze, it defines
+    a narrow update surface without unfreezing sibling weights or biases.
     """
 
     freeze_modules: list[ModuleSelector] | None = None
@@ -395,9 +439,18 @@ class FreezeConfig:
     freeze_audio_tower: bool = False
     freeze_language_model: bool = False
     freeze_video_embedder: bool = False
+    freeze_parameters: tuple[str, ...] | None = None
+    unfreeze_parameters: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate selectors and legacy compatibility options."""
+        for field_name in ("freeze_parameters", "unfreeze_parameters"):
+            names = getattr(self, field_name)
+            if names is not None:
+                if not isinstance(names, tuple) or any(not isinstance(name, str) or not name for name in names):
+                    raise ValueError(f"freeze_config.{field_name} must be a tuple of non-empty parameter names")
+                if len(set(names)) != len(names):
+                    raise ValueError(f"freeze_config.{field_name} must be unique")
         for field_name in ("freeze_modules", "unfreeze_modules"):
             selectors = getattr(self, field_name)
             if selectors is None:
@@ -419,10 +472,17 @@ class FreezeConfig:
 
     def has_generic_selectors(self) -> bool:
         """Return whether either generic selector field was explicitly declared."""
-        return self.freeze_modules is not None or self.unfreeze_modules is not None
+        return (
+            self.freeze_parameters is not None
+            or self.unfreeze_parameters is not None
+            or self.freeze_modules is not None
+            or self.unfreeze_modules is not None
+        )
 
 
 _FREEZE_CONFIG_OPTIONS = {
+    "freeze_parameters",
+    "unfreeze_parameters",
     "freeze_modules",
     "unfreeze_modules",
     "freeze_vision_tower",
@@ -510,14 +570,22 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
             raise ValueError(f"freeze_config.{option} must be a boolean; got {value!r}.")
         legacy_booleans[option] = value
 
+    freeze_parameters = config.get("freeze_parameters")
+    if "freeze_parameters" in config and not isinstance(freeze_parameters, (list, tuple)):
+        raise ValueError("freeze_config.freeze_parameters must be a list or tuple of parameter names")
+    unfreeze_parameters = config.get("unfreeze_parameters")
+    if "unfreeze_parameters" in config and not isinstance(unfreeze_parameters, (list, tuple)):
+        raise ValueError("freeze_config.unfreeze_parameters must be a list or tuple of parameter names")
     return FreezeConfig(
+        freeze_parameters=tuple(freeze_parameters) if freeze_parameters is not None else None,
+        unfreeze_parameters=tuple(unfreeze_parameters) if unfreeze_parameters is not None else None,
         freeze_modules=_selectors("freeze_modules"),
         unfreeze_modules=_selectors("unfreeze_modules"),
         **legacy_booleans,
     )
 
 
-def enable_radio_vit_fused_attn(model):
+def enable_radio_vit_fused_attn(model: nn.Module) -> None:
     """Route RADIO ViT attention through ``F.scaled_dot_product_attention``.
 
     RADIO's timm Attention blocks default to ``fused_attn=False``, which
@@ -596,6 +664,29 @@ def _apply_module_selectors(
             )
 
 
+def _resolve_selected_parameters(model: nn.Module, names: tuple[str, ...], *, strict: bool) -> list[nn.Parameter]:
+    """Resolve exact canonical names before changing trainability.
+
+    Args:
+        model: Model whose registered parameters may have arbitrary shapes.
+        names: Canonical parameter names, including tied aliases.
+        strict: Whether names missing from this model or pipeline stage are errors.
+
+    Returns:
+        Original Parameter objects of arbitrary shapes; storage and aliases are retained.
+    """
+    if not names:
+        return []
+    parameters = {
+        canonical_parameter_fqn(name).replace("_orig_mod.", ""): parameter
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+    }
+    missing = set(names) - parameters.keys()
+    if strict and missing:
+        raise ValueError(f"Unknown selected parameters: {sorted(missing)}")
+    return [parameters[name] for name in names if name in parameters]
+
+
 def apply_parameter_freezing(
     model: nn.Module,
     freeze_config: FreezeConfig | Mapping[str, Any],
@@ -608,6 +699,9 @@ def apply_parameter_freezing(
     then ``unfreeze_modules`` unfreezes and wins on overlap. Framework-required
     freezes (dead K/V projections, indexer parameters) are applied separately
     by the infrastructure after this function, before and after sharding.
+    Exact ``unfreeze_parameters`` are enabled after module selectors.
+    Exact ``freeze_parameters`` exclusions are applied last and do not change
+    the trainability of unlisted parameters, storage dtype, or parameter identity.
 
     Args:
         model: The model to apply freezing to.
@@ -628,6 +722,8 @@ def apply_parameter_freezing(
     if parsed_freeze_config is None:
         return
     freeze_config = parsed_freeze_config
+    frozen_parameters = _resolve_selected_parameters(model, freeze_config.freeze_parameters or (), strict=strict)
+    unfrozen_parameters = _resolve_selected_parameters(model, freeze_config.unfreeze_parameters or (), strict=strict)
 
     # Preserve the legacy attribute and substring matching independently of the
     # fnmatch semantics used by the generic selectors.
@@ -659,17 +755,21 @@ def apply_parameter_freezing(
         model, freeze_config.unfreeze_modules or [], requires_grad=True, strict=strict, field_name="unfreeze_modules"
     )
 
+    for parameter in unfrozen_parameters:
+        parameter.requires_grad_(True)
+    for parameter in frozen_parameters:
+        parameter.requires_grad_(False)
+
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache
     # attribute removed in transformers v5.x).
-    model_type = getattr(getattr(model, "config", None), "model_type", "")
-    if model_type == "phi4mm":
+    config = getattr(model, "config", None)
+    if config is not None and getattr(config, "model_type", "") == "phi4mm":
         cast_mixed_dtype_params_to_bf16(model)
-        if hasattr(model, "config"):
-            model.config.use_cache = False
+        config.use_cache = False
 
 
-def freeze_unused_kv_sharing_params(model):
+def freeze_unused_kv_sharing_params(model: nn.Module) -> None:
     """Freeze dead K/V parameters in KV-shared layers.
 
     Models like Gemma4 E2B/E4B use KV-sharing where the last N layers reuse
@@ -719,7 +819,7 @@ def freeze_unused_kv_sharing_params(model):
         )
 
 
-def freeze_deepseek_v4_indexer_params(model):
+def freeze_deepseek_v4_indexer_params(model: nn.Module) -> None:
     """Freeze DeepSeek V4 indexer params that only feed discrete top-k masks."""
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) != "deepseek_v4":
@@ -735,7 +835,7 @@ def freeze_deepseek_v4_indexer_params(model):
         logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
 
 
-def freeze_minimax_m3_indexer_params(model):
+def freeze_minimax_m3_indexer_params(model: nn.Module) -> None:
     """Freeze MiniMax M3 lightning-indexer params that only feed discrete top-k masks."""
     config = getattr(model, "config", None)
     if not str(getattr(config, "model_type", "")).startswith("minimax_m3"):
@@ -751,7 +851,7 @@ def freeze_minimax_m3_indexer_params(model):
         logger.info("Froze %d MiniMax M3 indexer parameters.", frozen_count)
 
 
-def cast_mixed_dtype_params_to_bf16(model):
+def cast_mixed_dtype_params_to_bf16(model: nn.Module) -> None:
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
     for p in model.parameters():
         if p.dtype == torch.float32:
@@ -761,7 +861,38 @@ def cast_mixed_dtype_params_to_bf16(model):
             b.data = b.data.to(torch.bfloat16)
 
 
-def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, seqlens_padding_value=-1000):
+# The caller's own ``**attn_kwargs`` mapping is updated in place and handed back,
+# so callers keep their declared mapping type for the values this helper does not touch.
+_ThdAttnKwargsT = TypeVar("_ThdAttnKwargsT", bound=MutableMapping[str, torch.Tensor | int | float | bool | str | None])
+
+
+@overload
+def squeeze_input_for_thd(
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    attn_kwargs: _ThdAttnKwargsT,
+    seqlens_padding_value: int = -1000,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, _ThdAttnKwargsT]: ...
+
+
+@overload
+def squeeze_input_for_thd(
+    input_ids: None,
+    position_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    attn_kwargs: _ThdAttnKwargsT,
+    seqlens_padding_value: int = -1000,
+) -> tuple[None, torch.Tensor, torch.Tensor | None, _ThdAttnKwargsT]: ...
+
+
+def squeeze_input_for_thd(
+    input_ids: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    attn_kwargs: _ThdAttnKwargsT,
+    seqlens_padding_value: int = -1000,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None, _ThdAttnKwargsT]:
     """
     Squeeze batch dimension and prepare inputs for THD (total, hidden, depth) format.
 
@@ -770,10 +901,11 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     batch has already been converted to THD format (with batch_size=1 as a placeholder
     dimension) and that dimension needs to be removed.
 
-    The function performs three key operations:
+    The function performs four key operations:
     1. Removes the batch dimension (dim 0) from input tensors
     2. Filters out padding values from cumulative sequence length tensors
     3. Converts max_seqlen from tensor to scalar if needed
+    4. Resolves the microbatch's TE padding flag from its complete boundary arrays
 
     Args:
         input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
@@ -784,7 +916,8 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
             and analogous code paths), so this helper has nothing to squeeze and
             simply returns ``None`` for the ``input_ids`` slot.
         position_ids (torch.Tensor): Position IDs with shape [1, total_tokens].
-            The first dimension will be squeezed.
+            The first dimension will be squeezed. Model forwards declare it optional,
+            but THD inputs require it; ``None`` raises ``ValueError``.
         padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens].
             The first dimension will be squeezed.
         attn_kwargs (dict): Dictionary of attention-related tensors. May contain:
@@ -830,6 +963,8 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
         This function modifies attn_kwargs in-place. If you need to preserve the original
         dictionary, pass a copy.
     """
+    if position_ids is None:
+        raise ValueError("squeeze_input_for_thd requires position_ids for THD inputs")
     if input_ids is not None:
         input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)
@@ -839,16 +974,27 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
         if isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.squeeze(0)
         if key in ["cu_seqlens", "cu_seqlens_padded"]:
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"attn_kwargs[{key!r}] must be a tensor, got {type(value).__name__}")
             attn_kwargs[key] = value[value != seqlens_padding_value].contiguous()
         if key == "max_seqlen" and isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.item()
+
+    # Resolve chunked THD metadata once per model call, after removing sentinels.
+    # A single batch-wide flag cannot describe microbatches with different padding.
+    if attn_kwargs.get("cu_seqlens_padded") is not None and attn_kwargs.get("pad_between_seqs") is None:
+        cu_seqlens_padded = attn_kwargs["cu_seqlens_padded"]
+        cu_seqlens = attn_kwargs["cu_seqlens"]
+        if not (isinstance(cu_seqlens_padded, torch.Tensor) and isinstance(cu_seqlens, torch.Tensor)):
+            raise TypeError("attn_kwargs['cu_seqlens'] and ['cu_seqlens_padded'] must be tensors")
+        attn_kwargs["pad_between_seqs"] = not torch.equal(cu_seqlens_padded, cu_seqlens)
 
     return input_ids, position_ids, padding_mask, attn_kwargs
 
 
 # taken and edited from https://github.com/huggingface/transformers/blob/32a58e31463e238c967207bf73772490c353551a/src/transformers/integrations/accelerate.py#L53-L158
 @contextmanager
-def init_empty_weights():
+def init_empty_weights() -> Generator[None, None, None]:
     """
     A context manager under which models are initialized with all parameters on the specified device.
 
@@ -874,17 +1020,16 @@ def init_empty_weights():
     }
     old_register_parameter = nn.Module.register_parameter
 
-    def register_empty_parameter(module, name, param):
-        old_register_parameter(module, name, param)
-        if param is not None:
-            param_cls = type(module._parameters[name])
-            if HAVE_TORCHAO and isinstance(
-                module._parameters[name], torch_ao.float8.fsdp_utils.WeightWithDynamicFloat8CastTensor
-            ):
+    def register_empty_parameter(self: nn.Module, name: str, param: nn.Parameter | None) -> None:
+        old_register_parameter(self, name, param)
+        registered = self._parameters[name]
+        if param is not None and registered is not None:
+            param_cls = type(registered)
+            if HAVE_TORCHAO and isinstance(registered, torch_ao.float8.fsdp_utils.WeightWithDynamicFloat8CastTensor):
                 kwargs = {}
-                for k in module._parameters[name].__dict__:
+                for k in registered.__dict__:
                     if k in fp8_parameter_mapping:
-                        kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
+                        kwargs[fp8_parameter_mapping[k]] = getattr(registered, k)
                 is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             else:
                 # Standard nn.Parameter only accepts requires_grad, not arbitrary __dict__ attributes
@@ -893,12 +1038,12 @@ def init_empty_weights():
                     kwargs = {"requires_grad": param.requires_grad}
                     is_hf_initialized = None
                 else:
-                    kwargs = module._parameters[name].__dict__.copy()
+                    kwargs = registered.__dict__.copy()
                     kwargs["requires_grad"] = param.requires_grad
                     is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
-            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            self._parameters[name] = param_cls(registered.to(device), **kwargs)
             if is_hf_initialized is not None:
-                setattr(module._parameters[name], "_is_hf_initialized", is_hf_initialized)
+                setattr(self._parameters[name], "_is_hf_initialized", is_hf_initialized)
 
     try:
         nn.Module.register_parameter = register_empty_parameter

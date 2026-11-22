@@ -15,6 +15,7 @@
 from nemo_automodel.components.loss.loss import (
     LOSS_CONFIG_REGISTRY,
     ChunkedCEConfig,
+    DFlashDecayLossConfig,
     FusedLinearCEConfig,
     KDLossConfig,
     LossConfig,
@@ -28,6 +29,7 @@ from nemo_automodel.components.loss.loss import (
 __all__ = [
     "LOSS_CONFIG_REGISTRY",
     "ChunkedCEConfig",
+    "DFlashDecayLossConfig",
     "FusedLinearCEConfig",
     "KDLossConfig",
     "LossConfig",

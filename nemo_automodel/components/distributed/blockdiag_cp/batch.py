@@ -142,6 +142,8 @@ def make_cp_blockdiag_batch_and_ctx(
     # ``doc_ids``; drop the (now stale, full-length) 4D mask so the model's own
     # mask machinery does not fire on the sharded local sequence.
     batch.pop("attention_mask", None)
+    for key in ("packed_token_indices", "cu_seqlens", "max_seqlen"):
+        batch.pop(key, None)
 
     # Preserve the padding signal for MoE routing / load-balance statistics after
     # the full attention_mask is dropped (0 == padding in doc_ids). Built at the

@@ -147,7 +147,9 @@ class TestFp32SafeRotaryEmbeddings:
             torch.testing.assert_close(buf.float(), original.float())
 
     def test_vision_rotary_inv_freq_remains_fp32(self):
-        rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim=16)
+        from transformers import Qwen3VLMoeVisionConfig
+
+        rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionConfig(hidden_size=64, num_heads=2))
         originals = {
             name: buf.detach().clone()
             for name, buf in rotary.named_buffers(recurse=False)
@@ -1124,8 +1126,50 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         ms = MagicMock()
         ms._vlm_pixel_values_chunks = None
         ms._vlm_image_grid_hws_chunks = None
+        ms._vlm_pixel_values_videos_chunks = None
+        ms._vlm_video_grid_thw_chunks = None
+        ms._vlm_patch_pixel_values_chunks = None
+        ms._vlm_num_patches_chunks = None
+        ms._vlm_patch_newline_mask_chunks = None
         ms._vlm_chunk_idx = 0
         return ms
+
+    @pytest.mark.parametrize("qkv_format", ["bshd", "thd"])
+    @pytest.mark.parametrize("media_count", [1, 2])
+    @pytest.mark.parametrize("media_kind", ["image", "video", "both"])
+    def test_packed_forward_preserves_media_axes(self, qkv_format, media_count, media_kind):
+        ms = self._mock_self()
+        ms._vlm_pixel_values_videos_chunks = None
+        ms.lm_head = None
+        media = {}
+        tokens = []
+        for kind, pixels_key, token in (("image", "pixel_values", 151655), ("video", "pixel_values_videos", 151656)):
+            if media_kind in (kind, "both"):
+                media[pixels_key] = torch.randn(media_count, 12)
+                media[f"{kind}_grid_thw"] = torch.ones(media_count, 3, dtype=torch.long)
+                tokens.extend([token] * media_count)
+        tokens.append(9)
+        seq_len = len(tokens)
+        attn_kwargs = {"qkv_format": qkv_format}
+        if qkv_format == "thd":
+            attn_kwargs.update(
+                cu_seqlens=torch.tensor([[0, seq_len]], dtype=torch.int32), max_seqlen=torch.tensor(seq_len)
+            )
+
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms,
+            input_ids=torch.tensor([tokens]),
+            position_ids=torch.arange(seq_len).view(1, 1, seq_len).expand(3, 1, seq_len),
+            **attn_kwargs,
+            **media,
+        )
+
+        forwarded = ms.model.call_args.kwargs
+        for name, value in media.items():
+            torch.testing.assert_close(forwarded[name], value)
+        if qkv_format == "thd":
+            assert forwarded["input_ids"].shape == (seq_len,)
+            assert forwarded["cu_seqlens"].tolist() == [0, seq_len]
 
     def test_pp_attention_mask_dropped_on_seq_len_mismatch(self):
         ms = self._mock_self()
@@ -1249,12 +1293,12 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         assert captured["video_grid_thw"] is video_grid_chunk
         assert captured["pixel_values"] is None  # image stream untouched
 
-    def test_chunked_pixel_values_skipped_without_media_tokens(self):
+    def test_empty_chunk_advances_without_media_tokens(self):
         ms = self._mock_self()
         pixel_chunk = torch.randn(4, 3, 2, 2)
         grid_hws_chunk = torch.tensor([[2, 2]])
-        ms._vlm_pixel_values_chunks = [pixel_chunk]
-        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk]
+        ms._vlm_pixel_values_chunks = [pixel_chunk[:0]]
+        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk[:0]]
         ms._vlm_chunk_idx = 0
 
         input_ids = torch.tensor([[1, 2, 3, 4]])
@@ -1271,7 +1315,7 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
 
         Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
 
-        assert ms._vlm_chunk_idx == 0
+        assert ms._vlm_chunk_idx == 1
         assert captured["pixel_values"] is None
 
     def test_chunked_pixel_values_passthrough_when_already_3d_grid(self):

@@ -104,3 +104,7 @@ distributed:
 dist_env:
   backend: nccl
   timeout_minutes: 30
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

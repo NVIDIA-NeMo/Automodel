@@ -54,6 +54,7 @@ from transformers import AutoTokenizer
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components.checkpoint.addons import load_automodel_peft_config_dict
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -77,14 +78,8 @@ def _is_consolidated_safetensors_checkpoint(checkpoint_path: str) -> bool:
 
 def _apply_peft_to_model(model: NeMoAutoModelForCausalLM, checkpoint_path: str) -> None:
     """Re-apply the LoRA structure recorded in the checkpoint before loading adapter weights."""
-    peft_dict = {}
-    with open(os.path.join(checkpoint_path, "model", "adapter_config.json"), "r") as f:
-        restored = json.load(f)
-        peft_dict["dim"] = restored["r"]
-        peft_dict["alpha"] = restored["lora_alpha"]
-    with open(os.path.join(checkpoint_path, "model", "automodel_peft_config.json"), "r") as f:
-        peft_dict |= json.load(f)
-    apply_lora_to_linear_modules(model, PeftConfig.from_dict(peft_dict))
+    peft_config = PeftConfig(**load_automodel_peft_config_dict(os.path.join(checkpoint_path, "model")))
+    apply_lora_to_linear_modules(model, peft_config)
 
 
 def load_model(checkpoint_path: str | None, base_model_path: str | None) -> NeMoAutoModelForCausalLM:

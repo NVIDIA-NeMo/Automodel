@@ -65,6 +65,7 @@ import logging
 
 import torch
 
+from nemo_automodel.components.speculative.eagle.remote import protocol
 from nemo_automodel.components.speculative.eagle.remote.server import TargetModelServer, serve
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
 
@@ -174,7 +175,7 @@ def main(argv=None) -> None:
     builders = {"hf": _build_hf_target, "sglang": _build_sglang_target, "vllm": _build_vllm_target}
     target_wrapper = builders[args.engine](args, device, dtype)
 
-    nccl_port = args.nccl_port if args.nccl_port is not None else args.port + 100
+    nccl_port = args.nccl_port if args.nccl_port is not None else args.port + protocol.NCCL_PORT_OFFSET
     server_logic = TargetModelServer(target_wrapper, nccl_port=nccl_port, host=args.host)
     serve(server_logic, args.host, args.port)
 
