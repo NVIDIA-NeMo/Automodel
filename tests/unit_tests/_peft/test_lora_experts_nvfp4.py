@@ -139,9 +139,15 @@ def test_nvfp4_module_packs_base_weights(moe_config, device):
 
 
 def test_nvfp4_forward_backward_matches_bf16(moe_config, device):
-    """With NVFP4-representable base weights, the packed module must match the bf16 module."""
+    """With NVFP4-representable base weights, the packed module must match the bf16 module to bf16 rounding.
+
+    The packed path multiplies by a transposed view of its dequantized weight, which a CPU grouped GEMM
+    accumulates in a different order than the bf16 module's contiguous weight, so a few elements can differ
+    by about one bf16 ulp. A wrong scale or layout misses these tolerances by orders of magnitude.
+    """
     if not _grouped_mm_available(device):
         pytest.skip("torch._grouped_mm is not available on this device")
+    torch.manual_seed(0)
     orig = _materialized_experts(moe_config, device)
     _make_representable_(orig)
 
@@ -156,13 +162,14 @@ def test_nvfp4_forward_backward_matches_bf16(moe_config, device):
 
     y_ref = ref(x_ref, token_mask, weights, indices)
     y_q = q(x_q, token_mask, weights, indices)
-    torch.testing.assert_close(y_q, y_ref, atol=1e-6, rtol=1e-6)
+    # The default bf16 tolerances: rtol 1.6e-2, atol 1e-5.
+    torch.testing.assert_close(y_q, y_ref)
 
     y_ref.float().pow(2).sum().backward()
     y_q.float().pow(2).sum().backward()
-    torch.testing.assert_close(x_q.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(x_q.grad, x_ref.grad)
     for name in LORA_NAMES:
-        torch.testing.assert_close(getattr(q, name).grad, getattr(ref, name).grad, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(getattr(q, name).grad, getattr(ref, name).grad)
     assert q.gate_and_up_projs_nvfp4.grad is None and q.down_projs_nvfp4.grad is None
 
 
