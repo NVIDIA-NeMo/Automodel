@@ -27,7 +27,6 @@ from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
     TENvfp4Config,
-    compute_lm_head_logits,
     generation_config_from_model_config,
     get_is_first_microbatch,
     get_is_optim_step,
