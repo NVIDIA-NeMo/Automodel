@@ -18,6 +18,8 @@ import json
 import os
 from typing import TYPE_CHECKING
 
+from huggingface_hub import try_to_load_from_cache
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -27,6 +29,28 @@ def _write_json(path: str, contents: dict) -> None:
     with open(path, "w") as stream:
         json.dump(contents, stream, indent=2, ensure_ascii=False)
         stream.write("\n")
+
+
+def tokenizer_source_path(tokenizer: "PreTrainedTokenizerBase", original_model_path: str | None) -> str | None:
+    """Locate the snapshot the tokenizer was loaded from.
+
+    The tokenizer can come from a different snapshot than the model weights. A tokenizer without a
+    ``name_or_path`` was built in memory and takes the model snapshot.
+
+    Args:
+        tokenizer: Tokenizer being saved.
+        original_model_path: Local snapshot of the model weights, or None.
+
+    Returns:
+        The local directory holding the tokenizer's own files, or None when it is not available locally.
+    """
+    name_or_path = tokenizer.name_or_path
+    if not name_or_path:
+        return original_model_path
+    if os.path.isdir(name_or_path):
+        return name_or_path
+    cached_file = try_to_load_from_cache(name_or_path, "tokenizer.json")
+    return os.path.dirname(cached_file) if isinstance(cached_file, str) else None
 
 
 def restore_source_tokenizer_truncation_and_padding(original_model_path: str | None, save_directory: str) -> None:

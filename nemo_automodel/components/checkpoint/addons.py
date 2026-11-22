@@ -38,7 +38,10 @@ from nemo_automodel.components.moe.state_dict_mixin import (
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
-from nemo_automodel.shared.tokenizer_serialization import restore_source_tokenizer_truncation_and_padding
+from nemo_automodel.shared.tokenizer_serialization import (
+    restore_source_tokenizer_truncation_and_padding,
+    tokenizer_source_path,
+)
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -222,7 +225,9 @@ class ConsolidatedHFAddon:
                     # save_pretrained wrote them out. Models that have a metadata exporter hook, or are built
                     # around a module that has one, are left as they are, also when the hook declines: for the
                     # retrieval encoders the reference directory is not always the source snapshot.
-                    restore_source_tokenizer_truncation_and_padding(original_model_path, hf_metadata_dir)
+                    restore_source_tokenizer_truncation_and_padding(
+                        tokenizer_source_path(tokenizer, original_model_path), hf_metadata_dir
+                    )
 
             # save the fqn_to_file_index_mapping file
             with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
@@ -316,7 +321,9 @@ class PeftAddon:
                 tokenizer.save_pretrained(model_path)
                 # As in the full-model save of ConsolidatedHFAddon.
                 if not _has_metadata_exporter_hook(model_part):
-                    restore_source_tokenizer_truncation_and_padding(original_model_path, model_path)
+                    restore_source_tokenizer_truncation_and_padding(
+                        tokenizer_source_path(tokenizer, original_model_path), model_path
+                    )
             # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
             with open(os.path.join(model_path, "adapter_config.json"), "w") as f:
                 json.dump(hf_peft_config, f, indent=2, sort_keys=True)

@@ -276,6 +276,29 @@ def test_saved_tokenizer_keeps_the_state_of_the_source_snapshot(tmp_path: Path, 
 
 
 @_SAVE_SITES
+def test_saved_tokenizer_keeps_the_state_of_its_own_snapshot_not_the_model_snapshot(
+    tmp_path: Path, save: SaveFn
+) -> None:
+    """The tokenizer comes from another snapshot than the weights, as with a separate ``dataset.tokenizer``."""
+    tokenizer_snapshot, tokenizer_state = _source_snapshot_with_state(tmp_path)
+    model_snapshot = tmp_path / "model_snapshot"
+    other = _tokenizer()
+    other.backend_tokenizer.enable_truncation(max_length=3)
+    other.backend_tokenizer.enable_padding(length=3, pad_id=1)
+    other.save_pretrained(model_snapshot)
+    assert _saved_state(model_snapshot) != tokenizer_state
+    tokenizer = _tokenizer()
+    tokenizer.name_or_path = str(tokenizer_snapshot)
+    _call_like_training(tokenizer)
+    directory = tmp_path / "saved"
+    directory.mkdir()
+
+    save(tokenizer, directory, str(model_snapshot))
+
+    assert _saved_state(directory) == tokenizer_state
+
+
+@_SAVE_SITES
 def test_saved_tokenizer_gets_the_state_of_the_source_when_the_last_call_left_none(
     tmp_path: Path, save: SaveFn
 ) -> None:
