@@ -2263,6 +2263,13 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
 
     # Get config class name
     config_class_name = config.__class__.__name__
+    if config_class_name == "Mistral3Config":
+        # The Mistral3 VLM wrapper carries either an MLA + MoE text backbone
+        # (Mistral Small 4) or a dense GQA one (Ministral 3, Devstral 2 Small),
+        # which has no ``kv_lora_rank`` for ``mla_moe_flops`` to read.
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None and getattr(text_config, "kv_lora_rank", None) is None:
+            return qwen3_flops
     if config_class_name == "Step5Config":
         from nemo_automodel.components.models.step5.flops import step5_flops
 
@@ -2277,6 +2284,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "GPTJConfig": gpt3_flops,
         # Llama family
         "LlamaConfig": llama2_flops,  # Llama 1 and 2 use same formula
+        # Mistral dense (GQA + SwiGLU; head_dim may differ from hidden_size // num_heads)
+        "MistralConfig": qwen3_flops,
+        "Ministral3Config": qwen3_flops,
         # Mixtral (MoE)
         "MixtralConfig": mixtral_flops,
         # Qwen family
