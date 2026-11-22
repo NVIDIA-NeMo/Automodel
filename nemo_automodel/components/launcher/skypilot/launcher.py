@@ -42,24 +42,17 @@ def _parse_gpus_per_node(accelerators: str) -> int:
     return 1
 
 
-def _recipe_module_path(recipe_target: str, repo_root: str) -> str:
-    module_path = recipe_target.rsplit(".", 1)[0]
-    return os.path.join(repo_root, module_path.replace(".", "/") + ".py")
-
-
 class SkyPilotLauncher(Launcher):
     """Launch a recipe job on a cloud VM via SkyPilot."""
 
     def _build_command(
         self,
-        recipe_target: str,
         job_conf_path: str,
         gpus_per_node: int,
         num_nodes: int,
-        extra_args: List[str] | None = None,
+        extra_args: list[str] | None = None,
     ) -> str:
         repo_root = "~/sky_workdir"
-        script_path = _recipe_module_path(recipe_target, repo_root)
 
         parts = [
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
@@ -75,7 +68,7 @@ class SkyPilotLauncher(Launcher):
                 "--master_port=12375",
             ]
 
-        parts += [script_path, "-c", job_conf_path]
+        parts += ["-m", "nemo_automodel.cli.app", shlex.quote(job_conf_path)]
 
         if extra_args:
             # ``run`` is executed by bash, so quote each override to pass it through verbatim.
@@ -112,7 +105,6 @@ class SkyPilotLauncher(Launcher):
         num_nodes = skypilot_cfg.get("num_nodes", 1)
 
         command = self._build_command(
-            recipe_target,
             REMOTE_CONFIG_PATH,
             gpus_per_node,
             num_nodes,

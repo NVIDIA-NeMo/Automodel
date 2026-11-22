@@ -29,7 +29,7 @@ from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     optim_steps_per_epoch as _optim_steps_per_epoch,
 )
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import (
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import (
     TrainEagle3Recipe,
 )
 

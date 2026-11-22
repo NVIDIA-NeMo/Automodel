@@ -35,10 +35,9 @@ from __future__ import annotations
 
 import logging
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.speculative.dflash.jetspec_core import JetSpecTrainerModule
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
 
 logger = logging.getLogger(__name__)
 
@@ -101,15 +100,3 @@ class TrainJetSpecRecipe(TrainDFlashRecipe):
         if m is None:
             return
         logger.info("  jetspec: accept_len(tau~)=%.3f", float(m.accept_len))
-
-
-def main(config_path: str | None = None):
-    """Entrypoint for ``TrainJetSpecRecipe``."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainJetSpecRecipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()

@@ -34,8 +34,8 @@ from nemo_automodel.components.speculative.dflash.dflash2_core import (
 )
 from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
-from nemo_automodel.recipes.speculative_decoding.train_dflash2 import TrainDFlash2Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash2 import TrainDFlash2Recipe
 
 VOCAB = 64
 HIDDEN = 32
@@ -281,7 +281,11 @@ def test_run_eval_weights_selector_loss_by_candidate_hits(selector_weights, expe
     recipe.trainer_module = torch.nn.Identity()
     recipe.target_wrapper = SimpleNamespace(generate_batch=lambda **kwargs: None)
     recipe.val_dataloader = [
-        {"input_ids": torch.ones(1, 4, dtype=torch.long), "attention_mask": torch.ones(1, 4), "loss_mask": torch.ones(1, 4)}
+        {
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4),
+            "loss_mask": torch.ones(1, 4),
+        }
     ] * 3
     recipe._run_trainer_step = Mock(
         side_effect=[
@@ -341,14 +345,3 @@ def test_setup_resets_the_metrics_cache(monkeypatch):
     monkeypatch.setattr(TrainDFlashRecipe, "setup", lambda self: None)
     recipe.setup()
     assert recipe._last_dflash2_metrics is None
-
-
-def test_main_runs_setup_then_loop(monkeypatch):
-    from nemo_automodel.recipes.speculative_decoding import train_dflash2
-
-    calls = []
-    monkeypatch.setattr(train_dflash2, "parse_args_and_load_config", lambda p: SimpleNamespace())
-    monkeypatch.setattr(TrainDFlash2Recipe, "setup", lambda self: calls.append("setup"))
-    monkeypatch.setattr(TrainDFlash2Recipe, "run_train_validation_loop", lambda self: calls.append("loop"))
-    train_dflash2.main("cfg.yaml")
-    assert calls == ["setup", "loop"]

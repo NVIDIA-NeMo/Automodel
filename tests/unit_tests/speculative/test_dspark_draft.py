@@ -29,7 +29,6 @@ from nemo_automodel.components.speculative.dspark import (
 )
 
 
-
 class _Args(dict):
     """Dict that also supports attribute access.
 

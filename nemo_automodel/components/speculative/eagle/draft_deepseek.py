@@ -146,7 +146,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
 
         ``precompute_freqs_cis`` returns fp32 base frequencies, but the EAGLE-3
         training build casts the whole draft with a raw ``.to(dtype=compute_dtype)``
-        (``train_eagle3.py``), and ``nn.Module.to`` rounds floating-point buffers --
+        (``recipes/speculative_decoding/algorithms/eagle3.py``), and ``nn.Module.to`` rounds floating-point buffers --
         so ``rope_freqs`` is downcast to bf16. The rounded frequencies dephase with
         absolute position (worse with longer context, and a bf16 round-trip cannot
         be undone by a later fp32 upcast), so the draft's RoPE drifts from the fp32

@@ -30,8 +30,8 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.jetspec_core import JetSpecTrainerModule
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
-from nemo_automodel.recipes.speculative_decoding.train_jetspec import TrainJetSpecRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.jetspec import TrainJetSpecRecipe
 
 VOCAB = 64
 HIDDEN = 32
@@ -151,17 +151,6 @@ def test_run_trainer_step_passes_target_logits():
     assert seen["input_ids"] is target_batch.input_ids
     assert seen["hidden_states"] is target_batch.hidden_states
     assert seen["loss_mask"] is target_batch.loss_mask
-
-
-def test_main_runs_setup_then_loop(monkeypatch):
-    from nemo_automodel.recipes.speculative_decoding import train_jetspec
-
-    calls = []
-    monkeypatch.setattr(train_jetspec, "parse_args_and_load_config", lambda p: SimpleNamespace())
-    monkeypatch.setattr(TrainJetSpecRecipe, "setup", lambda self: calls.append("setup"))
-    monkeypatch.setattr(TrainJetSpecRecipe, "run_train_validation_loop", lambda self: calls.append("loop"))
-    train_jetspec.main("cfg.yaml")
-    assert calls == ["setup", "loop"]
 
 
 def test_build_trainer_module_rejects_loss_type():

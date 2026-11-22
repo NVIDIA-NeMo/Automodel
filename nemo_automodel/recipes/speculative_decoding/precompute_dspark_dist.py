@@ -19,7 +19,7 @@ so very large targets (DeepSeek-V4-Flash, GLM-5.2) that do not fit on a single
 8x80GB node cannot be precomputed with it. This entry point loads such a target
 frozen through the same expert-parallel / FSDP distributed path the training recipe
 uses (the routed experts shard across ranks), runs it once over the dataset, and
-writes the same on-disk DSpark cache that ``train_dspark`` consumes through
+writes the same on-disk DSpark cache that ``TrainDSparkRecipe`` consumes through
 ``recipe_args.cached_target_path`` -- with no live target during draft training.
 
 It is config-driven (it reuses a training-style YAML: the ``distributed`` block that

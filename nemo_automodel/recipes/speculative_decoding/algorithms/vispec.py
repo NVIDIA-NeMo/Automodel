@@ -42,7 +42,6 @@ from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import load_hf_safetensors_state_dict
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
 from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
@@ -64,7 +63,7 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     raise_if_peft_configured,
     raise_if_target_not_materialized,
 )
-from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle import TrainEagle1Recipe
 
 logger = logging.getLogger(__name__)
 
@@ -509,32 +508,3 @@ class TrainVispecStage1Recipe(TrainEagle1Recipe):
         self.trainer_module = trainer_module
 
         self._finalize_setup(recipe_cfg=recipe_cfg, target_path=target_path, wandb_name_prefix="vispec_stage1_")
-
-
-def main(config_path: str | None = None):
-    """Entrypoint for the ViSpec stage selected by the recipe config.
-
-    Args:
-        config_path: Optional default YAML path. The command-line ``--config``
-            argument overrides this value.
-
-    Raises:
-        ValueError: If ``recipe`` is not a supported ViSpec recipe name.
-    """
-    cfg = parse_args_and_load_config(config_path)
-    recipe_name = cfg.get("recipe", "TrainVispecRecipe")
-    if recipe_name == "TrainVispecStage1Recipe":
-        recipe_cls = TrainVispecStage1Recipe
-    elif recipe_name == "TrainVispecRecipe":
-        recipe_cls = TrainVispecRecipe
-    else:
-        raise ValueError(
-            f"Unsupported ViSpec recipe {recipe_name!r}; expected 'TrainVispecStage1Recipe' or 'TrainVispecRecipe'."
-        )
-    trainer = recipe_cls(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()
