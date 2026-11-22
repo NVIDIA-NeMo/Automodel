@@ -23,11 +23,13 @@ call and never earlier, which is the contract the CI import walker checks.
 Two unrelated kinds of patch live here, and they must not be confused:
 
 * ``_patch_fmax`` changes **numerical behaviour** -- it rebinds a scalar helper so the CuTe DSL
-  4.6.2 binding is used instead of one that only exists under an older CUDA flavour.
+  binding (4.6.2 and later) is used instead of one that only exists under an older CUDA flavour.
 * ``_patch_jit_gencode`` changes **build behaviour** only -- it drops a device target the local
   nvcc cannot parse. It never touches what the compiled kernels compute.
 
-Both are removed once the pinned MSA revision carries the fix upstream.
+Both are removed once the pinned MSA revision carries the fix upstream. ``kernels()`` also calls
+``restore_quack_sub_packed_f32x2``: the pinned revision calls ``quack.activation.sub_packed_f32x2``,
+which quack-kernels 0.6.5 removed in favour of the identical ``cutlass.cute.arch.sub_packed_f32x2``.
 """
 
 import os
@@ -42,11 +44,12 @@ from typing import Any
 
 from nemo_automodel.components.models.minimax_m3_vl.kernels import MSA_KERNEL_IMPORT_ERROR
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import, safe_import_from
+from nemo_automodel.shared.quack_patches import restore_quack_sub_packed_f32x2
 
 _MSA_IMPORT_ERROR = (
     "BackendConfig.sparse_attn='msa' requires the fixed fmha-sm100 optional dependency. "
     "Install the project with uv sync --extra msa on a CUDA SM100 system; the MSA revision "
-    "must be compatible with nvidia-cutlass-dsl==4.6.2."
+    "must be compatible with nvidia-cutlass-dsl==4.8.0."
 )
 _BACKWARD_MODULE = "nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_sm100"
 
@@ -92,6 +95,7 @@ def kernels() -> MSAKernels:
         raise UnavailableError(MSA_KERNEL_IMPORT_ERROR)
     _patch_fmax(sparse)
     _patch_jit_gencode(jit)
+    restore_quack_sub_packed_f32x2()
     return MSAKernels(build_k2q_csr, sparse_atten_func, fmha_sm100, fmha_sm100_plan, run_backward)
 
 
@@ -108,7 +112,7 @@ def _patch_fmax(sparse_module: ModuleType) -> None:
     def fmax(
         a: float | utils.Float32, b: float | utils.Float32, c: float | utils.Float32 | None = None, *, loc=None, ip=None
     ) -> utils.Float32:
-        """Emit the two- or three-input scalar fp32 maximum using the 4.6.2 binding."""
+        """Emit the two- or three-input scalar fp32 maximum using the DSL's (4.6.2 and later) binding."""
         return utils.Float32(
             utils.nvvm.fmax(
                 utils.Float32(a).ir_value(loc=loc, ip=ip),

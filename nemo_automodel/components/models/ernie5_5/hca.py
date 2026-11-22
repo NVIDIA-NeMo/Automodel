@@ -25,15 +25,19 @@ Provenance: the operation order follows the ERNIE 5.5 HCA of Megatron-Bridge (Ap
 ``a38833622b88969564fe8bfa053c5e4e4989c6cd``:
 https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/a38833622b88969564fe8bfa053c5e4e4989c6cd/src/megatron/bridge/models/ernie/modeling_ernie55/hca_attention.py
 
-Supported inputs are one document per row starting at position zero, an
-explicit causal sliding-window mask, the eager attention backend and the torch
-rotary backend. Packed rows, context parallelism, a KV cache and the sparse
-attention kernels raise an error.
+Two kinds of input are supported, both with the torch rotary backend. A row
+that holds one document starting at position zero runs the eager attention under
+an explicit causal sliding-window mask. A packed row, or one rank's shard of it
+under context parallelism, runs sparse attention over the window keys and the
+complete compressed keys of each query's document; neighbouring ranks exchange
+the window keys at the shard boundary and all ranks share the compressed keys. A
+KV cache raises an error.
 """
 
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -45,7 +49,9 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _apply_partial_rope,
     eager_attention_with_sink,
 )
-from nemo_automodel.components.models.ernie5_5.layers import DENSE_ATTENTION_BACKENDS, virtual_head_mix
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
+from nemo_automodel.components.models.deepseek_v41.cp import gather_window
+from nemo_automodel.components.models.ernie5_5.layers import DENSE_ATTENTION_BACKENDS, shard_start, virtual_head_mix
 
 _HCA_COMPRESS_RATIO = 128
 
@@ -142,18 +148,19 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
         Args:
             config: DeepSeek V4 config describing the attention dimensions.
             layer_idx: Index into ``config.compress_ratios``; that entry must be 128.
-            backend: Backend selection. ``attn`` must be ``"eager"``, ``"torch"`` or
-                ``"sdpa"``; all three run DeepSeek V4's eager sink attention in PyTorch,
-                and no scaled-dot-product or sparse kernel is called. None selects
+            backend: Backend selection. ``attn`` selects the sparse attention of packed
+                rows: ``"cudnn"`` runs the cuDNN kernels, and ``"eager"``, ``"torch"`` and
+                ``"sdpa"`` run the PyTorch reference. A row that holds one document runs
+                DeepSeek V4's eager sink attention with every value. None selects
                 ``"eager"``. The Triton rotary kernel is rejected.
             vha_rank: Rank of the virtual-head mixing factors.
 
         Raises:
             ValueError: If the layer's compression ratio is not 128 or ``vha_rank``
                 is not positive.
-            NotImplementedError: If ``backend.attn`` is not one of the three dense
-                names, or the backend or config selects the Triton rotary kernel or the
-                fused query-norm rotation.
+            NotImplementedError: If ``backend.attn`` is neither ``"cudnn"`` nor one of
+                the three dense names, or the backend or config selects the Triton rotary
+                kernel or the fused query-norm rotation.
         """
         ratios = config.compress_ratios
         if not ratios or ratios[layer_idx] != _HCA_COMPRESS_RATIO:
@@ -164,10 +171,10 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
         if vha_rank <= 0:
             raise ValueError(f"vha_rank must be positive; got {vha_rank}")
         backend = backend or BackendConfig(attn="eager")
-        if backend.attn not in DENSE_ATTENTION_BACKENDS:
+        if backend.attn != "cudnn" and backend.attn not in DENSE_ATTENTION_BACKENDS:
             raise NotImplementedError(
-                f"ERNIE HCA supports only the dense attention backends {DENSE_ATTENTION_BACKENDS}, "
-                f"which run the eager PyTorch path; got attn={backend.attn!r}"
+                f"ERNIE HCA supports attn='cudnn' and the dense attention backends {DENSE_ATTENTION_BACKENDS}; "
+                f"got attn={backend.attn!r}"
             )
         if backend.rope == "triton":
             raise NotImplementedError("ERNIE HCA does not support the Triton rotary kernel (rope='triton')")
@@ -176,6 +183,7 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
         super().__init__(config, layer_idx, backend)
         self.vha = Ernie5_5HCAVirtualHeads(config.num_attention_heads, vha_rank)
         self.gate_proj = nn.Linear(config.q_lora_rank, config.o_groups * config.o_lora_rank, bias=False)
+        self.cp_group: dist.ProcessGroup | None = None
         nn.init.normal_(self.vha_postmix_U, std=0.02)
 
     @property
@@ -189,16 +197,12 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
         return self.vha.vha_postmix_V
 
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
-        """Reject context parallelism, which the inherited hook would otherwise enable.
+        """Record the context-parallel group whose ranks hold consecutive shards of a row.
 
         Args:
             cp_mesh: Context-parallel device mesh offered by the parallelizer.
-
-        Raises:
-            NotImplementedError: Always.
         """
-        del cp_mesh
-        raise NotImplementedError("ERNIE HCA does not support context parallelism")
+        self.cp_group = cp_mesh.get_group()
 
     def _validate_inputs(
         self,
@@ -222,8 +226,8 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
 
         Raises:
             ValueError: If the mask is missing or misshaped.
-            NotImplementedError: For packed rows, a nonzero start position, explicit
-                position ids or a context-parallel group.
+            NotImplementedError: For a nonzero start position, explicit position ids
+                or a context-parallel group.
             TypeError: For any other keyword argument.
         """
         batch, sequence = hidden_states.shape[:2]
@@ -246,8 +250,6 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
                 f"ERNIE HCA requires an explicit 4D additive attention mask of shape {expected}; "
                 f"got {tuple(attention_mask.shape)}"
             )
-        if extra.get("packed_seq_ids") is not None:
-            raise NotImplementedError("Packed ERNIE HCA inputs are not supported")
         if start_pos != 0:
             raise NotImplementedError(f"Nonzero ERNIE HCA start positions are not supported; got {start_pos}")
         if attention_mask.shape[1] not in (1, self.num_heads):
@@ -258,8 +260,8 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
             raise NotImplementedError(
                 "ERNIE HCA derives positions from the row offsets; explicit position_ids are not supported"
             )
-        if extra.get("_dsv4_cp_group") is not None:
-            raise NotImplementedError("ERNIE HCA does not support context parallelism")
+        if extra.get("_dsv4_cp_group") is not None or self.cp_group is not None:
+            raise NotImplementedError("ERNIE HCA supports context parallelism for rows with packed_seq_ids only")
         unexpected = sorted(set(extra) - {"packed_seq_ids", "_dsv4_cp_group"})
         if unexpected:
             raise TypeError(f"Unexpected ERNIE HCA forward arguments: {unexpected}")
@@ -278,40 +280,53 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run windowed attention over local and compressed keys, then mix heads and gate.
 
-        The caller is responsible for the mask contents: a causal mask limited to
-        the sliding window. Only its shape and dtype kind are checked.
+        Without ``packed_seq_ids`` every row is one document starting at position
+        zero, and the caller is responsible for the mask contents: a causal mask
+        limited to the sliding window. Only its shape and dtype kind are checked.
+        With ``packed_seq_ids`` the row is packed and takes no mask; see
+        ``_attend_packed``.
 
         Args:
-            hidden_states: Tensor of shape [batch, sequence, hidden]; each row is one
-                document starting at position zero.
+            hidden_states: Tensor of shape [batch, sequence, hidden]. With context
+                parallelism, ``sequence`` is this rank's shard of a packed row.
             position_embeddings: Main-rope cosine and sine, each of shape
                 [batch, sequence, rotary_channels]. Unused: a ratio-128 layer rotates
                 with the compress tables. Kept for the parent's signature.
-            attention_mask: Required additive mask of shape
-                [batch, 1 or heads, sequence, sequence] over the uncompressed keys.
+            attention_mask: Additive mask of shape
+                [batch, 1 or heads, sequence, sequence] over the uncompressed keys;
+                required for an unpacked row and None for a packed one.
             position_embeddings_compress: Required compress-rope cosine and sine, each
-                of shape [batch, sequence, rotary_channels], for positions
-                ``0..sequence-1``.
+                of shape [batch, sequence, rotary_channels], for the position of every
+                token in its document.
             rotary_compress: Required rotary module for the compressed keys.
             start_pos: First query position; must be zero.
-            position_ids: Must be None.
-            **kwargs: ``packed_seq_ids`` and ``_dsv4_cp_group`` are accepted only as
-                None; any other name raises.
+            position_ids: Integer tensor of shape [batch, sequence] with the position
+                of every token in its document; required for a packed row and None
+                for an unpacked one.
+            **kwargs: ``packed_seq_ids``, an integer tensor of shape [batch, sequence]
+                with the document of every token, selects the packed path.
+                ``_dsv4_cp_group`` is accepted only as None; any other name raises.
 
         Returns:
             Output of shape [batch, sequence, hidden], and the attention
             probabilities of shape [batch, heads, sequence, sequence + pooled], where
             pooled is the number of compressed keys. The probabilities have the
-            activation dtype.
+            activation dtype. A packed row returns None in their place.
 
         Raises:
-            ValueError: If ``position_embeddings_compress`` or ``rotary_compress`` is None. Every other rejected
-                input raises in ``_validate_inputs``: ``ValueError`` for a missing or misshaped mask,
-                ``NotImplementedError`` for packed rows, a nonzero start position, explicit position ids or a
-                context-parallel group, and ``TypeError`` for any other keyword argument.
+            ValueError: If ``position_embeddings_compress`` or ``rotary_compress`` is None, or a packed row comes
+                with a mask, without ``position_ids``, with a nonzero start position or with another keyword
+                argument. Every other rejected input of an unpacked row raises in ``_validate_inputs``:
+                ``ValueError`` for a missing or misshaped mask, ``NotImplementedError`` for a nonzero start
+                position, explicit position ids or a context-parallel group, and ``TypeError`` for any other
+                keyword argument.
         """
         del position_embeddings
-        attention_mask = self._validate_inputs(hidden_states, attention_mask, start_pos, position_ids, kwargs)
+        packed_seq_ids = kwargs.get("packed_seq_ids")
+        if packed_seq_ids is None:
+            attention_mask = self._validate_inputs(hidden_states, attention_mask, start_pos, position_ids, kwargs)
+        elif attention_mask is not None or position_ids is None or start_pos != 0 or len(kwargs) != 1:
+            raise ValueError("A packed ERNIE HCA row takes position_ids and packed_seq_ids, and no attention mask")
         if position_embeddings_compress is None or rotary_compress is None:
             raise ValueError("ERNIE HCA requires position_embeddings_compress and rotary_compress")
         batch, sequence = hidden_states.shape[:2]
@@ -321,6 +336,18 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
         query = self._project_query(q_residual, cos, sin)
         keys = self.kv_norm(self.wkv(hidden_states)).view(batch, sequence, 1, self.head_dim).transpose(1, 2)
         keys = _apply_partial_rope(keys, cos, sin, self.rope_head_dim, backend=self.backend.rope)
+        if packed_seq_ids is not None:
+            attended = self._attend_packed(
+                hidden_states,
+                q_residual,
+                query,
+                keys.squeeze(1),
+                position_embeddings_compress,
+                rotary_compress,
+                position_ids,
+                packed_seq_ids,
+            )
+            return self._project_output(attended, q_residual, cos, sin), None
 
         pooled_keys, _, _, _ = self.compressor(
             hidden_states,
@@ -350,16 +377,100 @@ class Ernie5_5HCAAttention(DeepseekV4Attention):
             dropout=self.attention_dropout if self.training else 0.0,
             scaling=self.scaling,
         )
+        return self._project_output(attended, q_residual, cos, sin), probabilities
+
+    def _attend_packed(
+        self,
+        hidden_states: torch.Tensor,
+        q_residual: torch.Tensor,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor],
+        rotary: nn.Module,
+        position_ids: torch.Tensor,
+        packed_seq_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend every query to the window keys and the complete compressed keys of its own document.
+
+        Every document starts at a row offset that is a multiple of the compression ratio, and so does every
+        context-parallel shard, so each compressed key pools the tokens of one document. A rank receives the last
+        ``sliding_window - 1`` keys of the preceding rank and the compressed keys of all ranks.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            q_residual: Query latent of shape [batch, sequence, q_lora_rank].
+            query: Rotated query of shape [batch, heads, sequence, head_dim].
+            keys: Rotated keys of shape [batch, sequence, head_dim].
+            rope: Compress-rope cosine and sine, each of shape [batch, sequence, rotary_channels].
+            rotary: Rotary module for the compressed keys.
+            position_ids: Integer tensor of shape [batch, sequence] with the position of every token in its
+                document.
+            packed_seq_ids: Integer tensor of shape [batch, sequence] with the document of every token, counted
+                from one along the row; zero marks padding.
+
+        Returns:
+            Attention output of shape [batch, sequence, heads, head_dim].
+        """
+        sequence = position_ids.shape[1]
+        keys, first_key = gather_window(keys, self.cp_group, window_size=self.sliding_window)
+        pooled, _, pooled_documents, pooled_windows = self.compressor(
+            hidden_states,
+            q_residual=q_residual,
+            rotary=rotary,
+            position_embeddings=rope,
+            cache=DeepseekV4TrainCache(),
+            layer_idx=self.layer_idx,
+            start_pos=0,
+            position_ids=position_ids,
+            packed_seq_ids=packed_seq_ids,
+            cp_group=self.cp_group,
+        )
+        offsets = shard_start(self.cp_group, sequence) + torch.arange(sequence, device=keys.device)
+        real = packed_seq_ids > 0
+        # A padding token attends to itself only, so every query has a key.
+        first = torch.where(real, torch.maximum(offsets - self.sliding_window + 1, offsets - position_ids), offsets)
+        window = first.unsqueeze(-1) + torch.arange(self.sliding_window, device=keys.device)
+        window = torch.where(window <= offsets.view(1, -1, 1), window - first_key, -1)
+        visible = (
+            real.unsqueeze(-1)
+            & (packed_seq_ids.unsqueeze(-1) == pooled_documents.unsqueeze(1))
+            & (pooled_windows.unsqueeze(1) < ((position_ids + 1) // self.compress_ratio).unsqueeze(-1))
+        )
+        compressed = torch.where(visible, torch.arange(pooled.shape[2], device=keys.device) + keys.shape[1], -1)
+        return dsv4_sparse_attention(
+            query.transpose(1, 2).contiguous(),
+            torch.cat((keys, pooled.squeeze(1)), dim=1),
+            self.sinks_param(query),
+            torch.cat((window, compressed), dim=-1),
+            self.scaling,
+            backend="cudnn" if self.backend.attn == "cudnn" else "torch",
+            all_rows_nonempty=True,
+        )
+
+    def _project_output(
+        self, attended: torch.Tensor, q_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        """Undo the key rotation, mix the heads and apply the gated grouped output projection.
+
+        Args:
+            attended: Attention output of shape [batch, sequence, heads, head_dim].
+            q_residual: Query latent of shape [batch, sequence, q_lora_rank].
+            cos: Compress-rope cosine of shape [batch, sequence, rotary_channels].
+            sin: Compress-rope sine of shape [batch, sequence, rotary_channels].
+
+        Returns:
+            Output of shape [batch, sequence, hidden].
+        """
+        batch, sequence = attended.shape[:2]
         # The values carry the key rotation; undo it on the output.
         attended = _apply_partial_rope(
             attended.transpose(1, 2), cos, -sin, self.rope_head_dim, backend=self.backend.rope
         ).transpose(1, 2)
-
         attended = self.vha(attended)
         grouped = attended.reshape(batch, sequence, -1).view(batch, sequence, self.config.o_groups, -1)
         projected = self.wo_a(grouped).flatten(2)
         gated = projected * torch.sigmoid(self.gate_proj(q_residual))
-        return self.wo_b(gated), probabilities
+        return self.wo_b(gated)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         """Initialize inherited and ERNIE parameters after meta materialization.
