@@ -316,6 +316,9 @@ def reference_logits(
                 update = update + mlp(y, p + "shared_experts.")
             x = x + update
     x = rms(x, state["norm.weight"], c.rms_norm_eps)
-    # The head accumulates and writes FP32 logits from its operands, then softcaps them.
-    logits = F.linear(x.float(), state["output.weight"].float())
+    # The head writes FP32 logits from its operands, but its backward GEMMs run in the weight dtype: the forward
+    # value is the FP32 projection exactly (plus zero), and the gradient flows through the weight-dtype one.
+    projected = F.linear(x, state["output.weight"]).float()
+    exact = F.linear(x.float(), state["output.weight"].float()).detach()
+    logits = exact + (projected - projected.detach())
     return c.final_logit_softcapping * torch.tanh(logits / c.final_logit_softcapping)
