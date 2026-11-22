@@ -61,6 +61,32 @@ def test_lm_head_takes_logits_dtype() -> None:
     assert type(model.lm_head) is LMHead and model.lm_head.logits_dtype == torch.float32
 
 
+def test_vocabulary_resize_keeps_the_logits_dtype() -> None:
+    model = Qwen2ForCausalLM(_config(), backend=resolve_bagel_backend(), logits_dtype=torch.float32)
+
+    model.resize_token_embeddings(40)
+
+    assert type(model.lm_head) is LMHead and model.lm_head.logits_dtype == torch.float32
+    assert model.lm_head.weight.shape == (40, 64)
+
+
+def test_hf_backbone_builder_passes_logits_dtype(tmp_path) -> None:
+    from nemo_automodel.components.models.bagel.hf_backbone_loader import build_bagel_from_hf_backbones
+
+    config = _config()
+    config.pad_token_id = 0  # within the tiny vocabulary
+    config.save_pretrained(tmp_path)
+    model = build_bagel_from_hf_backbones(
+        model_cfg={"llm_path": str(tmp_path), "visual_und": False, "logits_dtype": "float32"},
+        stage=1,
+        vae_config=None,
+        meta_init=True,
+        load_backbone_weights=False,
+    )
+
+    assert model.get_output_embeddings().logits_dtype == torch.float32
+
+
 def test_te_qk_norm_keeps_explicit_fp32_inference_path() -> None:
     class _UnexpectedTENorm(nn.Module):
         def __init__(self) -> None:

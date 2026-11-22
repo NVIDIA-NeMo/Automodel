@@ -24,7 +24,8 @@ Architecture (from tencent/Hy-MT2-30B-A3B config.json):
   - 256K context, rope_theta=11158840
   - dense intermediate_size=6912, moe_intermediate_size=expert_hidden_dim=768
   - vocab_size=120832
-  - enable_lm_head_fp32 = True (HF reference upcasts lm_head to fp32)
+  - enable_lm_head_fp32 = True (HF reference upcasts lm_head to fp32), so
+    ``logits_dtype`` defaults to FP32
 
 Notes vs. ``components/models/hy_v3`` (Hy3-preview 295B):
   - Smaller everywhere (48L / 128 experts / 32+4 heads / hidden=2048).
@@ -233,7 +234,9 @@ class HyMT2Model(nn.Module):
                 pipeline stages pass hidden states of shape [batch, sequence, hidden] or [1, tokens, hidden].
             position_ids: Optional positions of shape [batch, sequence]; packed input requires them, as
                 [1, tokens].
-            attention_mask: Optional padding or attention mask for unpacked input; packed input ignores it.
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding, or,
+                with SDPA and an explicit padding_mask, a dense mask of shape [batch, 1, sequence, sequence];
+                packed input ignores it.
             padding_mask: Optional bool mask of shape [batch, sequence] or [1, tokens], true at padding.
             **attn_kwargs: Backend metadata. Packed input sets ``qkv_format="thd"`` and passes int32
                 ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
@@ -357,6 +360,8 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         self.model = HyMT2Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
+        # The Hugging Face reference upcasts the head when the config enables it, so FP32 logits are the default.
+        logits_dtype = logits_dtype or (torch.float32 if config.enable_lm_head_fp32 else None)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=torch.bfloat16, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = HyMT2StateDictAdapter(
@@ -389,26 +394,33 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
-        """Forward pass returning :class:`CausalLMOutputWithPast`.
+        """Run the decoder and project the kept positions to vocabulary logits.
 
         Args:
-            input_ids: Token IDs. BSHD: ``[B, S]``; THD: ``[1, T]`` (squeezed internally).
-            position_ids: Optional position indices.
-            attention_mask: Optional 2D padding mask.
-            padding_mask: Optional padding mask used by the THD squeeze helper.
-            logits_to_keep: If 0 (default) compute logits for all positions; if > 0
-                only compute logits for the last ``logits_to_keep`` positions
-                (avoids materialising the full logit matrix during generation /
-                enables fused-linear cross-entropy in training).
-            output_hidden_states: Whether to return the final hidden states (the
-                input to ``lm_head``) on the output. Defaults to the config flag.
-            **attn_kwargs: Additional attention kwargs forwarded to the base model
-                (e.g. qkv_format, cu_seqlens, CP kwargs).
+            input_ids: Token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens], which the
+                decoder squeezes to [tokens]. Later pipeline stages pass hidden states of shape
+                [batch, sequence, hidden] or [1, tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence], or [1, tokens] for packed input, which
+                requires them.
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding, or,
+                with SDPA and an explicit padding_mask, a dense mask of shape [batch, 1, sequence, sequence];
+                packed input ignores it.
+            padding_mask: Optional bool Tensor of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; when None, the MoE layers derive it from attention_mask.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            output_hidden_states: Whether the output carries the final hidden states; None reads
+                ``config.output_hidden_states``.
+            **attn_kwargs: Backend metadata for the decoder. Packed input sets ``qkv_format="thd"`` and passes
+                int32 ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``.
 
         Returns:
-            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
-            ``logits`` and, when ``output_hidden_states`` is set, the final
-            ``hidden_states``.
+            CausalLMOutputWithPast whose ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] for packed
+            input, in the head's ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may
+            lower; on a pipeline stage without the head, ``logits`` holds the hidden states instead.
+            ``hidden_states``, when requested, are the final hidden states of shape [batch, sequence, hidden], or
+            [1, tokens, hidden] for packed input.
         """
         output_hidden_states = (
             output_hidden_states

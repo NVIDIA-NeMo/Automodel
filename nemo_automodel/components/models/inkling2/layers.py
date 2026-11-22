@@ -204,10 +204,23 @@ class Inkling2MoE(MoE):
 class Inkling2LMHead(LMHead):
     """Bias-free FP32 output projection that owns the logit softcap and padded-vocabulary mask."""
 
-    def __init__(self, config: Inkling2TextConfig, dtype: torch.dtype, logits_dtype: torch.dtype | None) -> None:
-        """Create the [vocab, hidden] head with ``config``'s softcap and usable vocabulary."""
-        super().__init__(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
-        self.logit_softcapping, self.unpadded_vocab_size = config.final_logit_softcapping, config.unpadded_vocab_size
+    def __init__(self, config: Inkling2TextConfig, *, dtype: torch.dtype, logits_dtype: torch.dtype) -> None:
+        """Create the [vocab, hidden] head with ``config``'s softcap and usable vocabulary.
+
+        Args:
+            config: Text configuration with the hidden and vocabulary sizes, the logit softcap and the usable
+                (unpadded) vocabulary size.
+            dtype: Dtype of the weight.
+            logits_dtype: Dtype of the logits; the projection, softcap and mask run in FP32 before the cast.
+        """
+        super().__init__(
+            config.hidden_size,
+            config.vocab_size,
+            dtype=dtype,
+            logits_dtype=logits_dtype,
+            logit_softcapping=config.final_logit_softcapping,
+        )
+        self.unpadded_vocab_size = config.unpadded_vocab_size
 
     def project(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         """Project FP32 copies of the hidden states with a supplied vocabulary weight.
@@ -218,9 +231,8 @@ class Inkling2LMHead(LMHead):
                 chunked loss gathered. A column-parallel DTensor uses Shard(0), with input replicated on its mesh.
 
         Returns:
-            Logits of shape [..., vocab] in ``logits_dtype`` (FP32 copies of the operands give FP32 logits when it
-            is unset), with the head's softcap applied and negative infinity in the padded vocabulary rows from
-            ``unpadded_vocab_size`` on. Inputs are not mutated.
+            Logits of shape [..., vocab] in ``logits_dtype``, with the head's softcap applied and negative infinity
+            in the padded vocabulary rows from ``unpadded_vocab_size`` on. Inputs are not mutated.
         """
         logits = super().project(input.float(), weight.float())
         padded = torch.arange(logits.shape[-1], device=logits.device) >= self.unpadded_vocab_size

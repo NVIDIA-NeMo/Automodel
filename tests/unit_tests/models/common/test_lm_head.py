@@ -95,6 +95,17 @@ def test_head_uses_the_fp32_kernel_only_to_widen_and_keeps_packed_positions(logi
         calls = 0
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            """Count the FP32-logits projections and run every operator unchanged.
+
+            Args:
+                func: Operator being dispatched.
+                types: Tensor subclasses taking part in the call; unused.
+                args: Operator arguments; tensors of any shape, passed through unchanged.
+                kwargs: Operator keyword arguments, or None.
+
+            Returns:
+                The operator's outputs, unaltered.
+            """
             if func is torch.ops.nemo_automodel.fp32_logits.default:
                 self.calls += 1
             return func(*args, **(kwargs or {}))
@@ -179,6 +190,17 @@ def test_fp32_head_backward_keeps_fp32_under_autocast():
 
     for actual_grad, expected_grad in zip(actual, expected):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float16])
+def test_softcapped_logits_are_rounded_once(logits_dtype):
+    hidden, weight, _ = _operands("cpu")
+    head = LMHead(weight.shape[1], weight.shape[0], logits_dtype=logits_dtype, logit_softcapping=30.0)
+
+    logits = head.project(hidden, weight)
+
+    fp32_logits = LMHead.linear(hidden, weight, logits_dtype=torch.float32)
+    torch.testing.assert_close(logits, (30.0 * torch.tanh(fp32_logits / 30.0)).to(logits_dtype), rtol=0, atol=0)
 
 
 def test_bias_is_added_in_fp32_and_receives_its_gradient():

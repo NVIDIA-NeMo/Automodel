@@ -316,5 +316,6 @@ def reference_logits(
                 update = update + mlp(y, p + "shared_experts.")
             x = x + update
     x = rms(x, state["norm.weight"], c.rms_norm_eps)
-    logits = F.linear(x, state["output.weight"]).float()
+    # The head accumulates and writes FP32 logits from its operands, then softcaps them.
+    logits = F.linear(x.float(), state["output.weight"].float())
     return c.final_logit_softcapping * torch.tanh(logits / c.final_logit_softcapping)

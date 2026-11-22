@@ -1298,7 +1298,48 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast | torch.Tensor:
-        """Run text or VLM forward with TE-local packed media placement."""
+        """Run the text or vision-language forward and project the kept positions to vocabulary logits.
+
+        Packed (THD) input requires the TE backend and ``cu_seqlens``; each TE shard splices only its own media
+        feature rows.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens] or
+                [tokens]. Later pipeline stages pass hidden states of shape [batch, sequence, hidden] or
+                [1, tokens, hidden].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or [1, tokens, hidden] when
+                packed, used instead of input_ids.
+            position_ids: Optional positions of shape [batch, sequence], or [1, tokens] when packed; None numbers
+                positions 0 to sequence - 1, across the whole pack for packed input.
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding.
+                Without TE it may instead be a bool or additive mask of shape [batch, 1, sequence, sequence], or a
+                dict of such masks keyed ``full_attention`` and ``sliding_attention``. Packed input ignores it.
+            padding_mask: Optional bool Tensor of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; when None, it is derived from a Tensor attention_mask.
+            pixel_values: Optional flattened image patches of shape [patches, patch_features].
+            image_grid_thw: Optional int grid of shape [images, 3] holding each image's (t, h, w) patch counts, or
+                [images, 2] holding (h, w).
+            pixel_values_videos: Optional flattened video patches of shape [patches, patch_features].
+            video_grid_thw: Optional int grid of shape [videos, 3] holding each video's (t, h, w) patch counts.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            output_hidden_states: Whether the output carries the final hidden states; None reads
+                ``config.output_hidden_states``.
+            **kwargs: Backend metadata for the decoder: ``qkv_format``, int32 ``cu_seqlens`` and
+                ``cu_seqlens_padded`` of shape [1, documents + 1] or [documents + 1], padded with -1000,
+                ``max_seqlen``, ``cp_size`` and ``cp_rank``, plus the private media and local-token maps that
+                MiMo's context-parallel sharder adds, which this method consumes.
+
+        Returns:
+            With ``_pp_return_hidden_states`` set, the hidden states Tensor of shape [batch, sequence, hidden], or
+            [1, tokens, hidden] when packed. On a pipeline stage without the head, a CausalLMOutputWithPast whose
+            ``logits``, and ``hidden_states`` when requested, hold those hidden states. Otherwise a
+            CausalLMOutputWithPast whose ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] when
+            packed, in the head's ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may
+            lower; ``hidden_states``, when requested, are the final hidden states of shape
+            [batch, sequence, hidden], or [tokens, hidden] for packed input, matching the flattened [tokens]
+            labels of fused cross-entropy.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

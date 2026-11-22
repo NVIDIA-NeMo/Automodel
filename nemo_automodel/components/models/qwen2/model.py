@@ -404,8 +404,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 ``max_seqlen``, ``cp_size``, and ``cp_rank``.
 
         Returns:
-            Decoder output with final states ``[B, S, H]`` or packed local
-            states ``[T, H]`` and requested hidden-state tensors in that layout.
+            Decoder output whose final states are ``[B, S, H]``, or ``[1, T, H]``
+            for packed THD input. Requested hidden states hold each layer's input
+            and then the final states; for packed input all but the final states
+            are ``[T, H]``.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -629,12 +631,12 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         """Run causal LM projection for BSHD or packed THD inputs.
 
         Args:
-            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[T]``.
+            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[1, T]`` (or ``[T]``).
             attention_mask: Optional padded mask. THD uses ``cu_seqlens``.
-            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
+            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[1, T]`` (or ``[T]``).
             past_key_values: Optional BSHD KV cache; unsupported for THD.
-            inputs_embeds: Optional hidden inputs ``[B, S, H]`` or ``[T, H]``.
-            labels: Optional labels ``[B, S]`` or packed ``[T]``.
+            inputs_embeds: Optional hidden inputs ``[B, S, H]`` or packed ``[1, T, H]`` (or ``[T, H]``).
+            labels: Optional labels ``[B, S]`` or packed ``[1, T]`` (or ``[T]``), passed to the loss unchanged.
             use_cache: Whether to update the BSHD KV cache.
             output_attentions: Whether to request attention outputs.
             output_hidden_states: Whether to return per-layer hidden states.
@@ -646,8 +648,8 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
                 ``cp_size`` and ``cp_rank``.
 
         Returns:
-            Causal LM output with BSHD logits ``[B, S, V]``. Packed local
-            logits are restored to ``[1, T, V]``.
+            Causal LM output with logits ``[B, S, V]``, or ``[1, T, V]`` for
+            packed THD input, and hidden states as the decoder returns them.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (

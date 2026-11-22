@@ -553,7 +553,9 @@ class MuseGlimmerModel(MuseGlimmerPreTrainedModel):
 
         Args:
             input_ids: Token IDs of shape [batch, sequence], or packed [1, tokens].
-            attention_mask: Optional padding mask for unpacked input; packed input ignores it.
+            attention_mask: Optional Tensor of shape [batch, sequence] ([batch, past + sequence] with a cache), 1 at
+                valid tokens and 0 at padding, or, with SDPA or eager attention, a dense mask of shape
+                [batch, 1, sequence, past + sequence]; packed input and context parallelism ignore it.
             position_ids: Optional positions of shape [batch, sequence], or packed [1, tokens].
             past_key_values: Optional generation cache; packed input disables it.
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or packed [1, tokens, hidden].
@@ -746,10 +748,12 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         cls,
         config: MuseGlimmerConfig,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> "MuseGlimmerForConditionalGeneration":
         del kwargs
-        return cls(config, backend=backend)
+        return cls(config, backend=backend, logits_dtype=logits_dtype)
 
     def __init__(
         self,
@@ -904,6 +908,45 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Run the vision-language decoder and project the kept positions to scaled vocabulary logits.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens],
+                which the decoder squeezes to [tokens]; give exactly one of input_ids and inputs_embeds.
+            attention_mask: Optional Tensor of shape [batch, sequence] ([batch, past + sequence] with a cache), 1 at
+                valid tokens and 0 at padding, or, with SDPA or eager attention, a dense mask of shape
+                [batch, 1, sequence, past + sequence]; packed input and context parallelism ignore it.
+            position_ids: Optional positions of shape [batch, sequence], or [1, tokens] for packed input, which
+                requires them.
+            past_key_values: Optional generation ``Cache``; packed input does not support one.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or packed [1, tokens, hidden].
+            labels: Optional target IDs of shape [batch, sequence] for the shifted next-token cross-entropy on the
+                returned logits, which ignores -100.
+            use_cache: Whether to return the cache; None caches in eval mode only, and packed input never caches.
+            output_attentions: Ignored; no attention weights are returned.
+            output_hidden_states: Passed to the decoder; the output carries the final hidden states regardless.
+            return_dict: Whether to return ``CausalLMOutputWithPast`` instead of a tuple.
+            cache_position: Optional cache positions of shape [sequence].
+            pixel_values: Optional flattened image patches of shape [patches, patch_features].
+            image_grid_thw: Optional int grid of shape [images, 3] holding each image's (t, h, w) patch counts.
+            pixel_values_videos: Optional flattened video patches of shape [patches, patch_features].
+            video_grid_thw: Optional int grid of shape [videos, 3] holding each video's (t, h, w) patch counts.
+            vision_mask: Optional bool mask of shape [batch, sequence], true at media tokens.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            **kwargs: Backend metadata for the decoder. Packed input sets ``qkv_format="thd"`` and passes
+                ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``. A ``padding_mask`` here is ignored.
+
+        Returns:
+            CausalLMOutputWithPast, or its tuple when ``return_dict`` is False. ``logits`` have shape
+            [batch, kept, vocab], or [1, kept, vocab] for packed input, in the head's ``logits_dtype`` when set and
+            otherwise in its weight dtype, which autocast may lower; they are scaled by ``config.output_multiplier``
+            and soft-capped when ``config.output_soft_cap_temp`` is set, and without a head (``lm_head`` is None)
+            the same applies to the hidden states held there instead. ``loss`` is a scalar when labels are given
+            and ``past_key_values`` is the cache when caching. ``hidden_states`` is always set: the final hidden
+            states times ``config.output_multiplier``, of shape [batch, sequence, hidden] or [1, tokens, hidden].
+        """
         del output_attentions
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else not self.training

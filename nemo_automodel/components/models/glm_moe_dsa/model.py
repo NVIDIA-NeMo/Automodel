@@ -490,7 +490,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             is_first: Whether this module is the first pipeline stage.
             microbatch_size: Number of sequences in the pipeline microbatch.
             seq_len: Sequence or packed-token length represented by the metadata.
-            dtype: Hidden-state and logits dtype.
+            dtype: Hidden-state dtype; also the logits dtype when the head's logits_dtype is unset.
 
         Returns:
             Pair of input and output metadata tuples. Optimized THD stages use hidden-state

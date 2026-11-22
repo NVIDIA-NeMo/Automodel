@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as HFQwen3_5ForCausalLM
@@ -24,6 +25,7 @@ from nemo_automodel.components.models.qwen3_5.model import (
     Qwen3_5ForConditionalGeneration,
     build_mtp_config_from_hf,
 )
+from tests.unit_tests.models.passthrough_layers import passthrough_layers
 
 
 def _tiny_config(**kwargs):
@@ -237,3 +239,32 @@ class TestQwen3_5VLMMTPModel:
         assert len(out.mtp_per_depth_h) == 1
         assert out.mtp_per_depth_h[0].shape == (1, 5, cfg.text_config.hidden_size)
         assert out.mtp_loss_scaling_factor == 0.2
+
+    def test_vlm_packed_forward_keeps_a_batch_axis(self):
+        cfg = _tiny_vlm_config()
+        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend())
+        tokens = 6
+        # Two packed documents of 3 tokens; M-RoPE positions are [axes, batch, tokens].
+        positions = torch.arange(3).repeat(2).expand(3, 1, tokens)
+
+        with passthrough_layers(model.model.language_model.layers.values()) as layer_inputs:
+            out = model(
+                input_ids=torch.randint(1, 50, (1, tokens)),
+                position_ids=positions,
+                qkv_format="thd",
+                cu_seqlens=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+                max_seqlen=torch.tensor([3]),
+            )
+
+        assert layer_inputs == [(tokens, cfg.text_config.hidden_size)] * cfg.text_config.num_hidden_layers
+        assert out.logits.shape == (1, tokens, cfg.text_config.vocab_size)
+
+    @pytest.mark.parametrize("logits_dtype", [None, torch.float32])
+    def test_vlm_stage_metas_declare_the_head_logits_dtype(self, logits_dtype):
+        model = Qwen3_5ForConditionalGeneration(_tiny_vlm_config(), backend=_backend(), logits_dtype=logits_dtype)
+
+        _, outputs = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=6, dtype=torch.bfloat16
+        )
+
+        assert [output.dtype for output in outputs] == [logits_dtype or torch.bfloat16]

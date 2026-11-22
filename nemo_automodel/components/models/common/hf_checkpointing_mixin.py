@@ -83,6 +83,8 @@ class HFCheckpointingMixin:
         new_lm_head = super()._get_resized_lm_head(old_lm_head, new_num_tokens, transposed, mean_resizing)
         if new_lm_head is old_lm_head or not isinstance(old_lm_head, LMHead):
             return new_lm_head
+        # Transformers reads the returned head's requires_grad to restore the old one's, so keep it here.
+        new_lm_head.requires_grad_(old_lm_head.weight.requires_grad)
         old_lm_head.weight, old_lm_head.bias = new_lm_head.weight, new_lm_head.bias
         old_lm_head.out_features = new_lm_head.out_features
         return old_lm_head

@@ -104,6 +104,21 @@ class TestSkipInitWeightsOnLoad:
 # --------------------------------------------------------------------------- #
 # __init__ side effects                                                       #
 # --------------------------------------------------------------------------- #
+def test_set_output_embeddings_keeps_the_logits_dtype():
+    """A plain nn.Linear, as a vocabulary resize builds, is wrapped in an LMHead with the current logits dtype."""
+    from nemo_automodel.components.models.common.lm_head import LMHead
+
+    model = Mistral3FP8VLMForConditionalGeneration.__new__(Mistral3FP8VLMForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.lm_head = LMHead(4, 8, logits_dtype=torch.float32)
+    resized = nn.Linear(4, 10, bias=False)
+
+    model.set_output_embeddings(resized)
+
+    assert type(model.lm_head) is LMHead and model.lm_head.logits_dtype == torch.float32
+    assert model.lm_head.weight is resized.weight
+
+
 def _make_dummy_init_super():
     """Returns a no-op replacement for HF's heavy __init__ that records the call."""
     captured = {}

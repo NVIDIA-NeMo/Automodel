@@ -18,6 +18,7 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import (
@@ -296,7 +297,9 @@ class Mistral4Model(nn.Module):
                 or packed [tokens, hidden] from a caller that already squeezed packed input.
             position_ids: Optional positions of shape [batch, sequence]; packed input requires them, as
                 [1, tokens].
-            attention_mask: Optional padding or attention mask for unpacked input; packed input ignores it.
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding, or,
+                with SDPA and an explicit padding_mask, a dense mask of shape [batch, 1, sequence, sequence];
+                packed input ignores it.
             padding_mask: Optional bool mask of shape [batch, sequence] or [1, tokens], true at padding.
             **attn_kwargs: Backend metadata. Packed input sets ``qkv_format="thd"`` and passes int32
                 ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
@@ -417,7 +420,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def __init__(
         self,
-        config: Mistral4Config,
+        config: Mistral4Config | Mistral3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
@@ -468,6 +471,34 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Run the decoder and project the kept positions to vocabulary logits.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens], which the
+                decoder squeezes to [tokens]. Later pipeline stages pass hidden states of shape
+                [batch, sequence, hidden] or [1, tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence], or [1, tokens] for packed input, which
+                requires them. They also set the Llama 4 query scaling when the config enables it.
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding, or,
+                with SDPA and an explicit padding_mask, a dense mask of shape [batch, 1, sequence, sequence];
+                packed input ignores it.
+            padding_mask: Optional bool Tensor of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; when None, the MoE layers derive it from attention_mask.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            output_hidden_states: Whether the output carries the final hidden states; None reads
+                ``config.output_hidden_states``.
+            **attn_kwargs: Backend metadata for the decoder. Packed input sets ``qkv_format="thd"`` and passes
+                int32 ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``.
+
+        Returns:
+            CausalLMOutputWithPast whose ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] for packed
+            input, in the head's ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may
+            lower; on a pipeline stage without the head, ``logits`` holds the hidden states instead.
+            ``hidden_states``, when requested, are the final hidden states of shape [batch, sequence, hidden], or
+            [1, tokens, hidden] for packed input.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -528,7 +559,6 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 # =============================================================================
 
 try:
-    from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
     from transformers.models.mistral3.modeling_mistral3 import (  # noqa: F401
         Mistral3ForConditionalGeneration as HFMistral3ForConditionalGeneration,
     )

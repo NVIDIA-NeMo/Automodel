@@ -15,6 +15,7 @@
 """Run a causal LM with identity decoder layers, to test packed (THD) plumbing without TE kernels."""
 
 import contextlib
+from collections.abc import Iterable, Iterator
 from typing import Any
 from unittest.mock import patch
 
@@ -22,16 +23,15 @@ import torch
 from torch import nn
 
 
-def run_with_passthrough_layers(model: nn.Module, *args: Any, **kwargs: Any) -> tuple[Any, list[tuple[int, ...]]]:
-    """Call ``model`` with every layer of its decoder returning its input.
+@contextlib.contextmanager
+def passthrough_layers(layers: Iterable[nn.Module]) -> Iterator[list[tuple[int, ...]]]:
+    """Make every one of ``layers`` return its input while the context is open.
 
     Args:
-        model: Causal LM whose decoder ``model.model`` keeps its layers in the ``layers`` ModuleDict.
-        *args: Positional arguments of the model's forward.
-        **kwargs: Keyword arguments of the model's forward.
+        layers: Decoder layers whose first argument, or keyword ``x``, holds their hidden states.
 
-    Returns:
-        The model's output, and the shape of the hidden states each layer received, in call order.
+    Yields:
+        The shape of the hidden states each layer received, in call order, filled in as the layers run.
     """
     shapes: list[tuple[int, ...]] = []
 
@@ -51,6 +51,21 @@ def run_with_passthrough_layers(model: nn.Module, *args: Any, **kwargs: Any) -> 
         return hidden
 
     with contextlib.ExitStack() as stack:
-        for layer in model.model.layers.values():
+        for layer in layers:
             stack.enter_context(patch.object(layer, "forward", side_effect=passthrough))
+        yield shapes
+
+
+def run_with_passthrough_layers(model: nn.Module, *args: Any, **kwargs: Any) -> tuple[Any, list[tuple[int, ...]]]:
+    """Call ``model`` with every layer of its decoder returning its input.
+
+    Args:
+        model: Causal LM whose decoder ``model.model`` keeps its layers in the ``layers`` ModuleDict.
+        *args: Positional arguments of the model's forward.
+        **kwargs: Keyword arguments of the model's forward.
+
+    Returns:
+        The model's output, and the shape of the hidden states each layer received, in call order.
+    """
+    with passthrough_layers(model.model.layers.values()) as shapes:
         return model(*args, **kwargs), shapes

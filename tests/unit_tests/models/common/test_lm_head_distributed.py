@@ -18,8 +18,8 @@ Each case compares FP32 logits, input and weight gradients, and the parameters a
 one SGD step against an unsharded single-process reference that runs the same head.
 Tensor-parallel input gradients are summed from per-rank BF16 partials, so they are
 compared with the BF16 ``nn.Linear`` head under the same layout, bit for bit.
-Tensor parallelism also covers a vocabulary the mesh does not divide evenly and weight
-layouts that DTensor must redistribute.
+Tensor parallelism also covers a vocabulary the mesh does not divide evenly, and input
+and weight layouts that must be redistributed, such as an input sharded on the sequence.
 """
 
 import os
@@ -134,8 +134,8 @@ def _check_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, upstream:
         torch.testing.assert_close(grads[True], grads[False], rtol=0, atol=0, msg=name)
 
 
-def _check_weight_layouts(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
-    """Check FP32 logits and input gradients for each weight layout, which DTensor redistributes as needed.
+def _check_layouts(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
+    """Check FP32 logits and input gradients for each input and weight layout, which are redistributed as needed.
 
     Args:
         hidden: BF16 tensor of shape [batch, sequence, hidden], identical on every rank.
@@ -147,17 +147,22 @@ def _check_weight_layouts(hidden: torch.Tensor, weight: torch.Tensor, upstream: 
     reference_hidden = hidden.clone().requires_grad_()
     reference_logits = LMHead.linear(reference_hidden, weight, logits_dtype=torch.float32)
     reference_logits.backward(upstream)
+    # Each is (mesh, input placements, weight placements).
     layouts = {
-        "vocabulary-sharded": (mesh, [Shard(0)]),
-        "replicated": (mesh, [Replicate()]),
-        "hidden-sharded": (mesh, [Shard(1)]),
-        "2-D mesh": (mesh_2d, [Replicate(), Shard(0)]),
+        "vocabulary-sharded": (mesh, [Replicate()], [Shard(0)]),
+        "replicated": (mesh, [Replicate()], [Replicate()]),
+        "hidden-sharded": (mesh, [Replicate()], [Shard(1)]),
+        "2-D mesh": (mesh_2d, [Replicate(), Replicate()], [Replicate(), Shard(0)]),
+        "batch-sharded input": (mesh, [Shard(0)], [Replicate()]),
+        "sequence-sharded input": (mesh, [Shard(1)], [Replicate()]),
     }
-    for name, (layout_mesh, placements) in layouts.items():
+    for name, (layout_mesh, input_placements, weight_placements) in layouts.items():
         local_hidden = hidden.clone().requires_grad_()
         replicated_hidden = DTensor.from_local(local_hidden, layout_mesh, [Replicate()] * layout_mesh.ndim)
-        sharded_weight = distribute_tensor(weight, layout_mesh, placements)
-        logits = LMHead.linear(replicated_hidden, sharded_weight, logits_dtype=torch.float32)
+        sharded_weight = distribute_tensor(weight, layout_mesh, weight_placements)
+        logits = LMHead.linear(
+            replicated_hidden.redistribute(placements=input_placements), sharded_weight, logits_dtype=torch.float32
+        )
         assert logits.dtype == torch.float32, name
         torch.testing.assert_close(logits.full_tensor(), reference_logits, rtol=1e-6, atol=1e-6, msg=name)
         logits.full_tensor().backward(upstream)
@@ -333,7 +338,7 @@ def _worker(rank: int, port: int) -> None:
         uneven_upstream = torch.randn(2, 8, _VOCAB + 1, generator=generator).bfloat16().float()
         _check_tensor_parallel(hidden, weight.bfloat16(), upstream)
         _check_tensor_parallel(hidden, uneven_weight.bfloat16(), uneven_upstream)
-        _check_weight_layouts(hidden, weight.bfloat16(), upstream)
+        _check_layouts(hidden, weight.bfloat16(), upstream)
         _check_biased_tensor_parallel(hidden, weight.bfloat16(), upstream)
         _check_gemma4_tied_tensor_parallel(hidden, weight.bfloat16())
         _check_fsdp(weight, input_ids, labels)

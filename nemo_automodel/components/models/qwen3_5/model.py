@@ -683,9 +683,10 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         """Decode text tokens with model-forward-owned packed GDN metadata.
 
         Args:
-            input_ids: Optional token IDs of shape [batch, sequence].
+            input_ids: Optional token IDs of shape [batch, sequence], or packed
+                (THD) IDs of shape [tokens] after the multimodal wrapper squeezes them.
             inputs_embeds: Optional token embeddings of shape [batch, sequence,
-                hidden].
+                hidden], or packed [tokens, hidden].
             attention_mask: Optional validity, indexed document, or backend mask
                 of shape [batch, sequence] or [batch, 1, sequence, sequence].
             position_ids: Optional positions of shape [batch, sequence] or
@@ -709,7 +710,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
-            hidden].
+            hidden], or [1, tokens, hidden] for packed input.
         """
         del output_hidden_states  # accepted for HF-forward compatibility; ignored
         for key in ("cu_seqlens", "max_seqlen"):
@@ -790,6 +791,8 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=None)
 
     def get_input_embeddings(self) -> nn.Module:

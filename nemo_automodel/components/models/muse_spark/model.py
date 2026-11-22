@@ -310,11 +310,13 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         config: MuseSpark1xOmniConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> "MuseSpark1xOmniForCausalLM":
         """Construct the native model from a resolved checkpoint config."""
         del kwargs
-        return cls(config, moe_config=moe_config, backend=backend)
+        return cls(config, moe_config=moe_config, backend=backend, logits_dtype=logits_dtype)
 
     def __init__(
         self,

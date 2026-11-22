@@ -77,15 +77,18 @@ def test_from_config_installs_an_fp32_logits_head(config_cls, tied):
     assert model.lm_head.weight.dtype == torch.bfloat16
 
     input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
-    logits = model(input_ids=input_ids).logits
-    hidden = model(input_ids=input_ids, output_hidden_states=True).hidden_states[-1]
+    output = model(input_ids=input_ids, output_hidden_states=True)
+    logits, hidden = output.logits, output.hidden_states[-1]
     reference = hidden.double() @ model.lm_head.weight.double().t()
     assert logits.dtype == torch.float32
     torch.testing.assert_close(logits.double(), reference, rtol=0, atol=1e-5)
     assert (logits == logits.bfloat16().float()).float().mean() < 0.01
 
-    logits.sum().backward()
-    assert model.lm_head.weight.grad is not None and torch.isfinite(model.lm_head.weight.grad).all()
+    upstream = torch.randn(logits.shape, generator=torch.Generator().manual_seed(2))
+    (hidden_grad,) = torch.autograd.grad(logits, hidden, upstream)
+    # The backward rounds the gradient to the BF16 weight dtype; a scaled or permuted gradient is far off.
+    expected = upstream.double() @ model.lm_head.weight.double()
+    assert (hidden_grad.double() - expected).norm() <= 1e-2 * expected.norm()
 
 
 @pytest.mark.parametrize("tied", [False, True])
@@ -113,14 +116,17 @@ def test_checkpoint_loads_into_the_fp32_logits_head(tmp_path, tied):
     torch.testing.assert_close(output.logits.double(), reference, rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("frozen", [False, True])
 @pytest.mark.parametrize("tied", [False, True])
-def test_vocabulary_resize_keeps_the_fp32_logits_head(tied):
+def test_vocabulary_resize_keeps_the_fp32_logits_head(tied, frozen):
     # Transformers builds a plain nn.Linear for a resized untied head; the LMHead takes its parameters instead.
     model = _build(_config(Qwen3Config, tied=tied), logits_dtype="float32")
+    model.lm_head.requires_grad_(not frozen)
 
     model.resize_token_embeddings(_VOCAB + 1)
 
     assert _is_fp32_logits_head(model.lm_head)
+    assert model.lm_head.weight.requires_grad is not frozen
     assert model.lm_head.weight.shape == (_VOCAB + 1, 32)
     assert (model.lm_head.weight is model.get_input_embeddings().weight) is tied
     input_ids = torch.randint(0, _VOCAB + 1, (2, 6), generator=torch.Generator().manual_seed(1))
@@ -183,6 +189,15 @@ def test_hugging_face_models_ignore_logits_dtype_with_a_warning(config, caplog):
     assert type(model.get_output_embeddings()) is nn.Linear
     input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
     assert model(input_ids=input_ids).logits.dtype == torch.bfloat16
+
+
+def test_a_repo_model_without_logits_dtype_rejects_it():
+    # The loader passes logits_dtype past its constructor-argument filter, so the model's own signature decides.
+    config = _config(LlamaConfig, tied=False)
+    config.architectures = ["LlamaBidirectionalModel"]
+
+    with pytest.raises(TypeError, match="logits_dtype"):
+        _build(config, logits_dtype="float32")
 
 
 def test_any_logits_dtype_is_applied():

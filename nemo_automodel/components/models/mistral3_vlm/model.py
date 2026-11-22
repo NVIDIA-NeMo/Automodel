@@ -190,6 +190,18 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 sub._mistral3_fp8_rotary_reinit_done = False
                 sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
 
+    def set_output_embeddings(self, new_embeddings: torch.nn.Module) -> None:
+        """Install the output head; a plain ``nn.Linear``, as a vocabulary resize builds, keeps the logits dtype.
+
+        Args:
+            new_embeddings: Output head with weight of shape [vocab, hidden].
+        """
+        self.lm_head = (
+            new_embeddings
+            if isinstance(new_embeddings, LMHead)
+            else LMHead.from_linear(new_embeddings, logits_dtype=self.lm_head.logits_dtype)
+        )
+
     def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the active text embedding when requested."""
         if getattr(getattr(self, "config", None), "tie_word_embeddings", False):

@@ -372,6 +372,10 @@ def test_fp32_projection_reproduces_the_fp32_logits_head(chunk_len):
     )
     bf16_projection = ChunkedCrossEntropy(chunk_len, compile=False)(hidden, labels, model.lm_head.weight)
     assert (actual.double() - reference).abs() * 10 < (bf16_projection.double() - reference).abs()
+    # A backward that projected in BF16 would put the input gradient as far off as the control's.
+    (bf16_hidden_grad,) = torch.autograd.grad(bf16_projection, (hidden,))
+    hidden_error = (actual_grads[0].float() - expected_grads[0].float()).norm()
+    assert hidden_error * 10 < (bf16_hidden_grad.float() - expected_grads[0].float()).norm()
 
 
 def test_compiled_chunks_keep_the_fp32_projection():
@@ -400,6 +404,23 @@ def test_compiled_chunks_keep_the_fp32_projection():
     assert (results[True][0].double() - reference).abs() * 10 < (bf16_projection.double() - reference).abs()
 
 
+def test_compiled_chunks_round_a_softcapped_head_once():
+    from nemo_automodel.components.models.common.lm_head import LMHead
+
+    torch.manual_seed(72)
+    weight = (torch.randn(53, 24) * 0.1).bfloat16()
+    hidden = torch.randn(2, 9, 24, dtype=torch.bfloat16)
+    labels = torch.randint(53, (2, 9))
+    head = LMHead(24, 53, logits_dtype=torch.bfloat16, logit_softcapping=2.0, device="meta")
+    fp32_logits = LMHead.linear(hidden, weight, logits_dtype=torch.float32)
+    once = (2.0 * torch.tanh(fp32_logits / 2.0)).bfloat16()
+    expected = F.cross_entropy(once.float().flatten(0, 1), labels.flatten(), reduction="sum")
+
+    for use_compile in (False, True):
+        loss = ChunkedCrossEntropy(4, compile=use_compile)(hidden, labels, weight, lm_head=head)
+        torch.testing.assert_close(loss, expected, msg=f"compile={use_compile}")
+
+
 def test_validate_lm_head_accepts_plain_and_fp32_logits_heads():
     from nemo_automodel.components.models.common.lm_head import LMHead
 
@@ -409,11 +430,22 @@ def test_validate_lm_head_accepts_plain_and_fp32_logits_heads():
 
             Args:
                 input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+            Returns:
+                Tensor of shape [..., vocab], twice the plain projection.
             """
             return 2 * super().forward(input)
 
     class InputOnlyHead(LMHead):
         def forward(self, input: torch.Tensor) -> torch.Tensor:
+            """Project like an LMHead through an overridden forward, which chunks cannot see.
+
+            Args:
+                input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+            Returns:
+                Tensor of shape [..., vocab].
+            """
             return super().forward(input)
 
     plain = torch.nn.Linear(4, 8, bias=False)

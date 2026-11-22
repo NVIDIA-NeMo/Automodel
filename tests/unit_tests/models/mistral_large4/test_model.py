@@ -27,6 +27,7 @@ from torch.nn import functional as F
 from nemo_automodel._transformers.model_capabilities import query_capabilities
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.mistral_large4.attention import MistralLarge4Indexer, SequenceLayout
 from nemo_automodel.components.models.mistral_large4.config import ConfigValue
@@ -191,7 +192,7 @@ def test_softcap_all_positions_tail_and_empty_supervision() -> None:
         model.lm_head.weight.mul_(1000)
     ids = torch.tensor([[1, 3, 8, 4]])
     out = model(ids, output_hidden_states=True, labels=ids)
-    raw = model.lm_head(out.hidden_states).float()
+    raw = LMHead.linear(out.hidden_states, model.lm_head.weight, logits_dtype=torch.float32)
     expected = 30 * torch.tanh(raw / 30)
     assert raw.abs().max() > 30 and out.logits.abs().max() <= 30
     torch.testing.assert_close(out.logits, expected)
@@ -204,19 +205,21 @@ def test_softcap_all_positions_tail_and_empty_supervision() -> None:
     assert torch.count_nonzero(model.lm_head.weight.grad) == 0
 
 
-@pytest.mark.parametrize("logits_dtype", [None, torch.bfloat16, torch.float32])
-def test_softcapped_logits_leave_in_the_requested_dtype(logits_dtype: torch.dtype | None) -> None:
-    """The softcap runs in FP32; the logits leave in the head's logits_dtype, FP32 by default."""
+@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
+def test_softcapped_logits_are_rounded_once(logits_dtype: torch.dtype) -> None:
+    """The head softcaps its FP32 logits, then rounds them once to its logits_dtype (FP32 by default)."""
     model = make_model()
+    assert model.lm_head.logits_dtype == torch.float32  # the default
     model.lm_head.logits_dtype = logits_dtype
     ids = torch.tensor([[1, 5, 7, 2]])
 
-    logits = model(ids).logits
+    output = model(ids, output_hidden_states=True)
 
-    assert logits.dtype == (logits_dtype or torch.float32)
     cap = model.config.final_logit_softcapping
-    expected = cap * torch.tanh(model.lm_head(model(ids, output_hidden_states=True).hidden_states).float() / cap)
-    torch.testing.assert_close(logits.float(), expected.to(logits.dtype).float(), atol=0, rtol=0)
+    fp32_logits = LMHead.linear(output.hidden_states, model.lm_head.weight, logits_dtype=torch.float32)
+    expected = (cap * torch.tanh(fp32_logits / cap)).to(logits_dtype)
+    assert output.logits.dtype == logits_dtype
+    torch.testing.assert_close(output.logits, expected, atol=0, rtol=0)
 
 
 def test_reject_unsupported_training_paths() -> None:
@@ -266,8 +269,8 @@ def test_existing_loss_guard_and_padding_mask() -> None:
     from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 
     model = make_model()
-    with pytest.raises(ValueError, match="softcapping"):
-        ChunkedCrossEntropy.validate_lm_head(model.lm_head, model_config=model.config)
+    # The head applies the softcap, so chunked CE, which projects through it, supports this model.
+    ChunkedCrossEntropy.validate_lm_head(model.lm_head, model_config=model.config)
     ids = torch.tensor([[0, 1, 3, 8, 0]])
     padding = torch.tensor([[True, False, False, False, True]])
     expected = model(ids, attention_mask=(~padding).long()).logits

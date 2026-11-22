@@ -1376,8 +1376,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
+            # The head keeps FP32 weights, so its logits are FP32 unless logits_dtype says otherwise.
             output_meta = meta((microbatch_size, seq_len, self.config.vocab_size)).to(
-                self.lm_head.logits_dtype or dtype
+                self.lm_head.logits_dtype or torch.float32
             )
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)

@@ -740,9 +740,10 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         """Decode text tokens with model-forward-owned packed GDN metadata.
 
         Args:
-            input_ids: Optional token IDs of shape [batch, sequence].
+            input_ids: Optional token IDs of shape [batch, sequence], or packed
+                (THD) IDs of shape [tokens] after the multimodal wrapper squeezes them.
             inputs_embeds: Optional token embeddings of shape [batch, sequence,
-                hidden].
+                hidden], or packed [tokens, hidden].
             attention_mask: Optional validity, indexed document, or backend mask
                 of shape [batch, sequence] or [batch, 1, sequence, sequence].
             position_ids: Optional positions of shape [batch, sequence] or
@@ -1697,8 +1698,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             ``[batch, sequence, vocab]`` (or ``[batch, sequence, hidden]`` on a
             non-final pipeline stage), whose requested hidden states have shape
             ``[batch, sequence, hidden]``, and whose optional MTP tensors each
-            have shape ``[batch, sequence, hidden]``. Under CP, ``sequence`` is
-            the local padded shard.
+            have shape ``[batch, sequence, hidden]``. Packed (THD) input keeps a
+            batch axis of one, except for the MTP tensors, which are packed
+            ``[tokens, hidden]``. Under CP, ``sequence`` is the local padded shard.
         """
         # Resolve from the text/decoder sub-config for this VL model.
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config

@@ -335,8 +335,9 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
 
         Returns:
             Input/output meta tuples: global int64 IDs [B,S] on stage zero,
-            local residuals [B,S/cp,H] between stages, and FP32 logits [B,S/cp,V]
-            or FP32 hidden states [B,S/cp,H] for a linear fused loss.
+            local residuals [B,S/cp,H] between stages, and logits [B,S/cp,V] in the
+            head's logits_dtype (FP32 by default) or FP32 hidden states [B,S/cp,H] for
+            a linear fused loss.
         """
         residual_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}.get(self.config.residual_dtype, dtype)
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
@@ -348,7 +349,10 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         final = self.lm_head is not None
         logits = final and not getattr(self, "_pp_return_hidden_states", False)
         width = self.vocab_size if logits else self.config.hidden_size
-        out_dtype = self.lm_head.logits_dtype if logits else (torch.float32 if final else residual_dtype)
+        # The head's weight is FP32, so unset logits_dtype gives FP32 logits.
+        out_dtype = (
+            (self.lm_head.logits_dtype or torch.float32) if logits else (torch.float32 if final else residual_dtype)
+        )
         outputs = (torch.empty(microbatch_size, local_length, width, dtype=out_dtype, device="meta"),)
         return inputs, outputs
 

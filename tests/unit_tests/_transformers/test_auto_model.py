@@ -1061,20 +1061,19 @@ class TestGetCheckpointTensorDtypes:
 class TestFilterKwargsForInit:
     """Test cases for _filter_kwargs_for_init function."""
 
-    def test_filter_kwargs_for_init_removes_unknown_kwargs(self):
-        """Filters out kwargs not in model __init__ signature."""
+    def test_filter_kwargs_for_init_removes_unknown_kwargs(self, caplog):
+        """Filters out kwargs not in model __init__ signature, with a warning that names them."""
 
         class ModelWithSpecificInit:
             def __init__(self, config, a, b):
                 pass
 
         kwargs = {"a": 1, "b": 2, "c": 3, "d": 4}
-        result = _filter_kwargs_for_init(ModelWithSpecificInit, kwargs)
+        with caplog.at_level(logging.WARNING):
+            result = _filter_kwargs_for_init(ModelWithSpecificInit, kwargs)
 
-        assert "a" in result
-        assert "b" in result
-        assert "c" not in result
-        assert "d" not in result
+        assert result == {"a": 1, "b": 2}
+        assert "ModelWithSpecificInit does not take c, d; ignoring them." in caplog.text
 
     def test_filter_kwargs_for_init_keeps_all_with_var_keyword(self):
         """If __init__ has **kwargs, returns all kwargs unchanged."""

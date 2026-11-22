@@ -14,7 +14,7 @@ from nemo_automodel.components.distributed.pipelining.functional import (
     calculate_virtual_stages,
     generate_hf_model_fqn_per_model_part,
 )
-from tests.unit_tests.models.muse_spark.conftest import tiny_muse_spark_model
+from tests.unit_tests.models.muse_spark.conftest import tiny_backend, tiny_muse_spark_config, tiny_muse_spark_model
 
 
 class _EchoTextModel(nn.Module):
@@ -33,6 +33,15 @@ class _EchoTextModel(nn.Module):
         del kwargs
         hidden = inputs_embeds.unsqueeze(0) if inputs_embeds.dim() == 2 else inputs_embeds
         return SimpleNamespace(last_hidden_state=hidden)
+
+
+def test_from_config_takes_logits_dtype() -> None:
+    from nemo_automodel.components.models.muse_spark.model import MuseSpark1xOmniForCausalLM
+
+    model = MuseSpark1xOmniForCausalLM.from_config(
+        tiny_muse_spark_config(), backend=tiny_backend(), logits_dtype=torch.bfloat16
+    )
+    assert model.lm_head.logits_dtype == torch.bfloat16
 
 
 def test_tiny_text_forward_backward_is_finite() -> None:

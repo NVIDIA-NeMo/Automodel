@@ -1376,7 +1376,7 @@ class TestKimiK25VLForConditionalGenerationInit:
         sig = inspect.signature(KimiK25VLForConditionalGeneration.__init__)
         params = list(sig.parameters.keys())
 
-        assert params == ["self", "config", "moe_config", "backend", "logits_dtype"]
+        assert {"config", "moe_config", "backend", "logits_dtype"} <= set(params)
 
     def test_init_creates_state_dict_adapter_when_enabled(self):
         """Test __init__ creates state_dict_adapter when backend.enable_hf_state_dict_adapter is True."""

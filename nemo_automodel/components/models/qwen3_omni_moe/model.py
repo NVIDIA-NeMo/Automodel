@@ -144,19 +144,18 @@ class Qwen3OmniMoeThinkerTextModel(
             position_ids: Optional positions of shape [batch, sequence] or [axes, batch, sequence], with 3
                 multimodal rotary axes (a 4th leading axis is dropped); packed input passes the thinker's
                 squeezed positions.
-            attention_mask: Optional padding or attention mask for unpacked input.
-            padding_mask: Optional bool mask with the token layout of input_ids, true at padding.
+            attention_mask: Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding; the decoder
+                derives the MoE padding mask from it.
+            padding_mask: Ignored; the MoE padding mask is derived from attention_mask.
+            visual_pos_masks: Optional bool mask of shape [batch, sequence, 1], true at visual placeholder tokens;
+                only its [..., 0] slice is read.
+            deepstack_visual_embeds: Optional list with one Tensor of shape [visual_tokens, hidden] per DeepStack
+                level (https://arxiv.org/abs/2406.04334), taken from successive vision-encoder layers; entry i is
+                added to the visual-token hidden states after decoder layer i.
             **attn_kwargs: Backend metadata, including packed sequence boundaries.
 
         Returns:
             Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
-
-        visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
-            The mask of the visual positions.
-        deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
-            The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
-            The feature is extracted from the different visual encoder layers, and fed to the decoder
-            hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -367,7 +366,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         """Forward pass with multimodal fusion.
 
         Args:
-            input_ids: Integer token IDs of shape [batch, sequence].
+            input_ids: Integer token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens],
+                which this method squeezes to [tokens].
             input_features: Audio features of shape [audios, mel_bins, frames].
             pixel_values: Packed image patches of shape [image_patches, patch_features],
                 where patch_features flattens channels, temporal depth, height, and width.
@@ -378,7 +378,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             feature_attention_mask: Valid audio frames of shape [audios, frames].
             audio_feature_lengths: Valid frame counts of shape [audios].
             position_ids: Rotary coordinates of shape [3, batch, sequence].
-            padding_mask: Valid token mask of shape [batch, sequence].
+            padding_mask: Optional bool mask of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; the decoder ignores it and derives padding from attention_mask.
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
             labels: Target token IDs of shape [batch, sequence].
             output_router_logits: Whether to output router logits
@@ -396,10 +397,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs: Additional attention arguments
 
         Returns:
-            Logits of shape [batch, selected_sequence, vocab] (or [tokens, vocab]
-            for packed input), a dict with scalar loss/aux_loss if labels provided, or a
-            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`
-            carrying hidden states of shape [batch, sequence, hidden] when requested.
+            With labels or ``output_router_logits``, a dict holding ``logits``, a scalar ``loss`` when labels are
+            given, a zero ``aux_loss`` when ``output_router_logits`` is set, and ``hidden_states`` when requested;
+            otherwise a CausalLMOutputWithPast when hidden states are requested, else the logits Tensor.
+            ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] for packed input, in the head's
+            ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may lower; without a head
+            (``lm_head`` is None) they are the hidden states. ``hidden_states`` are the final hidden states of
+            shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
         """
         output_hidden_states = (
             output_hidden_states

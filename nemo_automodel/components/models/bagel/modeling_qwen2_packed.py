@@ -1586,7 +1586,16 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-        self.lm_head = new_embeddings
+        """Install the output head; a plain ``nn.Linear``, as a vocabulary resize builds, keeps the logits dtype.
+
+        Args:
+            new_embeddings: Output head with weight of shape [vocab, hidden].
+        """
+        self.lm_head = (
+            new_embeddings
+            if isinstance(new_embeddings, LMHead)
+            else LMHead.from_linear(new_embeddings, logits_dtype=self.lm_head.logits_dtype)
+        )
 
     def set_decoder(self, decoder: nn.Module) -> None:
         self.model = decoder

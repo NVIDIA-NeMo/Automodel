@@ -564,7 +564,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         """Run one microbatch with direct or explicitly staged patch-based media.
 
         Args:
-            input_ids: Token IDs [batch, sequence], or [tokens] for THD.
+            input_ids: Token IDs [batch, sequence], or packed THD IDs [1, tokens] or [tokens], which this method
+                squeezes to [tokens]. Later pipeline stages pass hidden states [batch, sequence, hidden].
             *mtp_embed_inputs: Optional MTP embeddings [batch, sequence, hidden]
                 propagated by a previous pipeline stage.
             position_ids: Scalar positions matching the token axes.
@@ -579,10 +580,16 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 flags [patches], and optional packed cumulative offsets [segments + 1].
 
         Returns:
-            Logits [batch, sequence, vocab] or a model output containing those
-            logits, optional hidden states [batch, sequence, hidden], and MTP
-            logits with the same token axes. Non-final PP stages return hidden
-            values and optional propagated MTP embeddings.
+            Without pipeline parallelism, the logits Tensor, or a Step3p7CausalLMOutput when hidden states are
+            requested or MTP runs (training with an MTP module). ``logits`` have shape [batch, kept, vocab], or
+            [1, kept, vocab] for THD input, in the head's ``logits_dtype`` when set and otherwise in its weight
+            dtype, which autocast may lower. ``hidden_states``, when requested, have shape [batch, sequence, hidden],
+            or [1, tokens, hidden] for THD input. ``mtp_per_depth_logits`` hold one Tensor per depth of shape
+            [batch, sequence, vocab], or [tokens, vocab] for THD input, in the compute dtype. A pipeline stage
+            returns the logits, or its hidden states [batch, sequence, hidden] when it has no head; with MTP
+            enabled it returns a tuple of those followed by one Tensor per depth: the MTP embeddings
+            [batch, sequence, hidden] from stages before the last, and the MTP logits from the last stage (empty
+            placeholders of the logits' shape outside MTP training).
         """
         output_hidden_states = (
             output_hidden_states

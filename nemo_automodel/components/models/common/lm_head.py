@@ -69,7 +69,10 @@ def _fp32_logits_fake(input: torch.Tensor, weight: torch.Tensor, bias: torch.Ten
 
 @register_sharding(torch.ops.nemo_automodel.fp32_logits.default)
 def _fp32_logits_sharding(input, weight, bias):
-    """Shard the logits like a column-parallel linear, or along one of input's leading dimensions.
+    """Shard the logits like a column-parallel linear.
+
+    The backward flattens input's leading dimensions, so ``LMHead.linear`` replicates an input sharded on one of
+    them before calling the op.
 
     Args:
         input: Tensor metadata of global shape [..., hidden].
@@ -77,12 +80,10 @@ def _fp32_logits_sharding(input, weight, bias):
         bias: Tensor metadata of global shape [vocab], or None.
 
     Returns:
-        Supported output/input placements on each mesh axis: everything replicated; the vocabulary sharded, with
-        input replicated and weight and bias sharded on dim 0; or a leading dimension sharded on input and
-        logits, with weight and bias replicated.
+        Supported output/input placements on each mesh axis: everything replicated, or the vocabulary sharded,
+        with input replicated and weight and bias sharded on dim 0.
     """
     strategies = [(Replicate(), Replicate(), Replicate()), (Shard(input.ndim - 1), Replicate(), Shard(0))]
-    strategies += [(Shard(dim), Shard(dim), Replicate()) for dim in range(input.ndim - 1)]
     # Each is (logits, input, weight); the bias [vocab] is placed like the weight's vocabulary axis.
     return [([out], [inp, w, None if bias is None else w]) for out, inp, w in strategies]
 
@@ -198,13 +199,15 @@ class LMHead(nn.Linear):
 
         Returns:
             Logits of shape [..., vocab], with leading axes unchanged and the configured softcap applied.
-            Column-parallel output is sharded on the vocabulary axis. The dtype is ``logits_dtype`` when set;
-            otherwise it follows the linear's compute (autocast) dtype. Inputs are not mutated.
+            Column-parallel output is sharded on the vocabulary axis. The dtype is ``logits_dtype`` when set,
+            and the softcap then runs on the FP32 GEMM output, so the logits are rounded once; otherwise the
+            dtype follows the linear's compute (autocast) dtype. Inputs are not mutated.
         """
-        logits = self.linear(input, weight, self.bias, logits_dtype=self.logits_dtype)
+        compute_dtype = None if self.logits_dtype is None else torch.float32
+        logits = self.linear(input, weight, self.bias, logits_dtype=compute_dtype)
         if self.logit_softcapping is not None:
             logits = self.logit_softcapping * torch.tanh(logits / self.logit_softcapping)
-        return logits
+        return logits if self.logits_dtype is None else logits.to(self.logits_dtype)
 
     @staticmethod
     def linear(
@@ -213,7 +216,8 @@ class LMHead(nn.Linear):
         """Project hidden states with a supplied weight and bias, without a softcap.
 
         Args:
-            input: Tensor of shape [..., hidden], cast to the weight's dtype.
+            input: Tensor of shape [..., hidden], cast to the weight's dtype. With ``logits_dtype`` set, a DTensor
+                sharded on a leading dimension is replicated first.
             weight: Tensor of shape [vocab, hidden]; a column-parallel DTensor uses Shard(0), with the input
                 replicated on the same mesh.
             bias: Optional tensor of shape [vocab].
@@ -229,6 +233,13 @@ class LMHead(nn.Linear):
             if isinstance(weight, DTensor):  # tensor-parallel weight: compile-safe like TPLinear
                 return tp_linear_forward(input, weight, bias, mm_for_2d_compile=True)
             return F.linear(input, weight, bias)
+        if isinstance(input, DTensor):
+            # The op's backward flattens the leading dimensions, which DTensor cannot do across a sharded one.
+            last = input.ndim - 1
+            placements = [
+                Replicate() if isinstance(p, Shard) and p.dim % input.ndim < last else p for p in input.placements
+            ]
+            input = input.redistribute(placements=placements)
         return torch.ops.nemo_automodel.fp32_logits(input, weight, bias).to(logits_dtype)
 
     @classmethod
@@ -236,6 +247,14 @@ class LMHead(nn.Linear):
         """Wrap the plain linear head a Hugging Face parent class built, sharing its weight and bias.
 
         Ties, optimizer identity and checkpoint keys are unchanged.
+
+        Args:
+            head: Plain ``nn.Linear`` whose weight is a Tensor of shape [vocab, hidden] and whose bias is a Tensor
+                of shape [vocab] or None.
+            logits_dtype: Dtype of the logits; None keeps the weight's dtype, which autocast may lower.
+
+        Returns:
+            Head that shares ``head``'s weight and bias Parameters without copying, in ``head``'s training mode.
 
         Raises:
             ValueError: If ``head`` is not a plain ``nn.Linear``, so it has its own projection.
