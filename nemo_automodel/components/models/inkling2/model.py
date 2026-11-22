@@ -38,6 +38,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.moe.layers import Gate
 from nemo_automodel.shared.utils import dtype_from_str
 
 from .attention import AttentionSources, Inkling2Attention
@@ -125,6 +126,7 @@ class Inkling2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         bank: ResidualState | None = None,
         message_queries: torch.Tensor | None = None,
+        visit: int = 0,
     ) -> ResidualState:
         """Advance a depth block, with a new block beginning after boundary attention.
 
@@ -136,6 +138,8 @@ class Inkling2DecoderLayer(nn.Module):
                 None in the first pass and outside the loop core.
             message_queries: FP32 tensor of shape [4, hidden] with this layer's queries for
                 the attention Q, K, V and MoE inputs; given together with ``bank``.
+            visit: Which run of this layer in the forward the call is: the loop pass for a core
+                layer. Routing replay uses it to pick the expert selection of that run.
 
         Returns:
             New state with tensors of shape [batch, sequence, hidden]; previous state is unchanged.
@@ -166,6 +170,10 @@ class Inkling2DecoderLayer(nn.Module):
             assert self.controllers is not None
             mlp_stream = self.controllers["mlp"](mlp_stream, messages[3])
         mlp_input = self.mlp_norm(mlp_stream).to(dtype)
+        gate = self.mlp.gate
+        if isinstance(gate, Gate) and gate.router_replay is not None:
+            # An argument, not loop state: the activation-checkpoint recompute repeats this call.
+            gate.router_replay.visit = visit
         mlp = self.mlp_sconv(self.mlp(mlp_input, padding_mask=~valid), valid, positions=positions)
         return ResidualState(blocks, (partial + mlp.float()).to(dtype))
 
@@ -675,7 +683,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     if bank is None
                     else torch.stack((queries[first], kv_queries[first], kv_queries[second], queries[second]))
                 )
-                state = self.layers[str(index)](state, valid, positions, bank, layer_queries)
+                state = self.layers[str(index)](state, valid, positions, bank, layer_queries, pass_index)
         for index in range(core.stop, self.text_config.num_hidden_layers):
             state = self.layers[str(index)](state, valid, positions)
         return state
