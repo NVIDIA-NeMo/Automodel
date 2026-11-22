@@ -1,0 +1,41 @@
+# Patch for flash-linear-attention (fla-core) 0.5.2, file fla/ops/cp/chunk_delta_h.py.
+# Source: https://github.com/fla-org/flash-linear-attention at tag v0.5.2
+# (commit 9c8e42e762fce087c27b673af4922795d9edb85e), same file as the fla-core 0.5.2 wheel on PyPI.
+# The triton.autotune key of merge_fwd_bwd_kernel names "BT", which is not a kernel argument.
+# Triton 3.9 (PyTorch 26.11 base) rejects such keys when fla is imported. Earlier Triton dropped
+# the unknown name, so removing it keeps the same tuning key. fla 0.6 no longer has this key;
+# remove this patch with that upgrade. Docker accepts only the original or the already-patched
+# source.
+#
+# MIT License
+#
+# Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+--- a/fla/ops/cp/chunk_delta_h.py
++++ b/fla/ops/cp/chunk_delta_h.py
+@@ -325,7 +325,7 @@
+         for num_stages in [2, 3, 4]
+         for BV in [32, 64]
+     ],
+-    key=['HV', 'K', 'V', 'BT'],
++    key=['HV', 'K', 'V'],
+     **autotune_cache_kwargs,
+ )
+ @triton.jit(do_not_specialize=['pre_or_post_num_ranks', 'rank', 'NUM_SEQ_ENTRIES'])
