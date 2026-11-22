@@ -277,6 +277,29 @@ def test_load_openai_messages_local_applies_negative_and_percent_slices(tmp_path
     assert [r["messages"][0]["content"] for r in rows] == expected
 
 
+def _write_numbered_jsonl(fp, num_rows):
+    fp.write_text(
+        "\n".join(json.dumps({"messages": [{"role": "user", "content": f"q{i}"}]}) for i in range(num_rows)),
+        encoding="utf-8",
+    )
+
+
+def test_load_openai_messages_local_mixed_unit_slice_matches_datasets(tmp_path):
+    """If either bound has ``%`` both are percents, as in ``datasets``."""
+    fp = tmp_path / "data.jsonl"
+    _write_numbered_jsonl(fp, 200)
+    rows = tcd._load_openai_messages(str(fp), split="train[10:50%]")
+    assert [r["messages"][0]["content"] for r in rows] == [f"q{i}" for i in range(20, 100)]
+
+
+@pytest.mark.parametrize("split", ["train[50%:150]", "train[:150%]"])
+def test_load_openai_messages_local_rejects_out_of_range_percent(tmp_path, split):
+    fp = tmp_path / "data.jsonl"
+    _write_numbered_jsonl(fp, 200)
+    with pytest.raises(ValueError, match="Percent slice boundaries"):
+        tcd._load_openai_messages(str(fp), split=split)
+
+
 def test_load_openai_messages_local_rejects_unparsed_slice(tmp_path):
     fp = tmp_path / "data.jsonl"
     fp.write_text(json.dumps({"messages": [{"role": "user", "content": "q"}]}), encoding="utf-8")

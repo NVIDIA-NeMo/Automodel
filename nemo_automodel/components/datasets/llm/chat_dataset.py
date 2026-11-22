@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Sequence, Union
 
-from datasets import VerificationMode, load_dataset
+from datasets import ReadInstruction, VerificationMode, load_dataset
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -63,7 +63,7 @@ def _parse_split_slice(split: str | None):
     """Parse a split string like ``"train[1024:]"`` into ``(base_split, bounds | None)``.
 
     ``bounds`` is a ``(start, stop)`` pair of the raw bound strings (``None`` when a
-    bound is omitted). Resolve it against a row count with ``_split_slice_indices``.
+    bound is omitted). Resolve the split against a row count with ``_split_slice_indices``.
     """
     if split is None:
         return split, None
@@ -73,22 +73,14 @@ def _parse_split_slice(split: str | None):
     return match.group(1), (match.group(2), match.group(3))
 
 
-def _resolve_split_bound(bound: str | None, num_rows: int) -> int | None:
-    """Convert one slice bound to an absolute row offset the way ``datasets`` does.
+def _split_slice_indices(split: str, base_split: str, num_rows: int) -> range:
+    """Row indices selected by the slice in ``split`` out of ``num_rows`` rows.
 
-    Percent bounds use the ``closest`` rounding of ``datasets.ReadInstruction``.
+    Bounds are resolved by ``datasets.ReadInstruction`` so units, rounding and
+    range checks match ``load_dataset(..., split=split)``.
     """
-    if bound is None:
-        return None
-    if bound.endswith("%"):
-        return int(round(float(bound[:-1]) * num_rows / 100.0))
-    return int(bound)
-
-
-def _split_slice_indices(bounds: tuple[str | None, str | None], num_rows: int) -> range:
-    """Row indices selected by parsed slice ``bounds`` out of ``num_rows`` rows."""
-    start, stop = (_resolve_split_bound(b, num_rows) for b in bounds)
-    return range(*slice(start, stop).indices(num_rows))
+    (instruction,) = ReadInstruction.from_spec(split).to_absolute({base_split: num_rows})
+    return range(instruction.from_, instruction.to)
 
 
 def _load_openai_messages(
@@ -133,7 +125,7 @@ def _load_openai_messages(
             dataset = dataset.shuffle(seed=shuffle_seed)
 
         if sl is not None:
-            dataset = dataset.select(_split_slice_indices(sl, len(dataset)))
+            dataset = dataset.select(_split_slice_indices(split, base_split, len(dataset)))
 
         return dataset
 
@@ -163,7 +155,7 @@ def _load_openai_messages(
             if shuffle_seed is not None:
                 dataset = dataset.shuffle(seed=shuffle_seed)
             if sl is not None:
-                dataset = dataset.select(_split_slice_indices(sl, len(dataset)))
+                dataset = dataset.select(_split_slice_indices(split, base_split, len(dataset)))
             return dataset
 
     # Fall back to manual JSON/JSONL parsing for local files.
@@ -208,9 +200,9 @@ def _load_openai_messages(
 
     # Honor a split slice such as ``train[:1024]`` like the HF and Parquet
     # branches do. Local rows are not shuffled, so the slice is in file order.
-    _, sl = _parse_split_slice(split)
+    base_split, sl = _parse_split_slice(split)
     if sl is not None:
-        rows = [rows[i] for i in _split_slice_indices(sl, len(rows))]
+        rows = [rows[i] for i in _split_slice_indices(split, base_split, len(rows))]
     elif split is not None and "[" in split:
         # Returning every row here would silently turn a validation slice into
         # the whole file, so reject slice syntax that cannot be applied.
