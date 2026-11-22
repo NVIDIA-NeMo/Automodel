@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
 import torch
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from transformers import AutoConfig
 
 from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
@@ -29,6 +31,7 @@ from nemo_automodel.components.models.inkling2.config import (
 from nemo_automodel.components.models.inkling2.model import Inkling2ForCausalLM
 from nemo_automodel.components.models.inkling2.multimodal import Inkling2ForConditionalGeneration
 from nemo_automodel.components.models.inkling2.state_dict_adapter import Inkling2StateDictAdapter
+from nemo_automodel.components.moe.router_replay import RouterReplay
 
 from . import reference
 
@@ -109,6 +112,41 @@ def test_looped_outputs_and_all_parameter_gradients(seed: int) -> None:
         torch.testing.assert_close(parameter.grad, wanted, rtol=3e-4, atol=2e-5 * scale, msg=name)
     for name in ("message_queries.weight", "message_kv_queries.weight", "layers.3.controllers.v.down_weight"):
         assert parameters[name].grad.abs().sum() > 0, name
+
+
+def test_routing_replay_follows_each_pass_through_checkpoint_recompute() -> None:
+    torch.manual_seed(3)
+    config = looped_config()
+    model = looped_model(config)
+    RouterReplay.clear_registry()
+    used: list[tuple[int, int, torch.Tensor]] = []
+    for index, layer in model.layers.items():
+        gate = layer.mlp.gate
+        gate.router_replay = RouterReplay()
+        gate.register_forward_hook(
+            lambda module, inputs, output, index=int(index): used.append((index, module.router_replay.visit, output[1]))
+        )
+    try:
+        with RouterReplay.record():
+            model(torch.randint(0, config.unpadded_vocab_size, (1, 9)))
+        recorded = RouterReplay.collect()
+        # Layers 2-5 are the loop core: one selection per pass.
+        assert [selection.dim() for selection in recorded] == [2, 2, 3, 3, 3, 3, 2, 2]
+        assert not torch.equal(recorded[2][0], recorded[2][2])
+
+        for index, layer in list(model.layers.items()):
+            model.layers[index] = checkpoint_wrapper(layer)
+        used.clear()
+        with RouterReplay.replay(recorded):
+            model(torch.randint(0, config.unpadded_vocab_size, (1, 9))).sum().backward()
+    finally:
+        RouterReplay.clear_registry()
+    # Every layer visit runs once in the forward and once more in the recompute during backward.
+    runs = Counter((index, visit) for index, visit, _ in used)
+    assert len(runs) == 16 and set(runs.values()) == {2}
+    for index, visit, selection in used:
+        wanted = recorded[index] if recorded[index].dim() == 2 else recorded[index][visit]
+        assert torch.equal(selection, wanted), (index, visit)
 
 
 def test_each_pass_and_each_message_changes_the_output() -> None:
