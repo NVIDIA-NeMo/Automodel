@@ -23,12 +23,17 @@ from torch.utils.data import DataLoader
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.cached_data import (
+    CachedDFlashBatch,
     CachedDFlashDataConfig,
     CachedDFlashDataset,
     CachedDFlashRow,
     collate_cached_dflash,
 )
-from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule
+from nemo_automodel.components.speculative.dflash.core import (
+    DFlashStepMetrics,
+    DFlashTrainerModule,
+    NoValidAnchorsError,
+)
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 pytestmark = pytest.mark.cpu_only
@@ -172,12 +177,12 @@ def test_scoreless_cache_is_usable_by_dflash(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
+        ("input_ids", torch.empty(0, dtype=torch.long), "sequence length"),
         ("input_ids", torch.tensor([2, 3, 4, 5, 20]), "input_ids"),
         ("input_ids", torch.tensor([2, 3, 4, 5, -100]), "input_ids"),
         ("input_ids", torch.tensor([2, 3, 4, 5, 6], dtype=torch.int32), "input_ids"),
         ("loss_mask", torch.tensor([0, 1, 1, 2, 1]), "loss_mask"),
         ("loss_mask", torch.tensor([0, 1, 1, 1]), "loss_mask"),
-        ("loss_mask", torch.tensor([0, 0, 0, 1, 1]), "anchor"),
         ("hidden_states", torch.zeros(5, 7, dtype=torch.bfloat16), "hidden_states"),
         ("hidden_states", torch.zeros(5, 6, dtype=torch.float32), "hidden_states"),
         ("visual_score", torch.zeros(5), "visual_score"),
@@ -230,6 +235,9 @@ def test_collator_keeps_shorter_rows_training_blocks_inside_real_tokens(tmp_path
     torch.save(longer, tmp_path / "00000002.ckpt")
     batch = next(iter(_loader(tmp_path, pad_token_id=2)))
 
+    for field, tensor in batch.items():
+        assert all(size <= 1 or stride != 0 for size, stride in zip(tensor.shape, tensor.stride())), field
+
     torch.testing.assert_close(batch["input_ids"], torch.tensor([[2, 3, 4, 5, 6, 2, 2], [2, 3, 4, 5, 6, 7, 8]]))
     torch.testing.assert_close(batch["loss_mask"], torch.tensor([[0, 1, 1, 1, 1, 0, 0], [0, 1, 1, 1, 1, 1, 1]]))
     torch.testing.assert_close(batch["attention_mask"], torch.tensor([[True] * 5 + [False] * 2, [True] * 7]))
@@ -250,13 +258,9 @@ def test_loader_requires_valid_padding_token_even_with_masked_loss(tmp_path: Pat
         _loader(tmp_path, pad_token_id=_VOCAB_SIZE)
 
 
-def test_padded_cache_training_matches_unpadded_rows(tmp_path: Path) -> None:
-    _write_manifest(tmp_path, num_samples=2)
-    for i, length in enumerate((5, 7)):
-        torch.save(_sample(length), tmp_path / f"{i:08d}.ckpt")
-    loader = _loader(tmp_path, pad_token_id=0)
-    batch = next(iter(loader))
-
+@pytest.fixture(params=["dflash", "mmflash"])
+def cache_trainer(request: pytest.FixtureRequest) -> DFlashTrainerModule:
+    """Build a small trainable draft for each cached objective."""
     draft = Qwen3DFlashDraftModel(
         Qwen3Config(
             vocab_size=_VOCAB_SIZE,
@@ -273,7 +277,7 @@ def test_padded_cache_training_matches_unpadded_rows(tmp_path: Path) -> None:
             dflash_config={"mask_token_id": _MASK_TOKEN_ID, "target_layer_ids": _LAYERS},
         )
     )
-    trainer = DFlashTrainerModule(
+    return DFlashTrainerModule(
         draft_model=draft,
         target_lm_head=torch.nn.Linear(_WIDTH, _VOCAB_SIZE, bias=False),
         target_embed_tokens=torch.nn.Embedding(_VOCAB_SIZE, _WIDTH),
@@ -281,25 +285,44 @@ def test_padded_cache_training_matches_unpadded_rows(tmp_path: Path) -> None:
         block_size=_BLOCK_SIZE,
         attention_backend="sdpa",
         num_anchors=_MAX_SEQ_LEN,
+        loss_type=request.param,
     )
 
-    with torch.no_grad():
-        packed = trainer(
-            input_ids=batch["input_ids"],
-            hidden_states=batch["hidden_states"].float(),
-            loss_mask=batch["loss_mask"],
-            position_ids=batch["position_ids"],
-            seq_lens=batch["seq_lens"],
-            doc_remaining=batch["doc_remaining"],
-        )
-        individual = [
-            trainer(
-                input_ids=row["input_ids"].unsqueeze(0),
-                hidden_states=row["hidden_states"].unsqueeze(0).float(),
-                loss_mask=row["loss_mask"].unsqueeze(0),
-            )
-            for row in loader.dataset
-        ]
+
+@torch.no_grad()
+def _measure_cache_batch(trainer: DFlashTrainerModule, batch: CachedDFlashBatch) -> DFlashStepMetrics:
+    """Run a collated batch through the selected objective.
+
+    Args:
+        trainer: The draft and its training objective.
+        batch: IDs, masks, scores, positions, and document remainders of shape
+            [batch, sequence], hidden states of shape [batch, sequence,
+            layers * hidden_size], and sequence lengths of shape [batch, 1].
+
+    Returns:
+        Loss and token metrics for the collated batch.
+    """
+    return trainer(
+        input_ids=batch["input_ids"],
+        hidden_states=batch["hidden_states"].float(),
+        loss_mask=batch["loss_mask"],
+        position_ids=batch["position_ids"],
+        seq_lens=batch["seq_lens"],
+        doc_remaining=batch["doc_remaining"],
+        visual_score=batch.get("visual_score"),
+    )
+
+
+def test_padded_cache_training_matches_unpadded_rows(tmp_path: Path, cache_trainer: DFlashTrainerModule) -> None:
+    _write_manifest(tmp_path, num_samples=2)
+    for i, length in enumerate((5, 7)):
+        torch.save(_sample(length), tmp_path / f"{i:08d}.ckpt")
+    loader = _loader(tmp_path, pad_token_id=0)
+
+    packed = _measure_cache_batch(cache_trainer, next(iter(loader)))
+    individual = [
+        _measure_cache_batch(cache_trainer, collate_cached_dflash([row], pad_token_id=0)) for row in loader.dataset
+    ]
 
     assert packed.valid_blocks == sum(result.valid_blocks for result in individual)
     assert packed.valid_tokens == sum(result.valid_tokens for result in individual)
@@ -307,3 +330,25 @@ def test_padded_cache_training_matches_unpadded_rows(tmp_path: Path) -> None:
         packed.loss * packed.loss_weight,
         sum(result.loss * result.loss_weight for result in individual),
     )
+
+
+@pytest.mark.parametrize("length", [_BLOCK_SIZE - 1, 5], ids=["short-sequence", "short-answer"])
+def test_cached_rows_without_a_full_block_reach_the_trainer(
+    tmp_path: Path, cache_trainer: DFlashTrainerModule, length: int
+) -> None:
+    _write_manifest(tmp_path, num_samples=2)
+    torch.save(_sample(7), tmp_path / "00000001.ckpt")
+    short = _sample(length)
+    short["loss_mask"][:-1] = 0
+    short["visual_score"] *= short["loss_mask"]
+    torch.save(short, tmp_path / "00000002.ckpt")
+    loader = _loader(tmp_path, pad_token_id=0)
+
+    mixed = _measure_cache_batch(cache_trainer, next(iter(loader)))
+    full = _measure_cache_batch(cache_trainer, collate_cached_dflash([loader.dataset[0]], pad_token_id=0))
+    assert mixed.valid_blocks == full.valid_blocks > 0
+    assert mixed.valid_tokens == full.valid_tokens > 0
+    torch.testing.assert_close(mixed.loss * mixed.loss_weight, full.loss * full.loss_weight)
+
+    with pytest.raises(NoValidAnchorsError):
+        _measure_cache_batch(cache_trainer, collate_cached_dflash([loader.dataset[1]], pad_token_id=0))

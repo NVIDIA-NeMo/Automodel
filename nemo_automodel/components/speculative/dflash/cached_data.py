@@ -60,6 +60,7 @@ class CachedDFlashDataset(Dataset[CachedDFlashRow]):
 
     A ``manifest.json`` identifies the capture and its settings. Setup reads the
     manifest and enumerates the files. Tensors are read and validated on demand.
+    The trainer determines full-block anchor eligibility after batching.
     """
 
     def __init__(
@@ -149,7 +150,6 @@ class CachedDFlashDataset(Dataset[CachedDFlashRow]):
         self._hidden_dtype = _HIDDEN_DTYPES[hidden_dtype]
         self._feature_width = len(layer_ids) * target_hidden_size
         self._target_vocab_size = target_vocab_size
-        self._block_size = block_size
         self._max_seq_len = max_seq_len
 
     def __len__(self) -> int:
@@ -187,8 +187,8 @@ class CachedDFlashDataset(Dataset[CachedDFlashRow]):
         if input_ids.ndim != 1 or input_ids.dtype != torch.long:
             raise ValueError(f"{path}: input_ids must be int64 with shape [sequence]")
         length = input_ids.size(0)
-        if not self._block_size <= length <= self._max_seq_len:
-            raise ValueError(f"{path}: sequence length {length} is outside [{self._block_size}, {self._max_seq_len}]")
+        if not 1 <= length <= self._max_seq_len:
+            raise ValueError(f"{path}: sequence length {length} is outside [1, {self._max_seq_len}]")
         # input_ids also supplies the unshifted hard labels.
         if (input_ids < 0).any() or (input_ids >= self._target_vocab_size).any():
             raise ValueError(f"{path}: input_ids contains a token outside [0, {self._target_vocab_size})")
@@ -198,8 +198,6 @@ class CachedDFlashDataset(Dataset[CachedDFlashRow]):
             or ((loss_mask != 0) & (loss_mask != 1)).any()
         ):
             raise ValueError(f"{path}: loss_mask must be binary, bool or int64, and match input_ids")
-        if not loss_mask[: length - self._block_size + 1].any():
-            raise ValueError(f"{path}: loss_mask has no supervised anchor with a full draft block")
         if hidden_states.shape != (length, self._feature_width) or hidden_states.dtype != self._hidden_dtype:
             raise ValueError(
                 f"{path}: hidden_states must have shape ({length}, {self._feature_width}) "
@@ -254,7 +252,8 @@ def collate_cached_dflash(examples: list[CachedDFlashRow], *, pad_token_id: int)
         raise ValueError("All DFlash cache rows in a batch must share the same visual_score layout")
 
     input_ids = pad_sequence([row["input_ids"] for row in examples], batch_first=True, padding_value=pad_token_id)
-    positions = torch.arange(input_ids.shape[1], device=input_ids.device).expand_as(input_ids)
+    # Materialize the batch dimension so DataLoader can pin the positions.
+    positions = torch.arange(input_ids.shape[1], device=input_ids.device).expand_as(input_ids).clone()
     seq_lens = torch.tensor([row["input_ids"].numel() for row in examples], device=input_ids.device).unsqueeze(1)
     # The trainer's document-boundary contract lets every row keep its own
     # full-block anchors even when its neighbors need a wider padded tensor.

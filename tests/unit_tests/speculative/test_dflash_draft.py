@@ -197,11 +197,12 @@ def test_spec_generate_keeps_generated_tokens_equal_to_the_mask_id():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(("seed", "max_new_tokens"), [(0, 6), (1, 12), (4, 12), (6, 12)])
 def test_spec_generate_verifies_qwen3_5_image_prompt_after_rejections(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed: int, max_new_tokens: int
 ) -> None:
-    """Replay a real hybrid verifier after rejected image-token proposals."""
-    torch.manual_seed(0)
+    """Match greedy decoding through multiple rejected blocks and committed prefixes."""
+    torch.manual_seed(seed)
     config = Qwen3_5Config(
         text_config=Qwen3_5TextConfig(
             vocab_size=64,
@@ -253,17 +254,27 @@ def test_spec_generate_verifies_qwen3_5_image_prompt_after_rejections(
         "image_grid_thw": torch.tensor([[1, 4, 4]]),
         "mm_token_type_ids": (prompt == image_token_id).long(),
     }
-    expected = target.generate(**processor_outputs, max_new_tokens=6, do_sample=False, use_cache=True)
+    expected = target.generate(**processor_outputs, max_new_tokens=max_new_tokens, do_sample=False, use_cache=True)
     assert (expected[:, prompt.shape[1] :] != image_token_id).all()
 
     def propose_image_token(hidden: torch.Tensor, output_head: torch.nn.Module) -> torch.Tensor:
-        """Produce a rejected proposal that would be misread as a new image in pixel replay."""
+        """Propose image tokens so each block must be verified and rejected.
+
+        Args:
+            hidden: Draft states of shape [batch, block_size - 1, hidden_size].
+            output_head: Target vocabulary projection.
+
+        Returns:
+            Logits of shape [batch, block_size - 1, vocab_size].
+        """
         logits = output_head(hidden)
         logits[..., image_token_id] = torch.inf
         return logits
 
     monkeypatch.setattr(draft, "compute_logits", propose_image_token)
-    result = draft.spec_generate(target, **processor_outputs, max_new_tokens=6, stop_token_ids=None, temperature=0.0)
+    result = draft.spec_generate(
+        target, **processor_outputs, max_new_tokens=max_new_tokens, stop_token_ids=None, temperature=0.0
+    )
     torch.testing.assert_close(result, expected)
 
 
