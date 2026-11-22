@@ -97,7 +97,7 @@ def test_recipe_releases_unused_outputs_before_backward(output_kind, dtype, reco
         tokenizer=None,
         domain_mixture=None,
         gated_mtp=None,
-        te_fp8=None,
+        te_quantization=None,
         cfg=SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None)),
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,

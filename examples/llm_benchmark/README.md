@@ -51,7 +51,9 @@ kernels, loss, optimizer, parallelism and global/local batches. Their normal rou
 uses real gates; only `ci.perf_testing.fake_balanced_gate` enables balanced gates.
 Kimi and Step-5 keep synthetic-only `benchmark_static_routing` disabled in both
 normal and performance runs because it cannot represent real routing. This is a
-recorded difference from the two Kimi and one Step-5 legacy synthetic runs.
+recorded difference from the two Kimi and one Step-5 legacy synthetic runs. The
+seven Qwen3-MoE GB200 counterparts use FA4 attention, unlike their TE or compiled
+SDPA legacy benchmarks.
 
 The legacy `qwen/qwen3_moe_30b_te_fp8.yaml` and `moonlight/moonlight_16b_te_fp8.yaml`
 put activation checkpointing and resharding in a top-level `parallelizer` section,
@@ -153,11 +155,12 @@ and actual sequence lengths instead of assuming their TPS must match. The migrat
 loss upcast, optimizer-state and gradient-reduction precision come from throughput
 benchmarks; their effect on finetuning convergence has not been validated.
 
-The packed Qwen30B MXFP8 recipe keeps RoPE fusion disabled because its THD path has
-a documented NaN-gradient issue. Kimi and Step-5 static routing stay disabled. Neither
-exception is hidden in performance overrides. No current legacy benchmark enables
-a positive `packed_sequence_size`; fixed-length synthetic data alone does not
-request THD packing.
+The packed Qwen30B GB200 recipes use FA4 attention, unlike their TE or compiled SDPA
+legacy benchmarks. The packed Qwen30B MXFP8 recipe keeps RoPE fusion disabled because
+its THD path has a documented NaN-gradient issue. Kimi and Step-5 static routing stay
+disabled. None of these exceptions is hidden in performance overrides. No current
+legacy benchmark enables a positive `packed_sequence_size`; fixed-length synthetic
+data alone does not request THD packing.
 
 GLM-4.7 Flash finetuning explicitly sets `gate_precision: float32`. The benchmark
 and pretraining configs omit this setting, and `Glm4MoeLiteForCausalLM` resolves it

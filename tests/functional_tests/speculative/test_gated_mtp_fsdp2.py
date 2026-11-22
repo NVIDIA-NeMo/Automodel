@@ -120,7 +120,7 @@ def _make_recipe(model: torch.nn.Module, device: torch.device, *, dp_size: int, 
     object.__setattr__(recipe, "device_mesh", object())
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True, mp_policy=mp_policy))
     object.__setattr__(recipe, "loss_fn", MaskedCrossEntropy())
