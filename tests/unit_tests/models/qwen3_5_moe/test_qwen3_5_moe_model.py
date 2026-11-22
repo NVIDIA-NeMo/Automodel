@@ -23,6 +23,8 @@ import torch.nn as nn
 # Skip entire module when transformers has no Qwen3.5-MoE (e.g. older CI environments).
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
+from types import SimpleNamespace
+
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
@@ -478,7 +480,7 @@ class TestQwen3_5MoeModel:
         input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
 
         with (
-            patch.object(core.language_model, "get_input_embeddings", return_value=None),
+            patch.object(core.language_model, "embed_tokens", None),
             patch.object(core.language_model, "forward") as mock_lang_forward,
         ):
             mock_output = MagicMock()
@@ -764,11 +766,67 @@ class TestQwen3_5MoeModelVLPath:
         mock_language_forward.assert_not_called()
         kw = mock_hf_forward.call_args.kwargs
         assert kw["pixel_values"] is pixel_values
-        assert kw["input_ids"] is None
-        assert kw["inputs_embeds"] is not None
+        assert kw["input_ids"] is input_ids
+        assert kw["inputs_embeds"] is None
         # model.model (base) delegates the VL path to HF super().forward(), which returns the
         # multimodal hidden states; lm_head/logits live on the outer ForConditionalGeneration.
         assert result.last_hidden_state.shape == (batch, seq_len, vl_config.text_config.hidden_size)
+
+    def test_media_and_text_paths_issue_identical_embed_then_lm_sequence(
+        self, vl_config, backend_config, moe_config, device
+    ):
+        """Both media and text-only paths must invoke embed_tokens exactly once
+        before language_model so FSDP2 collectives match even with
+        reshard_after_forward=True."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+        model_dtype = next(model.parameters()).dtype
+
+        batch, seq_len = 1, 4
+        image_token_id = vl_config.image_token_id
+        media_input_ids = torch.tensor([[1, image_token_id, image_token_id, 2]], device=device)
+        text_input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
+        pixel_values = torch.randn(4, 3 * 2 * 16 * 16, device=device, dtype=model_dtype)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=device)
+
+        fake_image_embeds = torch.randn(2, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
+        fake_lm_output = Qwen3_5MoeModelOutputWithPast(
+            last_hidden_state=torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
+            )
+        )
+
+        def _run_and_record(**forward_kwargs):
+            call_order = []
+            orig_embed_forward = core.embed_tokens.forward
+
+            def _tracked_embed(*args, **kwargs):
+                call_order.append("embed_tokens")
+                return orig_embed_forward(*args, **kwargs)
+
+            def _tracked_lm(*args, **kwargs):
+                call_order.append("language_model")
+                return fake_lm_output
+
+            with (
+                patch.object(core.embed_tokens, "forward", side_effect=_tracked_embed),
+                patch.object(
+                    core, "get_image_features", return_value=SimpleNamespace(pooler_output=(fake_image_embeds,))
+                ),
+                patch.object(core.language_model, "forward", side_effect=_tracked_lm),
+            ):
+                core.forward(**forward_kwargs)
+            return call_order
+
+        media_order = _run_and_record(
+            input_ids=media_input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+        text_order = _run_and_record(input_ids=text_input_ids)
+
+        assert media_order == ["embed_tokens", "language_model"]
+        assert text_order == ["embed_tokens", "language_model"]
 
 
 # ---------------------------------------------------------------------------
