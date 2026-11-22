@@ -210,8 +210,18 @@ class Inkling2LMHead(LMHead):
         self.logit_softcapping, self.unpadded_vocab_size = config.final_logit_softcapping, config.unpadded_vocab_size
 
     def project(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        """Project FP32 copies of input [..., hidden] and weight [vocab, hidden] to softcapped logits
-        [..., vocab]; the padded vocabulary rows from ``unpadded_vocab_size`` on are negative infinity."""
+        """Project FP32 copies of the hidden states with a supplied vocabulary weight.
+
+        Args:
+            input: Tensor of shape [..., hidden], with arbitrary leading dimensions, in any floating dtype.
+            weight: Tensor of shape [vocab, hidden] on input's device: the head's own weight, or the weight a
+                chunked loss gathered. A column-parallel DTensor uses Shard(0), with input replicated on its mesh.
+
+        Returns:
+            Logits of shape [..., vocab] in ``logits_dtype`` (FP32 copies of the operands give FP32 logits when it
+            is unset), with the head's softcap applied and negative infinity in the padded vocabulary rows from
+            ``unpadded_vocab_size`` on. Inputs are not mutated.
+        """
         logits = super().project(input.float(), weight.float())
         padded = torch.arange(logits.shape[-1], device=logits.device) >= self.unpadded_vocab_size
         return logits.masked_fill(padded, float("-inf"))

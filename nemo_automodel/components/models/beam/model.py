@@ -372,12 +372,12 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
-        # Final-logit soft cap, as in HF: cap * tanh(logits / cap), computed in fp32. Only the stage
-        # that owns the head has logits (on other PP stages ``lm_head`` is None and the hidden
-        # states pass through in the logits slot).
+        # Final-logit soft cap, as in HF: cap * tanh(logits / cap), computed in fp32 and returned in the head's
+        # logits_dtype (fp32 when unset). Only the stage that owns the head has logits (on other PP stages
+        # ``lm_head`` is None and the hidden states pass through in the logits slot).
         if self.final_logit_softcapping and self.lm_head is not None:
             cap = float(self.final_logit_softcapping)
-            logits = (logits.float() / cap).tanh() * cap
+            logits = ((logits.float() / cap).tanh() * cap).to(self.lm_head.logits_dtype or torch.float32)
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()

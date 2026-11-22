@@ -100,13 +100,16 @@ def test_cuda_precision_matches_independent_reference(precision: str, tmp_path: 
             sink_observations.append((output.dtype, torch.is_autocast_enabled("cuda")))
 
         def capture_head(module: torch.nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
-            """Observe head input precision without changing its activation.
+            """Observe the head's projection precision without changing its activation.
+
+            The LMHead casts its input to its weight's dtype and runs its FP32-logits GEMM outside autocast,
+            so its weight and logits dtypes, not the input dtype or autocast state, set the projection's precision.
 
             Args:
-                module: Output linear module, owning [vocab,hidden] weight.
-                inputs: One CUDA tensor [batch,sequence,hidden], FP32 for head compute.
+                module: Output LMHead, owning [vocab,hidden] weight.
+                inputs: One CUDA tensor [batch,sequence,hidden] in the residual or compute dtype.
             """
-            head_observations.append((inputs[0].dtype, module.weight.dtype, torch.is_autocast_enabled("cuda")))
+            head_observations.append((module.weight.dtype, module.logits_dtype))
 
         def gate_capture(index: int):
             """Bind a layer index for a numerical route diagnostic."""
@@ -136,7 +139,7 @@ def test_cuda_precision_matches_independent_reference(precision: str, tmp_path: 
             actual = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
         assert actual.dtype == torch.float32
         assert sink_observations == [(torch.float32, False)] * config.num_hidden_layers
-        assert head_observations == [(torch.float32, torch.float32, False)]
+        assert head_observations == [(torch.float32, torch.float32)]
         valid = batch["attention_mask"].bool()
         atol, rtol = (3e-6, 3e-5) if precision == "fp32" else (1e-3, 5e-2)
         torch.testing.assert_close(actual[valid], expected[valid], atol=atol, rtol=rtol)

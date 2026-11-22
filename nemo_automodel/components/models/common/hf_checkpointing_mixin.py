@@ -28,6 +28,10 @@ Checkpointer is passed explicitly (dependency injection) - no global state.
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from torch import nn
+
+from nemo_automodel.components.models.common.lm_head import LMHead
+
 if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
@@ -51,7 +55,37 @@ class HFCheckpointingMixin:
 
     For nn.Module subclasses (no parent from_pretrained):
     - Falls back to manual config loading + Checkpointer
+
+    For PreTrainedModel subclasses, a vocabulary resize keeps the model's ``LMHead``.
     """
+
+    def _get_resized_lm_head(
+        self,
+        old_lm_head: nn.Linear,
+        new_num_tokens: int | None = None,
+        transposed: bool = False,
+        mean_resizing: bool = True,
+    ) -> nn.Linear:
+        """Resize the output head as Transformers does, keeping an ``LMHead`` and its settings.
+
+        Transformers builds a plain ``nn.Linear`` for the resized vocabulary. An ``LMHead`` takes that module's
+        resized parameters instead, so its class, ``logits_dtype`` and softcap survive the resize.
+
+        Args:
+            old_lm_head: The output head, with weight of shape [vocab, hidden].
+            new_num_tokens: New vocabulary size; None returns the head unchanged.
+            transposed: Whether the head's weight is stored as [hidden, vocab].
+            mean_resizing: Initialize added rows from the mean and covariance of the existing rows.
+
+        Returns:
+            The resized head, with weight of shape [new_num_tokens, hidden].
+        """
+        new_lm_head = super()._get_resized_lm_head(old_lm_head, new_num_tokens, transposed, mean_resizing)
+        if new_lm_head is old_lm_head or not isinstance(old_lm_head, LMHead):
+            return new_lm_head
+        old_lm_head.weight, old_lm_head.bias = new_lm_head.weight, new_lm_head.bias
+        old_lm_head.out_features = new_lm_head.out_features
+        return old_lm_head
 
     def save_pretrained(
         self,

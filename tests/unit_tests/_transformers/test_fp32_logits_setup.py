@@ -113,6 +113,23 @@ def test_checkpoint_loads_into_the_fp32_logits_head(tmp_path, tied):
     torch.testing.assert_close(output.logits.double(), reference, rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("tied", [False, True])
+def test_vocabulary_resize_keeps_the_fp32_logits_head(tied):
+    # Transformers builds a plain nn.Linear for a resized untied head; the LMHead takes its parameters instead.
+    model = _build(_config(Qwen3Config, tied=tied), logits_dtype="float32")
+
+    model.resize_token_embeddings(_VOCAB + 1)
+
+    assert _is_fp32_logits_head(model.lm_head)
+    assert model.lm_head.weight.shape == (_VOCAB + 1, 32)
+    assert (model.lm_head.weight is model.get_input_embeddings().weight) is tied
+    input_ids = torch.randint(0, _VOCAB + 1, (2, 6), generator=torch.Generator().manual_seed(1))
+    output = model(input_ids=input_ids, output_hidden_states=True)
+    reference = output.hidden_states[-1].double() @ model.lm_head.weight.double().t()
+    assert output.logits.dtype == torch.float32
+    torch.testing.assert_close(output.logits.double(), reference, rtol=0, atol=1e-5)
+
+
 def test_logits_dtype_survives_the_build_retry():
     # A failed SDPA patch rebuilds the model through _build_model's retry path.
     with patch(

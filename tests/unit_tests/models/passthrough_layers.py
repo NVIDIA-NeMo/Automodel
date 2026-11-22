@@ -39,8 +39,9 @@ def run_with_passthrough_layers(model: nn.Module, *args: Any, **kwargs: Any) -> 
         """Record and return a layer's hidden states.
 
         Args:
-            *layer_args: The layer's positional arguments; the first is its hidden states.
-            **layer_kwargs: The layer's keyword arguments; ``x`` holds the hidden states when none is positional.
+            *layer_args: The layer's positional arguments; the first is its hidden states, a tensor of shape
+                [batch, sequence, hidden] or packed [tokens, hidden].
+            **layer_kwargs: The layer's keyword arguments; ``x`` holds those hidden states when none is positional.
 
         Returns:
             The hidden states: Tensor of shape [batch, sequence, hidden], or packed [tokens, hidden].

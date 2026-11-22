@@ -204,6 +204,21 @@ def test_softcap_all_positions_tail_and_empty_supervision() -> None:
     assert torch.count_nonzero(model.lm_head.weight.grad) == 0
 
 
+@pytest.mark.parametrize("logits_dtype", [None, torch.bfloat16, torch.float32])
+def test_softcapped_logits_leave_in_the_requested_dtype(logits_dtype: torch.dtype | None) -> None:
+    """The softcap runs in FP32; the logits leave in the head's logits_dtype, FP32 by default."""
+    model = make_model()
+    model.lm_head.logits_dtype = logits_dtype
+    ids = torch.tensor([[1, 5, 7, 2]])
+
+    logits = model(ids).logits
+
+    assert logits.dtype == (logits_dtype or torch.float32)
+    cap = model.config.final_logit_softcapping
+    expected = cap * torch.tanh(model.lm_head(model(ids, output_hidden_states=True).hidden_states).float() / cap)
+    torch.testing.assert_close(logits.float(), expected.to(logits.dtype).float(), atol=0, rtol=0)
+
+
 def test_reject_unsupported_training_paths() -> None:
     model = make_model()
     ids = torch.tensor([[1, 2, 3]])
