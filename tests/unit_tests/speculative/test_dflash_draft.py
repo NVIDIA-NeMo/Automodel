@@ -16,10 +16,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
@@ -190,6 +194,77 @@ def test_spec_generate_keeps_generated_tokens_equal_to_the_mask_id():
     torch.testing.assert_close(out[:, : prompt.shape[1]], prompt)
     generated = out[0, prompt.shape[1] :]
     assert torch.all(generated == cfg.dflash_config["mask_token_id"])
+
+
+@pytest.mark.cpu_only
+def test_spec_generate_verifies_qwen3_5_image_prompt_after_rejections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay a real hybrid verifier after rejected image-token proposals."""
+    torch.manual_seed(0)
+    config = Qwen3_5Config(
+        text_config=Qwen3_5TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            layer_types=["linear_attention", "full_attention"],
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            rope_parameters={"rope_type": "default", "mrope_section": [2, 3, 3], "partial_rotary_factor": 1.0},
+            pad_token_id=0,
+            eos_token_id=None,
+        ),
+        vision_config=Qwen3_5VisionConfig(
+            depth=1,
+            hidden_size=32,
+            out_hidden_size=32,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=2,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            num_position_embeddings=16,
+        ),
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=62,
+        vision_end_token_id=63,
+    )
+    target = Qwen3_5ForConditionalGeneration._from_config(config, attn_implementation="sdpa").eval()
+    draft_config = _draft_cfg()
+    draft_config.num_target_layers = 2
+    draft_config.dflash_config = {"mask_token_id": 59, "target_layer_ids": [0]}
+    Qwen3DFlashDraftModel(draft_config).save_pretrained(tmp_path)
+    draft = Qwen3DFlashDraftModel.from_pretrained(tmp_path, attn_implementation="sdpa", local_files_only=True)
+
+    image_token_id = config.image_token_id
+    prompt = torch.tensor([[1, 62, image_token_id, image_token_id, image_token_id, image_token_id, 63, 2, 3]])
+    processor_outputs = {
+        "input_ids": prompt,
+        "attention_mask": torch.ones_like(prompt),
+        "pixel_values": torch.linspace(-1, 1, 16 * 24).reshape(16, 24),
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        "mm_token_type_ids": (prompt == image_token_id).long(),
+    }
+    expected = target.generate(**processor_outputs, max_new_tokens=6, do_sample=False, use_cache=True)
+    assert (expected[:, prompt.shape[1] :] != image_token_id).all()
+
+    def propose_image_token(hidden: torch.Tensor, output_head: torch.nn.Module) -> torch.Tensor:
+        """Produce a rejected proposal that would be misread as a new image in pixel replay."""
+        logits = output_head(hidden)
+        logits[..., image_token_id] = torch.inf
+        return logits
+
+    monkeypatch.setattr(draft, "compute_logits", propose_image_token)
+    result = draft.spec_generate(target, **processor_outputs, max_new_tokens=6, stop_token_ids=None, temperature=0.0)
+    torch.testing.assert_close(result, expected)
 
 
 def test_sliding_attention_layers_pick_up_the_window():

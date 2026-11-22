@@ -51,6 +51,7 @@ class DFlashTargetBatch:
     position_ids: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
     doc_remaining: torch.Tensor | None = None
+    visual_score: torch.Tensor | None = None  # [B, S] fixed-point offline label scores
 
 
 def resolve_text_config(config: Any) -> Any:

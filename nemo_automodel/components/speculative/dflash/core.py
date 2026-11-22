@@ -21,11 +21,16 @@ per anchor (the block's first token is the real anchor token, the rest are
 computes a block-wise cross-entropy loss against the ground-truth continuation
 of each anchor.
 
-Three training objectives are supported via ``loss_type``:
+Training objectives are selected via ``loss_type``:
 
 * ``"dflash"`` (default): the DFlash paper's fixed-anchor objective. Only block
   position 0 is a real token; positions ``1..block_size-1`` are supervised with
   the decay-weighted CE of Eq. 4 (``w_k = exp(-(k-1)/gamma)``).
+* ``"mmflash"`` uses the MMFlash fixed-anchor objective. Each supervised position
+  receives a detached product of smoothed draft confidences through that position
+  and a boost determined by its visual score and current draft confidence.
+  Unsupervised positions are excluded from both the product and the loss. The
+  weighted CE is summed over blocks and divided by the batch size.
 * ``"dpace*"``: the D-PACE objective (arXiv:2605.18810). Same fixed-anchor block
   as ``"dflash"``, but the CE is reweighted by detached Dynamic Position-Aware
   weights built from the draft's own confidence (see ``DFlashDecayLoss``);
@@ -62,6 +67,7 @@ from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
+from nemo_automodel.components.speculative.dflash.cached_data import VISUAL_SCORE_SCALE
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
@@ -196,17 +202,18 @@ class DFlashTrainerModule(nn.Module):
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
         sliding_window: int | None = None,
-        # dpace_alpha is the only parameter this PR actually adds; it is
-        # appended after every pre-existing parameter (including loss_type and
-        # prefix_weight_base, both predating D-PACE) and keyword-only, so an
-        # old positional caller's arguments keep binding to what they always
-        # bound to.
         *,
         dpace_alpha: float = 0.5,
-    ):
+        mmflash_smoothing: float = 0.5,
+        visual_alpha: float = 1.0,
+    ) -> None:
         super().__init__()
         if prefix_weight_base <= 0:
             raise ValueError(f"prefix_weight_base must be > 0, got {prefix_weight_base}")
+        if not 0.0 <= mmflash_smoothing <= 1.0:
+            raise ValueError(f"mmflash_smoothing must be in [0, 1], got {mmflash_smoothing}")
+        if not 0.0 <= visual_alpha < float("inf"):
+            raise ValueError(f"visual_alpha must be finite and >= 0, got {visual_alpha}")
         self.draft_model = draft_model
         # Keep the frozen target lm_head / embed_tokens as NON-registered
         # references. Under tensor parallelism their weights are DTensors; a
@@ -230,6 +237,8 @@ class DFlashTrainerModule(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = float(dpace_alpha)
+        self.mmflash_smoothing = float(mmflash_smoothing)
+        self.visual_alpha = float(visual_alpha)
         self.prefix_weight_base = float(prefix_weight_base)
         # Smallest visible-prefix length variable-prefix training samples (and the
         # slice point of its loss); single source of truth for both methods.
@@ -238,11 +247,11 @@ class DFlashTrainerModule(nn.Module):
         # Block-wise decay-weighted CE for the fixed-anchor objectives (``dflash``
         # and the D-PACE variants). ``normalize="mean"`` gives a local per-micro-batch
         # decay-weighted mean; ``loss_decay_gamma=None`` disables decay (uniform
-        # weights). The variable-prefix objective needs per-block data-dependent
-        # weights and computes its loss inline instead (see _variable_prefix_loss).
+        # weights). The variable-prefix and MMFlash objectives have their own
+        # loss reductions.
         self.loss_fn = (
             None
-            if loss_type == "variable_prefix"
+            if loss_type in {"mmflash", "variable_prefix"}
             else DFlashDecayLossConfig(
                 loss_gamma=loss_decay_gamma,
                 normalize="mean",
@@ -584,6 +593,32 @@ class DFlashTrainerModule(nn.Module):
             raise ValueError(f"label_ids must be on {input_ids.device}, got {label_ids.device}")
         return label_ids
 
+    @staticmethod
+    def _normalize_visual_score(input_ids: torch.Tensor, visual_score: torch.Tensor | None) -> torch.Tensor:
+        """Prepare the author-format MMFlash score channel for block gathering.
+
+        Args:
+            input_ids: Context IDs of shape [batch, sequence].
+            visual_score: Tensor of shape [batch, sequence] on the input device.
+                Int64 scores represent ``round(g * 10000)`` and floating scores
+                carry ``g`` directly. The ``-1`` text and padding sentinel is
+                treated as zero.
+
+        Returns:
+            Detached float32 scores of shape [batch, sequence] in [0, 1].
+        """
+        if visual_score is None:
+            raise ValueError("loss_type='mmflash' requires visual_score aligned with input_ids")
+        if visual_score.shape != input_ids.shape or visual_score.device != input_ids.device:
+            raise ValueError("visual_score must match the shape and device of input_ids")
+        if visual_score.dtype == torch.int64:
+            score = visual_score.float() / VISUAL_SCORE_SCALE
+        elif visual_score.is_floating_point():
+            score = visual_score.detach().float()
+        else:
+            raise ValueError("visual_score must be int64 or floating point")
+        return score.clamp(0.0, 1.0)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -593,6 +628,8 @@ class DFlashTrainerModule(nn.Module):
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
         label_ids: torch.Tensor | None = None,
+        *,
+        visual_score: torch.Tensor | None = None,
     ) -> DFlashStepMetrics:
         """Parallel block-wise training forward pass.
 
@@ -619,12 +656,17 @@ class DFlashTrainerModule(nn.Module):
                 id; exclude positions with ``loss_mask``, not ``-100``. Context,
                 clean anchors and visible ``variable_prefix`` tokens still use
                 ``input_ids``; ``None`` supervises ``input_ids``.
+            visual_score: Tensor of shape [batch, sequence], required for MMFlash.
+                Scores are indexed at the unshifted label position, on the same
+                device as ``input_ids``. Accepts int64 scores with scale 10000 or
+                floating scores in [0, 1], with ``-1`` for text and padding.
 
         Returns:
             DFlashStepMetrics for this micro-batch.
         """
         bsz, seq_len = input_ids.shape
         supervision_ids = self._resolve_supervision_ids(input_ids, label_ids)
+        visual_score = self._normalize_visual_score(input_ids, visual_score) if self.loss_type == "mmflash" else None
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
             self._prepare_block_inputs(
@@ -648,7 +690,7 @@ class DFlashTrainerModule(nn.Module):
         bs = self.block_size
 
         # Block position k predicts the token at anchor + k.
-        _, target_ids, block_mask = self._build_block_targets(
+        label_indices, target_ids, block_mask = self._build_block_targets(
             supervision_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
         )
 
@@ -663,31 +705,36 @@ class DFlashTrainerModule(nn.Module):
         pred_targets = target_ids[:, :, 1:]  # [bsz, n, bs-1]
         pred_mask = block_mask[:, :, 1:]  # [bsz, n, bs-1]
 
-        loss_fn = self.loss_fn
-        assert loss_fn is not None, "loss_fn is constructed for every loss_type except 'variable_prefix'"
-        # total_blocks=self.num_anchors: see the "dpace*" bullet above.
-        loss_details = loss_fn.forward_with_token_nll(
-            pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
-        )
-        loss_out = loss_details.output
-
-        # The loss reports the exact denominator it divided by (batch * blocks for
-        # D-PACE, the effective decay-weight sum for dflash), so read it directly --
-        # the metric can never drift from the loss's own normalization.
-        loss_weight = loss_details.denominator
-
-        count_per_pos = loss_out.draft_count_per_pos
-        valid_tokens = count_per_pos.sum()
-        correct_tokens = loss_out.draft_correct_per_pos.sum()
+        if visual_score is not None:
+            pred_positions = label_indices[:, :, 1:].clamp(max=seq_len - 1)
+            pred_scores = visual_score.gather(1, pred_positions.flatten(1)).reshape_as(pred_positions)
+            loss_weight = pred_logits.new_tensor(bsz, dtype=torch.float32)
+            loss = self._mmflash_loss_sum(pred_logits, pred_targets, pred_mask, pred_scores) / loss_weight
+            pred_ids = pred_logits.argmax(dim=-1)
+            valid_tokens = pred_mask.sum()
+            correct_tokens = ((pred_ids == pred_targets) * pred_mask).sum()
+        else:
+            loss_fn = self.loss_fn
+            assert loss_fn is not None, "the DFlash and D-PACE objectives use DFlashDecayLoss"
+            # total_blocks=self.num_anchors: see the "dpace*" bullet above.
+            loss_details = loss_fn.forward_with_token_nll(
+                pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
+            )
+            loss_out = loss_details.output
+            loss = loss_out.total_loss
+            loss_weight = loss_details.denominator
+            pred_ids = loss_details.pred_ids
+            valid_tokens = loss_out.draft_count_per_pos.sum()
+            correct_tokens = loss_out.draft_correct_per_pos.sum()
         accuracy = correct_tokens / valid_tokens.clamp_min(1)
         accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
-            loss_details.pred_ids,
+            pred_ids,
             pred_targets,
             pred_mask.bool(),
         )
 
         return DFlashStepMetrics(
-            loss=loss_out.total_loss,
+            loss=loss,
             loss_weight=loss_weight.detach(),
             accuracy=accuracy.detach(),
             valid_tokens=valid_tokens.detach(),
@@ -696,6 +743,38 @@ class DFlashTrainerModule(nn.Module):
             accept_len_sum=accept_len_sum.detach(),
             valid_blocks=valid_blocks.detach(),
         )
+
+    def _mmflash_loss_sum(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        block_mask: torch.Tensor,
+        visual_score: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum MMFlash weighted CE over the supervised predictions.
+
+        Args:
+            logits: Tensor of shape [batch, blocks, predicted, vocab], where
+                predicted is the number of positions following the anchor.
+            target_ids: Long tensor of shape [batch, blocks, predicted].
+            block_mask: Supervision mask of shape [batch, blocks, predicted].
+                Invalid positions multiply the prefix by one and incur zero CE.
+            visual_score: Normalized token scores of shape [batch, blocks, predicted].
+
+        Returns:
+            Differentiable scalar weighted CE sum, before normalization.
+        """
+        token_nll = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1), reduction="none"
+        ).reshape_as(target_ids)
+        with torch.no_grad():
+            weight_dtype = torch.promote_types(token_nll.dtype, torch.float32)
+            probability = torch.exp(-token_nll.to(weight_dtype))
+            confidence = self.mmflash_smoothing + (1.0 - self.mmflash_smoothing) * probability
+            prefix = confidence.masked_fill(block_mask <= 0, 1.0).cumprod(dim=-1)
+            boost = 1.0 + self.visual_alpha * visual_score.to(weight_dtype) * (1.0 - probability)
+            weights = prefix * boost * block_mask.to(weight_dtype)
+        return (token_nll * weights).sum()
 
     def _variable_prefix_loss(
         self,
