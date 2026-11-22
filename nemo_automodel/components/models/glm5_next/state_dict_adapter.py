@@ -4,8 +4,13 @@
 """Checkpoint conversion for the released GLM-5.3-Flash VLM.
 
 The checkpoint already uses the native vision/text prefix layout. Conversion is
-needed for grouped EP experts, flat mHC/KDA parameters, the extra MTP layer, and
+needed for grouped EP experts, flat mHC/KDA parameters, the MTP layer, and
 128x128 block-scaled FP8 training weights.
+
+The MTP layer is stored after the decoder stack as
+``model.language_model.layers.{num_hidden_layers + depth}`` with its final norm
+under ``shared_head.norm``; natively it is ``mtp.layers.{depth}`` with
+``final_layernorm``. With ``num_nextn_predict_layers=0`` it is dropped on load.
 """
 
 from __future__ import annotations
@@ -39,6 +44,10 @@ _NATIVE_HC_KEY = re.compile(
 )
 _KDA_PARAMETER = re.compile(r"^(model\.language_model\.layers\.\d+\.self_attn)\.(A_log|dt_bias)$")
 _NATIVE_KDA_PARAMETER = re.compile(r"^(model\.language_model\.layers\.\d+\.self_attn)\._fp32_params\.(A_log|dt_bias)$")
+_HF_LAYER = re.compile(r"^model\.language_model\.layers\.(\d+)\.(.+)$")
+_NATIVE_MTP_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.(.+)$")
+_HF_MTP_FINAL_NORM = "shared_head.norm."
+_NATIVE_MTP_FINAL_NORM = "final_layernorm."
 
 
 def _scale_shape(weight: torch.Tensor) -> tuple[int, int]:
@@ -201,6 +210,34 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         return "model.language_model."
 
     @property
+    def _num_mtp_layers(self) -> int:
+        return int(getattr(self.config.text_config, "num_nextn_predict_layers", 0) or 0)
+
+    def _hf_to_native_mtp_key(self, key: str) -> str:
+        """Rename a checkpoint key past the decoder stack to the native ``mtp.layers`` namespace."""
+        match = _HF_LAYER.match(key)
+        if match is None:
+            return key
+        depth = int(match.group(1)) - self.config.text_config.num_hidden_layers
+        if depth < 0:
+            return key
+        suffix = match.group(2)
+        if suffix.startswith(_HF_MTP_FINAL_NORM):
+            suffix = _NATIVE_MTP_FINAL_NORM + suffix[len(_HF_MTP_FINAL_NORM) :]
+        return f"mtp.layers.{depth}.{suffix}"
+
+    def _native_to_hf_mtp_key(self, key: str) -> str:
+        """Rename a native ``mtp.layers`` key to its checkpoint layer after the decoder stack."""
+        match = _NATIVE_MTP_LAYER.match(key)
+        if match is None:
+            return key
+        suffix = match.group(2)
+        if suffix.startswith(_NATIVE_MTP_FINAL_NORM):
+            suffix = _HF_MTP_FINAL_NORM + suffix[len(_NATIVE_MTP_FINAL_NORM) :]
+        layer_idx = self.config.text_config.num_hidden_layers + int(match.group(1))
+        return f"{self._hf_prefix}layers.{layer_idx}.{suffix}"
+
+    @property
     def _expert_path_segment(self) -> str:
         return "mlp.experts"
 
@@ -221,7 +258,10 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         match = _SPARSE_O_WEIGHT.match(key)
         if match is None:
             return False
-        return self.config.text_config.layer_types[int(match.group(1))] != "linear_attention"
+        layer_types = self.config.text_config.layer_types
+        layer_idx = int(match.group(1))
+        # MTP layers after the decoder stack use sparse attention.
+        return layer_idx >= len(layer_types) or layer_types[layer_idx] != "linear_attention"
 
     def from_hf(
         self,
@@ -229,12 +269,16 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         device_mesh: DeviceMesh | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Dequantize, drop MTP, route flat parameters and aggregate experts."""
+        """Dequantize, route flat parameters, aggregate experts and move MTP layers under ``mtp.``.
+
+        Checkpoint layers past ``num_hidden_layers + num_nextn_predict_layers``
+        are dropped, so a model built with MTP disabled ignores the MTP layer.
+        """
         del kwargs
-        layer_limit = self.config.text_config.num_hidden_layers
-        mtp_prefix = f"model.language_model.layers.{layer_limit}."
+        layer_limit = self.config.text_config.num_hidden_layers + self._num_mtp_layers
         for key in list(hf_state_dict):
-            if key.startswith(mtp_prefix):
+            match = _HF_LAYER.match(key)
+            if match is not None and int(match.group(1)) >= layer_limit:
                 hf_state_dict.pop(key)
         self._dequantize(hf_state_dict)
         for key in list(hf_state_dict):
@@ -245,7 +289,15 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             elif native_key.endswith("._fp32_params.dt_bias") or native_key.endswith(".e_score_correction_bias"):
                 value = value.float()
             hf_state_dict[native_key] = value
-        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+        native = self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+        if not self._num_mtp_layers:
+            return native
+        # Experts are merged under their checkpoint layer index; move the MTP layers
+        # (and the record of experts DCP loaded in place) to the native namespace.
+        view_loaded = getattr(self, "_view_loaded_native_keys", None)
+        if view_loaded:
+            self._view_loaded_native_keys = {self._hf_to_native_mtp_key(key) for key in view_loaded}
+        return {self._hf_to_native_mtp_key(key): value for key, value in native.items()}
 
     def to_hf(
         self,
@@ -271,6 +323,9 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         """Convert one native tensor, including split expert and FP8 load targets."""
         exclude = kwargs.get("exclude_key_regex")
         quantization = kwargs.get("quantization", False)
+        # Expert splitting reads the layer index from the key, so MTP keys take their
+        # checkpoint layer index first.
+        fqn = self._native_to_hf_mtp_key(fqn)
         expert = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         result = expert if expert is not None else [(fqn, tensor)]
         converted: list[tuple[str, Any]] = []
