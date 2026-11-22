@@ -1,0 +1,618 @@
+---
+title: "Nemotron 3.5 Decision"
+description: "Post-train Nemotron 3.5 Decision 8B on fictional SOC alert triage with LoRA or full fine-tuning, then export it and score typed decisions with Hugging Face Transformers."
+position: 16
+---
+**A step-by-step guide to post-training Nemotron 3.5 Decision 8B with
+[NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The model is an 8B bidirectional diffusion language model
+that answers typed decision questions in one forward pass. The guide runs LoRA on a single GPU or full fine-tuning on
+one node on a fictional SOC alert-triage dataset, then exports the result and scores it with plain Hugging Face
+Transformers.**
+
+---
+
+## What is Nemotron 3.5 Decision?
+
+Nemotron 3.5 Decision 8B (architecture `NemotronLabsDiffusionModel`) answers **typed decision questions** about a
+structured or free-text *state*. Each question is one of three types:
+
+| Type | Answer | Example |
+|------|--------|---------|
+| `choice` | One of several named options | "Which team should handle the ticket?" → `billing` |
+| `noul` | Yes or no (`true` / `false`) | "Does this alert need analyst review?" → `false` |
+| `score` | A position on an ordered scale | "How severe is the event?" → `Low` |
+
+The model does not generate text. It reads the question once, bidirectionally, with a single mask token in the
+answer slot. Its diffusion head, restricted to the option codes, gives **a probability for every option** in one
+forward pass, with no sampling.
+
+Key architectural details:
+- **Backbone**: 34-layer bidirectional transformer, hidden dim 4096, 32 attention heads (8 KV heads), head dim 128
+- **Vocabulary**: 131,072 tokens; diffusion mask token id `100`
+- **Context**: YaRN RoPE scaling to 262,144 positions
+- **Attention**: fully bidirectional (`dlm_paradigm: bidirectional`); text only
+- **Parameters**: 8.49B in total, of which 7.42B are decoder layers; ~17 GB in bf16
+
+## Post-Train for SOC Alert Triage
+
+This guide post-trains the model on a **fictional SOC (security operations center) alert-triage** dataset that ships
+with NeMo AutoModel. Every alert comes with five questions:
+
+| Question | Type | Options |
+|----------|------|---------|
+| `verdict` | `choice` | `malicious`, `benign_authorized`, `false_positive` |
+| `action` | `choice` | `close`, `monitor`, `escalate`, `contain` |
+| `attack_tactic` | `choice` | `credential_access`, `execution` |
+| `needs_human` | `noul` | `true`, `false` |
+| `severity` | `score` | `Informational`, `Low`, `Medium`, `High`, `Critical` |
+
+The labels follow a fictional tutorial policy. The base model answers from general knowledge: it gets 70% of the
+held-out questions right, and only 38% of the `severity` questions. After 40 LoRA steps it follows the policy on
+every held-out question. The same recipe runs on your own decisions (see
+[Bring Your Own Decisions](#bring-your-own-decisions)).
+
+<Warning>
+The tutorial data and labels are fictional. Accuracy on them shows that post-training works; it does not measure
+operational security performance.
+</Warning>
+
+## Guide Overview
+
+| Step | Description |
+|------|-------------|
+| **Step 0** | Environment setup |
+| **Step 1** | Prepare the SOC triage dataset |
+| **Step 2** | Training configuration (LoRA and full fine-tuning) |
+| **Step 3** | Score the base model, then launch post-training |
+| **Step 4** | Export the selected stage and run inference with Transformers |
+| **Step 5** | Results |
+
+## Hardware Requirements
+
+- **LoRA**: one GPU. Peak memory was ~18 GiB with this dataset's short prompts (bf16 base, activation
+  checkpointing); longer states need more.
+- **Full fine-tuning**: one node of 8 GPUs (~26 GiB peak per GPU; fp32 weights and AdamW state for the decoder
+  layers, sharded with FSDP2).
+- **Training time** (measured on 8x B200): LoRA ~3.5 min on one GPU and full fine-tuning ~3 min on 8 GPUs. Both
+  include model loading, validation, and test scoring. Scoring the base model takes ~1 min.
+- **Disk**: ~17 GB for the base checkpoint, ~180 MB per LoRA stage (adapter only), ~51 GB per full fine-tuning stage
+  (sharded and consolidated weights), and ~17 GB per exported checkpoint.
+
+---
+
+## Step 0 — Set Up the Environment
+
+```bash
+# Inside the NeMo AutoModel container:
+cd /opt/Automodel
+
+# Or from a source checkout:
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
+```
+
+Place the Nemotron 3.5 Decision 8B bf16 checkpoint in a **local directory**. This guide uses
+`checkpoints/nemotron-3.5-decision-8b`.
+
+<Note>
+Use the local directory, not a Hugging Face id, in every command below. Each saved stage records a fingerprint of
+the base checkpoint's configuration and weights, and the export refuses to merge a stage into a base it was not
+trained on. The fingerprint is only recorded when the base is a local directory.
+</Note>
+
+The recipe accepts bidirectional text checkpoints in the `NemotronLabsDiffusionModel` layout: `config.json` lists
+`"architectures": ["NemotronLabsDiffusionModel"]` and sets `"dlm_paradigm": "bidirectional"`. Block-causal, vision,
+and quantized (for example, NVFP4) variants stop at setup with an explicit error. Post-train the bf16 checkpoint and
+quantize afterwards.
+
+---
+
+## Step 1 — Prepare the SOC Triage Dataset
+
+Generate the fictional alerts. The generator is deterministic for a given seed. It needs no model, API key, or GPU,
+and it refuses to overwrite an existing directory:
+
+```bash
+PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+    --output-dir data/soc_triage --seed 7
+```
+
+Expected output:
+```
+INFO:__main__:Wrote {'train': 128, 'validation': 32, 'test': 32}
+```
+
+Each record holds one alert (`state`), its five `questions`, and the policy's `answers`:
+
+```json
+{
+  "id": "fictional-7-00000",
+  "state": {
+    "asset": "host-00000.example",
+    "asset_impact": "critical",
+    "behavior": "credential read attempt",
+    "evidence": "A signed maintenance ticket and the approved schedule explain the activity.",
+    "evidence_quality": "clear",
+    "source_ip": "192.0.2.1"
+  },
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "What explains the observed security alert?",
+      "criteria": {
+        "malicious": "The evidence supports an unauthorized attack.",
+        "benign_authorized": "The activity is authorized and expected.",
+        "false_positive": "A sensor artifact explains the alert."
+      }
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is the event under the tutorial policy?",
+      "criteria": ["Informational", "Low", "Medium", "High", "Critical"]
+    }
+  },
+  "answers": {"verdict": "benign_authorized", "severity": "1"}
+}
+```
+
+(Two of the five questions and some `state` fields are shown.)
+
+### Convert to One-Question Rows
+
+The model is trained the way it is served: **one question per read**. Convert each alert into five rows:
+
+```bash
+uv run python examples/decision/prepare_deciffusion_data.py systemone \
+    --input-dir data/soc_triage --output data/soc_triage_rows
+```
+
+Expected output:
+```json
+{
+  "rows": {"train": 640, "validation": 160, "test": 160},
+  "groups": {"train": 128, "validation": 32, "test": 32},
+  "group_overlap": 0,
+  "types": {"choice": 576, "noul": 192, "score": 192},
+  "soft_label_rows": 0
+}
+```
+
+All five questions about one alert stay in the same split (`group_overlap: 0`), so the validation and test alerts
+are never seen in training. A converted row:
+
+```json
+{
+  "id": "fictional-7-00000/action",
+  "input": {
+    "state": {"asset": "host-00000.example", "behavior": "credential read attempt", "...": "..."},
+    "questions": {
+      "action": {
+        "type": "choice",
+        "instructions": "Which response follows the tutorial policy?",
+        "criteria": {
+          "close": "Close the alert.",
+          "contain": "Contain the affected asset.",
+          "escalate": "Ask an analyst to investigate.",
+          "monitor": "Monitor the asset without containment."
+        }
+      }
+    }
+  },
+  "reference": {"target": "close"},
+  "group": "fictional-7-00000"
+}
+```
+
+### Serving Prompt Format
+
+The recipe renders every row exactly as the serving path does:
+- a fixed system message, then a JSON user turn `{"state", "question", "options"}`;
+- options in a fixed position order, each with a single-token code (`A`, `B`, ...);
+- special tokens inside user text escaped, so they cannot act as control tokens;
+- a single mask token after the prompt.
+
+The probability of each option is the diffusion head's distribution at that mask, restricted to the option codes.
+
+### Bring Your Own Decisions
+
+For your own data, write one decision per line:
+
+```json
+{"state": {"ticket": "I was charged twice for my March invoice."}, "question": "Which team should handle the ticket?", "type": "choice", "options": {"billing": "payments, invoices, refunds", "technical": "bugs, outages"}, "label": "billing", "group": "customer-0042"}
+```
+
+`soft_labels` (a probability per option) is optional. Rows that share a `group` stay in the same split, which keeps
+near-duplicates out of validation and test. Convert with:
+
+```bash
+uv run python examples/decision/prepare_deciffusion_data.py simple \
+    --input my_decisions.jsonl --output data/my_rows --split three-way
+```
+
+`--split three-way` writes group-disjoint `train` / `validation` / `test` files. Then point the `data.*` paths of
+`examples/decision/deciffusion_support_routing_lora.yaml` (or the SOC config) at them.
+
+---
+
+## Step 2 — Training Configuration
+
+**Config file**: `examples/decision/deciffusion_soc_triage_lora.yaml`
+
+```yaml
+recipe: nemo_automodel.recipes.decision.train_deciffusion.TrainDeciffusionDecisionRecipe
+
+mode: train            # eval | train
+seed: 101
+output_dir: runs/soc/lora
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /path/to/deciffusion-checkpoint   # a bidirectional text checkpoint directory
+  torch_dtype: bfloat16
+  trust_remote_code: true
+  dlm_paradigm: bidirectional
+  attn_implementation: sdpa
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*.q_proj"
+    - "*.k_proj"
+    - "*.v_proj"
+    - "*.o_proj"
+    - "*.gate_proj"
+    - "*.up_proj"
+    - "*.down_proj"
+  dim: 32
+  alpha: 64
+  dropout: 0.0
+
+distributed:
+  strategy: fsdp2
+  activation_checkpointing: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  save_consolidated: false  # LoRA stages save adapters; export_deciffusion.py merges them
+
+data:
+  train: data/soc_triage_rows/train.jsonl
+  validation: data/soc_triage_rows/validation.jsonl
+  test: data/soc_triage_rows/test.jsonl
+  max_tokens: 8192       # rows whose prompt + mask is longer are skipped and counted
+
+train:
+  global_batch_size: 16  # rows per optimizer step over all ranks
+  epochs: 1.0
+  warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
+  min_lr_ratio: 0.1
+  canonical_fraction: 0.5  # share of reads in serving option order; the rest are shuffled and re-coded
+  kl_weight: 0.0         # 0: cross-entropy; > 0: CE(gold) + kl_weight * KL(soft || p)
+  max_grad_norm: 1.0
+  val_every_steps: 50
+```
+
+What the recipe trains:
+
+- **Loss**: cross-entropy over the options against the gold label, or against `soft_labels` when a row has them.
+  `train.kl_weight > 0` switches to gold cross-entropy plus a weighted KL term to the soft labels.
+- **Option shuffle**: half of the training reads (`canonical_fraction: 0.5`) keep the serving option order. The other
+  half shuffle the options and re-code them by position. The model learns what the options *mean*, not which letter
+  they had.
+- **Frozen readout**: the embeddings and diffusion head never train, and no new parameters are added. The exported
+  checkpoint is scored by the unchanged serving path.
+- **Long rows**: rows longer than `data.max_tokens` are skipped and counted, never truncated.
+
+With rank 32 on the attention and MLP projections of all 34 layers, LoRA trains **89.1M parameters (1.04% of the
+model)**.
+
+### Full Fine-Tuning
+
+Override four keys on the command line to fully fine-tune the decoder layers and final norm:
+
+```bash
+--peft None --optimizer.lr 1.0e-6 --model.torch_dtype float32 --checkpoint.save_consolidated every
+```
+
+Full fine-tuning trains **7.42B parameters**. The embeddings and the diffusion head stay frozen. It keeps fp32
+weights and AdamW state for them, so it uses one node of 8 GPUs (see
+[Hardware Requirements](#hardware-requirements)).
+
+---
+
+## Step 3 — Launch Post-Training
+
+### Score the Base Model
+
+Run the same config in `eval` mode to get the *before* numbers on the validation and test splits:
+
+```bash
+automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 --mode eval \
+    --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
+    --output_dir runs/soc/base
+```
+
+```
+[eval] validation accuracy=0.7562 ce=0.5878
+[eval] test accuracy=0.7000 ce=0.6932
+```
+
+### LoRA
+
+```bash
+automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 \
+    --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
+    --output_dir runs/soc/lora
+```
+
+One epoch of the 640 training rows at 16 rows per step is **40 optimizer steps**. Validation runs on the starting
+checkpoint (step 0) and on the final step.
+
+### Full Fine-Tuning
+
+```bash
+automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 8 \
+    --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
+    --peft None --optimizer.lr 1.0e-6 --model.torch_dtype float32 --checkpoint.save_consolidated every \
+    --output_dir runs/soc/full
+```
+
+### Training Log for LoRA
+
+```
+Trainable parameters: 89,128,960
+Trainable parameters percentage: 1.04%
+
+validation {"step": 0, "accuracy": 0.75625, "correct": 121, "cross_entropy": 0.5878, "rows": 160}
+training {"step": 1, "epoch": 1, "loss": 0.77054, "grad_norm": 34.7594, "lr": 5e-05, "seconds": 3.71}
+training {"step": 10, "epoch": 1, "loss": 0.0758, "grad_norm": 2.5217, "lr": 9.05e-05, "seconds": 3.23}
+training {"step": 20, "epoch": 1, "loss": 0.00376, "grad_norm": 0.1085, "lr": 5.87e-05, "seconds": 3.38}
+training {"step": 30, "epoch": 1, "loss": 0.00037, "grad_norm": 0.0433, "lr": 2.45e-05, "seconds": 3.22}
+training {"step": 40, "epoch": 1, "loss": 0.00014, "grad_norm": 0.0055, "lr": 1e-05, "seconds": 3.23}
+validation {"step": 40, "accuracy": 1.0, "correct": 160, "cross_entropy": 0.0001, "rows": 160}  <-- LOWEST_VAL
+
+[train] validation accuracy=1.0000 ce=0.0001
+[train] test accuracy=1.0000 ce=0.0001
+```
+
+Each step takes ~3.3 s on one B200 (16 rows, activation checkpointing).
+
+### Training Log for Full Fine-Tuning
+
+```
+validation {"step": 0, "accuracy": 0.75625, "correct": 121, "cross_entropy": 0.5899, "rows": 160}
+training {"step": 1, "epoch": 1, "loss": 0.77494, "grad_norm": 151.8929, "lr": 5e-07, "seconds": 2.64}
+training {"step": 10, "epoch": 1, "loss": 0.06555, "grad_norm": 17.7863, "lr": 9.05e-07, "seconds": 0.9}
+training {"step": 20, "epoch": 1, "loss": 0.12657, "grad_norm": 15.5584, "lr": 5.87e-07, "seconds": 0.44}
+training {"step": 30, "epoch": 1, "loss": 0.03214, "grad_norm": 2.5924, "lr": 2.45e-07, "seconds": 0.49}
+training {"step": 40, "epoch": 1, "loss": 0.02368, "grad_norm": 1.5179, "lr": 1e-07, "seconds": 0.49}
+validation {"step": 40, "accuracy": 1.0, "correct": 160, "cross_entropy": 0.0251, "rows": 160}  <-- LOWEST_VAL
+
+[train] validation accuracy=1.0000 ce=0.0251
+[train] test accuracy=1.0000 ce=0.0269
+```
+
+The parameter summary printed when the model is built counts all 8.49B parameters. The recipe then freezes the
+embeddings and the diffusion head, so 7.42B parameters train.
+
+With a 100x lower learning rate, full fine-tuning reaches the same accuracy with less confident probabilities
+(cross-entropy 0.025 against 0.0001 for LoRA).
+
+### How a Stage Is Selected
+
+Validation publishes the best stage as `LOWEST_VAL`: **most correct validation rows first, then lowest
+cross-entropy**. For LoRA the starting checkpoint (step 0) is a saved, selectable stage, so a run that does not help
+publishes the base unchanged. Full fine-tuning selects among its trained stages. The test split is scored once, on
+the selected stage, and is never used for selection.
+
+### Checkpoints Saved
+
+```
+runs/soc/lora/
+  step_00000000/            # the starting checkpoint (LoRA only)
+  step_00000040/
+    model/
+      adapter_config.json
+      adapter_model.safetensors   # ~180 MB
+    stage.json              # base path and fingerprint, method, mask and readout ids, validation record
+    losses.json
+  LATEST -> step_00000040
+  LOWEST_VAL -> step_00000040
+  run_config.json
+  training.jsonl
+  validation.jsonl
+  selected.json             # the published step and its validation record
+  metrics_validation.json   # accuracy, cross-entropy, per-type accuracy, per-row probabilities
+  metrics_test.json
+```
+
+A full fine-tuning stage holds `model/consolidated/` (a Hugging Face export of the trained weights) instead of the
+adapter.
+
+---
+
+## Step 4 — Export and Run Inference
+
+### Export the Selected Stage
+
+Merge the selected LoRA stage into the base weights (`W += (alpha / r) * B @ A`, computed in fp32). The export writes
+a complete, standalone checkpoint:
+
+```bash
+uv run python examples/decision/export_deciffusion.py \
+    --base checkpoints/nemotron-3.5-decision-8b \
+    --stage runs/soc/lora/LOWEST_VAL \
+    --output exports/soc_lora
+```
+
+```json
+{
+  "stage": "runs/soc/lora/step_00000040",
+  "base": "checkpoints/nemotron-3.5-decision-8b",
+  "adapter": "runs/soc/lora/step_00000040/model",
+  "lora_modules": 238,
+  "r": 32,
+  "alpha": 64,
+  "scale": 2.0
+}
+```
+
+The same command exports a full fine-tuning stage (`--stage runs/soc/full/LOWEST_VAL`), cast to the base dtypes. The
+export first checks the stage's base fingerprint and refuses a base the stage was not trained on. It copies the base
+configuration, tokenizer, and model code unchanged, so the output loads anywhere the base loads. Each export takes
+~45 s.
+
+### Score Decisions with Transformers
+
+Load the export with plain Transformers. `prepare_question` renders the serving prompt. One bidirectional read with a
+trailing mask token gives the probability of every option. The example below is a held-out test alert:
+
+```python
+import torch
+from transformers import AutoModel, PreTrainedTokenizerFast
+
+from nemo_automodel.components.models.deciffusion import prepare_question
+
+CKPT = "exports/soc_lora"  # or checkpoints/nemotron-3.5-decision-8b for the base model
+
+tokenizer = PreTrainedTokenizerFast.from_pretrained(CKPT)
+model = AutoModel.from_pretrained(
+    CKPT, trust_remote_code=True, dtype=torch.bfloat16, attn_implementation="sdpa"
+).cuda().eval()
+
+
+@torch.inference_mode()
+def decide(state, question_id, question):
+    """Probability of every option of one question."""
+    prompt = prepare_question(tokenizer, state, question_id, question)
+    ids = torch.tensor([[*prompt.input_ids, model.mask_token_id]], device="cuda")
+    hidden = model.encoder(input_ids=ids, use_cache=False, use_causal_mask=False, is_training=False).last_hidden_state
+    logits = model.diffusion_head(hidden[:, -1]).float()[0, list(prompt.code_token_ids)]
+    return {label: round(p, 4) for label, p in zip(prompt.labels, logits.softmax(-1).tolist())}
+
+
+alert = {
+    "asset": "host-00162.example",
+    "asset_impact": "critical",
+    "behavior": "credential read attempt",
+    "contact": "analyst-00162@example.com",
+    "event_id": "event-7-00162",
+    "evidence": "A replayed sensor event does not correspond to activity on this asset.",
+    "evidence_quality": "ambiguous",
+    "source_ip": "192.0.2.163",
+}
+action = {
+    "type": "choice",
+    "instructions": "Which response follows the tutorial policy?",
+    "criteria": {
+        "close": "Close the alert.",
+        "contain": "Contain the affected asset.",
+        "escalate": "Ask an analyst to investigate.",
+        "monitor": "Monitor the asset without containment.",
+    },
+}
+print(decide(alert, "action", action))
+```
+
+Output of the post-trained export, with the base model on the same alert for comparison:
+```
+exports/soc_lora:                      {'contain': 0.0, 'escalate': 0.9999, 'close': 0.0, 'monitor': 0.0}
+checkpoints/nemotron-3.5-decision-8b:  {'contain': 0.0154, 'escalate': 0.1034, 'close': 0.8658, 'monitor': 0.0154}
+```
+
+The evidence is ambiguous and the asset is critical, so the tutorial policy escalates. The base model closes the
+alert with 87% confidence; the post-trained model escalates. The keys follow the prompt's option order. `score`
+options come back as their positions (`"0"` for `Informational` through `"4"` for `Critical`), and `noul` options
+as `"true"` / `"false"`.
+
+### Evaluate the Test Split
+
+Score the converted test rows with the same read. `encode_row` builds the prompt and the gold option index exactly as
+the recipe does:
+
+```python
+from nemo_automodel.components.models.deciffusion import encode_row
+from nemo_automodel.components.models.deciffusion.rows import read_jsonl
+
+correct = total = 0
+with torch.inference_mode():
+    for row in read_jsonl("data/soc_triage_rows/test.jsonl"):
+        example = encode_row(tokenizer, row, max_tokens=8192)
+        if example is None:
+            continue
+        ids = torch.tensor([[*example.prompt.input_ids, model.mask_token_id]], device="cuda")
+        hidden = model.encoder(input_ids=ids, use_cache=False, use_causal_mask=False, is_training=False).last_hidden_state
+        logits = model.diffusion_head(hidden[:, -1]).float()[0, list(example.prompt.code_token_ids)]
+        correct += int(logits.argmax()) == example.gold
+        total += 1
+print(f"test accuracy {correct / total:.4f} ({correct}/{total})")
+```
+
+```
+test accuracy 1.0000 (160/160)
+```
+
+The export reproduces the recipe's `metrics_test.json`: the same decision on all 160 test questions, with a maximum
+absolute probability difference of 5e-5. On the base checkpoint the same loop gives 0.7063 (113/160). One near-tie
+row resolves differently from the recipe's evaluation (0.7000), because the two runs round in bf16 differently.
+
+**Resources:** one GPU with ~16 GiB for the bf16 weights.
+**Runtime:** ~116 ms per question on 1x B200, one question at a time; the 160 test questions take ~19 s.
+
+---
+
+## Step 5 — Results
+
+### Evaluation on the 160 Test Questions (32 Held-Out Alerts)
+
+| Model | Accuracy | Cross-entropy | `choice` | `noul` | `score` |
+|---|---|---|---|---|---|
+| Base | 70.0% (112/160) | 0.693 | 78.1% | 78.1% | 37.5% |
+| LoRA, step 40 (`LOWEST_VAL`) | **100% (160/160)** | **0.0001** | 100% | 100% | 100% |
+| Full fine-tuning, step 40 (`LOWEST_VAL`) | **100% (160/160)** | 0.027 | 100% | 100% | 100% |
+
+### Accuracy by Question
+
+| Question | Base | LoRA | Full fine-tuning |
+|---|---|---|---|
+| `verdict` | 20/32 | 32/32 | 32/32 |
+| `action` | 23/32 | 32/32 | 32/32 |
+| `attack_tactic` | 32/32 | 32/32 | 32/32 |
+| `needs_human` | 25/32 | 32/32 | 32/32 |
+| `severity` | 12/32 | 32/32 | 32/32 |
+
+The base model already identifies the behavior behind an alert (`attack_tactic`). Its mistakes are the policy's
+choices, which it has no way to know: what a controlled test artifact means, when an ambiguous alert on a critical
+asset is escalated, and where the severity thresholds sit. Post-training teaches those rules. Both methods reach
+100% here because the fictional policy is deterministic. On your own data, compare the two methods on your held-out
+split.
+
+### Sample Predictions (Test Split)
+
+| Alert evidence | Question | Gold | Base: top answer (p) | LoRA: top answer (p) |
+|---|---|---|---|---|
+| A replayed sensor event does not correspond to activity on this asset (ambiguous, critical asset) | `action` | `escalate` | `close` (0.87) | `escalate` (1.00) |
+| Same alert | `needs_human` | `true` | `false` (0.56) | `true` (1.00) |
+| A controlled test artifact matches the detection and no authorized change exists (clear) | `verdict` | `malicious` | `false_positive` (0.75) | `malicious` (1.00) |
+| A signed maintenance ticket and the approved schedule explain the activity (ambiguous) | `severity` | `Low` | `Informational` (0.48) | `Low` (1.00) |
+
+### Summary
+
+| | LoRA | Full fine-tuning |
+|---|---|---|
+| Trainable params | 89.1M (1.04%) | 7.42B (decoder layers and final norm) |
+| Learning rate | 1e-4 (AdamW, cosine) | 1e-6 (AdamW, cosine) |
+| GPU memory | ~18 GiB on 1 GPU | ~26 GiB / GPU on 8 GPUs |
+| Training time | ~3.5 min on 1x B200 | ~3 min on 8x B200 |
+| Test accuracy | 100% (base 70.0%) | 100% (base 70.0%) |
+| Test cross-entropy | 0.0001 | 0.027 |
+| Stage size | ~180 MB (adapter only) | ~51 GB (sharded and consolidated) |
+| Export | merged into a ~17 GB bf16 checkpoint | cast to the base dtypes, ~17 GB |

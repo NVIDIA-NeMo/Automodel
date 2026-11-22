@@ -83,6 +83,9 @@ codes, special tokens in user text neutralized) followed by one mask token. One 
 frozen diffusion head's logits at the mask, restricted to the option codes, are the answer distribution. No extra
 readout parameters are trained, so an exported checkpoint is scored by the unchanged serving path.
 
+For a step-by-step walkthrough with training logs and results, see the
+[Nemotron 3.5 Decision guide](../../docs/guides/dllm/nemotron-3-5-decision.mdx).
+
 * Loss: cross-entropy against `soft_labels` when a row has them, otherwise against the gold label;
   `train.kl_weight > 0` switches to gold cross-entropy plus a weighted KL to the soft labels.
 * `train.canonical_fraction` (default 0.5) of training reads keep the serving option order; the rest are shuffled and
