@@ -2601,6 +2601,8 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
         if hasattr(module, "init_lora_weights"):
             try:
                 module.init_lora_weights(peft_init_method)
+            except ValueError:
+                raise
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
 
