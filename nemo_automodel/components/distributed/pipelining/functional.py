@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import copy
 import functools
 import inspect
 import logging
 import math
 import os
+import re
 import time
 import types
 from typing import Callable, Protocol
@@ -46,7 +48,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _get_optional_hook(module: object, name: str) -> Callable | None:
+def _get_optional_hook(module: nn.Module, name: str) -> Callable | None:
     try:
         inspect.getattr_static(module, name)
     except AttributeError:
@@ -311,7 +313,7 @@ def _precompute_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
-) -> None:
+) -> int:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
     By default, PipelineStage performs shape inference at runtime via a serial P2P chain:
@@ -327,15 +329,22 @@ def _precompute_stage_shapes(
         model_config: The HuggingFace model config (``model.config``).
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
+
+    Returns:
+        Maximum local token count across stage outputs for runtime initialization.
+        A packed primary output has layout [tokens, hidden]; batch-major outputs
+        have layout [batch, local_sequence, ...]. Trailing feature or
+        hyper-connection dimensions do not multiply the token count.
     """
     if stages and not all(
         callable(getattr(stage, "_configure_outputs_meta", None)) or getattr(stage, "_user_meta", None) is not None
         for stage in stages
     ):
         logger.info("PipelineStage does not expose a supported static metadata API; using dynamic metadata inference")
-        return
+        return microbatch_size * seq_len
 
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
+    local_token_counts = []
 
     for stage in stages:
         if tensor_dtype is None:
@@ -355,6 +364,12 @@ def _precompute_stage_shapes(
                 dtype=model_dtype,
             )
             _set_stage_metas(stage, inputs_meta, outputs_meta)
+            primary_output = outputs_meta[0]
+            local_token_counts.append(
+                primary_output.shape[0]
+                if primary_output.ndim == 2
+                else primary_output.shape[0] * primary_output.shape[1]
+            )
             continue
 
         # --- inputs_meta ---
@@ -374,11 +389,13 @@ def _precompute_stage_shapes(
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)
         _set_stage_metas(stage, inputs_meta, outputs_meta)
+        local_token_counts.append(microbatch_size * seq_len)
 
     logger.info(
         f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
         f"serial shape inference bypassed"
     )
+    return max(local_token_counts, default=microbatch_size * seq_len)
 
 
 def _warmup_pipeline_stage_neighbors(stage: PipelineStage) -> None:
@@ -493,7 +510,7 @@ def reset_pp_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
-) -> None:
+) -> int:
     """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
 
     VLM training produces batches with highly variable sequence lengths (image tokens expand
@@ -512,6 +529,9 @@ def reset_pp_stage_shapes(
         model_config: The HuggingFace model config (``model.config``).
         microbatch_size: Per-microbatch batch size used by the schedule.
         seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
+
+    Returns:
+        Maximum local token count across the recomputed stage outputs.
     """
     for stage in stages:
         # PyTorch <= 2.10 stores static metadata in these fields.
@@ -539,7 +559,9 @@ def reset_pp_stage_shapes(
         stage.grad_send_info = None
 
     # Analytically set shapes for the new seq_len (no forward pass)
-    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
+    local_num_tokens = _precompute_stage_shapes(
+        stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype
+    )
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
@@ -549,6 +571,7 @@ def reset_pp_stage_shapes(
     if hasattr(schedule, "_stages_forward_initialized"):
         schedule._stages_forward_initialized = False
         schedule._stages_backward_initialized = False
+    return local_num_tokens
 
 
 def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
@@ -594,6 +617,53 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
     stage_model.forward = _pp_tensor_forward
 
 
+def _stage_layer_ids(module_names: list[str], layers_prefix: str, num_layers: int) -> list[int]:
+    """Return the decoder layers a stage retains under the splitter's rules.
+
+    The splitter keeps a module whole when its FQN is listed, so a listed ancestor of the layer container
+    (``model.layers`` or ``model``) retains every layer; otherwise a layer is retained when its own FQN is
+    listed.
+    """
+    container = f"{layers_prefix}layers"
+    parts = container.split(".")
+    ancestors = {".".join(parts[:k]) for k in range(1, len(parts) + 1)}
+    names = set(module_names)
+    if names & ancestors:
+        return list(range(num_layers))
+    # The splitter matches ModuleDict keys by exact string, so only the canonical decimal form of an index,
+    # and nothing around it, retains a layer: neither ``layers.04`` nor ``layers.4`` with a trailing newline.
+    pattern = re.compile(rf"{re.escape(container)}\.(0|[1-9][0-9]*)")
+    return sorted({int(m.group(1)) for name in names if (m := pattern.fullmatch(name))})
+
+
+def _check_partition_lists_every_layer_once(
+    module_names_per_stage: list[list[str]], layers_prefix: str, num_layers: int
+) -> None:
+    """Reject an explicit partition that omits, repeats, invents or reorders a decoder layer.
+
+    A trimmed stage sees only its own modules, so a layer that no stage retains runs zero times, a layer that
+    two stages retain runs twice, and layers assigned to stages out of order run out of order, while the stages'
+    wire contracts still match.
+    """
+    per_stage = [_stage_layer_ids(names, layers_prefix, num_layers) for names in module_names_per_stage]
+    listed = [i for ids in per_stage for i in ids]
+    counts = collections.Counter(listed)
+    missing = [i for i in range(num_layers) if i not in counts]
+    repeated = sorted(i for i, count in counts.items() if count > 1)
+    unknown = sorted(i for i in counts if i >= num_layers)
+    if missing or repeated or unknown:
+        raise ValueError(
+            "module_fqns_per_model_part must retain every decoder layer exactly once: "
+            f"missing {missing}, repeated {repeated}, beyond the model {unknown}"
+        )
+    if listed != sorted(listed):
+        ranges = [(ids[0], ids[-1]) if ids else None for ids in per_stage]
+        raise ValueError(
+            "module_fqns_per_model_part must assign decoder layers to stages in increasing order; "
+            f"the stages retain the layer ranges {ranges}"
+        )
+
+
 def split_model_into_stages(
     model: torch.nn.Module,
     pp_mesh: DeviceMesh,
@@ -628,7 +698,7 @@ def split_model_into_stages(
     text_model = get_text_module(model.model if has_model_attr else model)
     text_model_attr_name = ""
     for attr_name in TEXT_MODULE_ATTRS:
-        if hasattr(model, attr_name) or hasattr(model.model, attr_name):
+        if hasattr(model, attr_name) or (has_model_attr and hasattr(model.model, attr_name)):
             text_model_attr_name = attr_name
             break
     has_rotary_emb = hasattr(text_model, "rotary_emb")
@@ -705,6 +775,8 @@ def split_model_into_stages(
             )
             if custom_module_names is not None:
                 module_names_per_stage = custom_module_names
+    else:
+        _check_partition_lists_every_layer_once(module_names_per_stage, layers_prefix, num_layers)
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int
@@ -839,7 +911,8 @@ def build_pipeline_schedule(
         loss_fn (Callable): The loss function.
 
     Returns:
-        _PipelineSchedule: The pipeline schedule for the given stages.
+        A schedule whose ``step()`` and ``eval()`` discard outputs by default.
+        Pass ``return_outputs=True`` to return merged outputs; read losses from ``losses``.
     """
     pp_schedule_csv = pipeline_parallel_schedule_csv
 
@@ -890,6 +963,7 @@ def build_pipeline_schedule(
         )
         schedule._load_csv(pp_schedule_csv)
 
+    schedule.step = functools.partial(schedule.step, return_outputs=False)
     return schedule
 
 

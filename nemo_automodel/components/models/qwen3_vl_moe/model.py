@@ -30,6 +30,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionRotaryEmbedding,
 )
 
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -133,6 +134,25 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
         cache_position=None,
         **kwargs,
     ):
+        """Fuse packed vision patches into padded text sequences.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence].
+            attention_mask: Padding mask of shape [batch, sequence], or per-layer masks.
+            position_ids: Rotary coordinates of shape [3, batch, sequence].
+            past_key_values: Hugging Face decoder cache, unused by the native text backend.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            pixel_values: Image patches of shape [image_patches, patch_features], where
+                patch_features flattens channels, temporal depth, height, and width.
+            pixel_values_videos: Video patches of shape [video_patches, patch_features].
+            image_grid_thw: Integer tensor of shape [images, 3] with temporal/height/width grids.
+            video_grid_thw: Integer tensor of shape [videos, 3] with temporal/height/width grids.
+            cache_position: Optional positions of shape [sequence].
+            **kwargs: Backend options, including mm_token_type_ids of shape [batch, sequence].
+
+        Returns:
+            Model output with last_hidden_state of shape [batch, sequence, hidden].
+        """
         embed_tokens = self.get_input_embeddings()
         if inputs_embeds is None:
             if embed_tokens is not None:
@@ -192,7 +212,10 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
             elif has_images:
                 image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
                 image_embeds = image_outputs.pooler_output
-                deepstack_image_embeds = image_outputs.deepstack_features
+                deepstack_image_embeds = [
+                    level if torch.is_tensor(level) else torch.cat(level, dim=0)
+                    for level in image_outputs.deepstack_features
+                ]
                 image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 image_mask, _ = self.get_placeholder_mask(
                     input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -202,7 +225,10 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
             else:  # has_videos only
                 video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
                 video_embeds = video_outputs.pooler_output
-                deepstack_video_embeds = video_outputs.deepstack_features
+                deepstack_video_embeds = [
+                    level if torch.is_tensor(level) else torch.cat(level, dim=0)
+                    for level in video_outputs.deepstack_features
+                ]
                 video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 _, video_mask = self.get_placeholder_mask(
                     input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -545,8 +571,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
 
         vision_model = getattr(self.model, "visual")
         rotary = vision_model.rotary_pos_emb
-        dim = rotary.inv_freq.shape[0] * 2
-        fp32_safe_rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim)
+        fp32_safe_rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(rotary.config)
         fp32_safe_rotary.register_buffer(
             "inv_freq",
             rotary.inv_freq.detach().clone().to(torch.float32, copy=True),
@@ -580,6 +605,36 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
+        """Run text and media inputs while preserving their distinct leading axes.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] or [tokens] for THD.
+            position_ids: Rotary coordinates of shape [3, batch, sequence],
+                with a placeholder batch axis of size one for THD.
+            attention_mask: Optional binary padding mask of shape [batch, sequence].
+                Dense NEAT masks are unsupported; packed inputs use THD with
+                ``qkv_format="thd"`` and ``attention_mask=None``.
+            padding_mask: Optional padding flags of shape [batch, sequence]
+                or [tokens] for THD.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden]
+                supplied by a preceding pipeline stage.
+            cache_position: Optional token positions of shape [sequence].
+            logits_to_keep: Number of trailing logits, or token indices of shape
+                [selected_tokens], to retain.
+            output_hidden_states: Return hidden states for fused loss computation.
+            **kwargs: Attention metadata, including ``cu_seqlens`` and
+                ``cu_seqlens_padded`` of shape [documents + 1] (optionally with
+                a leading placeholder batch axis), and scalar ``max_seqlen``.
+                Media tensors retain ``pixel_values``/``pixel_values_videos``
+                of shape [patches, patch_features] and image/video ``grid_thw``
+                of shape [media_items, 3], including when media_items is one.
+
+        Returns:
+            Model output with logits of shape [batch, sequence, vocab] or
+            [tokens, vocab] for THD, or hidden states with the same leading
+            axes and final dimension ``hidden`` when requested. Intermediate
+            pipeline stages return the hidden-state tensor directly.
+        """
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         output_hidden_states = (
             output_hidden_states
@@ -587,54 +642,26 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             else getattr(text_config, "output_hidden_states", False)
         )
 
-        # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
-        pixel_values = kwargs.get("pixel_values", None)
-        pixel_values_videos = kwargs.get("pixel_values_videos", None)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
-        if input_ids is not None:
-            has_image_tokens = (input_ids == 151655).any()
-            has_video_tokens = (input_ids == 151656).any()
-        else:
-            has_image_tokens = False
-            has_video_tokens = False
-
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-
-        if pixel_values is None and has_image_tokens:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
-                    image_grid_hws = image_grid_chunks[chunk_idx]
-                    # Convert image_grid_hws [N, 2] to image_grid_thw [N, 3] by prepending T=1
-                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
-                        if image_grid_hws.shape[-1] == 2:
-                            ones = torch.ones(
-                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                            )
-                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
-                        else:
-                            image_grid_thw = image_grid_hws
-                kwargs["pixel_values"] = pixel_values
-                kwargs["image_grid_thw"] = image_grid_thw
-                consumed_vlm_chunk = True
-
-        if pixel_values_videos is None and has_video_tokens:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if video_chunks is not None and chunk_idx < len(video_chunks):
-                pixel_values_videos = video_chunks[chunk_idx]
-                video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
-                if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
-                    video_grid_thw = video_grid_chunks[chunk_idx]
-                kwargs["pixel_values_videos"] = pixel_values_videos
-                kwargs["video_grid_thw"] = video_grid_thw
-                consumed_vlm_chunk = True
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
+        # Explicit chunks, rather than token values, own PP media scheduling.
+        pixel_values = kwargs.get("pixel_values")
+        pixel_values_videos = kwargs.get("pixel_values_videos")
+        image_grid_thw = kwargs.get("image_grid_thw")
+        video_grid_thw = kwargs.get("video_grid_thw")
+        if pixel_values is None and pixel_values_videos is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                pixel_values_videos = media.pixel_values_videos
+                image_grid_thw = media.image_grid
+                video_grid_thw = media.video_grid
+                if image_grid_thw is not None and image_grid_thw.shape[-1] == 2:
+                    image_grid_thw = torch.nn.functional.pad(image_grid_thw, (1, 0), value=1)
+                kwargs.update(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                )
 
         # With pipeline parallelism, attention_mask (from batch kwargs) can have a
         # different sequence length than inputs_embeds (hidden states from prev stage).
@@ -648,6 +675,16 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
             )
+            # Media axes count patches/items, not the THD placeholder batch.
+            # Restore model-owned payloads after the attention helper's squeeze.
+            for key, value in (
+                ("pixel_values", pixel_values),
+                ("pixel_values_videos", pixel_values_videos),
+                ("image_grid_thw", image_grid_thw),
+                ("video_grid_thw", video_grid_thw),
+            ):
+                if value is not None:
+                    kwargs[key] = value
             attention_mask = None
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask

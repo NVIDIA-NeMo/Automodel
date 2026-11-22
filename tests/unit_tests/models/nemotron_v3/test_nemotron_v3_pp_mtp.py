@@ -415,6 +415,8 @@ class TestPPForward:
             position_ids=position_ids,
             mtp_per_depth_position_ids=mtp_position_ids,
             qkv_format="thd",
+            cu_seqlens=torch.tensor([[0, 4]], dtype=torch.int32),
+            cu_seqlens_padded=torch.tensor([[0, 4]], dtype=torch.int32),
         )
 
         assert captured["hidden_states"].shape == (1, 4, cfg.hidden_size)
@@ -452,6 +454,110 @@ class TestPPForward:
         for ph in out[1 : 1 + D]:
             assert ph.shape == (1, 4, cfg.hidden_size)
         assert out[-1].shape == (1, 4) and out[-1].dtype == torch.int32
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize("layout", ["internal", "equal", "tail", "neat", "unpacked"])
+@pytest.mark.parametrize("batched_cu", [False, True])
+def test_pp_mtp_physical_boundaries_loss_and_gradients(backend, depth, layout, batched_cu):
+    """The real final-stage forward must bind each pack's physical layout to its loss."""
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    torch.manual_seed(4169)
+    model, cfg = _make_model(
+        backend,
+        mtp_layers=depth,
+        mtp_layers_block_type=["attention"],
+        layers_block_type=["attention", "attention"],
+    )
+    model = model.float().train()
+    model.model.embed_tokens = None
+    loss_fn = PipelineCausalLMLoss(MaskedCrossEntropy(), model, scaling_factor=0.3)
+
+    # Two consecutive microbatches have different document boundaries. Logical
+    # lengths deliberately disagree with storage offsets in the padding cases.
+    for lengths in ((3, 4), (1, 5)):
+        if layout == "internal":
+            boundary = lengths[0] + 1
+            spans = ((0, boundary), (boundary, 10))
+            real_cu = [0, lengths[0], sum(lengths)]
+            physical_cu = [0, boundary, 10]
+        elif layout == "tail":
+            boundary = lengths[0]
+            spans = ((0, boundary), (boundary, 10))
+            real_cu, physical_cu = [0, boundary, sum(lengths)], [0, boundary, 10]
+        elif layout in ("equal", "neat"):
+            boundary = lengths[0]
+            spans = ((0, boundary), (boundary, 10))
+            lengths = (boundary, 10 - boundary)
+            real_cu = physical_cu = [0, boundary, 10]
+        else:
+            spans = ((0, 10),)
+            lengths = (10,)
+            real_cu = physical_cu = [0, 10]
+
+        labels = torch.full((1, 10), -100, dtype=torch.long)
+        expected_ids = torch.empty((1, 10), dtype=torch.int32)
+        for doc, ((start, end), length) in enumerate(zip(spans, lengths)):
+            labels[0, start : start + length] = torch.arange(2, 2 + length)
+            expected_ids[0, start:end] = doc
+        kwargs = {}
+        if layout != "unpacked":
+            suffix = [-1000] if batched_cu else []
+            kwargs = dict(
+                qkv_format="thd",
+                cu_seqlens=torch.tensor(real_cu + suffix, dtype=torch.int32),
+                cu_seqlens_padded=torch.tensor(physical_cu + suffix, dtype=torch.int32),
+            )
+            if batched_cu:
+                kwargs["cu_seqlens"] = kwargs["cu_seqlens"].unsqueeze(0)
+                kwargs["cu_seqlens_padded"] = kwargs["cu_seqlens_padded"].unsqueeze(0)
+        if layout == "neat":
+            kwargs = {"seq_idx": expected_ids + 7}
+
+        activation = torch.randn(1, 10, cfg.hidden_size, requires_grad=True)
+        embeddings = tuple(torch.randn_like(activation, requires_grad=True) for _ in range(depth))
+        output = model(activation, *embeddings, **kwargs)
+        actual = loss_fn(output, labels)
+        # Independent per-document slicing: no rolling, searchsorted, or MTP
+        # helper is used to construct the reference targets.
+        logits = [output[0], *(model.lm_head(h) for h in output[1:-1])]
+        expected = torch.nn.functional.cross_entropy(logits[0].flatten(0, 1), labels.flatten(), reduction="sum")
+        for offset, prediction in enumerate(logits[1:], start=1):
+            target = torch.full_like(labels, -100)
+            for start, end in spans:
+                if end - start > offset:
+                    target[:, start : end - offset] = labels[:, start + offset : end]
+            expected = expected + (0.3 / depth) * torch.nn.functional.cross_entropy(
+                prediction.flatten(0, 1), target.flatten(), reduction="sum"
+            )
+        parameters = (activation, *embeddings, *model.parameters())
+        actual_grads = torch.autograd.grad(actual, parameters, retain_graph=True)
+        expected_grads = torch.autograd.grad(expected, parameters)
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad)
+        tail = output[-1]
+        # Equality classes, rather than the numeric ID origin, define documents.
+        torch.testing.assert_close(
+            tail.unsqueeze(-1) == tail.unsqueeze(-2), expected_ids.unsqueeze(-1) == expected_ids.unsqueeze(-2)
+        )
+
+
+def test_pp_mtp_rejects_missing_physical_boundaries(backend):
+    """A packed final stage must not silently use logical lengths or one document."""
+    model, cfg = _make_model(
+        backend,
+        mtp_layers=1,
+        mtp_layers_block_type=["attention"],
+        layers_block_type=["attention", "attention"],
+    )
+    model = model.float().train()
+    model.model.embed_tokens = None
+    activation = torch.randn(1, 8, cfg.hidden_size)
+    with pytest.raises(ValueError, match="Packed MTP requires cu_seqlens_padded"):
+        model(activation, activation.clone(), qkv_format="thd", cu_seqlens=torch.tensor([[0, 3, 7]], dtype=torch.int32))
 
 
 # ---------------------------------------------------------------------------

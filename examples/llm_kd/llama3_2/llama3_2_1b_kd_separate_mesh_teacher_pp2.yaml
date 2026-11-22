@@ -98,3 +98,7 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

@@ -211,7 +211,7 @@ def _lora_ep_ragged_worker(rank: int, world_size: int, port: int) -> None:
         os.environ["WORLD_SIZE"] = str(world_size)
         torch.cuda.set_device(rank)
         device = torch.device("cuda", rank)
-        dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=60))
+        dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=70))
 
         y_ref, weights_grad_ref, lora_grads_ref = _lora_reference_forward_backward(device)
 

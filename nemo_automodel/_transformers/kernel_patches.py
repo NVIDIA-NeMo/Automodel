@@ -72,10 +72,11 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
-# Models build their CP/fp32-gate-aware modules at construction; no load-time
-# runtime patching is registered here. (Qwen3.5 dense/MoE build the native
-# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
-_MODEL_RUNTIME_PATCHES = {}
+# Compatibility adapters for released remote-code models remain model-owned.
+_MODEL_RUNTIME_PATCHES = {
+    "NemotronFlashForCausalLM": ("nemo_automodel.components.models.nemotron_flash.packing", "apply_packing_adapters"),
+    "DeciLMForCausalLM": ("nemo_automodel.components.models.nemotron_nas.packing", "apply_packing_adapters"),
+}
 
 
 def _set_global_sdpa_backends(sdpa_method):
@@ -185,8 +186,14 @@ def _patch_liger_kernel(model):
 
             liger_kernel_trf = liger_kernel.transformers
 
-        liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
-        logger.info("Applied liger-kernel to model")
+        backbone = getattr(model, "model", model)
+        model_owned_patch = getattr(backbone, "_nemo_apply_liger_kernel", None)
+        if callable(model_owned_patch):
+            model_owned_patch(liger_kernel_trf)
+            logger.info("Applied model-owned Liger kernel patch")
+        else:
+            liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
+            logger.info("Applied liger-kernel to model")
         return model
     except Exception:
         logger.warning("Failed to apply liger-kernels to model; falling back to eager")
@@ -313,22 +320,10 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
         attn_implementation = "sdpa"
         logger.warning("Packed sequence is supported only with SDPA. Setting model's attn_implementation to sdpa")
 
-    if has_packed_sequence:
-        if cp_size == 1:
-            # FA2/FA3/FA4 all support varlen packing via transformers'
-            # flash-attention wrapper; keep an explicitly requested version.
-            if attn_implementation not in FLASH_ATTN_IMPLEMENTATIONS:
-                assert HAS_FA or HAS_FA3 or HAS_FA4, "Flash Attention is not available"
-                attn_implementation = (
-                    DEFAULT_ATTN_IMPLEMENTATION if HAS_FA else ("flash_attention_3" if HAS_FA3 else "flash_attention_4")
-                )
-                logger.warning(
-                    "Packed sequence is supported only with Flash Attention. Setting model's attn_implementation to %s",
-                    attn_implementation,
-                )
-        else:
-            # TODO: support packed sequence with CP size > 1
-            raise ValueError("Packed sequence is only supported with CP size 1")
+    # Packing does not select a kernel: SDPA/eager consume masks and Flash consumes
+    # cumulative lengths. Model-aware packing/CP checks run after construction;
+    # the packing flag must not override the selected backend.
+    del has_packed_sequence
     return attn_implementation, use_liger_kernel
 
 

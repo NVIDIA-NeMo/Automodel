@@ -44,8 +44,9 @@ from nemo_automodel.components.speculative import serve_target  # noqa: E402
 from nemo_automodel.components.speculative.eagle.remote import protocol, wire  # noqa: E402
 from nemo_automodel.components.speculative.eagle.remote.client import (  # noqa: E402
     RemoteEagle3TargetModel,
+    RemoteTargetPool,
+    TargetServerClient,
     _AsyncHandle,
-    _ServerClient,
 )
 from nemo_automodel.components.speculative.eagle.remote.server import (  # noqa: E402
     TargetModelServer,
@@ -125,25 +126,25 @@ def test_main_wires_server(monkeypatch, argv, expected_nccl_port):
     fake_model.requires_grad_.assert_called_once_with(False)
 
 
-# ── _ServerClient: URL / port parsing ────────────────────────────────────
+# ── TargetServerClient: URL / port parsing ────────────────────────────────────
 
 
 def test_host_and_default_nccl_port(monkeypatch):
     monkeypatch.delenv("NEMO_EAGLE_NCCL_PORT", raising=False)
-    client = _ServerClient("http://host.local:8001/", timeout=1, max_retries=0)
+    client = TargetServerClient("http://host.local:8001/", timeout=1, max_retries=0)
     assert client._host() == "host.local"
     assert client._nccl_port() == 8101  # 8001 + 100 + offset 0
 
 
 def test_nccl_port_env_override_with_offset(monkeypatch):
     monkeypatch.setenv("NEMO_EAGLE_NCCL_PORT", "5000")
-    client = _ServerClient("http://h:8001", timeout=1, max_retries=0, nccl_rank_offset=3)
+    client = TargetServerClient("http://h:8001", timeout=1, max_retries=0, nccl_rank_offset=3)
     assert client._nccl_port() == 5003
 
 
 def test_nccl_port_nondigit_falls_back(monkeypatch):
     monkeypatch.delenv("NEMO_EAGLE_NCCL_PORT", raising=False)
-    client = _ServerClient("http://hostname-no-port", timeout=1, max_retries=0)
+    client = TargetServerClient("http://hostname-no-port", timeout=1, max_retries=0)
     assert client._nccl_port() == 8100  # 8000 default + 100
 
 
@@ -154,7 +155,7 @@ def test_init_nccl_skips_server_when_locally_unavailable(monkeypatch):
     from nemo_automodel.components.speculative.eagle.remote import client as client_mod
 
     monkeypatch.setattr(client_mod, "nccl_transport_available", lambda: False)
-    client = _ServerClient("http://h:8001", timeout=1, max_retries=0)
+    client = TargetServerClient("http://h:8001", timeout=1, max_retries=0)
     sent = []
     monkeypatch.setattr(client, "request", lambda endpoint, *_a, **_k: sent.append(endpoint) or b"{}")
 
@@ -163,11 +164,19 @@ def test_init_nccl_skips_server_when_locally_unavailable(monkeypatch):
     assert client._nccl is None
 
 
-# ── _ServerClient.request: retry / failure ───────────────────────────────
+@pytest.mark.parametrize("enable_nccl,expected", [(True, True), (False, False)])
+def test_pool_enable_nccl_overrides_the_environment(monkeypatch, enable_nccl, expected):
+    monkeypatch.setenv("NEMO_EAGLE_ENABLE_NCCL", "1")
+    pool = RemoteTargetPool(["http://h:8001", "http://h:8002"], timeout=1, max_retries=0, enable_nccl=enable_nccl)
+    assert [client._nccl_enabled for client in pool.clients] == [expected, expected]
+    assert [client._nccl_port() for client in pool.clients] == [8101, 8103]
+
+
+# ── TargetServerClient.request: retry / failure ───────────────────────────────
 
 
 def test_request_retries_then_succeeds(monkeypatch):
-    client = _ServerClient("http://h:1", timeout=1, max_retries=2)
+    client = TargetServerClient("http://h:1", timeout=1, max_retries=2)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     ok = mock.MagicMock(content=b"payload")
     ok.raise_for_status.return_value = None
@@ -185,7 +194,7 @@ def test_request_retries_then_succeeds(monkeypatch):
 
 
 def test_request_exhausts_retries(monkeypatch):
-    client = _ServerClient("http://h:1", timeout=1, max_retries=1)
+    client = TargetServerClient("http://h:1", timeout=1, max_retries=1)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     monkeypatch.setattr(client._session, "post", mock.MagicMock(side_effect=requests.Timeout("slow")))
     with pytest.raises(RuntimeError, match="failed after 2 attempts"):
@@ -193,20 +202,20 @@ def test_request_exhausts_retries(monkeypatch):
 
 
 def test_close_swallows_request_errors(monkeypatch):
-    client = _ServerClient("http://h:1", timeout=1, max_retries=0)
+    client = TargetServerClient("http://h:1", timeout=1, max_retries=0)
     monkeypatch.setattr(client, "request", mock.MagicMock(side_effect=Exception("server gone")))
     # No NCCL transport was created (disabled); close must not raise.
     client.close()
 
 
-# ── _ServerClient.generate: hot-path retry (wire) vs single-shot (NCCL) ───
+# ── TargetServerClient.generate: hot-path retry (wire) vs single-shot (NCCL) ───
 
 
 def test_generate_wire_path_retries_then_succeeds(monkeypatch):
     """The wire ``/generate`` path reuses request()'s retry: a transient failure
     on the per-step hot path recovers instead of aborting training. NCCL is
     forced off module-wide, so this is the wire path."""
-    client = _ServerClient("http://h:1", timeout=1, max_retries=2)
+    client = TargetServerClient("http://h:1", timeout=1, max_retries=2)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     body = wire.encode_to_bytes({"x": torch.arange(3)})
     ok = mock.MagicMock(content=body)
@@ -228,7 +237,7 @@ def test_generate_wire_path_retries_then_succeeds(monkeypatch):
 def test_generate_wire_path_exhausts_retries(monkeypatch):
     """A persistent transport failure on the wire path surfaces as RuntimeError
     after exhausting retries (same contract as request())."""
-    client = _ServerClient("http://h:1", timeout=1, max_retries=1)
+    client = TargetServerClient("http://h:1", timeout=1, max_retries=1)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     monkeypatch.setattr(client._session, "post", mock.MagicMock(side_effect=requests.Timeout("slow")))
     with pytest.raises(RuntimeError, match="failed after 2 attempts"):
@@ -239,7 +248,7 @@ def test_generate_nccl_path_does_not_retry(monkeypatch):
     """The NCCL path is single-shot by design: retrying the POST would trigger a
     second server-side send and desync the data-plane group, so a transient
     failure must propagate immediately (the POST is issued exactly once)."""
-    client = _ServerClient("http://h:1", timeout=1, max_retries=3)
+    client = TargetServerClient("http://h:1", timeout=1, max_retries=3)
     # Simulate an initialized NCCL transport so generate() takes the NCCL branch.
     client._nccl_attempted = True
     client._nccl = mock.MagicMock(is_initialized=True)
@@ -329,8 +338,15 @@ def test_handle_disconnect_sets_shutdown_event():
 
 
 def test_handle_generate_requires_vocab_mapping():
+    payload = wire.encode_to_bytes(
+        {
+            "input_ids": torch.zeros(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            "loss_mask": torch.ones(1, 4, dtype=torch.long),
+        }
+    )
     with pytest.raises(RuntimeError, match="set_vocab_mapping must be called before generate"):
-        _server().handle_generate(b"", client_wants_nccl=False)
+        _server().handle_generate(payload, client_wants_nccl=False)
 
 
 def test_infer_device_falls_back_to_cpu_without_params():

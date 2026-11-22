@@ -110,8 +110,8 @@ def _write_teacher_cache(cache_dir: Path, queries: list[str], docs: list[str], d
     query_vectors = np.arange(len(queries) * dim, dtype=np.float16).reshape(len(queries), dim)
     doc_vectors = (100 + np.arange(len(docs) * dim, dtype=np.float16)).reshape(len(docs), dim)
 
-    np.save(cache_dir / "queries.npy", query_vectors)
-    np.save(cache_dir / "docs.npy", doc_vectors)
+    np.save(cache_dir / "queries.npy", query_vectors, allow_pickle=False)
+    np.save(cache_dir / "docs.npy", doc_vectors, allow_pickle=False)
     (cache_dir / "index.json").write_text(
         json.dumps(
             {

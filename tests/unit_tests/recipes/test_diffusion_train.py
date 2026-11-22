@@ -15,6 +15,7 @@
 import math
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,7 +27,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, Optimiz
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
-    _build_diffusion_parallel_manager_args,
+    _build_diffusion_mesh_context,
     _reject_removed_diffusion_keys,
     _resolve_model_dtypes,
     _validate_precision_configuration,
@@ -407,6 +408,43 @@ def test_recipe_config_resolves_diffusion_validation_dataloader_only_when_declar
     assert config.shuffle is False
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader",
+        "nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader",
+        "nemo_automodel.components.datasets.diffusion.image_edit_dataset.ImageEditDataloaderConfig",
+    ],
+)
+@pytest.mark.parametrize("override", [None, True, False])
+def test_diffusion_validation_drop_last_default_preserves_training_and_overrides(target, override):
+    node = {"_target_": target, "cache_dir": "/tmp/cache"}
+    if override is not None:
+        node["drop_last"] = override
+    raw = ConfigNode({"data": {"dataloader": dict(node), "validation_dataloader": dict(node)}})
+    cfg = RecipeConfig(raw)
+
+    assert cfg.diffusion_validation_dataloader.drop_last is (False if override is None else override)
+    assert cfg.diffusion_dataloader.drop_last is (True if override is None else override)
+    assert raw.get("data.validation_dataloader.drop_last", None) is override
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        {"_target_": "nemo_automodel.components.datasets.diffusion.mock_dataloader.MockWanDataloaderConfig"},
+        {
+            "_target_": "nemo_automodel.components.datasets.diffusion.meta_files_dataset.MetaFilesDataloaderConfig",
+            "meta_folder": "/tmp/cache",
+        },
+    ],
+)
+def test_diffusion_validation_accepts_loaders_without_drop_last(node):
+    assert (
+        RecipeConfig(ConfigNode({"data": {"validation_dataloader": node}})).diffusion_validation_dataloader is not None
+    )
+
+
 def test_recipe_config_rejects_unknown_diffusion_dataloader_field():
     raw = ConfigNode(
         {
@@ -420,57 +458,63 @@ def test_recipe_config_rejects_unknown_diffusion_dataloader_field():
         RecipeConfig.resolve_diffusion_dataloader(raw)
 
 
-def test_manager_args_default_to_pure_ulysses_cp_split():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={"cp_size": 2},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_defaults_to_pure_ulysses_cp_split():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={"cp_size": 2},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert args["cp_size"] == 2
-    assert args["cp_ring_degree"] == 1
-    assert args["cp_ulysses_degree"] == 2
+    kwargs = build_mesh.call_args.kwargs
+    assert kwargs["parallelism_sizes"].cp_size == 2
+    assert kwargs["cp_ring_degree"] == 1
+    assert kwargs["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_pass_explicit_ring_ulysses_split_through():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2, "cp_ulysses_degree": 2},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_passes_explicit_ring_ulysses_split_through():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2, "cp_ulysses_degree": 2},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
     # The builder only threads the split through; ring > 1 is rejected later by
     # _enable_context_parallel, where the diffusers version constraint lives.
-    assert args["cp_ring_degree"] == 2
-    assert args["cp_ulysses_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ring_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_derive_ulysses_from_ring_when_unset():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_derives_ulysses_from_ring_when_unset():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert args["cp_ring_degree"] == 2
-    assert args["cp_ulysses_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ring_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_cp_knobs_default_when_cp_disabled():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_cp_knobs_default_when_cp_disabled():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert args["cp_size"] == 1
-    assert args["cp_ring_degree"] == 1
-    assert args["cp_ulysses_degree"] == 1
+    kwargs = build_mesh.call_args.kwargs
+    assert kwargs["parallelism_sizes"].cp_size == 1
+    assert kwargs["cp_ring_degree"] == 1
+    assert kwargs["cp_ulysses_degree"] == 1

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import sys
+from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 import pytest
@@ -24,6 +28,70 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities, flatten_packed_sequence_metadata
+
+
+def _reference_varlen_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int | None, int | None] = (None, None),
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Evaluate independent per-document SDPA for a fake FA4 varlen kernel.
+
+    Args:
+        q: Query tensor of shape [tokens, heads, qk_head_dim].
+        k: Key tensor of shape [tokens, heads, qk_head_dim].
+        v: Value tensor of shape [tokens, heads, v_head_dim].
+        cu_seqlens_q: Query boundaries of shape [documents + 1].
+        cu_seqlens_k: Key/value boundaries of shape [documents + 1].
+        max_seqlen_q: Maximum query document length.
+        max_seqlen_k: Maximum key/value document length.
+        softmax_scale: Attention score scale.
+        causal: Whether to apply causal attention.
+        window_size: Inclusive left/right distances in the FA4 kernel convention.
+        **kwargs: Unused FA4 options accepted for signature compatibility.
+
+    Returns:
+        Pair of the independently evaluated output tensor of shape
+        [tokens, heads, v_head_dim] and None for the unused LSE, matching FA4.
+    """
+    del max_seqlen_q, max_seqlen_k, kwargs
+    outputs = []
+    for document_idx in range(cu_seqlens_q.numel() - 1):
+        q_start, q_end = (int(x) for x in cu_seqlens_q[document_idx : document_idx + 2])
+        k_start, k_end = (int(x) for x in cu_seqlens_k[document_idx : document_idx + 2])
+        q_document = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+        k_document = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        v_document = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        local_mask = None
+        if window_size[0] is not None or window_size[1] is not None:
+            q_pos = torch.arange(q_end - q_start, device=q.device)[:, None]
+            k_pos = torch.arange(k_end - k_start, device=q.device)[None, :]
+            local_mask = k_pos <= q_pos if causal else torch.ones_like(q_pos + k_pos, dtype=torch.bool)
+            if window_size[0] is not None:
+                local_mask = local_mask & (k_pos >= q_pos - window_size[0])
+            if window_size[1] is not None:
+                local_mask = local_mask & (k_pos <= q_pos + window_size[1])
+        output = F.scaled_dot_product_attention(
+            q_document,
+            k_document,
+            v_document,
+            attn_mask=local_mask,
+            is_causal=causal and local_mask is None,
+            scale=softmax_scale,
+            enable_gqa=True,
+        )
+        outputs.append(output.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs), None
 
 
 class TestInitializeAttnModuleAndFunc:
@@ -207,6 +275,42 @@ class TestPreprocessArgsAndKwargsForAttn:
         self.k = torch.randn(self.batch_size, self.num_heads, self.seq_len, self.head_dim)
         self.v = torch.randn(self.batch_size, self.num_heads, self.seq_len, self.head_dim)
 
+    @pytest.mark.parametrize("shape", [(4,), (1, 4, 4), (1, 1, 4, 4)])
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.float32])
+    def test_te_rejects_non_padding_mask_layouts(self, shape, dtype):
+        q = torch.randn(1, 4, 2, 8)
+        mask = torch.ones(shape, dtype=dtype)
+
+        with pytest.raises(ValueError, match="2D.*padding mask.*THD"):
+            preprocess_args_and_kwargs_for_attn(q, q, q, mask, attn_impl="te")
+
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.float32])
+    def test_te_preserves_binary_padding_mask_semantics(self, dtype):
+        q = torch.randn(1, 4, 2, 8)
+        mask = torch.tensor([[1, 1, 0, 0]], dtype=dtype)
+
+        q_out, k_out, v_out, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, mask, attn_impl="te")
+
+        assert q_out is q and k_out is q and v_out is q
+        assert kwargs["attn_mask_type"] == "padding_causal"
+        torch.testing.assert_close(kwargs["attention_mask"], torch.tensor([[[[False, False, True, True]]]]))
+        torch.testing.assert_close(mask, torch.tensor([[1, 1, 0, 0]], dtype=dtype))
+
+    def test_te_preserves_thd_document_boundaries(self):
+        q = torch.randn(5, 2, 8)
+        boundaries = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+        q_out, k_out, v_out, kwargs = preprocess_args_and_kwargs_for_attn(
+            q, q, q, None, attn_impl="te", cu_seqlens=boundaries, max_seqlen=3
+        )
+
+        assert q_out is q and k_out is q and v_out is q
+        assert kwargs["qkv_format"] == "thd"
+        assert "attention_mask" not in kwargs
+        torch.testing.assert_close(kwargs["cu_seqlens_q"], boundaries)
+        torch.testing.assert_close(kwargs["cu_seqlens_kv"], boundaries)
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_kv"] == 3
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_with_attention_mask(self):
         """Test TE preprocessing with attention mask."""
@@ -331,6 +435,43 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert v_out.shape == (1, 1, 4, 8)
         assert torch.equal(attn_kwargs["attn_mask"], expected_mask)
         assert attn_kwargs["is_causal"] is False
+
+    @pytest.mark.parametrize("window_size", [(-1, 0), (3, 0)])
+    def test_sdpa_compiled_padding_mask_forward_backward(self, window_size):
+        """Fullgraph attention must honor changing padding values without scalar extraction."""
+
+        def attend(q, k, v, padding_mask):
+            q, k, v, kwargs = preprocess_args_and_kwargs_for_attn(
+                q, k, v, attention_mask=padding_mask, attn_impl="sdpa", window_size=window_size
+            )
+            return F.scaled_dot_product_attention(q, k, v, **kwargs)
+
+        compiled = torch.compile(attend, backend="aot_eager", fullgraph=True)
+        torch.manual_seed(23)
+        values = [torch.randn(2, 5, 2, 8) for _ in range(3)]
+        # Reuse one compiled function as the same-shaped mask changes from all
+        # valid to padded, catching accidental specialization to tensor values.
+        for padding_mask in (
+            torch.ones(2, 5, dtype=torch.bool),
+            torch.tensor([[True, True, False, False, False], [True, True, True, False, True]]),
+        ):
+            inputs = [value.clone().requires_grad_() for value in values]
+            references = [value.clone().requires_grad_() for value in values]
+            actual = compiled(*inputs, padding_mask)
+            positions = torch.arange(5)
+            allowed = positions[:, None] >= positions[None, :]
+            if window_size[0] >= 0:
+                allowed &= positions[None, :] > positions[:, None] - window_size[0]
+            mask = allowed[None, None] & padding_mask[:, None, None, :]
+            expected = F.scaled_dot_product_attention(
+                *(value.transpose(1, 2).contiguous() for value in references), attn_mask=mask
+            )
+            torch.testing.assert_close(actual, expected)
+            gradient = torch.randn_like(expected)
+            actual.backward(gradient)
+            expected.backward(gradient)
+            for value, reference in zip(inputs, references):
+                torch.testing.assert_close(value.grad, reference.grad)
 
     def test_sdpa_preprocessing_with_explicit_attention_bias(self):
         """Test SDPA preserves a prebuilt additive attention mask."""
@@ -519,3 +660,553 @@ class TestEndToEndWorkflow:
 
         # Should remain the same shape
         assert final_output.shape == original_shape
+
+
+class TestFA4Backend:
+    """Tests for the FlashAttention-4 (CuTe) backend branch."""
+
+    @pytest.mark.parametrize("capability", [(10, 0), (11, 0)])
+    @pytest.mark.parametrize("varlen", [False, True])
+    def test_fa4_hd256_local_attention_fails_before_kernel(self, capability, varlen):
+        """Blackwell HD256 windows fail clearly without launching a CUDA kernel."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        flash_attn_cute = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"flash_attn.cute": flash_attn_cute}):
+            _, fa4 = initialize_attn_module_and_func("fa4", 4, 256, 256, 256**-0.5)
+        with FakeTensorMode(), mock.patch("torch.cuda.get_device_capability", return_value=capability):
+            q = k = v = torch.empty(1, 8, 4, 256, device="cuda")
+            metadata = {"cu_seqlens_q": torch.tensor([0, 8], device="cuda", dtype=torch.int32)} if varlen else {}
+            with pytest.raises(ValueError, match="use attn_impl='sdpa'"):
+                fa4(q, k, v, window_size=(15, None), **metadata)
+        flash_attn_cute.flash_attn_func.assert_not_called()
+        flash_attn_cute.flash_attn_varlen_func.assert_not_called()
+
+    def test_fa4_causal_defaults_without_mask(self):
+        """No mask -> plain causal, unbounded window, and no transpose."""
+        q = torch.randn(2, 8, 4, 16)
+        k = torch.randn(2, 8, 4, 16)
+        v = torch.randn(2, 8, 4, 16)
+
+        out_q, out_k, out_v, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4")
+
+        # FA4 consumes [b, s, nh, hd] directly, unlike sdpa/flex which transpose.
+        assert out_q is q and out_k is k and out_v is v
+        assert attn_kwargs == {"causal": True, "window_size": (None, None)}
+
+    @pytest.mark.parametrize(
+        "window_size, expected",
+        [
+            ((-1, 0), (None, None)),  # codebase's "unbounded causal"
+            ((128, 0), (127, None)),  # 128 keys including the current token
+            ((1, 0), (0, None)),  # self attention only
+            ((None, None), (None, None)),
+        ],
+    )
+    def test_fa4_window_size_translation(self, window_size, expected):
+        """-1/0 sentinels translate to FA4's None-based window convention."""
+        q = k = v = torch.randn(1, 4, 2, 8)
+        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", window_size=window_size)
+        assert attn_kwargs["window_size"] == expected
+
+    def test_fa4_rejects_zero_visible_window(self):
+        q = k = v = torch.randn(1, 4, 2, 8)
+        with pytest.raises(ValueError, match="at least the current token"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", window_size=(0, 0))
+
+    def test_fa4_varlen_from_cu_seqlens(self):
+        """Packed batches forward cu_seqlens/max_seqlen to the varlen entry point."""
+        q = k = v = torch.randn(1, 16, 2, 8)
+        cu_seqlens = torch.tensor([0, 5, 16], dtype=torch.int32)
+
+        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, None, "fa4", cu_seqlens=cu_seqlens, max_seqlen=11
+        )
+
+        assert attn_kwargs["cu_seqlens_q"] is cu_seqlens
+        assert attn_kwargs["cu_seqlens_kv"] is cu_seqlens
+        assert attn_kwargs["max_seqlen_q"] == 11
+        assert attn_kwargs["max_seqlen_kv"] == 11
+
+    def test_fa4_varlen_requires_max_seqlen(self):
+        q = k = v = torch.randn(1, 4, 2, 8)
+
+        with pytest.raises(ValueError, match="requires max_seqlen"):
+            preprocess_args_and_kwargs_for_attn(
+                q,
+                k,
+                v,
+                None,
+                "fa4",
+                cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+            )
+
+    def test_fa4_indexed_mask_requires_dataset_metadata(self):
+        """Attention consumes packed metadata instead of rebuilding dataset semantics."""
+        q = k = v = torch.randn(1, 4, 2, 8)
+        document_ids = torch.tensor([[1, 1, 2, 2]])
+
+        with pytest.raises(ValueError, match="dataset-provided"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, document_ids, "fa4")
+
+    def test_fa4_requires_model_entry_to_flatten_batch_major_metadata(self):
+        q = k = v = torch.randn(2, 4, 2, 8)
+
+        with pytest.raises(ValueError, match="flattened once at model entry"):
+            preprocess_args_and_kwargs_for_attn(
+                q,
+                k,
+                v,
+                None,
+                "fa4",
+                packed_token_indices=torch.tensor([[0, 1, -1, -1], [0, 1, 2, -1]]),
+                cu_seqlens=torch.tensor([[0, 2], [0, 3]], dtype=torch.int32),
+                max_seqlen=3,
+            )
+
+    @pytest.mark.parametrize("window_size", [-1, 1, 2])
+    def test_fa4_packed_bshd_forward_backward_matches_document_sdpa(self, window_size):
+        """Packed FA4 preserves MLA value width, outputs, and gradients."""
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        flash_attn_cute = ModuleType("flash_attn.cute")
+        flash_attn_cute.flash_attn_func = mock.Mock(side_effect=AssertionError("dense FA4 path was selected"))
+        flash_attn_cute.flash_attn_varlen_func = _reference_varlen_sdpa
+
+        collated = neat_packed_vlm_collater(
+            [
+                {
+                    "input_ids": torch.arange(6),
+                    "labels": torch.arange(6),
+                    "attention_mask": torch.tensor([1, 1, 2, 2, 2, 0]),
+                    "position_ids": torch.tensor([0, 1, 0, 1, 2, 0]),
+                    "n_images": 0,
+                    "n_videos": 0,
+                },
+                {
+                    "input_ids": torch.arange(6),
+                    "labels": torch.arange(6),
+                    "attention_mask": torch.tensor([1, 2, 2, 3, 3, 3]),
+                    "position_ids": torch.tensor([0, 0, 1, 0, 1, 2]),
+                    "n_images": 0,
+                    "n_videos": 0,
+                },
+            ],
+            packing=PackingCapabilities(
+                packed_mask_type="document_ids",
+                return_packed_sequence_metadata=True,
+            ),
+        )
+        attention_mask = collated["attention_mask"]
+        q = torch.randn(2, 6, 2, 8, requires_grad=True)
+        k = torch.randn(2, 6, 2, 8, requires_grad=True)
+        v = torch.randn(2, 6, 2, 6, requires_grad=True)
+        q_ref = q.detach().clone().requires_grad_()
+        k_ref = k.detach().clone().requires_grad_()
+        v_ref = v.detach().clone().requires_grad_()
+
+        with mock.patch.dict(sys.modules, {"flash_attn.cute": flash_attn_cute}):
+            _, fa4 = initialize_attn_module_and_func(
+                attn_impl="fa4",
+                num_attention_heads=2,
+                num_qk_channels=8,
+                num_v_channels=6,
+                softmax_scale=0.5,
+            )
+        packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
+            collated["packed_token_indices"],
+            collated["cu_seqlens"],
+            batch_size=2,
+            sequence_length=6,
+        )
+        packed_q, packed_k, packed_v, fa4_kwargs = preprocess_args_and_kwargs_for_attn(
+            q,
+            k,
+            v,
+            attention_mask,
+            "fa4",
+            cu_seqlens=cu_seqlens,
+            max_seqlen=collated["max_seqlen"],
+            packed_token_indices=packed_token_indices,
+            window_size=(window_size, 0),
+        )
+        output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
+
+        reference = v_ref.new_zeros((*q_ref.shape[:-1], v_ref.shape[-1]))
+        for batch_idx in range(attention_mask.shape[0]):
+            for document_id in range(1, int(attention_mask[batch_idx].max().item()) + 1):
+                positions = torch.nonzero(attention_mask[batch_idx] == document_id, as_tuple=False).flatten()
+                q_document = q_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+                k_document = k_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+                v_document = v_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+                positions_in_doc = torch.arange(positions.numel())
+                expected_mask = positions_in_doc[None, :] <= positions_in_doc[:, None]
+                if window_size > 0:
+                    expected_mask &= positions_in_doc[None, :] > positions_in_doc[:, None] - window_size
+                document_output = F.scaled_dot_product_attention(
+                    q_document,
+                    k_document,
+                    v_document,
+                    attn_mask=expected_mask,
+                    scale=0.5,
+                )
+                reference[batch_idx, positions] = document_output.squeeze(0).transpose(0, 1)
+
+        assert output.shape == (2, 6, 2, 6)
+        torch.testing.assert_close(output, reference)
+        output_weight = torch.randn_like(output)
+        (output * output_weight).sum().backward()
+        (reference * output_weight).sum().backward()
+        torch.testing.assert_close(q.grad, q_ref.grad)
+        torch.testing.assert_close(k.grad, k_ref.grad)
+        torch.testing.assert_close(v.grad, v_ref.grad)
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {},
+            {"cu_seqlens": torch.tensor([0, 16], dtype=torch.int32), "max_seqlen": 16},
+            {
+                "cu_seqlens_q": torch.tensor([0, 16], dtype=torch.int32),
+                "cu_seqlens_kv": torch.tensor([0, 16], dtype=torch.int32),
+            },
+        ],
+    )
+    def test_fa4_rejects_explicit_mask(self, metadata):
+        """A dense mask must raise -- dropping it would attend across documents."""
+        q = k = v = torch.randn(2, 8, 4, 16)
+        dense_mask = torch.ones(2, 1, 8, 8, dtype=torch.bool)
+
+        with pytest.raises(ValueError, match="cannot consume an explicit attention_mask"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, dense_mask, "fa4", **metadata)
+
+    def test_fa4_output_is_not_transposed(self):
+        """postprocess leaves FA4 output alone (already [b, s, nh, hd])."""
+        x = torch.randn(2, 8, 4, 16)
+        assert postprocess_output_for_attn(x, "fa4").shape == (2, 8, 4, 16)
+
+    def test_fa4_missing_install_raises_actionable_import_error(self):
+        """A broken/absent flash_attn.cute surfaces as an actionable ImportError."""
+        with mock.patch.dict("sys.modules", {"flash_attn.cute": None}):
+            with pytest.raises(ImportError, match="INSTALL_FA4=true"):
+                initialize_attn_module_and_func(
+                    attn_impl="fa4",
+                    num_attention_heads=4,
+                    num_qk_channels=16,
+                    num_v_channels=16,
+                    softmax_scale=0.25,
+                )
+
+    def test_fa4_broken_cuda_probe_raises_actionable_import_error(self):
+        """Non-ImportError failures from CuTe's CUDA probe retain their cause."""
+        with mock.patch(
+            "nemo_automodel.components.attention.utils.safe_import",
+            side_effect=RuntimeError("CUDA toolkit probe failed"),
+        ):
+            with pytest.raises(ImportError, match="RuntimeError: CUDA toolkit probe failed") as exc_info:
+                initialize_attn_module_and_func(
+                    attn_impl="fa4",
+                    num_attention_heads=4,
+                    num_qk_channels=16,
+                    num_v_channels=16,
+                    softmax_scale=0.25,
+                )
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+    @pytest.mark.parametrize("qkv_format", ["sbhd"])
+    def test_fa4_rejects_unsupported_qkv_format(self, qkv_format):
+        """The factory accepts BSHD/prepared THD, but rejects unsupported layouts."""
+        with mock.patch.dict("sys.modules", {"flash_attn.cute": mock.MagicMock()}):
+            with pytest.raises(ValueError, match="requires BSHD"):
+                initialize_attn_module_and_func(
+                    attn_impl="fa4",
+                    num_attention_heads=4,
+                    num_qk_channels=16,
+                    num_v_channels=16,
+                    softmax_scale=0.25,
+                    qkv_format=qkv_format,
+                )
+
+    @pytest.mark.parametrize(
+        "shape,metadata",
+        [
+            ((8, 2, 4), {}),
+            ((2, 4, 2, 4), {"qkv_format": "thd"}),
+            ((2, 4, 2, 4), {"cu_seqlens_padded": torch.tensor([0, 4, 8], dtype=torch.int32)}),
+        ],
+    )
+    def test_fa4_rejects_unprepared_thd_before_kernel(self, shape, metadata):
+        q = k = v = torch.randn(shape)
+        with pytest.raises(ValueError, match="FA4.*requires"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", **metadata)
+
+    def test_dense_fa4_unpacks_kernel_result_and_preserves_gradients(self):
+        q = k = v = torch.randn(2, 4, 2, 8, requires_grad=True)
+        expected = q * 2
+        flash_attn_cute = ModuleType("flash_attn.cute")
+        flash_attn_cute.flash_attn_func = mock.Mock(return_value=(expected, None))
+        flash_attn_cute.flash_attn_varlen_func = mock.Mock(side_effect=AssertionError("varlen selected"))
+        with mock.patch.dict(sys.modules, {"flash_attn.cute": flash_attn_cute}):
+            _, fa4 = initialize_attn_module_and_func("fa4", 2, 8, 8, 0.5)
+        output = fa4(q, k, v)
+        torch.testing.assert_close(output, expected)
+        upstream = torch.randn_like(output)
+        output.backward(upstream)
+        torch.testing.assert_close(q.grad, 2 * upstream)
+
+
+@pytest.mark.parametrize("padded,expected", [([0, 3, 5], False), ([0, 4, 8], True), ([0, 3, 8], True)])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_te_padding_flag_uses_boundaries_not_field_presence(padded, expected, explicit, monkeypatch):
+    cu = torch.tensor([0, 3, 5], dtype=torch.int32)
+    metadata = {"cu_seqlens": cu, "cu_seqlens_padded": torch.tensor(padded, dtype=torch.int32)}
+    if explicit:
+        metadata["pad_between_seqs"] = expected
+
+        def unexpected_comparison(*args, **kwargs):
+            raise AssertionError("The upstream padding decision must not be recomputed in each layer")
+
+        monkeypatch.setattr(torch, "equal", unexpected_comparison)
+    q = torch.randn(8, 2, 4)
+    _, _, _, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, None, "te", **metadata)
+    assert kwargs["pad_between_seqs"] is expected
+    assert kwargs["cu_seqlens_q_padded"] is metadata["cu_seqlens_padded"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lengths", [(2, 3, 3), (2, 2, 3), (2, 1, 2)])
+def test_fa4_prepared_thd_rejects_unequal_physical_streams(lengths: tuple[int, int, int]) -> None:
+    """Longer K/V streams must not be silently truncated by shared Q indices."""
+    q, k, v = [torch.randn(length, 2, 4) for length in lengths]
+    with pytest.raises(ValueError, match="equal physical Q/K/V"):
+        preprocess_args_and_kwargs_for_attn(
+            q,
+            k,
+            v,
+            None,
+            "fa4",
+            qkv_format="thd",
+            _fa4_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            _fa4_max_seqlen=2,
+            packed_token_indices=torch.tensor([0, 1]),
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("empty", [False, True])
+def test_fa4_prepared_thd_scatter_preserves_physical_layout_and_sink_gradient(empty: bool) -> None:
+    """Prepared THD gathers valid rows, restores gaps and keeps empty sink gradients."""
+    q = torch.randn(5, 2, 4, requires_grad=True)
+    k = torch.randn(5, 1, 4, requires_grad=True)
+    v = torch.randn(5, 1, 4, requires_grad=True)
+    sink = torch.randn(2, requires_grad=True)
+    indices = torch.tensor([] if empty else [0, 1, 4], dtype=torch.long)
+    offsets = torch.tensor([0, 0, 0] if empty else [0, 2, 3], dtype=torch.int32)
+    q1, k1, v1, kwargs = preprocess_args_and_kwargs_for_attn(
+        q,
+        k,
+        v,
+        None,
+        "fa4",
+        qkv_format="thd",
+        _fa4_cu_seqlens=offsets,
+        _fa4_max_seqlen=0 if empty else 2,
+        packed_token_indices=indices,
+        learnable_sink=sink,
+        window_size=(128, 0),
+    )
+    assert kwargs["window_size"] == (127, None)
+    torch.testing.assert_close(q1, q[indices])
+    expected = q1 + k1.repeat_interleave(2, -2) + v1.repeat_interleave(2, -2) + sink[None, :, None]
+    external = ModuleType("flash_attn.cute")
+    external.flash_attn_func = mock.Mock(side_effect=AssertionError("dense selected"))
+    external.flash_attn_varlen_func = mock.Mock(return_value=(expected, None))
+    with mock.patch.dict(sys.modules, {"flash_attn.cute": external}):
+        _, run = initialize_attn_module_and_func("fa4", 2, 4, 4, 0.5, qkv_format="thd")
+    output = run(q1, k1, v1, **kwargs)
+    assert output.shape == (5, 2, 4)
+    padding = torch.ones(5, dtype=torch.bool)
+    padding[indices] = False
+    assert torch.count_nonzero(output[padding]) == 0
+    upstream = torch.randn_like(output)
+    upstream[padding] = 0
+    output.backward(upstream)
+    for tensor in (q, k, v):
+        assert tensor.grad is not None and torch.count_nonzero(tensor.grad[padding]) == 0
+    assert sink.grad is not None
+    if empty:
+        external.flash_attn_varlen_func.assert_not_called()
+        assert torch.equal(sink.grad, torch.zeros_like(sink))
+    else:
+        torch.testing.assert_close(output[indices], expected)
+        torch.testing.assert_close(sink.grad, upstream[indices].sum((0, 2)))
+
+
+def test_fa4_physical_dependency_identity_is_cached_and_unreadable_falls_back(tmp_path: Path) -> None:
+    from hashlib import sha256
+    from types import SimpleNamespace
+
+    import nemo_automodel.components.attention.utils as utils
+
+    source = tmp_path / "interface.py"
+    source.write_bytes(b"original dependency fixture")
+    utils._fa4_interface_sha256.cache_clear()
+    try:
+        with mock.patch.object(
+            utils, "safe_import", return_value=(True, SimpleNamespace(__file__=str(source)))
+        ) as importer:
+            expected = sha256(source.read_bytes()).hexdigest()
+            assert utils._fa4_interface_sha256() == expected
+            source.write_bytes(b"changed fixture")
+            assert utils._fa4_interface_sha256() == expected
+            assert importer.call_count == 1
+        utils._fa4_interface_sha256.cache_clear()
+        with mock.patch.object(
+            utils, "safe_import", return_value=(True, SimpleNamespace(__file__=str(source / "missing")))
+        ):
+            assert utils._fa4_interface_sha256() is None
+    finally:
+        utils._fa4_interface_sha256.cache_clear()
+
+
+def test_fa4_original_interface_hash_tracks_the_container_pin() -> None:
+    """The original-interface hash must describe the FA4 build the container installs.
+
+    The hash enables the FA4 max-length hint only for that exact source, so bumping
+    FLASH_ATTN_REF in docker/Dockerfile without recomputing it silently drops the hint.
+    """
+    import nemo_automodel.components.attention.utils as utils
+
+    hashed_ref = "3c2c6b31e730fd13e7d6f0d384af22684b24c532"  # pragma: allowlist secret
+    dockerfile = (Path(__file__).resolve().parents[3] / "docker" / "Dockerfile").read_text(encoding="utf-8")
+
+    assert f"ARG FLASH_ATTN_REF={hashed_ref}\n" in dockerfile, (
+        "docker/Dockerfile changed FLASH_ATTN_REF: recompute _FA4_ORIGINAL_INTERFACE_SHA256 from "
+        "flash_attn/cute/interface.py at the new ref, then update hashed_ref here."
+    )
+    assert utils._FA4_ORIGINAL_INTERFACE_SHA256 == (
+        "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"  # pragma: allowlist secret
+    )
+
+
+@pytest.mark.parametrize("dependency", ["patched", "original", "unknown"])
+@pytest.mark.parametrize("window", [(-1, 0), (128, 0)])
+def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency: str, window: tuple[int, int]) -> None:
+    from torch.utils.checkpoint import checkpoint
+
+    import nemo_automodel.components.attention.utils as utils
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
+
+    tokens = 144
+    physical = torch.tensor([0, 136, 136, 140], dtype=torch.int32)
+    valid = torch.zeros(tokens, dtype=torch.bool)
+    valid[:128] = True
+    valid[136:139] = True
+    original = dict(qkv_format="thd", cu_seqlens=physical, cu_seqlens_padded=physical, padding_mask=~valid)
+    prepared = prepare_packed_metadata(None, (torch.arange(tokens),), original)[1]
+    sink = torch.randn(2, requires_grad=True)
+    qkv = [torch.randn(tokens, 2, 4, requires_grad=True) for _ in range(3)]
+    seen = []
+
+    def kernel(q, k, v, **kwargs):
+        """Exercise shared dispatch with a differentiable external-kernel stand-in.
+
+        Args:
+            q: Query tensor [tokens, heads, channels].
+            k: Key tensor [tokens, heads, channels] in this non-GQA fixture.
+            v: Value tensor [tokens, heads, channels].
+            **kwargs: Sink [heads], offsets [documents + 1], used lengths [documents].
+
+        Returns:
+            Output [tokens, heads, channels] and absent LSE; no attention math is mocked as parity.
+        """
+        used = kwargs.get("seqused_q")
+        seen.append((q, kwargs))
+        output = q + k + v + kwargs["learnable_sink"][None, :, None]
+        if used is not None:
+            mask = torch.zeros(q.shape[0], dtype=torch.bool)
+            for start, count in zip(kwargs["cu_seqlens_q"][:-1], used, strict=True):
+                mask[int(start) : int(start + count)] = True
+            output = torch.where(mask[:, None, None], output, 0)
+        return output, None
+
+    package = ModuleType("flash_attn.cute")
+    package.flash_attn_func = mock.Mock(side_effect=AssertionError("dense path selected"))
+    package.flash_attn_varlen_func = kernel
+    sha = {
+        "patched": utils._FA4_PHYSICAL_INTERFACE_SHA256,
+        "original": utils._FA4_ORIGINAL_INTERFACE_SHA256,
+        "unknown": None,
+    }[dependency]
+    with (
+        mock.patch.dict(sys.modules, {"flash_attn.cute": package}),
+        mock.patch.object(utils, "_fa4_interface_sha256", return_value=sha),
+    ):
+        _, call = initialize_attn_module_and_func("fa4", 2, 4, 4, 0.5)
+
+        # The model eligibility policy has separate tests; opt this small fixture in explicitly.
+        def forward(*values):
+            """Call shared preparation and the external-kernel stand-in.
+
+            Args:
+                *values: Q/K/V tensors [physical_tokens, heads, channels].
+
+            Returns:
+                Physical output tensor [physical_tokens, heads, channels].
+            """
+            a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(
+                *values, None, "fa4", **prepared, learnable_sink=sink, window_size=window, fa4_physical_layout=True
+            )
+            if dependency == "patched":
+                assert all(x is y for x, y in zip((a, b, c), values, strict=True))
+            return call(a, b, c, **kwargs)
+
+        reference = torch.where(valid[:, None, None], qkv[0] + qkv[1] + qkv[2] + sink[None, :, None], 0)
+        expected = torch.autograd.grad(reference, [*qkv, sink], torch.ones_like(reference))
+        for recompute in (False, True):
+            output = checkpoint(forward, *qkv, use_reentrant=False) if recompute else forward(*qkv)
+            gradients = torch.autograd.grad(output, [*qkv, sink], torch.ones_like(output))
+            assert torch.equal(output, reference)
+            assert all(torch.equal(a, b) for a, b in zip(gradients, expected, strict=True))
+            assert all(torch.count_nonzero(g[~valid]) == 0 for g in gradients[:3])
+    assert all(("seqused_q" in kw) is (dependency == "patched") for _, kw in seen)
+    assert all(kw["max_seqlen_q"] == (129 if dependency != "unknown" else 128) for _, kw in seen)
+    assert all(kw["window_size"] == ((None, None) if window[0] < 0 else (127, None)) for _, kw in seen)
+    assert all(kw["learnable_sink"] is sink for _, kw in seen)
+    assert torch.equal(original["cu_seqlens_padded"], physical)
+
+
+def test_fa4_physical_missing_max_has_descriptive_error() -> None:
+
+    q = torch.empty(2, 2, 4)
+    metadata = dict(
+        qkv_format="thd",
+        _fa4_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        packed_token_indices=torch.arange(2),
+        _fa4_seqused=torch.tensor([2], dtype=torch.int32),
+        _fa4_physical_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="requires max_seqlen"):
+        preprocess_args_and_kwargs_for_attn(q, q, q, None, "fa4", **metadata, fa4_physical_layout=True)
+
+
+def test_fa4_physical_tensor_maximum_keeps_compact_contract() -> None:
+    import nemo_automodel.components.attention.utils as utils
+
+    q = torch.empty(4, 2, 4)
+    maximum = torch.tensor(2, dtype=torch.int32)
+    metadata = dict(
+        qkv_format="thd",
+        _fa4_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        packed_token_indices=torch.tensor([0, 1]),
+        _fa4_seqused=torch.tensor([2], dtype=torch.int32),
+        _fa4_physical_cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+        _fa4_max_seqlen=maximum,
+    )
+    with mock.patch.object(utils, "_fa4_interface_sha256") as scope:
+        a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(
+            q, q, q, None, "fa4", **metadata, fa4_physical_layout=True
+        )
+    scope.assert_not_called()
+    assert a.shape[0] == b.shape[0] == c.shape[0] == 2
+    assert kwargs["max_seqlen_q"] is maximum and "seqused_q" not in kwargs

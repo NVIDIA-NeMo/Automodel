@@ -78,7 +78,7 @@ def test_parallelize_world_size_one_logs_error_when_checkpointing_not_supported(
 
 @pytest.mark.parametrize("flattened_dp_cp", [False, True])
 def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_nonzero3(
-    monkeypatch, capsys, caplog, flattened_dp_cp
+    monkeypatch, caplog, flattened_dp_cp
 ):
     monkeypatch.setattr(mfsdp, "dist", MagicMock(get_world_size=lambda: 8), raising=True)
 
@@ -111,15 +111,15 @@ def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_
         report_nan_in_param_grad=True,
     )
 
-    caplog.set_level(logging.ERROR)
+    caplog.set_level(logging.WARNING)
     out_model, out_opt = mgr.parallelize(model=object(), optimizer="opt")
     assert (out_model, out_opt) == ("parallel_model", "parallel_opt")
 
     # Activation checkpointing is not supported here; should emit an error log.
     assert "Activation checkpointing is not yet supported with MegatronFSDP. Skipping." in caplog.text
 
-    # zero_dp_strategy warning printed only on rank 0
-    assert "Warning: MegatronFSDP zero_dp_strategy is not 3" in capsys.readouterr().out
+    # zero_dp_strategy warning is emitted only on rank 0
+    assert "MegatronFSDP zero_dp_strategy is not 3" in caplog.text
 
     # TP plan should be selected when tp mesh size > 1
     get_plan_mock.assert_called_once()

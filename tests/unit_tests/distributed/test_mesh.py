@@ -55,9 +55,10 @@ class TestMeshContextDefaults:
 
     def test_default_config_fields(self):
         ctx = MeshContext()
-        assert not hasattr(ctx, "strategy_config")
+        assert ctx.strategy_config is None
         assert not hasattr(ctx, "pipeline_config")
-        assert not hasattr(ctx, "moe_config")
+        assert ctx.moe_parallel_config is None
+        assert ctx.activation_checkpointing is False
         assert ctx.device_mesh is None
         assert ctx.moe_mesh is None
 
@@ -193,6 +194,13 @@ class TestHelperMethods:
 
 
 class TestDistributedSetup:
+    def test_setup_without_policy_preserves_mesh_context(self):
+        mesh_context = MeshContext()
+
+        setup = DistributedSetup(mesh_context=mesh_context)
+
+        assert setup.mesh_context is mesh_context
+
     def test_minimal_setup_holds_mesh_and_policy(self):
         setup = DistributedSetup(mesh_context=MeshContext(), strategy_config=FSDP2Config(activation_checkpointing=True))
 

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import base64
 import json
 import os
 import re
@@ -19,17 +20,20 @@ import shutil
 import warnings
 from collections.abc import Callable, Mapping, Sized
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Union, overload
 
 import numpy as np
 from huggingface_hub import create_repo
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
+from mistral_common.protocol.instruct.validator import ValidationMode
 from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.tokens.tokenizers.tekken import Tekkenizer
 from mistral_common.tokens.tokenizers.utils import download_tokenizer_from_hf_hub, get_one_valid_tokenizer_file
 from transformers.audio_utils import load_audio_as
+from transformers.image_utils import is_pil_image
 from transformers.tokenization_utils_base import (
     LARGE_INTEGER,
     VERY_LARGE_INTEGER,
@@ -43,24 +47,6 @@ from transformers.tokenization_utils_base import (
 from transformers.utils import PaddingStrategy, TensorType, add_end_docstrings, logging, to_py_obj
 from transformers.utils.generic import is_torch_tensor
 from transformers.utils.import_utils import is_torch_available, requires
-
-
-class ValidationMode(Enum):
-    r"""Enum for the validation mode.
-
-    Attributes:
-        serving: The serving mode.
-        finetuning: The finetuning mode.
-        test: The test mode.
-
-    Examples:
-        >>> mode = ValidationMode.serving
-    """
-
-    serving = "serving"
-    finetuning = "finetuning"
-    test = "test"
-
 
 if is_torch_available():
     import torch
@@ -1583,13 +1569,21 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
                 Whether to return a dictionary with named outputs. Has no effect if tokenize is `False`.
                 If at least one conversation contains an image, its pixel values will be returned in the `pixel_values` key.
             kwargs (additional keyword arguments, *optional*):
-                Not supported by `MistralCommonBackend.apply_chat_template`.
-                Will raise an error if used.
+                Optional vendor request settings `reasoning_effort` and `response_format`.
+                `processor_kwargs` accepts padding, truncation and max_length from
+                the shared VLM collator. Other keys raise an error.
 
         Returns:
             `Union[str, list[int], list[str], list[list[int]], BatchEncoding]`: A list of token ids representing the tokenized chat so far, including control
             tokens. This output is ready to pass to the model, either directly or via methods like `generate()`.
         """
+        processor_kwargs = dict(kwargs.pop("processor_kwargs", None) or {})
+        padding = processor_kwargs.pop("padding", padding)
+        truncation = processor_kwargs.pop("truncation", truncation)
+        max_length = processor_kwargs.pop("max_length", max_length)
+        if processor_kwargs:
+            raise ValueError(f"Unsupported processor_kwargs: {list(processor_kwargs)}")
+        request_kwargs = {key: kwargs.pop(key) for key in ("reasoning_effort", "response_format") if key in kwargs}
         if kwargs:
             raise ValueError(
                 f"Kwargs {list(kwargs.keys())} are not supported by `MistralCommonBackend.apply_chat_template`."
@@ -1635,7 +1629,17 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
                     maybe_url: str | None = content.get("url")
                     maybe_path: str | None = content.get("path")
                     maybe_base64: str | None = content.get("base64")
-                    if maybe_url:
+                    image = content.get("image")
+                    if is_pil_image(image):
+                        buffer = BytesIO()
+                        image.save(buffer, format="PNG")
+                        image_content = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+                    elif isinstance(image, (str, Path)):
+                        value = str(image)
+                        image_content = (
+                            value if "://" in value or value.startswith("data:") else Path(value).resolve().as_uri()
+                        )
+                    elif maybe_url:
                         image_content = maybe_url
                     elif maybe_path:
                         if not maybe_path.startswith("file://"):
@@ -1661,7 +1665,13 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
                     normalized_content.append({"type": "audio_url", "audio_url": {"url": maybe_base64}})
                 else:
                     normalized_content.append(content)
-            message["content"] = normalized_content
+            # Dataset conversations use text chunks for assistant turns; the
+            # vendor request accepts their text as a single assistant string.
+            message["content"] = (
+                "".join(part["text"] for part in normalized_content)
+                if message.get("role") == "assistant" and all(part.get("type") == "text" for part in normalized_content)
+                else normalized_content
+            )
             return message
 
         outputs = []
@@ -1678,6 +1688,7 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
                 messages=messages,
                 tools=tools,
                 continue_final_message=continue_final_message,
+                **request_kwargs,
             )
 
             tokenized_request = self.tokenizer.encode_chat_completion(chat_request)
@@ -1709,7 +1720,11 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
                                 "Unable to convert output to PyTorch tensors format, PyTorch is not installed."
                             )
 
-                        pixel_values = torch.from_numpy(np.stack(images))
+                        pixel_values = (
+                            torch.from_numpy(np.stack(images))
+                            if all(image.shape == images[0].shape for image in images)
+                            else [torch.from_numpy(image) for image in images]
+                        )
                     elif return_tensors == "np":
                         pixel_values = np.array(images)
                     elif return_tensors is None:
@@ -1717,6 +1732,8 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
                     else:
                         raise ValueError(f"Unsupported return_tensors type: {return_tensors}")
                     out.data["pixel_values"] = pixel_values
+                    sizes = np.asarray([image.shape[-2:] for image in images], dtype=np.int64)
+                    out.data["image_sizes"] = torch.from_numpy(sizes) if return_tensors == "pt" else sizes
                 if audios:
                     if return_tensors is not None:
                         raise NotImplementedError(

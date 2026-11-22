@@ -81,3 +81,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: false
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: h100

@@ -65,8 +65,8 @@ class MiMoV2FlashConfig(PretrainedConfig):
         hybrid_block_size: int | None = None,
         hybrid_layer_pattern: list[int] | None = None,
         partial_rotary_factor: float = 0.334,
-        sliding_window: int | None = 128,
-        sliding_window_size: int | None = 128,
+        sliding_window: int | None = 129,
+        sliding_window_size: int | None = None,
         attention_chunk_size: int | None = 128,
         n_routed_experts: int | None = 256,
         n_shared_experts: int | None = None,
@@ -132,7 +132,8 @@ class MiMoV2FlashConfig(PretrainedConfig):
         ]
 
         self.partial_rotary_factor = partial_rotary_factor
-        self.sliding_window = sliding_window
+        # Hub size counts previous tokens; our masks also count the query (HF #49170).
+        self.sliding_window = sliding_window_size + 1 if sliding_window_size is not None else sliding_window
         self.sliding_window_size = sliding_window_size
         self.attention_chunk_size = attention_chunk_size
 

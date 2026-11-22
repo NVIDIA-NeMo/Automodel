@@ -37,6 +37,7 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.models.common.mtp import shift_packed_tensor
+from nemo_automodel.components.moe.router_replay import RouterReplay
 
 
 def dual_chunk_swap_unsplit(chunks_per_rank, cp_size, seq_dim=1):
@@ -596,7 +597,12 @@ def _create_mtp_model(config, backend, device):
     """Create a synchronized causal LM with its native Nemotron MTP head."""
     from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
-    model = NemotronHForCausalLM(config, backend=backend).to(device=device, dtype=torch.bfloat16)
+    # Register only the new fixture in the process-global replay registry. The
+    # baseline has finished before the CP fixture replaces its registrations.
+    RouterReplay.clear_registry()
+    model = NemotronHForCausalLM(config, backend=backend, moe_overrides={"enable_routing_replay": True}).to(
+        device=device, dtype=torch.bfloat16
+    )
     model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
     model.train()
     for parameter in model.parameters():
@@ -673,17 +679,22 @@ def run_thd_te_mtp(rank, world_size, device, config):
     num_label_tokens = int((labels_full != -100).sum().item())
     max_seqlen = torch.tensor(max(seq_len_a, seq_len_b), dtype=torch.int32, device=device)
 
-    output_baseline = model_baseline(
-        input_ids,
-        position_ids=position_ids,
-        mtp_per_depth_input_ids=(mtp_input_ids_full,),
-        mtp_per_depth_position_ids=(mtp_position_ids_full,),
-        qkv_format="thd",
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        cp_rank=0,
-        cp_size=1,
-    )
+    # BF16 CP accumulation can flip near-tied top-k choices. Compare the same
+    # discrete expert selection while retaining live router probabilities and
+    # gradients; otherwise a different expert can dominate the hidden-state error.
+    with RouterReplay.record():
+        output_baseline = model_baseline(
+            input_ids,
+            position_ids=position_ids,
+            mtp_per_depth_input_ids=(mtp_input_ids_full,),
+            mtp_per_depth_position_ids=(mtp_position_ids_full,),
+            qkv_format="thd",
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cp_rank=0,
+            cp_size=1,
+        )
+    routing_indices = RouterReplay.collect()
     mtp_hidden_baseline = output_baseline.mtp_per_depth_h[0].squeeze(0)
     loss_fn = MaskedCrossEntropy(reduction="sum")
     mtp_loss_baseline = calculate_mtp_loss(
@@ -702,9 +713,14 @@ def run_thd_te_mtp(rank, world_size, device, config):
         "lm_head.weight",
         "mtp.layers.0.eh_proj.weight",
         "mtp.layers.0.mixer.q_proj.weight",
+        "mtp.layers.1.mixer.gate.weight",
+        "mtp.layers.1.mixer.experts.gate_and_up_projs",
+        "mtp.layers.1.mixer.experts.down_projs",
     )
     baseline_params = dict(model_baseline.named_parameters())
     baseline_grads = {name: baseline_params[name].grad.detach().clone() for name in selected_names}
+    for name, gradient in baseline_grads.items():
+        assert torch.isfinite(gradient).all() and gradient.count_nonzero() > 0, name
     baseline_before_step = {name: baseline_params[name].detach().clone() for name in selected_names}
 
     model_cp = _create_mtp_model(config, backend, device)
@@ -743,27 +759,29 @@ def run_thd_te_mtp(rank, world_size, device, config):
     labels_local = labels_full.index_select(0, local_indices)
     mtp_targets_local = mtp_inputs_cp.targets[0].reshape(-1).index_select(0, local_indices)
 
-    output_cp = model_cp(
-        input_ids_local,
-        position_ids=position_ids_local,
-        mtp_per_depth_input_ids=(mtp_input_ids_local,),
-        mtp_per_depth_position_ids=(mtp_position_ids_local,),
-        qkv_format="thd",
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        cp_rank=rank,
-        cp_size=world_size,
-    )
-    mtp_loss_cp = calculate_mtp_loss(
-        loss_fn,
-        mtp_per_depth_h=output_cp.mtp_per_depth_h,
-        mtp_per_depth_targets=(mtp_targets_local,),
-        labels=labels_local,
-        model=model_cp,
-        scaling_factor=1.0,
-        num_label_tokens=num_label_tokens,
-    )
-    mtp_loss_cp.backward()
+    local_routing_indices = [indices.index_select(0, local_indices) for indices in routing_indices]
+    with RouterReplay.replay(local_routing_indices):
+        output_cp = model_cp(
+            input_ids_local,
+            position_ids=position_ids_local,
+            mtp_per_depth_input_ids=(mtp_input_ids_local,),
+            mtp_per_depth_position_ids=(mtp_position_ids_local,),
+            qkv_format="thd",
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cp_rank=rank,
+            cp_size=world_size,
+        )
+        mtp_loss_cp = calculate_mtp_loss(
+            loss_fn,
+            mtp_per_depth_h=output_cp.mtp_per_depth_h,
+            mtp_per_depth_targets=(mtp_targets_local,),
+            labels=labels_local,
+            model=model_cp,
+            scaling_factor=1.0,
+            num_label_tokens=num_label_tokens,
+        )
+        mtp_loss_cp.backward()
 
     mtp_hidden_cp = _gather_te_partition(
         output_cp.mtp_per_depth_h[0].squeeze(0).detach(),
@@ -1130,6 +1148,8 @@ def main():
             if rank == 0:
                 print(f"  {name}: ERROR - {e}")
             results[name] = 1
+        finally:
+            RouterReplay.clear_registry()
 
     if rank == 0:
         print(f"\n{'=' * 70}")

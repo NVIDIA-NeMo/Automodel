@@ -15,6 +15,7 @@
 import json
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -43,7 +44,14 @@ def test_copy_metadata_files_copies_and_preserves_source(tmp_path):
     assert not (out_dir / "fqn_to_file_index_mapping.json").exists()
 
 
-def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("timeout_args, expected_timeout", [([], 30), (["--timeout-minutes", "7"], 7)])
+def test_main_happy_path_calls_consolidate_and_copies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_args: list[str],
+    expected_timeout: int,
+) -> None:
     from tools import offline_hf_consolidation as script
 
     in_dir = tmp_path / "in"
@@ -60,7 +68,8 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
     in_dir.mkdir(exist_ok=True)
 
     # Patch out distributed and consolidation side effects
-    monkeypatch.setattr(script, "initialize_distributed", lambda backend: None)
+    initialize = Mock()
+    monkeypatch.setattr(script, "initialize_distributed", initialize)
     monkeypatch.setattr(script, "get_world_size_safe", lambda: 1)
     monkeypatch.setattr(script, "get_rank_safe", lambda: 0)
 
@@ -91,10 +100,11 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
         "2",
         "--backend",
         "gloo",
-    ]
+    ] + timeout_args
     monkeypatch.setattr(sys, "argv", argv)
 
     script.main()
+    initialize.assert_called_once_with("gloo", timeout_minutes=expected_timeout)
 
     # Consolidation called with expected arguments
     assert "args" in captured
@@ -123,7 +133,7 @@ def test_main_raises_if_missing_metadata(tmp_path, monkeypatch):
     out_dir = tmp_path / "out_no_meta"
     in_dir.mkdir()
 
-    monkeypatch.setattr(script, "initialize_distributed", lambda backend: None)
+    monkeypatch.setattr(script, "initialize_distributed", Mock())
     monkeypatch.setattr(script, "get_world_size_safe", lambda: 1)
     monkeypatch.setattr(script, "get_rank_safe", lambda: 0)
 

@@ -113,3 +113,7 @@ optimizer:
 moe_metrics:
   enabled: true
   mode: brief
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

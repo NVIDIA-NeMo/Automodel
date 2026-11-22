@@ -49,6 +49,7 @@ from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2Fo
 from nemo_automodel.components.models.bagel.modeling_siglip_navit import (
     SiglipVisionModel,
 )
+from nemo_automodel.components.models.bagel.parallelization import PARALLELIZER
 from nemo_automodel.components.models.bagel.state_dict_adapter import (
     BagelStateDictAdapter,
     load_bagel_checkpoint_state_dict,
@@ -624,3 +625,6 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             mse = (packed_mse_preds - target[has_mse]) ** 2
 
         return {"mse": mse, "ce": ce}
+
+
+BagelForUnifiedMultimodal.parallelizer = PARALLELIZER

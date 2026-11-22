@@ -62,7 +62,7 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 
-from .fsdp import register_diffusion_gemma_parallel_strategy
+from .fsdp import PARALLELIZER
 from .layers import (
     DiffusionGemmaMoEDecoderLayer,
     DiffusionGemmaRMSNorm,
@@ -443,7 +443,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the shared diffusion text embedding."""
         self.lm_head.weight = self.model.embed_tokens.weight
 
@@ -659,9 +659,4 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
 
 ModelClass = DiffusionGemmaForBlockDiffusion
-
-# Register the pure-FSDP2 (ep_size=1) parallelization strategy so that
-# get_parallelization_strategy() selects it for this model. Done here (not in
-# the package __init__) so registration runs alongside model construction.
-
-register_diffusion_gemma_parallel_strategy()
+DiffusionGemmaForBlockDiffusion.parallelizer = PARALLELIZER

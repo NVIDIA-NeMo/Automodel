@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
+import json
 import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union, cast
 
@@ -20,12 +20,7 @@ import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
 
-
-def _doc_id_str_to_int64(doc_id: str) -> int:
-    """Stable 63-bit int for corpus doc id strings (for in-batch duplicate masking)."""
-    h = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
-    return int.from_bytes(h, "little", signed=False) & ((1 << 63) - 1)
-
+from nemo_automodel.shared.retrieval_ids import document_id_to_int64
 
 if TYPE_CHECKING:
     from transformers import BatchEncoding
@@ -216,7 +211,7 @@ class BiEncoderCollator:
         if doc_id_groups and all(doc_ids and all(doc_ids) for doc_ids in doc_id_groups):
             doc_id_flat = [doc_id for doc_ids in doc_id_groups for doc_id in doc_ids]
             merged_batch_dict["passage_doc_ids"] = torch.tensor(
-                [_doc_id_str_to_int64(s) for s in doc_id_flat],
+                [document_id_to_int64(s) for s in doc_id_flat],
                 dtype=torch.long,
             )
 
@@ -279,6 +274,60 @@ class CrossEncoderCollator(DataCollatorWithPadding):
             self.args = kwargs.pop("args")
         super().__init__(*args, **kwargs)
 
+    def configure_tokenizer_for_export(self) -> None:
+        """Save the training format as a standard named tokenizer chat template.
+
+        The ``reranking`` template accepts flat query/document messages. It includes
+        the tokenizer's single-sequence special-token prefix and suffix because
+        tokenizer chat templates bypass automatic special-token insertion.
+        Sentence Transformers restores the special-token suffix after truncation.
+
+        Raises:
+            ValueError: If truncation is not right-sided, the prompt ends in fixed text, or the tokenizer does not
+                use a portable special-token prefix/suffix with zero token type IDs.
+        """
+        if not self.prompt_template.endswith(("{query}", "{passage}")):
+            raise ValueError(
+                "Text reranker export requires prompt_template to end with {query} or {passage}; "
+                "fixed trailing text cannot preserve training-time truncation through a chat template."
+            )
+        if self.tokenizer.truncation_side != "right":
+            raise ValueError("Text reranker export requires right truncation to preserve special-token boundaries.")
+        sample = "query passage"
+        plain_ids = self.tokenizer(sample, add_special_tokens=False, truncation=False, padding=False)["input_ids"]
+        wrapped = self.tokenizer(
+            sample, add_special_tokens=True, return_special_tokens_mask=True, truncation=False, padding=False
+        )
+        ids, mask = wrapped["input_ids"], wrapped["special_tokens_mask"]
+        content_positions = [index for index, special in enumerate(mask) if not special]
+        if not content_positions or len(ids) != len(mask):
+            raise ValueError("Text reranker export requires a tokenizer with a faithful special_tokens_mask.")
+        start, end = content_positions[0], content_positions[-1] + 1
+        if ids[start:end] != plain_ids or any(wrapped.get("token_type_ids", [])):
+            raise ValueError(
+                "Text reranker export requires single-sequence prefix/suffix special tokens and zero type IDs."
+            )
+        prefix = "".join(self.tokenizer.convert_ids_to_tokens(ids[:start]))
+        suffix = "".join(self.tokenizer.convert_ids_to_tokens(ids[end:]))
+        if self.tokenizer(prefix + sample + suffix, add_special_tokens=False)["input_ids"] != ids:
+            raise ValueError("Text reranker export cannot reproduce the tokenizer's special tokens in a chat template.")
+        template = (
+            "{%- if messages | length != 2 or messages[0]['role'] != 'query' "
+            "or messages[1]['role'] != 'document' -%}"
+            "{{- raise_exception('Reranking requires a query followed by a document') -}}{%- endif -%}"
+            "{{- "
+            + json.dumps(prefix, ensure_ascii=False)
+            + " + "
+            + json.dumps(self.prompt_template, ensure_ascii=False)
+            + ".format(query=messages[0]['content'], passage=messages[1]['content']) + "
+            + json.dumps(suffix, ensure_ascii=False)
+            + " -}}"
+        )
+        existing = self.tokenizer.chat_template
+        templates = dict(existing) if isinstance(existing, dict) else ({"default": existing} if existing else {})
+        templates["reranking"] = template
+        self.tokenizer.chat_template = templates
+
     def __call__(self, features: List[Dict[str, Any]]) -> "BatchEncoding":
         query_examples = [x["question"] for x in features]
         doc_examples = [x["doc_text"] for x in features]
@@ -321,10 +370,21 @@ class ProcessorMethodCollator:
             tokenizer: Runtime multimodal processor.
             collator_fn_name: Processor method used to collate each batch.
         """
+        self.processor = tokenizer
         self.collate_fn = cast(
             Callable[[list[dict[str, object]]], dict[str, object]],
             getattr(tokenizer, collator_fn_name),
         )
+
+    @property
+    def query_prefix(self) -> str:
+        """Return the query prefix owned by the underlying processor."""
+        return cast(str, getattr(self.processor, "query_prefix"))
+
+    @property
+    def passage_prefix(self) -> str:
+        """Return the passage prefix owned by the underlying processor."""
+        return cast(str, getattr(self.processor, "passage_prefix"))
 
     def __call__(self, batch: list[dict[str, object]]) -> dict[str, object]:
         """Collate retrieval examples with the resolved processor method.

@@ -243,8 +243,9 @@ class _KwargsChunkSchedule:
         self.args_during_step = None
         self.kwargs_chunk_spec_during_step = None
         self.kwargs_split = None
+        self.return_outputs_during_step = None
 
-    def step(self, *args, target=None, losses=None, **kwargs):
+    def step(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
         """Split schedule inputs using the chunk spec active during the call.
 
         Args:
@@ -253,6 +254,8 @@ class _KwargsChunkSchedule:
             target: Optional tensor of shape [batch, sequence] containing loss
                 targets.
             losses: Optional mutable list populated with scalar loss tensors.
+            return_outputs: Schedule option recorded for assertions; it defaults
+                to ``True`` like PyTorch's schedules.
             **kwargs: Keyword schedule inputs. Tensor values have arbitrary
                 model-defined layouts.
 
@@ -260,6 +263,7 @@ class _KwargsChunkSchedule:
             A sentinel string identifying the schedule result.
         """
         del target, losses
+        self.return_outputs_during_step = return_outputs
         self.args_during_step = args
         self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
         if self.fail_on_step:
@@ -315,6 +319,18 @@ class TestAutoPipelineKwargsChunkSpec:
         assert fixed_kwargs_split[1]["qkv_format"] == "thd"
         assert ap.info.schedule.args_during_step == (input_ids,)
         assert ap.info.schedule._kwargs_chunk_spec is None
+
+    @pytest.mark.parametrize(("step_kwargs", "expected"), [({}, False), ({"return_outputs": True}, True)])
+    def test_step_passes_return_outputs_to_schedule_outside_model_chunk_spec(
+        self, step_kwargs: dict[str, bool], expected: bool
+    ) -> None:
+        """return_outputs configures the schedule, so the model-owned chunk spec never sees it."""
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
+
+        ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8), **step_kwargs)
+
+        assert ap.info.schedule.return_outputs_during_step is expected
+        assert set(ap.info.schedule.kwargs_chunk_spec_during_step) == {"position_ids"}
 
     def test_step_without_model_hook_uses_pytorch_default_chunking(self):
         ap = self._pipeline_with_parts(nn.Module())
@@ -1116,3 +1132,48 @@ class TestAutoPipelineUpdateSeqLen:
         assert ap._model_config is None
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
         assert ap._model_config is model.config
+
+    def test_runtime_initializers_prepare_after_shape_reset_on_every_call(self, monkeypatch):
+        events = []
+
+        class RecordingInitializer:
+            @staticmethod
+            def prepare(*, num_tokens, device):
+                events.append(("prepare", num_tokens, device))
+
+        ap = AutoPipeline(
+            world_mesh=FakeDeviceMesh(),
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=2,
+            pp_batch_size=4,
+            device=torch.device("cpu"),
+        )
+        ap._model_config = object()
+        ap._info.schedule = object()
+        ap._info.stages = []
+        ap._runtime_initializers = [RecordingInitializer()]
+
+        def record_reset(*args, **kwargs):
+            events.append(("reset", args[4]))
+            return ap.pp_microbatch_size * args[4]
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.pipelining.autopipeline.reset_pp_stage_shapes",
+            record_reset,
+        )
+
+        ap.update_seq_len(8)
+        ap.update_seq_len(8)
+        ap.update_seq_len(16)
+        ap.update_seq_len(4)
+
+        assert events == [
+            ("reset", 8),
+            ("prepare", 16, torch.device("cpu")),
+            ("prepare", 16, torch.device("cpu")),
+            ("reset", 16),
+            ("prepare", 32, torch.device("cpu")),
+            ("reset", 4),
+            ("prepare", 8, torch.device("cpu")),
+        ]

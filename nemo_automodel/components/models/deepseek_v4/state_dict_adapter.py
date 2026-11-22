@@ -54,6 +54,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
     BLOCK_SIZE,
@@ -196,6 +197,11 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
 # Routed-expert pattern in HF V4 format
 _EXPERT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.weight$")
 
+# Base weights use DeepSeek's serialized names, which Transformers converts on
+# load. PEFT attaches directly to the constructed HF model and needs its names.
+_PEFT_MODULES_TO_HF = {"wq_a": "q_a_proj", "wq_b": "q_b_proj", "wkv": "kv_proj", "wo_b": "o_b_proj"}
+_PEFT_MODULES_FROM_HF = {hf: native for native, hf in _PEFT_MODULES_TO_HF.items()}
+
 
 class _HashBiasScope(enum.Enum):
     """Key-format scope for :meth:`DeepSeekV4StateDictAdapter._drop_hash_layer_gate_bias`."""
@@ -229,12 +235,29 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         moe_config: MoEConfig,
         backend: BackendConfig,
         dtype: torch.dtype = torch.float32,
+        expert_storage_format: str = "bf16",
     ):
         self.config = config
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
+        # "bf16": dequantize routed experts to bf16 on load (default).
+        # "mxfp4": passthrough — keep the checkpoint's packed fp4 (int8) + e8m0
+        # scales and aggregate them into ``*_packed`` / ``*_scales`` params so
+        # experts are never materialized in bf16 (caps the load-time peak).
+        self.expert_storage_format = expert_storage_format
         self._checkpoint_expert_quant_layout_cache: _ExpertQuantLayout | None = None
+
+    def set_expert_storage_format(self, storage_format: str) -> None:
+        """Select the routed-expert storage emitted during checkpoint loading."""
+        if storage_format not in ("bf16", "mxfp4"):
+            raise ValueError(f"Unsupported expert storage format: {storage_format}")
+        if storage_format == "mxfp4" and get_world_size_safe() == 1:
+            raise ValueError(
+                "MXFP4-resident DeepSeek-V4 experts require expert parallelism "
+                "(multi-GPU with distributed.ep_size>1); use ep_size>1 or BF16 expert storage."
+            )
+        self.expert_storage_format = storage_format
 
     # ------------------------------------------------------------------
     # from_hf
@@ -257,6 +280,18 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
           3. Aggregate per-expert routed weights into stacked tensors.
           4. Rename keys using the HF -> internal mapping table.
           5. Re-prefix MTP keys: ``model.layers.{k}.*`` -> ``mtp.layers.{k}.*``.
+
+        Args:
+            hf_state_dict: Checkpoint tensor mapping. Linear weights have shape [out, in]; routed experts are
+                per-expert [out, in] (FP4 packs two input values per byte). LoRA A/B tensors have shapes
+                [rank, in] and [out, rank]. Other parameters retain their model-defined shapes and axis order.
+            device_mesh: Optional expert-parallel mesh used to select and shard the expert axis.
+            **kwargs: Additional checkpoint-loader options.
+
+        Returns:
+            Native tensor mapping. Expert weights become [experts, hidden, 2 * intermediate] (gate then up)
+            and [experts, intermediate, hidden]. LoRA tensors retain their shape, dtype, device and storage;
+            only their module names change. Legacy AutoModel-named adapters remain accepted.
         """
         N = self.config.num_hidden_layers
         num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
@@ -276,6 +311,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         native_mtp_re = re.compile(r"^mtp\.(\d+)\.")
         for key in list(hf_state_dict.keys()):
             val = hf_state_dict[key]
+            if ".lora_" in key:
+                backbone_hf[".".join(_PEFT_MODULES_FROM_HF.get(part, part) for part in key.split("."))] = val
+                continue
             native_m = native_mtp_re.match(key)
             if native_m is not None:
                 mtp_depth = int(native_m.group(1))
@@ -345,6 +383,11 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             if scale_key is not None:
                 scale = state_dict[scale_key]
                 if self._is_expert_weight_key(key):
+                    # mxfp4 passthrough: leave packed expert weight + scale in place;
+                    # _aggregate_experts_packed consumes both. Only fp4-layout
+                    # checkpoints are eligible — fall back to dequant otherwise.
+                    if self.expert_storage_format == "mxfp4" and self._expert_key_is_fp4(weight, scale):
+                        continue
                     state_dict[key] = self._dequantize_expert_weight(key, weight, scale)
                 else:
                     state_dict[key] = dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
@@ -360,6 +403,8 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         device_mesh: DeviceMesh | None,
     ) -> dict[str, Any]:
         """Aggregate per-expert weights (w1/w2/w3) into stacked gate_and_up/down tensors."""
+        if self.expert_storage_format == "mxfp4":
+            return self._aggregate_experts_packed(state_dict, device_mesh)
         n_experts = self.moe_config.n_routed_experts
 
         if device_mesh is not None:
@@ -439,6 +484,86 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 native_key = f"model.layers.{layer_num}.mlp.experts.down_projs"
                 out[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
                 del by_layer[layer_num]["down"]
+
+        return out
+
+    def _expert_key_is_fp4(self, weight: torch.Tensor, scale: torch.Tensor) -> bool:
+        return self._expert_quant_layout_from_tensors(weight, scale) is _ExpertQuantLayout.FP4
+
+    def _aggregate_experts_packed(
+        self,
+        state_dict: dict[str, Any],
+        device_mesh: DeviceMesh | None,
+    ) -> dict[str, Any]:
+        """Aggregate per-expert packed fp4 weights + e8m0 scales WITHOUT dequantizing.
+
+        Concatenates gate (w1) and up (w3) along the output dim and stacks experts
+        on dim 0 — packing is along the contraction (input) dim, so both operations
+        are layout-preserving and no unpacking is needed. Emits ``*_packed`` /
+        ``*_scales`` keys matching ``MXFP4ExpertStorageMixin``'s packed params.
+        """
+        n_experts = self.moe_config.n_routed_experts
+        if device_mesh is not None:
+            rank = (
+                get_submesh(device_mesh, ("ep",)).get_rank()
+                if "ep" in device_mesh.mesh_dim_names
+                else device_mesh.get_rank()
+            )
+            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
+            expected_per_rank = end_expert - start_expert
+        else:
+            rank = None
+            expected_per_rank = n_experts
+
+        # layer -> {"gate_and_up": {eid: {"w1": (packed, scale), "w3": (...)}}, "down": {eid: (packed, scale)}}
+        by_layer: dict[str, dict] = {}
+        out: dict[str, Any] = {}
+
+        for key in list(state_dict.keys()):
+            m = _EXPERT_PATTERN.match(key)
+            if m is None:
+                # Drop orphaned expert scale keys (consumed via their weight key); pass the rest through.
+                if ".ffn.experts." in key and key.endswith(".scale"):
+                    continue
+                out[key] = state_dict[key]
+                continue
+
+            layer_num, expert_num, which = m.group(1), int(m.group(2)), m.group(3)
+            if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
+                continue
+
+            weight = state_dict[key]
+            scale = state_dict.get(key[: -len(".weight")] + ".scale")
+            assert scale is not None, f"missing scale for packed expert weight {key}"
+            packed = weight.to_local() if is_dtensor(weight) else weight
+            scale_local = scale.to_local() if is_dtensor(scale) else scale
+
+            layer = by_layer.setdefault(layer_num, {"gate_and_up": {}, "down": {}})
+            if which in ("w1", "w3"):
+                layer["gate_and_up"].setdefault(expert_num, {})[which] = (packed, scale_local)
+            else:  # w2 = down
+                layer["down"][expert_num] = (packed, scale_local)
+
+            gu = layer.get("gate_and_up")
+            if gu is not None and len(gu) == expected_per_rank and all("w1" in d and "w3" in d for d in gu.values()):
+                eids = sorted(gu.keys())
+                # cat(gate, up) along the output dim (dim 0 of [out, in//2] / [out, in//block]).
+                packed_stack = torch.stack([torch.cat([gu[e]["w1"][0], gu[e]["w3"][0]], dim=0) for e in eids], dim=0)
+                scale_stack = torch.stack([torch.cat([gu[e]["w1"][1], gu[e]["w3"][1]], dim=0) for e in eids], dim=0)
+                base = f"model.layers.{layer_num}.mlp.experts.gate_and_up_projs"
+                out[base + "_packed"] = create_dtensor_from_local(packed_stack, device_mesh, rank)
+                out[base + "_scales"] = create_dtensor_from_local(scale_stack, device_mesh, rank)
+                del layer["gate_and_up"]
+
+            down = layer.get("down")
+            if down is not None and len(down) == expected_per_rank:
+                eids = sorted(down.keys())
+                packed_stack = torch.stack([down[e][0] for e in eids], dim=0)
+                scale_stack = torch.stack([down[e][1] for e in eids], dim=0)
+                base = f"model.layers.{layer_num}.mlp.experts.down_projs"
+                out[base + "_packed"] = create_dtensor_from_local(packed_stack, device_mesh, rank)
+                out[base + "_scales"] = create_dtensor_from_local(scale_stack, device_mesh, rank)
+                del layer["down"]
 
         return out
 
@@ -622,7 +747,39 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 return new_key
         return key
 
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
+        """Name LoRA targets in the native Transformers DeepSeek V4 model.
+
+        Args:
+            name: Native module path or leaf name, including compressor/indexer projections.
+            v4_compatible: Export compatibility selection; both use the same attention module names.
+
+        Returns:
+            HF module path with the original outer namespace preserved.
+        """
+        return ".".join(_PEFT_MODULES_TO_HF.get(part, part) for part in name.split("."))
+
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Export one base-model or LoRA tensor to its receiving checkpoint layout.
+
+        Args:
+            fqn: Native parameter name, optionally under the PEFT ``base_model.model.`` prefix.
+            tensor: LoRA A/B tensor of shape [rank, in] / [out, rank], linear weight [out, in], grouped
+                gate/up weight [experts, hidden, 2 * intermediate], or down weight [experts, intermediate,
+                hidden]. Other parameters have arbitrary model-defined shapes. Expert DTensors shard the
+                expert axis; non-expert tensors retain their placement.
+            **kwargs: Existing export options, including exclusion regex and base-weight quantization.
+
+        Returns:
+            Named tensors. LoRA tensors alias the input without layout/dtype changes and use HF runtime names.
+            Base experts split to per-expert [out, in] tensors; other base weights retain the original DeepSeek
+            checkpoint names/layouts. Quantized experts pack the input axis and emit per-block scales.
+        """
+        if ".lora_" in fqn:
+            hf_key = self.map_peft_target_module_to_hf(fqn)
+            exclude_key_regex = kwargs.get("exclude_key_regex")
+            return [] if exclude_key_regex and re.match(exclude_key_regex, hf_key) else [(hf_key, tensor)]
+
         # MTP keys (``mtp.layers.{k}.*``) share the same per-block layout as
         # backbone layers, but current DSV4-Flash stores them under native
         # ``mtp.{k}.*`` keys.  Rewrite to an equivalent temporary
@@ -672,6 +829,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if quantization:
             quantized = []
             for key, value in result:
+                # mxfp4 passthrough: experts are already split into packed int8
+                # weight + e8m0 scale by _split_merged_expert; do not rebuild
+                # placeholders (the bf16->fp4 path assumes a bf16 input).
+                if self.expert_storage_format == "mxfp4" and self._is_expert_weight_key(key):
+                    quantized.append((key, value))
+                    continue
                 if key.endswith(".weight") and not self._is_non_quantized(key):
                     base = key[: -len(".weight")]
                     if self._is_expert_weight_key(key):
@@ -949,6 +1112,36 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         Handles DTensor inputs (EP-sharded) by working on the local shard only,
         emitting keys only for the experts owned by the current rank.
         """
+        # mxfp4 passthrough: packed params are already in checkpoint orientation
+        # [E, out, in//{2,block}]; split per-expert (dim 0) then gate||up along the
+        # output dim (dim 0 of the per-expert tensor). No transpose — unlike the
+        # bf16 path which stores compute layout and must transpose.
+        gate_up_packed_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs_(packed|scales)$")
+        down_packed_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.down_projs_(packed|scales)$")
+
+        m = gate_up_packed_pat.match(fqn)
+        if m:
+            layer_num, suffix = m.group(2), m.group(3)
+            disk_suffix = "weight" if suffix == "packed" else "scale"
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, self.moe_config.n_routed_experts)
+            result = []
+            for t, eid in zip(expert_tensors, expert_ids):
+                out_dim = t.shape[0] // 2
+                gate_t, up_t = t.split(out_dim, dim=0)
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w1.{disk_suffix}", gate_t))
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w3.{disk_suffix}", up_t))
+            return result
+
+        m = down_packed_pat.match(fqn)
+        if m:
+            layer_num, suffix = m.group(2), m.group(3)
+            disk_suffix = "weight" if suffix == "packed" else "scale"
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, self.moe_config.n_routed_experts)
+            return [
+                (f"layers.{layer_num}.ffn.experts.{eid}.w2.{disk_suffix}", t)
+                for t, eid in zip(expert_tensors, expert_ids)
+            ]
+
         gate_up_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs$")
         down_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.down_projs$")
 

@@ -71,7 +71,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   backend:
@@ -115,6 +115,7 @@ optimizer:
 
 
 ci:
+  nemo_ci_schedule: skipped
   time: "00:40:00"
   nodes: 2
   cluster_tag: gb200

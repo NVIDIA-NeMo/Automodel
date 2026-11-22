@@ -51,6 +51,7 @@ class NemotronV3Attention(nn.Module):
         self.hidden_size = config.hidden_size
         self.attention_bias = getattr(config, "attention_bias", False)
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
+        self.initializer_range = getattr(config, "initializer_range", 0.02)
         # Cached for debug-print role disambiguation (backbone vs mtp sublayer).
         self.num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
 
@@ -158,8 +159,17 @@ class NemotronV3Attention(nn.Module):
         rescale_prenorm_residual: bool = True,
         buffer_device: torch.device | None = None,
     ) -> None:
+        """Initialize attention projections after materialization, preserving storage dtype.
+
+        Args:
+            num_hidden_layers: Layer count used to rescale the output projection.
+            rescale_prenorm_residual: Whether to divide output weights by sqrt(layer count).
+            buffer_device: Device context for initialization. Each projection's weight
+                matrix and optional bias vector are overwritten in place.
+        """
         with buffer_device:
             for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
+                nn.init.normal_(proj.weight, mean=0.0, std=self.initializer_range)
                 if proj.bias is not None:
                     nn.init.zeros_(proj.bias)
 
@@ -438,6 +448,8 @@ class NemotronV3Mamba2Mixer(nn.Module):
             else:
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(A_log.float())
+                # Adapters and sharded wrappers must execute their module forward/hooks.
+                fuse_out_proj = type(self.out_proj) is nn.Linear
 
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
@@ -451,14 +463,16 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     activation=self.activation,
                     rmsnorm_weight=self.norm.weight,
                     rmsnorm_eps=self.norm.variance_epsilon,
-                    outproj_weight=self.out_proj.weight,
-                    outproj_bias=self.out_proj.bias,
+                    outproj_weight=self.out_proj.weight if fuse_out_proj else None,
+                    outproj_bias=self.out_proj.bias if fuse_out_proj else None,
                     headdim=self.head_dim,
                     ngroups=self.n_groups,
                     norm_before_gate=False,
                     return_final_states=False,
                     **dt_limit_kwargs,
                 )
+                if not fuse_out_proj:
+                    out = self.out_proj(out)
                 if squeezed:
                     out = out.squeeze(0)
                 return out

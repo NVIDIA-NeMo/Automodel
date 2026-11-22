@@ -23,21 +23,32 @@ grouped-experts MoE could save only ~1/pp of its layers). The fix all-gathers
 the per-rank PEFT dicts across the PP group and unions ``target_modules`` the
 same way.
 
-These tests fake ``torch.distributed`` so the merge/union logic runs on CPU
+Most of these tests fake ``torch.distributed`` so the merge/union logic runs on CPU
 with no real process group — the distributed primitive is trivial; the
 correctness we care about is the merge, the dedup, the world==1 short-circuit,
-and the degenerate-gather warning.
+and the degenerate-gather warning. Modules trained in full next to LoRA move
+between stages with their own collectives, which a two-rank gloo test exercises.
 """
 
 import logging
+import os
+from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 import torch
 from torch import nn
 
-from nemo_automodel.components.checkpoint.addons import _extract_target_modules, _extract_target_parameters
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components.checkpoint.addons import (
+    _extract_modules_to_save,
+    _extract_target_modules,
+    _extract_target_parameters,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    ModelState,
     _gather_peft_state_dict_across_pp,
+    _trainable_module_layout,
 )
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
@@ -202,6 +213,78 @@ class TestGatherPeftStateDictAcrossPP:
         assert not any("may be INCOMPLETE" in rec.message for rec in caplog.records)
 
 
+def _pipeline_stage(index: int) -> nn.Module:
+    """Stage ``index`` of a two-stage pipeline: LoRA in its decoder layer, other modules trained in full.
+
+    The first stage holds a bf16 embedding. The last holds an fp32 norm with a persistent 0-dim int64
+    buffer and a bf16 LM head. Every rank builds both stages and gets the same values.
+    """
+    torch.manual_seed(index)
+    stage = nn.Module()
+    stage.model = nn.Module()
+    if index == 0:
+        stage.model.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
+    stage.model.layers = nn.ModuleDict({str(index): nn.Module()})
+    stage.model.layers[str(index)].q_proj = nn.Linear(4, 4)
+    if index == 1:
+        stage.model.norm = nn.LayerNorm(4)
+        stage.model.norm.register_buffer("steps", torch.tensor(3))
+        stage.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+    apply_lora_to_linear_modules(stage, PeftConfig(target_modules=["*.q_proj"], dim=2, alpha=4, use_triton=False))
+    with torch.no_grad():
+        for name, parameter in stage.named_parameters():
+            parameter.copy_(torch.randn_like(parameter))
+            parameter.requires_grad_("lora_" in name or not name.startswith("model.layers."))
+    return stage
+
+
+def _run_pipeline_stage_save_worker(rank: int, init_file: str) -> None:
+    """Each rank saves its own stage and must return the whole adapter with exact values and dtypes."""
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    try:
+        stages = [_pipeline_stage(0), _pipeline_stage(1)]
+        pickled_payloads = []
+        all_gather_object = torch.distributed.all_gather_object
+
+        def recording_all_gather_object(object_list, obj, group=None):
+            pickled_payloads.append(obj)
+            all_gather_object(object_list, obj, group=group)
+
+        with patch.object(torch.distributed, "all_gather_object", recording_all_gather_object):
+            state = ModelState(stages[rank], is_peft=True, pp_group=torch.distributed.group.WORLD).state_dict()
+
+        expected = {
+            f"base_model.model.{name}": parameter.detach()
+            for stage in stages
+            for name, parameter in stage.named_parameters()
+            if parameter.requires_grad
+        }
+        expected["base_model.model.model.norm.steps"] = stages[1].model.norm.steps
+        assert state.keys() == expected.keys(), sorted(state.keys() ^ expected.keys())
+        for key, value in expected.items():
+            assert state[key].dtype == value.dtype, (key, state[key].dtype, value.dtype)
+            torch.testing.assert_close(
+                state[key], value, rtol=0, atol=0, msg=lambda formatted, key=key: f"{key}: {formatted}"
+            )
+        # The tensors of modules stored whole never enter the pickled gather, which stages every rank's
+        # payload on every rank's device at once.
+        pickled_keys = {key for payload in pickled_payloads if isinstance(payload, dict) for key in payload}
+        assert pickled_keys and all(".lora_" in key for key in pickled_keys), sorted(pickled_keys)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_pipeline_stages_share_fully_trained_modules_without_pickling_them(tmp_path):
+    """Every stage ends up with the other stage's modules trained in full, moved one tensor at a time."""
+    torch.multiprocessing.spawn(
+        _run_pipeline_stage_save_worker, args=(str(tmp_path / "dist_init"),), nprocs=2, join=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # _extract_target_modules PP union
 # ---------------------------------------------------------------------------
@@ -255,6 +338,59 @@ class TestExtractTargetModulesPPUnion:
         )
         result = _extract_target_modules(model, pp_group=None)
         assert result == ["model.layers.0.self_attn.wq_a"]
+
+
+class TestExtractModulesToSavePPUnion:
+    def test_stage_layouts_are_combined_before_naming_modules(self, monkeypatch):
+        """Every stage names the same modules, and a partial view never widens one.
+
+        The last stage holds model.norm but no decoder layer, so on its own every parameter
+        under ``model`` looks trained in full and ``model`` itself would be listed. HF PEFT
+        would then wrap the whole backbone and fail to load it from the adapter.
+        """
+        first = nn.Module()
+        first.model = nn.Module()
+        first.model.embed_tokens = nn.Embedding(4, 2)
+        first.model.layers = nn.ModuleList([nn.Module()])
+        first.model.layers[0].q_proj = nn.Linear(2, 2).requires_grad_(False)
+        first.model.layers[0].q_proj.lora_A = nn.Linear(2, 1, bias=False)
+        last = nn.Module()
+        last.model = nn.Module()
+        last.model.norm = nn.LayerNorm(2)
+        last.lm_head = nn.Linear(2, 4)
+        layouts = [_trainable_module_layout([first]), _trainable_module_layout([last])]
+        _install_fake_distributed(monkeypatch, layouts)
+
+        for stage in (first, last):
+            assert _extract_modules_to_save([stage], pp_group=_FakePPGroup(layouts)) == [
+                "lm_head",
+                "model.embed_tokens",
+                "model.norm",
+            ]
+
+    def test_trained_layer_container_split_across_stages_is_listed_by_block(self, monkeypatch):
+        """Each stage's ``model.layers`` ModuleDict holds one trained block; HF PEFT cannot wrap the container.
+
+        The last stage holds no frozen ``model`` parameter, so only the combined layout keeps it
+        from listing ``model`` whole.
+        """
+        stages = []
+        for index in range(2):
+            stage = nn.Module()
+            stage.model = nn.Module()
+            stage.model.layers = nn.ModuleDict({str(index): nn.LayerNorm(2)})
+            stages.append(stage)
+        stages[0].model.embed_tokens = nn.Embedding(4, 2).requires_grad_(False)
+        stages[1].lm_head = nn.Linear(2, 4).requires_grad_(False)
+        stages[1].lm_head.lora_A = nn.Linear(2, 1, bias=False)
+        layouts = [_trainable_module_layout([stage]) for stage in stages]
+        _install_fake_distributed(monkeypatch, layouts)
+
+        for stage in stages:
+            assert _extract_modules_to_save([stage], pp_group=_FakePPGroup(layouts)) == [
+                "model.layers.0",
+                "model.layers.1",
+            ]
 
 
 class TestExtractTargetParametersPPUnion:

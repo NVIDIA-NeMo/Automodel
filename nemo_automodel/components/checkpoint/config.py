@@ -86,6 +86,15 @@ def _normalize_save_consolidated(value: bool | str | SaveConsolidatedMode) -> Sa
     )
 
 
+def _normalize_model_save_format(value: str | SerializationFormat) -> SerializationFormat:
+    """Convert a raw string such as "safetensors" into the right Enum; Enum values pass through."""
+    if isinstance(value, SerializationFormat):
+        return value
+    formats = [v.value for v in SerializationFormat]
+    assert value in formats, f"Unsupported model save format: {value}. Supported formats: {formats}"
+    return SerializationFormat[value.upper()]
+
+
 @dataclass
 class CheckpointingConfig:
     """Configuration for checkpointing.
@@ -98,7 +107,7 @@ class CheckpointingConfig:
 
     enabled: bool = True
     checkpoint_dir: str | Path = "checkpoints/"
-    model_save_format: str = "safetensors"
+    model_save_format: str | SerializationFormat = "safetensors"
     model_cache_dir: str | Path | None = None
     model_repo_id: str | None = None
     save_consolidated: bool | str | SaveConsolidatedMode = "final"
@@ -109,6 +118,13 @@ class CheckpointingConfig:
     is_async: bool = False
     wait_for_staging: bool = False  # block on async staging before freeing memory; no effect unless is_async
     cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
+    # Use a separate CPU group for DCP load planning; tensor shards are still read onto their destination devices.
+    # The CPU group is shared by checkpointers with the same caller group until destroy_process_group()
+    # tears down the distributed world. Checkpointer.close() releases only its reference to that load group.
+    # Applies to this checkpointer's own loads and to NeMoAuto ``from_pretrained`` base-weight loads in the LLM, VLM,
+    # KD, sequence-classification, and speculative-decoding recipes. Bagel, retrieval, and diffusion load base
+    # weights through their own loaders and only honor it for resume loads.
+    load_metadata_with_gloo: bool = False
     # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
     allow_legacy_pickle_restore: bool = False
     # None or True permits dequantization when the source model config declares quantized weights; False disables it.
@@ -138,22 +154,26 @@ class CheckpointingConfig:
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
         if self.consolidation_timeout_minutes <= 0:
             raise ValueError("checkpoint.consolidation_timeout_minutes must be greater than 0")
+        if not isinstance(self.load_metadata_with_gloo, bool):
+            raise ValueError("checkpoint.load_metadata_with_gloo must be a boolean")
         if not isinstance(self.allow_legacy_pickle_restore, bool):
             raise ValueError("checkpoint.allow_legacy_pickle_restore must be a boolean")
 
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 
+        self.model_save_format = _normalize_model_save_format(self.model_save_format)
+
         # PEFT checkpointing is not supported for `torch_save`; flip only the two
         # incompatible fields (format -> safetensors, save_consolidated -> FINAL).
         # All other user-set fields (is_async, cpu_offload, staging_dir, v4_compatible,
         # single_rank_consolidation, ...) are preserved.
-        if self.is_peft and self.model_save_format == "torch_save":
+        if self.is_peft and self.model_save_format == SerializationFormat.TORCH_SAVE:
             logging.warning(
                 "PEFT checkpointing is not supported for `torch_save` format; "
                 "falling back to `safetensors` (all other checkpoint settings are preserved)."
             )
-            self.model_save_format = "safetensors"
+            self.model_save_format = SerializationFormat.SAFETENSORS
             self.save_consolidated = SaveConsolidatedMode.FINAL
 
         if self.max_recent_checkpoints is not None:
@@ -168,13 +188,6 @@ class CheckpointingConfig:
                     "checkpoint.max_recent_checkpoints is only supported for local checkpoint directories; "
                     "unset it when checkpoint.checkpoint_dir uses msc:// storage"
                 )
-
-        # Convert a raw string such as "safetensors" into the right Enum.
-        formats = [v.value for v in SerializationFormat]
-        assert self.model_save_format in formats, (
-            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
-        )
-        self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
         # Normalize legacy bools and string aliases to a consolidated export mode.
         self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)

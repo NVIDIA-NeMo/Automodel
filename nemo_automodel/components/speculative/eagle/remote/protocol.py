@@ -33,6 +33,7 @@ EP_GENERATE = "generate"
 EP_SET_VOCAB_MAPPING = "set_vocab_mapping"
 EP_MODEL_INFO = "model_info"
 EP_INPUT_EMBEDDINGS = "input_embeddings"
+EP_OUTPUT_EMBEDDINGS = "output_embeddings"
 EP_INIT_NCCL = "init_nccl"
 EP_HEARTBEAT = "heartbeat"
 EP_DISCONNECT = "disconnect"
@@ -43,9 +44,8 @@ EP_HEALTH = "health"
 # inline as a wire blob.
 NCCL_HEADER = "X-NeMo-NCCL"
 
-# The fixed order tensors are sent/received in for one ``generate`` response.
-# Server send order and client recv order MUST agree on this list.
-SUPERVISION_KEYS = ["aux_hidden_states", "target_probs", "position_mask", "input_ids", "loss_mask"]
+# Default distance from a server's HTTP port to its NCCL rendezvous port.
+NCCL_PORT_OFFSET = 100
 
 
 def encode_nccl_metadata(

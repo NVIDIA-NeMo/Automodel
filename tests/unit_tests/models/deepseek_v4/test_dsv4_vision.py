@@ -21,6 +21,7 @@ import pytest
 import torch
 from PIL import Image
 
+from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
 from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
@@ -88,6 +89,7 @@ def _sparse_attention_torch_module_oracle(
     sm_scale: float,
     *,
     backend: str,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run the Torch sparse-attention oracle behind the module's TileLang dispatch.
 
@@ -98,11 +100,12 @@ def _sparse_attention_torch_module_oracle(
         topk_indices: Sparse key indices of shape [batch, sequence, selected_keys].
         sm_scale: Attention score scaling factor.
         backend: Module-selected backend, ignored by this CPU oracle.
+        all_rows_nonempty: cuDNN empty-row hint, ignored by this CPU oracle.
 
     Returns:
         Attention output tensor of shape [batch, sequence, heads, head_dim].
     """
-    del backend
+    del backend, all_rows_nonempty
     return dsv4_sparse_attention(q, kv, sinks, topk_indices, sm_scale, backend="sparse_torch")
 
 
@@ -252,23 +255,16 @@ def test_sparse_visual_window_indices_match_released_reference(types):
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize(
-    ("device", "dtype", "uses_tilelang"),
-    [
-        pytest.param("cpu", torch.float32, False, id="torch_sparse_oracle"),
-        pytest.param(
-            "cuda",
-            torch.bfloat16,
-            True,
-            id="tilelang",
-            marks=pytest.mark.skipif(
-                not _can_run_tilelang_sparse_attention(),
-                reason="TileLang sparse attention requires CUDA compute capability 8.9 or newer",
-            ),
-        ),
-    ],
-)
-def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypatch, device, dtype, uses_tilelang):
+def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypatch: pytest.MonkeyPatch) -> None:
+    check_visual_sparse_attention_module_matches_dense_forward_backward(
+        monkeypatch, device="cpu", dtype=torch.float32, uses_tilelang=False
+    )
+
+
+def check_visual_sparse_attention_module_matches_dense_forward_backward(
+    monkeypatch: pytest.MonkeyPatch, *, device: str, dtype: torch.dtype, uses_tilelang: bool
+) -> None:
+    """Check image visibility and all gradients against dense attention on CPU or CUDA."""
     torch.manual_seed(123)
     if uses_tilelang:
         hidden_size, num_heads, head_dim, seq_len, window_size = 128, 16, 512, 192, 128
@@ -673,6 +669,23 @@ def test_vision_blocks_expose_fp32_norm_islands_to_dsv4_fsdp():
     assert _is_deepseek_v4_module(block)
     fp32_modules = list(_iter_dsv4_fp32_modules(block))
     assert fp32_modules == [block.norm1, block.norm2]
+
+
+def test_checkpoint_wrapped_vision_norms_are_single_fsdp_units(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = DeepseekV4VisionBlock(_vision_config(torch_dtype="bfloat16"))
+    apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=None)
+    calls = []
+    monkeypatch.setattr(dsv4_fsdp, "fully_shard", lambda child, **kwargs: calls.append((child, kwargs)))
+    policy = torch.distributed.fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+
+    dsv4_fsdp.fully_shard_deepseek_v4(block, mesh=object(), mp_policy=policy)
+
+    assert [child for child, _ in calls] == [block.norm1, block.norm2, block]
+    # The wrapped norms return the bf16 activation dtype expected by attn/mlp.
+    norm_policies = [kwargs["mp_policy"] for _, kwargs in calls[:2]]
+    assert all(norm_policy.param_dtype == torch.float32 for norm_policy in norm_policies)
+    assert all(norm_policy.output_dtype is None for norm_policy in norm_policies)
+    assert all(norm_policy.cast_forward_inputs is False for norm_policy in norm_policies)
 
 
 @pytest.mark.parametrize("whole_tower", [False, True])

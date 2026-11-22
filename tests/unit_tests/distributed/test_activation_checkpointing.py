@@ -590,3 +590,68 @@ def test_sac_replay_tolerates_recompute_only_record_function(monkeypatch):
 
     assert calls["n"] == 2
     assert x.grad is not None
+
+
+def test_recompute_only_deferred_down_projection_placeholder_bypasses_selective_ac_replay(monkeypatch):
+    """moe_tail allocates the skipped down projection's output in the recompute only; SAC must not index it."""
+    import nemo_automodel.components.moe.experts as experts_module
+    from nemo_automodel.components.moe.experts import _DownProjGroupedMM
+
+    # rows of 16 bf16 values: the CPU grouped GEMM wants strides that are multiples of 16 bytes
+    x = torch.randn(48, 16, dtype=torch.bfloat16)
+    w = torch.randn(3, 16, 32, dtype=torch.bfloat16)
+    offs = torch.tensor([16, 40, 48], dtype=torch.int32)
+    try:
+        torch._grouped_mm(x, w, offs)
+    except (RuntimeError, NotImplementedError) as err:  # no grouped GEMM on this build
+        pytest.skip(f"torch._grouped_mm unavailable: {err}")
+
+    calls = {"n": 0}
+
+    def cached_on_recompute():
+        calls["n"] += 1
+        return calls["n"] > 1  # the forward computes; the recompute finds the combine cached and skips the GEMM
+
+    monkeypatch.setattr(experts_module, "hybridep_combine_output_cached", cached_on_recompute)
+
+    def policy(ctx, func, *args, **kwargs):
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def context_fn():
+        return create_selective_checkpoint_contexts(policy)
+
+    # The deferred output may only feed consumers whose backward never reads it (in production: the cached HybridEP
+    # combine) — the recompute hands them an uninitialised placeholder. A constant scale is such a consumer.
+    seed = torch.randn(48, 32, dtype=torch.bfloat16)
+
+    def block(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Deferred down projection of x [tokens, in] with w [experts, in, out] -> [tokens, out], scaled by a constant."""
+        return _DownProjGroupedMM.apply(x, w, offs) * seed
+
+    sac_ignored = set(torch.utils.checkpoint.SAC_IGNORED_OPS)
+    sac_ignored.discard(torch.ops.aten.new_empty.default)
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
+
+    def run():
+        calls["n"] = 0
+        x_ = x.detach().clone().requires_grad_(True)
+        w_ = w.detach().clone().requires_grad_(True)
+        checkpoint(block, x_, w_, use_reentrant=False, context_fn=context_fn).sum().backward()
+        return x_.grad, w_.grad
+
+    # Without the ignore entry, selective checkpointing that indexes every recompute op (torch >= 2.14) refuses
+    # the replay-only allocation; older bookkeeping lets it through.
+    try:
+        run()
+    except RuntimeError as err:
+        assert "new_empty" in str(err)
+
+    ac.ensure_moe_recompute_cache_ops_sac_ignored()
+    assert torch.ops.aten.new_empty.default in sac_ignored
+    grad_x, grad_w = run()
+    assert calls["n"] == 2
+    x_ref = x.detach().clone().requires_grad_(True)
+    w_ref = w.detach().clone().requires_grad_(True)
+    (torch._grouped_mm(x_ref, w_ref, offs) * seed).sum().backward()
+    torch.testing.assert_close(grad_x, x_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(grad_w, w_ref.grad, rtol=0, atol=0)

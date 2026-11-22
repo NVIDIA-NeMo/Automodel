@@ -92,3 +92,7 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-5
   weight_decay: 0
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: h100

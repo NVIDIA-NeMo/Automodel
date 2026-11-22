@@ -23,7 +23,7 @@ Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.0
 | Step | Section | What You Do |
 |------|---------|-------------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package with `uv` or Docker |
-| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into latent cache files |
+| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images or videos into latent cache files |
 | **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
 | **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
 | **4b. Multi-Node** | [Multi-Node Training](#multi-node-training) | Scale training across multiple nodes |
@@ -56,8 +56,8 @@ uv pip install "nemo-automodel[diffusion,diffusion-media]"
 Alternatively, if you run into dependency or driver issues, use the prebuilt Docker container:
 
 ```bash
-docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
-docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.06.00
+docker pull nvcr.io/nvidia/nemo-automodel:26.10.00
+docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.10.00
 ```
 
 <Note>
@@ -137,8 +137,8 @@ For the full set of arguments and input format details, see the [Diffusion Datas
 
 Fine-tuning is driven by two components:
 
-1. A recipe script, such as [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py), orchestrates the training loop by loading the model, building the data loader, running forward and backward passes, computing the flow matching loss, checkpointing, and logging.
-2. A YAML configuration file is a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, and other settings. You customize training by editing this file rather than modifying code, allowing you to scale seamlessly from one to hundreds of GPUs.
+1. A recipe script, such as [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py), orchestrates the training loop by loading the model, building the data loader, running forward and backward passes, computing the flow-matching loss, checkpointing, and logging.
+2. A YAML configuration file is a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, and other settings. You customize training by editing this file rather than modifying code, so you can scale from one to hundreds of GPUs.
 
 The following annotated [`wan2_1_t2v_flow.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) config explains each section:
 
@@ -263,12 +263,22 @@ data:
     cache_dir: PATH_TO_YOUR_VAL_DATA
     model_type: wan
     shuffle: false
+    drop_last: false
 ```
 
 The validation loader takes the same builders and fields as the training one and is sharded across
 data-parallel ranks the same way. Validation scores the held-out set with the training flow-matching
 objective in `eval()` mode under `torch.no_grad()`, and logs `val_loss` to the console and to
 Weights & Biases, on the same scale as `train_loss`.
+
+Validation loaders that support `drop_last` default to `false`, retaining incomplete per-rank
+batches in each resolution bucket. The training component default remains `true` for compatibility,
+but most shipped fine-tuning configs, including the example above, explicitly set `drop_last: false`.
+The Qwen Image Edit config explicitly sets `drop_last: true`. An explicit
+`drop_last: true` also applies during validation: it drops bucket tails and can leave the loader
+empty when every per-rank bucket is smaller than a batch. `val_loss` is weighted by the actual
+number of samples in each batch. Distributed sampler padding can repeat samples; those repeats
+are included in the metric.
 
 Timesteps and noise are drawn under a fixed seed, and the training RNG state is restored afterward. The curve therefore reflects the model rather than the sampling. Enabling validation does not change the training trajectory.
 
@@ -295,7 +305,7 @@ When a single node does not provide enough GPUs or memory for your workload, you
 
 The main change is in the `fsdp` section. Set `dp_size` to the **total number of GPUs across all nodes**, and optionally increase `dp_replicate_size` for gradient replication across nodes.
 
-For example, to train on two nodes with eight GPUs each (16 GPUs total):
+For example, to train on two nodes with 8 GPUs each (16 GPUs total):
 
 ```yaml
 fsdp:
@@ -308,7 +318,7 @@ fsdp:
 
 A complete multi-node config is provided at [wan2_1_t2v_flow_multinode.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml).
 
-### Launch with torchrun
+### Launch with Torchrun
 
 Run the following command on **each node**, setting `NODE_RANK` to `0` on the first node, `1` on the second, and so on:
 
@@ -333,8 +343,8 @@ Use the following table to select a model for your use case:
 
 | Use Case | Model | Why Choose It |
 |----------|-------|---------------|
-| **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B params): fast iteration, fits on a single A100 40 GB |
-| **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | State-of-the-art text-to-image with 12B params and guidance-based control |
+| **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B parameters): fast iteration, fits on a single A100 40 GB |
+| **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | Text-to-image model with 12B parameters and guidance-based control |
 | **High-quality video generation** | [HunyuanVideo 1.5](#hunyuanvideo-15) | Larger video model with condition-latent support for richer motion and detail |
 | **Synchronized video and audio generation** | [LTX-2.3](#ltx-23) | Jointly denoises video and audio latents with a dual-stream transformer |
 
@@ -389,8 +399,8 @@ Use the following table to select a model for your use case:
 
 - **Adapter type**: `ltx2`
 - **Dataloader**: `build_video_multiresolution_dataloader` with `model_type: ltx2`
-- **Preprocessing**: use `--processor ltx2`, an explicit `8n+1` frame count, and `--output_format pt`
-- **Loss**: applies a shared noise level to synchronized video and audio latents and adds the weighted audio loss
+- **Preprocessing**: Use `--processor ltx2`, an explicit `8n+1` frame count, and `--output_format pt`
+- **Loss**: Applies a shared noise level to synchronized video and audio latents and adds the weighted audio loss
 - **Configs**: [full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) and [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml)
 
 ## Generation and Inference
@@ -416,7 +426,7 @@ torchrun --nproc-per-node=8 \
   examples/diffusion/generate/generate.py \
   -c examples/diffusion/generate/configs/generate_wan.yaml \
   --distributed.backend nccl \
-  --distributed.parallel_scheme.transformer.tp_size 8
+  --distributed.parallelism.tp_size 8
 ```
 
 **With a fine-tuned checkpoint:**

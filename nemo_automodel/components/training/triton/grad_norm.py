@@ -71,16 +71,16 @@ _REDUCE_ABSMAX = 1
 
 @(triton.jit if HAVE_TRITON else null_decorator)
 def _multi_tensor_reduce_kernel(
-    ptrs_ptr,  # int64[num_tensors]  -- data_ptr() of each tensor
-    numel_ptr,  # int64[num_tensors]
-    chunk_end_ptr,  # int64[num_tensors] -- exclusive prefix sum of chunk counts
-    partial_ptr,  # float64[num_chunks] -- one partial per program
+    ptrs_ptr: tl.tensor,  # int64[num_tensors]  -- data_ptr() of each tensor
+    numel_ptr: tl.tensor,  # int64[num_tensors]
+    chunk_end_ptr: tl.tensor,  # int64[num_tensors] -- exclusive prefix sum of chunk counts
+    partial_ptr: tl.tensor,  # float64[num_chunks] -- one partial per program
     REDUCE_OP: tl.constexpr,
     DTYPE_ID: tl.constexpr,
     NUM_TENSORS: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
-):
+) -> None:
     """Reduce one chunk of one tensor into a single fp64 partial."""
     pid = tl.program_id(0)
 
@@ -159,6 +159,22 @@ _DTYPE_IDS = {
 }
 
 
+def _copy_metadata_to_device(values: list[int], device: torch.device) -> torch.Tensor:
+    """Copy host integer metadata without a blocking CUDA transfer.
+
+    Args:
+        values: Host integer entries.
+        device: Destination device.
+
+    Returns:
+        Int64 tensor of shape [entries] on ``device``.
+    """
+    host = torch.tensor(values, dtype=torch.int64)
+    if device.type == "cuda":
+        host = host.pin_memory()
+    return host.to(device=device, non_blocking=device.type == "cuda")
+
+
 def _build_chunk_ends(tensors: Sequence[torch.Tensor], device: torch.device) -> tuple[torch.Tensor, int]:
     """Build the exclusive upper chunk bound for each input tensor.
 
@@ -172,7 +188,7 @@ def _build_chunk_ends(tensors: Sequence[torch.Tensor], device: torch.device) -> 
     """
     counts = [(t.numel() + _CHUNK - 1) // _CHUNK for t in tensors]
     chunk_ends = list(accumulate(counts))
-    return torch.tensor(chunk_ends, dtype=torch.int64, device=device), chunk_ends[-1]
+    return _copy_metadata_to_device(chunk_ends, device), chunk_ends[-1]
 
 
 def _kernel_eligible(t: torch.Tensor) -> bool:
@@ -188,10 +204,12 @@ def _kernel_eligible(t: torch.Tensor) -> bool:
     return HAVE_TRITON and t.is_cuda and t.is_contiguous() and t.dtype in _DTYPE_IDS
 
 
-def _reduce_one_dtype(tensors: Sequence[torch.Tensor], reduce_op: int, device, dtype) -> torch.Tensor:
+def _reduce_one_dtype(
+    tensors: Sequence[torch.Tensor], reduce_op: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
     """Launch the kernel once for a set of same-dtype, kernel-eligible tensors."""
-    ptrs = torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64, device=device)
-    numels = torch.tensor([t.numel() for t in tensors], dtype=torch.int64, device=device)
+    ptrs = _copy_metadata_to_device([t.data_ptr() for t in tensors], device)
+    numels = _copy_metadata_to_device([t.numel() for t in tensors], device)
     if len(tensors) == 1:
         chunk_ends = numels
         num_chunks = (tensors[0].numel() + _CHUNK - 1) // _CHUNK
@@ -230,7 +248,7 @@ def _reduce(tensors: Sequence[torch.Tensor], reduce_op: int) -> torch.Tensor:
     # One launch per dtype: the kernel reinterprets a raw address with a single
     # compile-time element type, so a mixed-dtype batch would read (say) BF16
     # storage as FP32.
-    by_dtype: dict = {}
+    by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
     ineligible: list[torch.Tensor] = []
     for t in tensors:
         if _kernel_eligible(t):

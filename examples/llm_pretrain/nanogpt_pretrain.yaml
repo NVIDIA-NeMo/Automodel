@@ -85,3 +85,7 @@ distributed:
   cp_size: 1
 
   sequence_parallel: false
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

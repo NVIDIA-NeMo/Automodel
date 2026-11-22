@@ -15,8 +15,8 @@
 """FSDP2 sharding for ``diffusion_gemma`` under pure FSDP (``ep_size=1``).
 
 At ``ep_size=1`` there is no MoE mesh, so the model is sharded by the generic
-:class:`~nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy`
-(via ``FSDP2Manager.parallelize``), which applies ``fully_shard`` per decoder
+:class:`~nemo_automodel.components.distributed.parallelizer.ModelParallelizer`
+(via ``ModelParallelizer.parallelize``), which applies ``fully_shard`` per decoder
 layer and to the root.  The generic ``fully_shard`` flattens *all* of a decoder
 layer's parameters into one FSDP unit, which folds each layer's grouped-expert
 tensors (``moe.experts.{gate_and_up_projs,down_projs}``, the bulk of the 26B
@@ -49,6 +49,8 @@ from __future__ import annotations
 
 from torch import nn
 from torch.distributed.fsdp import fully_shard
+
+from nemo_automodel.components.distributed import ModelParallelizer
 
 
 def _has_fsdp_state(module: nn.Module) -> bool:
@@ -114,34 +116,13 @@ def fully_shard_diffusion_gemma(module: nn.Module, mesh, mp_policy, offload_poli
     )
 
 
-def register_diffusion_gemma_parallel_strategy() -> None:
-    """Register the ``diffusion_gemma`` FSDP2 strategy (idempotent).
+class DiffusionGemmaModelParallelizer(ModelParallelizer):
+    """Pure-FSDP2 strategy that shards grouped experts as their own units."""
 
-    Binds :func:`fully_shard_diffusion_gemma` as the per-module shard function
-    of a :class:`DefaultParallelizationStrategy` subclass, keyed on the model
-    class name so ``get_parallelization_strategy`` selects it at ``ep_size=1``.
-    Invoked at import of ``model.py`` (a torch-enabled context), which always
-    runs before the model is parallelized.
-    """
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-        register_parallel_strategy,
-    )
+    def _fully_shard_module(self, module, **kwargs):
+        return fully_shard_diffusion_gemma(module, **kwargs)
 
-    name = "DiffusionGemmaForBlockDiffusion"
-    if name in PARALLELIZATION_STRATEGIES:
-        return
 
-    @register_parallel_strategy(name=name)
-    class DiffusionGemmaParallelizationStrategy(DefaultParallelizationStrategy):
-        """Pure-FSDP2 strategy that shards grouped experts as their own units."""
+PARALLELIZER = DiffusionGemmaModelParallelizer()
 
-        def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-            return super().parallelize(
-                model,
-                device_mesh,
-                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-                fully_shard_fn=fully_shard_diffusion_gemma,
-                **kwargs,
-            )
+__all__ = ["PARALLELIZER", "fully_shard_diffusion_gemma"]

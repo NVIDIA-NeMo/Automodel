@@ -36,7 +36,13 @@ MASK_ID = VOCAB - 1
 
 
 def _build_trainer(
-    num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa", sliding_window=None, input_embedding_scale=1.0
+    num_anchors=8,
+    loss_decay_gamma=None,
+    loss_type="dflash",
+    dpace_alpha=0.5,
+    attention_backend="sdpa",
+    sliding_window=None,
+    input_embedding_scale=1.0,
 ):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
@@ -71,6 +77,8 @@ def _build_trainer(
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
+        loss_type=loss_type,
+        dpace_alpha=dpace_alpha,
         sliding_window=sliding_window,
     )
 
@@ -97,6 +105,39 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
+
+
+def test_forward_supports_dpace_loss_and_grads_flow_to_draft():
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.4)
+    input_ids, hidden, loss_mask = _inputs()
+    bsz = input_ids.shape[0]
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    assert isinstance(out, DFlashStepMetrics)
+    assert torch.isfinite(out.loss) and out.loss.item() > 0
+    # D-PACE reports loss_weight = bsz * n_blocks (the denominator it divides by),
+    # not the decay-weight sum used for dflash, so the recipe's token-weighted
+    # validation average stays consistent with the objective. These inputs supply
+    # more valid anchors than num_anchors, so n_blocks is num_anchors exactly.
+    assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
+    out.loss.backward()
+    grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
+    assert grad > 0
+
+
+def test_dpace_loss_weight_uses_num_anchors_not_the_achieved_block_count():
+    """DDP-partition-dependence regression: the achieved block count
+    (``min(num_anchors, valid_anchors_in_batch)``) varies with each
+    micro-batch's own content and therefore differs across DP ranks; the
+    D-PACE "mean" denominator must stay ``bsz * num_anchors`` even when a
+    batch supplies far fewer valid anchors than ``num_anchors``."""
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.4)
+    input_ids, hidden, loss_mask = _inputs()
+    bsz = input_ids.shape[0]
+    loss_mask[:, 4:] = 0.0  # every sample now has far fewer than num_anchors=8 valid positions
+
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+
+    assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
 
 
 @pytest.mark.parametrize("attention_backend", ["eager", "sdpa"])
@@ -414,3 +455,110 @@ def test_sliding_window_defaults_to_off_and_rejects_non_positive():
     assert _build_trainer().sliding_window is None
     with pytest.raises(ValueError, match="sliding_window"):
         _build_trainer(sliding_window=0)
+
+
+def _fix_anchors(monkeypatch, trainer, anchors):
+    anchors = torch.tensor(anchors)
+    keep = torch.ones_like(anchors, dtype=torch.bool)
+    monkeypatch.setattr(
+        trainer,
+        "_sample_anchor_positions",
+        lambda seq_len, loss_mask, device, doc_remaining=None: (anchors.to(device), keep.to(device)),
+    )
+
+
+def test_label_ids_supervise_labels_but_keep_input_stream_for_noise(monkeypatch):
+    trainer = _build_trainer()
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=12)
+    label_ids = (input_ids + 5) % (VOCAB - 1)
+    _fix_anchors(monkeypatch, trainer, [[2], [3]])
+
+    captured = {}
+    original_build = trainer._build_block_targets
+    original_forward = trainer.draft_model.forward
+
+    def capture_build(*args, **kwargs):
+        out = original_build(*args, **kwargs)
+        captured["target_ids"] = out[1].detach().clone()
+        return out
+
+    def capture_forward(*args, **kwargs):
+        captured["noise_embedding"] = kwargs["noise_embedding"].detach().clone()
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_build_block_targets", capture_build)
+    monkeypatch.setattr(trainer.draft_model, "forward", capture_forward)
+
+    trainer(input_ids, hidden, loss_mask, label_ids=label_ids)
+    with_labels = captured["noise_embedding"]
+    # Predicted positions come from label_ids (position 0 is the never-supervised anchor).
+    for row, anchor in enumerate((2, 3)):
+        torch.testing.assert_close(captured["target_ids"][row, 0, 1:], label_ids[row, anchor + 1 : anchor + BLOCK_SIZE])
+
+    trainer(input_ids, hidden, loss_mask)
+    torch.testing.assert_close(captured["noise_embedding"], with_labels)
+
+
+def test_label_ids_equal_to_input_ids_matches_default_supervision(monkeypatch):
+    trainer = _build_trainer(loss_decay_gamma=4.0)
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=12)
+    _fix_anchors(monkeypatch, trainer, [[2], [3]])
+    default = trainer(input_ids, hidden, loss_mask)
+    labelled = trainer(input_ids, hidden, loss_mask, label_ids=input_ids.clone())
+    torch.testing.assert_close(labelled.loss, default.loss)
+    torch.testing.assert_close(labelled.correct_tokens, default.correct_tokens)
+
+    other = trainer(input_ids, hidden, loss_mask, label_ids=(input_ids + 5) % (VOCAB - 1))
+    assert not torch.allclose(other.loss, default.loss)
+
+
+def test_label_ids_must_match_input_shape_dtype_and_device():
+    trainer = _build_trainer()
+    input_ids, hidden, loss_mask = _inputs(bsz=1, seq_len=12)
+    with pytest.raises(ValueError, match="match input_ids shape"):
+        trainer(input_ids, hidden, loss_mask, label_ids=input_ids[:, :-1])
+    with pytest.raises(ValueError, match="must have dtype"):
+        trainer(input_ids, hidden, loss_mask, label_ids=input_ids.float())
+    with pytest.raises(ValueError, match="must be on"):
+        trainer(input_ids, hidden, loss_mask, label_ids=input_ids.to("meta"))
+
+
+def test_variable_prefix_label_ids_supervise_only_the_masked_tail(monkeypatch):
+    """The visible prefix shows ``input_ids``; only the masked tail reads labels."""
+    trainer = _build_vp_trainer(loss_decay_gamma=4.0)
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=12)
+    label_ids = (input_ids + 5) % (VOCAB - 1)
+    anchors, prefix_lengths = (2, 3), (2, 3)
+    _fix_anchors(monkeypatch, trainer, [[a] for a in anchors])
+    monkeypatch.setattr(
+        trainer, "_sample_prefix_lengths", lambda bsz, n_blocks, device: torch.tensor([[p] for p in prefix_lengths])
+    )
+    captured = {}
+    original_forward = trainer.draft_model.forward
+    original_loss = trainer._variable_prefix_loss
+
+    def capture_forward(*args, **kwargs):
+        captured["noise_embedding"] = kwargs["noise_embedding"].detach().clone()
+        return original_forward(*args, **kwargs)
+
+    def capture_loss(logits, target_ids, block_mask, prefix_lengths):
+        captured["target_ids"] = target_ids.detach().clone()
+        return original_loss(logits, target_ids, block_mask, prefix_lengths)
+
+    monkeypatch.setattr(trainer.draft_model, "forward", capture_forward)
+    monkeypatch.setattr(trainer, "_variable_prefix_loss", capture_loss)
+
+    default = trainer(input_ids, hidden, loss_mask)
+    default_noise = captured["noise_embedding"]
+    labelled = trainer(input_ids, hidden, loss_mask, label_ids=label_ids)
+    torch.testing.assert_close(captured["noise_embedding"], default_noise)
+    for row, (anchor, prefix) in enumerate(zip(anchors, prefix_lengths)):
+        tail = slice(anchor + prefix, anchor + BLOCK_SIZE)
+        torch.testing.assert_close(captured["target_ids"][row, 0, prefix:], label_ids[row, tail])
+    assert not torch.allclose(labelled.loss, default.loss)
+
+    # Labels at visible-prefix positions are never supervised.
+    prefix_only = input_ids.clone()
+    for row, (anchor, prefix) in enumerate(zip(anchors, prefix_lengths)):
+        prefix_only[row, anchor : anchor + prefix] = label_ids[row, anchor : anchor + prefix]
+    torch.testing.assert_close(trainer(input_ids, hidden, loss_mask, label_ids=prefix_only).loss, default.loss)

@@ -105,6 +105,7 @@ class PrewarmConfig:
         device: torch.device | int | str | None,
         batch_size: int = 1,
         pp_mesh: DeviceMesh | None = None,
+        ep_mesh: DeviceMesh | None = None,
         stages: list[Any] | None = None,
     ) -> None:
         """Run the enabled prewarms.
@@ -118,6 +119,10 @@ class PrewarmConfig:
             pp_mesh: The pipeline-parallel submesh, if pipeline parallelism is
                 enabled (its process group is warmed for the grad-norm
                 all-reduce).
+            ep_mesh: The flat expert-parallel submesh, if EP is enabled. TE
+                grouped expert params never carry the EP axis in their own
+                placements, so the enumeration cannot discover this group
+                either; grad clipping all-reduces expert norms over it.
             stages: The local ``PipelineStage`` objects (``AutoPipeline.info.stages``)
                 when pipeline parallelism is enabled; ``pipeline_stage_compile``
                 reads their ``inputs_meta`` and runs their ``submod``.
@@ -139,7 +144,7 @@ class PrewarmConfig:
                 logger.exception("Mamba SSD autotune prewarm failed; continuing without it.")
         if self.comm_groups:
             try:
-                _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh)
+                _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh, ep_mesh=ep_mesh)
             except Exception:
                 logger.exception("Communication-group prewarm failed; continuing without it.")
         if self.pipeline_stage_compile:
@@ -308,12 +313,13 @@ _FLA_PRE_PROCESS_BWD_KERNEL_ARGS = frozenset(
         "scale",
         "T",
         "H",
+        "HV",
         "K",
         "V",
         "BT",
         "BK1",
-        "USE_EXP2",
         "BLOCK_SIZE",
+        "USE_BG",
     )
 )
 _FLA_MERGE_FWD_BWD_KERNEL_ARGS = frozenset(
@@ -326,7 +332,7 @@ _FLA_MERGE_FWD_BWD_KERNEL_ARGS = frozenset(
         "init_offsets",
         "h0_seq_ids",
         "h0",
-        "H",
+        "HV",
         "K",
         "V",
         "BK",
@@ -421,6 +427,8 @@ def _prewarm_fla_gdn_cp_kernels(
         return
 
     with torch.no_grad():
+        # num_heads is the value-head count. The GDN modules repeat q and k to it before
+        # calling fla, so the kernels see H == HV.
         for (num_heads, head_k_dim, head_v_dim, dtype), module_name in shapes.items():
             block_size = 32 if head_k_dim <= 64 else 64
             bk1 = triton.next_power_of_2(head_k_dim)
@@ -462,12 +470,13 @@ def _prewarm_fla_gdn_cp_kernels(
                         scale=1.0,
                         T=seq_len,
                         H=num_heads,
+                        HV=num_heads,
                         K=head_k_dim,
                         V=head_v_dim,
                         BT=64,
                         BK1=bk1,
-                        USE_EXP2=False,
                         BLOCK_SIZE=block_size,
+                        USE_BG=False,
                     )
                     torch.cuda.synchronize(device)
                 except Exception:
@@ -483,9 +492,9 @@ def _prewarm_fla_gdn_cp_kernels(
             # backward the first CP rank skips pre_process_bwd_kernel_merged
             # and hits merge_fwd_bwd_kernel cold; its autotuner then
             # benchmarks its configs at peak backward memory. The autotune
-            # key is (H, K, V, BT, USE_EXP2) -- num_ranks and rank are not
-            # part of it -- so a tiny launch here caches the winning config
-            # for real world sizes.
+            # key is (HV, K, V) -- num_ranks and rank are not part of it --
+            # so a tiny launch here caches the winning config for real world
+            # sizes.
             #
             # CP-mode indexing inside the kernel: the BWD variant reads
             # all-gathered rank-slices rank+1 .. rank+num_ranks and the FWD
@@ -499,7 +508,7 @@ def _prewarm_fla_gdn_cp_kernels(
                 dtype=torch.float32,
             )
 
-            def _merge_grid(meta, _V=head_v_dim, _H=num_heads):
+            def _merge_grid(meta: dict[str, Any], _V: int = head_v_dim, _H: int = num_heads) -> tuple[int, int]:
                 return (triton.cdiv(_V, meta["BV"]), _H)
 
             try:
@@ -513,7 +522,7 @@ def _prewarm_fla_gdn_cp_kernels(
                         init_offsets=None,
                         h0_seq_ids=None,
                         h0=None,
-                        H=num_heads,
+                        HV=num_heads,
                         K=head_k_dim,
                         V=head_v_dim,
                         BK=bk1,
@@ -636,6 +645,7 @@ def _prewarm_comm_groups(
     model_parts: list[torch.nn.Module],
     device: torch.device | int | str | None,
     pp_mesh: DeviceMesh | None = None,
+    ep_mesh: DeviceMesh | None = None,
 ) -> int:
     """Eagerly create the NCCL communicators gradient-norm clipping will use.
 
@@ -657,6 +667,9 @@ def _prewarm_comm_groups(
             also all-reduces the total norm across the PP group, but
             parameters are never sharded along pp, so the placement
             enumeration alone cannot discover that group.
+        ep_mesh: Flat expert-parallel submesh, if enabled. TE grouped expert
+            params never carry the EP axis in their placements either, and
+            ``clip_grad_norm`` all-reduces their norm contribution over it.
 
     Returns:
         The number of process groups warmed.
@@ -688,11 +701,13 @@ def _prewarm_comm_groups(
                 seen.add(id(group))
                 groups.append(group)
 
-    if pp_mesh is not None:
+    for extra_mesh, axis in ((pp_mesh, "PP"), (ep_mesh, "EP")):
+        if extra_mesh is None:
+            continue
         try:
-            group = pp_mesh.get_group()
+            group = extra_mesh.get_group()
         except Exception:
-            logger.exception("Failed to resolve the PP mesh process group; skipping its prewarm.")
+            logger.exception("Failed to resolve the %s mesh process group; skipping its prewarm.", axis)
             group = None
         if group is not None and id(group) not in seen:
             seen.add(id(group))
@@ -765,7 +780,7 @@ def _prewarm_pipeline_stages(stages: list[Any] | None, device: torch.device | in
                 raise RuntimeError(
                     "pipeline-stage compile prewarm: the stage produced no floating-point output to backpropagate"
                 )
-            loss = sum(t.float().sum() for t in tensors)
+            loss = torch.sum(torch.stack([t.float().sum() for t in tensors]))
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             t_bwd = time.perf_counter()

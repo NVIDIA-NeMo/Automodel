@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import gc
 import math
-import re
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal, Protocol, runtime_checkable
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -30,13 +31,50 @@ from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
 _GradNormBackend = Literal["triton", "te"]
 
-# Regex pattern to match expert parameters in GroupedExpertsTE.
-# Matches FQNs like:
-# - model.layers.X.mlp.experts.gate_up_linear.weight0
-# - model.layers.X.mlp.experts.gate_up_linear.bias0
-# - model.layers.X.mlp.experts.down_linear.weight0
-# - model.layers.X.mlp.experts.down_linear.bias0
-_TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias)\d+")
+
+@runtime_checkable
+class SketchClippingOptimizer(Protocol):
+    """Optimizer that owns gradient synchronization and clipping (e.g. gradient sketch).
+
+    Matched structurally so this component does not import the optim component; plain
+    ``torch.optim.Optimizer`` instances have neither member.
+    """
+
+    ready: bool
+
+    def synchronize_and_clip(self, process_group: Any, max_norm: float | None) -> torch.Tensor: ...
+
+
+def _ep_local_expert_param_ids(
+    model_parts: list[torch.nn.Module],
+    ep_axis_name: str | None,
+) -> set[int]:
+    """ids of expert params whose grads live on the EP axis without carrying it.
+
+    Modules stamp ``_nemo_ep_local_expert_params`` at construction (TE grouped
+    experts, see ``GroupedExpertsTE.__init__``) because their parameters are
+    either plain tensors or DTensors sharded only over ``ep_shard`` — so no
+    mesh dimension of theirs reflects that gradients differ per EP rank. EP
+    grad scaling and the grad-clip EP norm reduction both use this set, and it
+    depends only on model structure, so every rank derives the same answer
+    (collective participation must be rank-uniform).
+
+    Params whose own mesh already carries the EP axis are excluded: the
+    per-mesh-dim reductions handle those, and reducing them again over EP
+    would double count.
+    """
+    ids: set[int] = set()
+    for model_part in model_parts:
+        for module in model_part.modules():
+            if not getattr(module, "_nemo_ep_local_expert_params", False):
+                continue
+            for p in module.parameters():
+                if not p.requires_grad:
+                    continue
+                if isinstance(p, DTensor) and ep_axis_name and ep_axis_name in (p.device_mesh.mesh_dim_names or ()):
+                    continue
+                ids.add(id(p))
+    return ids
 
 
 def _combine_norms(norms: list[torch.Tensor], norm_type: float, target_device: torch.device) -> torch.Tensor:
@@ -54,7 +92,7 @@ def _combine_norms(norms: list[torch.Tensor], norm_type: float, target_device: t
 
 def _all_reduce_scalar(
     scalar: torch.Tensor,
-    op: torch.distributed.ReduceOp,
+    op: torch.distributed.ReduceOp.RedOpType | torch.distributed.ReduceOp,
     mesh: DeviceMesh,
     mesh_dim: int | None = None,
 ) -> torch.Tensor:
@@ -86,7 +124,7 @@ def _all_reduce_scalar(
 
 
 @torch.no_grad()
-def count_tail_padding(labels, ignore_label=-100):
+def count_tail_padding(labels: torch.Tensor, ignore_label: int = -100) -> int:
     """Counts the total number of padding token in the tail of labels
 
     e.g.
@@ -111,21 +149,33 @@ def count_tail_padding(labels, ignore_label=-100):
     prod_mask = torch.cumprod(tail_mask.int(), dim=1)
 
     # Count tail -100s by summing cumprod mask along the sequence dimension
-    return prod_mask.view(-1).sum().item()
+    return int(prod_mask.view(-1).sum().item())
 
 
-def _use_fused_grad_norm(params, norm_type: float) -> bool:
+def _use_fused_grad_norm(representative: torch.Tensor, norm_type: float) -> bool:
     """Whether the fused multi-tensor reduction applies to this group.
 
-    Only the 2-norm and inf-norm are implemented by the kernel, and the whole
-    group has to be CUDA -- a mixed CPU/CUDA group would silently take two
-    different reduction paths.
+    Only the 2-norm and inf-norm are implemented by the kernel, and the kernel
+    itself is CUDA-only (``_reduce`` routes anything else through its reference
+    reduction, so a non-CUDA group would pay the wrapper for nothing).
+
+    The choice is made from the group's representative parameter rather than
+    from this rank's gradients. The fused branch issues one collective where the
+    fallback issues two, so a group that resolved differently on two ranks would
+    mismatch their collectives and hang. Every rank holds the representative for
+    every group, including the ranks that contributed no gradients this step, so
+    deriving the choice from it keeps the decision identical everywhere.
+
+    Args:
+        representative: The group's representative parameter, equal in device and
+            layout across ranks by construction.
+        norm_type: Norm exponent, including ``inf``.
     """
     if not HAVE_FUSED_GRAD_NORM:
         return False
     if not (math.isinf(norm_type) or norm_type == 2.0):
         return False
-    return all(p.grad is not None and p.grad.is_cuda for p in params)
+    return representative.is_cuda
 
 
 def _local_te_l2_norm(gradients: list[torch.Tensor], target_device: torch.device) -> torch.Tensor:
@@ -171,7 +221,7 @@ def _local_te_l2_norm(gradients: list[torch.Tensor], target_device: torch.device
         have_te_optimizers, te_optimizers = (
             safe_import("transformer_engine.pytorch.optimizers") if have_te else (False, None)
         )
-        if not have_te_optimizers:
+        if not (have_te_optimizers and te_optimizers is not None):
             raise RuntimeError("Transformer Engine gradient-norm backend requested but unavailable")
         for (device, _), group in te_groups.items():
             overflow = torch.zeros(1, dtype=torch.int32, device=device)
@@ -196,6 +246,8 @@ def _clip_grad_norm_impl(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
+    ep_mesh: DeviceMesh | None = None,
+    ep_param_ids: set[int] | None = None,
     *,
     grad_norm_backend: _GradNormBackend = "triton",
 ) -> torch.Tensor:
@@ -210,7 +262,15 @@ def _clip_grad_norm_impl(
         error_if_nonfinite: Whether to raise for a non-finite global norm.
         foreach: Optional foreach implementation preference for clipping.
         pp_mesh: Optional pipeline mesh over which the scalar norm is reduced.
-        grad_norm_backend: Local L2 reducer. ``"triton"`` uses this PR's FP64
+        ep_mesh: Optional expert-parallel mesh. Expert parameters live on the
+            EP axis without carrying it in their own mesh (TE grouped experts
+            are plain tensors, or DTensors on the ep_shard sub-mesh only), so
+            their norm contribution must additionally be reduced over this
+            mesh or every EP group computes a different "global" norm and
+            clips shards of the same logical parameter inconsistently.
+        ep_param_ids: ids of the parameters whose gradients differ across the
+            EP axis and need the ``ep_mesh`` reduction.
+        grad_norm_backend: Local L2 reducer. ``"triton"`` uses the FP64
             multi-tensor kernel; ``"te"`` uses Transformer Engine where eligible.
 
     Returns:
@@ -227,28 +287,37 @@ def _clip_grad_norm_impl(
         parameters = list(parameters)
 
     # Group parameters by their sharding pattern
-    # Key: (device_mesh_id, tuple of placements)
+    # Key: (device_mesh_id, tuple of placements, is_ep_param)
+    #
+    # Groups are derived from every parameter, including ones without a grad
+    # this step: group membership and iteration order decide which collectives
+    # run and in which order, so they must depend only on model structure,
+    # never on rank-local gradient state (a rank whose shard of some group has
+    # no grads must still join that group's reductions or its peers hang).
     sharding_groups = {}
 
     for p in parameters:
-        if p.grad is None:
-            continue
-
+        # EP-axis parameters get their own groups: their local norms differ
+        # per EP rank and need the extra ep_mesh reduction below.
+        is_ep_param = ep_mesh is not None and ep_param_ids is not None and id(p) in ep_param_ids
         if isinstance(p, DTensor):
             # Create a hashable key from device_mesh and placements
             mesh_id = id(p.device_mesh)
             placements_tuple = tuple(str(placement) for placement in p.placements)
-            key = (mesh_id, placements_tuple)
+            key = (mesh_id, placements_tuple, is_ep_param)
         else:
             # Regular tensor - group separately
-            key = ("regular", "regular")
+            key = ("regular", "regular", is_ep_param)
 
         if key not in sharding_groups:
-            sharding_groups[key] = []
-        sharding_groups[key].append(p)
+            # The representative carries mesh/placements even when this rank
+            # has no grads in the group; the list holds the contributors.
+            sharding_groups[key] = (p, [])
+        if p.grad is not None:
+            sharding_groups[key][1].append(p)
 
     target_device = None
-    for group_params in sharding_groups.values():
+    for _, group_params in sharding_groups.values():
         for p in group_params:
             g = p.grad
             if g is None:
@@ -271,40 +340,47 @@ def _clip_grad_norm_impl(
     # Replicate) then allreduces with mismatched numel and hangs.
     is_inf = math.isinf(norm_type)
     group_norms = []
-    for group_params in sharding_groups.values():
-        first = group_params[0]
-        is_dtensor = isinstance(first, DTensor)
+    for (_, _, is_ep_group), (representative, group_params) in sharding_groups.items():
+        is_dtensor = isinstance(representative, DTensor)
         # Partial placements can't be reduced via sum-of-local-norms; materialize
         # those per-grad (each full_tensor() is a same-shape collective, safe).
-        has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
+        has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in representative.placements)
+
+        def _reduce_group_scalar(
+            scalar: torch.Tensor, op: torch.distributed.ReduceOp.RedOpType | torch.distributed.ReduceOp
+        ) -> torch.Tensor:
+            # The same reductions must run for MAX (before the overflow-guard
+            # scale) and SUM (after), and on every rank of each group whether
+            # or not this rank contributed grads.
+            if isinstance(representative, DTensor) and not has_partial:
+                for dim_idx, pl in enumerate(representative.placements):
+                    if isinstance(pl, Replicate):
+                        continue
+                    scalar = _all_reduce_scalar(scalar, op, representative.device_mesh, dim_idx)
+            if is_ep_group and ep_mesh is not None:
+                # Expert grads differ per EP rank but their own mesh (if any)
+                # lacks the EP dim, so fold in the EP-wide reduction too.
+                scalar = _all_reduce_scalar(scalar, op, ep_mesh)
+            return scalar
 
         if grad_norm_backend == "te" and not has_partial:
             local_gradients = [
                 (p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).detach() for p in group_params
             ]
             local_norm = _local_te_l2_norm(local_gradients, target_device)
-            if is_dtensor:
-                maximum = local_norm.clone()
-                for dim_idx, placement in enumerate(first.placements):
-                    if not isinstance(placement, Replicate):
-                        maximum = _all_reduce_scalar(
-                            maximum, torch.distributed.ReduceOp.MAX, first.device_mesh, dim_idx
-                        )
-                scale = torch.where(torch.isfinite(maximum) & maximum.ne(0), maximum, torch.ones_like(maximum))
-                sum_squares = local_norm.div(scale).square()
-                for dim_idx, placement in enumerate(first.placements):
-                    if not isinstance(placement, Replicate):
-                        sum_squares = _all_reduce_scalar(
-                            sum_squares, torch.distributed.ReduceOp.SUM, first.device_mesh, dim_idx
-                        )
-                local_norm = maximum * sum_squares.sqrt()
-            group_norms.append(local_norm)
+            # Reduce through the group helper so an EP-local expert group folds in the
+            # EP axis as well as its own mesh dims. A group that needs no reduction
+            # gets its input back and the scale dance collapses to ``local_norm``.
+            maximum = _reduce_group_scalar(local_norm.clone(), torch.distributed.ReduceOp.MAX)
+            scale = torch.where(torch.isfinite(maximum) & maximum.ne(0), maximum, torch.ones_like(maximum))
+            sum_squares = _reduce_group_scalar(local_norm.div(scale).square(), torch.distributed.ReduceOp.SUM)
+            group_norms.append(maximum * sum_squares.sqrt())
             continue
 
         # Fused path: one kernel launch per dtype instead of ~7 per parameter.
         # Restricted to the 2- and inf-norms, the only orders the kernel
         # implements; anything else falls through to the loops below.
-        if grad_norm_backend == "triton" and _use_fused_grad_norm(group_params, norm_type):
+        if grad_norm_backend == "triton" and _use_fused_grad_norm(representative, norm_type):
             locals_ = []
             for p in group_params:
                 g = p.grad
@@ -323,12 +399,10 @@ def _clip_grad_norm_impl(
                 group_val = multi_tensor_sumsq(locals_)
                 reduce_op = torch.distributed.ReduceOp.SUM
 
-            if is_dtensor and not has_partial:
-                mesh = first.device_mesh
-                for dim_idx, pl in enumerate(first.placements):
-                    if isinstance(pl, Replicate):
-                        continue
-                    group_val = _all_reduce_scalar(group_val, reduce_op, mesh, dim_idx)
+            # multi_tensor_* hands back a CPU zero when the group has no local
+            # gradients, so place it before any collective. Same helper as the other
+            # paths: an EP-local group is reduced over the EP axis too.
+            group_val = _reduce_group_scalar(group_val.to(target_device), reduce_op)
 
             group_norms.append(group_val if is_inf else group_val.pow(1.0 / norm_type))
             continue
@@ -343,12 +417,7 @@ def _clip_grad_norm_impl(
             g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
             local_max = torch.maximum(local_max, g_abs_max)
 
-        if is_dtensor and not has_partial:
-            mesh = first.device_mesh
-            for dim_idx, pl in enumerate(first.placements):
-                if isinstance(pl, Replicate):
-                    continue
-                local_max = _all_reduce_scalar(local_max, torch.distributed.ReduceOp.MAX, mesh, dim_idx)
+        local_max = _reduce_group_scalar(local_max, torch.distributed.ReduceOp.MAX)
 
         if is_inf:
             group_norms.append(local_max)
@@ -368,16 +437,12 @@ def _clip_grad_norm_impl(
             else:
                 local_val = local_val + g.pow(norm_type).sum(dtype=torch.float64)
 
-        if is_dtensor and not has_partial:
-            mesh = first.device_mesh
-            for dim_idx, pl in enumerate(first.placements):
-                if isinstance(pl, Replicate):
-                    continue
-                local_val = _all_reduce_scalar(local_val, torch.distributed.ReduceOp.SUM, mesh, dim_idx)
+        local_val = _reduce_group_scalar(local_val, torch.distributed.ReduceOp.SUM)
 
         group_norms.append(local_max * local_val.pow(1.0 / norm_type))
 
-    # Combine norms across groups (all rank-identical scalars, no comm)
+    # Combine norms across groups (all rank-identical scalars after the
+    # mesh-dim and EP reductions above, no comm)
     total_norm = _combine_norms(group_norms, norm_type, target_device)
 
     # Reduce across pipeline parallel mesh if provided
@@ -402,8 +467,9 @@ def _clip_grad_norm_impl(
 
     # Clip gradients for each sharding group separately
     # This is necessary because clip_grads_with_norm_ doesn't support mixing tensors from different device meshes
-    for group_params in sharding_groups.values():
-        torch.nn.utils.clip_grads_with_norm_(group_params, max_norm, total_norm, foreach)
+    for _, group_params in sharding_groups.values():
+        if group_params:
+            torch.nn.utils.clip_grads_with_norm_(group_params, max_norm, total_norm, foreach)
 
     return total_norm
 
@@ -417,6 +483,9 @@ def clip_grad_norm(
     pp_enabled: bool = False,
     device_mesh: DeviceMesh | None = None,
     pp_axis_name: str | None = None,
+    moe_mesh: DeviceMesh | None = None,
+    ep_axis_name: str | None = None,
+    ep_param_ids: set[int] | None = None,
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
     grad_norm_backend: _GradNormBackend = "triton",
@@ -441,6 +510,15 @@ def clip_grad_norm(
         pp_enabled: Whether pipeline parallelism is enabled.
         device_mesh: Device mesh for parallelism.
         pp_axis_name: Pipeline parallel axis name.
+        moe_mesh: Optional MoE mesh. TE grouped expert parameters don't carry
+            the EP axis on their own mesh (they are plain tensors, or DTensors
+            sharded only over ep_shard), so without this their norm
+            contribution is never reduced across EP and every EP group clips
+            with a different "global" norm.
+        ep_axis_name: Name of the expert-parallel axis in ``moe_mesh``.
+        ep_param_ids: Optional precomputed result of
+            ``_ep_local_expert_param_ids`` (callers that already scanned the
+            modules pass it to avoid a second walk); derived when omitted.
         foreach: Whether to use foreach implementation for clipping.
         use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
         grad_norm_backend: Local L2 reducer, either ``"triton"`` or ``"te"``.
@@ -461,14 +539,37 @@ def clip_grad_norm(
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
         pp_mesh = device_mesh[pp_axis_name] if device_mesh is not None else None
 
-    can_use_torch_clip = use_torch_clip_grad_norm and grad_norm_backend == "triton" and pp_mesh is None
+    # Identify expert params whose grads differ across the EP axis without
+    # carrying it on their own mesh. Structural (module marker), so every EP
+    # rank derives the identical answer regardless of this step's grad state:
+    # collective participation must be rank-uniform or peers hang.
+    ep_mesh = None
+    if moe_mesh is not None and ep_axis_name:
+        try:
+            from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+
+            candidate_mesh = get_flat_mesh(moe_mesh, ep_axis_name)
+        except KeyError:
+            candidate_mesh = None
+        # get_flat_mesh can hand a non-member rank another stage's mesh; only
+        # members may join its collectives.
+        if candidate_mesh is not None and candidate_mesh.size() > 1 and candidate_mesh.get_coordinate() is not None:
+            ep_mesh = candidate_mesh
+    if ep_mesh is not None:
+        if ep_param_ids is None:
+            ep_param_ids = _ep_local_expert_param_ids(model_parts, ep_axis_name)
+        if not ep_param_ids:
+            ep_mesh = None
+            ep_param_ids = None
+    else:
+        ep_param_ids = None
+
+    can_use_torch_clip = (
+        use_torch_clip_grad_norm and grad_norm_backend == "triton" and pp_mesh is None and ep_param_ids is None
+    )
     if can_use_torch_clip:
         for p in parameters:
-            if (
-                isinstance(p, DTensor)
-                or isinstance(p.grad, DTensor)
-                or getattr(p, "_nemo_model_owned_grad_divisor", None) is not None
-            ):
+            if isinstance(p, DTensor) or isinstance(p.grad, DTensor):
                 can_use_torch_clip = False
                 break
 
@@ -489,13 +590,15 @@ def clip_grad_norm(
             error_if_nonfinite=False,
             foreach=foreach,
             pp_mesh=pp_mesh,
+            ep_mesh=ep_mesh,
+            ep_param_ids=ep_param_ids,
             grad_norm_backend=grad_norm_backend,
         )
 
     return grad_norm
 
 
-def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
+def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled: bool = False) -> None:
     """Prepare model parts before starting gradient accumulation.
 
     This is typically called once at the start of gradient accumulation to prepare
@@ -511,11 +614,12 @@ def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled
         return
 
     for mp in model_parts:
-        if hasattr(mp, "prepare_for_grad_accumulation"):
-            mp.prepare_for_grad_accumulation(pp_enabled=pp_enabled)
+        fn = getattr(mp, "prepare_for_grad_accumulation", None)
+        if callable(fn):
+            fn(pp_enabled=pp_enabled)
 
 
-def prepare_after_first_microbatch():
+def prepare_after_first_microbatch() -> None:
     """Disable first-microbatch flag after the first forward-backward pass.
 
     Called after the first microbatch in gradient accumulation so that
@@ -524,7 +628,7 @@ def prepare_after_first_microbatch():
     set_is_first_microbatch(False)
 
 
-def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
+def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: bool = False) -> None:
     """Prepare model parts before the final backward pass.
 
     This is typically called before the final gradient accumulation step to prepare
@@ -539,8 +643,9 @@ def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: b
         return
 
     for mp in model_parts:
-        if hasattr(mp, "prepare_for_final_backward"):
-            mp.prepare_for_final_backward(pp_enabled=pp_enabled)
+        fn = getattr(mp, "prepare_for_final_backward", None)
+        if callable(fn):
+            fn(pp_enabled=pp_enabled)
 
 
 def get_expert_tp_replication_factor(
@@ -583,16 +688,16 @@ def scale_grads_and_clip_grad_norm(
     use_torch_clip_grad_norm: bool = False,
     grad_norm_backend: _GradNormBackend = "triton",
 ) -> torch.Tensor | float:
-    """Scale gradients for PP/EP and model-owned shards, then clip.
+    """Scale gradients for PP/EP, then clip.
 
     The caller must synchronize TP-replicated gradients once after accumulation
     and before calling this function. This helper does not synchronize replicas.
+    Parameters a model shards itself (for example an Engram table routed over an
+    owner group) arrive here already averaged by the model's own backward.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
     - EP scaling: for parameters on the expert axis, divide grads by
       ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
-    - Owner-sharded scaling: divide each marked gradient by the explicit factor
-      declared by its model-owned sharding contract.
     - Finally, perform grad clipping with PP/EP-aware reductions.
 
     Args:
@@ -631,45 +736,41 @@ def scale_grads_and_clip_grad_norm(
 
     ep_ratio: float | None = None
     if moe_mesh is not None and dp_group_size is not None:
-        ep_shard_size = moe_mesh["ep_shard"].size() if "ep_shard" in moe_mesh.mesh_dim_names else 1
+        mesh_names = getattr(moe_mesh, "mesh_dim_names", None)
+        ep_shard_size = moe_mesh["ep_shard"].size() if (mesh_names is not None and "ep_shard" in mesh_names) else 1
         if ep_shard_size > 0:
             ep_ratio = float(dp_group_size) / float(ep_shard_size)
             ep_ratio *= float(expert_tp_replication_factor)
 
-    has_model_owned_sharded_params = any(
-        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
-        for model_part in model_parts
-        for parameter in model_part.parameters()
-    )
+    # One structural scan shared by the EP grad scaling below and the EP norm
+    # reduction inside clipping.
+    ep_param_ids = _ep_local_expert_param_ids(model_parts, ep_axis_name) if moe_mesh is not None else None
 
     # Single pass over parameters to apply both scalings where applicable
-    if pp_divisor is not None or ep_ratio is not None or has_model_owned_sharded_params:
+    if pp_divisor is not None or ep_ratio is not None:
         for mp in model_parts:
-            for name, p in mp.named_parameters():
+            for p in mp.parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
-                owner_divisor = getattr(p, "_nemo_model_owned_grad_divisor", None)
-                if owner_divisor is not None:
-                    p.grad.div_(float(owner_divisor))
                 if ep_ratio is not None:
                     # Scale expert gradients by the FSDP/EP ratio and by any
                     # identical TP token replicas that were gathered inside EP.
-                    # DTensor experts: check device mesh for EP sharding axis
-                    # Non-DTensor experts (e.g., DeepEP): check param name
+                    # DTensor experts carrying the EP axis: check their mesh.
+                    # TE grouped experts (never DTensor-wrapped on EP): the
+                    # structural marker set collected above.
+                    p_mesh = getattr(p, "device_mesh", None)
+                    p_mesh_names = getattr(p_mesh, "mesh_dim_names", None)
                     is_ep_sharded_dtensor = (
                         isinstance(p, DTensor)
                         and isinstance(p.grad, DTensor)
-                        and ep_axis_name
-                        and ep_axis_name in p.device_mesh.mesh_dim_names
+                        and bool(ep_axis_name)
+                        and p_mesh_names is not None
+                        and ep_axis_name in p_mesh_names
                     )
-                    is_expert_param = (
-                        isinstance(p, torch.Tensor)
-                        and isinstance(p.grad, torch.Tensor)
-                        and _TE_EXPERT_PARAM_PATTERN.search(name) is not None
-                    )
-                    if owner_divisor is None and (is_ep_sharded_dtensor or is_expert_param):
+                    is_expert_param = ep_param_ids is not None and id(p) in ep_param_ids
+                    if is_ep_sharded_dtensor or is_expert_param:
                         p.grad.div_(ep_ratio)
 
     # Clip with the existing PP/EP-aware helper
@@ -680,13 +781,75 @@ def scale_grads_and_clip_grad_norm(
         pp_enabled=pp_enabled,
         device_mesh=device_mesh,
         pp_axis_name=pp_axis_name,
+        moe_mesh=moe_mesh,
+        ep_axis_name=ep_axis_name,
+        ep_param_ids=ep_param_ids,
         foreach=foreach,
         use_torch_clip_grad_norm=use_torch_clip_grad_norm,
         grad_norm_backend=grad_norm_backend,
     )
 
 
-def move_to_device(model, device):
+def _reject_presketch_gradient_scaling(model_parts: list[torch.nn.Module], clip_kwargs: dict[str, Any]) -> None:
+    """Reject layouts whose gradients ``scale_grads_and_clip_grad_norm`` would pre-scale.
+
+    The sketch path bypasses that helper, so expert-parallel ratio scaling and model-owned
+    gradient divisors would be silently skipped.
+    """
+    moe_mesh = clip_kwargs.get("moe_mesh")
+    ep_axis_name = clip_kwargs.get("ep_axis_name")
+    mesh_names = getattr(moe_mesh, "mesh_dim_names", None) or ()
+    expert_parallel = (
+        moe_mesh is not None and bool(ep_axis_name) and ep_axis_name in mesh_names and moe_mesh[ep_axis_name].size() > 1
+    )
+    owner_scaled = any(
+        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        for model_part in model_parts
+        for parameter in model_part.parameters()
+    )
+    if expert_parallel or owner_scaled:
+        raise RuntimeError("gradient sketch does not support expert parallelism or owner-scaled gradients")
+
+
+def clip_grads_for_optimizers(
+    optimizers: list[torch.optim.Optimizer],
+    max_grad_norm: float | None,
+    model_parts: list[torch.nn.Module],
+    *,
+    dp_group: Any = None,
+    **clip_kwargs: Any,
+) -> torch.Tensor | float:
+    """Clip gradients the way the configured optimizers require.
+
+    Gradient-sketch optimizers own their gradients (sketches plus native grads) and
+    synchronize them as part of clipping; everything else goes through
+    :func:`scale_grads_and_clip_grad_norm` with ``clip_kwargs`` forwarded verbatim.
+
+    Args:
+        optimizers: Optimizers built for ``model_parts`` (one per part).
+        max_grad_norm: Clip threshold, or ``None`` to only measure.
+        model_parts: Model parts whose parameters the optimizers update.
+        dp_group: Data-parallel process group used by sketch synchronization.
+        **clip_kwargs: Keyword arguments for ``scale_grads_and_clip_grad_norm``.
+
+    Returns:
+        The pre-clip global norm.
+
+    Raises:
+        ValueError: If sketch and non-sketch optimizers are mixed.
+        RuntimeError: If sketch optimizers are used with expert parallelism or owner-scaled gradients.
+    """
+    sketch_optimizers = [o for o in optimizers if isinstance(o, SketchClippingOptimizer)]
+    if sketch_optimizers and len(sketch_optimizers) != len(optimizers):
+        raise ValueError("Cannot mix gradient-sketch optimizers with other optimizers across model parts")
+    if sketch_optimizers:
+        _reject_presketch_gradient_scaling(model_parts, clip_kwargs)
+        norms = [o.synchronize_and_clip(dp_group, max_grad_norm) for o in sketch_optimizers]
+        return torch.stack(norms).square().sum().sqrt() if len(norms) > 1 else norms[0]
+    return scale_grads_and_clip_grad_norm(max_grad_norm, model_parts, **clip_kwargs)
+
+
+def move_to_device(model: torch.nn.Module, device: torch.device | str) -> None:
     """Move a model and its buffers to a device and release stale CUDA cache."""
     # FSDP modules do not move buffers to the device automatically
     for v in model.buffers():
@@ -699,16 +862,21 @@ def move_to_device(model, device):
 class ScopedModuleOffloading:
     """Context manager that temporarily moves a module between CPU and CUDA."""
 
-    def __init__(self, model, enabled=False):
+    def __init__(self, model: torch.nn.Module, enabled: bool = False) -> None:
         self.model = model
         self.enabled = enabled
 
-    def __enter__(self):
+    def __enter__(self) -> ScopedModuleOffloading:
         if self.enabled:
             move_to_device(self.model, "cuda")
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> bool:
         if self.enabled:
             move_to_device(self.model, "cpu")
         return False  # Re-raise exceptions by default

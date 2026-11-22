@@ -114,6 +114,8 @@ freeze_config:
 
 
 ci:
+  nemo_ci_schedule: release
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 1
   time: "00:30:00"

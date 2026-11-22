@@ -73,7 +73,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
   backend:
@@ -118,6 +118,7 @@ optimizer:
 
 
 ci:
+  nemo_ci_schedule: skipped
   time: "04:00:00"
   nodes: 16
   cluster_tag: gb200

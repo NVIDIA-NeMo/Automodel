@@ -40,10 +40,12 @@ import torch.nn as nn
 from .adapters import (
     FlowMatchingContext,
     Flux2Adapter,
+    Flux3Adapter,
     FluxAdapter,
     HunyuanAdapter,
     LTX2Adapter,
     ModelAdapter,
+    QwenImage21Adapter,
     QwenImageAdapter,
     SimpleAdapter,
 )
@@ -139,7 +141,7 @@ class FlowMatchingPipeline:
         log_interval: int = 100,
         summary_log_interval: int = 10,
         device: torch.device | None = None,
-    ):
+    ) -> None:
         """
         Initialize the FlowMatching pipeline.
 
@@ -362,6 +364,8 @@ class FlowMatchingPipeline:
             elif self.loss_weighting_scheme == "linear":
                 loss_weight = 1.0 + self.flow_shift * sigma
                 loss_weight = loss_weight.view(-1, *([1] * (loss.ndim - 1)))
+            else:
+                raise ValueError(f"Unknown loss_weighting_scheme: {self.loss_weighting_scheme!r}")
         else:
             loss_weight = torch.ones_like(sigma).view(-1, *([1] * (loss.ndim - 1)))
 
@@ -551,7 +555,7 @@ class FlowMatchingPipeline:
         latents: torch.Tensor,
         noise: torch.Tensor,
         noisy_latents: torch.Tensor,
-    ):
+    ) -> None:
         """Log detailed training information."""
         logger.info("\n" + "=" * 80)
         logger.info(f"[STEP {global_step}] FLOW MATCHING")
@@ -598,7 +602,7 @@ class FlowMatchingPipeline:
         loss_weight: torch.Tensor,
         unweighted_loss: torch.Tensor,
         weighted_loss: torch.Tensor,
-    ):
+    ) -> None:
         """Log detailed loss information."""
         logger.info("=" * 80)
         logger.info(f"[STEP {global_step}] LOSS DEBUG")
@@ -625,20 +629,26 @@ class FlowMatchingPipeline:
 # =============================================================================
 
 
-def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
+def create_adapter(adapter_type: str, **kwargs: Any) -> ModelAdapter:
     """
     Factory function to create a model adapter by name.
 
     Args:
-        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image",
-            "qwen_image_edit", "ltx2")
+        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "flux3", "qwen_image",
+            "qwen_image_21", "qwen_image_edit", "ltx2", "hunyuan_image3")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
         ModelAdapter instance
     """
-    # Imported lazily: the adapter is owned by the model package, and importing
-    # it here at module scope would load the Qwen model code for every recipe.
+
+    # Adapters owned by a model package are imported only when selected, so other recipes never load that
+    # model's code.
+    def hunyuan_image3_adapter(**adapter_kwargs: Any) -> ModelAdapter:
+        from nemo_automodel.components.models.hunyuan_image3.flow_adapter import HunyuanImage3Adapter
+
+        return HunyuanImage3Adapter(**adapter_kwargs)
+
     from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
 
     adapters = {
@@ -646,9 +656,12 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "simple": SimpleAdapter,
         "flux": FluxAdapter,
         "flux2": Flux2Adapter,
+        "flux3": Flux3Adapter,
         "qwen_image": QwenImageAdapter,
+        "qwen_image_21": QwenImage21Adapter,
         "qwen_image_edit": QwenImageEditAdapter,
         "ltx2": LTX2Adapter,
+        "hunyuan_image3": hunyuan_image3_adapter,
     }
 
     if adapter_type not in adapters:
@@ -660,7 +673,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
 def create_pipeline(
     adapter_type: str,
     adapter_kwargs: Dict[str, Any] | None = None,
-    **pipeline_kwargs,
+    **pipeline_kwargs: Any,
 ) -> FlowMatchingPipeline:
     """
     Factory function to create a pipeline with a specific adapter.

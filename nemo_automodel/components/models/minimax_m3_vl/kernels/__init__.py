@@ -25,7 +25,7 @@ import torch
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import
 
 MSA_KERNEL_IMPORT_ERROR = (
-    "BackendConfig.sparse_attn='msa' backward requires nvidia-cutlass-dsl==4.6.2 and cuda-bindings from the "
+    "BackendConfig.sparse_attn='msa' backward requires nvidia-cutlass-dsl==4.8.0 and cuda-bindings from the "
     "msa optional dependency, which ship Linux wheels only. Install the project with uv sync --extra msa on a "
     "CUDA SM100 system."
 )
@@ -60,6 +60,11 @@ def sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+# MSA builds arch-specific cubins for exactly these targets (sm_100a and sm_103a, see
+# msa_bindings._SM103A_TARGET), so other 10.x devices cannot load them.
+MSA_CAPABILITIES = ((10, 0), (10, 3))
+
+
 def require_sm100(device: torch.device) -> None:
     """Reject any device the MSA kernels are not built for, before compiling or launching one.
 
@@ -67,13 +72,13 @@ def require_sm100(device: torch.device) -> None:
         device: CUDA device the caller is about to run MSA kernels on.
 
     Raises:
-        NotImplementedError: If ``device`` is not SM100.
+        NotImplementedError: If ``device`` is not one of ``MSA_CAPABILITIES``.
     """
     capability = sm_capability(device)
-    if capability != (10, 0):
+    if capability not in MSA_CAPABILITIES:
         raise NotImplementedError(
-            "MiniMax M3 MSA first supports SM100 (compute capability 10.0) only; got compute capability "
-            f"{capability[0]}.{capability[1]} on {device}. Use sparse_attn='generic' on this GPU."
+            "MiniMax M3 MSA supports SM100 and SM103 (compute capability 10.0 and 10.3) only; got compute "
+            f"capability {capability[0]}.{capability[1]} on {device}. Use sparse_attn='generic' on this GPU."
         )
 
 

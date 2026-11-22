@@ -89,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Ignored when a skypilot/nemo_run section is present."
         ),
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Apply ci.perf_testing runtime controls to the canonical training recipe (50 steps by default).",
+    )
     return parser
 
 
@@ -102,6 +107,8 @@ def main():
         int: Job's exit code.
     """
     args, extra = build_parser().parse_known_args()
+    if args.benchmark:
+        extra = ["--benchmark", *extra]
     config_path = args.config.resolve()
     logger.info("Config: %s", config_path)
     config = load_yaml(config_path)

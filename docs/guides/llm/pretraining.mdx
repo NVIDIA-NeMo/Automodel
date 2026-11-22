@@ -341,9 +341,11 @@ domain_mixture:
   domains:
     # Order must match the weighted paths above.
     - name: web
+      path: /data/web/processed_text_document
       sampling_weight: 0.70
       objective_weight: 0.50
     - name: code
+      path: /data/code/processed_text_document
       sampling_weight: 0.30
       objective_weight: 0.50
 
@@ -370,10 +372,24 @@ logs achieved supervised-token fractions for each domain, reports every
 per-domain validation loss, and reports their objective-weighted aggregate as
 `weighted`.
 
-The `sampling_weight` values must match the explicit weights in
-the `MegatronPretraining` dataset's `dataset.paths`, and domain order must
-match the blend order. Domain names are positional labels and are not inferred
-from path text. JSON blend files and implicit unweighted blends are not supported.
+The normalized `sampling_weight` values must match the explicit weights in
+the `MegatronPretraining` dataset's `dataset.paths`. Each domain must also declare
+its corpus prefix with `path`. Setup compares these prefixes against the training
+blend in order, including when sampling weights are equal. For split-specific
+paths, the comparison uses `dataset.paths.train`. Prefixes are compared as strings
+after trimming surrounding whitespace; paths are not resolved on the filesystem.
+Domain names are labels for metrics and named validation datasets and are never
+inferred from path text. Configure each `validation_dataset_<name>` with that
+domain's validation corpus, which may use a different prefix from training.
+
+<Note>
+Existing `domain_mixture` recipe configs must add `path` to every domain entry,
+using the corresponding training corpus prefix as shown above. Missing or
+misordered paths now raise a `ValueError` during setup instead of allowing an
+unchecked positional binding.
+</Note>
+
+JSON blend files and implicit unweighted blends are not supported.
 Sequence packing is not supported with `domain_mixture` because
 packed batches do not currently preserve per-token domain IDs. Pipeline
 parallelism is also not currently supported because its target contract does

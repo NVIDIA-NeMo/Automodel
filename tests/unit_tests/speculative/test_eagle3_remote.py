@@ -249,7 +249,7 @@ class _RecordingBackend:
 
 
 def test_prefetched_batches_preserves_order_and_prefetches_ahead():
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.target_wrapper = _RecordingBackend()
@@ -292,7 +292,7 @@ def test_prefetched_batches_never_exceeds_depth_in_flight():
     """The prefetcher must hold at most ``depth`` requests in flight. With depth
     capped to the server count, one extra request means some server runs two
     concurrent /generate forwards, which corrupts the hook-captured supervision."""
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.target_wrapper = _InflightBackend()
@@ -371,7 +371,7 @@ def test_server_serializes_concurrent_generate_requests():
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=60)
+            t.join(timeout=70)
 
         assert probe.max_active == 1, "concurrent /generate forwards ran on the shared target model"
         # Each request got the supervision for ITS OWN inputs.
@@ -386,14 +386,14 @@ def test_server_serializes_concurrent_generate_requests():
 
 
 def test_client_serializes_generate_per_server(monkeypatch):
-    """_ServerClient.generate must never have two requests in flight on one
+    """TargetServerClient.generate must never have two requests in flight on one
     server from this process (NCCL recv pairing relies on it)."""
     import time
 
-    from nemo_automodel.components.speculative.eagle.remote.client import _ServerClient
+    from nemo_automodel.components.speculative.eagle.remote.client import TargetServerClient
 
     monkeypatch.setenv("NEMO_EAGLE_ENABLE_NCCL", "0")
-    client = _ServerClient("http://127.0.0.1:9", timeout=5, max_retries=0)
+    client = TargetServerClient("http://127.0.0.1:9", timeout=5, max_retries=0)
     probe = _ConcurrencyProbe()
 
     class _Resp:

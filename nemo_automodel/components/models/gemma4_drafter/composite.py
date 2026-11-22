@@ -184,11 +184,10 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         #    no gradient flows. For multi-step training every step k > 0 reads
         #    its output, so leave it trainable.
         # 2. ``masked_embedding.centroids`` (only present when
-        #    ``config.use_ordered_embeddings=True``) is fed into a ``torch.topk``
-        #    immediately, and topk's discrete index output blocks gradient flow
-        #    back to ``centroids.weight``. Always frozen regardless of K; the
-        #    released drafter's centroids are learned via K-means clustering of
-        #    the embedding table, not joint SFT.
+        #    ``config.use_ordered_embeddings=True``) is unused in training, which
+        #    scores the full vocabulary (see ``Gemma4DrafterFullVocabEmbedder``).
+        #    Always frozen regardless of K; the released drafter's centroids are
+        #    learned via K-means clustering of the embedding table, not joint SFT.
         if self.drafter_num_steps == 1:
             post_proj = getattr(self.drafter, "post_projection", None)
             if post_proj is not None:

@@ -75,30 +75,16 @@ def _compute_flash_inv_freq(cfg, device, dim):
     return 1.0 / (base ** (indices / dim))
 
 
-def _is_nemotron_flash_config(cfg):
-    if cfg is None:
-        return False
-
-    model_type = getattr(cfg, "model_type", None)
-    if model_type == "nemotron_flash":
-        return True
-
-    architectures = getattr(cfg, "architectures", None) or ()
-    if "NemotronFlashForCausalLM" in architectures:
-        return True
-
-    name_or_path = getattr(cfg, "name_or_path", "") or ""
-    return "nemotron-flash" in name_or_path.lower()
-
-
 def should_fix_rotary_embeddings(model_parts):
     """Return True when the legacy rotary workaround should run."""
+    from nemo_automodel.components.distributed.optimized_tp_plans import is_nemotron_flash_config
+
     for mp in model_parts:
         if isinstance(mp, nn.Module):
             for _, module in mp.named_modules():
-                if _is_nemotron_flash_config(getattr(module, "config", None)):
+                if is_nemotron_flash_config(getattr(module, "config", None)):
                     return True
-        elif _is_nemotron_flash_config(getattr(mp, "config", None)):
+        elif is_nemotron_flash_config(getattr(mp, "config", None)):
             return True
 
     return False
@@ -128,7 +114,7 @@ def fix_rotary_embeddings(model_parts):
     vanilla HF reload all end up computing the same NTK-scaled rope.
 
     Scope: only touches modules whose ``config`` is recognized as Nemotron-
-    Flash (via ``_is_nemotron_flash_config``), so non-Flash models are never
+    Flash (via ``is_nemotron_flash_config``), so non-Flash models are never
     affected. ``should_fix_rotary_embeddings`` further narrows the call site.
     """
     fixed = 0

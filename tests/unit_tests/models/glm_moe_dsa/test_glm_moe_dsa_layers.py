@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+import inspect
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer as HFIndexer
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.glm_moe_dsa.config import (
+    GlmMoeDsaConfig as AutoModelConfig,
+)
 from nemo_automodel.components.models.glm_moe_dsa.layers import (
     GlmMoeDsaIndexer,
     GlmMoeDsaMLA,
@@ -26,6 +33,9 @@ from nemo_automodel.components.models.glm_moe_dsa.layers import (
     _rotate_activation,
     _to_additive_key_mask,
 )
+
+# HF 5.18 requires this unused compatibility argument; earlier releases omit it.
+_HF_INDEXER_KWARGS = {"position_ids": None} if "position_ids" in inspect.signature(HFIndexer.forward).parameters else {}
 
 
 @pytest.fixture
@@ -74,6 +84,13 @@ def sdpa_backend():
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
+
+
+@pytest.fixture
+def fp8_backend(sdpa_backend):
+    # The FP8 recipes: TE linears under ``te_fp8``. Tests that build an indexer from it patch
+    # ``initialize_linear_module`` so they run without Transformer Engine.
+    return replace(sdpa_backend, linear="te", te_fp8={"recipe": "block"})
 
 
 def _freqs(batch: int, seq_len: int, rope_dim: int) -> torch.Tensor:
@@ -132,6 +149,133 @@ def test_rotate_activation_converts_to_bfloat16():
 
 
 class TestGlmMoeDsaIndexer:
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("seq_len", [1, 9])
+    @pytest.mark.parametrize("tied_keys", [False, True])
+    def test_dense_scores_select_hf_keys_from_strided_inputs(self, config, sdpa_backend, packed, seq_len, tied_keys):
+        torch.manual_seed(19)
+        indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+        reference = HFIndexer(config, layer_idx=0)
+        reference.load_state_dict(indexer.state_dict())
+        batch = 2
+        x = torch.randn(batch, seq_len, config.hidden_size * 2)[..., ::2]
+        q_resid = torch.randn(batch, seq_len, config.q_lora_rank * 2)[..., ::2]
+        if tied_keys:
+            # Repeated keys exercise exact score ties without relying on tie-breaking
+            # being stable between unrelated top-k implementations.
+            x[:, 1:] = x[:, :1]
+        assert not x.is_contiguous()
+        assert not q_resid.is_contiguous()
+        freqs = _freqs(batch, seq_len, config.qk_rope_head_dim)
+        cos = torch.ones(batch, seq_len, config.qk_rope_head_dim)
+        sin = torch.zeros_like(cos)
+        causal = torch.zeros(seq_len, seq_len).masked_fill(
+            torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1), float("-inf")
+        )
+        # HF 5.18 returns int32 indices; AutoModel's sparse-mask contract is int64.
+        expected = reference(x, q_resid, (cos, sin), causal, **_HF_INDEXER_KWARGS).to(torch.int64)
+        if packed:
+            actual = torch.stack([indexer(x[b], q_resid[b], freqs[b]) for b in range(batch)])
+        else:
+            actual = indexer(x, q_resid, freqs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("interleaved", [None, False, True])
+    def test_checkpoint_rotary_layout_selects_expected_keys(self, config, sdpa_backend, packed, interleaved):
+        # Load checkpoint-style fields through AutoModel's config boundary.
+        fields = config.to_dict()
+        fields.pop("indexer_rope_interleave", None)
+        if interleaved is not None:
+            fields["indexer_rope_interleave"] = interleaved
+        config = AutoModelConfig.from_dict(fields)
+        torch.manual_seed(31)
+        indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+        batch, seq_len = 2, 9  # More valid causal keys than index_topk=2.
+        x = torch.randn(batch, seq_len, config.hidden_size)
+        q_resid = torch.randn(batch, seq_len, config.q_lora_rank)
+        angles = torch.arange(seq_len).float()[:, None] * torch.tensor([0.7, 0.2])
+        angles = angles.expand(batch, -1, -1)
+        freqs = torch.polar(torch.ones_like(angles), angles)
+
+        # Independent reference: multiply by explicit rotation matrices, leaving
+        # the non-positional coordinates untouched. No production RoPE helpers.
+        rotation = torch.eye(config.index_head_dim).repeat(batch, seq_len, 1, 1)
+        pairs = [(0, 1), (2, 3)] if interleaved else [(0, 2), (1, 3)]
+        for frequency, (first, second) in enumerate(pairs):
+            cos, sin = angles[..., frequency].cos(), angles[..., frequency].sin()
+            rotation[..., first, first] = cos
+            rotation[..., second, second] = cos
+            rotation[..., first, second] = -sin
+            rotation[..., second, first] = sin
+        q = indexer.wq_b(q_resid).reshape(batch, seq_len, config.index_n_heads, config.index_head_dim)
+        k = indexer.k_norm(indexer.wk(x))
+        q = torch.einsum("bsij,bshj->bshi", rotation, q)
+        k = torch.einsum("bsij,bsj->bsi", rotation, k)
+        scores = torch.einsum("bshd,btd->bsht", q, k).mul(config.index_head_dim**-0.5).relu()
+        weights = indexer.weights_proj(x) * config.index_n_heads**-0.5
+        scores = torch.einsum("bsht,bsh->bst", scores, weights)
+        future = torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1)
+        scores = scores.masked_fill(future, float("-inf"))
+        expected = scores.topk(config.index_topk, dim=-1).indices
+
+        if packed:
+            # Each THD invocation is one document; BSHD covers independent batches.
+            actual = torch.stack([indexer(x[b], q_resid[b], freqs[b]) for b in range(batch)])
+        else:
+            actual = indexer(x, q_resid, freqs)
+        # Exclude the initial dense prefix and compare sets, not tied-score order.
+        torch.testing.assert_close(
+            actual[:, config.index_topk :].sort(dim=-1).values,
+            expected[:, config.index_topk :].sort(dim=-1).values,
+        )
+
+    @pytest.mark.parametrize("backend_name", ["tilelang", "cudnn"])
+    @pytest.mark.parametrize("interleaved", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_rotary_layout_at_sparse_kernel_boundary(self, config, sdpa_backend, backend_name, interleaved, dtype):
+        fields = config.to_dict()
+        fields["indexer_rope_interleave"] = interleaved
+        config = AutoModelConfig.from_dict(fields)
+        sdpa_backend.attn = backend_name
+        torch.manual_seed(31)
+        indexer = GlmMoeDsaIndexer(config, sdpa_backend).to(dtype=dtype)
+        x = torch.randn(5, config.hidden_size, dtype=dtype, requires_grad=True)
+        q_resid = torch.randn(5, config.q_lora_rank, dtype=dtype, requires_grad=True)
+        # A quarter turn at frequency 0 and identity at frequency 1 have an
+        # exact signed-permutation oracle in either dtype.
+        freqs = torch.tensor([[1j, 1 + 0j]], dtype=torch.complex64).expand(5, -1).contiguous()
+        q = indexer.wq_b(q_resid).reshape(5, config.index_n_heads, config.index_head_dim)
+        k = indexer.k_norm(indexer.wk(x))
+        permutation = [1, 0, 2, 3, 4, 5, 6, 7] if interleaved else [2, 1, 0, 3, 4, 5, 6, 7]
+        signs = torch.tensor([-1, 1, 1, 1, 1, 1, 1, 1], dtype=dtype)
+        expected_q, expected_k = q[..., permutation] * signs, k[..., permutation] * signs
+        module = "nemo_automodel.components.models.glm_moe_dsa.layers"
+        # Only the optional GPU scoring kernel is replaced; all projection,
+        # normalization and rotary math runs on real tensors through forward().
+        with (
+            patch(f"{module}.is_cudnn_dsa_available", return_value=True),
+            patch(f"{module}.is_dsa_kernel_available", return_value=True),
+            patch(f"{module}.should_use_tilelang", return_value=True),
+            patch(f"{module}.{backend_name}_indexer_topk") as kernel,
+        ):
+            indexer(x, q_resid, freqs, cu_seqlens=torch.tensor([0, 5], dtype=torch.int32))
+        actual_q, actual_k = kernel.call_args.args[:2]
+        torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=0)
+        upstream = (torch.randn_like(q), torch.randn_like(k))
+        actual_grads = torch.autograd.grad((actual_q, actual_k), (x, q_resid), upstream)
+        expected_grads = torch.autograd.grad((expected_q, expected_k), (x, q_resid), upstream)
+        for actual, expected in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("invalid", [None, "false", 0, 1])
+    def test_invalid_checkpoint_rotary_layout_is_rejected(self, config, sdpa_backend, invalid):
+        fields = config.to_dict()
+        fields["indexer_rope_interleave"] = invalid
+        with pytest.raises(ValueError, match="indexer_rope_interleave must be boolean"):
+            GlmMoeDsaIndexer(AutoModelConfig.from_dict(fields), sdpa_backend)
+
     def test_initialization_uses_reference_shapes_and_layernorm_eps(self, config, sdpa_backend):
         indexer = GlmMoeDsaIndexer(config, sdpa_backend)
 
@@ -183,6 +327,58 @@ class TestGlmMoeDsaIndexer:
 
 
 class TestGlmMoeDsaMLA:
+    @pytest.mark.parametrize("checkpointed", [False, True])
+    def test_attention_outputs_and_gradients_match_hf_indexer(self, config, sdpa_backend, checkpointed):
+        torch.manual_seed(23)
+        actual = GlmMoeDsaMLA(config, sdpa_backend)
+        reference = copy.deepcopy(actual)
+        hf_indexer = HFIndexer(config, layer_idx=0)
+        hf_indexer.load_state_dict(reference.indexer.state_dict())
+        batch, seq_len = 2, 9
+        x = torch.randn(batch, seq_len, config.hidden_size, requires_grad=True)
+        reference_x = x.detach().clone().requires_grad_()
+        freqs = _freqs(batch, seq_len, config.qk_rope_head_dim)
+        cos = torch.ones(batch, seq_len, config.qk_rope_head_dim)
+        sin = torch.zeros_like(cos)
+        causal = torch.zeros(seq_len, seq_len).masked_fill(
+            torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1), float("-inf")
+        )
+
+        def hf_topk(hidden_states, q_resid, freqs_cis, attention_mask=None, **kwargs):
+            """Select keys using HF's independent indexer.
+
+            Args:
+                hidden_states: Hidden tensor of shape [batch, sequence, hidden].
+                q_resid: Query residual of shape [batch, sequence, q_lora_rank].
+                freqs_cis: Identity complex RoPE of shape [batch, sequence, rope_dim / 2].
+                attention_mask: Unused optional key mask; this test uses causal attention.
+                **kwargs: Unused attention metadata.
+
+            Returns:
+                Selected indices of shape [batch, sequence, index_topk].
+            """
+            return hf_indexer(hidden_states, q_resid, (cos, sin), causal, **_HF_INDEXER_KWARGS).to(torch.int64)
+
+        with patch.object(reference.indexer, "forward", side_effect=hf_topk):
+            if checkpointed:
+                actual_out = torch.utils.checkpoint.checkpoint(actual, x, freqs, use_reentrant=False)
+                expected_out = torch.utils.checkpoint.checkpoint(reference, reference_x, freqs, use_reentrant=False)
+            else:
+                actual_out, expected_out = actual(x, freqs), reference(reference_x, freqs)
+            upstream = torch.randn_like(actual_out)
+            actual_out.backward(upstream)
+            expected_out.backward(upstream)
+        torch.testing.assert_close(actual_out, expected_out, rtol=0, atol=0)
+        torch.testing.assert_close(x.grad, reference_x.grad, rtol=0, atol=0)
+        for (name, parameter), (reference_name, reference_parameter) in zip(
+            actual.named_parameters(), reference.named_parameters()
+        ):
+            assert name == reference_name
+            if parameter.grad is None or reference_parameter.grad is None:
+                assert parameter.grad is None and reference_parameter.grad is None, name
+            else:
+                torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=0, atol=0, msg=name)
+
     def test_initialization_uses_upstream_latent_norm_epsilon(self, config, sdpa_backend):
         config.rms_norm_eps = 1e-5
 
@@ -261,6 +457,43 @@ class TestGlmMoeDsaMLA:
         assert sparse_mask[0, 0, 2, 2] == 0
         assert sparse_mask[0, 0, 0, 1] == torch.finfo(torch.float32).min
 
+    @pytest.mark.parametrize("qkv_format,union", [("bshd", False), ("bshd", True), ("thd", False)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("top_k", [2, 5])
+    def test_sparse_mask_matches_causal_selection_for_every_head(
+        self, config, sdpa_backend, qkv_format, union, dtype, top_k
+    ):
+        """Future selections remain masked even when top-k spans the full sequence."""
+        mla = GlmMoeDsaMLA(config, sdpa_backend)
+        seq_len, n_heads = 5, 3
+        bsz = 1 if qkv_format == "thd" else 2
+        torch.manual_seed(14)
+        indices = torch.rand(bsz, seq_len, seq_len).argsort(dim=-1)[..., :top_k]
+        topk_indices = indices[0] if qkv_format == "thd" else indices
+        actual = mla._build_sparse_mask(
+            topk_indices,
+            seq_len,
+            qkv_format,
+            bsz=bsz,
+            n_heads=n_heads,
+            dtype=dtype,
+            union_across_batches=union,
+        )
+
+        output_batches = 1 if union else bsz
+        expected = torch.full((output_batches, n_heads, seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype)
+        for batch in range(output_batches):
+            selected_batches = range(bsz) if union else [batch]
+            for query in range(seq_len):
+                selected_keys = {int(key) for source in selected_batches for key in indices[source, query]}
+                for key in selected_keys:
+                    if key <= query:
+                        expected[batch, :, query, key] = 0
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if union or qkv_format == "thd":
+            assert actual.is_contiguous()
+
     def test_shared_forward_requires_previous_topk(self, config, sdpa_backend):
         mla = GlmMoeDsaMLA(config, sdpa_backend, skip_topk=True)
         x = torch.randn(1, 3, config.hidden_size)
@@ -291,3 +524,144 @@ class TestGlmMoeDsaMLA:
             mla.init_weights(torch.device("cpu"), init_std=0.01)
 
         assert trunc_normal.call_count == 5
+
+
+def _plain_linear(linear_impl, in_features, out_features, bias=False, device=None, dtype=torch.bfloat16):
+    return torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+
+
+def _indexer_without_te(config, backend):
+    """Build the indexer with plain Linear stand-ins for its TE projections (the FP8 recipes set linear='te')."""
+    with patch(
+        "nemo_automodel.components.models.glm_moe_dsa.layers.initialize_linear_module", side_effect=_plain_linear
+    ):
+        return GlmMoeDsaIndexer(config, backend)
+
+
+def test_indexer_weights_proj_stays_plain_linear_with_fp32_matmul_under_fp8_recipe(config, fp8_backend):
+    # wq_b / wk follow backend.linear (FP8 under te_fp8, like the checkpoint); weights_proj never
+    # goes through the backend helper because its output picks the attended keys.
+    with patch(
+        "nemo_automodel.components.models.glm_moe_dsa.layers.initialize_linear_module", side_effect=_plain_linear
+    ) as helper:
+        indexer = GlmMoeDsaIndexer(config, fp8_backend)
+
+    assert [call.kwargs["linear_impl"] for call in helper.call_args_list] == ["te", "te"]
+    assert [call.kwargs["out_features"] for call in helper.call_args_list] == [
+        config.index_n_heads * config.index_head_dim,
+        config.index_head_dim,
+    ]
+    assert type(indexer.weights_proj) is torch.nn.Linear
+
+    indexer.weights_proj.to(torch.bfloat16)  # bf16 compute weight, as under the FSDP2 mixed-precision policy
+    x = torch.randn(6, config.hidden_size).to(torch.bfloat16)
+    weights = indexer._head_weights(x)
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, x.float() @ indexer.weights_proj.weight.float().T)
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_head_weights_are_an_fp32_gemm_without_fp8_recipe_too(config, sdpa_backend, ndim):
+    # The head follows the RL trainer / SGLang in every configuration: an fp32 GEMM on the bf16 weight,
+    # not the bf16 projection lifted to fp32 that a bf16 HF model computes. Inputs are chosen so the
+    # two differ, which keeps the policy observable.
+    torch.manual_seed(11)
+    indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+    indexer.weights_proj.to(torch.bfloat16)
+    shape = (64, config.hidden_size) if ndim == 2 else (2, 32, config.hidden_size)
+    x = torch.randn(shape).to(torch.bfloat16)
+    bf16_rounding = torch.nn.functional.linear(x, indexer.weights_proj.weight).float()  # HF bf16 behaviour
+    fp32_gemm = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
+    assert not torch.equal(bf16_rounding, fp32_gemm)  # these inputs make the rounding visible
+
+    weights = indexer._head_weights(x)
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, fp32_gemm, rtol=0, atol=0)
+    assert not torch.equal(weights, bf16_rounding)
+
+
+@pytest.mark.parametrize("fp8_recipe", [False, True])
+@pytest.mark.parametrize("autocast_enabled", [False, True])
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_head_weights_stay_fp32_under_bf16_autocast(
+    config, sdpa_backend, fp8_backend, fp8_recipe, autocast_enabled, ndim
+):
+    # The single-rank FSDP2 path wraps the model forward in a bf16 autocast; the head projection must
+    # still be an fp32 GEMM, not a bf16 GEMM whose result is cast afterwards, with or without FP8.
+    indexer = _indexer_without_te(config, fp8_backend if fp8_recipe else sdpa_backend)
+    indexer.weights_proj.to(torch.bfloat16)
+    shape = (6, config.hidden_size) if ndim == 2 else (2, 3, config.hidden_size)
+    x = torch.randn(shape).to(torch.bfloat16)
+    oracle = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())  # autocast is off here
+
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+        if autocast_enabled:
+            # Negative control: the unguarded cast-then-linear is autocast-eligible and comes back bf16.
+            unguarded = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
+            assert unguarded.dtype == torch.bfloat16
+        weights = indexer._head_weights(x)
+
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, oracle, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fp8_recipe", [False, True])
+def test_dense_indexer_forward_completes_under_bf16_autocast(config, sdpa_backend, fp8_backend, fp8_recipe):
+    torch.manual_seed(3)
+    indexer = _indexer_without_te(config, fp8_backend if fp8_recipe else sdpa_backend).to(torch.bfloat16)
+    batch, seq_len = 2, 9
+    x = torch.randn(batch, seq_len, config.hidden_size).to(torch.bfloat16)
+    q_resid = torch.randn(batch, seq_len, config.q_lora_rank).to(torch.bfloat16)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = indexer(x, q_resid, _freqs(batch, seq_len, config.qk_rope_head_dim))
+
+    assert out.shape == (batch, seq_len, min(config.index_topk, seq_len))
+    assert out.dtype == torch.int64
+
+
+@pytest.mark.parametrize("fp8_recipe", [False, True])
+def test_head_weights_keep_installed_lora_adapter(config, sdpa_backend, fp8_backend, fp8_recipe):
+    # LoRA patches ``weights_proj`` in place (it matches the default ``*_proj`` target); the head
+    # weights must include the adapter update instead of reading only the base weight.
+    from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+    from nemo_automodel.shared.peft_config import PeftConfig
+
+    torch.manual_seed(5)
+    backend = fp8_backend if fp8_recipe else sdpa_backend
+    indexer = _indexer_without_te(config, backend)
+    control = _indexer_without_te(config, backend)
+    control.load_state_dict(indexer.state_dict())
+    matched = apply_lora_to_linear_modules(
+        indexer,
+        PeftConfig(target_modules=["weights_proj"], dim=1, alpha=1, use_triton=False, use_memory_efficient_lora=False),
+    )
+    assert matched == 1
+    assert type(indexer.weights_proj) is not torch.nn.Linear
+    with torch.no_grad():
+        indexer.weights_proj.weight.zero_()
+        indexer.weights_proj.lora_A.weight.fill_(1.0)
+        indexer.weights_proj.lora_B.weight.fill_(1.0)
+
+    x = torch.ones(6, config.hidden_size)
+    adapted = indexer._head_weights(x)
+    assert adapted.dtype == torch.float32
+    # Zero base weight + rank-one all-ones adapter at scale alpha/dim = 1: every head sums the input.
+    torch.testing.assert_close(adapted, torch.full((6, config.index_n_heads), float(config.hidden_size)))
+    with torch.no_grad():
+        indexer.weights_proj.lora_B.weight.mul_(2.0)
+    torch.testing.assert_close(
+        indexer._head_weights(x), torch.full((6, config.index_n_heads), 2.0 * config.hidden_size)
+    )
+
+    # Unadapted control: the fp32 GEMM on the stored weight, with or without the FP8 recipe.
+    torch.testing.assert_close(control._head_weights(x), x @ control.weights_proj.weight.float().T)
+
+    # The adapted dense indexer still runs end to end.
+    batch, seq_len = 2, 5
+    out = indexer(
+        torch.randn(batch, seq_len, config.hidden_size),
+        torch.randn(batch, seq_len, config.q_lora_rank),
+        _freqs(batch, seq_len, config.qk_rope_head_dim),
+    )
+    assert out.shape == (batch, seq_len, min(config.index_topk, seq_len))

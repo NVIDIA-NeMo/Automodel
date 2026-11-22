@@ -291,10 +291,20 @@ class TikTokenTokenizer(PreTrainedTokenizer):
             return token_ids, assistant_mask
         return token_ids
 
-    @staticmethod
-    def _truncate(ids: List[int], truncation: bool = False, max_length: int | None = None) -> List[int]:
+    def _truncate(self, ids: List[int], truncation: bool = False, max_length: int | None = None) -> List[int]:
+        """Truncate chat token IDs or assistant masks from ``truncation_side``.
+
+        Args:
+            ids: Token IDs or assistant-mask values of one chat, shape [sequence].
+            truncation: Whether to apply ``max_length``.
+            max_length: Maximum retained length.
+
+        Returns:
+            The retained prefix (right truncation) or suffix (left truncation).
+        """
         if truncation and max_length is not None:
-            return ids[:max_length]
+            start = max(0, len(ids) - max_length) if self.truncation_side == "left" else 0
+            return ids[start : start + max_length]
         return ids
 
     def _format_chat_token_output(

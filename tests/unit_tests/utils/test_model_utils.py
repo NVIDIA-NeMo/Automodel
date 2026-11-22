@@ -93,6 +93,27 @@ def test_print_trainable_parameters_custom_name(dummy_model, caplog):
     assert "Model summary:" not in caplog.text
 
 
+@pytest.mark.parametrize("packed_dtype", [torch.int8, torch.uint8])
+def test_model_param_stats_skips_packed_weight_norm(packed_dtype, monkeypatch):
+    """Packed weights still count, but their storage bytes are not a weight norm."""
+    model = nn.Module()
+    model.register_parameter("adapter", nn.Parameter(torch.tensor([3.0, 4.0])))
+    packed = nn.Parameter(torch.ones(8, dtype=packed_dtype), requires_grad=False)
+    model.register_parameter("packed", packed)
+    norm_dtypes = []
+    original_norm = torch.Tensor.norm
+
+    def record_norm(tensor, *args, **kwargs):
+        norm_dtypes.append(tensor.dtype)
+        return original_norm(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "norm", record_norm)
+    total, trainable, local_sq_norm = model_utils._get_model_param_stats(model)
+
+    assert norm_dtypes == [torch.float32]
+    assert (total, trainable, local_sq_norm) == (10, 2, 25.0)
+
+
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):
     """
     Helper must stay silent for non-zero ranks.
@@ -248,6 +269,32 @@ def test_legacy_freeze_alias_uses_substring_matching(dummy_model):
 
     assert not _any_requires_grad(dummy_model.vision_tower)
     assert not _any_requires_grad(dummy_model.visual_extra)
+
+
+def test_legacy_freeze_alias_skips_none_attributes():
+    """Optional tower attributes set to None do not prevent pattern-based freezing."""
+
+    class ModelWithOptionalTowers(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vision_tower = None
+            self.audio_tower = None
+            self.language_model = None
+            self.audio_encoder = nn.Linear(4, 4)
+            self.other = nn.Linear(4, 4)
+
+    model = ModelWithOptionalTowers()
+    model_utils.apply_parameter_freezing(
+        model,
+        model_utils.FreezeConfig(
+            freeze_vision_tower=True,
+            freeze_audio_tower=True,
+            freeze_language_model=True,
+        ),
+    )
+
+    assert not _any_requires_grad(model.audio_encoder)
+    assert _all_requires_grad(model.other)
 
 
 def test_generic_selectors_disable_implicit_legacy_vision_freeze(dummy_model):
@@ -691,6 +738,16 @@ def test_non_phi4mm_use_cache_unchanged():
 
 
 class TestFilterForwardKwargs:
+    def test_rejects_dropping_attention_policy_from_strict_forward(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, cu_seq_lens_q=None, cu_seq_lens_k=None, max_length_q=None, max_length_k=None):
+                return input_ids
+
+        with pytest.raises(ValueError, match="cannot receive _packed_seq_ids"):
+            model_utils.filter_forward_kwargs(
+                Model(), {"input_ids": torch.ones(1, 2), "_packed_seq_ids": torch.ones(1, 2)}
+            )
+
     def test_drops_unsupported_kwargs(self):
         class Model(nn.Module):
             def forward(self, input_ids, attention_mask=None):
@@ -891,6 +948,23 @@ class TestSqueezeInputForThd:
         assert kw["cu_seqlens"].tolist() == [0, 3, 5]
         assert kw["cu_seqlens_padded"].tolist() == [0, 4, 6]
 
+    def test_returns_the_callers_kwargs_mapping(self):
+        """The kwargs mapping is updated in place and returned, so callers that rebind
+        their ``**attn_kwargs`` dict keep the same object and its untouched entries."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+        kwargs["qkv_format"] = "thd"
+
+        _ids, _pos, _mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert kw is kwargs
+        assert kw["qkv_format"] == "thd"
+
+    def test_position_ids_none_raises_value_error(self):
+        """Model forwards declare ``position_ids`` optional, but THD inputs need it."""
+        with pytest.raises(ValueError, match="requires position_ids"):
+            model_utils.squeeze_input_for_thd(None, None, None, self._attn_kwargs())
+
 
 # =============================================================================
 # Tests for enable_radio_vit_fused_attn
@@ -1018,3 +1092,52 @@ def test_freeze_video_embedder_false_keeps_video_embedder_trainable(video_embedd
     )
 
     assert _all_requires_grad(video_embedder_model.patch_generator.video_embedder)
+
+
+class TestLmHeadLookup:
+    def test_get_lm_head_module_ignores_non_module_output_embeddings(self):
+        """A ``get_output_embeddings`` result that is not a module falls back to the ``lm_head`` search."""
+        from types import SimpleNamespace
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lm_head = nn.Linear(4, 8, bias=False)
+
+            def get_output_embeddings(self) -> SimpleNamespace:
+                return SimpleNamespace(weight=torch.zeros(8, 4))
+
+        model = Model()
+        assert model_utils.get_lm_head_module(model) is model.lm_head
+
+    def test_get_lm_head_weight_rejects_module_valued_weight(self):
+        class Head(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Linear(2, 2)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lm_head = Head()
+
+        with pytest.raises(TypeError, match="LM-head weight must be a tensor"):
+            model_utils.get_lm_head_weight(Model())
+
+
+class TestSkipRandomInit:
+    def test_leaves_releases_without_the_flag_unchanged(self, monkeypatch):
+        import transformers.initialization as init_module
+
+        monkeypatch.delattr(init_module, "_init_weights", raising=False)
+        with model_utils.skip_random_init():
+            assert not hasattr(init_module, "_init_weights")
+        assert not hasattr(init_module, "_init_weights")
+
+    def test_clears_and_restores_the_flag_when_present(self, monkeypatch):
+        import transformers.initialization as init_module
+
+        monkeypatch.setattr(init_module, "_init_weights", True, raising=False)
+        with model_utils.skip_random_init():
+            assert init_module._init_weights is False
+        assert init_module._init_weights is True

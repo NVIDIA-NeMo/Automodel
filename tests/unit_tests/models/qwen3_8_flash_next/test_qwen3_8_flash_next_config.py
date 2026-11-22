@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from transformers import AutoConfig
@@ -207,7 +208,7 @@ def test_text_config_derives_hybrid_and_ple_metadata() -> None:
         ngram_size=3,
     )
 
-    assert config.layer_types is None
+    assert config.layer_types == ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2
     assert config.layers_block_type == [
         "linear_attention",
         "linear_attention",
@@ -224,6 +225,45 @@ def test_text_config_derives_hybrid_and_ple_metadata() -> None:
     assert config.short_conv_state_shape == (256, 9)
     assert config.ngram_context_len == 2
     assert config.hc_mult == 4
+
+
+@pytest.mark.parametrize(
+    ("num_layers", "interval", "expected"),
+    [
+        (3, 1, ["full_attention", "full_attention", "full_attention"]),
+        (5, 2, ["linear_attention", "full_attention", "linear_attention", "full_attention", "linear_attention"]),
+        (2, 4, ["linear_attention", "linear_attention"]),
+    ],
+)
+def test_text_config_materializes_implicit_layer_types(num_layers: int, interval: int, expected: list[str]) -> None:
+    config = Qwen3_8_FlashNextTextConfig(num_hidden_layers=num_layers, full_attention_interval=interval)
+
+    assert config.layer_types == expected
+
+
+def test_explicit_layer_types_override_interval_without_aliasing() -> None:
+    layer_types = ["full_attention", "linear_attention"]
+    config = Qwen3_8_FlashNextTextConfig(num_hidden_layers=2, full_attention_interval=1, layer_types=layer_types)
+
+    assert config.layer_types == ["full_attention", "linear_attention"]
+    assert config.layers_block_type == ["attention", "linear_attention"]
+    assert config.layer_types is not layer_types
+
+
+@pytest.mark.parametrize("include_null", [False, True])
+def test_checkpoint_without_layer_types_resolves_and_round_trips(tmp_path: Path, include_null: bool) -> None:
+    text_config = {"num_hidden_layers": 4, "full_attention_interval": 4}
+    if include_null:
+        text_config["layer_types"] = None
+    payload = {"model_type": "qwen3_8_flash_next", "text_config": text_config}
+    (tmp_path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    config = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+    expected = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+    assert config.text_config.layer_types == expected
+    config.save_pretrained(tmp_path)
+    restored = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+    assert restored.text_config.layer_types == expected
 
 
 def test_sglang_compatible_defaults_do_not_enable_ple() -> None:

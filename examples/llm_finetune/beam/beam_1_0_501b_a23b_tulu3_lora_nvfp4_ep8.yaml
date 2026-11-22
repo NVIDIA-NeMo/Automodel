@@ -1,0 +1,167 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA fine-tuning of Beam-1.0-501B-A23B on Tulu-3 with the frozen routed experts kept in the NVFP4 format of a
+# ModelOpt-quantized checkpoint (hf_quant_config.json: quant_algo NVFP4, group_size 16) instead of bf16.
+# peft.expert_weight_format: nvfp4 loads the checkpoint's packed fp4-e2m1 expert weights, e4m3 block scales and
+# per-tensor scales straight into packed storage after expert-parallel sharding (about 0.56 bytes per expert
+# parameter instead of 2) and dequantizes them on the fly inside the grouped GEMMs, so no FP4 tensor cores are
+# needed and the adapter trains against the same quantized expert weights an NVFP4 inference engine serves (the
+# GEMMs run on bf16-rounded e2m1 * e4m3 * fp32 products). Point pretrained_model_name_or_path at an experts-only
+# NVFP4 export (dense projections, attention, router, norms and embeddings in floating point). On several ranks the
+# experts must be expert-parallel over the whole non-pipeline mesh (ep_size == world_size // pp_size); the experts
+# dispatch with HybridEP like beam_1_0_501b_a23b_tulu3_lora_ep8.yaml (the torch dispatcher works as well: over 20
+# steps on 8x H100 the two agree within 3e-3 per step, HybridEP being about 20% faster). Otherwise identical to that
+# recipe except for the optimizer: TE FusedAdam keeps fp32 master weights and fp32 Adam moments for the bf16 adapters.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  val_every_steps: 10
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: reflection/Beam-1.0-501B-A23B-NVFP4
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    rope_fusion: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: false
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*_proj"
+    - "*.experts"
+  dim: 32
+  alpha: 64
+  dropout: 0.0
+  use_triton: false
+  # Frozen routed experts stay in the checkpoint's NVFP4 format: the base checkpoint load fills the packed
+  # codes and scales through the Beam state-dict adapter, next to the dense, attention, router, norm and
+  # embedding weights, and the grouped GEMMs dequantize them on the fly.
+  expert_weight_format: nvfp4
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/beam_1_0_501b_a23b_tulu3_lora_nvfp4_ep8
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:100000]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 2048
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: reflection/Beam-1.0-501B-A23B-NVFP4
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[100000:100256]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 2048
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: reflection/Beam-1.0-501B-A23B-NVFP4
+
+packed_sequence:
+  packed_sequence_size: 2048
+  max_packs: 6500
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+  drop_last: false
+  num_workers: 0
+  pin_memory: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: false
+  drop_last: false
+  num_workers: 0
+  pin_memory: false
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-4
+  weight_decay: 0.0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: false
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+lr_scheduler:
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+
+ci:
+  nemo_ci_schedule: release
+  recipe_owner: mreso
+  # EP8 fits one node of 8 H100 80 GB GPUs (peak logged memory ~54 GiB per GPU).
+  nodes: 1
+  time: "00:30:00"
+  cluster_tag: h100
+  max_steps: 20

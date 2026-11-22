@@ -92,11 +92,15 @@ distributed:
   pp_size: 1
   cp_size: 1
   ep_size: 64
-  defer_fsdp_grad_sync: true
+  defer_fsdp_grad_sync: false
   sequence_parallel: false
   activation_checkpointing: true
   moe:
-    reshard_after_forward: true
+    # Keep the expert parameters gathered between forward and backward: the backward re-gathers were
+    # 346 all-gathers per step on 16 GB200 nodes and removing them measured +3.5 % tokens/s on the
+    # 4K benchmark basis of this recipe (peak device memory 172 -> 179 GiB of 184 at local batch 2;
+    # this recipe's local batch 1 sits lower).
+    reshard_after_forward: false
     wrap_outer_model: true
     lm_head_precision: float32
     # Single-pass mHC carries FP32 coefficients alongside BF16 residuals.
@@ -122,7 +126,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  num_samples_limit: 16384
+  limit_dataset_samples: 16384
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -145,7 +149,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -193,6 +197,8 @@ wandb:
   dir: ../logs/wandb
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   nodes: 16
+  cluster_tag: gb200
   time: "01:00:00"

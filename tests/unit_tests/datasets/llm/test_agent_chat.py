@@ -50,6 +50,20 @@ def test_sharegpt_to_chatml_rejects_unknown_role():
     [
         {"messages": [{"role": "user", "content": "question"}, {"role": "assistant", "content": "answer"}]},
         {"conversations": [{"from": "human", "value": "question"}, {"from": "gpt", "value": "answer"}]},
+        {
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "tool_call", "content": '{"name":"f","arguments":{}}'},
+                {"role": "tool_response", "content": "result"},
+            ]
+        },
+        {
+            "conversations": [
+                {"from": "human", "value": "question"},
+                {"from": "function_call", "value": '{"name":"f","arguments":{}}'},
+                {"from": "observation", "value": "result"},
+            ]
+        },
     ],
 )
 def test_has_assistant_message_accepts_supported_schemas(example):
@@ -78,6 +92,20 @@ def test_trim_after_last_assistant_removes_incomplete_tail():
     ]
 
     assert agent_chat._trim_after_last_assistant(messages) == messages[:2]
+
+
+def test_trim_after_last_assistant_keeps_trailing_tool_call():
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "follow-up"},
+        {"role": "tool_call", "content": '{"name":"f","arguments":{}}'},
+        {"role": "tool_call", "content": '{"name":"g","arguments":{}}'},
+        {"role": "tool_response", "content": "f result"},
+        {"role": "tool_response", "content": "g result"},
+    ]
+
+    assert agent_chat._trim_after_last_assistant(messages) == messages[:5]
 
 
 def test_trim_after_last_assistant_leaves_user_only_trace_unchanged():
@@ -349,6 +377,36 @@ def test_format_example_trims_incomplete_last_turn(monkeypatch):
     agent_chat._format_example(example, Tok(), 0, 0, trim_incomplete_last_turn=True)
 
     assert captured["formatted_text"] == example["messages"][:2]
+
+
+def test_format_example_trim_keeps_sharegpt_tool_call_target(monkeypatch):
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {
+        "conversations": [
+            {"from": "human", "value": "question"},
+            {"from": "gpt", "value": "answer"},
+            {"from": "human", "value": "follow-up"},
+            {"from": "function_call", "value": '{"name":"f","arguments":{}}'},
+            {"from": "observation", "value": "result"},
+        ]
+    }
+
+    agent_chat._format_example(example, Tok(), 0, 0, trim_incomplete_last_turn=True)
+
+    formatted = captured["formatted_text"]
+    assert [m["role"] for m in formatted] == ["user", "assistant", "user", "assistant"]
+    assert formatted[-1]["tool_calls"][0]["function"]["name"] == "f"
 
 
 def test_format_example_rejects_missing_messages_and_conversations():

@@ -1,7 +1,6 @@
 ---
 name: linting-and-formatting
-description: Code style and quality rules for NeMo AutoModel — ruff configuration, naming conventions, type hints, docstrings, copyright headers, and the code review checklist.
-when_to_use: Writing or reviewing code for style compliance, fixing ruff errors, understanding type hint or docstring conventions, copyright header questions, or pre-commit failures.
+description: "NeMo AutoModel code style: ruff config, naming, type hints, docstrings, copyright headers, and the review checklist. Use for style questions, ruff errors, or pre-commit failures."
 ---
 
 # Linting and Formatting
@@ -27,6 +26,7 @@ To check without modifying files:
 ruff format --check .   # exits non-zero if any file would change
 ruff check .            # exits non-zero on lint violations
 bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+python tools/lint_numpy_pickle.py # requires explicit allow_pickle=False on NumPy load/save, including tests
 python tools/lint_no_globals.py   # exits non-zero on globals() / module-namespace mutation
 ```
 
@@ -102,17 +102,11 @@ modify it. Use the current year (2026).
 # limitations under the License.
 ```
 
-## Additional Style Conventions
+## Repository-wide conventions
 
-- **Explicit over implicit.** Inline logic where possible; avoid hiding behavior
-  behind unnecessary layers of indirection.
-- **No speculative abstractions.** Do not add features, parameters, or
-  generalization beyond what is explicitly asked for.
-- **Optional dependencies** must be guarded with `safe_import()` from
-  `nemo_automodel.shared.import_utils`. Never let an optional import crash
-  module loading.
-- **Components must not import each other** — enforced by `import-linter`
-  (see `pyproject.toml`).
+Explicit over implicit, no speculative abstractions, `safe_import()` for optional
+dependencies, and no cross-component imports (`import-linter`) are
+repository-wide rules in `AGENTS.md`.
 
 ## Code Review Checklist
 
@@ -128,6 +122,6 @@ modify it. Use the current year (2026).
 ## Automated Review
 
 The review-only maintainability heuristics and thresholds live in
-`.github/workflows/claude-review.yml`. Keep repository-wide coding rules here
+`skills/pr-review/SKILL.md`. Keep repository-wide coding rules here
 and automated-review prompt policy there so the detailed checklist has one
 source of truth.

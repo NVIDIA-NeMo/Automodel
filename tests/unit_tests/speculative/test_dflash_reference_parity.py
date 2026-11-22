@@ -112,9 +112,7 @@ def test_sample_is_greedy_at_zero_temperature_and_stays_in_support():
     assert bool((allowed == drawn.unsqueeze(-1)).any(-1).all())
 
 
-@pytest.mark.parametrize(
-    "temperature,top_p,top_k", [(-0.1, 1.0, 0), (1.0, 0.0, 0), (1.0, 1.5, 0), (1.0, 1.0, -1)]
-)
+@pytest.mark.parametrize("temperature,top_p,top_k", [(-0.1, 1.0, 0), (1.0, 0.0, 0), (1.0, 1.5, 0), (1.0, 1.0, -1)])
 def test_invalid_sampling_parameters_are_rejected(temperature, top_p, top_k):
     with pytest.raises(ValueError, match="sampling parameters"):
         validate_sampling(temperature, top_p, top_k)

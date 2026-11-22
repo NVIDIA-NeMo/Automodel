@@ -72,7 +72,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         self,
         data_config: "BagelDatasetConfig",
         tokenizer: "PreTrainedTokenizerBase",
-        special_tokens: Mapping[str, object],
+        special_tokens: Mapping[str, int],
         local_rank: int,
         world_size: int,
         num_workers: int,
@@ -83,7 +83,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         max_buffer_size: int = 50,
         interpolate_pos: bool = False,
         use_flex: bool = False,
-        data_status: object | None = None,
+        data_status: Mapping[str, list[int | list[int] | None]] | None = None,
         dataset_info: Mapping[str, object] | None = None,
         global_seed: int | None = None,
     ) -> None:

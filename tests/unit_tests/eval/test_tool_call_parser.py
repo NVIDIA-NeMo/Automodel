@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
+
 import pytest
 
 from nemo_automodel.components.eval.tool_call_parser import (
@@ -86,6 +88,88 @@ def test_parse_harmony_gpt_oss():
     assert len(calls) == 1
     assert calls[0].name == "lookup"
     assert calls[0].arguments == {"city": "Paris"}
+
+
+def test_parse_harmony_constrain_token():
+    # Harmony spec example: a ``<|constrain|>json`` token between the recipient and ``<|message|>``.
+    text = (
+        "<|channel|>analysis<|message|>Need to use function get_weather.<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json"
+        '<|message|>{"location":"San Francisco"}<|call|>'
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "get_weather"
+    assert calls[0].arguments == {"location": "San Francisco"}
+
+
+def test_parse_harmony_recipient_in_role_header():
+    # Harmony also allows the recipient in the role section of the header.
+    text = (
+        "<|start|>assistant to=functions.lookup_weather<|channel|>commentary <|constrain|>json"
+        '<|message|>{"location": "San Francisco"}<|call|>'
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "lookup_weather"
+    assert calls[0].arguments == {"location": "San Francisco"}
+
+
+def test_parse_harmony_recipient_in_role_header_after_generation_prompt():
+    # The GPT-OSS chat template's generation prompt ends with ``<|start|>assistant``,
+    # so the decoded completion starts at the recipient.
+    text = ' to=functions.get_weather<|channel|>commentary json<|message|>{"location": "San Francisco"}<|call|>'
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "get_weather"
+    assert calls[0].arguments == {"location": "San Francisco"}
+
+
+def test_parse_harmony_multiple_calls():
+    text = (
+        "<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json"
+        '<|message|>{"city": "Paris"}<|call|>'
+        "<|start|>assistant to=functions.get_time<|channel|>commentary <|constrain|>json"
+        '<|message|>{"tz": "CET"}<|call|>'
+    )
+    calls = parse_tool_calls(text)
+    assert [c.name for c in calls] == ["get_weather", "get_time"]
+    assert [c.arguments for c in calls] == [{"city": "Paris"}, {"tz": "CET"}]
+
+
+def test_parse_harmony_final_channel_is_not_a_call():
+    # Function calls go to the commentary channel; a final-channel message is an answer.
+    for text in (
+        '<|start|>assistant<|channel|>final to=functions.f<|message|>{"k": 1}<|return|>',
+        '<|start|>assistant to=functions.f<|channel|>final<|message|>{"k": 1}<|return|>',
+    ):
+        assert parse_tool_calls(text) == []
+
+
+def test_parse_harmony_non_functions_recipient_is_not_a_call():
+    # A built-in tool call, and a tool response addressed back to the assistant.
+    for text in (
+        '<|start|>assistant<|channel|>commentary to=browser.search <|constrain|>json<|message|>{"q": "x"}<|call|>',
+        '<|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>{"sunny": true}<|end|>',
+    ):
+        assert parse_tool_calls(text) == []
+
+
+def test_parse_harmony_call_does_not_cross_a_message_boundary():
+    # The recipient's message ends at <|end|>; the next message's body is not its arguments.
+    text = (
+        "<|start|>assistant<|channel|>commentary to=functions.get_weather<|end|>"
+        '<|start|>assistant<|channel|>final<|message|>{"city": "Paris"}<|return|>'
+    )
+    assert [c.name for c in parse_tool_calls(text)] == []
+
+
+def test_parse_harmony_long_unterminated_header_stays_linear():
+    # Without the guard after the name, the regex backtracks quadratically (about 7s at this size).
+    text = "<|channel|>commentary to=functions." + "a" * 20000
+    start = time.perf_counter()
+    parse_tool_calls(text)
+    assert time.perf_counter() - start < 1.0
 
 
 def test_parse_generic_json_fallback():

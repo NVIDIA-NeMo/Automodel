@@ -121,7 +121,7 @@ def test_validate_tp_mesh_basic_divisibility(monkeypatch, num_heads, tp_size, sh
     _install_fake_gemma3(monkeypatch)
 
     if should_raise:
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError, match="must be divisible"):
             validate_tp_mesh(model, tp_mesh)
     else:
         validate_tp_mesh(model, tp_mesh)

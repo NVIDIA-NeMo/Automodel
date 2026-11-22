@@ -203,7 +203,7 @@ def _process_image(args: Tuple) -> Dict | None:
         orig_width, orig_height = image.size
 
         bucket = _worker_calculator.get_bucket_for_image(orig_width, orig_height)
-        target_width, target_height = bucket["resolution"]
+        target_width, target_height = _worker_processor.target_resolution(orig_width, orig_height, bucket)
 
         resized_image, crop_offset = _worker_calculator.resize_and_crop(
             image, target_width, target_height, crop_mode="center"
@@ -237,7 +237,7 @@ def _process_image(args: Tuple) -> Dict | None:
             "prompt": caption,
             "image_path": str(Path(image_path).absolute()),
             "bucket_id": bucket["id"],
-            "aspect_ratio": bucket["aspect_ratio"],
+            "aspect_ratio": target_width / target_height,
         }
 
         cache_data = _worker_processor.get_cache_data(latent, text_encodings, metadata)
@@ -250,7 +250,7 @@ def _process_image(args: Tuple) -> Dict | None:
             "original_resolution": [orig_width, orig_height],
             "prompt": caption,
             "bucket_id": bucket["id"],
-            "aspect_ratio": bucket["aspect_ratio"],
+            "aspect_ratio": target_width / target_height,
             "pixels": target_width * target_height,
             "model_type": _worker_processor.model_type,
         }

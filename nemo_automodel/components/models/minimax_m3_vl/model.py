@@ -33,6 +33,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -153,7 +154,9 @@ class MiniMaxM3TextModel(nn.Module):
             )
 
         gemma = getattr(config, "use_gemma_norm", False)
-        self.norm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.norm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -225,6 +228,10 @@ class MiniMaxM3TextModel(nn.Module):
                 attn_kwargs=attn_kwargs,
                 forced_blocks=self._msa_forced_blocks,
             )
+            # Plan block selection before the decoder blocks: built lazily inside an activation-checkpointed
+            # block, its one-time ops would be saved by the checkpoint forward and never replayed by the
+            # recompute, shifting every later saved op of that block.
+            msa.prepare_selection()
             # Canonical ids still own padding for the MoE router. Every attention layer packs, so
             # document isolation travels as cu_seqlens and no attention mask may survive: a non-None
             # mask makes the TE backend silently drop cu_seqlens (attention/utils.py:135-143).
@@ -309,10 +316,6 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
 
     _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
-
-    # The state-dict adapter loads every tensor from the checkpoint, so skip HF
-    # random init on load (also avoids DTensor-collective hangs under sharding/PP).
-    _skip_init_weights_on_load = True
 
     @classmethod
     def from_config(
@@ -417,7 +420,9 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 
@@ -454,10 +459,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # The same attention shards the packed sequence in forward and carries the document
     # boundaries into every layer, so it owns the packed CP path end to end.
     _owns_cp_attention = True
-    # The state-dict adapter fully populates every tensor from the checkpoint
-    # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
-    # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
-    _skip_init_weights_on_load = True
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None (default) means the forward embeds and shards
     # nothing for CP. See prepare_model_inputs_for_cp / forward.
@@ -543,6 +544,41 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
     def get_output_embeddings(self):
         return self.lm_head
+
+    def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
+        """Return modules whose inputs are the DSpark target features of ``layer_ids``.
+
+        The feature of layer ``i`` is the residual stream entering layer ``i + 1``.
+        For the last layer that is the stream entering the final norm, so the
+        draft sees the same unnormalized last-layer state as at serving time
+        instead of the normalized hidden state that feeds ``lm_head``. Each
+        decoder block's input norm and the final norm take that stream as their
+        first positional argument.
+
+        Args:
+            layer_ids: Strictly increasing decoder-layer indices in
+                ``[-1, num_hidden_layers)``; ``-1`` selects the stream entering
+                layer 0.
+
+        Returns:
+            Modules ordered like ``layer_ids``. Each receives a tensor of shape
+            [batch, sequence, hidden] as its first forward argument.
+
+        Raises:
+            ValueError: If the indices are duplicated, unsorted, or outside the
+                decoder depth, or this rank does not hold the final norm.
+        """
+        num_layers = len(self.model.layers)
+        if layer_ids != sorted(set(layer_ids)):
+            raise ValueError(f"DSpark target layer IDs must be strictly increasing, got {layer_ids}")
+        if any(type(layer_id) is not int or not -1 <= layer_id < num_layers for layer_id in layer_ids):
+            raise ValueError(f"DSpark target layer IDs must be integers in [-1, {num_layers}), got {layer_ids}")
+        if self.model.norm is None:
+            raise ValueError("DSpark target features need the final norm, which this pipeline stage does not hold")
+        return tuple(
+            self.model.norm if layer_id == num_layers - 1 else self.model.layers[str(layer_id + 1)].input_layernorm
+            for layer_id in layer_ids
+        )
 
     def customize_pipeline_stage_modules(
         self,
@@ -747,6 +783,43 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         logits_to_keep: int | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | MiniMaxM3CausalLMOutput | dict[str, torch.Tensor]:
+        """Run one MiniMax-M3 VL microbatch, consuming staged PP media when present.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] on the first stage,
+                with one placeholder per merged vision token, or float hidden
+                states of shape [batch, sequence, hidden] from the previous
+                pipeline stage. Under CP they stay full-length until the
+                embeddings are sharded here.
+            pixel_values: Optional image patch rows of shape
+                [patches, patch_features], where patch_features is
+                channels * temporal_patch_size * patch_size**2 and each image's
+                time * height * width patches are concatenated in image order.
+                When both media inputs are None, the next staged PP media chunk
+                is used.
+            image_grid_thw: Optional tensor of shape [images, 3], or a list of
+                [time, height, width] triples, storing each image's patch grid.
+            pixel_values_videos: Optional video patch rows of shape
+                [patches, patch_features], laid out like pixel_values.
+            video_grid_thw: Optional tensor of shape [videos, 3], or a list of
+                [time, height, width] triples, storing each video's patch grid.
+            position_ids: Optional tensor of shape [batch, sequence]; under CP,
+                sequence is the local shard.
+            attention_mask: Optional mask of shape [batch, sequence] or
+                [batch, 1, sequence, sequence].
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            logits_to_keep: When set outside pipeline parallelism, skip the LM
+                head and return hidden states for the fused loss.
+            **kwargs: Attention metadata forwarded to the text model.
+
+        Returns:
+            Logits of shape [batch, sequence, vocab], or hidden states of shape
+            [batch, sequence, hidden] on a pipeline stage without the LM head;
+            under CP, sequence is the local shard. When logits_to_keep is set outside pipeline parallelism,
+            a dict whose "hidden_states" has shape [batch, sequence, hidden].
+            During MTP training, a MiniMaxM3CausalLMOutput that also carries the
+            per-depth MTP logits.
+        """
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
@@ -759,37 +832,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 "set text_config.num_mtp_modules=0 for pp_size>1 runs."
             )
 
-        # Pipeline stage 0 does not receive media in the batch: the VLM-PP collate
-        # strips pixel_values/grids and stage_vlm_media_for_pp attaches them here as
-        # per-microbatch chunks. Pull this microbatch's media off the cursor before
-        # embedding so vision features still get spliced (mirrors KimiVL/Step3p7).
-        # `_vlm_image_grid_hws_chunks` holds M3's image_grid_thw values (the PP media
-        # prep stores whatever grid the model emits under that key), so no reshape.
-        chunks = getattr(self, "_vlm_pixel_values_chunks", None)
         if (
             pixel_values is None
             and pixel_values_videos is None
             and input_ids is not None
             and not torch.is_floating_point(input_ids)
-            and (chunks is not None or getattr(self, "_vlm_pixel_values_videos_chunks", None) is not None)
         ):
-            chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-            consumed = False
-            if chunks is not None and (input_ids == self.image_token_index).any() and chunk_idx < len(chunks):
-                pixel_values = chunks[chunk_idx]
-                image_grid_thw = self._vlm_image_grid_hws_chunks[chunk_idx]
-                consumed = True
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if (
-                video_chunks is not None
-                and (input_ids == self.video_token_index).any()
-                and chunk_idx < len(video_chunks)
-            ):
-                pixel_values_videos = video_chunks[chunk_idx]
-                video_grid_thw = self._vlm_video_grid_thw_chunks[chunk_idx]
-                consumed = True
-            if consumed:
-                self._vlm_chunk_idx = chunk_idx + 1
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values, image_grid_thw = media.pixel_values, media.image_grid
+                pixel_values_videos, video_grid_thw = media.pixel_values_videos, media.video_grid
 
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
 
@@ -869,7 +921,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 

@@ -56,3 +56,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: ./outputs/eagle3_qwen3_8b_lora/checkpoints
   model_save_format: safetensors
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

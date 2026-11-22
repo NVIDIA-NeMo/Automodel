@@ -24,7 +24,6 @@ import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-import nemo_automodel.recipes.llm.train_eagle1 as train_eagle1
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel, _to_full_tensor
 
 
@@ -111,19 +110,3 @@ def test_generate_batch_gathers_tp_sharded_logits(single_rank_pg):
     # Hidden states are replicated under the default plan -> plain tensors.
     assert not hasattr(batch.input_hidden_states, "full_tensor")
     assert not hasattr(batch.target_hidden_states, "full_tensor")
-
-
-# --------------------------------------------------------------------------- #
-# _submesh_or_none: None mesh, present axis, missing axis (KeyError -> None)
-# --------------------------------------------------------------------------- #
-def test_submesh_or_none_handles_none_present_and_missing(monkeypatch):
-    assert train_eagle1._submesh_or_none(None, "dp") is None
-
-    monkeypatch.setattr(train_eagle1, "get_flat_mesh", lambda mesh, name: ("submesh", name))
-    assert train_eagle1._submesh_or_none(object(), "dp") == ("submesh", "dp")
-
-    def _raise(mesh, name):
-        raise KeyError(name)
-
-    monkeypatch.setattr(train_eagle1, "get_flat_mesh", _raise)
-    assert train_eagle1._submesh_or_none(object(), "dp") is None

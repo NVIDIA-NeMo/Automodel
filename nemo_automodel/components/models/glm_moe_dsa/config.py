@@ -83,6 +83,7 @@ class GlmMoeDsaConfig(PretrainedConfig):
         bos_token_id: int | None = 0,
         eos_token_id: int | list[int] | None = 1,
         tie_word_embeddings: bool = False,
+        indexer_rope_interleave: bool = False,
         **kwargs,
     ):
         """Initialize the config.
@@ -93,6 +94,8 @@ class GlmMoeDsaConfig(PretrainedConfig):
             indexer_types: Per-layer ``"full"``/``"shared"`` indexer pattern.
                 Derived from ``index_topk_pattern`` / ``index_topk_freq`` when
                 omitted.
+            indexer_rope_interleave: Use adjacent-pair rotary embeddings in the
+                indexer when true. False preserves the legacy half-split layout.
             index_topk_pattern: Indexer pattern as an ``F``/``S`` string or an
                 explicit list.
             index_topk_freq: Stride used when no pattern is given: layer 0 and
@@ -131,6 +134,7 @@ class GlmMoeDsaConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
+        self.indexer_rope_interleave = indexer_rope_interleave
         self.index_topk_pattern = index_topk_pattern
         self.index_topk_freq = index_topk_freq
 

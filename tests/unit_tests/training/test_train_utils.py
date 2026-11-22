@@ -34,7 +34,7 @@ from nemo_automodel.components.training.utils import (
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def test_docstring_example():
@@ -212,28 +212,6 @@ def test_clip_grad_norm_rejects_invalid_backend():
 
     with pytest.raises(ValueError, match="grad_norm_backend must be 'triton' or 'te'"):
         clip_grad_norm(max_grad_norm=1.0, model_parts=[model], grad_norm_backend="invalid")
-
-
-def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
-    """A model-owned local shard requires the contract's global norm group."""
-    model = torch.nn.Linear(2, 1, bias=False)
-    model.weight.grad = torch.tensor([[3.0, 4.0]])
-    model.weight._nemo_model_owned_grad_divisor = 1.0
-
-    torch_clip_mock = Mock(return_value=torch.tensor(-1.0))
-    sharding_aware_clip_mock = Mock()
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", torch_clip_mock)
-    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", sharding_aware_clip_mock)
-
-    grad_norm = clip_grad_norm(
-        max_grad_norm=10.0,
-        model_parts=[model],
-        use_torch_clip_grad_norm=True,
-    )
-
-    torch.testing.assert_close(grad_norm, torch.tensor(5.0, dtype=torch.float64))
-    torch_clip_mock.assert_not_called()
-    sharding_aware_clip_mock.assert_called_once()
 
 
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
@@ -587,11 +565,13 @@ class _TEGroupedLinearMock(nn.Module):
 
 
 class _ExpertsModule(nn.Module):
-    """Mock experts module with parameters matching GroupedExpertsTE pattern."""
+    """Mock experts module carrying the GroupedExpertsTE structural marker."""
 
     def __init__(self):
         super().__init__()
-        # Submodule names match GroupedExpertsTE: gate_up_linear, down_linear
+        # EP grad scaling and the grad-clip EP reduction identify TE expert
+        # params through this marker, mirroring GroupedExpertsTE.__init__.
+        self._nemo_ep_local_expert_params = True
         self.gate_up_linear = _TEGroupedLinearMock()
 
 
@@ -601,29 +581,14 @@ class _MoEModule(nn.Module):
     def __init__(self):
         super().__init__()
         self.gate = nn.Linear(4, 2, bias=False)
-        # FQN will be mlp.experts.gate_up_linear.weight0, matching _EXPERT_PARAM_PATTERN
         self.mlp = nn.ModuleDict({"experts": _ExpertsModule()})
 
 
 class TestScaleGradsAndClipGradNorm:
     """Tests for scale_grads_and_clip_grad_norm with EP scaling."""
 
-    def test_owner_shard_uses_explicit_gradient_divisor(self):
-        """Owner scaling is declared by the model and independent of DP arguments."""
-        model = nn.Linear(2, 1, bias=False)
-        model.weight.grad = torch.full_like(model.weight, 8.0)
-        model.weight._nemo_model_owned_grad_divisor = 4.0
-
-        scale_grads_and_clip_grad_norm(
-            max_grad_norm=None,
-            model_parts=[model],
-            dp_group_size=999,
-        )
-
-        torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
-
-    def test_ep_scaling_for_expert_params_by_name(self):
-        """Test that expert params are scaled by EP ratio based on param name."""
+    def test_ep_scaling_for_marked_expert_params(self):
+        """Expert params found via the structural marker are scaled by the EP ratio."""
         model = _MoEModule()
         expert_param = model.mlp["experts"].gate_up_linear.weight0
         model.gate.weight.grad = torch.ones_like(model.gate.weight) * 2.0

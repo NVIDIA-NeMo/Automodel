@@ -23,6 +23,7 @@ import mmap
 import os
 import queue
 import re
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -265,7 +266,12 @@ class _HuggingFaceStorageReader(FsspecReader):
     Fsspec registration of the storage solution is required.
     """
 
-    def __init__(self, path: str, token: str | None = None, key_mapping: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        token: str | None = None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None = None,
+    ) -> None:
         """
         Initialize the huggingface reader pointing to path.
 
@@ -274,8 +280,8 @@ class _HuggingFaceStorageReader(FsspecReader):
             Needs to have .safetensors file, but can be from any fsspec supported storage,
             including localFS and hf://.
             token: The token to use to authenticate with huggingface hub.
-            key_mapping: VLMs in HuggingFace can have their FQNs remapped at load time. This means that the state dict keys are not the same as the loaded model's FQNs.
-                         This mapping is used to map the state dict keys to the loaded model's FQNs.
+            key_mapping: Regex mapping or callable converting checkpoint keys to model FQNs.
+                A callable can preserve ordered, scoped renames for nested HF models.
         """
 
         if token is not None:
@@ -619,10 +625,12 @@ def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: dict[str, s
 # the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
 def _get_key_renaming_mapping(
     key: str,
-    key_mapping: dict[str, str] | None = None,
+    key_mapping: dict[str, str] | Callable[[str], str] | None = None,
 ) -> str:
     if key_mapping is None:
         return key
+    if callable(key_mapping):
+        return key_mapping(key)
 
     # Optionally map the key according to `key_mapping`
     for pattern, replacement in key_mapping.items():

@@ -30,6 +30,8 @@ from torch.distributed.tensor.parallel import (
 from nemo_automodel.components.distributed.tp_replicas import mark_tp_replica_gradient_reduction
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 
+__all__ = ["ReplicatedWithGradAllReduce", "translate_to_lora"]
+
 
 class ReplicatedWithGradAllReduce(ParallelStyle):
     """Keep parameters local while sum-reducing their partial TP gradients."""

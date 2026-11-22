@@ -16,8 +16,10 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from nemo_automodel.components.checkpoint.addons import _extract_target_modules
 from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
 
 
@@ -122,5 +124,37 @@ def test_target_modules_get_the_thinker_namespace():
 
     assert (
         adapter.map_peft_target_module_to_hf("model.layers.0.self_attn.q_proj")
+        == "thinker.model.layers.0.self_attn.q_proj"
+    )
+
+
+def _model_with_lora_q_proj(adapter):
+    """Minimal module tree whose only LoRA module is model.layers.0.self_attn.q_proj.lora_A."""
+    q_proj = torch.nn.Module()
+    q_proj.lora_A = torch.nn.Linear(32, 4, bias=False)
+    self_attn = torch.nn.Module()
+    self_attn.q_proj = q_proj
+    layer = torch.nn.Module()
+    layer.self_attn = self_attn
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([layer])
+    model.state_dict_adapter = adapter
+    return model
+
+
+@pytest.mark.parametrize("v4_compatible", [False, True])
+def test_peft_save_target_modules_accept_v4_compatible(v4_compatible):
+    """The PEFT save path (adapter_config.json target_modules) always passes
+    ``v4_compatible`` to ``map_peft_target_module_to_hf``; the Qwen2.5 Omni
+    override must accept it like the base class does instead of raising
+    ``TypeError`` and aborting the checkpoint save."""
+    adapter = _adapter()
+
+    assert _extract_target_modules(_model_with_lora_q_proj(adapter), v4_compatible=v4_compatible) == [
+        "thinker.model.layers.0.self_attn.q_proj"
+    ]
+    assert (
+        adapter.map_peft_target_module_to_hf("model.layers.0.self_attn.q_proj", v4_compatible=v4_compatible)
         == "thinker.model.layers.0.self_attn.q_proj"
     )

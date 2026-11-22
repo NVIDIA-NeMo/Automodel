@@ -87,9 +87,11 @@ class PipelineConfig:
             a ring sized to the 1F1B in-flight depth instead of pre-allocating one
             buffer set per microbatch and direction. Cuts pipeline-stage buffer
             memory roughly by num_microbatches / (num_stages - stage_index + slack)
-            on early/middle stages. Only applied for schedules with a bounded
-            in-flight depth (currently "1f1b"); ignored with a warning otherwise.
-            Defaults to False.
+            on early/middle stages. For native interleaved 1F1B, receives are pooled using the lowered
+            schedule's actual lifetimes. Inputs are copied into independent
+            leaves before forward, and gradients are copied before backward
+            to protect checkpoint recomputation and escaping aliases.
+            Other schedules are ignored with a warning. Defaults to False.
         pp_recv_buffer_pool_slack (int): Extra buffer sets beyond the 1F1B
             in-flight depth when pp_recv_buffer_pool is enabled. Defaults to 2.
     """

@@ -1,0 +1,81 @@
+---
+title: "Kimi-Linear-48B-A3B-Instruct"
+description: "Use Kimi-Linear-48B-A3B-Instruct with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
+slug: model-coverage/large-language-models/moonshotai/Kimi-Linear-48B-A3B-Instruct
+---
+
+[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention Mixture-of-Experts language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-Head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinear48BForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Fine-Tune Kimi-Linear-48B-A3B-Instruct
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml
+```
+
+The recipe selects `model.backend.attn: fa4` for non-CP MLA and requires a container
+built with `INSTALL_FA4=true`, CUDA FP16 or BF16 inputs, and zero attention dropout.
+The `fa` extra installs FlashAttention-2 and does not supply `flash_attn.cute`.
+The shared native FA4 path forwards PyTorch's deterministic-algorithms setting to
+FlashAttention. For an environment without FA4, select eager MLA:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml --model.backend.attn eager
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT): Kimi Linear 48B A3B on HellaSwag with EP=8 | Use [kimi_linear_48b_a3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml). |
+| Supervised fine-tuning (SFT): 32k packed sequences with CP=8 and EP=8 | Use [kimi_linear_48b_a3b_longcontext_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml). |
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (hybrid linear attention, MoE) |
+| Architecture | `KimiLinear48BForCausalLM` |
+| Parameters | 48B total / 3B active |
+| Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
+
+- `KimiLinear48BForCausalLM` (`model_type: kimi_linear_48b_a3b`)
+- Hybrid attention stack: KDA linear-attention layers interleaved with MLA layers
+- MoE feed-forward blocks with sigmoid routing and grouped top-k selection
+
+Moonshot publishes this model and the Kimi K3 text backbone under the same
+`model_type: kimi_linear` and the same `architectures: ["KimiLinearForCausalLM"]`, so
+neither field identifies the model on its own. NeMo AutoModel gives this implementation a
+distinct identity, `kimi_linear_48b_a3b` / `KimiLinear48BForCausalLM`, and leaves
+`kimi_linear` to the K3 text config. The example recipes name `KimiLinear48BConfig`
+explicitly, which is what a published Moonshot checkpoint needs; checkpoints saved by
+NeMo AutoModel already carry the distinct identity and load without that override.
+
+### Supported Parallelism
+
+| Feature | Notes |
+|---|---|
+| FSDP2 | Default sharding strategy for the recipes below |
+| Expert parallelism (EP) | Shards the MoE experts across ranks |
+| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
+| Packed sequences | The HellaSwag recipe uses NEAT packing: document-ID masks and dataset-provided cumulative lengths and token indices isolate documents in both KDA and MLA. CP retains its compressed-KV/FlexAttention path. |
+
+Non-CP MLA uses the shared native FA4 backend with the checkpoint's QK=192 and
+V=128 head widths. Packed FA4 inputs require NEAT BSHD metadata:
+`cu_seqlens`, `max_seqlen`, and `packed_token_indices`. Pre-packed THD inputs and
+physical `cu_seqlens_padded` are unsupported; use NEAT packing.
+
+### Available Models
+
+| Model | HF ID |
+|---|---|
+| Kimi Linear 48B A3B Instruct | [`moonshotai/Kimi-Linear-48B-A3B-Instruct`](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)

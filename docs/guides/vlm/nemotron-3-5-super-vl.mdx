@@ -1,9 +1,9 @@
 ---
-title: "Nemotron 3.5 Super VL"
+title: "NVIDIA Nemotron 3.5 Super VL"
 description: "Fine-tune Nemotron 3.5 Super VL on CORD-v2 for receipt field extraction, then run inference and evaluation."
 position: 15
 ---
-**A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba and Attention
+**A step-by-step guide for fine-tuning NVIDIA Nemotron 3.5 Super VL (121B hybrid Mamba and Attention
 Mixture-of-Experts (MoE) VLM) to extract structured receipt data from scanned images using
 [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 4 nodes or LoRA on a single node,
 then inference and evaluation on the CORD-v2 validation split.**
@@ -12,14 +12,14 @@ then inference and evaluation on the CORD-v2 validation split.**
 
 ## What is Nemotron 3.5 Super VL?
 
-Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`,
+NVIDIA Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`,
 architecture `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family.
 
 Key architectural details:
 - **LLM backbone**: NemotronV3 hybrid, 88 layers (40 Mamba2, 8 attention, 40 MoE), hidden dim 4096
 - **MoE**: 512 routed experts per MoE layer, top-22 routing plus 1 shared expert
 - **Vision encoder**: RADIO v2.5-H (ViT-Huge), 512x512 tiles, 256 vision tokens per tile
-- **Audio**: This vision-pretrained checkpoint ships no `sound_config`, so no audio tower is built
+- **Audio**: This BF16 checkpoint ships no `sound_config`, so no audio tower is built
 - **MTP**: The checkpoint ships one multi-token-prediction head; the recipe below keeps it off (`num_nextn_predict_layers: 0`)
 - **Parameters**: 120.7B trainable with the vision tower frozen (99.31% of the model); ~227 GB in bf16
 
@@ -151,6 +151,8 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
+    experts: torch_mm
+    dispatcher: hybridep
     rms_norm: torch_fp32
     rope_fusion: false
     fake_balanced_gate: false
@@ -356,13 +358,17 @@ vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/
 ```
 
 A checkpoint is written at the end of every epoch (every 100 steps for the 800-receipt training set) and at the
-final step, so `LOWEST_VAL` can point at any of them; with fp32 master weights and Adam moments each sharded
-checkpoint of this model is ~1.4 TB, so budget ~6 TB for the run. Intermediate checkpoints stay sharded; run their
+final step, so `LOWEST_VAL` can point at any of them. The optimizer uses fp32 master weights and bf16 Adam
+moments. In the measured run, each sharded checkpoint occupied ~1.4 TB, so budget ~6 TB for the run.
+Intermediate checkpoints stay sharded; run their
 `model/consolidate.sh` to get an HF export of `LOWEST_VAL`.
 
 ---
 
 ## Step 4 — Run Inference and Evaluation
+
+The examples below use Transformers 5.18.0. The inference setup preserves the checkpoint's
+Mamba time-step limits and selects each layer's CUDA device when the model spans multiple GPUs.
 
 ### Full SFT Inference
 
@@ -381,20 +387,38 @@ bash vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidate.
 
 ```python
 import difflib, json
+from functools import wraps
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModel, AutoProcessor
+from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMamba2Mixer
 
 from nemo_automodel.components.datasets.vlm.utils import json2token
+
+def prepare_inference(model):
+    # Avoid cuDNN SDPA plan-building overhead as decode lengths change.
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    # Transformers 5.18 must use the checkpoint's runtime dt limits.
+    # mamba-ssm's scan must launch on the GPU that owns the layer.
+    def on_device(forward, device):
+        @wraps(forward)
+        def wrapped(*args, **kwargs):
+            with torch.cuda.device(device):
+                return forward(*args, **kwargs)
+        return wrapped
+
+    for module in model.modules():
+        if isinstance(module, NemotronHMamba2Mixer):
+            module.time_step_limit = module.config.time_step_limit
+            module.forward = on_device(module.forward, module.dt_bias.device)
 
 CKPT = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidated"  # pragma: allowlist secret
 NUM_SAMPLES = 20
 
 processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
 model = AutoModel.from_pretrained(CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
-# RADIO's `summary_idxs` is a non-persistent buffer and can come back as a meta tensor after loading.
-model.vision_model.radio_model.summary_idxs = None
+prepare_inference(model)
 model.eval()
 
 # Same single-turn prompt the collate function trained on; enable_thinking=False emits the empty
@@ -454,7 +478,7 @@ ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/LOWEST_VAL/model" 
 
 processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
 model = AutoModel.from_pretrained(BASE, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
-model.vision_model.radio_model.summary_idxs = None
+prepare_inference(model)
 model.eval()
 
 cfg = json.loads((Path(ADAPTER) / "adapter_config.json").read_text())
@@ -469,6 +493,8 @@ with safe_open(str(Path(ADAPTER) / "adapter_model.safetensors"), framework="pt")
 modules = dict(model.named_modules())
 with torch.no_grad():
     for fqn, ab in pairs.items():
+        # Transformers renames the released checkpoint backbone when loading.
+        fqn = fqn.replace("language_model.backbone.", "language_model.model.", 1)
         weight = modules[fqn].weight
         delta = (ab["B"].to(weight.device, torch.float32) @ ab["A"].to(weight.device, torch.float32)) * scale
         weight.add_(delta.to(weight.dtype))
@@ -478,7 +504,7 @@ print(f"merged {len(pairs)} LoRA modules (r={cfg['r']}, alpha={cfg['lora_alpha']
 
 **Resources:** One node with 8x H100 (bf16 weights spread over the GPUs).
 **Runtime:** About 2–4 min to load the 227 GB export, then about 26 s per receipt (greedy, up to 1024 new
-tokens); 20 samples take about 13 min. The un-tuned base model is slower (~55 s per sample) because
+tokens); 20 samples take about 13 min. The starting BF16 checkpoint is slower (~55 s per sample) because
 its free-form descriptions run to the token limit.
 
 ---
@@ -497,7 +523,7 @@ its free-form descriptions run to the token limit.
 The checkpoint with the lowest validation loss also decodes best, so evaluate `LOWEST_VAL` (run its
 `model/consolidate.sh` first; the final step is the only one exported inline).
 
-The base model answers `Describe this image.` with prose ("This is a photograph of a receipt from a
+Before task-specific fine-tuning, the model answers `Describe this image.` with prose ("This is a photograph of a receipt from a
 restaurant, likely a pizzeria ..."). After fine-tuning every prediction is a well-formed
 `<s_total>...</s_total><s_menu>...</s_menu>` sequence; the remaining errors are field-level (a
 dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or OCR digits.

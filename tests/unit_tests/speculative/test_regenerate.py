@@ -24,9 +24,9 @@ import pytest
 from nemo_automodel.components.speculative.regenerate import (
     _MANIFEST_BACKFILL,
     _MANIFEST_NAME,
-    _build_parser,
     GenerationConfig,
     _build_manifest,
+    _build_parser,
     _chat_completion,
     _ensure_manifest_compatible,
     _existing_shard_indices,

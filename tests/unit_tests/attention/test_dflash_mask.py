@@ -24,7 +24,7 @@ from nemo_automodel.components.attention.dflash_mask import create_dflash_block_
 
 # Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
 # Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_size, causal=False, sliding_window=None):

@@ -20,6 +20,8 @@ the Hyper-Connections weight builder, and the partial-RoPE helper).
 Full-model behaviour is covered by ``test_dsv4_model_smoke.py``.
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -56,10 +58,6 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     is_dsv4_kernel_available,
     sinkhorn_normalize_torch,
 )
-
-# Over the default 5s budget on purpose: TileLang compilation takes up to about 37s on a cold worker.
-# Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
 
 _MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES = 229376
 
@@ -682,8 +680,294 @@ class TestDeepseekV4AttentionMask:
 
         assert actual_weights.shape[-1] == expected_attention_width
 
+    def test_validated_complete_hca_windows_avoid_collective_and_preserve_gradients(self, monkeypatch):
+        """The model's all-rank complete-window contract removes only a redundant decision."""
+        from unittest.mock import Mock
+
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        hidden, rotary, rotary_compress_values, rotary_compress, mask = self._hca_inputs(cfg, 129)
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        decision = Mock(return_value=True)
+        monkeypatch.setattr(attention.compressor, "_compute_fsdp_group_has_complete_hca_window", decision)
+        upstream = torch.randn_like(hidden)
+        records = []
+        for complete in (False, True):
+            attention.zero_grad(set_to_none=True)
+            x = hidden.detach().clone().requires_grad_()
+            output, _ = attention(
+                x,
+                position_embeddings=rotary,
+                attention_mask=mask,
+                position_embeddings_compress=rotary_compress_values,
+                rotary_compress=rotary_compress,
+                _dsv4_complete_compressor_windows=complete,
+            )
+            output.backward(upstream)
+            records.append((output.detach(), x.grad.clone(), [p.grad.clone() for p in attention.parameters()]))
+            assert decision.call_count == 1
+        for actual, expected in zip(records[1][:2], records[0][:2], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual, expected in zip(records[1][2], records[0][2], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize(
+        ("ratio", "segments", "expected"),
+        [
+            # Segment: (document id or 0 for padding, length, first position or None for a constant
+            # position 0). Expected: (document, window, first source row) of every pooled window.
+            (128, [(1, 128, 0), (2, 128, 0)], [(1, 0, 0), (2, 0, 128)]),
+            (128, [(1, 256, 0), (2, 384, 0)], [(1, 0, 0), (1, 1, 128), (2, 0, 256), (2, 1, 384), (2, 2, 512)]),
+            # Document 2 starts at row 100: its windows are rows 100..227 and 228..355.
+            (128, [(1, 100, 0), (2, 300, 0)], [(2, 0, 100), (2, 1, 228)]),
+            (128, [(1, 100, 0), (0, 28, 0), (2, 300, 0), (0, 84, 0)], [(2, 0, 128), (2, 1, 256)]),
+            (128, [(1, 127, 0), (2, 127, 0)], []),
+            # Positions that run over the row keep the row-aligned windows that lie inside one document.
+            (128, [(1, 100, 0), (2, 300, 100)], [(2, 1, 128), (2, 2, 256)]),
+            # Padding that is its own document with one repeated position never forms a window.
+            (128, [(1, 100, 0), (2, 28, None), (3, 300, 0), (4, 128, None)], [(3, 0, 128), (3, 1, 256)]),
+            # Ratio 4: document 1 keeps window 0; document 2 starts at row 6 and has three windows.
+            (4, [(1, 6, 0), (2, 14, 0)], [(1, 0, 0), (2, 0, 6), (2, 1, 10), (2, 2, 14)]),
+            # Positions 1..10: only window 1 (positions 4..7, rows 3..6) is complete.
+            (4, [(1, 10, 1)], [(1, 1, 3)]),
+        ],
+    )
+    def test_align_packed_compressor_windows_selects_complete_document_windows(
+        self, ratio: int, segments: list[tuple[int, int, int | None]], expected: list[tuple[int, int, int]]
+    ):
+        seq_ids = torch.cat([torch.full((length,), doc) for doc, length, _ in segments]).unsqueeze(0)
+        position_ids = torch.cat(
+            [
+                torch.zeros(length, dtype=torch.long) if first is None else torch.arange(first, first + length)
+                for _, length, first in segments
+            ]
+        ).unsqueeze(0)
+        # Feature 0 of token ``row`` is ``row``, so a window's source rows can be read back.
+        kv = torch.arange(seq_ids.shape[1], dtype=torch.float32).view(1, -1, 1).repeat(1, 1, 2)
+
+        aligned_kv, aligned_gate, aligned_seq_ids, aligned_positions = dsv4_layers._align_packed_compressor_windows(
+            kv, -kv, seq_ids, position_ids, ratio
+        )
+        window_seq_ids, window_positions = dsv4_layers._compressed_window_metadata(
+            seq_ids=aligned_seq_ids, position_ids=aligned_positions, ready_len=aligned_kv.shape[1], ratio=ratio
+        )
+
+        usable = (seq_ids.shape[1] // ratio) * ratio
+        assert aligned_kv.shape[1] == usable
+        torch.testing.assert_close(aligned_gate, -aligned_kv)
+        if [row for _, _, row in expected] == list(range(0, usable, ratio)):
+            # Every row chunk already is a complete window: nothing moves.
+            assert torch.equal(aligned_kv, kv[:, :usable])
+        windows = []
+        for slot in range(0 if window_seq_ids is None else window_seq_ids.shape[1]):
+            if window_seq_ids[0, slot] > 0:
+                rows = aligned_kv[0, slot * ratio : (slot + 1) * ratio, 0].long()
+                torch.testing.assert_close(rows, torch.arange(int(rows[0]), int(rows[0]) + ratio))
+                # A window never moves behind the row chunk that holds its last token, so kernels that
+                # bound compressed keys by the query's row offset still reach it.
+                assert slot <= int(rows[-1]) // ratio
+                windows.append((int(window_seq_ids[0, slot]), int(window_positions[0, slot]), int(rows[0])))
+        assert windows == expected
+        # Slots without a window are padding: they must not keep a document id.
+        assert not aligned_seq_ids[0, len(expected) * ratio :].any()
+
+    def test_align_packed_compressor_windows_handles_each_batch_row_on_its_own(self):
+        ratio = 4
+        layouts = ([6, 14], [9, 11])
+        seq_ids = torch.stack(
+            [torch.cat([torch.full((n,), i + 1) for i, n in enumerate(lengths)]) for lengths in layouts]
+        )
+        position_ids = torch.stack([torch.cat([torch.arange(n) for n in lengths]) for lengths in layouts])
+        kv = torch.randn(2, 20, 3)
+        gate = torch.randn(2, 20, 3)
+
+        batched = dsv4_layers._align_packed_compressor_windows(kv, gate, seq_ids, position_ids, ratio)
+
+        for row in range(2):
+            single = dsv4_layers._align_packed_compressor_windows(
+                kv[row : row + 1], gate[row : row + 1], seq_ids[row], position_ids[row], ratio
+            )
+            for batched_tensor, single_tensor in zip(batched, single, strict=True):
+                assert torch.equal(batched_tensor[row : row + 1], single_tensor)
+        # Row 0 pools windows of rows 0..3, 6..9, 10..13, 14..17; row 1 pools 0..3, 4..7, 9..12, 13..16.
+        assert batched[2][:, ::ratio].tolist() == [[1, 2, 2, 2, 0], [1, 1, 2, 2, 0]]
+
+    def test_packed_hca_pools_each_document_from_its_own_start(self):
+        """A packed document that starts off a 128-token boundary pools the same keys as when it runs alone."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        lengths = [100, 300]
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+        hidden_states = torch.randn(1, sum(lengths), cfg.hidden_size)
+        position_ids, packed_seq_ids, position_embeddings_compress, rotary_compress, _ = self._packed_inputs(
+            cfg, hidden_states, lengths
+        )
+        second = hidden_states[:, lengths[0] :]
+        _, single_embeddings_compress, single_rotary_compress, _ = self._hca_inputs(cfg, lengths[1])[1:]
+
+        with torch.no_grad():
+            packed_pool, _, pooled_seq_ids, pooled_positions = attention.compressor(
+                hidden_states,
+                q_residual=None,
+                rotary=rotary_compress,
+                position_embeddings=position_embeddings_compress,
+                cache=dsv4_layers.DeepseekV4TrainCache(),
+                layer_idx=0,
+                start_pos=0,
+                position_ids=position_ids,
+                packed_seq_ids=packed_seq_ids,
+            )
+            single_pool, _, _, _ = attention.compressor(
+                second,
+                q_residual=None,
+                rotary=single_rotary_compress,
+                position_embeddings=single_embeddings_compress,
+                cache=dsv4_layers.DeepseekV4TrainCache(),
+                layer_idx=0,
+                start_pos=0,
+            )
+
+        # Document 1 has no complete window; document 2 has windows 0 and 1.
+        valid = pooled_seq_ids[0] > 0
+        assert pooled_seq_ids[0, valid].tolist() == [2, 2]
+        assert pooled_positions[0, valid].tolist() == [0, 1]
+        torch.testing.assert_close(packed_pool[0, 0, valid], single_pool[0, 0], rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        ("compress_ratio", "sliding_window", "lengths", "causal_positions", "reach_position", "reach_tokens", "index"),
+        [
+            # HCA: compressed window 0 of document 2 becomes visible at its position 127. Position 200
+            # reaches tokens 0..72 of the document only through that window.
+            (128, 128, [100, 300], (126, 127, 130, 149, 200, 298), 200, 73, {}),
+            # CSA with the indexer selecting every key: position 20 of document 2 reaches its tokens
+            # 0..11 only through compressed keys.
+            (4, 8, [6, 26], tuple(range(25)), 20, 12, {}),
+            # CSA with the indexer choosing two keys per query, so its scores decide the result: they
+            # must come from the same per-document windows as the compressor pool they index.
+            (4, 8, [6, 26], tuple(range(25)), None, 0, {"index_topk": 2, "index_n_heads": 16}),
+        ],
+    )
+    def test_packed_unaligned_document_stays_causal_and_matches_separate_run(
+        self,
+        compress_ratio: int,
+        sliding_window: int,
+        lengths: list[int],
+        causal_positions: tuple[int, ...],
+        reach_position: int | None,
+        reach_tokens: int,
+        index: dict[str, int],
+    ):
+        """Document 2 starts off a compressor-window boundary; it must behave as when it runs alone."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config(compress_ratio=compress_ratio, sliding_window=sliding_window, **index)
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.eval()
+        hidden_states = torch.randn(1, sum(lengths), cfg.hidden_size, requires_grad=True)
+        position_ids, packed_seq_ids, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._packed_inputs(cfg, hidden_states, lengths)
+        )
+        compressor_parameters = [attention.compressor.wkv.weight, attention.compressor.wgate.weight]
+        # A fixed random upstream gradient, so the parameter gradients below are not a plain count.
+        upstream = torch.randn(1, sum(lengths), cfg.hidden_size)
+
+        packed_output, _ = attention(
+            hidden_states,
+            position_embeddings=position_embeddings_compress,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+            position_ids=position_ids,
+            packed_seq_ids=packed_seq_ids,
+        )
+
+        # No position of document 2 may depend on a later token of the row.
+        start = lengths[0]
+        for position in causal_positions:
+            row = start + position
+            (dependence,) = torch.autograd.grad(packed_output[0, row].sum(), hidden_states, retain_graph=True)
+            assert dependence[0, row + 1 :].abs().max().item() == 0.0, f"position {position} depends on a later token"
+        if reach_position is not None:
+            # Tokens outside the sliding window are reached through compressed keys, so those are in use.
+            (dependence,) = torch.autograd.grad(
+                packed_output[0, start + reach_position].sum(), hidden_states, retain_graph=True
+            )
+            assert (dependence[0, start : start + reach_tokens].abs().amax(dim=-1) > 0).all()
+        packed_gradients = torch.autograd.grad((packed_output * upstream).sum(), compressor_parameters)
+
+        separate_outputs = []
+        separate_gradients = [torch.zeros_like(parameter) for parameter in compressor_parameters]
+        offset = 0
+        for length in lengths:
+            document = hidden_states[:, offset : offset + length].detach()
+            _, _, single_embeddings_compress, single_rotary_compress, single_mask = self._hca_inputs(cfg, length)
+            output, _ = attention(
+                document,
+                position_embeddings=single_embeddings_compress,
+                attention_mask=single_mask,
+                position_embeddings_compress=single_embeddings_compress,
+                rotary_compress=single_rotary_compress,
+            )
+            separate_outputs.append(output.detach())
+            gradients = torch.autograd.grad(
+                (output * upstream[:, offset : offset + length]).sum(), compressor_parameters, allow_unused=True
+            )
+            for total, gradient in zip(separate_gradients, gradients, strict=True):
+                if gradient is not None:  # a document shorter than one window does not use the compressor
+                    total += gradient
+            offset += length
+        # Packed and separate runs do the same arithmetic on differently shaped tensors, so they agree
+        # to float32 rounding; the misplaced windows this guards against change outputs by 1e-2 or more.
+        torch.testing.assert_close(packed_output.detach(), torch.cat(separate_outputs, dim=1), rtol=1e-5, atol=1e-6)
+        for packed_gradient, separate_gradient in zip(packed_gradients, separate_gradients, strict=True):
+            torch.testing.assert_close(packed_gradient, separate_gradient, rtol=1e-4, atol=1e-6)
+
     @staticmethod
-    def _tiny_hca_config() -> DeepseekV4Config:
+    def _packed_inputs(
+        cfg: DeepseekV4Config,
+        hidden_states: torch.Tensor,
+        lengths: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], nn.Module, torch.Tensor]:
+        """Build the attention inputs of one packed row whose documents are directly concatenated.
+
+        Args:
+            cfg: Model config; supplies the rotary settings and the sliding window.
+            hidden_states: Tensor of shape [1, sequence, hidden] with sequence equal to ``sum(lengths)``.
+            lengths: Document lengths in row order.
+
+        Returns:
+            Positions of shape [1, sequence] that restart at zero for each document, document ids of shape
+            [1, sequence] starting at one, the compress-rope cosine and sine of shape
+            [1, sequence, rotary_channels], the compress-rope module, and the additive block-causal
+            sliding-window mask of shape [1, 1, sequence, sequence].
+        """
+        position_ids = torch.cat([torch.arange(length) for length in lengths]).unsqueeze(0)
+        packed_seq_ids = torch.cat(
+            [torch.full((length,), index + 1) for index, length in enumerate(lengths)]
+        ).unsqueeze(0)
+        rotary_compress = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.compress_rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=float(cfg.qk_rope_head_dim) / float(cfg.head_dim),
+        )
+        position_embeddings_compress = rotary_compress(hidden_states, position_ids)
+        attention_mask = build_packed_causal_padding_mask(
+            torch.tensor([lengths]),
+            seq_len=sum(lengths),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            sliding_window=cfg.sliding_window,
+        )
+        return position_ids, packed_seq_ids, position_embeddings_compress, rotary_compress, attention_mask
+
+    @staticmethod
+    def _tiny_hca_config(
+        compress_ratio: int = 128, sliding_window: int = 128, index_topk: int = 512, index_n_heads: int = 64
+    ) -> DeepseekV4Config:
         return DeepseekV4Config(
             vocab_size=32,
             hidden_size=16,
@@ -700,8 +984,10 @@ class TestDeepseekV4AttentionMask:
             n_shared_experts=0,
             num_experts_per_tok=1,
             max_position_embeddings=256,
-            compress_ratios=[128],
-            sliding_window=128,
+            compress_ratios=[compress_ratio],
+            sliding_window=sliding_window,
+            index_topk=index_topk,
+            index_n_heads=index_n_heads,
             attention_dropout=0.0,
             num_hash_layers=0,
             hc_mult=1,
@@ -826,6 +1112,72 @@ class TestDeepseekV4GroupedLinear:
         w_ref = proj.weight.view(n_groups, out_total // n_groups, in_per)
         out_ref = torch.stack([x[:, g, :] @ w_ref[g].t() for g in range(n_groups)], dim=1)
         torch.testing.assert_close(out, out_ref)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_token_major_output_and_gradients_match_the_per_group_reference(self, dtype: torch.dtype):
+        """The out= path returns a contiguous token-major output (the caller's flatten is a view) and the
+        same input / weight gradients as the per-group matmul."""
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups).to(dtype)
+        x = torch.randn(2, 3, n_groups, in_per, dtype=dtype, requires_grad=True)
+        out = proj(x)
+        assert out.shape == (2, 3, n_groups, out_total // n_groups) and out.is_contiguous()
+        assert out.flatten(2).data_ptr() == out.data_ptr()
+        gx, gw = torch.autograd.grad((out.float() ** 2).sum(), (x, proj.weight))
+        x_ref = x.detach().clone().requires_grad_()
+        w_ref = proj.weight.detach().clone().requires_grad_()
+        w_groups = w_ref.view(n_groups, out_total // n_groups, in_per)
+        ref = torch.stack([x_ref[..., g, :] @ w_groups[g].t() for g in range(n_groups)], dim=-2)
+        ref_gx, ref_gw = torch.autograd.grad((ref.float() ** 2).sum(), (x_ref, w_ref))
+        tol = {} if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out, ref, **tol)
+        torch.testing.assert_close(gx, ref_gx, **tol)
+        torch.testing.assert_close(gw, ref_gw, **tol)
+
+    @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+    def test_autocast_with_fp32_parameters_matches_the_plain_bmm_path(self, input_dtype: torch.dtype):
+        """AMP training: FP32 parameters, BF16 (or FP32) activations under autocast. The out= path must behave like
+        the autocast bmm it replaces — BF16 output, gradients in the dtype of the tensor they belong to."""
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups)  # FP32 weight
+        x = torch.randn(2, 3, n_groups, in_per, dtype=input_dtype, requires_grad=True)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = proj(x)
+        assert out.dtype == torch.bfloat16 and out.is_contiguous()
+        gx, gw = torch.autograd.grad(out.float().square().sum(), (x, proj.weight))
+        assert gx.dtype == input_dtype and gw.dtype == torch.float32
+        x_ref = x.detach().clone().requires_grad_()
+        w_ref = proj.weight.detach().clone().requires_grad_()
+        w_groups = w_ref.view(n_groups, out_total // n_groups, in_per)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            ref = torch.stack([x_ref[..., g, :] @ w_groups[g].t() for g in range(n_groups)], dim=-2)
+        ref_gx, ref_gw = torch.autograd.grad(ref.float().square().sum(), (x_ref, w_ref))
+        assert ref.dtype == torch.bfloat16
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gx, ref_gx, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gw, ref_gw, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.runtime_budget(20, hard_timeout=90, reason="torch.compile tracing of the module")
+    def test_compiled_forward_backward_matches_eager_without_graph_breaks(self):
+        """Under the compiler the module traces the plain bmm (Dynamo cannot capture a strided out= buffer):
+        fullgraph compiles, no graph breaks, same values and gradients as eager."""
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups)
+        x = torch.randn(2, 3, n_groups, in_per, requires_grad=True)
+        explanation = torch._dynamo.explain(proj)(x)
+        assert explanation.graph_break_count == 0 and explanation.graph_count == 1, explanation
+        compiled = torch.compile(proj, backend="eager", fullgraph=True)
+        out_c = compiled(x)
+        gx_c, gw_c = torch.autograd.grad(out_c.square().sum(), (x, proj.weight))
+        out_e = proj(x)
+        gx_e, gw_e = torch.autograd.grad(out_e.square().sum(), (x, proj.weight))
+        torch.testing.assert_close(out_c, out_e)
+        torch.testing.assert_close(gx_c, gx_e)
+        torch.testing.assert_close(gw_c, gw_e)
 
 
 class TestDeepseekV4HyperConnection:
@@ -1140,49 +1492,6 @@ class TestDeepseekV4OptimizedKernels:
         finally:
             sys.modules.pop(module_name, None)
 
-    @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
-        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
-    )
-    def test_sinkhorn_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        x = torch.randn(2, 128, 4, 4, device="cuda")
-        grad = torch.randn_like(x)
-        expected, (expected_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        actual, (actual_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
-
-    @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
-        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
-    )
-    def test_sinkhorn_tilelang_backend_accepts_non_contiguous_grad(self):
-        torch.manual_seed(123)
-        x = torch.randn(2, 128, 4, 4, device="cuda")
-        grad = torch.randn_like(x).transpose(-1, -2)
-        assert not grad.is_contiguous()
-        expected, (expected_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        actual, (actual_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
-
     def test_sparse_attention_torch_matches_dense_topk_reference(self):
         torch.manual_seed(123)
         bsz, seq, heads, dim = 2, 7, 3, 8
@@ -1324,101 +1633,32 @@ class TestDeepseekV4OptimizedKernels:
         for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
             torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, key_len, topk_len = 1, 16, 8, 128, 20, 16
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = torch.stack(
-            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
-        ).to(torch.int32)
-        topk[:, :, -4:] = -1
-        grad = torch.randn(bsz, seq, dim, heads, device="cuda", dtype=q.dtype).transpose(2, 3)
-        assert not grad.is_contiguous()
+    def test_sparse_attention_backward_threads_follow_head_count(self):
+        from nemo_automodel.components.models.deepseek_v4.kernels.tilelang_sparse_mla_bwd import _bwd_threads_for_heads
 
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="sparse_torch",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+        assert [_bwd_threads_for_heads(h) for h in (8, 16, 32, 64, 128)] == [128, 128, 256, 512, 512]
 
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, n_pooled = 1, 192, 128, 128, 48
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, seq + n_pooled, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = build_dsv4_sparse_topk_indices(
-            batch_size=bsz,
-            seq_len=seq,
-            key_len=seq + n_pooled,
-            window_size=128,
-            device=q.device,
-            compress_ratio=4,
-            n_pooled=n_pooled,
-        )
-        assert (topk == -1).any()
-        grad = torch.randn_like(q).transpose(2, 3).contiguous().transpose(2, 3)
-        assert not grad.is_contiguous()
+    def test_sparse_attention_tilelang_runs_sixty_four_heads_in_one_backward_kernel(self, monkeypatch):
+        """TP=1 V4 shapes (64 heads, head_dim 512) no longer split the backward into 16-head kernels."""
+        import nemo_automodel.components.models.deepseek_v4.optimized_kernels as optimized_kernels
 
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="sparse_torch",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+        whole = Mock(side_effect=lambda q, *args, **kwargs: q.clone())
+        chunked = Mock(side_effect=lambda q, *args, **kwargs: q.clone())
+        monkeypatch.setattr(optimized_kernels, "_HAS_MILES_SPARSE_ATTN", True)
+        monkeypatch.setattr(optimized_kernels, "_HAS_MILES_SPARSE_ATTN_CHUNKED", True)
+        monkeypatch.setattr(optimized_kernels, "_miles_sparse_attn_tilelang", whole)
+        monkeypatch.setattr(optimized_kernels, "_miles_sparse_attn_tilelang_head_chunked", chunked)
+        monkeypatch.setattr(optimized_kernels, "_should_use_tilelang", lambda *args, **kwargs: True)
+        q = torch.randn(1, 4, 64, 512, dtype=torch.bfloat16)
+        kv = torch.randn(1, 8, 512, dtype=torch.bfloat16)
+        sinks = torch.randn(64)
+        topk = torch.zeros(1, 4, 32, dtype=torch.int32)
+
+        out = optimized_kernels.dsv4_sparse_attention(q, kv, sinks, topk, 512**-0.5, backend="tilelang")
+
+        assert out.shape == q.shape
+        whole.assert_called_once()
+        chunked.assert_not_called()
 
     def test_indexer_scores_torch_backend_matches_reference(self):
         torch.manual_seed(123)
@@ -1516,84 +1756,6 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected)
         for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
             torch.testing.assert_close(actual_grad, expected_grad)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_indexer(),
-        reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
-    )
-    def test_indexer_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled = 2, 17, 8, 128, 5
-        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
-        q_pos = torch.arange(seq, device="cuda")
-        pooled_pos = torch.arange(pooled, device="cuda")
-        valid = pooled_pos.unsqueeze(0) < ((q_pos + 1) // 4).unsqueeze(1)
-        expected = dsv4_indexer_scores(
-            q,
-            pooled_kv,
-            weights,
-            compress_ratio=4,
-            softmax_scale=dim**-0.5,
-            backend="torch",
-        )
-        expected = torch.where(valid.unsqueeze(0), expected, torch.full_like(expected, float("-inf")))
-        actual = dsv4_indexer_scores(
-            q,
-            pooled_kv,
-            weights,
-            compress_ratio=4,
-            softmax_scale=dim**-0.5,
-            backend="tilelang",
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_indexer(),
-        reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
-    )
-    def test_indexer_topk_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled, topk = 1, 17, 8, 128, 5, 4
-        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
-        topk_indices = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, 1, topk).expand(bsz, seq, -1)
-        q_pos = torch.arange(seq, device="cuda")
-        valid_end = ((q_pos + 1) // 4).view(1, seq, 1)
-        topk_indices = torch.where(topk_indices < valid_end, topk_indices, torch.full_like(topk_indices, -1))
-        grad = torch.randn(bsz, seq, topk, device="cuda")
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
-                q_,
-                pooled_kv_,
-                weights_,
-                topk_indices,
-                compress_ratio=4,
-                softmax_scale=dim**-0.5,
-                backend="torch",
-            ),
-            (q, pooled_kv, weights),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
-                q_,
-                pooled_kv_,
-                weights_,
-                topk_indices,
-                compress_ratio=4,
-                softmax_scale=dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, pooled_kv, weights),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-2, atol=3e-2)
 
 
 class TestApplyPartialRopeInterleaved:
@@ -1861,3 +2023,125 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
         assert cos.shape == (bsz, seq, 64)
         assert sin.shape == (bsz, seq, 64)
         assert not torch.isnan(cos).any() and not torch.isnan(sin).any()
+
+
+def test_compiled_hyperconnection_uses_copied_stage_parameters(monkeypatch):
+    """A PP-style copy from meta must execute and differentiate its own weights."""
+    import copy
+
+    original_compile = torch.compile
+    monkeypatch.setattr(
+        torch, "compile", lambda function, **kwargs: original_compile(function, backend="eager", **kwargs)
+    )
+    kwargs = dict(hc_mult=4, hidden_size=8, hc_sinkhorn_iters=3, hc_eps=1e-6, rms_norm_eps=1e-6)
+    with torch.device("meta"):
+        source = DeepseekV4HyperConnection(**kwargs, compile_hc=True)
+    stage = copy.deepcopy(source).to_empty(device="cpu")
+    stage.init_weights(0.1)
+    reference = DeepseekV4HyperConnection(**kwargs)
+    reference.load_state_dict(stage.state_dict())
+    inputs = torch.randn(2, 5, 4, 8, requires_grad=True)
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    actual = stage(inputs)
+    expected = reference(reference_inputs)
+    upstream = [torch.randn_like(value) for value in expected]
+    for observed, wanted in zip(actual, expected):
+        torch.testing.assert_close(observed, wanted)
+    torch.autograd.backward(actual, upstream)
+    torch.autograd.backward(expected, upstream)
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+    for (name, parameter), (reference_name, reference_parameter) in zip(
+        stage.named_parameters(), reference.named_parameters()
+    ):
+        assert name == reference_name
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad)
+    assert all(parameter.device.type == "meta" for parameter in source.parameters())
+
+
+@pytest.mark.parametrize("selective", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_frozen_indexer_replay_preserves_attention_and_interleaved_microbatch_gradients(selective, packed):
+    """Replay skips selection work without changing sparse keys or any attention gradient."""
+    import copy
+    from unittest.mock import patch
+
+    from torch.utils.checkpoint import checkpoint
+
+    from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
+
+    cfg = TestDeepseekV4AttentionMask._tiny_hca_config()
+    cfg.compress_ratios = [4]
+    cfg.sliding_window = 4
+    cfg.index_topk = 1
+    cfg.index_head_dim = 8
+    cfg.index_n_heads = 2
+    torch.manual_seed(1243)
+    reference = DeepseekV4Attention(cfg, layer_idx=0)
+    reference.init_weights(torch.device("cpu"))
+    reference.compressor.indexer.requires_grad_(False)
+    _, rotary_main, rotary_compress, rotary, mask = TestDeepseekV4AttentionMask._hca_inputs(cfg, 16)
+    inputs = [torch.randn(1, 16, cfg.hidden_size) for _ in range(2)]
+    upstream = [torch.randn_like(x) for x in inputs]
+    if packed:
+        seq_ids = torch.tensor([[1] * 8 + [2] * 8])
+        positions = torch.arange(8).repeat(2).unsqueeze(0)
+        rotary_main = rotary(inputs[0], positions)
+        rotary_compress = rotary_main
+        mask = build_packed_causal_padding_mask(
+            torch.tensor([[8, 8]]),
+            16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            sliding_window=cfg.sliding_window,
+        )
+    else:
+        seq_ids = None
+        positions = torch.arange(16).unsqueeze(0)
+
+    runs = []
+    for enabled in (False, True):
+        module = copy.deepcopy(reference)
+        module.compressor.indexer.reuse_selection_on_recompute = enabled
+        xs = [x.clone().requires_grad_() for x in inputs]
+        selections = []
+        hook = module.compressor.indexer.register_forward_hook(
+            lambda _module, _args, output: selections.append(output.detach().clone())
+        )
+        inner = make_selective_checkpoint_context_fn() if selective else None
+        context_fn = dsv4_layers.dsv4_indexer_replay.checkpoint_context_fn(inner)
+
+        def forward(x):
+            """Run the attention layer under checkpointing.
+
+            Args:
+                x: Tensor of shape [batch, sequence, hidden].
+
+            Returns:
+                Attention output of shape [batch, sequence, hidden].
+            """
+            return module(
+                x,
+                position_embeddings=rotary_main,
+                position_embeddings_compress=rotary_compress,
+                rotary_compress=rotary,
+                position_ids=positions,
+                packed_seq_ids=seq_ids,
+                attention_mask=mask,
+            )[0]
+
+        with patch.object(
+            module.compressor.indexer, "_select_keys", wraps=module.compressor.indexer._select_keys
+        ) as select:
+            # Both forwards remain live; backward traverses the second call first.
+            outputs = [checkpoint(forward, x, use_reentrant=False, context_fn=context_fn) for x in xs]
+            loss = sum((outputs[i] * upstream[i]).sum() for i in (1, 0))
+            params = tuple(p for p in module.parameters() if p.requires_grad)
+            gradients = torch.autograd.grad(loss, (*xs, *params))
+            assert select.call_count == (2 if enabled else 4)
+        hook.remove()
+        assert selections[0].shape == (1, 16, 1)
+        runs.append((outputs, gradients, selections[:2]))
+
+    for before, after in zip(runs[0], runs[1]):
+        for expected, actual in zip(before, after):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

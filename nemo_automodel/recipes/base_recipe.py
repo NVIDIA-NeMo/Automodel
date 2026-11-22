@@ -16,9 +16,12 @@ import getpass
 import logging
 import os
 import socket
+import time
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -56,7 +59,12 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.recipes._typed_config import RecipeConfig
+
+if TYPE_CHECKING:
+    from nemo_automodel._transformers.mfu import AutoMFU
+    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +171,10 @@ class BaseRecipe:
     """
     BaseRecipe provides checkpoint load/save functionality for recipes.
     """
+
+    dist_env: "DistInfo"
+    mfu_calculator: "AutoMFU | None" = None
+    timestamp: float
 
     @staticmethod
     def _distributed_setup_attributes(distributed_setup):
@@ -391,7 +403,7 @@ class BaseRecipe:
             scheduler,
             optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
         )
-        save_config(config.raw_config, path)
+        save_config(config.to_yaml_dict(use_orig_values=True), path)
         if is_dist_initialized:
             _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
@@ -836,10 +848,52 @@ class BaseRecipe:
             return tensor
         if dp_group is not None or dist.is_initialized():
             if not tensor.is_cuda and torch.cuda.is_available():
-                tensor = tensor.cuda()
+                tensor = tensor.pin_memory().to(
+                    device=torch.device("cuda", torch.cuda.current_device()), non_blocking=True
+                )
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
+
+    def _step_throughput(
+        self, batches: Sequence[Mapping[str, torch.Tensor]], num_tokens_in_batch: float
+    ) -> tuple[float, float | None]:
+        """Advance the step timer and return the step's tokens/s and MFU.
+
+        MFU is ``None`` without an MFU calculator, without batches, or when any batch
+        lacks ``input_ids`` or has no FLOPs formula.
+        """
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+
+        mfu_calculator = self.mfu_calculator
+        if not batches or mfu_calculator is None:
+            return tps, None
+        step_flops = 0.0
+        for batch in batches:
+            input_ids = batch.get("input_ids")
+            if input_ids is None:
+                return tps, None
+            batch_flops = mfu_calculator.get_flops(input_ids)
+            if batch_flops is None:
+                return tps, None
+            step_flops += float(batch_flops)
+
+        # Sum over DP ranks only, like the token count. Every CP rank of a DP replica holds
+        # the same unsharded batches (CP shards a copy inside the step), so including CP
+        # would count each sequence's FLOPs cp_size times.
+        step_flops = self._dp_allreduce(
+            torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device)
+        ).item()
+        mfu = calculate_mfu(
+            step_flops / 1e12,
+            self.dist_env.world_size,
+            time_delta,
+            reference_mfu=mfu_calculator.reference_mfu,
+        )
+        return tps, mfu
 
     def _make_progress_bar(self, total: int | None = None, initial: int = 0):
         """Create a tqdm progress bar on rank 0; returns None on other ranks.
@@ -967,10 +1021,11 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     Compare the checkpoint's saved ``config.yaml`` model signature to the
     current run's model signature.
 
-    Uses ``raw_config`` (when available) for comparison because
-    ``save_config`` serialises ``raw_config`` to YAML.  Round-tripping
-    through YAML preserves types, avoiding false mismatches that would
-    arise from using ``to_dict()`` (which may apply type conversions).
+    Uses the effective YAML-ready config (when available) for comparison so
+    runtime overrides are checked against the same representation saved in
+    the checkpoint. Round-tripping through YAML preserves types, avoiding
+    false mismatches that would arise from using ``to_dict()`` (which may
+    apply type conversions).
     """
     config_path = os.path.join(os.fspath(ckpt_dir), "config.yaml")
     if not os.path.exists(config_path):
@@ -981,10 +1036,12 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     except (OSError, yaml.YAMLError) as e:
         return True, f"failed to read checkpoint config.yaml (cannot validate): {e}"
 
-    # Prefer raw_config (same representation that was saved) to avoid
-    # type-coercion mismatches between to_dict() and yaml.safe_load().
+    # Prefer the effective YAML-ready representation used by save_checkpoint
+    # to avoid stale pre-override values and type-coercion mismatches.
     try:
-        if hasattr(current_cfg, "raw_config"):
+        if hasattr(current_cfg, "to_yaml_dict"):
+            cur_cfg = current_cfg.to_yaml_dict(use_orig_values=True)
+        elif hasattr(current_cfg, "raw_config"):
             cur_cfg = current_cfg.raw_config
         elif hasattr(current_cfg, "to_dict"):
             cur_cfg = current_cfg.to_dict()

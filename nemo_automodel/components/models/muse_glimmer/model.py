@@ -54,7 +54,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.muse_glimmer.config import MuseGlimmerConfig
-from nemo_automodel.components.models.muse_glimmer.parallelization import register_muse_glimmer_parallel_strategy
+from nemo_automodel.components.models.muse_glimmer.parallelization import PARALLELIZER
 from nemo_automodel.components.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
 from nemo_automodel.components.models.muse_glimmer.vision import MuseGlimmerVisionAdapter, MuseGlimmerVisionEncoder
 
@@ -938,5 +938,5 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         return output if return_dict else output.to_tuple()
 
 
-register_muse_glimmer_parallel_strategy()
+MuseGlimmerForConditionalGeneration.parallelizer = PARALLELIZER
 ModelClass = MuseGlimmerForConditionalGeneration

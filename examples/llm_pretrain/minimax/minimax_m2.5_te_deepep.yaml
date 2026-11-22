@@ -1,0 +1,92 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Synthetic pretraining counterpart of examples/llm_benchmark/minimax/minimax_m2.5_te_deepep.yaml
+# Fixed-length mock tokens; runtime tuning is canonical. GPU validation is pending.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 512
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  num_epochs: null
+  max_steps: 1000
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 2
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: MiniMaxAI/MiniMax-M2.5
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+checkpoint:
+  enabled: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 200064
+  seq_len: 4096
+  include_position_ids: false
+  exclude_token_ids: [0]
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+  pin_memory: true
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100
+  time: 00:30:00
+  nodes: 8
+  recipe_owner: akoumpa
+  nproc_per_node: 8
+  perf_testing:
+    schedule: nightly
+    fake_balanced_gate: true

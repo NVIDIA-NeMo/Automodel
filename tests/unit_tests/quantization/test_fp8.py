@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.quantization.fp8 import (
     FP8Config,
     _module_filter_fn,
@@ -180,6 +181,41 @@ class TestFP8Conversion:
                 emulate=False
             )
 
+    @pytest.mark.parametrize("recipe_name", ["tensorwise", "rowwise", "rowwise_with_gw_hp"])
+    @patch('nemo_automodel.components.quantization.fp8._has_cuda_capability')
+    def test_apply_fp8_recipe_emulate(self, mock_cuda_capability, recipe_name, monkeypatch):
+        """Test emulate=True is honored by every recipe on hardware without FP8 support."""
+        pytest.importorskip("torchao.float8", reason="torchao not available")
+        mock_cuda_capability.return_value = False
+        # The rowwise recipe sets this global inductor flag; restore it after the test
+        monkeypatch.setattr(
+            torch._inductor.config, "emulate_precision_casts", torch._inductor.config.emulate_precision_casts
+        )
+
+        model = self.create_test_model()
+        config = FP8Config(enabled=True, recipe_name=recipe_name, emulate=True)
+
+        result = apply_fp8_to_model(model, config=config)
+
+        assert verify_fp8_conversion(result)['fp8_count'] == 2
+        assert result.linear1.config.emulate is True
+
+    @pytest.mark.parametrize("recipe_name", ["rowwise", "rowwise_with_gw_hp"])
+    @patch('nemo_automodel.components.quantization.fp8._has_cuda_capability')
+    def test_apply_fp8_recipe_hardware_check_fail(self, mock_cuda_capability, recipe_name, monkeypatch):
+        """Test recipes without emulation still fail the hardware check."""
+        pytest.importorskip("torchao.float8", reason="torchao not available")
+        mock_cuda_capability.return_value = False
+        monkeypatch.setattr(
+            torch._inductor.config, "emulate_precision_casts", torch._inductor.config.emulate_precision_casts
+        )
+
+        model = self.create_test_model()
+        config = FP8Config(enabled=True, recipe_name=recipe_name, emulate=False)
+
+        with pytest.raises(ValueError, match="FP8 is only supported on SM89"):
+            apply_fp8_to_model(model, config=config)
+
     @patch('nemo_automodel.components.quantization.fp8._has_cuda_capability')
     @patch('nemo_automodel.components.quantization.fp8.HAVE_TORCHAO', False)
     def test_apply_fp8_torchao_import_error(self, mock_cuda_capability):
@@ -329,6 +365,16 @@ class TestFP8ConfigBuilders:
         assert config.enabled is False
         assert config.recipe_name is None
         assert config.filter_fqns == []
+
+    def test_build_fp8_config_from_config_node(self):
+        """Test build_fp8_config accepts the recipe's ConfigNode input."""
+        config_node = ConfigNode({"enabled": True, "recipe_name": "rowwise", "filter_fqns": ["lm_head"]})
+
+        config = build_fp8_config(config_node)
+
+        assert config.enabled is True
+        assert config.recipe_name == "rowwise"
+        assert config.filter_fqns == ["lm_head"]
 
 
 class TestIntegration:
