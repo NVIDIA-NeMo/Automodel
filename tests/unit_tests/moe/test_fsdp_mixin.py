@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
@@ -619,6 +620,22 @@ class TestRunPostBackwardHooks:
         result()
         mock_fsdp_state._root_post_backward_final_callback.assert_called_once()
 
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    def test_final_callback_follows_backward_finalization_mode(self, mock_fully_shard):
+        """PyTorch 2.15 clears the finalization mode once the backward iteration ends."""
+        fsdp_module = MockFSDPModule()
+        mock_fsdp_state = Mock()
+        mock_fsdp_state._state_ctx = SimpleNamespace(all_states=[], manual_backward_finalization_active=False)
+        mock_fully_shard.state.return_value = mock_fsdp_state
+
+        callback = _run_post_backward_hooks(fsdp_module)
+        callback()
+        mock_fsdp_state._root_post_backward_final_callback.assert_called_once()
+
+        mock_fsdp_state._state_ctx.manual_backward_finalization_active = None
+        callback()
+        mock_fsdp_state._root_post_backward_final_callback.assert_called_once()
+
 
 class TestDisableFsdpForMoeModule:
     """Test _disable_fsdp_for_moe_module helper function."""
@@ -710,6 +727,48 @@ class TestRunPostBackwardForMoeModule:
         assert block.mlp.experts._is_last_backward is True
         assert block.mlp.experts._reshard_after_backward is True
         assert block.mlp.experts._requires_gradient_sync is True
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_finalizes_shared_state_context_once(self, mock_isinstance, mock_fully_shard):
+        """FSDP units sharing their root's state context finalize the backward once.
+
+        PyTorch 2.15 (NGC 26.11) ends the backward iteration in the first root final
+        callback and asserts when another unit of the same context calls it again.
+        """
+
+        def isinstance_side_effect(obj, cls):
+            if cls.__name__ == "FSDPModule":
+                return isinstance(obj, MockFSDPModule)
+            return isinstance(obj, cls)
+
+        mock_isinstance.side_effect = isinstance_side_effect
+
+        model = MockFSDPModule()
+        model.layers = Mock()
+        block = Mock()
+        block.mlp = Mock()
+        block.mlp.experts = MockFSDPModule()
+        model.layers.named_children = Mock(return_value=[("layer_0", block)])
+        moe_model = MockMoEModel(MockBackend(), model, has_lm_head=True)
+
+        shared_ctx = SimpleNamespace(all_states=[], manual_backward_finalization_active=False)
+        finalized = []
+
+        def root_post_backward_final_callback():
+            if shared_ctx.manual_backward_finalization_active is None:
+                raise AssertionError("Expected manual backward finalization mode to be set")
+            finalized.append(True)
+            shared_ctx.manual_backward_finalization_active = None
+
+        mock_fully_shard.state.return_value = SimpleNamespace(
+            _state_ctx=shared_ctx, _root_post_backward_final_callback=root_post_backward_final_callback
+        )
+
+        _run_post_backward_for_moe_module(moe_model)
+
+        assert mock_fully_shard.state.call_count == 3
+        assert finalized == [True]
 
 
 class TestPatchedBackwardMaybeWithNosync:
@@ -814,6 +873,33 @@ class TestPatchedBackwardMaybeWithNosync:
                 grads, param_groups = result
                 assert grads == ((), None)
                 assert param_groups is None
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    def test_fsdp_module_skips_callback_after_fsdp_finalized(self, mock_fully_shard):
+        """A per-micro-batch reduction lets FSDP's own callback end the last backward.
+
+        PyTorch 2.15 then clears the finalization mode, and the manual root callback
+        would assert, so only the idempotent post-backward hooks run.
+        """
+        mock_stage = Mock()
+        mock_stage.submod = MockFSDPModule()
+        mock_stage._reduce_grad_per_microbatch = True
+        bwd_kwargs = {"stage_output": Mock(), "output_grads": Mock(), "input_values": Mock()}
+
+        mock_state = Mock()
+        mock_fsdp_state = Mock()
+        mock_fsdp_state._state_ctx = SimpleNamespace(all_states=[mock_state], manual_backward_finalization_active=None)
+        mock_fully_shard.state.return_value = mock_fsdp_state
+
+        with patch("nemo_automodel.components.moe.fsdp_mixin.stage_backward") as mock_stage_backward:
+            with patch("nemo_automodel.components.moe.fsdp_mixin.isinstance") as mock_isinstance:
+                mock_isinstance.side_effect = lambda obj, cls: cls.__name__ == "FSDPModule"
+                mock_stage_backward.return_value = ((), None)
+
+                patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=True)
+
+        mock_state._fsdp_param_group.post_backward.assert_called_once()
+        mock_fsdp_state._root_post_backward_final_callback.assert_not_called()
 
     @patch("nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step")
     @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")

@@ -169,6 +169,7 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
     recipe.kd_loss_fn = KDLoss()
     recipe.kd_ratio = 0.5
     recipe._offload_teacher_model = False
+    recipe.te_quantization = None
     recipe.separate_meshes = False
     recipe._get_dp_group = lambda include_cp=True: grad_reduce_group
     recipe._get_dp_group_size = lambda include_cp=True: 1
@@ -276,6 +277,7 @@ def test_kd_uses_main_loss_mask_and_denominator(
     recipe.kd_loss_fn = KDLoss()
     recipe.kd_ratio = 1.0
     recipe._offload_teacher_model = False
+    recipe.te_quantization = None
     recipe.separate_meshes = False
     recipe._get_dp_group_size = lambda include_cp=True: 1
 
@@ -607,6 +609,7 @@ def test_chunked_kd_real_llama_loss_and_gradients(recipe_module, recipe_cls, _, 
         recipe.kd_loss_fn = KDLoss()
         recipe.kd_ratio = 0.5
         recipe._offload_teacher_model = False
+        recipe.te_quantization = None
         recipe.separate_meshes = False
         recipe._get_dp_group = lambda **kw: None
         recipe._get_dp_group_size = lambda **kw: 1
@@ -809,6 +812,7 @@ def test_kd_only_delivers_neat_offsets_to_consumers_that_require_them(
     recipe.kd_loss_fn = KDLoss()
     recipe.kd_ratio = 0.5
     recipe._offload_teacher_model = False
+    recipe.te_quantization = None
     recipe._get_dp_group = lambda **kwargs: None
     recipe._get_dp_group_size = lambda **kwargs: 1
     recipe._ce_loss_buffer = []

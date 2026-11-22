@@ -23,6 +23,7 @@ _SCRIPT = Path(".github/scripts/prepare-container-dependencies.sh").resolve()
 _INPUTS = (
     "docker/Dockerfile",
     "docker/common/deepep.patch",
+    "docker/common/torchao-autotune-key.patch",
     "docker/common/uv-pytorch.toml",
     "docker/common/uv-pytorch.lock",
     "docker/common/update_pyproject_pytorch.sh",

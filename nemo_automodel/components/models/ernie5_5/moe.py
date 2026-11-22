@@ -38,8 +38,8 @@ Supported execution: the torch linear backend with one of two expert and dispatc
 The two pairs store the expert weights in the same parameters with the same placements. In a single process there
 is no placement requirement. With more than one process the expert weights must be ``DTensor`` objects on an
 ``("ep",)`` mesh with placements ``(Shard(0),)`` or on an ``("ep_shard", "ep")`` mesh with placements
-``(Shard(1), Shard(0))``; ``Ernie5_5MoE.forward`` raises ``RuntimeError`` for any other layout and for context
-parallelism.
+``(Shard(1), Shard(0))``; ``Ernie5_5MoE.forward`` raises ``RuntimeError`` for any other layout. Routing uses the
+local token states, so a context-parallel shard is routed like any other row.
 
 Provenance: the expert-selection and routing-weight contracts of ``route`` are those of the ERNIE 5.5 implementation
 in Megatron-Bridge (Apache License 2.0) at revision ``a38833622b88969564fe8bfa053c5e4e4989c6cd``:
@@ -244,7 +244,12 @@ def _routed_situ(x: torch.Tensor, weights: torch.Tensor, *, beta: float, linear_
 
 
 class Ernie5_5SharedExpert(MLP):
-    """Preserve ERNIE shared-expert arithmetic at a callable FSDP boundary."""
+    """Preserve ERNIE shared-expert arithmetic at a callable FSDP boundary.
+
+    The module has the gate, up and down projections of the shared ``MLP`` and computes SiTU between them. Its
+    ``activation`` attribute is ``"situ"``: code that selects a kernel from that attribute, such as the fused LoRA
+    MLP path, finds no SwiGLU module here and leaves ``forward`` in place.
+    """
 
     def __init__(self, old: MLP, *, beta: float, linear_beta: float | None) -> None:
         """Wrap an existing shared-expert MLP.
@@ -272,6 +277,10 @@ class Ernie5_5SharedExpert(MLP):
             )
         self.gate_proj, self.up_proj, self.down_proj = old.gate_proj, old.up_proj, old.down_proj
         self.beta, self.linear_beta = beta, linear_beta
+        # The base class builds the gated layout for "swiglu" and records that name. This forward computes SiTU,
+        # so the recorded name is corrected: the fused LoRA MLP path replaces the forward of a module that
+        # reports "swiglu" with a SwiGLU kernel.
+        self.activation = "situ"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run SiTU and the output projection inside the FSDP-wrapped module.
@@ -332,7 +341,7 @@ class Ernie5_5MoE(MoE):
     The routed experts are the shared ``GroupedExperts`` (torch dispatcher, or one process) or the shared
     ``GroupedExpertsDeepEP`` (HybridEP dispatcher in a job of several processes), with SiTU installed as their
     activation. Distributed execution is restricted to the expert-parallel layouts that ``forward`` checks, and
-    with the HybridEP dispatcher to BF16 activations. Context parallelism is not supported.
+    with the HybridEP dispatcher to BF16 activations.
     """
 
     def __init__(
@@ -409,13 +418,13 @@ class Ernie5_5MoE(MoE):
         Args:
             hidden: Tensor of shape [..., hidden] with arbitrary leading dimensions.
             padding_mask: Boolean tensor of shape [...] where true marks padding.
-            cp_mesh: Context-parallel mesh; only None is supported.
+            cp_mesh: Context-parallel mesh; unused, because the gate computes no auxiliary loss.
 
         Returns:
             Output of shape [..., hidden].
 
         Raises:
-            RuntimeError: If a context-parallel mesh is passed or set on the module; if, with more than one
+            RuntimeError: If, with more than one
                 process, the expert weights are not ``DTensor`` objects with the same mesh and placements in a
                 supported layout (mesh ``("ep",)`` with placements ``(Shard(0),)``, or mesh ``("ep_shard", "ep")``
                 with placements ``(Shard(1), Shard(0))``, with more than one expert-parallel rank); if, with more
@@ -425,8 +434,7 @@ class Ernie5_5MoE(MoE):
             ValueError: If ``hidden`` is empty, has fewer than two dimensions or does not end in the configured
                 hidden size, or ``padding_mask`` does not have the shape of ``hidden`` without its final axis.
         """
-        if cp_mesh is not None or self.cp_mesh is not None:
-            raise RuntimeError("ERNIE 5.5 MoE does not support context parallelism")
+        del cp_mesh
         if get_world_size_safe() != 1:
             if self.backend.dispatcher == "hybridep" and not self._dispatches_through_hybridep:
                 raise RuntimeError(
