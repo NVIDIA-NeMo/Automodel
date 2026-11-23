@@ -123,6 +123,7 @@ MODEL_TYPE_OVERVIEW_PATHS = (
     ("Embedding", "embedding/index.mdx"),
     ("Reranking", "reranker/index.mdx"),
     ("WAM", "wam/index.mdx"),
+    ("Decision", "decision/index.mdx"),
 )
 
 
@@ -156,8 +157,10 @@ PROVIDER_ORGS = {
     "bigcode": "bigcode",
     "black-forest-labs": "black-forest-labs",
     "bytedance-seed": "ByteDance-Seed",
+    "cloudflare": "Cloudflare",
     "cohere": "CohereForAI",
     "coherelabs": "CohereLabs",
+    "contrastive-lm": "Contrastive-LM",
     "deepseek-ai": "deepseek-ai",
     "diffusers": "diffusers",
     "eleutherai": "EleutherAI",

@@ -337,7 +337,7 @@ def _validate_redirects(repo_root: Path) -> None:
         route
         for route in routes
         if re.fullmatch(
-            "/model-coverage/(?:large-language-models|vision-language-models|multimodal|omni|dllm|diffusion|embedding-models|reranking-models)/[^/]+",
+            "/model-coverage/(?:large-language-models|vision-language-models|multimodal|omni|dllm|diffusion|embedding-models|reranking-models|decision-models)/[^/]+",
             route,
         )
     }
