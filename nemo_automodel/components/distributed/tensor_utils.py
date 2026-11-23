@@ -19,21 +19,24 @@ This module provides utilities for handling tensor operations across different d
 and distributed tensor types, with optimizations for performance in distributed training scenarios.
 """
 
-from typing import Iterable, Union
+from collections.abc import Iterable
+from typing import TypeVar, overload
 
 import torch
 from torch.distributed.tensor import DTensor
 
+T = TypeVar("T")
+
 
 @torch.no_grad()
 def get_cpu_state_dict(
-    state_generator: Iterable[tuple[str, Union[torch.Tensor, DTensor]]],
+    state_generator: Iterable[tuple[str, torch.Tensor | DTensor]],
     pin_memory: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Copy the state dict generator to CPU memory.
 
     Args:
-        state_generator (Iterable[tuple[str, Union[torch.Tensor, DTensor]]]):
+        state_generator (Iterable[tuple[str, torch.Tensor | DTensor]]):
             An iterable that yields (key, tensor) pairs from a model state.
         pin_memory (bool, optional):
             Whether to allocate the CPU tensors in pinned memory for faster GPU transfer.
@@ -42,7 +45,7 @@ def get_cpu_state_dict(
     Returns:
         dict[str, torch.Tensor]: A dictionary mapping parameter names to CPU tensors.
     """
-    new_state_dict = {}
+    new_state_dict: dict[str, torch.Tensor] = {}
     for k, v in state_generator:
         val = to_local_if_dtensor(v)
 
@@ -57,20 +60,27 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-def to_cpu(v):
-    """
-    Move a tensor or distributed tensor to the CPU.
+@overload
+def to_cpu(v: torch.Tensor) -> torch.Tensor: ...
+
+
+@overload
+def to_cpu(v: T) -> T: ...
+
+
+def to_cpu(v: torch.Tensor | T) -> torch.Tensor | T:
+    """Move a tensor or distributed tensor to the CPU.
 
     This function takes an input tensor, which can be either a `DTensor` (distributed tensor)
     or a standard `Tensor`, and ensures that it is moved to the CPU.
 
     Args:
-        v (DTensor | Tensor | any): The input value, which can be a `DTensor`, `Tensor`, or
-                                    any other object. If `DTensor`, it checks the device and
-                                    moves the tensor accordingly.
+        v (DTensor | Tensor | T): The input value, which can be a `DTensor`, `Tensor`, or
+                                  any other object. If `DTensor`, it checks the device and
+                                  moves the tensor accordingly.
 
     Returns:
-        Tensor | any: The corresponding CPU tensor if `v` is a `DTensor` or `Tensor`,
+        Tensor | T: The corresponding CPU tensor if `v` is a `DTensor` or `Tensor`,
                     otherwise returns `v` unchanged.
 
     Raises:
@@ -98,7 +108,7 @@ def to_cpu(v):
         return v
 
 
-def to_local_if_dtensor(tensor: Union[torch.Tensor, DTensor]) -> torch.Tensor:
+def to_local_if_dtensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
     """Returns the local shard of the given tensor if it is a DTensor.
 
     Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/605f618f237cda8fa80132bc2ccff933512d5a0d/megatron/core/utils.py#L746

@@ -22,7 +22,7 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -272,6 +272,26 @@ def _get_shared_parameter_names(model_parts: list[nn.Module]) -> list[list[str]]
         for name, parameter in unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
             names_by_parameter.setdefault(id(parameter), []).append(canonical_parameter_fqn(name))
     return [names for names in names_by_parameter.values() if len(names) > 1]
+
+
+def _get_task_head_keys(model: nn.Module, state_dict_keys: Iterable[str]) -> list[str]:
+    """Return keys outside the backbone when the model's class differs from its checkpoint architecture.
+
+    E.g. ``score.*`` of ``Qwen2ForTokenClassification`` built on a ``Qwen2ForCausalLM`` checkpoint.
+    """
+    unwrapped = _unwrap_ddp_model(model)
+    prefix = getattr(unwrapped, "base_model_prefix", "")
+    backbone = getattr(unwrapped, prefix, None) if prefix else None
+    # A model that is its own backbone (e.g. T5ForConditionalGeneration) has no task heads.
+    if not isinstance(backbone, nn.Module) or backbone is unwrapped:
+        return []
+    checkpoint_architectures = getattr(getattr(unwrapped, "config", None), "architectures", None) or []
+    # FSDP2 swaps in a generated subclass, so match any class in the MRO.
+    if not checkpoint_architectures or any(cls.__name__ in checkpoint_architectures for cls in type(unwrapped).__mro__):
+        return []
+    return sorted(
+        key for key in state_dict_keys if not key.startswith(f"{prefix}.") and not key.endswith("_extra_state")
+    )
 
 
 def _normalize_dtype_mapping_to_state_dict_keys(
@@ -1337,12 +1357,18 @@ class Checkpointer:
         shared_parameter_names = (
             _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
         )
+        task_head_keys = (
+            _get_task_head_keys(model_state.model[0], state_dict)
+            if is_init_step and uses_standard_hf_state_dict and not allow_checkpoint_key_subset
+            else []
+        )
         if (
             should_try_tied_lm_head_compat
             or allow_checkpoint_key_subset
             or extra_state_keys
             or shared_parameter_names
             or checkpoint_key_aliases
+            or task_head_keys
         ):
             checkpoint_metadata = _get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata
             checkpoint_metadata_keys = set(checkpoint_metadata)
@@ -1416,6 +1442,21 @@ class Checkpointer:
                 if name in state_dict and name not in checkpoint_metadata_keys:
                     state_dict.setdefault(source_name, state_dict.pop(name))
                     shared_alias_sources[name] = source_name
+
+        # Like HF from_pretrained, keep new task heads absent from a base checkpoint at their init.
+        new_task_head_keys = [
+            key for key in task_head_keys if key in state_dict and key not in checkpoint_metadata_keys
+        ]
+        if new_task_head_keys:
+            for key in new_task_head_keys:
+                state_dict.pop(key)
+            logging.warning(
+                "Checkpoint %s has no weights for %d task-head keys outside the model backbone. "
+                "Keeping their initialization (examples=%s).",
+                model_path,
+                len(new_task_head_keys),
+                new_task_head_keys[:10],
+            )
 
         if allow_checkpoint_key_subset:
             missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
@@ -1493,6 +1534,7 @@ class Checkpointer:
             # Keys deliberately kept at init were already warned about above; keep
             # reporting unexpected keys, which nothing else surfaces.
             expected_keys_for_diff &= loaded_keys_for_diff
+        expected_keys_for_diff.difference_update(new_task_head_keys)
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             safe_moe_tp_requires_complete_checkpoint = any(
@@ -1519,7 +1561,12 @@ class Checkpointer:
         state_dict.update(preserved_extra_state)
         model_state.load_state_dict(
             state_dict,
-            strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
+            strict=not (
+                len(model_state.model) > 1
+                or has_state_dict_adapter
+                or allow_checkpoint_key_subset
+                or bool(new_task_head_keys)
+            ),
             broadcast_from_rank0=self.process_group is None and torch.distributed.is_initialized(),
         )
         install_complete = time.monotonic()
@@ -3324,6 +3371,7 @@ def _load_hf_safetensors_checkpoint(
     model_path: str,
     *,
     prefault_mmap: bool = False,
+    key_filter: Callable[[str], bool] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """
     Load a safetensors checkpoint into a state dict.
@@ -3331,6 +3379,9 @@ def _load_hf_safetensors_checkpoint(
     On integrated CUDA systems, ``prefault_mmap`` reads every file-backed tensor
     once before installation. This keeps the returned tensors mmap-backed and
     reclaimable while avoiding page-by-page migration during the later CUDA copy.
+
+    ``key_filter`` keeps only the tensors it accepts; an index-sharded directory
+    then opens only the shards that hold one.
     """
     from safetensors import safe_open
 
@@ -3343,13 +3394,16 @@ def _load_hf_safetensors_checkpoint(
             del prefaulted
         return tensor
 
+    def wanted(key: str) -> bool:
+        return key_filter is None or key_filter(key)
+
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
-        if not prefault_mmap:
+        if not prefault_mmap and key_filter is None:
             return dict(load_file(model_path))
-        # load_file hides per-tensor access; safe_open lets us prefault each view.
+        # load_file hides per-tensor access; safe_open lets us prefault or skip each view.
         with safe_open(model_path, framework="pt", device="cpu") as f:
-            return {key: get_tensor(f, key) for key in f.keys()}
+            return {key: get_tensor(f, key) for key in f.keys() if wanted(key)}
     # Directory: try index first, then glob
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.isfile(index_file):
@@ -3359,7 +3413,8 @@ def _load_hf_safetensors_checkpoint(
             index = json.load(f)
         keys_by_filename: dict[str, list[str]] = {}
         for key, filename in index.get("weight_map", {}).items():
-            keys_by_filename.setdefault(filename, []).append(key)
+            if wanted(key):
+                keys_by_filename.setdefault(filename, []).append(key)
         for filename, keys in keys_by_filename.items():
             sf_path = os.path.join(model_path, filename)
             if not os.path.isfile(sf_path):
@@ -3373,7 +3428,8 @@ def _load_hf_safetensors_checkpoint(
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    out[key] = get_tensor(f, key)
+                    if wanted(key):
+                        out[key] = get_tensor(f, key)
     return out if out else None
 
 
