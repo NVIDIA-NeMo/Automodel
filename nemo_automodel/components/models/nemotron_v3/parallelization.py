@@ -126,6 +126,11 @@ class NemotronHModelParallelizer(ModelParallelizer):
             )
             for key, layer in list(block_items):
                 if getattr(layer, "block_type", None) in ("mlp", "mamba"):
+                    # Only ``NemotronV3Block`` carries the flag (set through ``mamba_ac_exempt_blocks``); the
+                    # blocks of a Transformers Nemotron-H backbone, which this parallelizer also serves, do not.
+                    if getattr(layer, "_nemo_disable_activation_checkpointing", False):
+                        logger.info("Skipping activation checkpointing for exempt block %s", key)
+                        continue
                     block_container[key] = checkpoint_wrapper(layer)
             _, layers = _decoder_blocks(model)
 

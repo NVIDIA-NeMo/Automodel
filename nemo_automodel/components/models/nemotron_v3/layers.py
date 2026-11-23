@@ -750,6 +750,11 @@ class NemotronV3Block(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.residual_in_fp32 = getattr(config, "residual_in_fp32", False)
+        # Read by every activation-checkpointing entry point of the model (the MoE parallelizer, the model's
+        # own parallelizer and ``gradient_checkpointing_enable``): a block with this flag set is left out of
+        # block-level activation checkpointing (``NemotronV3ForCausalLM`` sets it through
+        # ``mamba_ac_exempt_blocks``).
+        self._nemo_disable_activation_checkpointing = False
 
         # RMSNorm
         self.norm = initialize_rms_norm_module(

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 import torch
 import torch.nn as nn
@@ -415,6 +415,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         num_nextn_predict_layers: int | None = None,
         mtp_use_repeated_layer: bool = False,
         logits_dtype: torch.dtype | None = None,
+        mamba_ac_exempt_blocks: int | Literal["all"] = 0,
     ):
         """Initialize NemotronV3ForCausalLM.
 
@@ -436,6 +437,17 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 MTP depth and reuse it across all iterations. Mirrors
                 Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
             logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
+            mamba_ac_exempt_blocks: Number of Mamba blocks, counted from the first
+                in layer order, that opt out of block-level activation
+                checkpointing and keep their activations (``"all"`` for every
+                Mamba block). The fused Mamba kernel recomputes its convolution
+                and scan in its own backward, so a checkpointed Mamba block runs
+                that forward three times per step and an exempt block twice. An
+                exempt block holds its normalized input, its projected input and
+                its scan output: about 7.5 hidden-size activations per token
+                (0.47 GiB per 8192-token sequence in BF16 at hidden size 4096).
+                Attention and MoE blocks are unaffected. Defaults to ``0``
+                (every block is checkpointed).
         """
         super().__init__()
         self.config = config
@@ -473,6 +485,28 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             )
         else:
             self.mtp = None
+
+        if mamba_ac_exempt_blocks != 0:
+            mamba_blocks = [
+                module
+                for module in self.modules()
+                if isinstance(module, NemotronV3Block) and module.block_type == "mamba"
+            ]
+            if mamba_ac_exempt_blocks == "all":
+                num_exempt = len(mamba_blocks)
+            elif (
+                isinstance(mamba_ac_exempt_blocks, int)
+                and not isinstance(mamba_ac_exempt_blocks, bool)
+                and 0 <= mamba_ac_exempt_blocks <= len(mamba_blocks)
+            ):
+                num_exempt = mamba_ac_exempt_blocks
+            else:
+                raise ValueError(
+                    f"mamba_ac_exempt_blocks must be 'all' or an integer between 0 and the number of Mamba "
+                    f"blocks ({len(mamba_blocks)}), got {mamba_ac_exempt_blocks!r}"
+                )
+            for block in mamba_blocks[:num_exempt]:
+                block._nemo_disable_activation_checkpointing = True
 
         # When True, the MTP heads also run under eval mode (``self.training``
         # False) so validation can measure per-head token acceptance. Defaults
@@ -521,7 +555,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         Wraps every decoder block (and MTP block, when present) with a
         non-reentrant checkpoint wrapper so that block activations are recomputed
-        during the backward pass instead of being stored. This is the single-GPU
+        during the backward pass instead of being stored; Mamba blocks exempted
+        through ``mamba_ac_exempt_blocks`` are left unwrapped. This is the single-GPU
         entry point: ``ModelParallelizer.parallelize`` calls it when ``world_size == 1``
         (the expert-parallel path performs the equivalent wrapping inside the MoE
         parallelizer's ``apply_ac``). Without it, the hybrid Mamba2/Attention MoE
@@ -548,6 +583,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             containers.append(self.mtp.layers)
         for layers in containers:
             for layer_id, block in list(layers.named_children()):
+                if block._nemo_disable_activation_checkpointing:
+                    # A Mamba block exempted through ``mamba_ac_exempt_blocks`` keeps its activations.
+                    continue
                 layers.register_module(layer_id, _wrap(block))
         self._gradient_checkpointing = True
 

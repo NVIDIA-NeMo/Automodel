@@ -94,6 +94,31 @@ class MockNemotronV3Config:
         return vars(self)
 
 
+def _model_parallelizer_exemption_worker(rank: int, rendezvous: str) -> None:
+    """One gloo rank: apply the model's own parallelizer with activation checkpointing on a CPU mesh."""
+    import torch.distributed as dist
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1, 1, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
+        backend = BackendConfig(
+            linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+        )
+        config = MockNemotronV3Config(layers_block_type=["mamba", "attention", "mlp", "mamba"], num_hidden_layers=4)
+        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=1)
+        PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=True)
+        # This parallelizer checkpoints Mamba and dense MLP blocks: the exempt first Mamba block stays itself.
+        wrapped = [isinstance(block, CheckpointWrapper) for block in model.model.layers.values()]
+        assert wrapped == [False, False, True, True], wrapped
+    finally:
+        dist.destroy_process_group()
+
+
 class TestNemotronV3Model:
     """Test NemotronV3Model base model."""
 
@@ -608,6 +633,80 @@ class TestNemotronHForCausalLM:
             assert params[name].dtype == torch.float32
             torch.testing.assert_close(params[name], values)
         assert model.lm_head.weight.dtype == torch.bfloat16
+
+    def test_mamba_blocks_are_checkpointed_by_default(self, config, backend):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp"]
+        config.num_hidden_layers = 3
+        model = NemotronHForCausalLM(config, backend=backend)
+
+        assert all(block._nemo_disable_activation_checkpointing is False for block in model.model.layers.values())
+
+    @pytest.mark.parametrize(
+        ("exempt", "expected"),
+        [("all", [True, False, False, True, True]), (2, [True, False, False, True, False]), (0, [False] * 5)],
+    )
+    def test_mamba_ac_exempt_blocks_marks_the_first_mamba_blocks(self, config, backend, exempt, expected):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba", "mamba"]
+        config.num_hidden_layers = 5
+        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=exempt)
+
+        opted_out = [block._nemo_disable_activation_checkpointing for block in model.model.layers.values()]
+        assert opted_out == expected
+
+    @pytest.mark.parametrize("exempt", [-1, 3, "some", True, 1.0])
+    def test_mamba_ac_exempt_blocks_rejects_values_outside_the_mamba_block_count(self, config, backend, exempt):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
+        config.num_hidden_layers = 4
+
+        with pytest.raises(ValueError, match="mamba_ac_exempt_blocks must be 'all' or an integer between 0 and"):
+            NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=exempt)
+
+    def test_mamba_ac_exempt_blocks_are_left_unwrapped_by_gradient_checkpointing_enable(self, config, backend):
+        """The single-process entry point (world size 1, DDP) honors the exemption like the MoE parallelizer."""
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
+        config.num_hidden_layers = 4
+        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=1)
+
+        model.gradient_checkpointing_enable()
+        assert [isinstance(block, NemotronV3Block) for block in model.model.layers.values()] == [
+            True,
+            False,
+            False,
+            False,
+        ]
+        model.gradient_checkpointing_disable()
+        assert all(isinstance(block, NemotronV3Block) for block in model.model.layers.values())
+
+    def test_mamba_ac_exempt_blocks_are_left_unwrapped_by_the_model_parallelizer(self, tmp_path):
+        """FSDP2 without expert parallelism (``NemotronHModelParallelizer``) honors the exemption too."""
+        import torch.multiprocessing as mp
+
+        mp.spawn(_model_parallelizer_exemption_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=1, join=True)
+
+    @pytest.mark.parametrize("selective", [False, True])
+    def test_mamba_ac_exempt_blocks_leaves_exempt_blocks_unwrapped(self, config, backend, selective):
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+        from nemo_automodel.components.moe.parallelizer import apply_ac
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
+        config.num_hidden_layers = 4
+        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=1)
+
+        apply_ac(model, hidden_size=config.hidden_size, num_experts=config.n_routed_experts, selective=selective)
+
+        # A checkpoint wrapper replaces the block in the layer collection; an exempt block stays itself.
+        unwrapped = [isinstance(block, NemotronV3Block) for block in model.model.layers.values()]
+        assert unwrapped == [True, False, False, False]
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""
