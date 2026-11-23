@@ -58,7 +58,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -949,8 +949,7 @@ class DeepseekV4Model(nn.Module):
             # Packed-sequence (THD) inputs arrive with the batch axis collapsed
             # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
             # Restore the leading batch dim so the hc_mult expand below sees the
-            # expected ``[B, S, dim]`` rank, mirroring the output-side THD
-            # ``unsqueeze(0)`` in ``LMHead.output``.
+            # expected ``[B, S, dim]`` rank, so the head and every output stay batched.
             if inputs_embeds.dim() == 2:
                 inputs_embeds = inputs_embeds.unsqueeze(0)
             # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
@@ -1248,7 +1247,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = torch.float32,
-        **kwargs,
+        moe_overrides: dict | None = None,
+        mtp_loss_scaling_factor: float = 0.1,
     ):
         super().__init__()
         self.config = config
@@ -1270,8 +1270,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 "self_attn.compressor.indexer.wgate",
                 "self_attn.compressor.indexer.ape_param",
             )
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = DeepseekV4Model(
             config,
             backend=self.backend,
@@ -1378,8 +1376,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
+            # The head keeps FP32 weights, so its logits are FP32 unless logits_dtype says otherwise.
             output_meta = meta((microbatch_size, seq_len, self.config.vocab_size)).to(
-                self.lm_head.logits_dtype or dtype
+                self.lm_head.logits_dtype or torch.float32
             )
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)
@@ -1551,10 +1550,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # Linear CE owns the final projection in PP, avoiding a full logits
         # allocation for every in-flight microbatch. MTP still carries its
         # per-depth hidden states through the existing tuple contract.
-        if self._pp_return_hidden_states:
+        if self._pp_return_hidden_states or self.lm_head is None:
             logits = hidden_states
         else:
-            logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

@@ -416,7 +416,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         weight, hidden, labels = _data(43)
         config = tiny_config(dtype="bfloat16")
         config.hidden_size, config.vocab_size, config.unpadded_vocab_size = _HIDDEN, 43, 37
-        head = Inkling2LMHead(config, torch.bfloat16, torch.float32)
+        head = Inkling2LMHead(config, dtype=torch.bfloat16, logits_dtype=torch.float32)
         head.weight = torch.nn.Parameter(weight.bfloat16())
         labels = torch.where(labels == -100, labels, labels % config.unpadded_vocab_size)
         dense_hidden = hidden.bfloat16().requires_grad_()
@@ -428,7 +428,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         local_hidden = dense_hidden[rank].detach().requires_grad_()
 
         def train() -> torch.Tensor:
-            loss = chunked(local_hidden, labels[rank], head.weight, normalizer, world, projection=head.projection)
+            loss = chunked(local_hidden, labels[rank], head.weight, normalizer, world, lm_head=head)
             (loss * _WORLD_SIZE).backward()
             return loss.detach()
 

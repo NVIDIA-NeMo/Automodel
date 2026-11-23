@@ -27,7 +27,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.packing import prepare_packed_metadata
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -173,16 +173,36 @@ class GptOssModel(nn.Module):
         """Run decoder layers, preparing private FA4 metadata once per model call.
 
         Args:
-            input_ids: Token IDs [batch, sequence] or physical THD IDs [tokens].
+            input_ids: Token IDs [batch, sequence] or physical THD IDs [1, tokens] (or [tokens]), squeezed to
+                [tokens] for the layers. THD offsets with a singleton batch select THD without ``qkv_format``.
             position_ids: Optional positions with the same token layout.
             attention_mask: Optional BSHD padding mask [batch, sequence].
-            padding_mask: Optional bool [tokens] mask, True at physical THD padding.
+            padding_mask: Optional bool mask with the token layout of input_ids, True at physical THD padding.
             **attn_kwargs: Original THD offsets [documents + 1], maxima and layout;
                 private FA4 offsets index compact valid tokens. Inputs are not mutated.
 
         Returns:
-            Hidden states [batch, sequence, hidden] or [physical_tokens, hidden].
+            Hidden states [batch, sequence, hidden], or [1, physical_tokens, hidden] for THD input.
         """
+        is_thd = attn_kwargs.get("qkv_format") == "thd" or (
+            _has_thd_metadata(attn_kwargs) and (input_ids.ndim == 1 or input_ids.shape[0] == 1)
+        )
+        if is_thd:  # TE's packed kernels take [tokens, ...]
+            attn_kwargs = {**attn_kwargs, "qkv_format": "thd"}
+            if position_ids is None:
+                if input_ids.ndim == 1:
+                    position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
+                else:
+                    position_ids = (
+                        torch.arange(0, input_ids.shape[1], device=input_ids.device)
+                        .unsqueeze(0)
+                        .expand(input_ids.shape[0], -1)
+                    )
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if self.backend.attn == "fa4" and attn_kwargs.get("qkv_format") == "thd":
             prepared = prepare_packed_metadata(self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask})
             if prepared is not None:
@@ -218,7 +238,7 @@ class GptOssModel(nn.Module):
             )
 
         h = self.norm(h) if self.norm else h
-        return h
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -292,13 +312,12 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig(attn="flex")
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
@@ -330,48 +349,38 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
-        """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.
+        """Run the decoder and project the kept positions to vocabulary logits.
 
         Args:
-            input_ids: Token IDs. BSHD: ``[B, S]``; THD: ``[1, T]`` (squeezed internally).
-            position_ids: Optional position indices.
-            attention_mask: Optional attention mask.
-            padding_mask: Optional padding mask.
-            logits_to_keep: If ``0`` (default) compute logits for all positions; otherwise
-                compute logits only for the last ``logits_to_keep`` positions (used by
-                memory-efficient fused cross-entropy / generation).
-            output_hidden_states: When truthy, the returned output carries the final hidden
-                states (the input to ``lm_head``) so the recipe can run fused cross-entropy.
-            **attn_kwargs: Additional attention kwargs forwarded to the base model
-                (e.g. ``qkv_format``, ``cu_seqlens``, ``seq_idx``, CP kwargs).
+            input_ids: Token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens] or [tokens],
+                which the decoder squeezes to [tokens]. Later pipeline stages pass hidden states of shape
+                [batch, sequence, hidden] or [1, tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence], or [1, tokens] for packed input; packed
+                input without them is numbered 0 to tokens - 1 across the whole pack.
+            attention_mask: Optional padding mask of shape [batch, sequence], 1 at valid tokens and 0 at padding,
+                for unpacked input; packed input ignores it.
+            padding_mask: Optional bool Tensor of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; when None, the MoE layers derive it from attention_mask.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            output_hidden_states: Whether the output carries the final hidden states; None reads
+                ``config.output_hidden_states``.
+            **attn_kwargs: Backend metadata for the decoder. Packed input passes ``cu_seqlens`` and
+                ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and ``max_seqlen``; it is
+                selected by ``qkv_format="thd"`` or by ``cu_seqlens`` with a batch of one.
 
         Returns:
-            ``CausalLMOutputWithPast`` with ``logits`` and optional ``hidden_states``.
+            CausalLMOutputWithPast whose ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] for packed
+            input, in the head's ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may
+            lower; on a pipeline stage without the head, ``logits`` holds the hidden states instead.
+            ``hidden_states``, when requested, are the final hidden states of shape [batch, sequence, hidden], or
+            [1, tokens, hidden] for packed input.
         """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
-
-        is_thd = attn_kwargs.get("qkv_format") == "thd" or (
-            _has_thd_metadata(attn_kwargs) and (input_ids.ndim == 1 or input_ids.shape[0] == 1)
-        )
-        if is_thd:
-            attn_kwargs = {**attn_kwargs, "qkv_format": "thd"}
-            if position_ids is None:
-                if input_ids.ndim == 1:
-                    position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
-                else:
-                    position_ids = (
-                        torch.arange(0, input_ids.shape[1], device=input_ids.device)
-                        .unsqueeze(0)
-                        .expand(input_ids.shape[0], -1)
-                    )
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
 
         hidden = self.model(
             input_ids,
@@ -381,7 +390,8 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        return LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

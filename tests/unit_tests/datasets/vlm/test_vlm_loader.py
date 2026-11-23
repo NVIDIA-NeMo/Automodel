@@ -33,7 +33,11 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
 )
-from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
+from nemo_automodel.components.datasets.vlm.datasets import (
+    CordV2DatasetConfig,
+    PreTokenizedDatasetWrapperConfig,
+    RobustDatasetWrapper,
+)
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
@@ -186,6 +190,28 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert result.processor is processor
     assert batch == ["item:one", "item:two"]
     assert padding_idx == processor.tokenizer.pad_token_id
+
+
+@dataclass
+class _RobustDatasetConfig:
+    def build(self):
+        return RobustDatasetWrapper(["one", "two"])
+
+
+def test_vlm_dataloader_robust_collate_runs_in_spawn_workers():
+    """The robust collate wrapper must survive pickling into spawn/forkserver workers."""
+    config = VlmDataloaderConfig(
+        dataset_config=_RobustDatasetConfig(),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        collator=VlmCollatorConfig(factory=_collate_prefixed_examples, kwargs={"prefix": "item:"}),
+        shuffle=False,
+        num_workers=1,
+    )
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2)
+    result.dataloader.multiprocessing_context = "spawn"
+
+    assert list(result.dataloader) == [(["item:one", "item:two"], 0)]
 
 
 @pytest.mark.parametrize(

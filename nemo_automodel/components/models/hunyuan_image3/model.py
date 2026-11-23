@@ -281,7 +281,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -292,7 +292,6 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         if self.backend.dispatcher == "mok":
             raise NotImplementedError("dispatcher='mok' needs a split shared expert; HunyuanImage-3.0 fuses it.")
         dtype = _model_dtype(config)
-        moe_overrides = kwargs.pop("moe_overrides", None)
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides.")
         moe_config = moe_config or build_moe_config(config, moe_overrides)
@@ -388,7 +387,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             input_ids: Long tensor of shape [batch, sequence].
 
         Returns:
-            fp32 tensor of shape [batch, sequence, vocab].
+            Tensor of shape [batch, sequence, vocab] in the head's ``logits_dtype``, FP32 by default.
         """
         _, seq_len = input_ids.shape
         cos, sin = rope_cos_sin(
@@ -397,7 +396,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             self.config.rope_theta,
         )
         hidden = self.model(self.model.embed_tokens(input_ids), cos, sin)
-        return self.lm_head(self.model.norm(hidden)).float()
+        return self.lm_head(self.model.norm(hidden)).to(self.lm_head.logits_dtype or torch.float32)
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():

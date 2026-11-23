@@ -18,7 +18,7 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig
+from transformers import AutoConfig, NemotronHConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common import (
     HFCheckpointingMixin,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPContextParallelInputs,
     prepare_mtp_context_parallel_inputs,
@@ -394,20 +394,23 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def __init__(
         self,
-        config,
+        config: NemotronHConfig,
         backend: BackendConfig | None = None,
         *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
         mtp_use_repeated_layer: bool = False,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
     ):
         """Initialize NemotronV3ForCausalLM.
 
         Args:
             config: NemotronH config.
             backend: Backend configuration.
+            moe_config: MoE configuration (optional, will create default if None).
+            moe_overrides: Optional dict of overrides to apply to the default MoE config.
             mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
                 (default ``0.1``). Programmatic override only — not exposed
                 as a YAML knob to keep recipe configs auto-detected.
@@ -421,8 +424,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 MTP depth and reuse it across all iterations. Mirrors
                 Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
             logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
-            **kwargs: Additional arguments. Recognized keys:
-                ``moe_config``, ``moe_overrides``.
         """
         super().__init__()
         self.config = config
@@ -430,8 +431,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self.backend = backend or BackendConfig()
 
         # Base model
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        moe_config = kwargs.pop("moe_config", None)
         self.model = NemotronV3Model(
             config,
             backend=self.backend,
@@ -911,7 +910,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             past_key_values.has_previous_state = True
 
         if compute_logits:
-            logits = LMHead.output(self.lm_head, hidden_states, logits_to_keep).logits
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
         else:
             if labels is not None or is_pp_stage:
                 raise ValueError("compute_logits=False is only supported off-PP without labels.")

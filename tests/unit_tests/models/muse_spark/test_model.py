@@ -14,15 +14,34 @@ from nemo_automodel.components.distributed.pipelining.functional import (
     calculate_virtual_stages,
     generate_hf_model_fqn_per_model_part,
 )
-from tests.unit_tests.models.muse_spark.conftest import tiny_muse_spark_model
+from tests.unit_tests.models.muse_spark.conftest import tiny_backend, tiny_muse_spark_config, tiny_muse_spark_model
 
 
 class _EchoTextModel(nn.Module):
     """Return the residual unchanged so PP/CP boundary behavior is isolated."""
 
     def forward(self, *, inputs_embeds, **kwargs):
+        """Echo inputs_embeds, batched like ``MuseSparkTextModel``.
+
+        Args:
+            inputs_embeds: Tensor of shape [batch, sequence, hidden], or packed (THD) [tokens, hidden].
+            **kwargs: Ignored decoder metadata.
+
+        Returns:
+            Namespace whose last_hidden_state is inputs_embeds, with packed input as [1, tokens, hidden].
+        """
         del kwargs
-        return SimpleNamespace(last_hidden_state=inputs_embeds)
+        hidden = inputs_embeds.unsqueeze(0) if inputs_embeds.dim() == 2 else inputs_embeds
+        return SimpleNamespace(last_hidden_state=hidden)
+
+
+def test_from_config_takes_logits_dtype() -> None:
+    from nemo_automodel.components.models.muse_spark.model import MuseSpark1xOmniForCausalLM
+
+    model = MuseSpark1xOmniForCausalLM.from_config(
+        tiny_muse_spark_config(), backend=tiny_backend(), logits_dtype=torch.bfloat16
+    )
+    assert model.lm_head.logits_dtype == torch.bfloat16
 
 
 def test_tiny_text_forward_backward_is_finite() -> None:
@@ -345,6 +364,13 @@ def test_pipeline_fused_head_metadata_uses_cp_local_hidden_size() -> None:
     assert fused[0].dtype == torch.bfloat16
     with pytest.raises(ValueError, match="labels to be passed to the pipeline loss"):
         model(input_ids=torch.ones(1, 4, dtype=torch.long), labels=torch.ones(1, 4, dtype=torch.long))
+    # FP32 logits do not change the hidden states that the fused loss receives instead of logits.
+    model.lm_head.logits_dtype = torch.float32
+    _, fused = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=64, dtype=torch.bfloat16)
+    assert fused[0].dtype == torch.bfloat16
+    model._pp_return_hidden_states = False
+    _, ordinary = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=64, dtype=torch.bfloat16)
+    assert ordinary[0].dtype == torch.float32
 
 
 def test_vlm_pipeline_fused_loss_receives_hidden_states() -> None:

@@ -169,7 +169,7 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
         config: MistralLarge4Config,
         backend: BackendConfig | None = None,
         *,
-        logits_dtype: torch.dtype | None = None,
+        logits_dtype: torch.dtype | None = torch.float32,
     ) -> None:
         if not config.vision_config:
             raise ValueError("Conditional generation requires the native vision_config")

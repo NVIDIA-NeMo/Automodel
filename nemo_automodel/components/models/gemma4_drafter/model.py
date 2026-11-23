@@ -96,9 +96,9 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
         tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
         _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-        def __init__(self, config: Gemma4AssistantConfig, *args, logits_dtype: torch.dtype | None = None, **kwargs):
+        def __init__(self, config: Gemma4AssistantConfig, *, logits_dtype: torch.dtype | None = None):
             reject_unsupported_tie_word_embeddings(type(self), config)
-            super().__init__(config, *args, **kwargs)
+            super().__init__(config)
             self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
             if self.masked_embedding is not None:
                 # Reuse the initialized HF centroids and token ordering so the state dict is unchanged.

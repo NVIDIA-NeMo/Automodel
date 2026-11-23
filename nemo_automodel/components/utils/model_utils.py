@@ -888,17 +888,19 @@ def squeeze_input_for_thd(
 
     Args:
         input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
-            or [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+            or [1, total_tokens, hidden_dim]. The first dimension will be squeezed;
+            already packed [total_tokens] IDs or [total_tokens, hidden_dim] activations
+            are returned unchanged, so a second call is a no-op.
             ``None`` is permitted when the caller is feeding the model via
             ``inputs_embeds`` instead — embeddings are squeezed inside the model
             forward (the ``squeezed_for_thd`` branch in ``NemotronHModel.forward``
             and analogous code paths), so this helper has nothing to squeeze and
             simply returns ``None`` for the ``input_ids`` slot.
-        position_ids (torch.Tensor): Position IDs with shape [1, total_tokens].
-            The first dimension will be squeezed. Model forwards declare it optional,
+        position_ids (torch.Tensor): Position IDs with shape [1, total_tokens], or
+            already packed [total_tokens]. The first dimension will be squeezed. Model forwards declare it optional,
             but THD inputs require it; ``None`` raises ``ValueError``.
-        padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens].
-            The first dimension will be squeezed.
+        padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens], or
+            already packed [total_tokens]. The first dimension will be squeezed.
         attn_kwargs (dict): Dictionary of attention-related tensors. May contain:
             - cu_seqlens: Cumulative sequence lengths [1, num_seqs+1]
             - cu_seqlens_padded: Cumulative padded sequence lengths [1, num_seqs+1]
@@ -944,10 +946,13 @@ def squeeze_input_for_thd(
     """
     if position_ids is None:
         raise ValueError("squeeze_input_for_thd requires position_ids for THD inputs")
-    if input_ids is not None:
+    # Remove only the placeholder batch axis. Inputs that are already packed pass through, so a decoder may squeeze
+    # what its wrapper squeezed: one token's ids [1] must not become a scalar, nor its activations [1, hidden] [hidden].
+    if input_ids is not None and input_ids.ndim > (2 if input_ids.is_floating_point() else 1):
         input_ids = input_ids.squeeze(0)
-    position_ids = position_ids.squeeze(0)
-    if isinstance(padding_mask, torch.Tensor):
+    if position_ids.ndim > 1:
+        position_ids = position_ids.squeeze(0)
+    if isinstance(padding_mask, torch.Tensor) and padding_mask.ndim > 1:
         padding_mask = padding_mask.squeeze(0)
     for key, value in attn_kwargs.items():
         if isinstance(value, torch.Tensor):

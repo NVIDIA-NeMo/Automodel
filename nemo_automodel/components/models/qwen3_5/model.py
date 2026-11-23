@@ -60,7 +60,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -250,6 +250,38 @@ def _mtp_block_causal_mask(packing_mask: torch.Tensor, inputs_embeds: torch.Tens
     causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=mask.device).tril()
     not_padding = (mask > 0).unsqueeze(2) & (mask > 0).unsqueeze(1)
     return (same_doc & causal.unsqueeze(0) & not_padding).unsqueeze(1)
+
+
+def _mtp_sdpa_causal_mask(
+    config: Qwen3_5TextConfig,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_values: Any | None,
+    position_ids: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Build the MTP fallback causal mask in the SDPA layout used by the MTP sublayers.
+
+    Args:
+        config: Backbone text config; a shallow copy with ``_attn_implementation="sdpa"`` is used.
+        inputs_embeds: Tensor of shape [batch, sequence, hidden].
+        attention_mask: Optional 0/1 padding mask `[batch, sequence]`, or an already prepared SDPA mask
+            `[batch, 1, sequence, sequence]`.
+        past_key_values: Optional KV cache.
+        position_ids: Optional text position ids of shape [batch, sequence].
+
+    Returns:
+        Boolean mask of shape [batch, 1, sequence, sequence] (``True`` = attend), or ``None`` when
+        SDPA can run with ``is_causal``.
+    """
+    sdpa_config = copy.copy(config)
+    sdpa_config._attn_implementation = "sdpa"
+    return create_causal_mask(
+        config=sdpa_config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
 
 
 def _rolled_embed_inputs(inputs_embeds: torch.Tensor, num_depths: int) -> tuple[torch.Tensor, ...]:
@@ -683,9 +715,10 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         """Decode text tokens with model-forward-owned packed GDN metadata.
 
         Args:
-            input_ids: Optional token IDs of shape [batch, sequence].
+            input_ids: Optional token IDs of shape [batch, sequence], or packed
+                (THD) IDs of shape [tokens] after the multimodal wrapper squeezes them.
             inputs_embeds: Optional token embeddings of shape [batch, sequence,
-                hidden].
+                hidden], or packed [tokens, hidden].
             attention_mask: Optional validity, indexed document, or backend mask
                 of shape [batch, sequence] or [batch, 1, sequence, sequence].
             position_ids: Optional positions of shape [batch, sequence] or
@@ -709,7 +742,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
-            hidden].
+            hidden], or [1, tokens, hidden] for packed input.
         """
         del output_hidden_states  # accepted for HF-forward compatibility; ignored
         for key in ("cu_seqlens", "max_seqlen"):
@@ -790,6 +823,8 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=None)
 
     def get_input_embeddings(self) -> nn.Module:
@@ -1148,11 +1183,9 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
-        del kwargs
         self.config = config
         self.backend = _qwen3_5_backend(backend)
 
@@ -1248,8 +1281,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
@@ -1274,7 +1306,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             if is_indexed_packed_mask(packing_mask):
                 causal_mask = _mtp_block_causal_mask(packing_mask, source_embeds)
             else:
-                causal_mask = create_causal_mask(
+                causal_mask = _mtp_sdpa_causal_mask(
                     config=self.model.config,
                     inputs_embeds=source_embeds,
                     attention_mask=attention_mask,
@@ -1412,10 +1444,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
-        del kwargs
         super().__init__(config)
         self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         self.backend = _qwen3_5_backend(backend)
@@ -1995,8 +2025,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         )
 
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
 
         loss = None
         if labels is not None:
@@ -2023,7 +2052,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             if is_indexed_packed_mask(packing_mask):
                 causal_mask = _mtp_block_causal_mask(packing_mask, source_embeds)
             else:
-                causal_mask = create_causal_mask(
+                causal_mask = _mtp_sdpa_causal_mask(
                     config=language_model.config,
                     inputs_embeds=source_embeds,
                     attention_mask=attention_mask,

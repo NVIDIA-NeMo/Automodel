@@ -117,14 +117,21 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         config: KimiK3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs: Any,
+        num_hidden_layers: int | None = None,
+        kda_mode: str | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict[str, Any] | None = None,
     ) -> None:
         top_config = config
         super().__init__(
             config.text_config,
             moe_config=moe_config,
             backend=backend,
-            **kwargs,
+            num_hidden_layers=num_hidden_layers,
+            kda_mode=kda_mode,
+            logits_dtype=logits_dtype,
+            moe_overrides=moe_overrides,
         )
         self.cp_mesh: DeviceMesh | None = None
         self.config = top_config

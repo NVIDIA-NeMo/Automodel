@@ -285,7 +285,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
                     )
         if hidden_states.dtype != lm_weight.dtype:
             # Project in the dtype of the weight the loss actually consumes, as the model's own lm_head
-            # (``LMHead.output``) and ChunkedCrossEntropy do: the backbone hands its activations
+            # (``LMHead.linear``) and ChunkedCrossEntropy do: the backbone hands its activations
             # out unchanged, so a bf16 backbone with an fp32 head (DeepSeek V4.1, ``lm_head_precision:
             # float32``) is promoted once here, and an FSDP head whose master weight is gathered after
             # resharding meets hidden states of the same dtype. The projection ``e @ c.T`` inside

@@ -92,7 +92,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_sequence_for_cp_contiguous,
 )
-from nemo_automodel.components.models.common import BackendConfig, LMHead
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -1184,12 +1184,14 @@ class Gemma4ForConditionalGeneration(
         return cls(config, moe_config=moe_config, backend=backend, **kwargs)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str, *model_args, attn_implementation: str | None = None, **kwargs
+    ):
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
         config = Gemma4Config.from_pretrained(pretrained_model_name_or_path)
         # #2208: fused bf16 SDPA NaNs on Hopper; run SDPA in fp32 instead.
-        attn_impl = kwargs.get("attn_implementation") or getattr(config, "_attn_implementation", None)
+        attn_impl = attn_implementation or getattr(config, "_attn_implementation", None)
         if attn_impl == "sdpa":
             enable_gemma4_sdpa_fp32()
         return cls.from_config(config, *model_args, **kwargs)
@@ -1206,7 +1208,7 @@ class Gemma4ForConditionalGeneration(
         text_config: dict | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs,
+        moe_overrides: dict | None = None,
     ):
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
@@ -1263,7 +1265,6 @@ class Gemma4ForConditionalGeneration(
             return
 
         # --- MoE path: replace the text model ---
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.__class__ = Gemma4MoEModel
         self.model.language_model = Gemma4MoETextModelBackend(
             text_config,
@@ -1601,11 +1602,9 @@ class Gemma4ForConditionalGeneration(
 
         hidden_states = outputs.last_hidden_state
 
-        logits = LMHead.output(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-        ).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping
@@ -1635,30 +1634,19 @@ class Gemma4ForConditionalGeneration(
             this is a DTensor sharded on the vocab axis; otherwise it is a local
             tensor.
         """
+        selected_hidden_states = slice_logits_to_keep(hidden_states, logits_to_keep)
         if getattr(self, "_gemma4_tp_enabled", False) and isinstance(self.lm_head.weight, DTensor):
-            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                selected_hidden_states = hidden_states
-            else:
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                selected_hidden_states = hidden_states[:, slice_indices, :]
-
-            # The tied vocabulary shard is invoked through F.linear rather than
-            # lm_head.forward (the latter still owns pre-TP module hooks). Match
-            # the shared weight's effective dtype explicitly, mirroring the
-            # dtype boundary enforced by LMHead.output for other heads.
-            selected_hidden_states = selected_hidden_states.to(self.lm_head.weight.dtype)
+            # The tied vocabulary shard is projected through LMHead.project rather
+            # than lm_head.forward (the latter still owns pre-TP module hooks), so
+            # the head's logits_dtype applies and the input is cast to the weight's dtype.
             replicated_hidden_states = DTensor.from_local(
                 selected_hidden_states,
                 device_mesh=self._gemma4_tp_mesh,
                 placements=(Replicate(),),
                 run_check=False,
             )
-            return F.linear(replicated_hidden_states, self.lm_head.weight)
-        return LMHead.output(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-        ).logits
+            return self.lm_head.project(replicated_hidden_states, self.lm_head.weight)
+        return hidden_states if self.lm_head is None else self.lm_head(selected_hidden_states)
 
     def _get_special_image_mask(
         self,

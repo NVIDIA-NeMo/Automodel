@@ -51,10 +51,9 @@ _NEEDS_MODULE = {
     "KimiK31ForConditionalGeneration": "fla",
     "KimiK3ForCausalLM": "fla",
     "KimiK3ForConditionalGeneration": "fla",
-    "NemotronParseForConditionalGeneration": "timm",
 }
 
-# Construction needs the checkpoint's remote-code configuration (vision and audio encoders).
+# Construction needs the checkpoint's remote-code vision and audio encoder configurations.
 _NEEDS_CHECKPOINT = {"NemotronOmniForConditionalGeneration"}
 
 
@@ -78,6 +77,28 @@ def _registry_config(model_type: str, **kwargs: object) -> PretrainedConfig:
     return getattr(importlib.import_module(module), name)(**kwargs)
 
 
+def _stub_radio_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for NemotronParse's RADIO vision encoder, whose configuration and model are Hub remote code."""
+    module = importlib.import_module("nemo_automodel.components.models.nemotron_parse.model")
+    encoder_config = PretrainedConfig(patch_size=16, max_resolution=64)
+    monkeypatch.setattr(module.AutoConfig, "from_pretrained", lambda *args, **kwargs: encoder_config)
+    monkeypatch.setattr(module.AutoModel, "from_config", lambda config, trust_remote_code: nn.Identity())
+
+
+def _nemotron_parse_config() -> PretrainedConfig:
+    module = importlib.import_module("nemo_automodel.components.models.nemotron_parse.model")
+    decoder = {"vocab_size": 50, "d_model": 32, "decoder_attention_heads": 4, "decoder_ffn_dim": 64}
+    return module.NemotronParseConfig(
+        encoder={"patch_size": 16, "max_resolution": 64}, decoder=decoder, max_sequence_length=32
+    )
+
+
+def _eager_vision(config: PretrainedConfig) -> PretrainedConfig:
+    """Select eager vision attention: FlashAttention 2, the default, raises at construction without CUDA."""
+    config.vision_config._attn_implementation = "eager"
+    return config
+
+
 # Classes whose default config does not build. Prefer the tiny config of the model's own tests.
 _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     "BagelForUnifiedMultimodal": lambda: _registry_config("bagel", visual_und=False, visual_gen=False),
@@ -91,6 +112,7 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
         vision_config=None,
         canvas_length=4,
     ),
+    "Ernie5_5_MoeForCausalLM": lambda: _helper("tests.unit_tests.models.ernie5_5.test_model:_tiny_config")(),
     "Gemma4DrafterForCausalLM": lambda: importlib.import_module(
         "transformers.models.gemma4_assistant.configuration_gemma4_assistant"
     ).Gemma4AssistantConfig(
@@ -102,6 +124,8 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     "Glm4MoeLiteForCausalLM": Glm4MoeLiteConfig,
     "HYV3ForCausalLM": lambda: _registry_config("hy_v3"),
     "HyMT2ForCausalLM": HyMT2Config,
+    "KimiK31ForConditionalGeneration": lambda: _eager_vision(_registry_config("kimi_k31")),
+    "KimiK3ForConditionalGeneration": lambda: _eager_vision(_registry_config("kimi_k3")),
     "KimiLinear48BForCausalLM": lambda: _helper("tests.unit_tests.models.kimi_linear.test_model:_tiny_kimi_config")(),
     "KimiVLForConditionalGeneration": lambda: _registry_config("kimi_vl"),
     "MiniMaxM2ForCausalLM": MiniMaxM2Config,
@@ -110,13 +134,7 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     "Mistral4ForCausalLM": lambda: _registry_config("mistral4"),
     "MistralLarge4ForConditionalGeneration": _mistral_large4_vlm_config,
     "NemotronHForCausalLM": NemotronHConfig,
-    "NemotronParseForConditionalGeneration": lambda: importlib.import_module(
-        "nemo_automodel.components.models.nemotron_parse.model"
-    ).NemotronParseConfig(
-        encoder={"patch_size": 16, "max_resolution": 64},
-        decoder={"vocab_size": 64, "d_model": 32, "encoder_attention_heads": 4, "decoder_attention_heads": 4},
-        max_sequence_length=32,
-    ),
+    "NemotronParseForConditionalGeneration": _nemotron_parse_config,
     "Qwen3_8_FlashNextForConditionalGeneration": lambda: _helper(
         "tests.unit_tests.models.qwen3_8_flash_next.test_qsa_route_replay:_tiny_config"
     )(),
@@ -126,14 +144,20 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
 
 # Constructor arguments for classes whose defaults need a checkpoint.
 _BUILD_KWARGS: dict[str, Callable[[], dict[str, object]]] = {
+    # ERNIE 5.5 implements the torch kernels only, and its default backend runs the DSA layers on cuDNN
+    # kernels that need BF16 and the released dimensions.
+    "Ernie5_5_MoeForCausalLM": lambda: {
+        "backend": BackendConfig(attn="eager", linear="torch", experts="torch", dispatcher="torch", rope_fusion=False)
+    },
     # The HF state-dict adapter expects the released checkpoint's single PLE layer.
     "Qwen3_8_FlashNextForConditionalGeneration": lambda: {"backend": BackendConfig(enable_hf_state_dict_adapter=False)},
 }
 
 
-def _model_class(name: str) -> type[nn.Module]:
-    module = next(entry[0] for entry in MODEL_ARCH_MAPPING.values() if entry[1] == name)
-    return getattr(importlib.import_module(module), name)
+# Stubs for remote-code components, applied before the config is built.
+_STUBS: dict[str, Callable[[pytest.MonkeyPatch], None]] = {
+    "NemotronParseForConditionalGeneration": _stub_radio_encoder,
+}
 
 
 def _default_config(model_cls: type[nn.Module]) -> PretrainedConfig:
@@ -145,18 +169,23 @@ def _default_config(model_cls: type[nn.Module]) -> PretrainedConfig:
     return config_cls()
 
 
-_LM_CLASSES = sorted({entry[1] for entry in MODEL_ARCH_MAPPING.values()} - _NO_LM_HEAD)
+# Two modules may register classes of the same name, so each case is a (module, class name) pair.
+_LM_CLASSES = sorted({entry[:2] for entry in MODEL_ARCH_MAPPING.values() if entry[1] not in _NO_LM_HEAD})
 
 
-@pytest.mark.parametrize("name", _LM_CLASSES)
-def test_registered_lm_class_takes_logits_dtype(name, monkeypatch):
+@pytest.mark.parametrize(
+    ("module", "name"), [pytest.param(*entry, id=f"{entry[0].split('.')[-2]}.{entry[1]}") for entry in _LM_CLASSES]
+)
+def test_registered_lm_class_takes_logits_dtype(module, name, monkeypatch):
     # Some constructors record the current CUDA device for their rotary embedding.
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     if name in _NEEDS_MODULE:
         pytest.importorskip(_NEEDS_MODULE[name])
     if name in _NEEDS_CHECKPOINT:
         pytest.skip("construction needs the checkpoint's remote-code configuration")
-    model_cls = _model_class(name)
+    if name in _STUBS:
+        _STUBS[name](monkeypatch)
+    model_cls = getattr(importlib.import_module(module), name)
     config = _CONFIGS[name]() if name in _CONFIGS else _default_config(model_cls)
     kwargs = _BUILD_KWARGS[name]() if name in _BUILD_KWARGS else {}
     with torch.device("meta"):

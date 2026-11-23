@@ -208,7 +208,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             )
             unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
             head = _get_lm_head_module(unwrapped)
-            loss_fn_kwargs["projection"] = head.projection if isinstance(head, LMHead) else None
+            loss_fn_kwargs["lm_head"] = head if isinstance(head, LMHead) else None
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),

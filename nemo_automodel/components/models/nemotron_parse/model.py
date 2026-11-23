@@ -40,7 +40,7 @@ from transformers.models.mbart.modeling_mbart import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -492,7 +492,9 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: NemotronParseConfig, loss_fn=None, *, logits_dtype: torch.dtype | None = None, **kwargs):
+    def __init__(
+        self, config: NemotronParseConfig, loss_fn: nn.Module | None = None, *, logits_dtype: torch.dtype | None = None
+    ):
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.loss_fn = loss_fn
@@ -606,7 +608,11 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # Final decoder hidden states feeding the lm_head.
         final_hidden_states = decoder_outputs.last_hidden_state
 
-        logits = LMHead.output(self.lm_head, final_hidden_states, logits_to_keep).logits
+        logits = (
+            final_hidden_states
+            if self.lm_head is None
+            else self.lm_head(slice_logits_to_keep(final_hidden_states, logits_to_keep))
+        )
 
         if not return_dict:
             return decoder_outputs + encoder_outputs

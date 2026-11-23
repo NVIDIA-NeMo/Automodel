@@ -31,7 +31,7 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_round_robin
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -335,8 +335,9 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
 
         Returns:
             Input/output meta tuples: global int64 IDs [B,S] on stage zero,
-            local residuals [B,S/cp,H] between stages, and FP32 logits [B,S/cp,V]
-            or FP32 hidden states [B,S/cp,H] for a linear fused loss.
+            local residuals [B,S/cp,H] between stages, and logits [B,S/cp,V] in the
+            head's logits_dtype (FP32 by default) or FP32 hidden states [B,S/cp,H] for
+            a linear fused loss.
         """
         residual_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}.get(self.config.residual_dtype, dtype)
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
@@ -348,7 +349,10 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         final = self.lm_head is not None
         logits = final and not getattr(self, "_pp_return_hidden_states", False)
         width = self.vocab_size if logits else self.config.hidden_size
-        out_dtype = self.lm_head.logits_dtype if logits else (torch.float32 if final else residual_dtype)
+        # The head's weight is FP32, so unset logits_dtype gives FP32 logits.
+        out_dtype = (
+            (self.lm_head.logits_dtype or torch.float32) if logits else (torch.float32 if final else residual_dtype)
+        )
         outputs = (torch.empty(microbatch_size, local_length, width, dtype=out_dtype, device="meta"),)
         return inputs, outputs
 
@@ -571,8 +575,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             return CausalLMOutputWithPast(hidden_states=hidden_states.float())
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden_states)
-        selected = hidden_states[:, -logits_to_keep:] if logits_to_keep else hidden_states
-        logits = self.lm_head(selected)
+        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         loss = None
         if labels is not None:
             if labels.shape != hidden_states.shape[:2]:

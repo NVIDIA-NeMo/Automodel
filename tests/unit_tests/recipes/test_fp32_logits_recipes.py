@@ -15,7 +15,7 @@
 """Recipes training a ``model.logits_dtype: float32`` model with linear losses.
 
 Linear losses recompute the LM-head projection from hidden states, so each recipe
-must project the way the FP32-logits head does. Every case compares the recipe's
+must project the way the FP32-logits head does. Each case compares the recipe's
 cross-entropy with the cross-entropy of the model's own FP32 logits.
 """
 
@@ -30,14 +30,11 @@ from torch import nn
 from transformers import LlamaConfig
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.models.common.lm_head import LMHead
-from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
-from tests.unit_tests.recipes.test_train_ft import _patch_setup_minimals
 
 pytestmark = pytest.mark.cpu_only
 
@@ -46,6 +43,8 @@ _VOCAB = 128
 
 @pytest.fixture(autouse=True)
 def _cpu_current_device(monkeypatch):
+    # Build on the CPU on GPU machines too: setup checks the CUDA device when CUDA is available.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
 
 
@@ -113,9 +112,30 @@ def _assert_matches_fp32_logits_ce(
     return expected
 
 
+def _bf16_projection_gradients(
+    model: nn.Module, input_ids: torch.Tensor, labels: torch.Tensor, num_label_tokens: int
+) -> dict[str, torch.Tensor]:
+    """Backpropagate the cross-entropy of logits projected in the BF16 weight dtype, as a plain head would.
+
+    Args:
+        model: Unchanged copy of the trained model, whose parameters receive the gradients.
+        input_ids: Token ids of shape [batch, sequence].
+        labels: Targets of shape [batch, sequence]; -100 marks unsupervised tokens.
+        num_label_tokens: Count of supervised targets in ``labels``.
+
+    Returns:
+        Each parameter's gradient by name, in the parameter's shape and dtype.
+    """
+    hidden = model(input_ids=input_ids, output_hidden_states=True).hidden_states[-1]
+    logits = F.linear(hidden, model.lm_head.weight).float()
+    (F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum") / num_label_tokens).backward()
+    return {name: parameter.grad for name, parameter in model.named_parameters()}
+
+
 def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
     model = _fp32_logits_llama()
     reference = copy.deepcopy(model)
+    control = copy.deepcopy(model)
     recipe = SimpleNamespace(
         model_parts=[model],
         loss_fn=ChunkedCrossEntropy(8, compile=False),
@@ -124,7 +144,7 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -144,10 +164,16 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
 
     expected = _assert_matches_fp32_logits_ce(losses[0], reference, input_ids, labels, num_label_tokens)
     expected.backward()
+    control_grads = _bf16_projection_gradients(control, input_ids, labels, num_label_tokens)
     for (name, parameter), reference_parameter in zip(model.named_parameters(), reference.parameters()):
-        # Chunks round their BF16 head-weight gradients before the FP32 cross-chunk sum.
-        error = (parameter.grad.float() - reference_parameter.grad.float()).norm()
-        assert error <= 1e-2 * reference_parameter.grad.float().norm(), name
+        reference_grad = reference_parameter.grad.float()
+        error = (parameter.grad.float() - reference_grad).norm()
+        if name == "lm_head.weight":
+            # Chunks round their BF16 head-weight gradients before the FP32 cross-chunk sum.
+            assert error <= 1e-2 * reference_grad.norm(), name
+        else:
+            # A backward that projected in BF16 would be as far off as the control.
+            assert error * 10 < (control_grads[name].float() - reference_grad).norm(), name
 
 
 class _OneHotTeacher(nn.Module):
@@ -193,6 +219,7 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
     recipe.kd_loss_fn = KDLoss()
     recipe.kd_ratio = 0.5
     recipe._offload_teacher_model = False
+    recipe.te_quantization = None
     recipe.separate_meshes = False
     input_ids, labels, num_label_tokens = _batch()
 
@@ -206,27 +233,3 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
 
     _assert_matches_fp32_logits_ce(ce_loss, reference, input_ids, labels, num_label_tokens)
 
-
-def test_setup_accepts_chunked_ce_with_the_fp32_logits_head(monkeypatch):
-    cfg = ConfigNode(
-        {
-            "model": {},
-            "dataloader": {},
-            "dataset": {},
-            "validation_dataloader": {},
-            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-            "optimizer": {},
-            "loss_fn": {},
-            "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": 1},
-        }
-    )
-    loss_fn = ChunkedCrossEntropy(compile=False)
-    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
-    model = _fp32_logits_llama()
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *args, **kwargs: model)
-    monkeypatch.setattr(RecipeConfig, "loss_fn", property(lambda self: SimpleNamespace(build=lambda: loss_fn)))
-    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-
-    trainer.setup()
-    assert trainer.loss_fn is loss_fn

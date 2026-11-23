@@ -20,7 +20,7 @@ The reviewer's scenario on #4288: a native model with FP32 parameters under
 loss streams that sharded master in vocabulary chunks and the hidden states the model hands out must be
 projected in its dtype; the ``torch_compile`` projection ``e @ c.T`` aligns nothing itself. The CPU stand-in for the reviewer's Qwen3MoE is a
 tiny dense DeepSeek-V3 (Qwen3MoE builds its rotary cache on the current CUDA device): the same
-``LMHead.output`` head path, the same standalone FSDP ``lm_head`` unit under the policy.
+``LMHead`` projection path, the same standalone FSDP ``lm_head`` unit under the policy.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def _config() -> DeepseekV3Config:
     )
 
 
-def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, projection=None):
+def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, lm_head=None):
     """The streamed ``torch_compile`` kernel's chunk math, run eagerly; mixed operands would raise here.
 
     Args:
@@ -79,7 +79,7 @@ def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, proj
         targets: Tensor of shape [tokens] with chunk-local target rows, or -1.
         softcap: Optional logit softcapping value.
         logits_dtype: Optional rounding dtype for the projection output.
-        projection: Optional settings for projecting the streamed weight.
+        lm_head: Optional ``LMHead`` whose ``project`` gives the chunk's logits.
 
     Returns:
         FP32 tensors of shape [tokens]: the chunk log-sum-exp and target logits.
@@ -87,7 +87,7 @@ def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, proj
     from nemo_automodel.components.loss import linear_ce_base
 
     assert hidden.dtype == weight.dtype, f"mixed operands reached the kernel: {hidden.dtype} vs {weight.dtype}"
-    return linear_ce_base._chunk_lse_and_target(hidden, weight, targets, softcap, logits_dtype, projection)
+    return linear_ce_base._chunk_lse_and_target(hidden, weight, targets, softcap, logits_dtype, lm_head)
 
 
 def _worker(rank: int, port: int) -> None:

@@ -31,7 +31,7 @@ from nemo_automodel.components.loss.linear_ce_base import (
     _chunk_logits,
     sharded_linear_cross_entropy,
 )
-from nemo_automodel.components.models.common.lm_head import LMHead, LogitsProjection
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 
 def _validate_chunk_len(chunk_len: int) -> int:
@@ -68,7 +68,7 @@ def _linear_cross_entropy(
     labels: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype | None,
-    projection: LogitsProjection | None = None,
+    lm_head: LMHead | None = None,
 ) -> torch.Tensor:
     """Project one token chunk and compute CE.
 
@@ -78,12 +78,12 @@ def _linear_cross_entropy(
         labels: Target indices shaped [chunk_tokens].
         ignore_index: Ignored target value.
         logits_dtype: Optional model-owned output dtype after projection.
-        projection: Optional parameter-free settings for model-specific logits.
+        lm_head: The model's ``LMHead``, whose ``project`` gives the logits; None for a plain head.
 
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    logits = _chunk_logits(hidden, weight, None, logits_dtype, projection)
+    logits = _chunk_logits(hidden, weight, None, logits_dtype, lm_head)
     return compute_cross_entropy(logits, labels, ignore_index, "none")
 
 
@@ -212,7 +212,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         A linear module alone does not rule out post-projection transformations.
         Read the text configuration through the HF config contract, including
         multimodal models whose output settings live in a nested text config.
-        Each chunk applies the projection settings, including any head-owned softcap.
+        Each chunk calls an ``LMHead``'s ``project``, so only a softcap outside the head is rejected.
 
         Args:
             lm_head: Output head with weight of global shape [vocab, hidden].
@@ -282,7 +282,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         *,
         mask: torch.Tensor | None = None,
         logits_dtype: torch.dtype | None = None,
-        projection: LogitsProjection | None = None,
+        lm_head: LMHead | None = None,
     ) -> torch.Tensor:
         """Compute CE directly from hidden states, with no full-logit allocation.
 
@@ -303,7 +303,8 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             logits_dtype: Optional output cast after projection, matching the
                 owning model. Projection uses lm_weight.dtype; mixed-dtype
                 hidden states are converted per chunk, never the full weight.
-            projection: Optional parameter-free settings applied to the materialized weight.
+            lm_head: The model's ``LMHead``, whose ``project`` each chunk calls with the
+                materialized weight; None projects like a plain bias-free linear head.
 
         Returns:
             FP32 scalar, or losses shaped [...] for reduction="none". Inputs
@@ -326,10 +327,10 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             raise ValueError("loss_weights.shape must match labels.shape")
         weight = self.resolve_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
         if isinstance(weight, ShardedLMHeadWeight):
-            # Trim the global vocabulary before gathering. Chunk-local row numbers cannot identify padded tokens.
-            if projection is not None and projection.unpadded_vocab_size is not None:
-                weight = dataclasses.replace(weight, vocab_size=min(weight.shape[0], projection.unpadded_vocab_size))
-                projection = dataclasses.replace(projection, unpadded_vocab_size=None)
+            # Trim a padded vocabulary before gathering: chunk-local row numbers cannot identify padded rows, and
+            # no chunk then has as many rows as the head's own padding mask starts at.
+            if lm_head is not None and lm_head.unpadded_vocab_size is not None:
+                weight = dataclasses.replace(weight, vocab_size=min(weight.shape[0], lm_head.unpadded_vocab_size))
             losses = sharded_linear_cross_entropy(
                 hidden_states.reshape(-1, hidden_states.shape[-1]),
                 labels.reshape(-1),
@@ -339,7 +340,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
                     softcap=None,
                     logits_dtype=logits_dtype,
                     compile=self.compile,
-                    projection=projection,
+                    lm_head=lm_head,
                 ),
                 ignore_index=self.ignore_index,
             ).reshape(labels.shape)
@@ -351,7 +352,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
                 self.chunk_len,
                 self.ignore_index,
                 logits_dtype,
-                partial(self._compute_loss, projection=projection),
+                partial(self._compute_loss, lm_head=lm_head),
             ).reshape(labels.shape)
         if loss_weights is not None:
             losses = losses * loss_weights.to(device=losses.device, dtype=torch.float32)

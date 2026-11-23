@@ -38,7 +38,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -169,17 +169,25 @@ class BeamModel(nn.Module):
         """Run this pipeline stage with one shared FP32 RoPE-table pair per layer type.
 
         Args:
-            input_ids: Integer tensor [batch, sequence] or packed [tokens]; later PP stages
+            input_ids: Integer tensor [batch, sequence] or packed [1, tokens], squeezed to [tokens] for the
+                layers; later PP stages
                 receive floating hidden states with an extra final hidden axis. Positions are local under CP.
-            position_ids: Optional integer tensor [batch, sequence] or [tokens], absolute within each document.
+            position_ids: Optional integer tensor [batch, sequence] or packed [1, tokens], absolute within each
+                document.
             attention_mask: Optional [batch, sequence] bool/0-1 mask; True/1 means valid. None on flex.
             padding_mask: Optional bool tensor matching the position axes; True skips routing.
             **attn_kwargs: Backend metadata: qkv_format (bshd/thd), integer cu_seqlens and
                 cu_seqlens_padded [documents + 1], scalar max_seqlen, cp_size and cp_rank.
 
         Returns:
-            Hidden states [batch, sequence, hidden] or [tokens, hidden], local under CP,
+            Hidden states [batch, sequence, hidden], or [1, tokens, hidden] for packed input, local under CP,
             in the final layer/norm dtype."""
+        if attn_kwargs.get("qkv_format") == "thd":  # TE's packed kernels take [tokens, ...]
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if position_ids is None:
             # ``input_ids`` is [B, S] (or [T] packed); on later pipeline stages it carries the hidden states
             # [B, S, H] instead, so the sequence length is the second dimension, never the last.
@@ -218,7 +226,8 @@ class BeamModel(nn.Module):
                 padding_mask=padding_mask,
                 **attn_kwargs,
             )
-        return self.norm(h) if self.norm else h
+        h = self.norm(h) if self.norm else h
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -283,17 +292,24 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         logits_dtype: torch.dtype | None = None,
-        **kwargs: Any,
+        moe_overrides: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = resolve_backend_gate_precision(backend or BackendConfig())
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = BeamModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
-        self.final_logit_softcapping = getattr(config, "final_logit_softcapping", None)
+        self.final_logit_softcapping = getattr(config, "final_logit_softcapping", None) or None
+        # The head applies the final-logit softcap to its FP32 logits, as HF does, so a softcapped head defaults to
+        # FP32 logits.
+        self.lm_head = LMHead(
+            config.hidden_size,
+            config.vocab_size,
+            dtype=model_dtype,
+            logits_dtype=logits_dtype or (torch.float32 if self.final_logit_softcapping else None),
+            logit_softcapping=self.final_logit_softcapping,
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = BeamStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -342,7 +358,8 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         Returns:
             CausalLMOutputWithPast: logits [batch, selected_sequence, vocab] or packed
-            [1, selected_tokens, vocab], FP32 with softcapping, otherwise in the head's dtype.
+            [1, selected_tokens, vocab] in the head's logits_dtype, softcapped by the head (FP32 by default when
+            the config softcaps).
             Stages without a head pass hidden states [batch, sequence, hidden] or [1, tokens, hidden]
             in logits. Optional hidden_states has that full hidden layout. Positions are local
             under CP; loss, cache and attention fields are unset."""
@@ -351,12 +368,6 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
-        is_thd = attn_kwargs.get("qkv_format") == "thd"
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
         if getattr(self, "_cp_enabled", False):
             # Set by the CP parallelizer (moe.parallelizer.apply_cp). The sequence is sharded per rank while a
             # padded batch mask would span the full sequence, and TE rejects padding masks under CP; causal
@@ -369,14 +380,9 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        out = LMHead.output(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
-        # Final-logit soft cap, as in HF: cap * tanh(logits / cap), computed in fp32. Only the stage
-        # that owns the head has logits (on other PP stages ``lm_head`` is None and the hidden
-        # states pass through in the logits slot).
-        if self.final_logit_softcapping and self.lm_head is not None and out.logits is not None:
-            cap = float(self.final_logit_softcapping)
-            out.logits = (out.logits.float() / cap).tanh() * cap
-        return out
+        # Only the stage that owns the head has logits; on other PP stages the hidden states pass through.
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

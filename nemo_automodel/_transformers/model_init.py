@@ -1697,7 +1697,7 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     """
-    Filter kwargs down to what `model_cls.__init__` explicitly accepts.
+    Filter kwargs down to what `model_cls.__init__` explicitly accepts, warning about the rest.
 
     If the constructor has a `**kwargs` parameter (VAR_KEYWORD) or signature cannot be
     inspected, returns kwargs unchanged.
@@ -1713,6 +1713,8 @@ def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     allowed.discard("self")
     # We pass `config` positionally.
     allowed.discard("config")
+    if ignored := sorted(kwargs.keys() - allowed):
+        logger.warning("%s does not take %s; ignoring them.", model_cls.__name__, ", ".join(ignored))
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
