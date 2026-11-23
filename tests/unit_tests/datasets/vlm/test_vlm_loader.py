@@ -192,6 +192,33 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert padding_idx == processor.tokenizer.pad_token_id
 
 
+@pytest.mark.parametrize("explicit_collator", [False, True])
+def test_vlm_dataloader_rejects_default_collator_without_processor(explicit_collator):
+    """Fail while building instead of deferring the processor error to first batch."""
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: None),
+        collator=VlmCollatorConfig(factory=vlm_loader.COLLATE_FNS["default"]) if explicit_collator else None,
+    )
+
+    with pytest.raises(ValueError, match="VLM dataloader for 'unused' requires a processor"):
+        config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2)
+
+
+def test_vlm_dataloader_allows_processorless_custom_collator():
+    """A custom collator remains responsible for its own processor contract."""
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: None),
+        collator=VlmCollatorConfig(factory=_collate_worker_samples),
+        shuffle=False,
+        num_workers=1,
+    )
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2)
+    assert list(result.dataloader) == [(["one", "two"], 0)]
+
+
 @dataclass
 class _RobustDatasetConfig:
     def build(self):

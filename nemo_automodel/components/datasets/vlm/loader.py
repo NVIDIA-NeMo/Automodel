@@ -388,6 +388,17 @@ class VlmDataloaderConfig:
                 raise ValueError("VLM pretokenization requires a processor")
             dataset = self.pretokenization.build(dataset=dataset, processor=processor)
 
+        if (
+            processor is None
+            and self.pretokenization is None
+            and self.packing is None
+            and (self.collator is None or getattr(self.collator, "factory", None) is COLLATE_FNS["default"])
+        ):
+            raise ValueError(
+                f"VLM dataloader for {pretrained_model_name_or_path!r} requires a processor; "
+                "AutoProcessor.from_pretrained did not return one"
+            )
+
         if self.packing is not None:
             if self.pretokenization is None:
                 raise ValueError("VLM neat packing requires pretokenization")

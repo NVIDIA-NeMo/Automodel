@@ -1363,6 +1363,9 @@ def default_collate_fn(
         whose tensor elements preserve their processor-defined shapes; image lists
         commonly contain tensors of shape [channels, height, width].
     """
+    if processor is None:
+        raise ValueError("default_collate_fn requires a processor to apply the chat template")
+
     conversations = _ensure_rgb([example["conversation"] for example in examples], preserve_alpha=preserve_alpha)
 
     # Optionally drop overlong samples before processing
