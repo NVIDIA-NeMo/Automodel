@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -297,7 +296,6 @@ class CachedDFlashDataConfig:
         mask_token_id: int,
         pad_token_id: int,
         distributed: bool = False,
-        dp_mesh: DeviceMesh | None = None,
     ) -> DataLoader[CachedDFlashRow]:
         """Build a cache reader and its CPU dataloader.
 
@@ -309,9 +307,7 @@ class CachedDFlashDataConfig:
             block_size: DFlash block size, including the unmasked anchor token.
             mask_token_id: Token used for the masked draft positions.
             pad_token_id: In-vocabulary token used to pad uneven batches.
-            distributed: Use the distributed data sampler.
-            dp_mesh: Data-parallel submesh. With no submesh, the sampler uses
-                the default process group.
+            distributed: Shard samples across the default process group.
 
         Returns:
             Dataloader yielding right-padded CPU batches as defined by
@@ -332,12 +328,10 @@ class CachedDFlashDataConfig:
         )
         sampler = None
         if distributed or self.shuffle:
-            replicas = dp_mesh.size() if dp_mesh is not None else (None if distributed else 1)
-            rank = dp_mesh.get_local_rank() if dp_mesh is not None else (None if distributed else 0)
             sampler = DistributedSampler(
                 dataset,
-                num_replicas=replicas,
-                rank=rank,
+                num_replicas=None if distributed else 1,
+                rank=None if distributed else 0,
                 shuffle=self.shuffle,
                 seed=self.shuffle_seed,
             )
@@ -346,7 +340,6 @@ class CachedDFlashDataConfig:
             dataset,
             batch_size=self.batch_size,
             collate_fn=partial(collate_cached_dflash, pad_token_id=pad_token_id),
-            shuffle=self.shuffle and sampler is None,
             sampler=sampler,
             generator=torch.Generator().manual_seed(self.shuffle_seed),
             num_workers=self.num_workers,

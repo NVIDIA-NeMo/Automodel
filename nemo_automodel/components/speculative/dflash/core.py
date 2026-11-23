@@ -708,7 +708,11 @@ class DFlashTrainerModule(nn.Module):
         if visual_score is not None:
             pred_positions = label_indices[:, :, 1:].clamp(max=seq_len - 1)
             pred_scores = visual_score.gather(1, pred_positions.flatten(1)).reshape_as(pred_positions)
-            loss_weight = pred_logits.new_tensor(bsz, dtype=torch.float32)
+            if self.training:
+                loss_weight = pred_logits.new_tensor(bsz, dtype=torch.float32)
+            else:
+                # A row without a kept block is skipped when evaluated alone.
+                loss_weight = block_keep_mask.any(dim=1).sum(dtype=torch.float32)
             loss = self._mmflash_loss_sum(pred_logits, pred_targets, pred_mask, pred_scores) / loss_weight
             pred_ids = pred_logits.argmax(dim=-1)
             valid_tokens = pred_mask.sum()

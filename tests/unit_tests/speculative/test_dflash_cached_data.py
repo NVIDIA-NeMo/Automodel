@@ -344,11 +344,21 @@ def test_cached_rows_without_a_full_block_reach_the_trainer(
     torch.save(short, tmp_path / "00000002.ckpt")
     loader = _loader(tmp_path, pad_token_id=0)
 
-    mixed = _measure_cache_batch(cache_trainer, next(iter(loader)))
-    full = _measure_cache_batch(cache_trainer, collate_cached_dflash([loader.dataset[0]], pad_token_id=0))
+    mixed_batch = next(iter(loader))
+    full_batch = collate_cached_dflash([loader.dataset[0]], pad_token_id=0)
+    mixed = _measure_cache_batch(cache_trainer, mixed_batch)
+    full = _measure_cache_batch(cache_trainer, full_batch)
     assert mixed.valid_blocks == full.valid_blocks > 0
     assert mixed.valid_tokens == full.valid_tokens > 0
     torch.testing.assert_close(mixed.loss * mixed.loss_weight, full.loss * full.loss_weight)
+    if cache_trainer.loss_type == "mmflash":
+        assert mixed.loss_weight.item() == 2
 
     with pytest.raises(NoValidAnchorsError):
         _measure_cache_batch(cache_trainer, collate_cached_dflash([loader.dataset[1]], pad_token_id=0))
+
+    cache_trainer.eval()
+    mixed = _measure_cache_batch(cache_trainer, mixed_batch)
+    full = _measure_cache_batch(cache_trainer, full_batch)
+    torch.testing.assert_close(mixed.loss_weight, full.loss_weight)
+    torch.testing.assert_close(mixed.loss, full.loss)
