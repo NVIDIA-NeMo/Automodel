@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Distributed random initialization must not repeat router rows across shards."""
+"""Distributed random initialization must not repeat rows across shards: the router and the MoE projections."""
 
 from pathlib import Path
 
@@ -23,8 +23,9 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import Gate
+from nemo_automodel.components.moe.layers import Gate, MoE
 
 
 def _worker(rank: int, init_file: str, dtype: torch.dtype) -> None:
@@ -93,3 +94,72 @@ def _worker(rank: int, init_file: str, dtype: torch.dtype) -> None:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fsdp_gate_initialization_has_distinct_shards(tmp_path: Path, dtype: torch.dtype) -> None:
     mp.spawn(_worker, args=(str(tmp_path / "init"), dtype), nprocs=2, join=True)
+
+
+# The weights of an MoE layer that ``MoE.init_weights`` draws on FSDP-sharded parameters, besides the router.
+SHARDED_PROJECTIONS = (
+    "shared_experts.up_proj.weight",
+    "shared_experts.gate_proj.weight",
+    "shared_experts.down_proj.weight",
+    "fc1_latent_proj.weight",
+    "fc2_latent_proj.weight",
+)
+
+
+def _projection_worker(rank: int, init_file: str, dtype: torch.dtype) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=f"file://{init_file}", rank=rank, world_size=2)
+    try:
+        config = MoEConfig(
+            n_routed_experts=8,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=48,
+            norm_topk_prob=False,
+            shared_expert_gate=True,
+            moe_latent_size=32,
+            dtype=dtype,
+        )
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+        mesh = init_device_mesh("cuda", (2,))
+        with torch.device("meta"):
+            moe = MoE(config, backend)
+        fully_shard(moe, mesh=mesh)
+        moe.to_empty(device=torch.device("cuda", rank))
+        # Both ranks start from one random state, as they do in training once a sharded tensor has been drawn.
+        torch.manual_seed(1234)
+        with torch.no_grad():
+            moe.init_weights(torch.device("cuda", rank))
+        for name in SHARDED_PROJECTIONS:
+            weight = moe.get_parameter(name).full_tensor()
+            half = weight.shape[0] // 2
+            assert half > 0 and weight.shape[0] == 2 * half, name
+            # With a draw on each rank's local shard, the second shard repeats the rows of the first.
+            assert not torch.equal(weight[:half], weight[half:]), f"FSDP shards of {name} repeat identical rows"
+            assert torch.unique(weight, dim=0).shape[0] == weight.shape[0], name
+            assert 0.017 < weight.float().std().item() < 0.023, name
+            expected = weight.clone()
+            dist.broadcast(expected, src=0)
+            torch.testing.assert_close(weight, expected, rtol=0, atol=0)
+        # One row, held by the first rank: N(0, 0.02) values, not left at the allocation's content.
+        gate_weight = moe.shared_expert_gate.weight.full_tensor()
+        assert gate_weight.shape == (1, config.dim)
+        assert 0.01 < gate_weight.float().std().item() < 0.03
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA devices")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fsdp_moe_projection_initialization_has_distinct_shards(tmp_path: Path, dtype: torch.dtype) -> None:
+    """The shared-expert MLP and the latent projections of an FSDP-sharded MoE layer differ between ranks."""
+    mp.spawn(_projection_worker, args=(str(tmp_path / "init"), dtype), nprocs=2, join=True)

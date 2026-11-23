@@ -2303,6 +2303,32 @@ def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeyp
         assert experts.down_linear.num_gemms == moe_config.n_routed_experts // 2
 
 
+@pytest.mark.cpu_only
+def test_random_stream_separates_streams_and_keeps_generators_in_step():
+    from nemo_automodel.components.moe.experts import _random_stream
+
+    def draw(stream: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Values drawn inside the stream and the first value drawn after it, from one starting state."""
+        torch.manual_seed(7)
+        with _random_stream(torch.device("cpu"), stream):
+            inside = torch.randn(64)
+        return inside, torch.rand(4)
+
+    first, after_first = draw(0)
+    second, after_second = draw(32)
+    repeated, _ = draw(0)
+    assert not torch.equal(first, second)
+    assert torch.equal(first, repeated)
+    # However much a stream draws, the generator continues one draw after where it was.
+    assert torch.equal(after_first, after_second)
+    torch.manual_seed(7)
+    torch.randint(2**62, (1,))
+    assert torch.equal(after_first, torch.rand(4))
+    # Independent values, not a shifted copy of one sequence.
+    assert abs(float(torch.corrcoef(torch.stack([first, second]))[0, 1])) < 0.5
+    assert not any(torch.equal(first[shift:], second[: 64 - shift]) for shift in range(1, 33))
+
+
 @pytest.mark.parametrize(
     ("name", "first_expert", "expected"),
     [
@@ -3135,6 +3161,47 @@ class TestGroupedExpertsTE:
 
         # Weights should be unchanged
         torch.testing.assert_close(experts.gate_and_up_projs, original_gate_up, rtol=1e-4, atol=1e-4)
+
+    def test_init_weights_gives_expert_parallel_ranks_different_values(self, te_moe_config):
+        """Ranks whose random generators are in one state must not draw the same values for different experts."""
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        def rank_weights(ep_rank: int) -> tuple[list[torch.Tensor], torch.Tensor]:
+            """Weights of the experts of one of two expert-parallel ranks, and the generator state afterwards.
+
+            Returns:
+                One tensor of shape [out_features, in_features] per expert weight, and the CUDA generator state.
+            """
+            experts = GroupedExpertsTE(te_moe_config)
+            mock_mesh = Mock()
+            mock_mesh.size.return_value = 2
+            mock_mesh.get_local_rank.return_value = ep_rank
+            mock_mesh.get_group.return_value = Mock()
+            mock_mesh.mesh_dim_names = ("ep",)
+            with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher"):
+                experts.init_token_dispatcher(mock_mesh)
+            # The state every rank holds once a sharded tensor has been drawn.
+            torch.cuda.manual_seed(1234)
+            experts.init_weights(torch.device("cuda"))
+            weights = [parameter.detach().clone() for parameter in experts.parameters()]
+            return weights, torch.cuda.get_rng_state()
+
+        rank0, state0 = rank_weights(0)
+        rank1, state1 = rank_weights(1)
+        rank0_again, _ = rank_weights(0)
+        assert len(rank0) == len(rank1) == te_moe_config.n_routed_experts  # two projections for half the experts
+        for first, second, repeated in zip(rank0, rank1, rank0_again, strict=True):
+            assert first.shape == second.shape
+            assert not torch.equal(first, second)
+            # Ranks that hold the same experts (data-parallel replicas) draw the same values.
+            assert torch.equal(first, repeated)
+            # Transformer Engine's default initialization, N(0, 0.023), on both ranks.
+            for weight in (first, second):
+                assert float(weight.float().std()) == pytest.approx(0.023, rel=0.2)
+        # The experts of one rank differ from each other as well.
+        assert not torch.equal(rank0[0], rank0[1])
+        # The generators leave the initialization in one state again.
+        assert torch.equal(state0, state1)
 
     def test_grouped_experts_te_init_weights(self, te_moe_config):
         """Test init_weights method."""

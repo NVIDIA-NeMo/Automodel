@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import re
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -2598,9 +2599,50 @@ class GroupedExpertsTE(nn.Module):
         return y
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        """Initialize weights using reset_parameters()"""
-        self.gate_up_linear.reset_parameters()
-        self.down_linear.reset_parameters()
+        """Draw the weights of this rank's experts with Transformer Engine's ``reset_parameters()``.
+
+        The experts of an expert-parallel rank are local parameters, and the ranks hold one random state once
+        a sharded tensor has been drawn, so every rank would draw the same values for its own experts. The
+        draw therefore uses a random stream of its own per first expert: ranks with different experts get
+        independent values, ranks that hold the same experts get the same ones.
+
+        Args:
+            buffer_device: Unused; Transformer Engine keeps a parameter on its device and materializes a
+                meta parameter on the current CUDA device.
+            init_std: Unused; Transformer Engine draws from its default N(0, 0.023).
+        """
+        parameter = next(self.gate_up_linear.parameters())
+        device = torch.device("cuda", torch.cuda.current_device()) if parameter.is_meta else parameter.device
+        first_expert = self.ep_rank * self.num_local_experts
+        with _random_stream(device, first_expert):
+            self.gate_up_linear.reset_parameters()
+            self.down_linear.reset_parameters()
+
+
+@contextmanager
+def _random_stream(device: torch.device, stream: int) -> Iterator[None]:
+    """Draw from stream ``stream`` of the default random generator of ``device`` inside the context.
+
+    One value is drawn from the generator and the generator is reseeded with that value plus ``stream``.
+    Generators in the same state therefore give independent values for different streams and equal values
+    for the same stream. On exit the generator continues from its state after that one draw, whatever was
+    drawn inside, so generators that were in the same state stay in the same state.
+
+    Args:
+        device: Device whose default generator is used; for CUDA without an index, the current device.
+        stream: Non-negative number of the stream.
+    """
+    base = int(torch.randint(2**62, (1,), device=device).item())
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [torch.cuda.current_device() if device.index is None else device.index]
+    with torch.random.fork_rng(devices=cuda_devices):
+        if device.type == "cuda":
+            with torch.cuda.device(cuda_devices[0]):
+                torch.cuda.manual_seed(base + stream)
+        else:
+            torch.default_generator.manual_seed(base + stream)
+        yield
 
 
 def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):

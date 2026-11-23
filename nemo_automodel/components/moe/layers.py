@@ -1036,20 +1036,22 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         elif isinstance(module, GroupedExpertsMoK):
             module.init_weights(buffer_device, init_std)
         elif isinstance(module, MLP):
-            to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
-            to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
+            # Drawn on the parameters, like the gate weight: a draw on a rank's local shard would repeat on
+            # every rank, because the ranks hold one random state once a sharded tensor has been drawn.
+            nn.init.normal_(module.down_proj.weight, mean=0.0, std=init_std)
+            nn.init.normal_(module.up_proj.weight, mean=0.0, std=init_std)
             if module.gate_proj is not None:
-                to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
+                nn.init.normal_(module.gate_proj.weight, mean=0.0, std=init_std)
         elif isinstance(module, MoE):
             if module.shared_expert_gate is not None:
-                to_local(module.shared_expert_gate.weight).normal_(mean=0.0, std=init_std)
+                nn.init.normal_(module.shared_expert_gate.weight, mean=0.0, std=init_std)
                 if module.shared_expert_gate.bias is not None:
                     to_local(module.shared_expert_gate.bias).zero_()
             if module.fc1_latent_proj is not None:
-                to_local(module.fc1_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                nn.init.normal_(module.fc1_latent_proj.weight, mean=0.0, std=init_std)
                 if module.fc1_latent_proj.bias is not None:
                     to_local(module.fc1_latent_proj.bias).zero_()
             if module.fc2_latent_proj is not None:
-                to_local(module.fc2_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                nn.init.normal_(module.fc2_latent_proj.weight, mean=0.0, std=init_std)
                 if module.fc2_latent_proj.bias is not None:
                     to_local(module.fc2_latent_proj.bias).zero_()
