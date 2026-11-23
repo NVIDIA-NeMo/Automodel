@@ -743,6 +743,11 @@ class BackendConfig:
             path. Never enable with a learned gate: cached metadata would go
             stale and silently corrupt expert dispatch.
         cuda_graph: Scoped partial CUDA-graph configuration.
+        mamba_linear: Linear implementation of the Mamba mixer's input and output projections
+            (NemotronV3). ``"torch"`` keeps ``torch.nn.Linear`` with the output projection applied
+            inside the scan kernel. ``"te"`` builds both as Transformer Engine linears: the output
+            projection then runs as a module after the scan kernel and ``te_fp8`` / ``te_nvfp4``
+            quantize both GEMMs. Default ``"torch"``.
     """
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -838,8 +843,14 @@ class BackendConfig:
     # __post_init__), where that metadata is constant by construction. Default False.
     benchmark_static_routing: bool = False
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
+    mamba_linear: Literal["torch", "te"] = "torch"
 
     def __post_init__(self) -> None:
+        if self.mamba_linear not in ("torch", "te"):
+            raise ValueError(f"Unsupported mamba_linear={self.mamba_linear!r}; expected 'torch' or 'te'.")
+        if self.mamba_linear == "te" and not HAVE_TE:
+            raise ValueError("mamba_linear='te' requires Transformer Engine")
+
         # benchmark_static_routing caches routing metadata across microbatches, which is
         # only sound when routing is constant by construction (forced balance, no noise).
         if self.benchmark_static_routing and not (self.fake_balanced_gate and self.fake_gate_noise == 0.0):

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from typing import Literal, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -251,6 +252,15 @@ class NemotronV3MambaFP32Params(nn.Module):
         )
 
 
+class _MambaProjectionConfig(Protocol):
+    """The fields of the model configuration that a Mamba projection is built from."""
+
+    use_bias: bool
+    """Whether the projections have a bias."""
+    torch_dtype: str | torch.dtype | None
+    """Parameter dtype of the model; a Transformer Engine projection is built in it."""
+
+
 class NemotronV3Mamba2Mixer(nn.Module):
     """Mamba2 mixer for NemotronV3 (training-only, uses CUDA kernels).
 
@@ -258,11 +268,17 @@ class NemotronV3Mamba2Mixer(nn.Module):
     for maximum training efficiency. Does not support inference caching.
 
     Requires mamba_ssm and causal_conv1d packages.
+
+    The input and output projections follow ``backend.mamba_linear``. With ``"torch"`` (the default) both
+    are ``torch.nn.Linear`` and the training path applies the output projection inside the scan kernel.
+    With ``"te"`` both are Transformer Engine linears, the output projection runs as a module after the
+    scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize both GEMMs like every other TE linear.
     """
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.layer_idx = layer_idx
+        mamba_linear = backend.mamba_linear if backend is not None else "torch"
 
         # Model dimensions
         self.hidden_size = config.hidden_size
@@ -290,7 +306,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # Layers
         # Input projection: projects to [gate, x, B, C, dt]
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
-        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=config.use_bias)
+        self.in_proj = self._build_projection(mamba_linear, self.hidden_size, projection_size, config)
 
         # Conv1d for sequence mixing
         self.conv1d = nn.Conv1d(
@@ -313,10 +329,39 @@ class NemotronV3Mamba2Mixer(nn.Module):
         )
 
         # Output projection
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
+        self.out_proj = self._build_projection(mamba_linear, self.intermediate_size, self.hidden_size, config)
 
         # Context parallelism — set post-construction by the parallelizer
         self.cp = None
+
+    @staticmethod
+    def _build_projection(
+        mamba_linear: Literal["torch", "te"],
+        in_features: int,
+        out_features: int,
+        config: _MambaProjectionConfig,
+    ) -> nn.Module:
+        """Build one Mamba projection of shape ``[out_features, in_features]``.
+
+        Args:
+            mamba_linear: ``BackendConfig.mamba_linear``.
+            in_features: Width of the projection input.
+            out_features: Width of the projection output.
+            config: Model configuration; ``use_bias`` and ``torch_dtype`` are read.
+
+        Returns:
+            ``torch.nn.Linear`` with PyTorch's default construction for ``"torch"`` (unchanged
+            initialization stream), otherwise the module built by ``initialize_linear_module``.
+        """
+        if mamba_linear == "torch":
+            return nn.Linear(in_features, out_features, bias=config.use_bias)
+        return initialize_linear_module(
+            mamba_linear,
+            in_features,
+            out_features,
+            bias=config.use_bias,
+            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+        )
 
     @property
     def dt_bias(self) -> torch.Tensor:
@@ -775,7 +820,7 @@ class NemotronV3Block(nn.Module):
 
         # Create mixer based on block type
         if self.block_type == "mamba":
-            self.mixer = NemotronV3Mamba2Mixer(config, layer_idx=layer_idx)
+            self.mixer = NemotronV3Mamba2Mixer(config, layer_idx=layer_idx, backend=backend)
         elif self.block_type == "attention":
             self.mixer = NemotronV3Attention(config, backend=backend)
         elif self.block_type == "mlp":
