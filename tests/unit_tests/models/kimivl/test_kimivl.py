@@ -578,6 +578,151 @@ class TestKimiVLStateDictAdapter:
         assert "model.vision_tower.patch_embed.proj.weight" in restored
 
 
+class TestKimiVLStateDictAdapterConvertSingleTensor:
+    """Tests for KimiVLStateDictAdapter.convert_single_tensor_to_hf."""
+
+    # dim=32, moe_inter_dim=48, 4 experts: every dimension differs so a transposed shape is detectable.
+    DIM = 32
+    MOE_INTER = 48
+    N_EXPERTS = 4
+
+    @pytest.fixture
+    def adapter(self):
+        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.kimivl.model import KimiVLStateDictAdapter
+        from nemo_automodel.components.moe.config import MoEConfig
+
+        config = KimiVLConfig(
+            vision_config=MoonViTConfig(hidden_size=self.DIM),
+            text_config=DeepseekV3Config(
+                hidden_size=self.DIM,
+                num_hidden_layers=1,
+                n_routed_experts=self.N_EXPERTS,
+                n_group=2,
+                topk_group=2,
+            ),
+        )
+        moe_config = MoEConfig(
+            dim=self.DIM,
+            inter_dim=64,
+            moe_inter_dim=self.MOE_INTER,
+            n_routed_experts=self.N_EXPERTS,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=2,
+            n_limited_groups=2,
+            train_gate=True,
+            gate_bias_update_factor=1e-3,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            norm_topk_prob=True,
+        )
+        return KimiVLStateDictAdapter(config, moe_config, BackendConfig(linear="torch", rms_norm="torch"))
+
+    @pytest.mark.parametrize(
+        "native_key, shape, hf_key",
+        [
+            (
+                "model.language_model.model.embed_tokens.weight",
+                (100, 32),
+                "language_model.model.embed_tokens.weight",
+            ),
+            (
+                "model.language_model.model.layers.0.self_attn.q_proj.weight",
+                (32, 32),
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+            ),
+            (
+                "model.vision_tower.patch_embed.proj.weight",
+                (32, 3, 14, 14),
+                "vision_tower.patch_embed.proj.weight",
+            ),
+            (
+                "model.multi_modal_projector.linear_1.weight",
+                (64, 128),
+                "multi_modal_projector.linear_1.weight",
+            ),
+            ("lm_head.weight", (100, 32), "language_model.lm_head.weight"),
+        ],
+    )
+    def test_single_output_keys(self, adapter, native_key, shape, hf_key):
+        tensor = torch.randn(*shape)
+        out = adapter.convert_single_tensor_to_hf(native_key, tensor)
+        assert len(out) == 1
+        assert out[0][0] == hf_key
+        assert out[0][1] is tensor
+
+    def test_grouped_expert_weight_splits_per_expert(self, adapter):
+        # gate_and_up_projs is [experts, dim, 2 * moe_inter]; HF stores each projection as [moe_inter, dim].
+        gate_up = torch.randn(4, 32, 96)
+        out = dict(
+            adapter.convert_single_tensor_to_hf(
+                "model.language_model.model.layers.0.mlp.experts.gate_and_up_projs", gate_up
+            )
+        )
+        prefix = "language_model.model.layers.0.mlp.experts"
+        expected_keys = {f"{prefix}.{i}.{proj}.weight" for i in range(4) for proj in ("gate_proj", "up_proj")}
+        assert set(out) == expected_keys
+        assert all(v.shape == (48, 32) for v in out.values())
+        assert torch.equal(out[f"{prefix}.2.gate_proj.weight"], gate_up[2, :, :48].T)
+        assert torch.equal(out[f"{prefix}.2.up_proj.weight"], gate_up[2, :, 48:].T)
+
+        # down_projs is [experts, moe_inter, dim]; HF stores each as [dim, moe_inter].
+        down = torch.randn(4, 48, 32)
+        out = dict(
+            adapter.convert_single_tensor_to_hf("model.language_model.model.layers.0.mlp.experts.down_projs", down)
+        )
+        assert set(out) == {f"{prefix}.{i}.down_proj.weight" for i in range(4)}
+        assert all(v.shape == (32, 48) for v in out.values())
+        assert torch.equal(out[f"{prefix}.3.down_proj.weight"], down[3].T)
+
+    def test_model_model_key_is_dropped(self, adapter):
+        out = adapter.convert_single_tensor_to_hf("model.model.layers.0.weight", torch.randn(2, 2))
+        assert out == []
+
+    def test_exclude_key_regex(self, adapter):
+        regex = r"model\.vision_tower\."
+        assert (
+            adapter.convert_single_tensor_to_hf("model.vision_tower.a.weight", torch.randn(2), exclude_key_regex=regex)
+            == []
+        )
+        out = adapter.convert_single_tensor_to_hf(
+            "model.multi_modal_projector.a.weight", torch.randn(2), exclude_key_regex=regex
+        )
+        assert [k for k, _ in out] == ["multi_modal_projector.a.weight"]
+
+        # The regex also filters converted language-model keys, so expert splits can be excluded.
+        out = adapter.convert_single_tensor_to_hf(
+            "model.language_model.model.layers.0.mlp.experts.down_projs",
+            torch.randn(4, 48, 32),
+            exclude_key_regex=r".*experts.*",
+        )
+        assert out == []
+
+    def test_merged_per_tensor_results_equal_to_hf(self, adapter):
+        state_dict = {
+            "model.language_model.model.embed_tokens.weight": torch.randn(100, 32),
+            "model.language_model.model.layers.0.self_attn.q_proj.weight": torch.randn(32, 32),
+            "model.language_model.model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 32, 96),
+            "model.language_model.model.layers.0.mlp.experts.down_projs": torch.randn(4, 48, 32),
+            "model.language_model.model.norm.weight": torch.randn(32),
+            "model.vision_tower.patch_embed.proj.weight": torch.randn(32, 3, 14, 14),
+            "model.multi_modal_projector.linear_1.weight": torch.randn(64, 128),
+            "model.model.dropped.weight": torch.randn(2),
+            "lm_head.weight": torch.randn(100, 32),
+        }
+        for kwargs in ({}, {"exclude_key_regex": r".*norm\..*"}):
+            merged = {}
+            for fqn, tensor in state_dict.items():
+                for k, v in adapter.convert_single_tensor_to_hf(fqn, tensor, **kwargs):
+                    merged[k] = v
+            expected = adapter.to_hf(state_dict, **kwargs)
+            assert set(merged) == set(expected)
+            for k in expected:
+                assert torch.equal(merged[k], expected[k]), k
+
+
 class TestKimiVLPipelineParallelismChunking:
     """Exercise the actual wrapper, with its decoder replaced by a local probe."""
 
