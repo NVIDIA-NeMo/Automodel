@@ -31,11 +31,11 @@ model:
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa     # WAVE 13: compilable attention backend (TE attn not fullgraph-traceable)
+    attn: fa4  # Varlen attention preserves packed document boundaries without a dense mask.
     linear: torch  # WAVE 13: TE Linear is @torch.compiler.disable'd -> breaks attn fullgraph
     rms_norm: torch  # WAVE 13: TE RMSNorm also compiler-disabled
     rope_fusion: false  # WAVE 13: fused RoPE is a TE compiler-disabled op
-    compile_attn: true  # WAVE 13: torch.compile(fullgraph) the GQA attention forward
+    compile_attn: true  # Compile padded projections/norm/RoPE around varlen FA4.
     experts: te  # TE GroupedLinear bf16 (no fp8) — fastest retained bf16 backend (te 26.27% > torch_mm 25.45%)
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: false

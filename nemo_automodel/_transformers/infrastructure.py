@@ -45,6 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
+from nemo_automodel.components.checkpoint.stateful_wrappers import validate_peft_trainable_modules
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedStrategyConfig,
@@ -77,7 +78,9 @@ from nemo_automodel.components.moe.quantized_experts import (
     apply_mxfp4_to_moe_experts,
     apply_nvfp4_to_moe_experts,
     packed_expert_parameters,
+    select_nvfp4_expert_storage_format,
     validate_nvfp4_checkpoint_config,
+    validate_nvfp4_resident_experts,
     validate_packed_expert_topology,
 )
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
@@ -713,6 +716,16 @@ def apply_model_infrastructure(
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+    validate_nvfp4_resident_experts(
+        model,
+        device_mesh=mesh.device_mesh,
+        ep_size=mesh.ep_size,
+        pp_size=mesh.pp_size,
+        loads_base_checkpoint=bool(pretrained_model_name_or_path and load_base_model),
+    )
+    # Experts that hold packed NVFP4 placeholders (te_nvfp4.resident_weights, or the PEFT conversion
+    # above) are filled by the base load with the checkpoint packed expert tensors, unchanged.
+    select_nvfp4_expert_storage_format(model)
 
     # Inject TE attention into HF models when requested.
     # Done after PEFT (so projection shapes are final) and before sharding
@@ -919,6 +932,11 @@ def apply_model_infrastructure(
                 "The configured trainability policy left no trainable parameters; "
                 "check freeze_config and the PEFT configuration."
             )
+    if peft_config is not None:
+        # Modules freeze_config unfreezes next to LoRA are saved whole with the adapter;
+        # reject layouts the adapter checkpoint cannot restore before training starts.
+        for mp in trainability_models:
+            validate_peft_trainable_modules(mp)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded

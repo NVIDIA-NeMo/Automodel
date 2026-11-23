@@ -176,11 +176,12 @@ class TestGPTOSSStateDictAdapter:
         assert len(adapter.hf_to_internal_map) == 4
         assert len(adapter.internal_to_hf_map) == 4
 
-    def test_initialization_with_te_backend(self):
+    @pytest.mark.parametrize("attn", ["te", "fa4"])
+    def test_initialization_with_te_backend(self, attn: str) -> None:
         """Test that TE backend adds sinks mapping to adapter."""
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(attn="te")
+        backend = self.create_mock_backend_config(attn=attn)
 
         adapter = GPTOSSStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.float16)
 
@@ -415,11 +416,12 @@ class TestGPTOSSStateDictAdapter:
         assert "layers.0.mlp.router.weight" not in out
         assert "layers.0.mlp.router.bias" not in out
 
-    def test_from_hf_with_te_backend_sinks_mapping(self):
+    @pytest.mark.parametrize("attn", ["te", "fa4"])
+    def test_from_hf_with_te_backend_sinks_mapping(self, attn: str) -> None:
         """Test from_hf applies sinks mapping with TE backend."""
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(attn="te")
+        backend = self.create_mock_backend_config(attn=attn)
         adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
 
         hf_state = {
@@ -436,11 +438,12 @@ class TestGPTOSSStateDictAdapter:
         # Router mapping should still work
         assert "model.layers.0.mlp.gate.weight" in out
 
-    def test_to_hf_with_te_backend_sinks_mapping(self):
+    @pytest.mark.parametrize("attn", ["te", "fa4"])
+    def test_to_hf_with_te_backend_sinks_mapping(self, attn: str) -> None:
         """Test to_hf applies sinks mapping with TE backend."""
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
-        backend = self.create_mock_backend_config(attn="te")
+        backend = self.create_mock_backend_config(attn=attn)
         adapter = GPTOSSStateDictAdapter(config, moe_config, backend)
 
         state_dict = {
