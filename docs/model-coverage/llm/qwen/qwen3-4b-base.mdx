@@ -18,6 +18,7 @@ its declared topology below before choosing a local or cluster launcher.
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_te_fusedadam.yaml). |
+| Train gated-LoRA MTP on the Qwen3-4B variant | Use [qwen3_4b_gated_lora_mtp_paper.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mtp_finetune/qwen3_4b_gated_lora_mtp_paper.yaml) on one GPU. See the [MTP guide](/recipes-e2e-examples/mtp-speculative-decoding) for the objective and limitations. |
 
 ### Configuration
 
@@ -46,6 +47,7 @@ its declared topology below before choosing a local or cluster launcher.
 ### Available Models
 
 - [`Qwen/Qwen3-4B-Base`](https://huggingface.co/Qwen/Qwen3-4B-Base)
+- [`Qwen/Qwen3-4B`](https://huggingface.co/Qwen/Qwen3-4B), used by the gated-LoRA MTP recipe.
 
 ## Related Resources
 

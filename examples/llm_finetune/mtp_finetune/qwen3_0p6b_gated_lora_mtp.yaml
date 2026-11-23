@@ -62,10 +62,7 @@ peft:
 gated_mtp:
   mask_token_ids: [151700, 151701, 151702]
   scaling_factor: 1.0
-
-# Distill every depth towards the frozen base model's own next-token distribution, the verifier at decode time.
-mtp:
-  distillation_mode: soft
+  objective: paper
 
 distributed:
   strategy: fsdp2

@@ -22,7 +22,9 @@ are all checked against first principles.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 import torch
@@ -30,6 +32,7 @@ import torch.nn.functional as F
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules, lora_token_gate
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig, GatedMTPSampler
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -61,7 +64,7 @@ def _build_lora_model() -> Qwen3ForCausalLM:
     return model
 
 
-def _make_recipe(model, monkeypatch, *, distillation_mode: str):
+def _make_recipe(model, monkeypatch, *, distillation_mode: str, objective: Literal["mtp", "paper"] = "mtp"):
     """Build a minimal harness around the real non-PP ``_forward_backward_step`` with gated MTP enabled."""
     recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     object.__setattr__(
@@ -78,7 +81,11 @@ def _make_recipe(model, monkeypatch, *, distillation_mode: str):
     object.__setattr__(recipe, "domain_mixture", None)
     object.__setattr__(recipe, "_get_cp_group_size", lambda: 1)
     object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
-    object.__setattr__(recipe, "gated_mtp", GatedMTPConfig(mask_token_ids=_MASK_IDS, scaling_factor=_SCALING).build())
+    object.__setattr__(
+        recipe,
+        "gated_mtp",
+        GatedMTPConfig(mask_token_ids=_MASK_IDS, scaling_factor=_SCALING, objective=objective).build(),
+    )
     recipe._mtp_accept_metrics = []
 
     class _IdentitySharder:
@@ -135,12 +142,9 @@ def _sequential_mtp_hidden(model, input_ids, anchor: int, depth: int) -> torch.T
 
 
 def _build_lora_model_with_sampler() -> Qwen3ForCausalLM:
-    """A LoRA model with a `GatedMTPSampler` attached, its no-op zero-init broken deterministically
-    (same RNG draw sequence every call) so a gradient-matching test isn't trivially vacuous."""
+    """A tiny LoRA model with the normally initialized paper sampler attached."""
     model = _build_lora_model()
     sampler = GatedMTPSampler(hidden_size=model.config.hidden_size, num_depths=len(_MASK_IDS))
-    with torch.no_grad():
-        sampler.mlp[3].weight.normal_(std=0.1)
     model.gated_mtp_sampler = sampler
     return model
 
@@ -232,6 +236,162 @@ def _reference_lora_grads(input_ids, labels, *, soft: bool):
                 loss = loss + _SCALING / num_depths * term / num_label_tokens
     loss.backward()
     return _lora_grads(model)
+
+
+def _reference_paper_loss(model: Qwen3ForCausalLM, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Evaluate the paper using independent causal forwards for each anchor and depth.
+
+    Args:
+        model: Tiny frozen base model with trainable LoRA and sampler modules.
+        input_ids: Tensor of shape [batch, sequence].
+        labels: Tensor of shape [batch, sequence], with -100 at ignored positions.
+
+    Returns:
+        Scalar batch mean of base CE, sampler CE, and target-grouped LCM.
+    """
+    with lora_token_gate(model, torch.zeros_like(input_ids, dtype=torch.bool)):
+        clean = model(input_ids=input_ids, output_hidden_states=True)
+    sampler = model.gated_mtp_sampler
+    clean_sampler = model.lm_head(sampler(clean.hidden_states[-1], model.get_input_embeddings()(input_ids)))
+    losses = []
+    for row in range(input_ids.shape[0]):
+        ce_terms, matches = [], {}
+        for anchor in range(input_ids.shape[1]):
+            if labels[row, anchor] == -100:
+                continue
+            target = labels[row, anchor].view(1)
+            ce_terms.append(
+                F.cross_entropy(clean.logits[row, anchor].view(1, -1), target)
+                + F.cross_entropy(clean_sampler[row, anchor].view(1, -1), target)
+            )
+            prev_id = clean.logits[row, anchor].argmax(-1).view(1, 1)
+            for depth in range(1, len(_MASK_IDS) + 1):
+                hidden = _sequential_mtp_hidden(model, input_ids[row : row + 1], anchor, depth)
+                sampled = model.lm_head(sampler(hidden, model.get_input_embeddings()(prev_id)[:, 0]))
+                prev_id = sampled.argmax(-1).view(1, 1)
+                position = anchor + depth
+                if position >= input_ids.shape[1] or labels[row, position] == -100:
+                    continue
+                target = labels[row, position].view(1)
+                ce_terms.append(F.cross_entropy(model.lm_head(hidden), target) + F.cross_entropy(sampled, target))
+                matches.setdefault(position, []).append(
+                    F.mse_loss(hidden[0], clean.hidden_states[-1][row, position].detach())
+                )
+        consistency = sum(torch.stack(terms).mean() for terms in matches.values())
+        consistency = consistency / (labels[row] != -100).sum()
+        losses.append(torch.stack(ce_terms).mean() + consistency)
+    return _SCALING * torch.stack(losses).mean()
+
+
+@pytest.mark.parametrize("microbatch_sizes", [(3,), (2, 1), (1, 1, 1)])
+@pytest.mark.parametrize("activation_checkpointing", [False, True])
+def test_paper_step_matches_causal_reference_after_clipping_and_update(
+    monkeypatch: pytest.MonkeyPatch, microbatch_sizes: tuple[int, ...], activation_checkpointing: bool
+) -> None:
+    """Check full gradients, norm, and update with partial accumulation and AC replay."""
+    model = _build_lora_model_with_sampler().train()
+    reference = _build_lora_model_with_sampler().train()
+    if activation_checkpointing:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    recipe = _make_recipe(model, monkeypatch, distillation_mode="hard", objective="paper")
+    ids, labels = _batch()
+    ids, labels = torch.cat([ids, ids[:1].flip(-1)]), torch.cat([labels, labels[:1]])
+    labels[0, 0] = -100  # A future supervised target cannot activate this ignored anchor.
+    loss_buffer = []
+    start = 0
+    for idx, size in enumerate(microbatch_sizes):
+        end = start + size
+        recipe._forward_backward_step(
+            idx,
+            {"input_ids": ids[start:end], "labels": labels[start:end]},
+            loss_buffer=loss_buffer,
+            num_label_tokens=int((labels != -100).sum()),
+            num_batches=len(microbatch_sizes),
+            num_samples=ids.shape[0],
+        )
+        start = end
+    reference_loss = _reference_paper_loss(reference, ids, labels)
+    reference_loss.backward()
+    torch.testing.assert_close(torch.stack(loss_buffer).sum(), reference_loss.detach(), atol=1e-6, rtol=1e-5)
+    trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
+    reference_params = dict(reference.named_parameters())
+    for name, param in trainable.items():
+        assert param.grad is not None and torch.isfinite(param.grad).all(), name
+        assert torch.count_nonzero(param.grad) > 0, name
+        torch.testing.assert_close(param.grad, reference_params[name].grad, atol=1e-6, rtol=1e-4)
+    assert all(p.grad is None for p in model.parameters() if not p.requires_grad)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.05)
+    reference_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.05)
+    assert norm > 0.05  # Clipping must actually execute.
+    torch.testing.assert_close(norm, reference_norm, atol=1e-6, rtol=1e-5)
+    torch.optim.AdamW(model.parameters(), lr=1e-4).step()
+    torch.optim.AdamW(reference.parameters(), lr=1e-4).step()
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param, reference_params[name], atol=1e-7, rtol=1e-5)
+    assert all(getattr(module, "_lora_token_gate", None) is None for module in model.modules())
+
+
+def test_paper_checkpoint_resume_matches_uninterrupted_update(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Production PEFT serialization must preserve sampler weights and Adam moments."""
+    model = _build_lora_model_with_sampler().train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    recipe = _make_recipe(model, monkeypatch, distillation_mode="hard", objective="paper")
+    ids, labels = _batch()
+
+    def step(trainer: TrainFinetuneRecipeForNextTokenPrediction, opt: torch.optim.Optimizer) -> None:
+        trainer._forward_backward_step(
+            0,
+            {"input_ids": ids, "labels": labels},
+            loss_buffer=[],
+            num_label_tokens=int((labels != -100).sum()),
+            num_batches=1,
+        )
+        torch.nn.utils.clip_grad_norm_(trainer.model_parts[0].parameters(), 0.1)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    step(recipe, optimizer)
+    adapter = ModelState(model, is_peft=True).state_dict()
+    assert sum("gated_mtp_sampler" in name for name in adapter) == 8
+    assert all("embed_tokens" not in name for name in adapter)
+    path = tmp_path / "paper_checkpoint.pt"
+    torch.save({"adapter": adapter, "optimizer": optimizer.state_dict()}, path)
+    step(recipe, optimizer)
+
+    resumed = _build_lora_model_with_sampler().train()
+    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=1e-4)
+    state = torch.load(path, weights_only=True)
+    ModelState(resumed, is_peft=True).load_state_dict(state["adapter"], broadcast_from_rank0=False)
+    resumed_optimizer.load_state_dict(state["optimizer"])
+    resumed_recipe = _make_recipe(resumed, monkeypatch, distillation_mode="hard", objective="paper")
+    step(resumed_recipe, resumed_optimizer)
+    for actual, expected in zip(resumed.parameters(), model.parameters()):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for actual, expected in zip(resumed_optimizer.state.values(), optimizer.state.values()):
+        for name in actual:
+            torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("unsupported", ["soft", "linear_loss", "domain_mixture"])
+def test_paper_setup_rejects_incompatible_objectives(monkeypatch: pytest.MonkeyPatch, unsupported: str) -> None:
+    """Reject settings the paper path cannot honor instead of silently ignoring them."""
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    model = _build_lora_model_with_sampler()
+    recipe = _make_recipe(
+        model, monkeypatch, distillation_mode="soft" if unsupported == "soft" else "hard", objective="paper"
+    )
+    object.__setattr__(recipe, "peft_config", PeftConfig(target_modules=["*_proj"]))
+    object.__setattr__(recipe, "mesh_context", SimpleNamespace(cp_size=1, tp_size=1))
+    model.supports = SimpleNamespace(mtp_enabled=False)
+    if unsupported == "linear_loss":
+        object.__setattr__(recipe, "loss_fn", ChunkedCrossEntropy(chunk_len=2, compile=False))
+    elif unsupported == "domain_mixture":
+        object.__setattr__(recipe, "domain_mixture", SimpleNamespace())
+    expected = NotImplementedError if unsupported == "domain_mixture" else ValueError
+    with pytest.raises(expected, match="paper"):
+        recipe._validate_gated_mtp(is_packed=False)
 
 
 @pytest.mark.parametrize("distillation_mode", ["hard", "soft"])
@@ -340,9 +500,8 @@ def test_eval_step_scores_sampler_refined_drafts_against_the_base_model(monkeypa
     hits_2 = {(b, t) for b, t in hits_1 if (b, t, 2) in supervised and drafts[b, t, 2] == verifier[b, t + 2]}
     torch.testing.assert_close(metrics.valid, torch.tensor(valid))
     torch.testing.assert_close(metrics.prefix_hits, torch.tensor([len(hits_1), len(hits_2)]))
-    # The sampler's second layer was perturbed away from its zero-init no-op, so the sampler-refined
-    # drafts must actually differ from the raw (un-refined) ones somewhere -- otherwise this test
-    # would pass vacuously even if the fix were reverted.
+    # The normally initialized sampler must actually change a raw draft somewhere;
+    # otherwise this test could pass even if evaluation bypassed it.
     raw_drafts = {
         (b, t, d): _sequential_mtp_logits(model, input_ids[b : b + 1], t, d).argmax(-1).item() for b, t, d in drafts
     }

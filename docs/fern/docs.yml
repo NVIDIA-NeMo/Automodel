@@ -76,6 +76,10 @@ versions:
     availability: stable
 
 redirects:
+  - source: "/nemo/automodel/model-coverage/large-language-models/qwen/Qwen3-4B"
+    destination: "/nemo/automodel/model-coverage/large-language-models/qwen/Qwen3-4B-Base"
+  - source: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/Qwen3-4B"
+    destination: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/Qwen3-4B-Base"
   # Preserve the former MiniMax provider and checkpoint URLs.
   - source: "/nemo/automodel/model-coverage/large-language-models/minimax"
     destination: "/nemo/automodel/model-coverage/large-language-models/MiniMaxAI"

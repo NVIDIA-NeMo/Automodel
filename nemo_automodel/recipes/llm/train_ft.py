@@ -106,7 +106,7 @@ from nemo_automodel.components.models.common.packing import (
     validate_thd_packing_support,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.speculative.gated_mtp import GatedMTPLayout, GatedMTPSampler
+from nemo_automodel.components.speculative.gated_mtp import GatedMTPLayout
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.embedding_row_repair import randomize_embedding_rows
@@ -746,12 +746,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # damaged (embedding_row_repair wouldn't touch them), just duplicated copies of one
             # placeholder vector in the base checkpoint, so every depth needs its own random row.
             randomize_embedding_rows(model, list(self.cfg.gated_mtp.mask_token_ids), seed=self.cfg.get("seed", 42))
-            # The sampler (arXiv:2507.11851 Sec. 2.3) is only ever read in distillation_mode="soft"
-            # (see the `distillation_mode == "soft"` gate around _gated_mtp_sampler_logits below);
-            # hard mode's CE loss never touches it. Only attach it when it's actually needed, so
-            # hard-mode (the original, non-distillation gated-MTP loss) training isn't blocked by a
-            # restriction that exists solely for the sampler.
-            if getattr(self.cfg.mtp, "distillation_mode", "hard") == "soft":
+            # The paper objective and the experimental soft-MTP objective train the
+            # sampler. The existing hard-MTP baseline has no sampler and retains DP support.
+            if self.cfg.gated_mtp.objective == "paper" or self.cfg.mtp.distillation_mode == "soft":
                 # Attached here, after `build_model()` has already applied FSDP2 sharding (for
                 # NeMoAutoModel targets, infra runs inside `from_pretrained`/`from_config`): it's a
                 # new submodule (not a structural replacement like a wrapped embedding would be), so
@@ -759,10 +756,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # multi-GPU FSDP2 sharding of a late-attached module is unsupported, hence the guard.
                 if self.dist_env.world_size > 1:
                     raise NotImplementedError("gated_mtp's sampler does not support multi-GPU yet (world_size > 1).")
-                model.gated_mtp_sampler = GatedMTPSampler(
-                    hidden_size=model.config.hidden_size,
-                    num_depths=len(self.cfg.gated_mtp.mask_token_ids),
-                ).to(device=next(model.parameters()).device, dtype=next(model.parameters()).dtype)
+                with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=False):
+                    parameter = next(model.parameters())
+                    model.gated_mtp_sampler = self.cfg.gated_mtp.build_sampler(
+                        hidden_size=model.config.hidden_size, device=parameter.device, dtype=parameter.dtype
+                    )
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
@@ -1272,6 +1270,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             raise NotImplementedError("gated_mtp does not support pipeline, context, or tensor parallelism yet.")
         if is_packed:
             raise NotImplementedError("gated_mtp does not support packed sequences yet.")
+        if self.gated_mtp.objective == "paper":
+            if self.cfg.mtp.distillation_mode != "hard":
+                raise ValueError("gated_mtp.objective='paper' uses CE and LCM; remove mtp.distillation_mode='soft'.")
+            if not isinstance(self.loss_fn, MaskedCrossEntropy):
+                raise ValueError("gated_mtp.objective='paper' currently requires MaskedCrossEntropy.")
+            if self.domain_mixture is not None:
+                raise NotImplementedError("gated_mtp.objective='paper' does not support domain-mixture loss weights.")
         config = getattr(model, "config", None)
         if getattr(config, "_attn_implementation", None) not in ("sdpa", "eager", "flex_attention"):
             raise ValueError("gated_mtp needs attn_implementation 'sdpa', 'eager', or 'flex_attention'.")
@@ -1372,6 +1377,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_label_tokens,
         num_batches,
         is_train: bool = True,
+        num_samples: int | None = None,
     ):
         """Run one local batch and accumulate its loss and optional gradients.
 
@@ -1388,6 +1394,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_label_tokens: Global supervised-token count for loss normalization.
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
+            num_samples: Sample count across the accumulation window, for the paper
+                objective's per-sample mean. Defaults to equal-sized microbatches.
         """
         if self.pp_enabled and "_packed_seq_ids" in batch:
             # Flat Flash offsets span the whole local batch and cannot be split
@@ -1525,13 +1533,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             gated_mtp_ctx = nullcontext()
+            clean_input_ids = None
             if self.gated_mtp is not None:
                 # Append the mask tokens and gate the LoRA adapter on for them only. The gate stays installed
                 # through backward so that activation-checkpoint recomputation sees it too.
                 valid_mask = batch.get("attention_mask")
                 if valid_mask is None:
                     valid_mask = torch.ones_like(batch["input_ids"])
-                gated_mtp_inputs = self.gated_mtp.prepare_inputs(batch["input_ids"], batch.get("position_ids"))
+                clean_input_ids = batch["input_ids"]
+                gated_mtp_inputs = self.gated_mtp.prepare_inputs(clean_input_ids, batch.get("position_ids"))
                 batch["input_ids"] = gated_mtp_inputs.input_ids
                 batch["position_ids"] = gated_mtp_inputs.position_ids
                 batch["attention_mask"] = self._gated_mtp_attention_mask(model, valid_mask)
@@ -1552,6 +1562,28 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if self.gated_mtp is not None:
                     # Split into the clean copy (the base model) and the MTP depths (the mask tokens).
                     out = self.gated_mtp.split_output(getattr(out, "logits", None), get_final_hidden_states(out))
+                    if is_train and self.gated_mtp.objective == "paper":
+                        lm_head = _get_lm_head_module(model)
+                        if lm_head is None:
+                            raise ValueError("lm_head module not found in model")
+                        sampler_logits = self._gated_mtp_sampler_logits(model, out, out.mtp_per_depth_h)
+                        if sampler_logits is None:
+                            raise ValueError("The paper objective requires a gated_mtp_sampler")
+                        clean_sampler_logits = lm_head(
+                            model.gated_mtp_sampler(out.hidden_states, model.get_input_embeddings()(clean_input_ids))
+                        )
+                        per_sample_loss = self.gated_mtp.paper_loss(
+                            out,
+                            sampler_logits=[clean_sampler_logits, *sampler_logits],
+                            lm_head=lm_head,
+                            labels=labels,
+                            ignore_index=ignore_index,
+                        )
+                        normalizer = num_samples if num_samples is not None else labels.shape[0] * num_batches
+                        local_loss = per_sample_loss.sum() / normalizer
+                        loss_buffer.append(local_loss.detach())
+                        local_loss.backward()
+                        return
 
                 # Gather the LM head once and share it across the main loss and
                 # all MTP depths (linear CE path) to avoid redundant
@@ -1695,6 +1727,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                                 ignore_index=ignore_index,
                                 seq_idx=mtp_seq_idx,
                                 cu_seqlens=mtp_cu_seqlens,
+                                anchor_mask=(labels != ignore_index) & (labels != -100)
+                                if self.gated_mtp is not None and self.gated_mtp.objective == "paper"
+                                else None,
                             )
                         )
                     # Drop the alias explicitly: unlike `out`, it isn't in the del
@@ -1799,12 +1834,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
+        paper_step_kwargs = {}
+        if self.gated_mtp is not None and self.gated_mtp.objective == "paper":
+            paper_step_kwargs["num_samples"] = sum(batch["labels"].shape[0] for batch in batches)
+
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
             self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                i,
+                batch,
+                loss_buffer=loss_buffer,
+                num_label_tokens=num_label_tokens,
+                num_batches=num_batches,
+                **paper_step_kwargs,
             )
 
             if i == 0:

@@ -152,7 +152,18 @@ def create_gated_mtp_block_mask(
     key_valid = _key_valid(valid_mask, num_depths)
     padded_query = _padded_clean_query(valid_mask, num_depths)
 
-    def gated_mtp_mask_mod(b, h, q_idx, kv_idx):
+    def gated_mtp_mask_mod(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+        """Evaluate one allowed attention edge under FlexAttention's scalar contract.
+
+        Args:
+            b: Integer Tensor of shape [], the batch index.
+            h: Integer Tensor of shape [], the unused head index.
+            q_idx: Integer Tensor of shape [], the concatenated query position.
+            kv_idx: Integer Tensor of shape [], the concatenated key position.
+
+        Returns:
+            Bool Tensor of shape [], True when the attention edge is allowed.
+        """
         # See create_gated_mtp_sdpa_mask: a padded clean query attends only itself, never nothing.
         return (_gated_mtp_allowed(q_idx, kv_idx, seq_len) & key_valid[b, kv_idx]) | (
             padded_query[b, q_idx] & (q_idx == kv_idx)

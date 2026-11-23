@@ -27,14 +27,14 @@ import torch.nn as nn
 class GatedMTPSampler(nn.Module):
     """Refines a gated-MTP depth's hidden state using the previous token's embedding.
 
-    Implements the paper's non-recurrent sampler: a 2-layer MLP over
-    ``[previous_token_embedding; hidden_state]``, added back as a residual. The second linear
-    layer is zero-initialized, so the module starts as an exact no-op (``forward`` returns
-    ``hidden_state`` unchanged) -- consistent with gated-LoRA MTP's existing "lossless until
-    trained" design.
+    Implements Section 2.3's two Linear/SiLU/LayerNorm blocks over
+    ``[previous_token_embedding; hidden_state]``. The shared LM head projects the
+    transformed feature directly: there is no residual connection to the input.
+    Both Linear layers use PyTorch's ordinary initialization. Zeroing a Linear
+    before LayerNorm would amplify its first gradients and parameter updates.
 
     Attributes:
-        mlp: Two-layer MLP producing the residual correction.
+        mlp: Two-layer MLP producing the transformed feature.
     """
 
     def __init__(self, hidden_size: int, num_depths: int) -> None:
@@ -55,26 +55,18 @@ class GatedMTPSampler(nn.Module):
             nn.SiLU(),
             nn.LayerNorm(hidden_size),
         )
-        self._zero_init_residual()
-
-    def _zero_init_residual(self) -> None:
-        """Zero the second Linear layer so the sampler starts as a no-op residual."""
-        last_linear = self.mlp[3]
-        nn.init.zeros_(last_linear.weight)
-        if last_linear.bias is not None:
-            nn.init.zeros_(last_linear.bias)
 
     def forward(self, hidden_state: torch.Tensor, prev_token_embedding: torch.Tensor) -> torch.Tensor:
         """Refine a mask position's hidden state given the previous token's embedding.
 
         Args:
-            hidden_state: Mask position's hidden state, shape ``[..., hidden_size]``.
-            prev_token_embedding: Embedding of the token immediately preceding this depth's
-                target, same leading shape as ``hidden_state``.
+            hidden_state: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+            prev_token_embedding: Tensor of shape [..., hidden], with the same leading
+                dimensions; embedding of the preceding sampled token.
 
         Returns:
-            Refined hidden state, same shape as ``hidden_state``. The caller projects this
-            through the shared LM head, exactly as the un-refined hidden state would be.
+            Transformed feature, Tensor of shape [..., hidden]. The caller projects it
+            through the shared LM head. Neither input is mutated or aliased.
         """
         combined = torch.cat([prev_token_embedding, hidden_state], dim=-1)
-        return hidden_state + self.mlp(combined)
+        return self.mlp(combined)

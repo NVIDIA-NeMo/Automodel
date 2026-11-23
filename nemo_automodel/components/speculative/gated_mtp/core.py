@@ -16,21 +16,27 @@
 
 A frozen base model learns to predict ``D`` future tokens at once: ``D`` mask tokens are appended after a
 position, and a LoRA adapter that is gated on for the mask tokens only turns their hidden states into
-predictions of the next ``D + 1``-th, ..., ``2D``-th tokens. All other tokens use the base weights, so the
-model's next-token distribution is unchanged and drafts can be verified losslessly by the same forward.
+predictions of the second through ``D + 1``-th future tokens. All other tokens use the base weights, so
+drafts can be verified against the clean-token path in the same forward. Randomizing reserved embedding
+rows can change their output logits on models with tied input/output embeddings.
 
 Training uses the paper's dense layout: every position is an anchor. One forward runs over the depth-major
 ``[clean (S) | depth 1 (S) | ... | depth D (S)]`` sequence under the attention mask of
 ``nemo_automodel.components.attention.gated_mtp_mask``, and the mask hidden states are returned as
 ``mtp_per_depth_h``, aligned with the native MTP heads: depth ``d`` at position ``t`` predicts token
-``t + d + 1``. The existing MTP loss, soft-MTP distillation, and acceptance metrics consume them unchanged.
+``t + d + 1``. Training can use either Section 2.5's objective or the existing hard/soft MTP baselines.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from nemo_automodel.components.speculative.gated_mtp.sampler import GatedMTPSampler
 
 
 @dataclass
@@ -41,12 +47,15 @@ class GatedMTPConfig:
         mask_token_ids: One token id per MTP depth, appended after every anchor position. The ids must exist in
             the model vocabulary; reserved or otherwise unused special tokens work well, since only the gated
             LoRA adapter learns to use them.
-        scaling_factor: Weight of the MTP loss. The base model is frozen, so the main next-token loss has no
-            trainable parameters and this only scales the MTP objective relative to it.
+        scaling_factor: Weight of the auxiliary loss for ``mtp``, or of the complete
+            CE-plus-LCM objective for ``paper``.
+        objective: ``paper`` trains base CE, sampler CE, and latent consistency from
+            Section 2.5. ``mtp`` preserves the existing hard/soft MTP objectives.
     """
 
     mask_token_ids: list[int] = field(default_factory=list)
     scaling_factor: float = 1.0
+    objective: Literal["mtp", "paper"] = "mtp"
 
     def build(self) -> GatedMTPLayout:
         """Build the layout helper for this config.
@@ -55,13 +64,31 @@ class GatedMTPConfig:
             The :class:`GatedMTPLayout` for ``mask_token_ids`` and ``scaling_factor``.
 
         Raises:
-            ValueError: If ``mask_token_ids`` is empty or ``scaling_factor`` is not positive.
+            ValueError: If ``mask_token_ids`` is empty, ``scaling_factor`` is not positive,
+                or ``objective`` is unknown.
         """
         if not self.mask_token_ids:
             raise ValueError("gated_mtp.mask_token_ids needs one token id per MTP depth.")
         if self.scaling_factor <= 0:
             raise ValueError(f"gated_mtp.scaling_factor must be positive, got {self.scaling_factor}.")
-        return GatedMTPLayout(mask_token_ids=tuple(self.mask_token_ids), scaling_factor=self.scaling_factor)
+        if self.objective not in ("mtp", "paper"):
+            raise ValueError(f"gated_mtp.objective must be 'mtp' or 'paper', got {self.objective!r}.")
+        return GatedMTPLayout(
+            mask_token_ids=tuple(self.mask_token_ids), scaling_factor=self.scaling_factor, objective=self.objective
+        )
+
+    def build_sampler(self, *, hidden_size: int, device: torch.device, dtype: torch.dtype) -> GatedMTPSampler:
+        """Build the shared sampler before the optimizer captures its parameters.
+
+        Args:
+            hidden_size: Width of the base model's hidden representation.
+            device: Runtime device for the sampler parameters.
+            dtype: Runtime storage dtype for the sampler parameters.
+
+        Returns:
+            A randomly initialized Section 2.3 sampler on the requested device.
+        """
+        return GatedMTPSampler(hidden_size, len(self.mask_token_ids)).to(device=device, dtype=dtype)
 
 
 @dataclass
@@ -108,20 +135,103 @@ class GatedMTPOutput:
 class GatedMTPLayout:
     """Build the dense gated-MTP inputs and split the model output into the clean copy and the MTP depths."""
 
-    def __init__(self, *, mask_token_ids: tuple[int, ...], scaling_factor: float) -> None:
+    def __init__(
+        self, *, mask_token_ids: tuple[int, ...], scaling_factor: float, objective: Literal["mtp", "paper"] = "mtp"
+    ) -> None:
         """Store the per-depth mask token ids and the MTP loss weight.
 
         Args:
             mask_token_ids: One token id per MTP depth.
             scaling_factor: Weight of the MTP loss.
+            objective: Training objective; ``paper`` enables Section 2.5's losses.
         """
         self.mask_token_ids = mask_token_ids
         self.scaling_factor = scaling_factor
+        self.objective = objective
 
     @property
     def num_depths(self) -> int:
         """Number of MTP depths ``D``."""
         return len(self.mask_token_ids)
+
+    def paper_loss(
+        self,
+        output: GatedMTPOutput,
+        *,
+        sampler_logits: list[torch.Tensor],
+        lm_head: nn.Module,
+        labels: torch.Tensor,
+        ignore_index: int,
+    ) -> torch.Tensor:
+        """Compute Section 2.5's per-sample base CE, sampler CE, and LCM sum.
+
+        CE is averaged over supervised NTP and MTP positions together. LCM first
+        averages the matching mask states for each clean target, then averages
+        over supervised clean positions. Clean LCM targets are detached. Mask
+        positions whose anchor is unsupervised are excluded, as in Section 2.1.
+        The dense layout still computes those positions, but they contribute no loss.
+
+        Args:
+            output: Clean logits, Tensor of shape [batch, sequence, vocab]; clean hidden
+                states, Tensor of shape [batch, sequence, hidden]; and one mask-state
+                Tensor of shape [batch, sequence, hidden] per depth. All tensors are local,
+                unsharded tensors; this objective currently supports one GPU.
+            sampler_logits: Clean sampler logits followed by one Tensor of shape
+                [batch, sequence, vocab] per depth.
+            lm_head: Frozen projection from hidden features to vocabulary logits.
+            labels: Next-token labels, Tensor of shape [batch, sequence], with
+                ``ignore_index`` at unsupervised and padded positions.
+            ignore_index: Label value excluded from both objectives.
+
+        Returns:
+            Tensor of shape [batch], containing the scaled objective per sample.
+            Empty-supervision samples contribute zero while retaining a backward graph.
+        """
+        if len(sampler_logits) != self.num_depths + 1:
+            raise ValueError("paper_loss requires clean sampler logits and one tensor per MTP depth")
+        if output.logits is None or len(output.mtp_per_depth_h) != self.num_depths:
+            raise ValueError("paper_loss requires full clean logits and one hidden-state tensor per MTP depth")
+        batch, sequence = labels.shape
+        supervised = (labels != ignore_index) & (labels != -100)
+        labels = labels.masked_fill(~supervised, ignore_index)
+
+        def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            """Return per-position CE with ignored labels contributing zero.
+
+            Args:
+                logits: Tensor of shape [batch, positions, vocab].
+                targets: Tensor of shape [batch, positions].
+
+            Returns:
+                Tensor of shape [batch, positions], computed in float32.
+            """
+            return F.cross_entropy(
+                logits.float().reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=ignore_index,
+                reduction="none",
+            ).reshape(batch, -1)
+
+        ce = cross_entropy(output.logits, labels).sum(-1) + cross_entropy(sampler_logits[0], labels).sum(-1)
+        ce_count = supervised.sum(-1)
+        lcm = torch.zeros(batch, sequence, device=labels.device, dtype=torch.float32)
+        lcm_count = torch.zeros_like(lcm)
+        for depth, hidden in enumerate(output.mtp_per_depth_h, start=1):
+            if depth >= sequence:
+                # Keep every sampler parameter connected even with no valid targets.
+                ce = ce + sampler_logits[depth].float().sum((1, 2)) * 0.0
+                continue
+            valid = supervised[:, :-depth] & supervised[:, depth:]
+            targets = labels[:, depth:].masked_fill(~valid, ignore_index)
+            ce = ce + cross_entropy(lm_head(hidden[:, :-depth]), targets).sum(-1)
+            ce = ce + cross_entropy(sampler_logits[depth][:, :-depth], targets).sum(-1)
+            ce_count = ce_count + valid.sum(-1)
+            error = (hidden[:, :-depth].float() - output.hidden_states[:, depth:].detach().float()).square().mean(-1)
+            lcm = lcm + F.pad(error * valid, (depth, 0))
+            lcm_count = lcm_count + F.pad(valid.float(), (depth, 0))
+        ce = ce / ce_count.clamp_min(1)
+        lcm = ((lcm / lcm_count.clamp_min(1)) * supervised).sum(-1) / supervised.sum(-1).clamp_min(1)
+        return self.scaling_factor * (ce + lcm)
 
     def prepare_inputs(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None) -> GatedMTPInputs:
         """Append one mask token per depth after every position.

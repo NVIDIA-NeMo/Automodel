@@ -96,6 +96,7 @@ def compute_mtp_prefix_hits(
     ignore_index: int,
     seq_idx: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    anchor_mask: torch.Tensor | None = None,
 ) -> MTPAcceptanceMetrics:
     """Score a model's MTP depths against its own main-head greedy prediction.
 
@@ -119,6 +120,9 @@ def compute_mtp_prefix_hits(
         cu_seqlens: Optional cumulative sequence lengths ``[num_seqs+1]``
             (THD-pack layout) used to derive ``seq_idx`` when it is not given,
             the same boundary ``calculate_mtp_loss`` uses for this batch.
+        anchor_mask: Optional Bool Tensor with the same shape as ``labels``.
+            False excludes every depth of that anchor, for gated-MTP layouts
+            trained only after supervised clean positions.
 
     Returns:
         :class:`MTPAcceptanceMetrics` with one raw sum per depth.
@@ -152,7 +156,9 @@ def compute_mtp_prefix_hits(
     valids = []
     for lt, vt, mtp_output in zip(label_targets, verifier_targets, mtp_outputs):
         logits = mtp_output if mtp_per_depth_logits is not None else lm_head(mtp_output)
-        valid_mask = lt != ignore_index
+        valid_mask = (lt != ignore_index) & (lt != -100)
+        if anchor_mask is not None:
+            valid_mask = valid_mask & anchor_mask
         correct = (logits.argmax(dim=-1) == vt) & valid_mask
 
         prefix_correct = correct if prefix_correct is None else prefix_correct & correct

@@ -106,7 +106,14 @@ def test_split_output_returns_clean_copy_and_per_depth_mask_states():
         layout.split_output(None, hidden_states[:, :8])
 
 
-@pytest.mark.parametrize("kwargs", [{"mask_token_ids": []}, {"mask_token_ids": [1], "scaling_factor": 0.0}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"mask_token_ids": []},
+        {"mask_token_ids": [1], "scaling_factor": 0.0},
+        {"mask_token_ids": [1], "objective": "unknown"},
+    ],
+)
 def test_config_rejects_invalid_values(kwargs):
     with pytest.raises(ValueError, match="gated_mtp"):
         GatedMTPConfig(**kwargs).build()
@@ -162,22 +169,25 @@ def test_mtp_depths_match_appending_the_mask_tokens_after_each_anchor():
     assert not torch.allclose(out.mtp_per_depth_h[0], ungated[:, seq_len : 2 * seq_len])
 
 
-def test_sampler_is_a_no_op_at_init_and_learns_after_one_step():
-    """The sampler's zero-initialized second layer must make it an exact identity at
-    construction, and an ordinary gradient step must break that symmetry."""
-    sampler = GatedMTPSampler(hidden_size=8, num_depths=3)
-    h = torch.randn(2, 5, 8)
-    prev_emb = torch.randn(2, 5, 8)
+def test_sampler_starts_with_a_normalized_feature_and_finite_gradients() -> None:
+    """The paper projects the normalized MLP feature, without a zero-init residual."""
+    torch.manual_seed(42)
+    sampler = GatedMTPSampler(hidden_size=128, num_depths=3)
+    h = torch.randn(2, 16, 128, requires_grad=True)
+    prev_emb = torch.randn(2, 16, 128, requires_grad=True)
 
     out = sampler(h, prev_emb)
     assert out.shape == h.shape
-    torch.testing.assert_close(out, h)
-
-    before = {name: p.detach().clone() for name, p in sampler.named_parameters()}
-    out.sum().backward()
-    opt = torch.optim.SGD(sampler.parameters(), lr=0.1)
+    torch.testing.assert_close(out.mean(-1), torch.zeros(2, 16), atol=1e-6, rtol=0)
+    torch.testing.assert_close(out.square().mean(-1), torch.ones(2, 16), atol=0.01, rtol=0)
+    target = torch.randn_like(out)
+    (out - target).square().mean().backward()
+    for grad in [h.grad, prev_emb.grad, *(p.grad for p in sampler.parameters())]:
+        assert grad is not None and torch.isfinite(grad).all()
+        assert torch.count_nonzero(grad) > 0
+    grad_norm = torch.nn.utils.clip_grad_norm_(sampler.parameters(), float("inf"))
+    assert grad_norm < 10
+    opt = torch.optim.Adam(sampler.parameters(), lr=1e-4)
     opt.step()
     after_out = sampler(h, prev_emb)
-
-    assert not torch.allclose(after_out, h)
-    assert any(not torch.allclose(before[name], p) for name, p in sampler.named_parameters())
+    assert 0 < (after_out - out).square().mean().sqrt() < 0.2
