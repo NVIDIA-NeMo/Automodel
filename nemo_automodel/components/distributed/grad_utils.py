@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union
+from collections.abc import Iterable
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -21,11 +21,11 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 
 
 def clip_grad_by_total_norm_(
-    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
-    max_grad_norm: Union[int, float],
+    parameters: Iterable[torch.Tensor | DTensor] | torch.Tensor | DTensor,
+    max_grad_norm: int | float,
     total_norm: float,
     dtype: torch.dtype = torch.float32,
-):
+) -> None:
     """Clips gradient of an iterable of parameters by total norm.
 
     Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/a695b2bd2a0ca9ca63385a48c41a1c5a033cdd1e/megatron/core/optimizer/clip_grads.py#L138
@@ -33,17 +33,21 @@ def clip_grad_by_total_norm_(
     Note that the gradients are modified in place.
 
     Args:
-        parameters (Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]]):
+        parameters (Iterable[torch.Tensor | DTensor] | torch.Tensor | DTensor):
             An iterable of Tensors or DTensors, or a single Tensor or DTensor
             that will have gradients normalized.
-        max_grad_norm (Union[float, int]): Maximum norm of the gradients.
+        max_grad_norm (float | int): Maximum norm of the gradients.
         total_norm (float): The pre-computed total norm of the gradients to use for scaling.
+        dtype (torch.dtype, optional): Data type to cast gradients for scaling. Defaults to torch.float32.
     """
+    params: Iterable[torch.Tensor | DTensor]
     if isinstance(parameters, (torch.Tensor, DTensor)):
-        parameters = [parameters]
+        params = [parameters]
+    else:
+        params = parameters
 
     # Grads.
-    grads = [to_local_if_dtensor(p.grad.detach()).to(dtype) for p in parameters if p.grad is not None]
+    grads = [to_local_if_dtensor(p.grad.detach()).to(dtype) for p in params if p.grad is not None]
 
     # Scale.
     clip_coeff = max_grad_norm / (total_norm + 1.0e-6)
@@ -54,10 +58,10 @@ def clip_grad_by_total_norm_(
 
 
 def get_grad_norm(
-    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
+    parameters: Iterable[torch.Tensor | DTensor] | torch.Tensor | DTensor,
     dp_cp_group: torch.distributed.ProcessGroup,
     tp_group: torch.distributed.ProcessGroup,
-    norm_type: Union[int, float] = 2,
+    norm_type: int | float = 2,
     dtype: torch.dtype = torch.float32,
 ) -> float:
     """Calculate the norm of gradients.
@@ -65,27 +69,30 @@ def get_grad_norm(
     Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/a695b2bd2a0ca9ca63385a48c41a1c5a033cdd1e/megatron/core/optimizer/clip_grads.py#L51
 
     Args:
-        parameters (Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]]):
+        parameters (Iterable[torch.Tensor | DTensor] | torch.Tensor | DTensor):
             An iterable of Tensors or DTensors, or a single Tensor or DTensor
             that will have gradient norm calculated.
-        dp_group (torch.distributed.ProcessGroup): Process group for data parallel communication.
-        cp_group (torch.distributed.ProcessGroup): Process group for context parallel communication.
+        dp_cp_group (torch.distributed.ProcessGroup): Process group for data and context parallel communication.
         tp_group (torch.distributed.ProcessGroup): Process group for tensor parallel communication.
-        norm_type (Union[int, float]): Type of the used p-norm. Can be ``'inf'`` for
+        norm_type (int | float): Type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
+        dtype (torch.dtype, optional): Data type for gradient conversion. Defaults to torch.float32.
 
     Returns:
         float: Total norm of the gradients (viewed as a single vector)
     """
+    params: Iterable[torch.Tensor | DTensor]
     if isinstance(parameters, (torch.Tensor, DTensor)):
-        parameters = [parameters]
+        params = [parameters]
+    else:
+        params = parameters
 
     # Grads.
-    grads_for_norm = [to_local_if_dtensor(p.grad.detach()).to(dtype) for p in parameters if p.grad is not None]
+    grads_for_norm = [to_local_if_dtensor(p.grad.detach()).to(dtype) for p in params if p.grad is not None]
 
     # Norm parameters.
     norm_type = float(norm_type)
-    total_norm = 0.0
+    total_norm: float = 0.0
 
     # Calculate norm.
     if norm_type == torch.inf:
@@ -98,15 +105,16 @@ def get_grad_norm(
         total_norm = total_norm_cuda[0].item()
 
     else:
+        total_norm_accum = torch.zeros(1, dtype=torch.float32)
         for grad in grads_for_norm:
             grad_norm = torch.norm(grad, norm_type)
-            total_norm += grad_norm**norm_type
+            total_norm_accum += grad_norm**norm_type
 
-        total_norm = total_norm.cuda()  # type: ignore
+        total_norm_cuda = total_norm_accum.cuda()
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
-        torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group)
+        torch.distributed.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group)
 
-        torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-        total_norm = total_norm.item() ** (1.0 / norm_type)  # type: ignore
+        torch.distributed.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+        total_norm = float(total_norm_cuda.item() ** (1.0 / norm_type))
 
     return total_norm
