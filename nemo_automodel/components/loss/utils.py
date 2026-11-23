@@ -138,6 +138,19 @@ def _get_final_hidden_states(model_output: Any) -> Any | None:
     return hidden_states
 
 
+def projected_logits_dtype(logits: object) -> torch.dtype | None:
+    """Return the dtype of the logits a model's forward returned, or None when it skipped the LM head.
+
+    Args:
+        logits: The output's logits: a Tensor of shape [..., vocab]; an empty Tensor of shape [..., 0], from a forward
+            called with ``compute_logits=False``; or any other value, such as a dict output without logits.
+
+    Returns:
+        The logits' dtype, or None when there are no logits to take it from.
+    """
+    return logits.dtype if isinstance(logits, torch.Tensor) and logits.shape[-1] > 0 else None
+
+
 def prepare_lm_weight(
     loss_fn: LinearCrossEntropy,
     model: nn.Module,
@@ -202,10 +215,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         if lm_weight is None:
             lm_weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
         if isinstance(loss_fn, ChunkedCrossEntropy):
-            logits = kwargs.get("logits")
-            loss_fn_kwargs["logits_dtype"] = kwargs.pop(
-                "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
-            )
+            loss_fn_kwargs["logits_dtype"] = kwargs.pop("logits_dtype", projected_logits_dtype(kwargs.get("logits")))
             unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
             head = _get_lm_head_module(unwrapped)
             loss_fn_kwargs["lm_head"] = head if isinstance(head, LMHead) else None

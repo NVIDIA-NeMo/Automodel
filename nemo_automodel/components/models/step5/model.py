@@ -382,6 +382,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         output_hidden_states: bool = False,
         labels: torch.Tensor | None = None,
         _packed_seq_ids: torch.Tensor | None = None,
+        compute_logits: bool = True,
         **kwargs: ConfigValue | torch.Tensor,
     ) -> CausalLMOutputWithPast | torch.Tensor:
         """Evaluate all local query positions.
@@ -394,6 +395,9 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             attention_mask: Optional tensor of shape [batch, local_sequence], one for valid tokens.
             padding_mask: Optional bool tensor of shape [batch, local_sequence], true for padding.
             logits_to_keep: Last-token count or tensor of sequence indices to project.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Return final hidden states for native fused CE.
             labels: Optional tensor of shape [batch, local_sequence] for serial HF-style shifted CE.
             _packed_seq_ids: Optional [batch, local_sequence] document IDs from native packing.
@@ -438,7 +442,10 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             return hidden
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden)
-        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         out = CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
         if labels is not None:
             if self.cp_mesh is not None and self.cp_mesh.size() > 1:

@@ -559,6 +559,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         cache_position: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> torch.Tensor | Step3p7CausalLMOutput:
         """Run one microbatch with direct or explicitly staged patch-based media.
@@ -574,6 +575,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             inputs_embeds: Optional embeddings [batch, sequence, hidden].
             cache_position: Optional cache positions [sequence].
             logits_to_keep: Number of trailing logits, or indices [selected_tokens].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Include final hidden states in the model output.
             **kwargs: Media pixels [images, channels, height, width], patch pixels
                 [patches, channels, height, width], patch counts [images], newline
@@ -705,9 +709,14 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             **kwargs,
         )
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)

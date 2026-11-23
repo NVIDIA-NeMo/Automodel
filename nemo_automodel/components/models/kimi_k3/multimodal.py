@@ -331,6 +331,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         output_hidden_states: bool | None = None,
         kimi_vlm_full_input: bool = False,
         kimi_vlm_token_order: torch.Tensor | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast | torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run text-only or multimodal K3 inputs.
@@ -350,6 +351,9 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             labels: Optional unshifted targets [batch, sequence], with ignore_index
                 at unsupervised positions. Native recipes compute loss externally.
             logits_to_keep: Trailing logit count or sequence indices [selected_tokens].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to return final hidden states.
             kimi_vlm_full_input: Whether CP left the primary token stream intact
                 for image embedding before contiguous sequence sharding.
@@ -441,6 +445,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             attention_mask=attention_mask,
             position_ids=position_ids,
             logits_to_keep=logits_to_keep,
+            compute_logits=compute_logits,
             output_hidden_states=output_hidden_states,
             **kwargs,
         )

@@ -377,6 +377,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Run Qwen3Next without unsupported packed FA4 recurrent attention.
@@ -388,6 +389,9 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 an explicit mask of shape [batch, 1, sequence, sequence].
             padding_mask: Optional padding mask of shape [batch, sequence].
             logits_to_keep: Number of trailing logits, or indices of shape [kept_tokens].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to return the final hidden states.
             **attn_kwargs: Attention metadata, including cumulative document
                 lengths of shape [documents + 1] and packed indices of shape [tokens].
@@ -418,7 +422,10 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()

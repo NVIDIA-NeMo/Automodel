@@ -152,6 +152,8 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
     )
     input_ids, labels, num_label_tokens = _batch()
     losses = []
+    head_calls = []
+    model.lm_head.register_forward_pre_hook(lambda module, args: head_calls.append(module))
 
     TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
         recipe,
@@ -162,6 +164,8 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         num_batches=1,
     )
 
+    # The model can skip its logits, so the step never runs the head; the loss projects the hidden states.
+    assert head_calls == []
     expected = _assert_matches_fp32_logits_ce(losses[0], reference, input_ids, labels, num_label_tokens)
     expected.backward()
     control_grads = _bf16_projection_gradients(control, input_ids, labels, num_label_tokens)

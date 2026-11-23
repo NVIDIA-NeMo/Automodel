@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``logits_to_keep`` on the M3 VLM forward, the contract the fused losses need.
+"""``compute_logits`` and ``logits_to_keep`` on the M3 VLM forward, the contract the fused losses need.
 
 The recipe decides whether a memory-efficient loss is usable by inspecting the
 forward signature (``_supports_logits_to_keep``), so absorbing the kwarg into
 ``**kwargs`` silently downgrades the configured ``loss_fn`` to a default
 ``MaskedCrossEntropy`` -- along with its ``fp32_upcast`` setting -- and
-materialises the ``[tokens, vocab_size]`` logits tensor.
+materialises the ``[tokens, vocab_size]`` logits tensor. A forward that declares
+``compute_logits`` (``_supports_compute_logits``) is then called without logits.
 """
 
 import pytest
@@ -26,7 +27,7 @@ import torch
 
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from nemo_automodel.components.utils.model_utils import _supports_compute_logits, _supports_logits_to_keep
 
 from .conftest import (
     IMAGE_TOKEN_INDEX,
@@ -62,17 +63,18 @@ def mtp_vlm_model(backend):
 
 
 def test_recipe_detects_logits_to_keep_support(vlm_model):
-    """The probe the trainer actually runs before keeping a fused loss."""
+    """The probes the trainer actually runs before keeping a fused loss and skipping the head."""
     assert _supports_logits_to_keep(vlm_model)
+    assert _supports_compute_logits(vlm_model)
 
 
-def test_logits_to_keep_returns_hidden_states_and_skips_lm_head(vlm_model):
+def test_compute_logits_false_returns_hidden_states_and_skips_lm_head(vlm_model):
     hidden_size = vlm_model.config.text_config.hidden_size
     vocab = vlm_model.config.text_config.vocab_size
     ids = torch.randint(2, 99, (1, 16))
 
     with torch.no_grad():
-        out = vlm_model(ids, logits_to_keep=1)
+        out = vlm_model(ids, compute_logits=False)
 
     # FusedLinearCrossEntropy reads this via `"hidden_states" not in out` then
     # get_final_hidden_states(out), so the mapping matters as much as the tensor.
@@ -95,14 +97,25 @@ def test_without_logits_to_keep_still_returns_logits(vlm_model):
     assert logits.shape == (1, 16, vocab)
 
 
-def test_logits_to_keep_with_mtp_raises(mtp_vlm_model):
+def test_logits_to_keep_projects_the_kept_positions(vlm_model):
+    vocab = vlm_model.config.text_config.vocab_size
+    ids = torch.randint(2, 99, (1, 16))
+
+    with torch.no_grad():
+        logits = vlm_model(ids, logits_to_keep=1)
+
+    torch.testing.assert_close(logits, vlm_model(ids)[:, -1:])
+    assert logits.shape == (1, 1, vocab)
+
+
+def test_compute_logits_false_with_mtp_raises(mtp_vlm_model):
     """MTP needs full logits, so the fused path must fail loudly rather than
     hand back a dict ``mtp_logits`` cannot consume."""
     mtp_vlm_model.train()
     ids = torch.randint(2, 99, (1, 16))
 
     with pytest.raises(NotImplementedError, match="num_mtp_modules"):
-        mtp_vlm_model(ids, logits_to_keep=1)
+        mtp_vlm_model(ids, compute_logits=False)
 
 
 def test_mtp_without_logits_to_keep_is_unaffected(mtp_vlm_model):

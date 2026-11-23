@@ -1036,6 +1036,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         cache_position: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> Qwen3_5MoeCausalLMOutputWithPast:
         """Run the text-only causal LM forward pass.
@@ -1063,6 +1065,9 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             logits_to_keep: ``0`` to project every position, a positive integer
                 to keep the last positions, or indices of shape
                 ``[kept_sequence]``.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to include final decoder states in the
                 output for the fused loss path.
             cache_position: Optional token positions of shape ``[sequence]``.
@@ -1096,9 +1101,14 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
@@ -1660,6 +1670,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         mtp_per_depth_valid_masks: tuple[torch.BoolTensor, ...] | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ):
         """Run Qwen3.5-MoE VLM generation with model-owned CP embedding.
@@ -1686,6 +1697,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 valid same-document future token.
             logits_to_keep: Number of trailing logits to retain, or indices of
                 shape ``[kept_sequence]``.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to expose final decoder states for the
                 fused loss path.
             **kwargs: Model inputs including image/video patch rows of shape
@@ -1829,9 +1843,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         hidden_states = outputs.last_hidden_state
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:

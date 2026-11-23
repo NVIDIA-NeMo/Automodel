@@ -1456,6 +1456,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         vision_token_types: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
         """Run causal language modeling with optional DSV4 visual inputs.
@@ -1474,6 +1475,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             vision_token_types: Visual types with layout ``[batch, sequence]``
                 and ``-1`` for text.
             logits_to_keep: Number or positions of logits to retain.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to expose final states.
 
         Returns:
@@ -1553,7 +1557,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if self._pp_return_hidden_states or self.lm_head is None:
             logits = hidden_states
         else:
-            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            if compute_logits:
+                logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            else:
+                logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

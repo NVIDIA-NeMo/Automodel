@@ -1296,6 +1296,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         video_grid_thw: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast | torch.Tensor:
         """Run the text or vision-language forward and project the kept positions to vocabulary logits.
@@ -1323,6 +1324,9 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             video_grid_thw: Optional int grid of shape [videos, 3] holding each video's (t, h, w) patch counts.
             logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
                 Tensor of shape [kept] keeps those positions.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether the output carries the final hidden states; None reads
                 ``config.output_hidden_states``.
             **kwargs: Backend metadata for the decoder: ``qkv_format``, int32 ``cu_seqlens`` and
@@ -1399,7 +1403,10 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         if output_hidden_states and is_thd and hidden.shape[0] == 1:
             # The TE THD sharder flattens labels to [T]. FusedLinearCrossEntropy
             # therefore consumes [T,H], while logits retain the public [1,T,V]

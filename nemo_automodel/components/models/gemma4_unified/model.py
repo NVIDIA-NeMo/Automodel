@@ -119,6 +119,8 @@ class Gemma4UnifiedForConditionalGeneration(
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         mm_encoder_outputs: dict[str, Any] | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> Gemma4UnifiedCausalLMOutputWithPast:
         """Hugging Face's forward, or the context-parallel forward once CP is set up.
@@ -157,6 +159,9 @@ class Gemma4UnifiedForConditionalGeneration(
             use_cache: Whether to return a KV cache; off under CP.
             logits_to_keep: Integer suffix length, or an index tensor ``[kept_positions]`` selecting the
                 returned positions.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             mm_encoder_outputs: Precomputed multimodal encoder outputs; not supported under CP.
             **kwargs: Remaining keyword arguments. Under CP, ``padding_mask`` (True = pad) and
                 ``_packed_seq_ids`` (0 = pad) carry this rank's slices to the ring.
@@ -260,9 +265,14 @@ class Gemma4UnifiedForConditionalGeneration(
             **kwargs,
         )
         hidden_states = text_outputs.last_hidden_state
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         if (final_logit_softcapping := text_config.final_logit_softcapping) is not None:
             logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
         return Gemma4UnifiedCausalLMOutputWithPast(logits=logits, hidden_states=text_outputs.hidden_states)

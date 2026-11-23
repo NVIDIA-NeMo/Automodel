@@ -129,6 +129,7 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
         position_ids: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool = False,
+        compute_logits: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
         """Fuse images into unpacked image/text sequences.
 
@@ -151,6 +152,9 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
             padding_mask: Optional boolean [batch, sequence], true for padding.
             position_ids: Optional integer [batch, sequence] consecutive positions.
             logits_to_keep: Tail length or sequence indices for the shared loss path.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Return final decoder features for external loss.
 
         Returns:
@@ -169,6 +173,7 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
                 padding_mask=padding_mask,
                 position_ids=position_ids,
                 logits_to_keep=logits_to_keep,
+                compute_logits=compute_logits,
                 output_hidden_states=output_hidden_states,
             )
         if pipeline_tensors:
@@ -250,5 +255,6 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
             padding_mask=padding_mask,
             position_ids=position_ids,
             logits_to_keep=logits_to_keep,
+            compute_logits=compute_logits,
             output_hidden_states=output_hidden_states,
         )

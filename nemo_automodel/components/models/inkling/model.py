@@ -236,6 +236,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> InklingCausalLMOutputWithPast | torch.Tensor:
         """Run native Inkling multimodal conditional generation.
@@ -254,6 +256,9 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             labels: Optional long tensor of shape ``[batch, sequence]``.
             use_cache: Whether to allocate and return a decoding cache.
             logits_to_keep: Number or indices of trailing logits to compute.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Additional text-attention arguments.
 
         Returns:
@@ -292,7 +297,10 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             return hidden_states
 
         hidden_states = hidden_states / self.config.text_config.logits_mup_width_multiplier
-        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         unpadded_vocab_size = self.config.text_config.unpadded_vocab_size
         if unpadded_vocab_size is not None and unpadded_vocab_size < logits.shape[-1]:
             logits = logits[..., :unpadded_vocab_size].contiguous()

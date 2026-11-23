@@ -376,6 +376,8 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         video_grid_thw: torch.LongTensor | None = None,
         output_hidden_states: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_hidden_states = (
@@ -399,9 +401,14 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
 
         hidden_states = outputs.last_hidden_state
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         if labels is not None:

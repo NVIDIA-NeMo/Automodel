@@ -1333,6 +1333,7 @@ class Gemma4ForConditionalGeneration(
         mm_token_type_ids: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ):
         """Run Gemma4, retaining native image policy for document-causal inputs.
@@ -1350,6 +1351,9 @@ class Gemma4ForConditionalGeneration(
             image_position_ids: Processor patch coordinates [images, patches, 2].
             mm_token_type_ids: Processor modality IDs [batch, sequence].
             logits_to_keep: Number of trailing logits or token indices [selected].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to retain decoder hidden states.
             **kwargs: Other native HF inputs, including original document IDs
                 ``_packed_seq_ids`` [batch, sequence] when packed.
@@ -1473,7 +1477,10 @@ class Gemma4ForConditionalGeneration(
                     **kwargs,
                 )
                 hidden_states = text_outputs.last_hidden_state
-                logits = self._dense_parallel_lm_head(hidden_states, logits_to_keep)
+                if compute_logits:
+                    logits = self._dense_parallel_lm_head(hidden_states, logits_to_keep)
+                else:
+                    logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
                 if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
                     logits = logits / final_logit_softcapping
                     logits = torch.tanh(logits)
@@ -1527,7 +1534,7 @@ class Gemma4ForConditionalGeneration(
             attention_mask = self.prepare_document_attention_mask(
                 attention_mask, mm_token_type_ids, kwargs.get("document_ids", kwargs.get("_packed_seq_ids"))
             )
-            return super().forward(
+            output = super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -1536,11 +1543,15 @@ class Gemma4ForConditionalGeneration(
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
                 mm_token_type_ids=mm_token_type_ids,
-                logits_to_keep=logits_to_keep,
+                # Hugging Face's forward always runs the head: without logits, project one position and drop it.
+                logits_to_keep=logits_to_keep if compute_logits else 1,
                 output_hidden_states=output_hidden_states,
                 past_key_values=kv_share_holder,
                 **kwargs,
             )
+            if not compute_logits:
+                output.logits = output.logits[..., :0]
+            return output
 
         # --- MoE forward path ---
         if cp_enabled:
@@ -1602,9 +1613,14 @@ class Gemma4ForConditionalGeneration(
 
         hidden_states = outputs.last_hidden_state
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping

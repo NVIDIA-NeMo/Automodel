@@ -369,6 +369,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Compute logits while preserving packed document and padding metadata.
@@ -389,6 +390,9 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 batches use dense FA4.
             logits_to_keep: Number of trailing positions to project, or position
                 indices of shape [selected_tokens].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to include final hidden states.
             **attn_kwargs: Backend metadata. Native FA4 packing passes int64
                 packed_token_indices of shape [batch, sequence] (row-local token
@@ -434,7 +438,10 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()

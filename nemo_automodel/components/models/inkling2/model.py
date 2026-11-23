@@ -489,6 +489,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         seq_lens_padded: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool = False,
+        compute_logits: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
         """Return unshifted text logits; the shared loss path owns the target shift.
 
@@ -519,6 +520,9 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 indices of shape [kept_sequence]. Used by the shared linear-loss path.
             output_hidden_states: Include final hidden states for external loss; targets
                 are already aligned by the caller and are never shifted here.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
 
         Returns:
             Logits of shape [batch, kept_sequence, vocab] in the head's logits_dtype, softcapped
@@ -533,7 +537,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         is_stage = self.embed_tokens is None or self.lm_head is None
         if is_stage:
             self._pipeline_layer_ids()
-            if output_hidden_states or not isinstance(logits_to_keep, int) or logits_to_keep != 0:
+            if output_hidden_states or not compute_logits or not isinstance(logits_to_keep, int) or logits_to_keep:
                 raise ValueError("Inkling2 PP requires full outputs and the external pipeline loss")
         if self.embed_tokens is None:
             if inputs_embeds is not None:
@@ -604,9 +608,12 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     raise ValueError("logits_to_keep must be nonnegative")
             elif logits_to_keep.ndim != 1 or logits_to_keep.dtype != torch.int64:
                 raise ValueError("logits_to_keep indices must be int64 [kept_sequence]")
-            selected = slice_logits_to_keep(hidden, logits_to_keep)
-            # The head projects in FP32 even with BF16 weights and returns its logits_dtype.
-            logits = self._project_logits(selected)
+            if compute_logits:
+                selected = slice_logits_to_keep(hidden, logits_to_keep)
+                # The head projects in FP32 even with BF16 weights and returns its logits_dtype.
+                logits = self._project_logits(selected)
+            else:
+                logits = hidden.new_empty((*hidden.shape[:-1], 0))
             if output_hidden_states:
                 # Automodel's loss contract consumes the final tensor here; HF
                 # annotates a tuple of per-layer states. Remove this boundary

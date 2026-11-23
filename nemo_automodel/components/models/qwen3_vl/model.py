@@ -348,6 +348,8 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> tuple | Qwen3VLCausalLMOutputWithPast:
         """Run Qwen3-VL, including its model-owned multimodal and CP paths.
@@ -378,6 +380,9 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                 ``[sequence]``.
             logits_to_keep: Number of trailing logits to return, or token indices
                 of shape ``[kept_sequence]``.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Additional Hugging Face language-model options. Packed
                 FlashAttention metadata contains cumulative sequence lengths of
                 shape ``[num_documents + 1]`` and scalar maximum lengths, or an
@@ -464,7 +469,10 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
             **kwargs,
         )
         hidden_states = text_outputs[0]
-        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)

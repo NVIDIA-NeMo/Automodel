@@ -839,6 +839,8 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         video_grid_thw: torch.Tensor | None = None,
         audio_values: list[torch.Tensor] | torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
         """Run causal language modeling for BSHD or packed THD multimodal inputs.
@@ -861,6 +863,9 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 one tensor or a list of variable-length tensors.
             logits_to_keep: Final token count, or indices [kept_tokens]; zero
                 selects every position.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             kwargs: Attention/packing metadata and model-owned media coordinates.
                 _thd_local_indices [local_tokens] selects from the current
                 microbatch's global padded stream; global media masks cover that
@@ -1032,7 +1037,12 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             # passed between non-final PP stages.
             logits = hidden_states
         else:
-            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep)) * self.config.output_multiplier
+            if compute_logits:
+                logits = (
+                    self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep)) * self.config.output_multiplier
+                )
+            else:
+                logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
             if self.config.output_soft_cap_temp is not None:
                 cap = float(self.config.output_soft_cap_temp)
                 logits = torch.tanh(logits / cap) * cap

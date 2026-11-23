@@ -243,6 +243,7 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
         qkv_format: str = "bshd",
         use_cache: bool = False,
         _mistral_packed_document_ids: torch.Tensor | None = None,
+        compute_logits: bool = True,
     ) -> CausalLMOutputWithPast | torch.Tensor | tuple[torch.Tensor, ...]:
         """Replace complete image grids and run the existing causal training path.
 
@@ -266,6 +267,9 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
                 [batch, local_sequence] under CP. Image tokens and delimiters are
                 masked on a copy before the existing shifted CE.
             logits_to_keep: Zero for all, positive tail length or int64 [kept_positions].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Return final hidden states in addition to logits.
             cu_seqlens: Optional packed integer [documents + 1] boundaries.
             seq_lens: Optional real document lengths [batch, documents], with
@@ -294,6 +298,7 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
                 padding_mask=padding_mask,
                 labels=labels,
                 logits_to_keep=logits_to_keep,
+                compute_logits=compute_logits,
                 output_hidden_states=output_hidden_states,
                 cu_seqlens=cu_seqlens,
                 seq_lens=seq_lens,
@@ -370,6 +375,7 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
             padding_mask=padding_mask,
             labels=labels,
             logits_to_keep=logits_to_keep,
+            compute_logits=compute_logits,
             output_hidden_states=output_hidden_states,
             cu_seqlens=cu_seqlens,
             seq_lens=seq_lens,

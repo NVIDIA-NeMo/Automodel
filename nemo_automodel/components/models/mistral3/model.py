@@ -579,6 +579,8 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (
@@ -599,9 +601,14 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         )
 
         hidden_states = outputs.last_hidden_state
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         if labels is not None:

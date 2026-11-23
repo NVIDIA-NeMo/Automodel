@@ -97,6 +97,7 @@ from nemo_automodel.components.loss.utils import (
     _get_loss_ignore_index,
     calculate_loss,
     prepare_lm_weight,
+    projected_logits_dtype,
 )
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
@@ -121,6 +122,7 @@ from nemo_automodel.components.utils.compile_utils import (
 )
 from nemo_automodel.components.utils.model_utils import (
     FreezeConfig,
+    _supports_compute_logits,
     _supports_logits_to_keep,
     _supports_seq_lens,
     filter_forward_kwargs,
@@ -1384,8 +1386,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             with train_ctx(), sync_ctx, te_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
+                    # The loss projects the hidden states itself: skip the LM head, and its FSDP all-gather, where the
+                    # model can, else project a single position.
+                    no_logits = {"compute_logits": False} if _supports_compute_logits(model) else {"logits_to_keep": 1}
+                    out = model(**{**batch, **no_logits, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
@@ -1407,7 +1411,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
                     if isinstance(self.loss_fn, ChunkedCrossEntropy):
-                        loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
+                        loss_distributed_kwargs["logits_dtype"] = projected_logits_dtype(getattr(out, "logits", None))
                 # Only forward the domain-mixture weights when configured, so
                 # loss paths that predate them keep their original signature.
                 if loss_weights is not None:

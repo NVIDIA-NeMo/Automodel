@@ -396,9 +396,13 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         pixel_values_videos: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> Glm5NextCausalLMOutputWithPast:
         """Run image splice, contiguous CP slicing, text decoding, the MTP head and lm head.
+
+        With ``compute_logits=False`` (off-PP), for fused-linear losses that consume the final hidden states
+        directly, the LM head does not run and the logits are empty, of shape [..., 0].
 
         In training with MTP enabled, each depth's future-token embedding is the
         spliced text/image embedding stream shifted left by ``depth`` inside its
@@ -473,7 +477,10 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             if output_hidden_states is not None
             else bool(getattr(self.config.text_config, "output_hidden_states", False))
         )
-        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         return Glm5NextCausalLMOutputWithPast(
             logits=logits,
             hidden_states=hidden if output_hidden_states else None,

@@ -906,6 +906,8 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         video_grid_thw: torch.Tensor | None = None,
         vision_mask: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Run the vision-language decoder and project the kept positions to scaled vocabulary logits.
@@ -934,6 +936,9 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             vision_mask: Optional bool mask of shape [batch, sequence], true at media tokens.
             logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
                 Tensor of shape [kept] keeps those positions.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Backend metadata for the decoder. Packed input sets ``qkv_format="thd"`` and passes
                 ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
                 ``max_seqlen``. A ``padding_mask`` here is ignored.
@@ -969,9 +974,14 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         output_multiplier = float(self.config.output_multiplier)
         soft_cap = self.config.output_soft_cap_temp
         logits = logits * output_multiplier

@@ -1239,6 +1239,8 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
         """Compute causal-LM logits and optional multi-token prediction states.
@@ -1256,6 +1258,9 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             use_cache: Whether to cache states; only False or None is supported.
             logits_to_keep: Trailing token count (zero means all), or position
                 indices of shape [selected_tokens] indexing the sequence axis.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Backbone arguments, including ``_packed_seq_ids`` of shape
                 [batch, sequence], ``packed_token_indices`` of shape [batch, sequence]
                 or [tokens], ``cu_seqlens`` of shape [batch, max_documents + 1] or
@@ -1281,7 +1286,10 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
@@ -1883,6 +1891,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
         mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         mtp_per_depth_valid_masks: tuple[torch.BoolTensor, ...] | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
         effective_use_cache = False if use_cache is None and self.training else use_cache
@@ -2025,7 +2035,10 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         )
 
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         if labels is not None:

@@ -735,6 +735,8 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         image_grid_hws=None,
         padding_mask=None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs,
     ):
         # Resolve from the text/decoder sub-config (the language model produces text logits).
@@ -768,6 +770,9 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
                 marks padding.
             logits_to_keep: Number of trailing positions to project, or indices
                 of shape [kept_sequence].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Attention metadata forwarded to the language model.
 
         Returns:
@@ -801,9 +806,14 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             **kwargs,
         )
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         if labels is not None and self.lm_head is not None:
