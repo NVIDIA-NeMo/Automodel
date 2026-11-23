@@ -1,29 +1,35 @@
 ---
 title: "CLM-v0.1-8B"
-description: "Post-train the CLM-v0.1-8B decision heads with NeMo AutoModel: embed states and options once with a frozen Qwen3-8B encoder, then train the heads with SFT and RL."
+description: "Post-train the CLM-v0.1-8B projection heads with NeMo AutoModel: embed states and options once with a frozen Qwen3-8B encoder, then train the heads with SFT and RL."
 slug: model-coverage/decision-models/contrastive-lm/CLM-v0.1-8B
 ---
 
 [CLM-v0.1-8B](https://huggingface.co/Contrastive-LM/CLM-v0.1-8B) is a Contrastive Language Model (CLM): two small
-projection heads, a state head and an action head, on top of a frozen
+projection heads (a state head and an action head) on top of a frozen
 [Qwen3-8B](/model-coverage/large-language-models/qwen/Qwen3-8B) encoder. The encoder embeds the state together with a
 question, and it embeds each option separately. The score of an option is the scaled cosine similarity between the
 projected state and option embeddings, and a softmax over the options of a question gives its answer distribution.
 Because options are embedded separately, their embeddings can be cached and reused.
 
-NeMo AutoModel keeps the encoder frozen, because the released heads and the publisher's serving cache depend on its
-exact embedding space. The recipe embeds every unique state and option text once, sharded across all GPUs, and caches
-the embeddings on disk. It then trains or evaluates only the heads, which have about 20M parameters, on rank 0.
+NeMo AutoModel keeps the encoder frozen, because the released heads and the action cache of the Contrastive-LM
+`clm-serve` server depend on its exact embedding space. The recipe embeds every unique state and option text once,
+sharded across all GPUs, and caches the embeddings on disk. It then trains or evaluates only the heads (about 20M
+parameters) on rank 0.
 
 ## Post-Train CLM-v0.1-8B
 
-Follow the [installation instructions](/get-started/installation) from a source checkout. Then, from the repository
-root, generate the fictional alert-triage records that the example configuration reads:
+Set up a source checkout of NeMo AutoModel as described in
+[Run Decision Models with NeMo AutoModel](/model-coverage/decision-models/overview#run-decision-models-with-nemo-automodel).
+Then, from the repository root, generate the fictional alert-triage records that the example configuration reads.
+The generator rejects an existing output directory, so skip this step if you already generated `data/soc_triage` for
+another decision model:
 
 ```bash
 PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
     --output-dir data/soc_triage --seed 7
 ```
+
+For the record format, see [Prepare Decision Records](/model-coverage/decision-models/overview#prepare-decision-records).
 
 Evaluate the released heads to record the baseline, and then run supervised fine-tuning (SFT):
 
@@ -40,22 +46,25 @@ automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode train 
     --train.eval_metric reward --output_dir runs/clm/rl
 ```
 
-Each run writes `metrics_validation.json` and `metrics_test.json` to its output directory. Training runs also save
-the selected heads as `heads.pt` in the `contrastive-lm` checkpoint format, so the publisher's `clm-serve` can load
-them through `CLM_CKPT`.
+Each run writes `metrics_validation.json` and `metrics_test.json` to its output directory. Training runs also save the
+heads with the best validation score for `train.eval_metric` as `heads.pt`. The RL command sets
+`--train.eval_metric reward`, so the RL stage keeps the heads with the best validation reward. If no epoch improves on
+the starting heads, `heads.pt` contains the starting heads. The file uses the checkpoint format of the
+`contrastive-lm` package, so the Contrastive-LM `clm-serve` server can load it through the `CLM_CKPT` environment
+variable, for example `CLM_CKPT=runs/clm/rl/heads.pt clm-serve`.
 
 <Note>
-The SFT stage uses the decision objective of NeMo AutoModel: label-smoothed cross-entropy, a Brier term, and a
-ranked-probability term for ordinal questions. It does not implement the publisher's soft preference-target
-fine-tuning objective.
+The SFT stage trains on the gold answers with the NeMo AutoModel decision objective: label-smoothed cross-entropy, a
+Brier term, and a ranked-probability term for ordinal questions. It does not implement the Contrastive-LM fine-tuning
+objective, which by default trains against annotator distributions (soft targets).
 </Note>
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Evaluate, fine-tune, and continue the released heads with RL | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clm_soc_triage.yaml). |
-| Follow the supervised and reward stages in a notebook | Follow the [CLM tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/01_clm_supervised_and_utility.ipynb). |
+| Evaluate and fine-tune the released heads, and then continue training with RL | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clm_soc_triage.yaml). |
+| Run the baseline, SFT, and optional RL stages in a notebook | Follow the [CLM tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/01_clm_supervised_and_utility.ipynb). |
 | Train the heads with a contrastive objective on cached features | Follow the [contrastive-heads notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/03_clm_contrastive_heads.ipynb). |
 
 ### Configuration
@@ -65,12 +74,16 @@ fine-tuning objective.
 | Strategy | Data-parallel embedding on every rank, then head training on rank 0 |
 | Processes | 8 per node in the example commands (`--nproc-per-node 8`) |
 | Trainable parameters | State head, action head, and logit scale (about 20M parameters) |
-| Frozen weights | The Qwen3-8B encoder (last-token pooling, L2 normalization, 2,048-token window) |
-| Feature cache | `encode.cache_dir`, which every rank must share, including ranks on other nodes |
-| Objectives | SFT with label smoothing, a Brier term, and a ranked-probability term for ordinal questions; RL by exact expected reward or group relative policy optimization (GRPO), with a Kullback-Leibler (KL) penalty to the starting heads |
+| Frozen weights | The Qwen3-8B encoder |
+| Encoding | Last-token pooling, L2 normalization, and a 2,048-token window that keeps the last tokens of longer inputs |
+| Feature cache | `encode.cache_dir`, on a file system that every rank can access, including ranks on other nodes |
+| SFT objective | Label-smoothed cross-entropy, a Brier term, and a ranked-probability term for ordinal questions |
+| RL objective | Exact expected reward (default) or group relative policy optimization (GRPO), selected with `loss.rl_objective`, with a Kullback-Leibler (KL) penalty to the starting heads and a gold-answer anchor term (`loss.anchor_weight`) |
 
-The cache key includes the encoder and tokenizer revisions and the truncation, pooling, normalization, precision, and
-library settings. Changing any of them creates a new cache instead of reusing stale embeddings.
+The cache key covers the encoder and tokenizer names and revisions, the input texts, the truncation, pooling,
+normalization, attention, and precision settings, and the installed Transformers version. Changing any of them creates
+a new cache instead of reusing stale embeddings. Set the encoder and tokenizer revisions to full 40-character commit
+IDs. The recipe rejects other values, such as the branch name `main`.
 
 ## Model Reference
 
@@ -78,7 +91,7 @@ library settings. Changing any of them creates a new cache instead of reusing st
 
 | Property | Value |
 | --- | --- |
-| Task | Typed decision scoring by state and option similarity |
+| Task | Typed decision scoring: one probability for every allowed option of every question, from state and option similarity |
 | **Architecture** | Frozen Qwen3-8B encoder with two CLM projection heads |
 | Projection heads | About 20M parameters |
 
@@ -88,6 +101,7 @@ library settings. Changing any of them creates a new cache instead of reusing st
 
 ## Related Resources
 
+- [Decision Models overview](/model-coverage/decision-models/overview)
 - [Decision post-training examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/README.md)
 - [Decision-model tutorials](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/README.md)
 - [CLM source code and checkpoint format](https://github.com/Contrastive-LM/CLM)

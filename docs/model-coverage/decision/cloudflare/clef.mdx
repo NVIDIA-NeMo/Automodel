@@ -1,24 +1,34 @@
 ---
 title: "clef"
-description: "Post-train Cloudflare's clef decision model with NeMo AutoModel: train its joint schema head on a frozen backbone, or add LoRA, with SFT and RL stages."
+description: "Post-train Cloudflare's clef decision model with NeMo AutoModel in SFT and RL stages: train the joint schema head on a frozen backbone, or add LoRA adapters."
 slug: model-coverage/decision-models/cloudflare/clef
 ---
 
-[Clef](https://huggingface.co/Cloudflare/clef) is Cloudflare's 27B multimodal decision model. Its backbone, post-trained
-from Qwen3.8-27B, reads a state and every question of a record in one forward pass. A small transformer, the joint
-schema head, then routes evidence from the state to each question and returns one logit per allowed option. NeMo
-AutoModel post-trains Clef with FSDP2 data parallelism. It can train the joint schema head on a frozen backbone, or
-train low-rank adaptation (LoRA) adapters on the language model together with the head.
+[Clef](https://huggingface.co/Cloudflare/clef) is Cloudflare's 27B multimodal decision model, post-trained from
+Qwen3.8-27B. Its backbone, which uses the Qwen3.5 architecture, reads a record's state and all of its questions in one
+forward pass. A small transformer, the joint schema head, then routes evidence from the state to each question and
+returns one logit per allowed option. NeMo AutoModel post-trains Clef with FSDP2 data parallelism. It can train the
+joint schema head on a frozen backbone, or train low-rank adaptation (LoRA) adapters on the language model together
+with the head. The recipe trains on text records. It does not support records with `images` or `videos`.
 
 ## Post-Train Clef
 
-Follow the [installation instructions](/get-started/installation) from a source checkout. Then, from the repository
-root, generate the fictional alert-triage records that the example configurations read:
+Set up a source checkout of NeMo AutoModel as described in
+[Run Decision Models with NeMo AutoModel](/model-coverage/decision-models/overview#run-decision-models-with-nemo-automodel).
+Then, from the repository root, generate the fictional alert-triage records that the example configurations read.
+The generator rejects an existing output directory, so skip this step if you already generated `data/soc_triage` for
+another decision model:
 
 ```bash
 PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
     --output-dir data/soc_triage --seed 7
 ```
+
+For the record format, see [Prepare Decision Records](/model-coverage/decision-models/overview#prepare-decision-records).
+
+The following commands use the LoRA configuration. To train only the joint schema head on a frozen backbone, replace
+`clef_soc_triage_lora.yaml` with `clef_soc_triage_heads.yaml`, and write to separate directories, such as
+`runs/clef_heads/base`, `runs/clef_heads/sft`, and `runs/clef_heads/rl`.
 
 Evaluate the released model to record the baseline, and then run supervised fine-tuning (SFT):
 
@@ -27,8 +37,8 @@ automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode 
 automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode train --loss.mode sft --output_dir runs/clef/sft
 ```
 
-To continue with reinforcement learning (RL) on the per-option rewards, initialize the next stage from the
-validation-selected SFT stage:
+To continue with reinforcement learning (RL) on the per-option rewards, initialize the RL stage from the SFT checkpoint
+with the best validation score:
 
 ```bash
 automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode train --loss.mode rl \
@@ -36,8 +46,9 @@ automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode 
     --train.eval_metric reward --output_dir runs/clef/rl
 ```
 
-Each run writes `metrics_validation.json` and `metrics_test.json` to its output directory. `init_from` loads the
-weights of the selected stage only; the optimizer and the learning-rate schedule start again.
+Each run writes `metrics_validation.json` and `metrics_test.json` to its output directory. The `init_from` setting
+loads only the weights of the selected checkpoint. The optimizer and the learning-rate schedule start fresh. Each
+training run needs a new output directory. To repeat a run, remove its directory or pass a different `--output_dir`.
 
 ## Choose a Workflow
 
@@ -45,23 +56,26 @@ weights of the selected stage only; the optimizer and the learning-rate schedule
 | --- | --- |
 | Train only the joint schema head on a frozen backbone | Use the [frozen-backbone configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clef_soc_triage_heads.yaml). |
 | Train LoRA adapters on the language model together with the joint schema head | Use the [LoRA configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clef_soc_triage_lora.yaml). |
-| Merge a LoRA stage into the layout of the Cloudflare release | Run [`export_clef_release.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/export_clef_release.py). |
-| Compare both workflows in a notebook | Follow the [Clef tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/02_clef_heads_or_lora.ipynb). |
+| Export a trained checkpoint in the layout of the Cloudflare release, merging any LoRA adapters | Run [`export_clef_release.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/export_clef_release.py). |
+| Run either workflow in a notebook | Follow the [Clef tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/02_clef_heads_or_lora.ipynb), and set `HEAD_ONLY` to choose the workflow. |
 
 ### Configuration
 
 | Setting | Configuration |
 | --- | --- |
-| Strategy | FSDP2 data parallelism; tp_size=1, cp_size=1, pp_size=1 |
-| Processes | 8 per node in the example commands (`--nproc-per-node 8`) |
-| Trainable parameters | Joint schema head (frozen-backbone configuration), or LoRA adapters (dim=32, alpha=64) and the joint schema head |
-| Frozen weights | The whole backbone in the frozen-backbone configuration; with LoRA, the base weights, the vision encoder, and the LM head |
-| Features | Activation checkpointing (LoRA configuration), FP32 joint schema head on every rank, validation-selected stage checkpoints |
-| Objectives | SFT with label smoothing, a Brier term, and a ranked-probability term for ordinal questions; RL by exact expected reward or group relative policy optimization (GRPO), with a Kullback-Leibler (KL) penalty to the starting stage |
+| Strategy | FSDP2 data parallelism only (`tp_size`, `cp_size`, and `pp_size` must be 1) |
+| Processes | 8 per node in the example commands (`--nproc-per-node 8`). Other process counts work if `train.global_batch_size` is divisible by `train.local_batch_size` times the process count. |
+| Trainable parameters | Joint schema head (frozen-backbone configuration), or LoRA adapters (`dim: 32`, `alpha: 64`) and the joint schema head |
+| Frozen weights | All original backbone weights in both configurations. The LoRA configuration adds no adapters to the vision encoder or the LM head. |
+| Features | Activation checkpointing (LoRA configuration), FP32 joint schema head replicated on every rank, validation-selected checkpoints |
+| SFT objective | Label-smoothed cross-entropy, a Brier term, and a ranked-probability term for ordinal questions |
+| RL objective | Exact expected reward (default) or group relative policy optimization (GRPO), selected with `loss.rl_objective`, with a Kullback-Leibler (KL) penalty to the starting checkpoint and a gold-answer anchor term (`loss.anchor_weight`) |
 
-Training requires `checkpoint.enabled: true`. Each stage saves the PEFT checkpoint under `model/` and the joint schema
-head under `head/`. The `LATEST` pointer selects the last saved stage, and `LOWEST_VAL` selects the stage with the
-best validation score.
+Training requires `checkpoint.enabled: true`. Each training run saves a checkpoint directory (`step_00000000`,
+`step_00000025`, and so on) before the first step, after every `train.val_every_steps` steps, and at the end. Every
+checkpoint stores the joint schema head under `head/`. In the LoRA configuration, it also stores the LoRA adapters
+under `model/`. The `LATEST` pointer selects the most recent checkpoint, and `LOWEST_VAL` selects the checkpoint with
+the best validation score for `train.eval_metric`.
 
 ## Model Reference
 
@@ -80,6 +94,7 @@ best validation score.
 
 ## Related Resources
 
+- [Decision Models overview](/model-coverage/decision-models/overview)
 - [Decision post-training examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/README.md)
 - [Decision-model tutorials](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/README.md)
 - [Clef on Hugging Face](https://huggingface.co/Cloudflare/clef)
