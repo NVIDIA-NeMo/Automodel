@@ -1,0 +1,47 @@
+---
+title: "LFM3-VL-2B"
+description: "Use LFM3-VL-2B with NeMo AutoModel for vision-language fine-tuning, with a documented checkpoint, a runnable recipe, setup guidance, and model reference details."
+slug: model-coverage/vision-language-models/liquidai/LFM3-VL-2B
+---
+
+[LFM3-VL-2B](https://huggingface.co/LiquidAI/LFM3-VL-2B) pairs the LFM3 language model with a vision encoder of gated 2D convolutions and bidirectional attention. It reads images and videos at their native resolution.
+The Hugging Face configuration declares the `Lfm3VlForConditionalGeneration` architecture.
+
+## Fine-Tune LFM3-VL-2B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/vlm_finetune/lfm3/lfm3_vl_2b_medpix.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) on MedPix | Use [lfm3_vl_2b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/lfm3/lfm3_vl_2b_medpix.yaml). Dataset: MedPix-VQA. |
+
+<Note>
+The checkpoint's processor configuration names image and video processors that exist only as remote code. NeMo AutoModel builds the equivalent Qwen2-VL image and Qwen3-VL video processors from the stored settings, the same mapping Transformers 5.23.0 uses, so `AutoProcessor.from_pretrained` works without `trust_remote_code`. The language model applies the rotary-embedding handling described for [LFM3-1.7B](/model-coverage/large-language-models/liquidai/LFM3-1.7B).
+</Note>
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| Architecture | `Lfm3VlForConditionalGeneration` |
+| Parameters | 2B |
+| Hugging Face Organization | [LiquidAI](https://huggingface.co/LiquidAI) |
+
+### Available Models
+
+| Model | HF ID |
+|---|---|
+| LFM3-VL 2B | [`LiquidAI/LFM3-VL-2B`](https://huggingface.co/LiquidAI/LFM3-VL-2B) |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)

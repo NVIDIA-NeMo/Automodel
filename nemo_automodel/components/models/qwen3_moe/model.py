@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import prepare_packed_metadata
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -193,6 +194,31 @@ class Qwen3MoeModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run decoder layers, preparing private FA4 THD metadata once per model call.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] or physical THD token IDs
+                of shape [tokens]. Pipeline stages after the first receive hidden states
+                of shape [batch, sequence, hidden] or [tokens, hidden] in this slot.
+            position_ids: Optional positions with the token layout of input_ids.
+            attention_mask: Optional [batch, sequence] padding mask or packed document
+                IDs, or a [batch, 1, sequence, sequence] dense mask. None for THD.
+            padding_mask: Optional bool mask with the token layout of input_ids, True at
+                padding, including physical THD padding between documents.
+            **attn_kwargs: Backend metadata. THD supplies int32 cu_seqlens and
+                cu_seqlens_padded of shape [documents + 1]. For FA4 THD this adds private
+                compact offsets of shape [documents + 1] and int64 packed_token_indices of
+                shape [valid_tokens] into the physical [tokens] axis, shared by every layer.
+                Inputs are not mutated.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden] or [tokens, hidden].
+        """
+        if self.backend.attn == "fa4" and attn_kwargs.get("qkv_format") == "thd":
+            prepared = prepare_packed_metadata(self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask})
+            if prepared is not None:
+                _, attn_kwargs = prepared
+                attn_kwargs.pop("padding_mask")
         if position_ids is None:
             position_ids = (
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
@@ -239,6 +265,7 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _uses_native_fa4: bool = True
     # Skip patch_hf_model_for_pp: this model's own forward already handles
     # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
     # owning stage; hidden states arrive in the input_ids slot) AND context
@@ -258,6 +285,20 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+
+    @property
+    def _owns_packed_attention(self) -> bool:
+        """Declare only this model's FA4 THD input path; other backends keep their contracts."""
+        return self.backend.attn == "fa4"
+
+    @property
+    def requires_thd_batch_preparation(self) -> bool:
+        """Request framework-owned raw token/label flattening for the FA4 path.
+
+        This requests CP1 batch conversion only, not context or pipeline
+        parallelism. TE retains its existing backend-owned preparation.
+        """
+        return self.backend.attn == "fa4"
 
     @classmethod
     def from_config(
@@ -324,6 +365,43 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Compute logits while preserving packed document and padding metadata.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or [1, tokens] for
+                pre-packed THD input. Pipeline stages after the first receive
+                hidden states of shape [batch, sequence, hidden] in this slot.
+            position_ids: Optional document-local positions of shape
+                [batch, sequence], or [1, tokens] for THD input.
+            attention_mask: Optional tensor of shape [batch, sequence] holding
+                either a padding mask (nonzero at valid tokens) or packed
+                1-based document IDs with zero at padding, or a dense mask of
+                shape [batch, 1, sequence, sequence] for backends that accept one.
+            padding_mask: Optional boolean tensor of shape [batch, sequence],
+                true at padding. Native FA4 derives its valid-token mask from it
+                when attention_mask is None and some token is padding; all-valid
+                batches use dense FA4.
+            logits_to_keep: Number of trailing positions to project, or position
+                indices of shape [selected_tokens].
+            output_hidden_states: Whether to include final hidden states.
+            **attn_kwargs: Backend metadata. Native FA4 packing passes int64
+                packed_token_indices of shape [batch, sequence] (row-local token
+                indices, -1 at padding), int32 cu_seqlens of shape
+                [batch, max_documents + 1] (row-local offsets, -1 at unused
+                entries) and an integer max_seqlen. The model-entry hook flattens
+                them to indices of shape [tokens] into the flattened
+                [batch * sequence] axis and offsets of shape [documents + 1];
+                already flattened metadata passes through unchanged.
+
+        Returns:
+            CausalLMOutputWithPast whose logits have shape [batch, sequence,
+            vocab], or [1, tokens, vocab] for THD input, along the positions
+            selected by logits_to_keep. Pipeline stages without the LM head
+            return their hidden states of shape [batch, sequence, hidden] as
+            logits. When output_hidden_states is true, hidden_states holds the
+            final hidden states with the same leading axes and a trailing
+            hidden axis; otherwise it is None.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -331,6 +409,16 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
+        # One host check per call keeps all-valid batches on the dense kernel; a mask makes
+        # every layer derive offsets and unpad, and THD prepares its own metadata.
+        if (
+            self.backend.attn == "fa4"
+            and not is_thd
+            and attention_mask is None
+            and padding_mask is not None
+            and bool(padding_mask.any())
+        ):
+            attention_mask = padding_mask.logical_not()
         if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs

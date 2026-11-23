@@ -1,5 +1,7 @@
 # Regression coverage for NVBug 6575831: FP32-storage BERT + LoRA under BF16 compute.
 # Uses random weights and a mock dataset, so no downloads are needed.
+# The final checkpoint is checked by check_lora_classifier_checkpoint.py: the classifier
+# trains in full next to LoRA (freeze_config) and must be saved with the adapter.
 
 step_scheduler:
   global_batch_size: 4
@@ -47,7 +49,7 @@ freeze_config:
   - glob: "*classifier"
 
 dataset:
-  _target_: nemo_automodel/components/datasets/llm/mock_seq_cls.py:MockSequenceClassificationDataset
+  _target_: nemo_automodel.components.datasets.llm.mock_seq_cls.MockSequenceClassificationDataset
   num_samples: 4
   num_labels: 2
   vocab_size: 256
@@ -66,5 +68,7 @@ optimizer:
   weight_decay: 0
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints_seq_cls_lora_fp32_test/
+  model_save_format: safetensors
+  save_consolidated: false

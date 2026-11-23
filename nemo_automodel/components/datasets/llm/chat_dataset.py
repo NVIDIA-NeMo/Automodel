@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Sequence, Union
 
-from datasets import VerificationMode, load_dataset
+from datasets import ReadInstruction, VerificationMode, load_dataset
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -54,20 +54,33 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
             yield x
 
 
-_SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
+# Hugging Face slice syntax: absolute or percent bounds, either may be negative,
+# e.g. ``train[1024:]``, ``train[-500:]``, ``train[:95%]`` or ``train[-5%:]``.
+_SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(-?\d+%?)?:(-?\d+%?)?\]$")
 
 
 def _parse_split_slice(split: str | None):
-    """Parse a split string like ``"train[1024:]"`` into ``(base_split, slice | None)``."""
+    """Parse a split string like ``"train[1024:]"`` into ``(base_split, bounds | None)``.
+
+    ``bounds`` is a ``(start, stop)`` pair of the raw bound strings (``None`` when a
+    bound is omitted). Resolve the split against a row count with ``_split_slice_indices``.
+    """
     if split is None:
         return split, None
     match = _SPLIT_SLICE_RE.match(split)
     if not match:
         return split, None
-    base = match.group(1)
-    start = int(match.group(2)) if match.group(2) else None
-    end = int(match.group(3)) if match.group(3) else None
-    return base, slice(start, end)
+    return match.group(1), (match.group(2), match.group(3))
+
+
+def _split_slice_indices(split: str, base_split: str, num_rows: int) -> range:
+    """Row indices selected by the slice in ``split`` out of ``num_rows`` rows.
+
+    Bounds are resolved by ``datasets.ReadInstruction`` so units, rounding and
+    range checks match ``load_dataset(..., split=split)``.
+    """
+    (instruction,) = ReadInstruction.from_spec(split).to_absolute({base_split: num_rows})
+    return range(instruction.from_, instruction.to)
 
 
 def _load_openai_messages(
@@ -112,8 +125,7 @@ def _load_openai_messages(
             dataset = dataset.shuffle(seed=shuffle_seed)
 
         if sl is not None:
-            indices = range(*sl.indices(len(dataset)))
-            dataset = dataset.select(indices)
+            dataset = dataset.select(_split_slice_indices(split, base_split, len(dataset)))
 
         return dataset
 
@@ -143,8 +155,7 @@ def _load_openai_messages(
             if shuffle_seed is not None:
                 dataset = dataset.shuffle(seed=shuffle_seed)
             if sl is not None:
-                indices = range(*sl.indices(len(dataset)))
-                dataset = dataset.select(indices)
+                dataset = dataset.select(_split_slice_indices(split, base_split, len(dataset)))
             return dataset
 
     # Fall back to manual JSON/JSONL parsing for local files.
@@ -189,9 +200,16 @@ def _load_openai_messages(
 
     # Honor a split slice such as ``train[:1024]`` like the HF and Parquet
     # branches do. Local rows are not shuffled, so the slice is in file order.
-    _, sl = _parse_split_slice(split)
+    base_split, sl = _parse_split_slice(split)
     if sl is not None:
-        rows = rows[sl]
+        rows = [rows[i] for i in _split_slice_indices(split, base_split, len(rows))]
+    elif split is not None and "[" in split:
+        # Returning every row here would silently turn a validation slice into
+        # the whole file, so reject slice syntax that cannot be applied.
+        raise ValueError(
+            f"Unsupported split slice {split!r} for local JSON/JSONL files; use e.g. "
+            "'train[:1024]', 'train[-500:]' or 'train[:95%]'"
+        )
 
     return rows
 
@@ -500,29 +518,6 @@ class ChatDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    @staticmethod
-    def _keep_last_supervised_run(seq: List[int], unsupervised_value: int) -> None:
-        """In place, keep only the final contiguous supervised run; mask the rest.
-
-        Supervised positions are those ``!= unsupervised_value`` (0 for ``loss_mask``,
-        -100 for ``labels``). Used for ``mask_history``: a multi-turn conversation has
-        one supervised run per assistant turn separated by unsupervised user turns;
-        this collapses it to the last turn so the supervised tokens form a single
-        suffix.
-        """
-        last = -1
-        for i in range(len(seq) - 1, -1, -1):
-            if seq[i] != unsupervised_value:
-                last = i
-                break
-        if last < 0:
-            return
-        start = last
-        while start - 1 >= 0 and seq[start - 1] != unsupervised_value:
-            start -= 1
-        for i in range(start):
-            seq[i] = unsupervised_value
-
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
         messages = row.get("messages")
@@ -562,17 +557,12 @@ class ChatDataset(Dataset):
             truncation=self.truncation,
             tools=tools,
             mask_reasoning_content=self.mask_reasoning_content,
+            # Restrict to the final turn inside format_chat_template, before the reasoning
+            # hole is cut: a post-hoc last-run collapse would mistake that hole for a turn
+            # boundary and drop the start of the final turn.
+            train_on_last_turn_only=self.mask_history,
             unshifted=self.unshifted,
             mask_generation_prompt=self.mask_generation_prompt,
             chat_template_kwargs=self.chat_template_kwargs,
         )
-        if self.mask_history:
-            # Collapse multi-turn supervision to the final assistant turn so the
-            # supervised tokens are a single contiguous suffix (prior turns become
-            # clean prompt context) — required by the block-diffusion response window
-            # and matching Google's prompt+single-response data model.
-            if "loss_mask" in sample:
-                self._keep_last_supervised_run(sample["loss_mask"], 0)
-            if "labels" in sample:
-                self._keep_last_supervised_run(sample["labels"], -100)
         return sample

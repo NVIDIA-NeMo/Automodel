@@ -14,9 +14,7 @@
 from __future__ import annotations
 
 import math
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -252,6 +250,23 @@ def test_default_collater_padding_mask_fallback_without_attention_mask() -> None
     assert torch.equal(collated["padding_mask"], expected)
 
 
+@pytest.mark.parametrize("omit_empty", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_default_collater_only_omits_empty_padding_masks(omit_empty: bool, padded: bool) -> None:
+    """Opting into implicit unpadded inputs must never hide real padding."""
+    batch = [{"input_ids": [1, 2, 3], "labels": [2, 3, -100]}]
+    if padded:
+        batch.append({"input_ids": [4, 5], "labels": [5, -100]})
+
+    result = sftp.default_collater(batch, omit_empty_padding_mask=omit_empty)
+
+    assert ("padding_mask" in result) is (padded or not omit_empty)
+    assert torch.equal(result["input_ids"][0], torch.tensor([1, 2, 3]))
+    assert torch.equal(result["labels"][0], torch.tensor([2, 3, -100]))
+    if padded:
+        assert torch.equal(result["padding_mask"], torch.tensor([[False, False, False], [False, False, True]]))
+
+
 def test_tokenize_function_strips_special_tokens(dummy_tokenizer: DummyTokenizer) -> None:
     """
     • Context trailing *eos* token must be removed.
@@ -401,20 +416,6 @@ def test_get_pad_token_from_key(val, expected):
 )
 def test_make_attention_mask_from_labels(ids, expected):
     assert sftp.make_attention_mask_from_labels(ids) == expected
-
-
-def test_create_causal_mask_mapping_uses_inputs_embeds_keyword() -> None:
-    """Mask creation must use the Transformers 5.3+ inputs_embeds keyword."""
-    with patch.object(sftp, "create_causal_mask", return_value="full_attention") as mock_create_causal:
-        mapping = sftp.create_causal_mask_mapping(
-            model_config=SimpleNamespace(),
-            batch_size=2,
-            seq_len=4,
-        )
-
-    assert mapping == {"full_attention": "full_attention"}
-    assert "inputs_embeds" in mock_create_causal.call_args.kwargs
-    assert "input_embeds" not in mock_create_causal.call_args.kwargs
 
 
 class TestPackedSequenceTHDCollater:

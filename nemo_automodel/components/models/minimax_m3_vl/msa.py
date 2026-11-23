@@ -91,9 +91,10 @@ def require_msa_support(attention: Any, backend: BackendConfig) -> None:
         # The fused scorer reports unscaled QK maxima, so only a reduction that is invariant under a
         # positive rescaling of the logits keeps the same ranking; logsumexp is not.
         raise ValueError(f"MSA requires sparse_score_type='max'; got {indexer.score_type!r}.")
-    if backend.te_fp8 is not None:
+    if backend.te_quantization is not None:
         raise NotImplementedError(
-            "MiniMax M3 MSA first supports BF16 projection only; set backend.te_fp8=None or use sparse_attn='generic'."
+            "MiniMax M3 MSA first supports BF16 projection only; unset backend.te_fp8 and backend.te_nvfp4 or use "
+            "sparse_attn='generic'."
         )
     if backend.rope_fusion:
         raise NotImplementedError(

@@ -1,34 +1,34 @@
 ---
 title: "Integrate Your Own Multi-Modal Dataset"
-description: ""
+description: "Integrate custom multi-modal and audio datasets into NeMo AutoModel, including preprocessing, collate functions, YAML configuration, and chat templates."
 position: 6
 ---
-This guide shows you how to integrate your own dataset into NeMo Automodel for training.
-You'll learn about **multi-modal datasets** that combine text with images or other modalities. We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
+This guide shows you how to integrate your own dataset into NeMo AutoModel for training.
+You will learn about **multi-modal datasets** that combine text with images or other modalities. The guide covers how to create custom datasets by implementing the required methods and preprocessing functions. It also shows how to define your own data logic in YAML configuration with file paths, without modifying the main codebase.
 
 ## Quick Start Summary
 | **Type**        |  **Use Case**    | **Example** | **Preprocessor**               | **Section**              |
 | --------------- | ------------------ | -------------- | --------------------------------- | --------------------------- |
-| 🖼️ Multi-modal  | Vision + Language  | MedPix-VQA     | `apply_chat_template`, collate fn | [Jump](#multi-modal-datasets) |
-| 🎤 Audio        | Speech + Language  | Common Voice 17| `apply_chat_template`, collate fn | [Jump](#audio-datasets) |
+| 🖼️ Multi-modal  | Vision and Language | MedPix-VQA     | `apply_chat_template`, collate function | [Multi-Modal Datasets](#multi-modal-datasets) |
+| 🎤 Audio        | Speech and Language | Common Voice 17| `apply_chat_template`, collate function | [Audio Datasets](#audio-datasets) |
 
-## Multi-modal Datasets
+## Multi-Modal Datasets
 
-Multi-modal datasets combine text with other input types (e.g., images, audio, or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
+Multi-modal datasets combine text with other input types (for example, images, audio, or video) and are essential for training Vision-Language Models (VLMs). These datasets introduce specific challenges such as aligning modalities, batching diverse data types, and formatting prompts for multi-turn, multi-modal dialogue.
 
-NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
+NeMo AutoModel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
 
-### Typical Types in Multi-modal Datasets
+### Typical Types in Multi-Modal Datasets
 A multi-modal dataset typically contains:
-- **Images, videos, audios** or other non-text modalities.
+- **Images, videos, audio,** or other non-text modalities.
 - **Textual inputs** such as questions, instructions, or captions.
 - **Answers** or expected outputs from the model.
 
-These are formatted into structured conversations or instruction-response pairs for use with VLMs like BLIP, Llava, or Flamingo.
+These are formatted into structured conversations or instruction-response pairs for use with VLMs such as BLIP, Llava, or Flamingo.
 
-#### Example: MedPix-VQA Dataset
+#### MedPix-VQA Dataset Example
 
-The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset is a comprehensive medical Visual Question Answering dataset designed for training and evaluating VQA models in the medical domain. It contains radiological images (from MedPix; well-known medial image dataset) and associated QA pairs used for medical image interpretation.
+The [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset is a comprehensive medical Visual Question Answering dataset designed for training and evaluating VQA models in the medical domain. It contains radiological images (from MedPix, a well-known medical image dataset) and associated QA pairs used for medical image interpretation.
 
 **Structure**:
 - 20,500 total examples
@@ -48,7 +48,7 @@ The example dataset preprocessing performs the following steps:
 
 1. Loads the dataset using Hugging Face's `datasets` library.
 2. Extracts the `question` and `answer`.
-3. Transforms the data into a chat-like format that is compatible with Hugging Face's Autoprocessor `apply_chat_template` function. For example:
+3. Transforms the data into a chat-like format that is compatible with Hugging Face's `AutoProcessor` `apply_chat_template` function. For example:
 
 ```python
 conversation = [
@@ -70,16 +70,16 @@ For more detailed examples of how to process multi-modal datasets for VLMs, see 
 
 ## Audio Datasets
 
-Audio datasets combine speech input with text transcriptions and are essential for training models capable of speech recognition and transcription tasks. NeMo Automodel supports audio dataset integration through specialized preprocessing functions and custom collate functions for multimodal models like Phi-4.
+Audio datasets combine speech input with text transcriptions and are essential for training models capable of speech recognition and transcription tasks. NeMo AutoModel supports audio dataset integration through specialized preprocessing functions and custom collate functions for multi-modal models such as Phi-4.
 
-### Example: Common Voice 17 Dataset
+### Common Voice 17 Dataset Example
 
 The [Common Voice 17](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed) dataset is a comprehensive speech recognition dataset containing audio clips and corresponding transcriptions. This particular version focuses on Turkish speech data and has been preprocessed and fixed for compatibility with modern training frameworks.
 
 **Structure**:
 - **Audio**: Speech recordings in various formats
 - **Transcription**: Text transcriptions of the spoken content
-- **Use case**: Speech-to-text transcription for multimodal models
+- **Use case**: Speech-to-text transcription for multi-modal models
 
 ```json
 {
@@ -101,15 +101,15 @@ For more detailed examples of how to process multi-modal datasets, see the examp
 
 ### Collate Functions
 
-NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
+NeMo AutoModel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
 
-Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a Hugging Face `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
+Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a Hugging Face `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. NeMo AutoModel provides [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
 
-## YAML-based Custom Dataset Configuration
+## YAML-Based Custom Dataset Configuration
 
-NeMo Automodel supports YAML-based dataset specification using the _target_ key. This lets you reference dataset-building classes or functions using either:
+NeMo AutoModel supports YAML-based dataset specification using the `_target_` key. This enables you to reference dataset-building classes or functions using either a Python dotted path or a file path and function name.
 
-- 1. Python Dotted Path
+To use a Python dotted path, specify the full import path:
 
 ```yaml
 dataset:
@@ -118,13 +118,13 @@ dataset:
   split: train
 ```
 
-- 2. File Path + Function Name
+To use a file path and function name, specify the following format:
 
 ```
 <file-path>:<function-name>
 ```
 
-Where:
+The pattern has the following parts:
 - `<file-path>`: The absolute path to a Python file containing your dataset function
 - `<function-name>`: The name of the function to call from that file
 
@@ -133,7 +133,12 @@ dataset:
   _target_: /path/to/your/custom_dataset.py:build_my_dataset
   num_blocks: 111
 ```
-This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
+This calls `build_my_dataset()` from the specified file with the other keys (for example, `num_blocks`) as arguments. This approach enables you to integrate custom datasets through config alone, with no need to alter the codebase or package structure.
+
+<Note>
+Loading the file runs its code, so NeMo AutoModel loads a file from outside the installed package only after you opt in. Launch with `NEMO_ENABLE_USER_MODULES=1 automodel my_config.yaml`, and only load files that you trust.
+
+</Note>
 
 ## DataLoader Workers
 
@@ -160,7 +165,7 @@ validation_dataloader:
 
 Custom datasets and collators run in worker processes and must prepare data on
 the CPU. Move batches to the GPU in the training process. All VLM loaders use
-worker processes; `num_workers: 1` selects one worker. Prefetched tensor batches
+worker processes. Setting `num_workers: 1` selects one worker. Prefetched tensor batches
 use shared memory, so size container shared memory for your batches and worker count.
 
 Automatic and explicit positive worker counts can resume checkpoints saved by
@@ -169,7 +174,7 @@ to worker processes. Sampler position and order are preserved. Preprocessing tha
 depends on worker-local state, including random transforms, can differ when moving
 to workers or changing their count. Worker checkpoints can change count when no
 per-worker dataset or iterator state was saved. Otherwise, restore with the saved
-worker count; changing it raises an error during checkpoint loading.
+worker count. Changing it raises an error during checkpoint loading.
 
 ## Custom Chat Template
 
@@ -182,15 +187,16 @@ dataset:
   chat_template: /path/to/template.jinja
 ```
 
-Accepted values:
-- A Jinja template string (e.g., `"{% for msg in messages %}..."`)
+The `chat_template` field accepts the following values:
+- A Jinja template string (for example, `"{% for msg in messages %}..."`)
 - A path to a `.jinja` template file
-- A path to a JSON file containing a `chat_template` key (e.g., `tokenizer_config.json`)
+- A path to a JSON file containing a `chat_template` key (for example, `tokenizer_config.json`)
 
 The override is applied to both `processor.chat_template` and `processor.tokenizer.chat_template` before dataset loading.
 
 ## Troubleshooting Tips
 
-- **Tokenization Mismatch?** Ensure your tokenizer aligns with the model's expected inputs.
-- **Dataset too large?** Use `limit_dataset_samples` in your YAML config to load a subset, useful for quick debugging.
-- **Loss not decreasing?** Verify that your loss mask correctly ignores prompt tokens.
+Use the following checks when dataset training does not behave as expected:
+- **Tokenization mismatch:** Ensure your tokenizer aligns with the model's expected inputs.
+- **Dataset too large:** Use `limit_dataset_samples` in your YAML config to load a subset, which is useful for quick debugging.
+- **Loss not decreasing:** Verify that your loss mask correctly ignores prompt tokens.

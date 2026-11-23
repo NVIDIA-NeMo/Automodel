@@ -56,7 +56,6 @@ from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
-from torch.nn.parallel import DistributedDataParallel
 from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
@@ -92,6 +91,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_cloud_path,
     is_rank_0,
     materialize_missing_tied_lm_head,
+    unwrap_ddp_model,
 )
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import get_torch_version
@@ -224,13 +224,6 @@ def load_torch_ckpt(
         raise RuntimeError(_format_restricted_load_error(f)) from err
 
 
-def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
-    """Return the module that owns model metadata hidden by DDP."""
-    if isinstance(model, DistributedDataParallel):
-        return model.module
-    return model
-
-
 def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None) -> bool:
     """Return whether this load requires checkpoint dequantization.
 
@@ -250,7 +243,7 @@ def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None)
     if requested is False:
         return False
 
-    quantization_config = getattr(getattr(_unwrap_ddp_model(model), "config", None), "quantization_config", None)
+    quantization_config = getattr(getattr(unwrap_ddp_model(model), "config", None), "quantization_config", None)
     if isinstance(quantization_config, dict):
         quantization_method = quantization_config.get("quant_method")
     else:
@@ -275,7 +268,7 @@ def _get_shared_parameter_names(model_parts: list[nn.Module]) -> list[list[str]]
     """
     names_by_parameter: dict[int, list[str]] = {}
     for part in model_parts:
-        for name, parameter in _unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
+        for name, parameter in unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
             names_by_parameter.setdefault(id(parameter), []).append(canonical_parameter_fqn(name))
     return [names for names in names_by_parameter.values() if len(names) > 1]
 
@@ -307,7 +300,7 @@ def _apply_adapter_forced_dtype_mapping(
     fqn_to_dtype_mapping: dict[str, str],
 ) -> dict[str, str]:
     """Let model adapters override original HF dtype metadata for export-only keys."""
-    model = _unwrap_ddp_model(model)
+    model = unwrap_ddp_model(model)
     adapter = getattr(model, "state_dict_adapter", None)
     forced_dtype_mapping = getattr(adapter, "forced_hf_dtype_mapping", None)
     if not callable(forced_dtype_mapping):
@@ -777,6 +770,7 @@ class Checkpointer:
                 hf_metadata_dir=hf_metadata_dir,
                 tokenizer=tokenizer,
                 peft_config=peft_config,
+                exported_tensor_names=tuple(state_dict),
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
@@ -1077,7 +1071,7 @@ class Checkpointer:
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
-        has_state_dict_adapter = hasattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter")
+        has_state_dict_adapter = hasattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter")
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
@@ -1114,7 +1108,7 @@ class Checkpointer:
             world_size = torch.distributed.get_world_size()
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        state_dict_adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         uses_standard_hf_state_dict = state_dict_adapter is None
         can_use_low_memory_dcp = not should_dequantize_base_checkpoint and (
             uses_standard_hf_state_dict
@@ -1279,7 +1273,7 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
-        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         checkpoint_key_aliases = dict(getattr(adapter, "checkpoint_key_aliases", {}))
         applied_key_aliases: dict[str, str] = {}
         checkpoint_metadata = {}
@@ -1439,7 +1433,7 @@ class Checkpointer:
         # them), so they are absent from the returned state_dict but ARE loaded. The adapter
         # tracks them (reset + populated entirely inside from_hf); count them as loaded for the
         # diff to avoid false "missing" warnings while genuinely unloaded params are still flagged.
-        _adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        _adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         loaded_keys_for_diff |= getattr(_adapter, "view_loaded_native_keys", None) or set()
         if allow_checkpoint_key_subset:
             # Keys deliberately kept at init were already warned about above; keep
@@ -1690,6 +1684,9 @@ class Checkpointer:
                 is_init_step=True,
                 key_mapping=key_mapping,
             )
+            # DoRA magnitudes are derived from the base weight, which only now holds checkpoint values.
+            # An adapter checkpoint restored later still overwrites them.
+            _init_dora_magnitudes(model)
 
         _reinit_non_persistent_buffers(model, device, model_type=model_type)
 
@@ -2244,7 +2241,7 @@ fi
         if not _should_write_hf_metadata(self.config):
             return None
 
-        model = _unwrap_ddp_model(model_state.model[0])
+        model = unwrap_ddp_model(model_state.model[0])
         normalized_dtype_mapping: dict[str, str] = {}
         reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
@@ -2604,8 +2601,22 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
         if hasattr(module, "init_lora_weights"):
             try:
                 module.init_lora_weights(peft_init_method)
+            except ValueError:
+                raise
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _init_dora_magnitudes(model: nn.Module) -> None:
+    """
+    Set every DoRA magnitude vector to the row-wise L2 norm of its module's current base weight.
+
+    Args:
+        model: Model whose DoRA modules (``use_dora=True`` with an ``init_dora_magnitude`` method) are updated.
+    """
+    for module in model.modules():
+        if getattr(module, "use_dora", False) and hasattr(module, "init_dora_magnitude"):
+            module.init_dora_magnitude()
 
 
 _MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(
@@ -3050,7 +3061,7 @@ def _maybe_adapt_state_dict_to_hf(
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
-    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    adapter = getattr(unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
@@ -3388,7 +3399,7 @@ def _maybe_adapt_state_dict_from_hf(
     the checkpoint's automodel_peft_config.json (see _read_paramwrapper_layout_metadata),
     so the adapter resolves the peft ParamWrapper layout from metadata instead of shapes.
     """
-    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    adapter = getattr(unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh

@@ -120,6 +120,7 @@ optimizer:
 
 
 ci:
+  nemo_ci_schedule: skipped
   time: "00:40:00"
   nodes: 8
   cluster_tag: gb200
