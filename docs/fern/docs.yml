@@ -902,6 +902,11 @@ redirects:
     destination: "/nemo/automodel/nightly/model-coverage/multimodal/bytedance-seed"
   - source: "/nemo/automodel/model-coverage/multimodal/bytedance-seed/bagel"
     destination: "/nemo/automodel/model-coverage/multimodal/bytedance-seed"
+  # Decision models moved from Multimodal to their own section; only nightly published these routes.
+  - source: "/nemo/automodel/nightly/model-coverage/multimodal/liquidai"
+    destination: "/nemo/automodel/nightly/model-coverage/decision-models/liquidai"
+  - source: "/nemo/automodel/nightly/model-coverage/multimodal/liquidai/d1-3B"
+    destination: "/nemo/automodel/nightly/model-coverage/decision-models/liquidai/d1-3B"
   - source: "/nemo/automodel/nightly/model-coverage/omni/microsoft/phi-4-multimodal"
     destination: "/nemo/automodel/nightly/model-coverage/omni/microsoft"
   - source: "/nemo/automodel/model-coverage/omni/microsoft/phi-4-multimodal"

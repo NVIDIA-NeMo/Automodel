@@ -1,0 +1,85 @@
+---
+title: "clef"
+description: "Post-train Cloudflare's clef decision model with NeMo AutoModel: train its joint schema head on a frozen backbone, or add LoRA, with SFT and RL stages."
+slug: model-coverage/decision-models/cloudflare/clef
+---
+
+[Clef](https://huggingface.co/Cloudflare/clef) is Cloudflare's 27B multimodal decision model. Its backbone, post-trained
+from Qwen3.8-27B, reads a state and every question of a record in one forward pass. A small transformer, the joint
+schema head, then routes evidence from the state to each question and returns one logit per allowed option. NeMo
+AutoModel post-trains Clef with FSDP2 data parallelism. It can train the joint schema head on a frozen backbone, or
+train low-rank adaptation (LoRA) adapters on the language model together with the head.
+
+## Post-Train Clef
+
+Follow the [installation instructions](/get-started/installation) from a source checkout. Then, from the repository
+root, generate the fictional alert-triage records that the example configurations read:
+
+```bash
+PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+    --output-dir data/soc_triage --seed 7
+```
+
+Evaluate the released model to record the baseline, and then run supervised fine-tuning (SFT):
+
+```bash
+automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode eval --output_dir runs/clef/base
+automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode train --loss.mode sft --output_dir runs/clef/sft
+```
+
+To continue with reinforcement learning (RL) on the per-option rewards, initialize the next stage from the
+validation-selected SFT stage:
+
+```bash
+automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode train --loss.mode rl \
+    --init_from runs/clef/sft/LOWEST_VAL --train.epochs 1 --optimizer.lr 2.0e-5 --head_optimizer.lr 1.0e-5 \
+    --train.eval_metric reward --output_dir runs/clef/rl
+```
+
+Each run writes `metrics_validation.json` and `metrics_test.json` to its output directory. `init_from` loads the
+weights of the selected stage only; the optimizer and the learning-rate schedule start again.
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Train only the joint schema head on a frozen backbone | Use the [frozen-backbone configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clef_soc_triage_heads.yaml). |
+| Train LoRA adapters on the language model together with the joint schema head | Use the [LoRA configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clef_soc_triage_lora.yaml). |
+| Merge a LoRA stage into the layout of the Cloudflare release | Run [`export_clef_release.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/export_clef_release.py). |
+| Compare both workflows in a notebook | Follow the [Clef tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/02_clef_heads_or_lora.ipynb). |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Strategy | FSDP2 data parallelism; tp_size=1, cp_size=1, pp_size=1 |
+| Processes | 8 per node in the example commands (`--nproc-per-node 8`) |
+| Trainable parameters | Joint schema head (frozen-backbone configuration), or LoRA adapters (dim=32, alpha=64) and the joint schema head |
+| Frozen weights | The whole backbone in the frozen-backbone configuration; with LoRA, the base weights, the vision encoder, and the LM head |
+| Features | Activation checkpointing (LoRA configuration), FP32 joint schema head on every rank, validation-selected stage checkpoints |
+| Objectives | SFT with label smoothing, a Brier term, and a ranked-probability term for ordinal questions; RL by exact expected reward or group relative policy optimization (GRPO), with a Kullback-Leibler (KL) penalty to the starting stage |
+
+Training requires `checkpoint.enabled: true`. Each stage saves the PEFT checkpoint under `model/` and the joint schema
+head under `head/`. The `LATEST` pointer selects the last saved stage, and `LOWEST_VAL` selects the stage with the
+best validation score.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Typed decision scoring: one probability for every allowed option of every question |
+| **Architecture** | `Qwen3_5ForConditionalGeneration` backbone with a joint schema head |
+| Backbone | 27B, post-trained from Qwen3.8-27B, with its vision encoder |
+| Joint schema head | About 128M parameters, trained in FP32 |
+
+### Available Models
+
+- [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef): the example configurations pin revision `ed3eed331870db2eff4b0db01237128ede8a00ce`.
+
+## Related Resources
+
+- [Decision post-training examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/README.md)
+- [Decision-model tutorials](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/README.md)
+- [Clef on Hugging Face](https://huggingface.co/Cloudflare/clef)
