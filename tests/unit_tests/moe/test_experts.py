@@ -55,6 +55,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    GroupedExpertsTE,
     _apply_bias,
     _checkpointed_chunked_expert_mlp,
     _DeterministicBiasRepeatInterleave,
@@ -2614,6 +2615,146 @@ def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
     with patch("torch.tensor", side_effect=AssertionError("Must reject before creating device splits")):
         with pytest.raises(ValueError, match="Set te_grouped_tensor=False"):
             experts(*args)
+
+
+class _CountingDispatcher:
+    """Dispatcher stand-in returning per-expert counts as an int32 tensor, as the flex dispatchers do."""
+
+    def __init__(self, counts: list[int]) -> None:
+        self.counts = torch.tensor(counts, dtype=torch.int32)
+
+    def token_permutation2(
+        self, hidden_states: torch.Tensor, token_probs: torch.Tensor, **kwargs: int | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pass the rows through as if every one were dispatched to this rank.
+
+        Args:
+            hidden_states: Tensor of shape [rows, hidden].
+            token_probs: Tensor of shape [rows, top_k].
+            **kwargs: Routing arguments of the real dispatcher (row count, [rows, top_k] expert indices); unused.
+
+        Returns:
+            ``hidden_states`` itself, the int32 counts of shape [local_experts], and the first routing
+            probability of every row, of shape [rows].
+        """
+        return hidden_states, self.counts, token_probs[:, 0]
+
+    def token_unpermutation(self, values: torch.Tensor) -> torch.Tensor:
+        """Return the expert outputs unchanged.
+
+        Args:
+            values: Tensor of shape [rows, hidden].
+
+        Returns:
+            ``values`` itself.
+        """
+        return values
+
+
+def _gate_half_times_probs(values: torch.Tensor, probabilities: torch.Tensor) -> torch.Tensor:
+    """Expert activation stand-in: the gate half of the projection, scaled by the routing probability.
+
+    Args:
+        values: Tensor of shape [rows, 2 * inter_dim], the gate half first.
+        probabilities: Tensor of shape [rows, 1].
+
+    Returns:
+        Tensor of shape [rows, inter_dim].
+    """
+    return values.chunk(2, -1)[0] * probabilities
+
+
+def _native_te_experts(moe_config: MoEConfig, counts: list[int]) -> tuple[GroupedExpertsTE, list[torch.Tensor]]:
+    """Build grouped-tensor TE experts over the CPU stand-ins and record the split sizes each GEMM receives."""
+    experts = GroupedExpertsTE(
+        moe_config, backend=BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=True)
+    )
+    mesh = Mock()
+    mesh.size.return_value = 1
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+    experts.token_dispatcher = _CountingDispatcher(counts)
+    experts.expert_activation = _gate_half_times_probs
+    seen: list[torch.Tensor] = []
+
+    def record_splits(module: torch.nn.Module, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+        """Keep the split sizes of one grouped GEMM call.
+
+        Args:
+            module: The grouped linear being called.
+            inputs: Its positional arguments: rows of shape [rows, features] and split sizes of shape
+                [local_experts].
+        """
+        seen.append(inputs[1])
+
+    for layer in (experts.gate_up_linear, experts.down_linear):
+        layer.register_forward_pre_hook(record_splits)
+    return experts, seen
+
+
+def test_te_grouped_tensor_feeds_dispatcher_counts_without_a_host_read(moe_config, fake_native_te, monkeypatch):
+    """Without a quantization recipe the grouped-tensor GEMMs take the dispatcher's counts as an int64 tensor and
+    the layer never materializes them on the host."""
+    counts = [3, 0, 2] + [0] * (moe_config.n_routed_experts - 3)
+    experts, seen = _native_te_experts(moe_config, counts)
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.experts._resolve_m_splits",
+        Mock(side_effect=AssertionError("split sizes must stay on the device")),
+    )
+    x = torch.randn(5, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    weights = torch.rand(5, 1, dtype=moe_config.dtype)
+    out = experts(x, torch.ones(5, dtype=torch.bool), weights, torch.zeros(5, 1, dtype=torch.long))
+
+    assert out.shape == x.shape
+    assert len(seen) == 2
+    for splits in seen:
+        assert splits.dtype == torch.int64
+        assert splits.tolist() == counts
+
+
+def test_te_grouped_tensor_keeps_host_split_sizes_under_a_quantization_recipe(moe_config, fake_native_te):
+    """A quantization recipe pads every expert segment to a block multiple on the host, so the host list stays."""
+    counts = [5] + [0] * (moe_config.n_routed_experts - 1)
+    experts, seen = _native_te_experts(moe_config, counts)
+    recipe = Mock()
+    recipe.mxfp8.return_value = True
+    recipe.float8_block_scaling.return_value = False
+    fake_native_te.state.is_fp8_enabled.return_value = True
+    fake_native_te.state.get_fp8_recipe.return_value = recipe
+    padded: list[list[int]] = []
+
+    def record_padding(module: torch.nn.Module, inputs: tuple[torch.Tensor, list[int]]) -> None:
+        """Keep the split sizes of one padding call.
+
+        Args:
+            module: The padding module being called.
+            inputs: Its positional arguments: rows of shape [rows, features] and the host list of split sizes.
+        """
+        padded.append(inputs[1])
+
+    experts.native_fp8_padding.register_forward_pre_hook(record_padding)
+    x = torch.randn(5, moe_config.dim, dtype=moe_config.dtype)
+    experts(x, torch.ones(5, dtype=torch.bool), torch.rand(5, 1, dtype=x.dtype), torch.zeros(5, 1, dtype=torch.long))
+
+    assert padded == [counts, counts]
+    assert [splits.tolist() for splits in seen] == [counts, counts]
+
+
+def test_te_grouped_tensor_takes_the_empty_dispatch_branch_from_the_buffer_extent(moe_config, fake_native_te):
+    """A rank that receives no rows skips the grouped GEMMs, decided from the dispatched buffer's row count."""
+    experts, seen = _native_te_experts(moe_config, [0] * moe_config.n_routed_experts)
+    for layer in (experts.gate_up_linear, experts.down_linear):
+        layer.weight0 = layer.weight
+    x = torch.randn(0, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    weights = torch.rand(0, 1, dtype=moe_config.dtype)
+    out = experts(x, torch.ones(0, dtype=torch.bool), weights, torch.zeros(0, 1, dtype=torch.long))
+    out.sum().backward()
+
+    assert out.shape == (0, moe_config.dim)
+    assert seen == []
+    for layer in (experts.gate_up_linear, experts.down_linear):
+        assert layer.weight.grad is not None and torch.count_nonzero(layer.weight.grad) == 0
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")

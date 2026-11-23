@@ -2482,14 +2482,29 @@ class GroupedExpertsTE(nn.Module):
         if self.config.apply_router_weight_after_down:
             permuted_probs = torch.ones_like(permuted_probs)
 
-        m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
-        if self.static_routing and self._static_m_splits is None:
-            self._static_m_splits = m_splits
-
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
         recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8_active else None
+
+        # TE's grouped-tensor GEMM reads its split sizes on the device. Without a quantization recipe nothing
+        # else in this layer needs them on the host (no padding to a block multiple), so the dispatcher's
+        # counts go to the GEMMs as a device tensor and the forward and its checkpoint recompute skip the
+        # device-to-host read. A dispatched buffer holds exactly sum(tokens_per_expert) rows here (capacity
+        # mode is rejected in __init__), so its leading extent answers the empty-dispatch check on the host.
+        device_m_splits: torch.Tensor | None = None
+        if self.use_grouped_tensor and recipe is None and isinstance(tokens_per_expert, torch.Tensor):
+            device_m_splits = tokens_per_expert.to(
+                device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
+            )
+            m_splits: list[int] = []
+            has_dispatched_rows = permuted_local_hidden_states.shape[0] > 0
+        else:
+            m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
+            if self.static_routing and self._static_m_splits is None:
+                self._static_m_splits = m_splits
+            has_dispatched_rows = sum(m_splits) > 0
+
         if self.use_grouped_tensor:
             from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
 
@@ -2518,14 +2533,15 @@ class GroupedExpertsTE(nn.Module):
             permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
             permuted_probs, _ = padding(permuted_probs, actual_m_splits)
 
-        if sum(m_splits) > 0:
+        if has_dispatched_rows:
             # The native grouped-tensor API consumes device-side int64 split sizes.
             # Keep the host list for padding, unpadding, and the legacy TE path.
-            grouped_m_splits = (
-                torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
-                if self.use_grouped_tensor
-                else m_splits
-            )
+            if device_m_splits is not None:
+                grouped_m_splits = device_m_splits
+            elif self.use_grouped_tensor:
+                grouped_m_splits = torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
+            else:
+                grouped_m_splits = m_splits
             # No FSDP mixed-precision wrapper casts EP-local experts when ep_shard is 1, so
             # FP32 master weights meet BF16 dispatched tokens here. TE accepts parameters
             # in another dtype only under torch.autocast, which casts them per GEMM like
@@ -2553,7 +2569,11 @@ class GroupedExpertsTE(nn.Module):
             if self.expert_bias and not self.config.apply_router_weight_after_down:
                 down_bias = self._get_stacked_bias(self.down_linear)
                 if down_bias is not None:
-                    splits_t = torch.as_tensor(m_splits, device=output2.device)
+                    splits_t = (
+                        device_m_splits
+                        if device_m_splits is not None
+                        else torch.as_tensor(m_splits, device=output2.device)
+                    )
                     output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
         else:
             # Handle edge case: no tokens routed to local experts
