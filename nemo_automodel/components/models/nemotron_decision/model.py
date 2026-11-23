@@ -17,7 +17,8 @@
 Nemotron 3.5 Decision checkpoints ship ``architectures: ["NemotronForDecision"]`` with remote code that needs a newer
 Transformers than this repository pins. This class loads the same checkpoint natively: the encoder is
 ``Ministral3BidirectionalModel`` (non-causal attention over the whole sequence) and the head keeps the checkpoint's
-weight name, ``diffusion_head``, so the safetensors load and export without renaming.
+weight name, ``diffusion_head`` (named after the checkpoint it was initialized from), so the safetensors load and
+export without renaming.
 """
 
 from __future__ import annotations

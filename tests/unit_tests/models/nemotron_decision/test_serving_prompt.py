@@ -22,14 +22,14 @@ import random
 
 import pytest
 
-from nemo_automodel.components.models.deciffusion.serving_prompt import (
+from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
     DecisionContract,
     perm_seed,
     prepare_question,
     question_options,
     readout_token_ids,
 )
-from tests.unit_tests.models.deciffusion.char_tokenizer import MASK, char_tokenizer, write_contract
+from tests.unit_tests.models.nemotron_decision.char_tokenizer import MASK, char_tokenizer, write_contract
 
 CHOICE = {
     "type": "choice",
@@ -289,7 +289,7 @@ def public_tokenizer():
 @pytest.mark.parametrize("case", GOLDEN, ids=lambda c: f"{c['record']}-{c['shuffle_seed']}")
 def test_parity_with_the_checkpoint_preparation(public_tokenizer, tmp_path, case):
     from nemo_automodel.components.datasets.decision.records import question_targets, validate_record
-    from nemo_automodel.components.models.deciffusion.records import encode_question
+    from nemo_automodel.components.models.nemotron_decision.records import encode_question
 
     codes = ("A", "B", "C", "D", "E", "F", "G", "H")
     contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt", codes=codes))

@@ -17,15 +17,15 @@
 #
 #   PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
 #       --output-dir data/soc_triage --seed 7
-#   automodel examples/decision/deciffusion_soc_triage_lora.yaml --mode eval --output_dir runs/soc/base
-#   automodel examples/decision/deciffusion_soc_triage_lora.yaml --output_dir runs/soc/lora
+#   automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --mode eval --output_dir runs/soc/base
+#   automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --output_dir runs/soc/lora
 #
 # Supported checkpoints: text Nemotron 3.5 Decision checkpoints (NemotronForDecision, a bidirectional Ministral 3
 # encoder) that ship decision.json and decision_template.jinja. Vision and quantized variants are rejected at setup.
-# For full fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
+# For backbone fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
 # checkpoint.save_consolidated: every (decoder layers and final norm train; embeddings and head stay frozen).
 
-recipe: nemo_automodel.recipes.decision.train_deciffusion.TrainDeciffusionDecisionRecipe
+recipe: nemo_automodel.recipes.decision.train_nemotron_decision.TrainNemotronDecisionRecipe
 
 mode: train            # eval | train
 seed: 101
@@ -76,7 +76,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  save_consolidated: false  # LoRA stages save adapters; export_deciffusion.py merges them
+  save_consolidated: false  # LoRA stages save adapters; export_nemotron_decision.py merges them
 
 data:
   train: data/soc_triage/train.jsonl

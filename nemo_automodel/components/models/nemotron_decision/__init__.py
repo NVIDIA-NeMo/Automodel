@@ -14,10 +14,10 @@
 
 """Typed-decision post-training support for Nemotron 3.5 Decision checkpoints."""
 
-from nemo_automodel.components.models.deciffusion.model import NemotronForDecision
-from nemo_automodel.components.models.deciffusion.records import encode_question
-from nemo_automodel.components.models.deciffusion.scorer import require_decision_config
-from nemo_automodel.components.models.deciffusion.serving_prompt import (
+from nemo_automodel.components.models.nemotron_decision.model import NemotronForDecision
+from nemo_automodel.components.models.nemotron_decision.records import encode_question
+from nemo_automodel.components.models.nemotron_decision.scorer import require_decision_config
+from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
     DecisionContract,
     PreparedQuestion,
     prepare_question,

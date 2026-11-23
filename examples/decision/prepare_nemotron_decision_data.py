@@ -15,7 +15,7 @@
 """Convert one-decision JSONL into single-question SystemOne records with group-disjoint splits.
 
   # simple one-decision-per-line JSONL (e.g. a synthetic support-routing dataset)
-  uv run python examples/decision/prepare_deciffusion_data.py --input support_routing.jsonl \
+  uv run python examples/decision/prepare_nemotron_decision_data.py --input support_routing.jsonl \
       --output data/support_routing --split three-way
 
 SystemOne records, such as the fictional SOC-triage tutorial data, need no conversion: point ``data.*`` at them.
@@ -31,7 +31,7 @@ from collections import Counter
 from pathlib import Path
 
 from nemo_automodel.components.datasets.decision.records import validate_record
-from nemo_automodel.components.models.deciffusion.records import (
+from nemo_automodel.components.models.nemotron_decision.records import (
     convert_simple_line,
     in_heldout,
     read_jsonl,

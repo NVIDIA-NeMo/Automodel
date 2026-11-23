@@ -21,7 +21,7 @@ import torch
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 
-from nemo_automodel.components.models.deciffusion.model import NemotronForDecision
+from nemo_automodel.components.models.nemotron_decision.model import NemotronForDecision
 
 
 def _config(**overrides):

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a validation-selected Deciffusion decision stage as a complete, servable checkpoint.
+"""Export a validation-selected Nemotron Decision stage as a complete, servable checkpoint.
 
-  uv run python examples/decision/export_deciffusion.py --base /path/to/deciffusion-checkpoint \
+  uv run python examples/decision/export_nemotron_decision.py --base /path/to/nemotron-3.5-decision-8b \
       --stage runs/support/lora/LOWEST_VAL --output exports/support_lora
 
-LoRA stages are merged into the base weights (W += alpha / r * B @ A, in fp32); full fine-tuning stages are written
+LoRA stages are merged into the base weights (W += alpha / r * B @ A, in fp32); backbone fine-tuning stages are written
 from their consolidated weights in the base dtypes. The base configuration is copied unchanged. The stage must have
 been trained on this exact base.
 """
@@ -27,7 +27,7 @@ import json
 from pathlib import Path
 
 from nemo_automodel.components.checkpoint.utils import read_checkpoint_pointer
-from nemo_automodel.components.models.deciffusion.export import (
+from nemo_automodel.components.models.nemotron_decision.export import (
     checkpoint_fingerprint,
     export_full_checkpoint,
     merge_lora_checkpoint,

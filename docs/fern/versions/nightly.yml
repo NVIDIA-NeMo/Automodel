@@ -990,7 +990,7 @@ navigation:
             path: ../../guides/dllm/diffusiongemma.mdx
             slug: recipes-e2e-examples/diffusiongemma
           - page: "NVIDIA Nemotron 3.5 Decision"
-            path: ../../guides/dllm/nemotron-3-5-decision.mdx
+            path: ../../guides/decision/nemotron-3-5-decision.mdx
             slug: recipes-e2e-examples/nemotron-3-5-decision
       - section: "Vision & Multimodal Models"
         skip-slug: true

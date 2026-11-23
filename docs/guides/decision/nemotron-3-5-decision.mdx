@@ -1,11 +1,11 @@
 ---
 title: "Nemotron 3.5 Decision"
-description: "Post-train Nemotron 3.5 Decision 8B on fictional SOC alert triage with LoRA or full fine-tuning, then export it and score typed decisions with Hugging Face Transformers."
+description: "Post-train Nemotron 3.5 Decision 8B on fictional SOC alert triage with LoRA or backbone fine-tuning, then export it and score typed decisions with Hugging Face Transformers."
 position: 16
 ---
 **A step-by-step guide to post-training Nemotron 3.5 Decision 8B with
-[NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The model is an 8B bidirectional diffusion language model
-that answers typed decision questions in one forward pass. The guide runs LoRA on a single GPU or full fine-tuning on
+[NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The model is an 8B decision model that uses a bidirectional Ministral 3 encoder to score
+the supplied options in one forward pass. The guide runs LoRA on a single GPU or backbone fine-tuning on
 one node on a fictional SOC alert-triage dataset, then exports the result and scores it with the checkpoint's own
 code on Hugging Face Transformers.**
 
@@ -62,7 +62,7 @@ operational security performance.
 |------|-------------|
 | **Step 0** | Environment setup |
 | **Step 1** | Prepare the SOC triage dataset |
-| **Step 2** | Training configuration (LoRA and full fine-tuning) |
+| **Step 2** | Training configuration (LoRA and backbone fine-tuning) |
 | **Step 3** | Score the base model, then launch post-training |
 | **Step 4** | Export the selected stage and run inference with the checkpoint's own code |
 | **Step 5** | Results |
@@ -71,11 +71,11 @@ operational security performance.
 
 - **LoRA**: one GPU. Peak memory was ~18 GiB with this dataset's short prompts (bf16 base, activation
   checkpointing); longer states need more.
-- **Full fine-tuning**: one node of 8 GPUs (~26 GiB peak per GPU; fp32 weights and AdamW state for the decoder
+- **Backbone fine-tuning**: one node of 8 GPUs (~26 GiB peak per GPU; fp32 weights and AdamW state for the decoder
   layers, sharded with FSDP2).
-- **Training time** (measured on 8x B200): LoRA ~3.5 min on one GPU and full fine-tuning ~2.5 min on 8 GPUs. Both
+- **Training time** (measured on 8x B200): LoRA ~3.5 min on one GPU and backbone fine-tuning ~2.5 min on 8 GPUs. Both
   include model loading, validation, and test scoring. Scoring the base model takes ~1 min.
-- **Disk**: ~17 GB for the base checkpoint, ~170 MB per LoRA stage (adapter only), ~48 GB per full fine-tuning stage
+- **Disk**: ~17 GB for the base checkpoint, ~170 MB per LoRA stage (adapter only), ~48 GB per backbone fine-tuning stage
   (sharded and consolidated weights), and ~17 GB per exported checkpoint.
 
 ---
@@ -187,12 +187,12 @@ For your own data, write one decision per line:
 near-duplicates out of validation and test. Convert the lines to single-question SystemOne records with:
 
 ```bash
-uv run python examples/decision/prepare_deciffusion_data.py \
+uv run python examples/decision/prepare_nemotron_decision_data.py \
     --input my_decisions.jsonl --output data/my_records --split three-way
 ```
 
 `--split three-way` writes group-disjoint `train` / `validation` / `test` files. Then point the `data.*` paths of
-`examples/decision/deciffusion_support_routing_lora.yaml` (or the SOC config) at them. If your data is already in
+`examples/decision/nemotron_decision_support_routing_lora.yaml` (or the SOC config) at them. If your data is already in
 SystemOne records, use them as they are. Soft labels there map each question to option weights:
 `"soft_labels": {"verdict": {"malicious": 0.8, "false_positive": 0.2}}`.
 
@@ -200,10 +200,10 @@ SystemOne records, use them as they are. Soft labels there map each question to 
 
 ## Step 2 — Training Configuration
 
-**Config file**: `examples/decision/deciffusion_soc_triage_lora.yaml`
+**Config file**: `examples/decision/nemotron_decision_soc_triage_lora.yaml`
 
 ```yaml
-recipe: nemo_automodel.recipes.decision.train_deciffusion.TrainDeciffusionDecisionRecipe
+recipe: nemo_automodel.recipes.decision.train_nemotron_decision.TrainNemotronDecisionRecipe
 
 mode: train            # eval | train
 seed: 101
@@ -242,7 +242,7 @@ optimizer:
 
 checkpoint:
   enabled: true
-  save_consolidated: false  # LoRA stages save adapters; export_deciffusion.py merges them
+  save_consolidated: false  # LoRA stages save adapters; export_nemotron_decision.py merges them
 
 data:
   train: data/soc_triage/train.jsonl
@@ -288,16 +288,20 @@ What the recipe trains:
 With rank 32 on the attention and MLP projections of all 34 layers, LoRA trains **89.1M parameters (1.04% of the
 model)**.
 
-### Full Fine-Tuning
+### Backbone Fine-Tuning
 
-Override four keys on the command line to fully fine-tune the decoder layers and final norm:
+Backbone fine-tuning trains the encoder blocks and final norm instead of LoRA adapters. Override four keys on the
+command line:
 
 ```bash
 --peft None --optimizer.lr 1.0e-6 --model.torch_dtype float32 --checkpoint.save_consolidated every
 ```
 
-Full fine-tuning trains **7.42B parameters**. The embeddings and the decision head stay frozen. It keeps fp32
-weights and AdamW state for them, so it uses one node of 8 GPUs (see
+It trains **7.42B parameters**: all 34 encoder blocks and the final norm. The input embeddings and the output
+projection (the decision head) stay frozen. The head's rows for the option codes are the readout, so keeping them
+fixed keeps every code's meaning identical to the base checkpoint: the exported model reads its decision contract
+exactly as the base does, and training cannot move probability toward tokens that are not option codes. It keeps
+fp32 weights and AdamW state for the trained parameters, so it uses one node of 8 GPUs (see
 [Hardware Requirements](#hardware-requirements)).
 
 ---
@@ -309,7 +313,7 @@ weights and AdamW state for them, so it uses one node of 8 GPUs (see
 Run the same config in `eval` mode to get the *before* numbers on the validation and test splits:
 
 ```bash
-automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 --mode eval \
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --nproc-per-node 1 --mode eval \
     --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
     --output_dir runs/soc/base
 ```
@@ -322,7 +326,7 @@ automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 
 ### LoRA
 
 ```bash
-automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 \
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --nproc-per-node 1 \
     --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
     --output_dir runs/soc/lora
 ```
@@ -330,13 +334,13 @@ automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 
 One epoch of the 640 training questions at 16 questions per step is **40 optimizer steps**. Validation runs on the starting
 checkpoint (step 0) and on the final step.
 
-### Full Fine-Tuning
+### Backbone Fine-Tuning
 
 ```bash
-automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 8 \
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --nproc-per-node 8 \
     --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
     --peft None --optimizer.lr 1.0e-6 --model.torch_dtype float32 --checkpoint.save_consolidated every \
-    --output_dir runs/soc/full
+    --output_dir runs/soc/backbone
 ```
 
 ### Training Log for LoRA
@@ -359,7 +363,7 @@ validation {"step": 40, "accuracy": 1.0, "correct": 160, "nll": 0.001, "decision
 
 Each step takes ~3.6 s on one B200 (16 questions, activation checkpointing).
 
-### Training Log for Full Fine-Tuning
+### Training Log for Backbone Fine-Tuning
 
 ```
 validation {"step": 0, "accuracy": 0.7625, "correct": 122, "nll": 0.6412, "decisions": 160}
@@ -377,14 +381,14 @@ validation {"step": 40, "accuracy": 1.0, "correct": 160, "nll": 0.0231, "decisio
 The parameter summary printed when the model is built counts all 8.49B parameters. The recipe then freezes the
 embeddings and the decision head, so 7.42B parameters train.
 
-With a 100x lower learning rate, full fine-tuning reaches the same accuracy with less confident probabilities
+With a 100x lower learning rate, backbone fine-tuning reaches the same accuracy with less confident probabilities
 (cross-entropy 0.023 against 0.001 for LoRA).
 
 ### How a Stage Is Selected
 
 Validation publishes the best stage as `LOWEST_VAL`: **most correct validation questions first, then lowest
 cross-entropy (NLL)**. For LoRA the starting checkpoint (step 0) is a saved, selectable stage, so a run that does not help
-publishes the base unchanged. Full fine-tuning selects among its trained stages. The test split is scored once, on
+publishes the base unchanged. Backbone fine-tuning selects among its trained stages. The test split is scored once, on
 the selected stage, and is never used for selection.
 
 ### Checkpoints Saved
@@ -410,7 +414,7 @@ runs/soc/lora/
   predictions_test.jsonl
 ```
 
-A full fine-tuning stage holds `model/consolidated/` (a Hugging Face export of the trained weights) instead of the
+A backbone fine-tuning stage holds `model/consolidated/` (a Hugging Face export of the trained weights) instead of the
 adapter.
 
 ---
@@ -423,7 +427,7 @@ Merge the selected LoRA stage into the base weights (`W += (alpha / r) * B @ A`,
 a complete, standalone checkpoint:
 
 ```bash
-uv run python examples/decision/export_deciffusion.py \
+uv run python examples/decision/export_nemotron_decision.py \
     --base checkpoints/nemotron-3.5-decision-8b \
     --stage runs/soc/lora/LOWEST_VAL \
     --output exports/soc_lora
@@ -441,7 +445,7 @@ uv run python examples/decision/export_deciffusion.py \
 }
 ```
 
-The same command exports a full fine-tuning stage (`--stage runs/soc/full/LOWEST_VAL`), cast to the base dtypes. The
+The same command exports a backbone fine-tuning stage (`--stage runs/soc/backbone/LOWEST_VAL`), cast to the base dtypes. The
 export first checks the stage's base fingerprint and refuses a base the stage was not trained on. It copies the base
 configuration, tokenizer, and model code unchanged, so the output loads anywhere the base loads. Each export takes
 ~45 s.
@@ -539,7 +543,7 @@ test accuracy 1.0000 (160/160)
 
 The checkpoint's own code reproduces the recipe's test predictions (`predictions_test.jsonl`): the same decision on
 all 160 test questions, with a maximum absolute probability difference of 0.0008 for the LoRA export and 0.0024 for the
-full fine-tuning export. On the base checkpoint the same loop gives 0.7125 (114/160), also matching the recipe
+backbone fine-tuning export. On the base checkpoint the same loop gives 0.7125 (114/160), also matching the recipe
 decision for decision.
 
 **Resources:** one GPU with ~16 GiB for the bf16 weights.
@@ -555,11 +559,11 @@ decision for decision.
 |---|---|---|---|---|---|
 | Base | 71.3% (114/160) | 0.752 | 78.1% | 84.4% | 37.5% |
 | LoRA, step 40 (`LOWEST_VAL`) | **100% (160/160)** | **0.001** | 100% | 100% | 100% |
-| Full fine-tuning, step 40 (`LOWEST_VAL`) | **100% (160/160)** | 0.024 | 100% | 100% | 100% |
+| Backbone fine-tuning, step 40 (`LOWEST_VAL`) | **100% (160/160)** | 0.024 | 100% | 100% | 100% |
 
 ### Accuracy by Question
 
-| Question | Base | LoRA | Full fine-tuning |
+| Question | Base | LoRA | Backbone fine-tuning |
 |---|---|---|---|
 | `verdict` | 20/32 | 32/32 | 32/32 |
 | `action` | 23/32 | 32/32 | 32/32 |
@@ -584,7 +588,7 @@ split.
 
 ### Summary
 
-| | LoRA | Full fine-tuning |
+| | LoRA | Backbone fine-tuning |
 |---|---|---|
 | Trainable params | 89.1M (1.04%) | 7.42B (decoder layers and final norm) |
 | Learning rate | 1e-4 (AdamW, cosine) | 1e-6 (AdamW, cosine) |

@@ -46,8 +46,8 @@ def _tiny_checkpoint(root: Path, seed: int) -> None:
     from huggingface_hub import hf_hub_download
     from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 
-    from nemo_automodel.components.models.deciffusion.model import NemotronForDecision
-    from tests.unit_tests.models.deciffusion.char_tokenizer import write_contract
+    from nemo_automodel.components.models.nemotron_decision.model import NemotronForDecision
+    from tests.unit_tests.models.nemotron_decision.char_tokenizer import write_contract
 
     root.mkdir(parents=True)
     for name in TOKENIZER_FILES:
@@ -73,7 +73,7 @@ def _tiny_checkpoint(root: Path, seed: int) -> None:
 
 
 def _records(root: Path) -> None:
-    from nemo_automodel.components.models.deciffusion.records import convert_simple_line, write_jsonl
+    from nemo_automodel.components.models.nemotron_decision.records import convert_simple_line, write_jsonl
 
     teams = {"billing": "Payments and refunds", "technical": "Bugs and outages", "sales": "Contracts and quotes"}
     lines = []
@@ -125,8 +125,8 @@ def _reference_probabilities(
     from transformers import AutoConfig, PreTrainedTokenizerFast
     from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 
-    from nemo_automodel.components.models.deciffusion.records import encode_question, read_jsonl
-    from nemo_automodel.components.models.deciffusion.serving_prompt import DecisionContract
+    from nemo_automodel.components.models.nemotron_decision.records import encode_question, read_jsonl
+    from nemo_automodel.components.models.nemotron_decision.serving_prompt import DecisionContract
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained(export_dir)
     contract = DecisionContract.from_pretrained(export_dir)
@@ -174,7 +174,7 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
     subprocess.run(
         [
             sys.executable,
-            str(repository / "examples/decision/export_deciffusion.py"),
+            str(repository / "examples/decision/export_nemotron_decision.py"),
             "--base",
             str(root / "base"),
             "--stage",
@@ -196,7 +196,7 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
     wrong = subprocess.run(
         [
             sys.executable,
-            str(repository / "examples/decision/export_deciffusion.py"),
+            str(repository / "examples/decision/export_nemotron_decision.py"),
             "--base",
             str(root / "other"),
             "--stage",
@@ -212,7 +212,7 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
 
 def _worker(root: Path, method: str) -> None:
     from nemo_automodel.components.config.loader import ConfigNode
-    from nemo_automodel.recipes.decision.train_deciffusion import TrainDeciffusionDecisionRecipe
+    from nemo_automodel.recipes.decision.train_nemotron_decision import TrainNemotronDecisionRecipe
 
     # IEEE fp32 matmuls for the native and reference reads: an fp32 MixedPrecisionPolicy does not disable TF32.
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -220,7 +220,7 @@ def _worker(root: Path, method: str) -> None:
     torch.set_float32_matmul_precision("highest")
 
     repository = Path(__file__).resolve().parents[4]
-    cfg = yaml.safe_load((repository / "examples/decision/deciffusion_support_routing_lora.yaml").read_text())
+    cfg = yaml.safe_load((repository / "examples/decision/nemotron_decision_support_routing_lora.yaml").read_text())
     cfg["model"]["pretrained_model_name_or_path"] = str(root / "base")
     cfg["model"]["torch_dtype"] = "float32"
     cfg["output_dir"] = str(root / f"run_{method}")
@@ -237,7 +237,7 @@ def _worker(root: Path, method: str) -> None:
     if method == "full":
         cfg["peft"] = None
         cfg["checkpoint"]["save_consolidated"] = "every"
-    recipe = TrainDeciffusionDecisionRecipe(ConfigNode(cfg))
+    recipe = TrainNemotronDecisionRecipe(ConfigNode(cfg))
     recipe.setup()
     assert recipe._get_dp_group_size() == 2
     trainable = {name for name, p in recipe.model.named_parameters() if p.requires_grad}
@@ -256,7 +256,7 @@ def _worker(root: Path, method: str) -> None:
     del recipe
     torch.cuda.empty_cache()
     cfg_eval = {**cfg, "mode": "eval", "init_from": str(run / "LATEST"), "output_dir": str(root / f"eval_{method}")}
-    reloaded = TrainDeciffusionDecisionRecipe(ConfigNode(cfg_eval))
+    reloaded = TrainNemotronDecisionRecipe(ConfigNode(cfg_eval))
     reloaded.setup()
     reloaded.run_train_validation_loop()
     metrics = json.loads((root / f"eval_{method}" / "metrics_test.json").read_text())
@@ -287,7 +287,7 @@ def _main() -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two assigned CUDA GPUs for native FSDP2 setup")
 @pytest.mark.parametrize("method", ["lora", "full"])
-def test_deciffusion_recipe_two_gpu(tmp_path, method):
+def test_nemotron_decision_recipe_two_gpu(tmp_path, method):
     _tiny_checkpoint(tmp_path / "base", seed=0)
     _tiny_checkpoint(tmp_path / "other", seed=1)
     _records(tmp_path / "data")

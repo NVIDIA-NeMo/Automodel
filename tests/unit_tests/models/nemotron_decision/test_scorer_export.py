@@ -24,12 +24,12 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch import nn
 
-from nemo_automodel.components.models.deciffusion.export import (
+from nemo_automodel.components.models.nemotron_decision.export import (
     checkpoint_fingerprint,
     export_full_checkpoint,
     merge_lora_checkpoint,
 )
-from nemo_automodel.components.models.deciffusion.scorer import (
+from nemo_automodel.components.models.nemotron_decision.scorer import (
     full_finetune_trainable,
     gather_head_rows,
     option_logits,
@@ -40,7 +40,7 @@ HIDDEN, VOCAB = 8, 32
 
 
 class TinyDiffusion(nn.Module):
-    """Interface stand-in: bidirectional encoder over all positions and a bias-free diffusion head."""
+    """Interface stand-in: bidirectional encoder over all positions and a bias-free decision head."""
 
     def __init__(self) -> None:
         super().__init__()

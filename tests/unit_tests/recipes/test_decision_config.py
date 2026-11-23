@@ -29,8 +29,8 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
         "clm_soc_triage.yaml",
         "clef_soc_triage_lora.yaml",
         "clef_soc_triage_heads.yaml",
-        "deciffusion_soc_triage_lora.yaml",
-        "deciffusion_support_routing_lora.yaml",
+        "nemotron_decision_soc_triage_lora.yaml",
+        "nemotron_decision_support_routing_lora.yaml",
     ],
 )
 def test_example_recipe_targets_resolve(filename):
@@ -358,8 +358,8 @@ def test_clef_training_rejects_disabled_checkpoints_before_training_or_loading_o
     assert (output / "LOWEST_VAL").is_symlink() == stale_pointer
 
 
-def test_deciffusion_selection_prefers_accuracy_then_lower_cross_entropy():
-    from nemo_automodel.recipes.decision.train_deciffusion import selection_value
+def test_nemotron_decision_selection_prefers_accuracy_then_lower_cross_entropy():
+    from nemo_automodel.recipes.decision.train_nemotron_decision import selection_value
 
     assert selection_value(9, 0.3) < selection_value(9, 0.4)
     assert selection_value(9, 1000.0) < selection_value(8, 0.0)  # one more correct row outranks any CE
@@ -369,10 +369,10 @@ def test_deciffusion_selection_prefers_accuracy_then_lower_cross_entropy():
 
 
 @pytest.mark.parametrize("batch,world", [(0, 1), (6, 4), (-4, 2)])
-def test_deciffusion_rejects_batches_that_do_not_split_over_dp(batch, world):
-    from nemo_automodel.recipes.decision.train_deciffusion import TrainDeciffusionDecisionRecipe
+def test_nemotron_decision_rejects_batches_that_do_not_split_over_dp(batch, world):
+    from nemo_automodel.recipes.decision.train_nemotron_decision import TrainNemotronDecisionRecipe
 
-    recipe = TrainDeciffusionDecisionRecipe.__new__(TrainDeciffusionDecisionRecipe)
+    recipe = TrainNemotronDecisionRecipe.__new__(TrainNemotronDecisionRecipe)
     recipe.cfg = {"train.global_batch_size": batch}
     recipe._get_dp_group_size = lambda: world
     recipe._get_dp_rank = lambda: 0
@@ -380,9 +380,9 @@ def test_deciffusion_rejects_batches_that_do_not_split_over_dp(batch, world):
         recipe._train()
 
 
-def test_deciffusion_examples_keep_the_reference_training_contract():
+def test_nemotron_decision_examples_keep_the_reference_training_contract():
     root = Path(__file__).resolve().parents[3] / "examples" / "decision"
-    for name in ("deciffusion_soc_triage_lora.yaml", "deciffusion_support_routing_lora.yaml"):
+    for name in ("nemotron_decision_soc_triage_lora.yaml", "nemotron_decision_support_routing_lora.yaml"):
         config = yaml.safe_load((root / name).read_text())
         assert "dlm_paradigm" not in config["model"] and not config["model"].get("trust_remote_code")
         assert (config["peft"]["dim"], config["peft"]["alpha"], config["peft"]["dropout"]) == (32, 64, 0.0)
@@ -397,12 +397,14 @@ def test_deciffusion_examples_keep_the_reference_training_contract():
 
 
 @pytest.mark.parametrize("soft_label_kl_weight,trained", [(0.0, ["gold", "soft"]), (0.5, ["gold"])])
-def test_deciffusion_reads_each_supervised_question_and_counts_unreadable_ones(tmp_path, soft_label_kl_weight, trained):
+def test_nemotron_decision_reads_each_supervised_question_and_counts_unreadable_ones(
+    tmp_path, soft_label_kl_weight, trained
+):
     from nemo_automodel.components.datasets.decision.records import validate_record
     from nemo_automodel.components.loss.decision import DecisionLossConfig
-    from nemo_automodel.components.models.deciffusion.serving_prompt import DecisionContract
-    from nemo_automodel.recipes.decision.train_deciffusion import TrainDeciffusionDecisionRecipe
-    from tests.unit_tests.models.deciffusion.char_tokenizer import MASK, char_tokenizer, write_contract
+    from nemo_automodel.components.models.nemotron_decision.serving_prompt import DecisionContract
+    from nemo_automodel.recipes.decision.train_nemotron_decision import TrainNemotronDecisionRecipe
+    from tests.unit_tests.models.nemotron_decision.char_tokenizer import MASK, char_tokenizer, write_contract
 
     record = {
         "id": "r1",
@@ -419,7 +421,7 @@ def test_deciffusion_reads_each_supervised_question_and_counts_unreadable_ones(t
         "rewards": {"reward": {"true": 1.0, "false": 0.0}},
     }
     validate_record(record)
-    recipe = TrainDeciffusionDecisionRecipe.__new__(TrainDeciffusionDecisionRecipe)
+    recipe = TrainNemotronDecisionRecipe.__new__(TrainNemotronDecisionRecipe)
     recipe.tokenizer = char_tokenizer()
     recipe.contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt"))
     recipe.mask_token_id = recipe.tokenizer.convert_tokens_to_ids(MASK)

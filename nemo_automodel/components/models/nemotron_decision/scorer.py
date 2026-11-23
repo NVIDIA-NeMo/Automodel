@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Scoring and checkpoint-contract checks for Deciffusion decision post-training."""
+"""Scoring and checkpoint-contract checks for Nemotron Decision post-training."""
 
 from __future__ import annotations
 
@@ -22,14 +22,14 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.models.deciffusion.model import ARCHITECTURE
+from nemo_automodel.components.models.nemotron_decision.model import ARCHITECTURE
 
 FULL_FINETUNE_PREFIXES = ("encoder.layers.", "encoder.norm.")
 _WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module.", "_orig_mod.")
 
 
 def full_finetune_trainable(parameter_name: str) -> bool:
-    """Whether full fine-tuning trains this parameter: decoder layers and final norm, not embeddings or the head.
+    """Whether backbone fine-tuning trains this parameter: decoder layers and final norm, not embeddings or the head.
 
     Activation-checkpoint and ``torch.compile`` wrapper segments in the name are ignored.
     """
@@ -67,12 +67,12 @@ def require_decision_config(config: Any) -> None:
 
 @torch.no_grad()
 def gather_head_rows(model: nn.Module, token_ids: Sequence[int]) -> torch.Tensor:
-    """Rows of the frozen, bias-free diffusion head for ``token_ids``.
+    """Rows of the frozen, bias-free decision head for ``token_ids``.
 
     All ranks must call this when the head weight is a sharded ``DTensor``.
 
     Args:
-        model: Model exposing the diffusion head through ``get_output_embeddings()``.
+        model: Model exposing the decision head through ``get_output_embeddings()``.
         token_ids: Vocabulary ids of the rows to gather, length ``T``.
 
     Returns:
@@ -80,9 +80,9 @@ def gather_head_rows(model: nn.Module, token_ids: Sequence[int]) -> torch.Tensor
     """
     head = model.get_output_embeddings()
     if head is None:
-        raise ValueError("model exposes no output embeddings (diffusion head)")
+        raise ValueError("model exposes no output embeddings (decision head)")
     if getattr(head, "bias", None) is not None:
-        raise ValueError("the diffusion head has a bias; restricted-row scoring would drop it")
+        raise ValueError("the decision head has a bias; restricted-row scoring would drop it")
     weight = head.weight.full_tensor() if isinstance(head.weight, DTensor) else head.weight
     index = torch.tensor(list(token_ids), dtype=torch.long, device=weight.device)
     return weight.index_select(0, index).clone()
@@ -106,7 +106,7 @@ def option_logits(
         model: Backbone returning the last hidden state for ``input_ids`` (``output_last_hidden_states_only=True``).
         input_ids: Prompt token ids, length ``L`` (no mask).
         code_token_ids: Single-token code of each option, length ``N``.
-        mask_token_id: Diffusion mask token appended as the answer slot.
+        mask_token_id: Mask token appended as the answer slot.
         rows: Frozen head rows by vocabulary id, each of shape ``[hidden]``.
         device: Device of the token ids.
 

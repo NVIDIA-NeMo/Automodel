@@ -19,13 +19,13 @@ from __future__ import annotations
 import pytest
 
 from nemo_automodel.components.datasets.decision.records import question_targets, validate_record
-from nemo_automodel.components.models.deciffusion.records import (
+from nemo_automodel.components.models.nemotron_decision.records import (
     convert_simple_line,
     encode_question,
     in_heldout,
 )
-from nemo_automodel.components.models.deciffusion.serving_prompt import DecisionContract
-from tests.unit_tests.models.deciffusion.char_tokenizer import MASK, char_tokenizer, write_contract
+from nemo_automodel.components.models.nemotron_decision.serving_prompt import DecisionContract
+from tests.unit_tests.models.nemotron_decision.char_tokenizer import MASK, char_tokenizer, write_contract
 
 LINE = {
     "id": "t-1",

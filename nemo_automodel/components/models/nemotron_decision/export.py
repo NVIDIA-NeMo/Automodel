@@ -15,7 +15,7 @@
 # Code provenance: the merge follows the reference fine-tuning merge script (W += (alpha / r) * B @ A in fp32,
 # complete standalone checkpoint). See serving_prompt.py for the provenance note.
 
-"""Export a trained Deciffusion stage (merged LoRA adapter or full weights) as a complete, servable checkpoint."""
+"""Export a trained Nemotron Decision stage (merged LoRA adapter or full weights) as a complete, servable checkpoint."""
 
 from __future__ import annotations
 
@@ -27,7 +27,10 @@ from pathlib import Path
 
 import safetensors.torch as _st
 
-from nemo_automodel.components.models.deciffusion.serving_prompt import DECISION_CONFIG_FILE, DECISION_TEMPLATE_FILE
+from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
+    DECISION_CONFIG_FILE,
+    DECISION_TEMPLATE_FILE,
+)
 
 # Base-checkpoint files replaced by the export (weights, their index, caches and receipts of an earlier export).
 _NOT_COPIED = ("*.safetensors", "*.safetensors.index.json", ".cache", "merge-receipt.json", "export-receipt.json")
@@ -134,7 +137,7 @@ def merge_lora_checkpoint(base_dir: str | Path, adapter_dir: str | Path, output_
 
 
 def export_full_checkpoint(base_dir: str | Path, weights_dir: str | Path, output_dir: str | Path) -> dict:
-    """Write a complete checkpoint from consolidated full-fine-tuning weights, cast to the base dtypes.
+    """Write a complete checkpoint from consolidated backbone fine-tuning weights, cast to the base dtypes.
 
     Args:
         base_dir: Checkpoint the run started from (configuration, tokenizer and model code are copied from it).

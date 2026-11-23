@@ -17,22 +17,22 @@
 # {"state", "question", "type", "options", "label", optional "soft_labels" and "group"}. Bring your own file;
 # the prepare script converts it to single-question SystemOne records with group-disjoint splits.
 #
-#   uv run python examples/decision/prepare_deciffusion_data.py --input support_routing.jsonl \
+#   uv run python examples/decision/prepare_nemotron_decision_data.py --input support_routing.jsonl \
 #       --split three-way --output data/support_routing
 #   # before: score the starting checkpoint
-#   automodel examples/decision/deciffusion_support_routing_lora.yaml --mode eval --output_dir runs/support/base
+#   automodel examples/decision/nemotron_decision_support_routing_lora.yaml --mode eval --output_dir runs/support/base
 #   # train (validation selects the stage; test is reported separately)
-#   automodel examples/decision/deciffusion_support_routing_lora.yaml --output_dir runs/support/lora
+#   automodel examples/decision/nemotron_decision_support_routing_lora.yaml --output_dir runs/support/lora
 #   # export a complete servable checkpoint
-#   uv run python examples/decision/export_deciffusion.py --base <checkpoint> \
+#   uv run python examples/decision/export_nemotron_decision.py --base <checkpoint> \
 #       --stage runs/support/lora/LOWEST_VAL --output exports/support_lora
 #
 # Supported checkpoints: text Nemotron 3.5 Decision checkpoints (NemotronForDecision, a bidirectional Ministral 3
 # encoder) that ship decision.json and decision_template.jinja. Vision and quantized variants are rejected at setup.
-# For full fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
+# For backbone fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
 # checkpoint.save_consolidated: every (decoder layers and final norm train; embeddings and head stay frozen).
 
-recipe: nemo_automodel.recipes.decision.train_deciffusion.TrainDeciffusionDecisionRecipe
+recipe: nemo_automodel.recipes.decision.train_nemotron_decision.TrainNemotronDecisionRecipe
 
 mode: train            # eval | train
 seed: 101
@@ -83,7 +83,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  save_consolidated: false  # LoRA stages save adapters; export_deciffusion.py merges them
+  save_consolidated: false  # LoRA stages save adapters; export_nemotron_decision.py merges them
 
 data:
   train: data/support_routing/train.jsonl

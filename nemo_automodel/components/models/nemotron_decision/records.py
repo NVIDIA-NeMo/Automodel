@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SystemOne records for Deciffusion decision post-training: one-question encoding and one-decision JSONL conversion.
+"""SystemOne records for Nemotron Decision post-training: one-question encoding and one-decision JSONL conversion.
 
 The recipe reads SystemOne records (``{"id", "state", "questions", "answers"}`` plus optional ``rewards``,
 ``soft_labels`` and ``meta``) and reads every question of a record through its own serving prompt. Simple
@@ -27,7 +27,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from nemo_automodel.components.models.deciffusion.serving_prompt import (
+from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
     DecisionContract,
     PreparedQuestion,
     prepare_question,

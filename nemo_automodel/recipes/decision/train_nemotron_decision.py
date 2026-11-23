@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Post-train Nemotron 3.5 Decision checkpoints on SystemOne records (LoRA or full fine-tuning).
+"""Post-train Nemotron 3.5 Decision checkpoints on SystemOne records (LoRA or backbone fine-tuning).
 
 Every question of a record is its own read, rendered with the checkpoint's own decision contract
 (``decision_template.jinja`` and ``decision.json``: the question's option order and the checkpoint's codes), which
@@ -24,17 +24,17 @@ scores validation and test. Training reads keep the checkpoint's option order un
 below 1, in which case the remaining share is shuffled and re-coded by position.
 
 * ``peft`` set: LoRA on the attention/MLP projections; embeddings and the decision head stay frozen.
-* ``peft: null``: full fine-tuning of the decoder layers and final norm; embeddings and the decision head stay frozen.
+* ``peft: null``: backbone fine-tuning of the encoder blocks and final norm; embeddings and the decision head stay frozen.
 * ``mode: eval`` scores the configured checkpoint (or ``init_from`` stage) on validation and test.
 
 Validation selects the published stage (``LOWEST_VAL``): most correct validation decisions, then lowest NLL; for LoRA
-the starting checkpoint (step 0) is a saved, selectable stage; full fine-tuning selects among trained stages. Report
+the starting checkpoint (step 0) is a saved, selectable stage; backbone fine-tuning selects among trained stages. Report
 the test split separately; the validation split is not an untouched test. Export a selected stage as a complete
-servable checkpoint with ``examples/decision/export_deciffusion.py``.
+servable checkpoint with ``examples/decision/export_nemotron_decision.py``.
 
 Run with::
 
-    automodel examples/decision/deciffusion_support_routing_lora.yaml --nproc-per-node 1
+    automodel examples/decision/nemotron_decision_support_routing_lora.yaml --nproc-per-node 1
 """
 
 from __future__ import annotations
@@ -69,15 +69,15 @@ from nemo_automodel.components.eval.decision.metrics import DecisionEvaluator, s
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
-from nemo_automodel.components.models.deciffusion.export import checkpoint_fingerprint
-from nemo_automodel.components.models.deciffusion.records import encode_question
-from nemo_automodel.components.models.deciffusion.scorer import (
+from nemo_automodel.components.models.nemotron_decision.export import checkpoint_fingerprint
+from nemo_automodel.components.models.nemotron_decision.records import encode_question
+from nemo_automodel.components.models.nemotron_decision.scorer import (
     full_finetune_trainable,
     gather_head_rows,
     option_logits,
     require_decision_config,
 )
-from nemo_automodel.components.models.deciffusion.serving_prompt import (
+from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
     DecisionContract,
     PreparedQuestion,
     readout_token_ids,
@@ -91,7 +91,7 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 logger = logging.getLogger(__name__)
 
 MODES = ("eval", "train")
-STAGE_FORMAT = "deciffusion-decision-stage-v1"
+STAGE_FORMAT = "nemotron-decision-stage-v1"
 
 
 def selection_value(correct: int, cross_entropy: float) -> float:
@@ -122,7 +122,7 @@ class _Decision:
     target: QuestionTarget
 
 
-class TrainDeciffusionDecisionRecipe(BaseRecipe):
+class TrainNemotronDecisionRecipe(BaseRecipe):
     """LoRA or full post-training of Nemotron 3.5 Decision checkpoints (see module docstring)."""
 
     def __init__(self, cfg: RecipeConfig | ConfigNode) -> None:
@@ -146,10 +146,10 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             self.cfg.loss.instantiate() if self.cfg.get("loss", None) is not None else DecisionLossConfig()
         )
         if self.loss_config.mode != "sft":
-            raise ValueError("Deciffusion decision post-training supports loss.mode=sft only")
+            raise ValueError("Nemotron Decision post-training supports loss.mode=sft only")
         self.loss_fn = self.loss_config.build()
         self.seed = int(self.cfg.get("seed", 101))
-        self.output_dir = Path(self.cfg.get("output_dir", f"runs/deciffusion_{self.mode}"))
+        self.output_dir = Path(self.cfg.get("output_dir", f"runs/nemotron_decision_{self.mode}"))
         self.device = self.dist_env.device
         torch.manual_seed(self.seed)
 
@@ -175,7 +175,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
         )
         if self.pp_enabled or self.mesh_context.tp_size > 1 or self.mesh_context.cp_size > 1:
-            raise ValueError("Deciffusion decision post-training supports data parallelism only (tp=cp=pp=1)")
+            raise ValueError("Nemotron Decision post-training supports data parallelism only (tp=cp=pp=1)")
 
         self.peft_config = self.cfg.peft.instantiate() if self.cfg.get("peft", None) is not None else None
         self.model = self.cfg.model.instantiate(peft_config=self.peft_config, distributed_setup=self.distributed_setup)
@@ -370,7 +370,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             if value is not None:
                 (path / "losses.json").write_text(json.dumps({"selection": value}))
 
-        self.checkpointer.lifecycle.run_coordinator_step(write_metadata, description="write Deciffusion stage metadata")
+        self.checkpointer.lifecycle.run_coordinator_step(write_metadata, description="write decision stage metadata")
         self.checkpointer.async_wait()
         self.checkpointer.lifecycle.publish(str(path), best_val_metric=value, metric_key="selection")
 
@@ -382,7 +382,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 raise FileNotFoundError(f"stage pointer {path} has no published target")
             path = Path(resolved)
         if is_checkpoint_incomplete(path) or not (path / "stage.json").exists():
-            raise ValueError(f"{path} is not a complete Deciffusion decision stage")
+            raise ValueError(f"{path} is not a complete decision stage")
         saved = json.loads((path / "stage.json").read_text())
         mismatched = sorted(k for k in self.identity if saved.get(k) != self.identity[k])
         if mismatched:
@@ -589,9 +589,9 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
 
 
 def main(config_path: str | None = None) -> None:
-    """CLI entry point: ``python -m nemo_automodel.recipes.decision.train_deciffusion --config <yaml>``."""
+    """CLI entry point: ``python -m nemo_automodel.recipes.decision.train_nemotron_decision --config <yaml>``."""
     cfg = parse_args_and_load_config(config_path)
-    recipe = TrainDeciffusionDecisionRecipe(cfg)
+    recipe = TrainNemotronDecisionRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 
