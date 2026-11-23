@@ -109,8 +109,11 @@ class RouterReplay:
             # Indices are integer selection ids carrying no gradient; detach so the
             # capture never pins the forward graph.
             recorded = indices.detach()
-            if self.visit:
-                recorded = torch.cat((self.recorded_indices.reshape(-1, *recorded.shape), recorded[None]))
+            previous = self.recorded_indices
+            if previous is not None and (self.visit or previous.dim() > recorded.dim()):
+                # One slot per visit, so the activation-checkpoint recompute of a visit rewrites its own.
+                previous = previous.reshape(-1, *recorded.shape)
+                recorded = torch.cat((previous[: self.visit], recorded[None], previous[self.visit + 1 :]))
             self.recorded_indices = recorded
             return indices
         if self.mode == RouterReplayMode.REPLAY:
@@ -211,6 +214,8 @@ class RouterReplay:
     @contextmanager
     def record(cls) -> Iterator[None]:
         """Record the top-k selection of every gate for the duration of the block."""
+        for inst in cls._registry:
+            inst.recorded_indices = None
         cls.set_mode(RouterReplayMode.RECORD)
         try:
             yield
