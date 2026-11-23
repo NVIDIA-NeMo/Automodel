@@ -66,6 +66,11 @@ def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone()
 
 
+def _keep_saved_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Pack and unpack hook that keeps a tensor saved for backward as it is."""
+    return tensor
+
+
 class NemotronV3Attention(nn.Module):
     """GQA attention for NemotronV3 (no RoPE), compatible with TE/SDPA backends."""
 
@@ -278,7 +283,15 @@ class NemotronV3Mamba2Mixer(nn.Module):
 
     ``backend.mamba_norm_backward_grid_scale`` above 1 runs the training scan through
     ``mamba_scan.split_conv1d_scan``, which launches the gated-RMSNorm backward kernel with that many times
-    the programs.
+    the programs. ``backend.mamba_out_proj_ac_exempt`` keeps the tensors an output projection applied after
+    the kernel saves out of activation checkpointing. ``scan_ac_exempt`` (set per block through
+    ``mamba_scan_ac_exempt_blocks`` of ``NemotronV3ForCausalLM``) also keeps the scan kernel's state, so a
+    checkpoint recompute of the block ends after the input projection.
+
+    With context parallelism the scan runs through the context-parallel transport, which applies the norm and
+    the output projection as modules and has none of these paths: ``mamba_fused_out_proj`` and
+    ``mamba_norm_backward_grid_scale`` do not apply there, and a mixer with ``mamba_out_proj_ac_exempt`` or
+    ``scan_ac_exempt`` raises in its forward instead of silently recomputing what it was told to keep.
     """
 
     def __init__(self, config, layer_idx: int, backend: BackendConfig | None = None):
@@ -288,6 +301,9 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # Whether a plain torch.nn.Linear output projection is applied inside the scan kernel.
         self.fused_out_proj = backend.mamba_fused_out_proj if backend is not None else True
         self.norm_backward_grid_scale = backend.mamba_norm_backward_grid_scale if backend is not None else 1
+        self.out_proj_ac_exempt = backend.mamba_out_proj_ac_exempt if backend is not None else False
+        # Set by ``NemotronV3ForCausalLM`` through ``mamba_scan_ac_exempt_blocks``.
+        self.scan_ac_exempt = False
 
         # Model dimensions
         self.hidden_size = config.hidden_size
@@ -476,6 +492,13 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             if self.cp is not None:
+                if self.scan_ac_exempt or self.out_proj_ac_exempt:
+                    raise ValueError(
+                        "mamba_scan_ac_exempt_blocks and backend.mamba_out_proj_ac_exempt are not supported with "
+                        "context parallelism: the context-parallel Mamba scan has no checkpoint-exempt path and "
+                        "would recompute the scan and the output projection. Remove them, or use "
+                        "mamba_ac_exempt_blocks, which takes whole blocks out of activation checkpointing."
+                    )
                 # ``MambaContextParallel`` uses a non-None ``cu_seqlens`` to
                 # select its packed 2D THD transport. SDPA/flex attention
                 # keeps qkv_format="thd" inputs in 3D BSHD, where the CP
@@ -533,7 +556,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 # Adapters and sharded wrappers must execute their module forward/hooks.
                 fuse_out_proj = self.fused_out_proj and type(self.out_proj) is nn.Linear
 
-                if self.norm_backward_grid_scale > 1:
+                if self.norm_backward_grid_scale > 1 or self.scan_ac_exempt:
                     out = split_conv1d_scan(
                         projected_states,
                         self.conv1d.weight.squeeze(1),
@@ -552,6 +575,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                         headdim=self.head_dim,
                         ngroups=self.n_groups,
                         norm_backward_grid_scale=self.norm_backward_grid_scale,
+                        checkpoint_exempt=self.scan_ac_exempt,
                     )
                 else:
                     out = mamba_split_conv1d_scan_combined(
@@ -575,7 +599,15 @@ class NemotronV3Mamba2Mixer(nn.Module):
                         **dt_limit_kwargs,
                     )
                 if not fuse_out_proj:
-                    out = self.out_proj(out)
+                    if self.out_proj_ac_exempt or self.scan_ac_exempt:
+                        # Only the innermost pair of saved-tensor hooks applies, so the projection's saved
+                        # tensors bypass the hooks of an enclosing activation checkpoint: they stay alive,
+                        # and the checkpoint's recompute ends before the projection's forward (at the scan
+                        # kernel, or at the input projection when the scan's state is exempt too).
+                        with torch.autograd.graph.saved_tensors_hooks(_keep_saved_tensor, _keep_saved_tensor):
+                            out = self.out_proj(out)
+                    else:
+                        out = self.out_proj(out)
                 if squeezed:
                     out = out.squeeze(0)
                 return out

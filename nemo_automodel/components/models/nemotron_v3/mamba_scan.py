@@ -35,6 +35,13 @@ fills each multiprocessor with several programs. The kernels and their inputs ar
 output and the gradients agree with mamba_ssm's as closely as two runs of mamba_ssm agree with each other
 (it accumulates the conv, ``dt_bias`` and ``A`` gradients with atomic adds). The one exception is the gradient
 of the norm weight: it is the sum of per-program partial sums, so its float32 summation order follows the grid.
+
+``checkpoint_exempt=True`` builds the scan from two autograd nodes instead of one. The inputs node saves what
+the scan reads (the projected input and the parameters); the kernel node runs the forward and keeps the scan
+output and the norm statistics outside autograd's saved tensors. Under a non-reentrant activation checkpoint
+the saved tensors of the inputs node are the last ones the checkpoint tracks, so its recompute ends before
+the scan kernels run again, while the kernel node's state stays alive from the forward. The backward is the
+same computation, issued by the inputs node once the recompute has rebuilt the projected input.
 """
 
 import math
@@ -304,7 +311,7 @@ class _ScanSettings:
 
 
 def _library_forward(
-    ctx: torch.autograd.function.FunctionCtx,
+    ctx: "torch.autograd.function.FunctionCtx | _KernelState",
     zxbcdt: torch.Tensor,
     conv1d_weight: torch.Tensor,
     conv1d_bias: torch.Tensor | None,
@@ -476,6 +483,210 @@ class _SplitConv1dScanFn(torch.autograd.Function):
         )
 
 
+class _KernelState:
+    """What the kernel node of a split scan keeps from its forward for the backward of the inputs node.
+
+    It stands in for the autograd context in mamba_ssm's forward, so the tensors that forward would save are
+    received here instead of entering autograd's saved tensors.
+    """
+
+    def __init__(self) -> None:
+        self.scan_out: torch.Tensor | None = None
+        self.rstd: torch.Tensor | None = None
+        self.dout: torch.Tensor | None = None
+        # The autocast state of the forward; the backward of the inputs node runs in it, as the backward of
+        # the one-node scan does.
+        self.used_autocast = False
+        self.autocast_dtype = torch.float16
+
+    def save_for_backward(self, *tensors: torch.Tensor | None) -> None:
+        """Keep the scan output and the norm statistics; the inputs node saves the rest."""
+        self.scan_out, self.rstd = tensors[3], tensors[10]
+
+
+class _ScanInputsFn(torch.autograd.Function):
+    """Inputs node of a split scan: saves what the scan reads and computes every gradient in its backward."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        zxbcdt: torch.Tensor,
+        conv1d_weight: torch.Tensor,
+        conv1d_bias: torch.Tensor | None,
+        dt_bias: torch.Tensor,
+        A: torch.Tensor,
+        D: torch.Tensor,
+        seq_idx: torch.Tensor | None,
+        rmsnorm_weight: torch.Tensor,
+        outproj_weight: torch.Tensor | None,
+        outproj_bias: torch.Tensor | None,
+        settings: _ScanSettings,
+        norm_backward_grid_scale: int,
+        state: _KernelState,
+    ) -> torch.Tensor:
+        """Save the tensors the scan reads and pass the projected input on.
+
+        Args:
+            ctx: Autograd context; receives the ten tensors below through ``save_for_backward``.
+            zxbcdt: Projected input, ``[batch, seqlen, dim + conv_dim + nheads]``.
+            conv1d_weight: ``[conv_dim, kernel_size]``.
+            conv1d_bias: ``[conv_dim]`` or None.
+            dt_bias: ``[nheads]``.
+            A: ``[nheads]``.
+            D: ``[nheads]``.
+            seq_idx: ``[batch, seqlen]`` int32, or None.
+            rmsnorm_weight: ``[dim]``.
+            outproj_weight: ``[out_dim, dim]`` or None.
+            outproj_bias: ``[out_dim]`` or None.
+            settings: Scalar settings of the scan.
+            norm_backward_grid_scale: Multiplier on the row blocks of the norm backward kernel.
+            state: Shared with the kernel node, which fills it.
+
+        Returns:
+            A view of ``zxbcdt``, same shape, for the kernel node to read.
+        """
+        ctx.save_for_backward(
+            zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, seq_idx, rmsnorm_weight, outproj_weight, outproj_bias
+        )
+        ctx.settings = settings
+        ctx.norm_backward_grid_scale = norm_backward_grid_scale
+        ctx.state = state
+        return zxbcdt.view_as(zxbcdt)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, placeholder: torch.Tensor
+    ) -> tuple[torch.Tensor | None, ...]:
+        """Compute every gradient from the output gradient the kernel node left in the shared state.
+
+        Args:
+            ctx: Autograd context of the forward.
+            placeholder: The zero the kernel node returns for the projected input, ``[batch, seqlen,
+                dim + conv_dim + nheads]`` expanded from one element; its values are not read.
+
+        Returns:
+            One entry per forward argument: the gradients of the nine differentiable tensors in the shape of
+            their tensor, None for ``seq_idx``, the two settings and the state.
+        """
+        del placeholder
+        state = ctx.state
+        if state.dout is None or state.scan_out is None or state.rstd is None:
+            raise RuntimeError("the kernel node of a split Mamba scan did not run before its inputs node")
+        (
+            zxbcdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D,
+            seq_idx,
+            rmsnorm_weight,
+            outproj_weight,
+            outproj_bias,
+        ) = ctx.saved_tensors
+        with torch.autocast("cuda", enabled=state.used_autocast, dtype=state.autocast_dtype):
+            dzxbcdt, dconv1d_weight, dconv1d_bias, ddt_bias, dA, dD, drmsnorm_weight, doutproj_weight, doutproj_bias = (
+                _scan_backward(
+                    state.dout,
+                    zxbcdt,
+                    conv1d_weight,
+                    conv1d_bias,
+                    dt_bias,
+                    A,
+                    D,
+                    seq_idx,
+                    rmsnorm_weight,
+                    outproj_weight,
+                    outproj_bias,
+                    state.scan_out,
+                    state.rstd,
+                    ctx.settings,
+                    ctx.norm_backward_grid_scale,
+                )  # fmt: skip
+            )
+        state.dout = None
+        return (
+            dzxbcdt,
+            dconv1d_weight,
+            dconv1d_bias,
+            ddt_bias,
+            dA,
+            dD,
+            None,
+            drmsnorm_weight,
+            doutproj_weight,
+            doutproj_bias,
+            None,
+            None,
+            None,
+        )
+
+
+class _ScanKernelFn(torch.autograd.Function):
+    """Kernel node of a split scan: runs the forward and hands the output gradient to the inputs node."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        zxbcdt: torch.Tensor,
+        conv1d_weight: torch.Tensor,
+        conv1d_bias: torch.Tensor | None,
+        dt_bias: torch.Tensor,
+        A: torch.Tensor,
+        D: torch.Tensor,
+        seq_idx: torch.Tensor | None,
+        rmsnorm_weight: torch.Tensor,
+        outproj_weight: torch.Tensor | None,
+        outproj_bias: torch.Tensor | None,
+        settings: _ScanSettings,
+        state: _KernelState,
+    ) -> torch.Tensor:
+        """Run mamba_ssm's fused forward; ``state`` receives what it would save for the backward.
+
+        Args:
+            ctx: Autograd context; keeps ``state`` and the shape of ``zxbcdt``.
+            zxbcdt: Output of the inputs node, ``[batch, seqlen, dim + conv_dim + nheads]``.
+            conv1d_weight: ``[conv_dim, kernel_size]``, detached.
+            conv1d_bias: ``[conv_dim]`` or None, detached.
+            dt_bias: ``[nheads]``, detached.
+            A: ``[nheads]``, detached.
+            D: ``[nheads]``, detached.
+            seq_idx: ``[batch, seqlen]`` int32, or None.
+            rmsnorm_weight: ``[dim]``, detached.
+            outproj_weight: ``[out_dim, dim]`` or None, detached.
+            outproj_bias: ``[out_dim]`` or None, detached.
+            settings: Scalar settings of the scan.
+            state: Receives the scan output, the norm statistics and the autocast state.
+
+        Returns:
+            ``[batch, seqlen, dim]``, or ``[batch, seqlen, out_dim]`` with an output projection.
+        """
+        state.used_autocast = torch.is_autocast_enabled("cuda")
+        state.autocast_dtype = torch.get_autocast_dtype("cuda")
+        ctx.state = state
+        ctx.input_shape = zxbcdt.shape
+        return _library_forward(
+            state, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, seq_idx, rmsnorm_weight, outproj_weight,
+            outproj_bias, settings,
+        )  # fmt: skip
+
+    @staticmethod
+    def backward(ctx: torch.autograd.function.FunctionCtx, dout: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        """Hand the output gradient to the inputs node.
+
+        Args:
+            ctx: Autograd context of the forward.
+            dout: Gradient of the forward's output, in its shape, any strides.
+
+        Returns:
+            A zero in the shape of ``zxbcdt`` for the inputs node and None for the eleven other arguments.
+        """
+        ctx.state.dout = dout
+        # The inputs node computes every gradient. It runs only if this node passes it a gradient, so pass a
+        # zero of the input's shape that occupies one element.
+        return (dout.new_zeros(()).expand(ctx.input_shape), *([None] * 11))
+
+
 def split_conv1d_scan(
     zxbcdt: torch.Tensor,
     conv1d_weight: torch.Tensor,
@@ -495,6 +706,7 @@ def split_conv1d_scan(
     headdim: int,
     ngroups: int,
     norm_backward_grid_scale: int,
+    checkpoint_exempt: bool,
 ) -> torch.Tensor:
     """Fused Mamba2 training scan: causal conv1d, SSD scan, ``rmsnorm(x * silu(z))`` and an optional projection.
 
@@ -518,6 +730,9 @@ def split_conv1d_scan(
         ngroups: Number of B / C groups, which is also the number of normalization groups.
         norm_backward_grid_scale: Multiplier on mamba_ssm's number of row blocks for the gated-RMSNorm
             backward kernel; at least 1.
+        checkpoint_exempt: Build the scan from an inputs node and a kernel node, so that an enclosing
+            non-reentrant activation checkpoint recomputes the projected input only and the scan output
+            and norm statistics are kept from the forward.
 
     Returns:
         ``[batch, seqlen, dim]``, or ``[batch, seqlen, out_dim]`` with an output projection.
@@ -532,17 +747,10 @@ def split_conv1d_scan(
         headdim=headdim,
         ngroups=ngroups,
     )
-    return _SplitConv1dScanFn.apply(
-        zxbcdt,
-        conv1d_weight,
-        conv1d_bias,
-        dt_bias,
-        A,
-        D,
-        seq_idx,
-        rmsnorm_weight,
-        outproj_weight,
-        outproj_bias,
-        settings,
-        norm_backward_grid_scale,
-    )
+    tensors = (zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, seq_idx, rmsnorm_weight, outproj_weight, outproj_bias)
+    if not checkpoint_exempt:
+        return _SplitConv1dScanFn.apply(*tensors, settings, norm_backward_grid_scale)
+    state = _KernelState()
+    tracked = _ScanInputsFn.apply(*tensors, settings, norm_backward_grid_scale, state)
+    # The parameters reach autograd through the inputs node; the kernel node reads their values only.
+    return _ScanKernelFn.apply(tracked, *(None if t is None else t.detach() for t in tensors[1:]), settings, state)

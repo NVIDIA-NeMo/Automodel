@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``BackendConfig.mamba_norm_backward_grid_scale``: which scan the mixer runs, on a CPU stand-in.
+"""``BackendConfig.mamba_norm_backward_grid_scale`` and ``BackendConfig.mamba_out_proj_ac_exempt`` on a CPU stand-in.
 
-The comparisons with mamba_ssm's own scan on the real kernels are in
+Which scan the mixer runs, how often an output projection that saves its input after computing (as a
+Transformer Engine linear does) runs under a non-reentrant activation checkpoint, and what context
+parallelism refuses. The comparisons with mamba_ssm's own scan on the real kernels are in
 ``tests/functional_tests/kernel_parity/test_nemotron_v3_mamba_scan.py``.
 """
 
 import pytest
 import torch
+from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3 import layers as nemotron_layers
@@ -37,14 +41,17 @@ def _backend(**mamba: int | float | bool | str) -> BackendConfig:
 
 
 @pytest.mark.cpu_only
-def test_default_keeps_the_library_scan():
+def test_defaults_keep_the_library_scan_and_checkpointed_projection():
     backend = _backend()
     assert backend.mamba_norm_backward_grid_scale == 1
+    assert backend.mamba_out_proj_ac_exempt is False
     for mixer in (
         NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0),
         NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=backend),
     ):
         assert mixer.norm_backward_grid_scale == 1
+        assert mixer.out_proj_ac_exempt is False
+        assert mixer.scan_ac_exempt is False
 
 
 @pytest.mark.cpu_only
@@ -79,16 +86,18 @@ def test_grid_scale_below_one_is_rejected(scale):
             headdim=1,
             ngroups=1,
             norm_backward_grid_scale=scale,
+            checkpoint_exempt=False,
         )
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("scale", [1, 8])
+@pytest.mark.parametrize(("scale", "scan_exempt"), [(1, False), (8, False), (1, True), (8, True)])
 @pytest.mark.parametrize("fused", [True, False])
-def test_mixer_selects_the_scan_by_grid_scale(monkeypatch, scale, fused):
+def test_mixer_selects_the_scan_by_grid_scale_and_exemption(monkeypatch, scale, scan_exempt, fused):
     torch.manual_seed(3)
     backend = _backend(mamba_norm_backward_grid_scale=scale, mamba_fused_out_proj=fused)
     mixer = NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=backend).float()
+    mixer.scan_ac_exempt = scan_exempt
     library_calls = _install_cpu_scan(monkeypatch, mixer)
     own_calls = []
 
@@ -109,12 +118,13 @@ def test_mixer_selects_the_scan_by_grid_scale(monkeypatch, scale, fused):
         @ mixer.out_proj.weight.T
     )
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
-    if scale == 1:
+    if scale == 1 and not scan_exempt:
         assert len(library_calls) == 1 and own_calls == []
         return
     assert library_calls == [] and len(own_calls) == 1
     call = own_calls[0]
     assert call["norm_backward_grid_scale"] == scale
+    assert call["checkpoint_exempt"] is scan_exempt
     assert call["rmsnorm_weight"] is mixer.norm.weight
     assert call["rmsnorm_eps"] == mixer.norm.variance_epsilon
     assert (call["outproj_weight"] is mixer.out_proj.weight) == fused
@@ -125,3 +135,101 @@ def test_mixer_selects_the_scan_by_grid_scale(monkeypatch, scale, fused):
     assert call["headdim"] == mixer.head_dim and call["ngroups"] == mixer.n_groups
     assert call["dt_limit"] == (0.0, float("inf"))
     assert call["activation"] == "silu" and call["seq_idx"] is None
+
+
+class _SaveAfterMatmul(torch.autograd.Function):
+    """``x @ weight.T`` that saves its inputs after computing, as a Transformer Engine linear does."""
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        out = x @ weight.T
+        ctx.save_for_backward(x, weight)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, weight = ctx.saved_tensors
+        return grad @ weight, torch.einsum("bso,bsi->oi", grad, x)
+
+
+class _SaveAfterLinear(nn.Module):
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight.detach().clone())
+        self.computed = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.computed += 1
+        return _SaveAfterMatmul.apply(x, self.weight)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("exempt", [False, True])
+def test_out_proj_ac_exempt_ends_the_checkpoint_recompute_at_the_scan(monkeypatch, exempt):
+    """The projection's GEMM runs twice under a checkpoint unless its saved tensors are exempt."""
+    torch.manual_seed(17)
+    mixer = NemotronV3Mamba2Mixer(
+        MockNemotronV3Config(), layer_idx=0, backend=_backend(mamba_out_proj_ac_exempt=exempt)
+    ).float()
+    assert mixer.out_proj_ac_exempt is exempt
+    mixer.out_proj = _SaveAfterLinear(mixer.out_proj.weight)
+    scan_calls = _install_cpu_scan(monkeypatch, mixer)
+
+    x = torch.randn(2, 7, mixer.hidden_size)
+    hidden = x.clone().requires_grad_()
+    out = checkpoint(mixer, hidden, use_reentrant=False)
+    assert mixer.out_proj.computed == 1
+    out.square().sum().backward()
+
+    assert len(scan_calls) == 2, "the scan runs in the forward and in the recompute"
+    assert all(call["outproj_weight"] is None for call in scan_calls)
+    assert mixer.out_proj.computed == (1 if exempt else 2)
+
+    # Independent expectation: an uncheckpointed stand-in scan and plain matrix algebra under autograd.
+    reference_hidden = x.clone().requires_grad_()
+    reference = (
+        _pre_projection(
+            mixer.in_proj(reference_hidden), mixer.intermediate_size, mixer.norm.weight, mixer.norm.variance_epsilon
+        )
+        @ mixer.out_proj.weight.T
+    )
+    torch.testing.assert_close(out, reference, rtol=1e-6, atol=1e-6)
+    names = ["hidden", "in_proj.weight", "norm.weight", "out_proj.weight"]
+    actual_grads = [hidden.grad, mixer.in_proj.weight.grad, mixer.norm.weight.grad, mixer.out_proj.weight.grad]
+    expected_grads = torch.autograd.grad(
+        reference.square().sum(),
+        (reference_hidden, mixer.in_proj.weight, mixer.norm.weight, mixer.out_proj.weight),
+    )
+    for name, actual, expected in zip(names, actual_grads, expected_grads):
+        assert actual is not None and torch.count_nonzero(actual) > 0, name
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6, msg=name)
+
+
+class _UnusedContextParallel:
+    """Stands in for the context-parallel transport of a mixer; a refused forward never calls it."""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("scan_exempt", "out_proj_exempt", "refused"),
+    [(True, False, True), (False, True, True), (True, True, True), (False, False, False)],
+)
+def test_checkpoint_exempt_scan_state_is_refused_with_context_parallelism(
+    monkeypatch, scan_exempt, out_proj_exempt, refused
+):
+    """The context-parallel scan has no checkpoint-exempt path: it must not silently recompute the state."""
+    torch.manual_seed(23)
+    mixer = NemotronV3Mamba2Mixer(
+        MockNemotronV3Config(), layer_idx=0, backend=_backend(mamba_out_proj_ac_exempt=out_proj_exempt)
+    ).float()
+    mixer.scan_ac_exempt = scan_exempt
+    _install_cpu_scan(monkeypatch, mixer)
+    x = torch.randn(2, 7, mixer.hidden_size)
+    mixer.cp = _UnusedContextParallel()
+    if refused:
+        with pytest.raises(ValueError, match="not supported with context parallelism"):
+            mixer(x)
+    else:
+        # The transport is reached: the stand-in has none of its methods.
+        with pytest.raises(AttributeError, match="pre_conv_ssm"):
+            mixer(x)

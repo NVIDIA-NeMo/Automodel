@@ -416,6 +416,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         mtp_use_repeated_layer: bool = False,
         logits_dtype: torch.dtype | None = None,
         mamba_ac_exempt_blocks: int | Literal["all"] = 0,
+        mamba_scan_ac_exempt_blocks: int | Literal["all"] = 0,
     ):
         """Initialize NemotronV3ForCausalLM.
 
@@ -448,6 +449,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 (0.47 GiB per 8192-token sequence in BF16 at hidden size 4096).
                 Attention and MoE blocks are unaffected. Defaults to ``0``
                 (every block is checkpointed).
+            mamba_scan_ac_exempt_blocks: Number of Mamba blocks, counted from the
+                first one that ``mamba_ac_exempt_blocks`` leaves checkpointed,
+                whose scan kernel state and output projection opt out of
+                activation checkpointing (``"all"`` for every such block). The
+                recompute of such a block ends after its input projection: the
+                scan kernels and the output projection run once per step instead
+                of twice. The block keeps its scan output and what its output
+                projection saves: about 2 hidden-size activations per token in
+                BF16 (0.125 GiB per 8192-token sequence at hidden size 4096),
+                plus the saved input of the output projection. The gradients are
+                those of the checkpointed block. Not supported with context
+                parallelism: such a mixer raises in its forward. Defaults to ``0``.
         """
         super().__init__()
         self.config = config
@@ -507,6 +520,31 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 )
             for block in mamba_blocks[:num_exempt]:
                 block._nemo_disable_activation_checkpointing = True
+
+        if mamba_scan_ac_exempt_blocks != 0:
+            checkpointed_mamba_blocks = [
+                module
+                for module in self.modules()
+                if isinstance(module, NemotronV3Block)
+                and module.block_type == "mamba"
+                and not module._nemo_disable_activation_checkpointing
+            ]
+            if mamba_scan_ac_exempt_blocks == "all":
+                num_scan_exempt = len(checkpointed_mamba_blocks)
+            elif (
+                isinstance(mamba_scan_ac_exempt_blocks, int)
+                and not isinstance(mamba_scan_ac_exempt_blocks, bool)
+                and 0 <= mamba_scan_ac_exempt_blocks <= len(checkpointed_mamba_blocks)
+            ):
+                num_scan_exempt = mamba_scan_ac_exempt_blocks
+            else:
+                raise ValueError(
+                    f"mamba_scan_ac_exempt_blocks must be 'all' or an integer between 0 and the number of "
+                    f"checkpointed Mamba blocks ({len(checkpointed_mamba_blocks)}), got "
+                    f"{mamba_scan_ac_exempt_blocks!r}"
+                )
+            for block in checkpointed_mamba_blocks[:num_scan_exempt]:
+                block.mixer.scan_ac_exempt = True
 
         # When True, the MTP heads also run under eval mode (``self.training``
         # False) so validation can measure per-head token acceptance. Defaults

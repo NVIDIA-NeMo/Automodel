@@ -708,6 +708,45 @@ class TestNemotronHForCausalLM:
         unwrapped = [isinstance(block, NemotronV3Block) for block in model.model.layers.values()]
         assert unwrapped == [True, False, False, False]
 
+    @pytest.mark.parametrize(
+        ("exempt", "scan_exempt", "expected"),
+        [
+            (0, "all", [True, True, True]),
+            (1, "all", [False, True, True]),
+            (1, 1, [False, True, False]),
+            (0, 2, [True, True, False]),
+            (2, 0, [False, False, False]),
+            ("all", "all", [False, False, False]),
+        ],
+    )
+    def test_mamba_scan_ac_exempt_blocks_marks_the_first_checkpointed_mamba_blocks(
+        self, config, backend, exempt, scan_exempt, expected
+    ):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba", "mamba"]
+        config.num_hidden_layers = 5
+        model = NemotronHForCausalLM(
+            config, backend=backend, mamba_ac_exempt_blocks=exempt, mamba_scan_ac_exempt_blocks=scan_exempt
+        )
+
+        marked = [block.mixer.scan_ac_exempt for block in model.model.layers.values() if block.block_type == "mamba"]
+        assert marked == expected
+
+    @pytest.mark.parametrize(("exempt", "scan_exempt"), [(0, 3), (1, 2), (0, -1), (0, "some"), (0, 1.5), (0, True)])
+    def test_mamba_scan_ac_exempt_blocks_rejects_values_outside_the_checkpointed_block_count(
+        self, config, backend, exempt, scan_exempt
+    ):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
+        config.num_hidden_layers = 4
+
+        with pytest.raises(ValueError, match="mamba_scan_ac_exempt_blocks must be 'all' or an integer between 0 and"):
+            NemotronHForCausalLM(
+                config, backend=backend, mamba_ac_exempt_blocks=exempt, mamba_scan_ac_exempt_blocks=scan_exempt
+            )
+
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""
         from nemo_automodel.components.models.nemotron_v3.model import (

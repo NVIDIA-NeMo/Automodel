@@ -763,6 +763,14 @@ class BackendConfig:
             same kernels in the same order, with shorter row loops for this one. The output is
             unchanged; of the gradients only the norm weight's changes, in its float32 summation
             order. Not used with context parallelism. Default 1.
+        mamba_out_proj_ac_exempt: Keep the tensors saved by a Mamba output projection that runs as a
+            module after the scan kernel (NemotronV3) out of activation checkpointing. A Transformer
+            Engine linear saves its (quantized) input only after its GEMM, so a checkpoint recompute
+            repeats the projection's quantization and GEMM just to rebuild them. With True they are
+            kept from the forward, which costs their memory per checkpointed Mamba block, and the
+            recompute ends at the scan kernel. No effect on a projection applied inside the kernel or
+            on blocks that are not checkpointed. Not supported with context parallelism: the mixer
+            raises. Default False.
     """
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -861,6 +869,7 @@ class BackendConfig:
     mamba_linear: Literal["torch", "te"] = "torch"
     mamba_fused_out_proj: bool = True
     mamba_norm_backward_grid_scale: int = 1
+    mamba_out_proj_ac_exempt: bool = False
 
     def __post_init__(self) -> None:
         if self.mamba_linear not in ("torch", "te"):

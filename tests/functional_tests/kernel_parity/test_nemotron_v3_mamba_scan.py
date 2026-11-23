@@ -16,7 +16,8 @@
 
 Every gradient has to equal the library's bit for bit, except the ones the library accumulates with atomic
 adds and the norm weight when the launch grid differs; the gated-RMSNorm backward launched from this
-repository is also checked against float32 autograd of the norm's formula. The first run of a dtype
+repository is also checked against float32 autograd of the norm's formula, and a mixer whose scan state is
+exempt from activation checkpointing is counted to run its scan once. The first run of a dtype
 compiles the Triton kernels of the scan, about a minute each, which is why these comparisons are not unit
 tests.
 """
@@ -25,6 +26,7 @@ import math
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 from nemo_automodel.components.models.nemotron_v3.mamba_scan import _gated_rmsnorm_backward, split_conv1d_scan
@@ -141,11 +143,12 @@ def _weighted_sum(output: torch.Tensor) -> torch.Tensor:
     return (output.float() * weights.reshape(output.shape)).sum()
 
 
+@pytest.mark.parametrize("checkpoint_exempt", [False, True], ids=["one_node", "two_nodes"])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("scale", [1, 8])
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_split_conv1d_scan_matches_the_library_scan_on_the_real_kernels(dtype, fused, scale, packed):
+def test_split_conv1d_scan_matches_the_library_scan_on_the_real_kernels(dtype, fused, scale, packed, checkpoint_exempt):
     ssd_combined = pytest.importorskip("mamba_ssm.ops.triton.ssd_combined")
     config, tensors = _scan_inputs(dtype, fused)
     seq_idx = None
@@ -175,6 +178,7 @@ def test_split_conv1d_scan_matches_the_library_scan_on_the_real_kernels(dtype, f
         tensors["D"],
         dt_limit=(0.0, float("inf")),
         norm_backward_grid_scale=scale,
+        checkpoint_exempt=checkpoint_exempt,
         **common,
     )
     own_grads = torch.autograd.grad(_weighted_sum(own_out), leaves)
@@ -190,8 +194,9 @@ def test_split_conv1d_scan_matches_the_library_scan_on_the_real_kernels(dtype, f
             assert torch.equal(own, library), name
 
 
+@pytest.mark.parametrize("checkpoint_exempt", [False, True], ids=["one_node", "two_nodes"])
 @pytest.mark.parametrize("scale", [1, 8])
-def test_split_conv1d_scan_takes_an_expanded_output_gradient(scale):
+def test_split_conv1d_scan_takes_an_expanded_output_gradient(scale, checkpoint_exempt):
     """The gradient of ``out.sum()`` is one element expanded to the shape of the output, with stride 0.
 
     Without an output projection that tensor reaches the gated-RMSNorm backward kernel, which reads every row
@@ -224,6 +229,7 @@ def test_split_conv1d_scan_takes_an_expanded_output_gradient(scale):
         tensors["D"],
         dt_limit=(0.0, float("inf")),
         norm_backward_grid_scale=scale,
+        checkpoint_exempt=checkpoint_exempt,
         **common,
     )
     backing = torch.full((own_out.shape[-1],), float("nan"), device=own_out.device, dtype=own_out.dtype)
@@ -239,6 +245,64 @@ def test_split_conv1d_scan_takes_an_expanded_output_gradient(scale):
             _assert_close_to_rounding(own, library, name)
         else:
             assert torch.equal(own, library), name
+
+
+@pytest.mark.parametrize("checkpoint_exempt", [False, True], ids=["one_node", "two_nodes"])
+def test_split_conv1d_scan_backward_runs_in_the_autocast_dtype_of_its_forward(checkpoint_exempt):
+    """Under ``torch.autocast`` the output projection's backward runs in the autocast dtype of the forward.
+
+    FP32 tensors under a BF16 autocast: the library's backward computes the projection's input gradient in
+    BF16. A backward that ran in another autocast dtype, or in none, would round it differently.
+    """
+    ssd_combined = pytest.importorskip("mamba_ssm.ops.triton.ssd_combined")
+    config, tensors = _scan_inputs(torch.float32, fused=True)
+    common = {
+        "chunk_size": config.chunk_size,
+        "seq_idx": None,
+        "activation": config.mamba_hidden_act,
+        "rmsnorm_weight": tensors["rmsnorm_weight"],
+        "rmsnorm_eps": config.layer_norm_epsilon,
+        "outproj_weight": tensors["outproj_weight"],
+        "outproj_bias": None,
+        "headdim": config.mamba_head_dim,
+        "ngroups": config.n_groups,
+    }
+    positional = [tensors[name] for name in ("zxbcdt", "conv1d_weight", "conv1d_bias", "dt_bias", "A")]
+    leaves = list(tensors.values())
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        library_out = ssd_combined.mamba_split_conv1d_scan_combined(
+            *positional, D=tensors["D"], norm_before_gate=False, return_final_states=False, **common
+        )
+        own_out = split_conv1d_scan(
+            *positional,
+            tensors["D"],
+            dt_limit=(0.0, float("inf")),
+            norm_backward_grid_scale=1,
+            checkpoint_exempt=checkpoint_exempt,
+            **common,
+        )
+    # The backward runs outside the autocast context, as ``loss.backward()`` does in a training step.
+    library_grads = torch.autograd.grad(_weighted_sum(library_out), leaves)
+    own_grads = torch.autograd.grad(_weighted_sum(own_out), leaves)
+    assert torch.equal(own_out, library_out)
+    for name, own, library in zip(tensors, own_grads, library_grads):
+        assert torch.isfinite(library).all() and torch.count_nonzero(library) > 0, name
+        if name in _ATOMIC_ADD_GRADIENTS:
+            _assert_close_to_rounding(own, library, name)
+        else:
+            assert torch.equal(own, library), name
+    # The comparison can tell the autocast dtypes apart: without autocast the input gradient is another one.
+    plain_out = split_conv1d_scan(
+        *positional,
+        tensors["D"],
+        dt_limit=(0.0, float("inf")),
+        norm_backward_grid_scale=1,
+        checkpoint_exempt=checkpoint_exempt,
+        **common,
+    )
+    plain_grads = torch.autograd.grad(_weighted_sum(plain_out), leaves)
+    assert not torch.equal(plain_grads[0], library_grads[0])
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -271,3 +335,66 @@ def test_mixer_with_a_scaled_grid_matches_the_default_mixer_on_the_real_kernels(
             assert torch.equal(scaled_grads[name], expected), name
         else:
             _assert_close_to_rounding(scaled_grads[name], expected, name)
+
+
+class _ForwardCounter:
+    """Counts the calls of a function it wraps."""
+
+    def __init__(self, function):
+        self.function = function
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.function(*args, **kwargs)
+
+
+@pytest.mark.parametrize("scale", [1, 8])
+@pytest.mark.parametrize("projections", ["torch_fused", "torch_after_kernel", "te"])
+@pytest.mark.parametrize("scan_exempt", [False, True])
+def test_scan_exempt_mixer_recomputes_only_its_input_projection(monkeypatch, scan_exempt, projections, scale):
+    """Under a checkpoint, an exempt scan runs once and the gradients are those of an uncheckpointed mixer."""
+    ssd_combined = pytest.importorskip("mamba_ssm.ops.triton.ssd_combined")
+    if projections == "te":
+        pytest.importorskip("transformer_engine")
+    config = MockNemotronV3Config(mamba_num_heads=4, n_groups=2)
+    backend = _backend(
+        mamba_linear="te" if projections == "te" else "torch",
+        mamba_fused_out_proj=projections == "torch_fused",
+        mamba_norm_backward_grid_scale=scale,
+    )
+    torch.manual_seed(20261123)
+    mixer = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=backend)
+    with torch.no_grad():
+        mixer.norm.weight.uniform_(0.5, 1.5)
+    mixer.to(device="cuda", dtype=torch.bfloat16)
+    mixer._fp32_params.float()  # the SSM parameters are fp32 in every recipe
+    inputs = torch.randn(2, 160, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    def gradients(checkpointed: bool) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        mixer.zero_grad(set_to_none=True)
+        hidden = inputs.clone().requires_grad_()
+        output = checkpoint(mixer, hidden, use_reentrant=False) if checkpointed else mixer(hidden)
+        _weighted_sum(output).backward()
+        return output.detach(), hidden.grad, {name: p.grad.clone() for name, p in mixer.named_parameters()}
+
+    # Reference: the same mixer with the library scan (or the one-node scan), not checkpointed.
+    reference_out, reference_dx, reference_grads = gradients(checkpointed=False)
+
+    mixer.scan_ac_exempt = scan_exempt
+    scan_forward = _ForwardCounter(ssd_combined.MambaSplitConv1dScanCombinedFn.forward)
+    monkeypatch.setattr(ssd_combined.MambaSplitConv1dScanCombinedFn, "forward", staticmethod(scan_forward))
+    in_proj_calls = []
+    mixer.in_proj.register_forward_pre_hook(lambda module, args: in_proj_calls.append(True))
+    out, dx, grads = gradients(checkpointed=True)
+
+    assert len(in_proj_calls) == 2, "the input projection runs in the forward and in the recompute"
+    assert scan_forward.calls == (1 if scan_exempt else 2)
+    assert torch.equal(out, reference_out)
+    assert torch.equal(dx, reference_dx)
+    for name, expected in reference_grads.items():
+        assert torch.count_nonzero(expected) > 0, name
+        if name in ("in_proj.weight", "out_proj.weight", "_fp32_params.D"):
+            assert torch.equal(grads[name], expected), name
+        else:
+            _assert_close_to_rounding(grads[name], expected, name)
