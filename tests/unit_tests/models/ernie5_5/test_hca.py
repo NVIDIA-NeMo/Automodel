@@ -366,11 +366,11 @@ def test_per_head_mask_matches_the_shared_mask() -> None:
 
 
 def test_inputs_outside_the_single_document_path_are_rejected() -> None:
-    """Packed rows, offsets, explicit positions, context parallelism and unknown arguments all raise."""
+    """A masked packed row, offsets, explicit positions, context parallelism and unknown arguments all raise."""
     module = _attention()
     hidden, kwargs = _inputs(LONG)
     positions = torch.arange(LONG).unsqueeze(0)
-    with pytest.raises(NotImplementedError, match="Packed"):
+    with pytest.raises(ValueError, match="packed ERNIE HCA row takes position_ids and packed_seq_ids"):
         module(hidden, **kwargs, packed_seq_ids=torch.ones(1, LONG, dtype=torch.long))
     with pytest.raises(NotImplementedError, match="Nonzero"):
         module(hidden, **kwargs, start_pos=1)
@@ -392,18 +392,22 @@ def test_inputs_outside_the_single_document_path_are_rejected() -> None:
     assert torch.isfinite(output).all()
 
 
-def test_context_parallel_setup_is_rejected() -> None:
-    """The inherited context-parallel hook must not silently enable an unvalidated path."""
+def test_context_parallel_setup_records_the_group_and_rejects_an_unpacked_row() -> None:
+    """The hook stores the group of the mesh; a shard without ``packed_seq_ids`` cannot use the masked path."""
     module = _attention()
-    with pytest.raises(NotImplementedError, match="context parallelism"):
-        module.setup_cp_attention(create_autospec(DeviceMesh, instance=True))
+    assert module.cp_group is None
+    mesh = create_autospec(DeviceMesh, instance=True)
+    module.setup_cp_attention(mesh)
+    assert module.cp_group is mesh.get_group.return_value
+    hidden, kwargs = _inputs(LONG)
+    with pytest.raises(NotImplementedError, match="context parallelism for rows with packed_seq_ids only"):
+        module(hidden, **kwargs)
 
 
 @pytest.mark.parametrize(
     ("attn", "rope", "message"),
     [
         ("tilelang", "torch", "got attn='tilelang'"),
-        ("cudnn", "torch", "got attn='cudnn'"),
         ("te", "torch", "got attn='te'"),
         ("flex", "torch", "got attn='flex'"),
         ("fa4", "torch", "got attn='fa4'"),
@@ -412,7 +416,7 @@ def test_context_parallel_setup_is_rejected() -> None:
     ],
 )
 def test_backends_without_a_reference_comparison_are_rejected(attn: str, rope: str, message: str) -> None:
-    """Every attention name outside the dense allow-list, and the Triton rotation, fail at construction."""
+    """Every attention name other than cudnn and the dense names, and the Triton rotation, fail at construction."""
     backend = _backend()
     backend.attn, backend.rope = attn, rope
     with pytest.raises(NotImplementedError, match=message):

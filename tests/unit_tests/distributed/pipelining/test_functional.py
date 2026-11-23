@@ -26,6 +26,7 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from nemo_automodel.components.distributed.pipelining.functional import (
+    _check_stage_reinit_is_static,
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
     _preserve_grads_across_stage_reinit,
@@ -1954,60 +1955,63 @@ class TestPrecomputeStageShapesNewStageApi:
 
 
 class TestPreserveGradsAcrossStageReinit:
-    """Stage re-initialization must not discard accumulated gradients.
+    """Stage re-initialization must stay free of FSDP side effects in static metadata mode.
 
-    ``_initialize_pp_stages`` always ends by calling
-    ``_post_metadata_inference_cleanup``, which nulls parameter gradients.
-    ``reset_pp_stage_shapes`` re-initializes on every sequence-length change, so
-    under gradient accumulation that cleanup lands between micro-batches and drops
-    everything accumulated so far.
+    ``_initialize_pp_stages`` always ends by calling ``_post_metadata_inference_cleanup``,
+    which reshards FSDP modules and nulls parameter gradients. ``reset_pp_stage_shapes``
+    re-initializes on every local sequence-length change, so that cleanup would drop
+    accumulated gradients and reshard only the rank that re-initialized.
     """
 
     def _make_stage(self, inference_mode):
-        """Build a stage stand-in whose cleanup nulls its submodule's gradients.
+        """Build a stage stand-in whose cleanup reshards and nulls its submodule's gradients.
 
         Args:
             inference_mode: Value to expose as the stage's ``_inference_mode``.
 
         Returns:
-            Tuple of (stage, param) where ``param`` is a tensor of shape [2] whose
-            ``.grad`` is also shape [2].
+            Tuple of (stage, param, calls) where ``param`` is a tensor of shape [1, 2] whose
+            ``.grad`` is also shape [1, 2], and ``calls`` counts cleanup invocations.
         """
         submod = torch.nn.Linear(2, 1, bias=False)
         param = submod.weight
         param.grad = torch.ones_like(param)
+        calls = []
 
         stage = types.SimpleNamespace(submod=submod, _inference_mode=inference_mode)
 
         def _cleanup():
+            calls.append("reshard")
             for p in submod.parameters():
                 p.grad = None
 
         stage._post_metadata_inference_cleanup = _cleanup
-        return stage, param
+        return stage, param, calls
 
-    def test_static_mode_keeps_accumulated_grads(self, monkeypatch):
-        """With static metadata no inference ran, so gradients must survive."""
+    def test_static_mode_skips_cleanup(self):
+        """With static metadata no inference ran, so neither the reshard nor the grad wipe may run."""
         from torch.distributed.pipelining._utils import InferenceMode
 
-        stage, param = self._make_stage(InferenceMode.STATIC)
+        stage, param, calls = self._make_stage(InferenceMode.STATIC)
         expected = param.grad.clone()
 
         _preserve_grads_across_stage_reinit([stage])
         stage._post_metadata_inference_cleanup()
 
-        assert param.grad is not None, "accumulated gradients were discarded on stage re-init"
+        assert calls == []
         torch.testing.assert_close(param.grad, expected)
 
-    def test_dynamic_mode_still_clears_stale_grads(self):
-        """Dynamic inference runs a throwaway backward, so its grads must be cleared."""
+    @pytest.mark.parametrize("mode_name", ["DYNAMIC", None])
+    def test_non_static_mode_still_runs_cleanup(self, mode_name):
+        """Dynamic inference runs a throwaway forward/backward, so its cleanup must still run."""
         from torch.distributed.pipelining._utils import InferenceMode
 
-        stage, param = self._make_stage(InferenceMode.DYNAMIC)
+        stage, param, calls = self._make_stage(getattr(InferenceMode, mode_name) if mode_name else None)
 
         _preserve_grads_across_stage_reinit([stage])
         stage._post_metadata_inference_cleanup()
 
+        assert calls == ["reshard"]
         assert param.grad is None
 
     def test_stage_without_cleanup_hook_is_skipped(self):
@@ -2017,3 +2021,105 @@ class TestPreserveGradsAcrossStageReinit:
         _preserve_grads_across_stage_reinit([stage])
 
         assert not hasattr(stage, "_post_metadata_inference_cleanup")
+
+
+class TestCheckStageReinitIsStatic:
+    """A sequence-length reset must not lead to rank-local dynamic metadata inference."""
+
+    @staticmethod
+    def _user_meta(has_dtensors, grads=None):
+        """Return torch stage metadata with complete forward metadata and optional DTensor activations."""
+        from torch.distributed.pipelining._utils import _StageMeta
+
+        class _FakeDTensorStageMeta(_StageMeta):
+            def has_dtensors(self):
+                return has_dtensors
+
+        return _FakeDTensorStageMeta(inputs=(), outputs=(), input_grads=grads, output_grads=grads)
+
+    def test_dtensor_stage_with_backward_and_no_grad_metadata_raises(self):
+        stage = types.SimpleNamespace(stage_index=1, _user_meta=self._user_meta(has_dtensors=True))
+
+        with pytest.raises(ValueError, match="needs dynamic metadata inference after a sequence-length reset"):
+            _check_stage_reinit_is_static(types.SimpleNamespace(_has_backward=True), [stage])
+
+    @pytest.mark.parametrize(
+        ("has_dtensors", "grads", "has_backward"),
+        [(False, None, True), (True, None, False), (True, (None,), True)],
+    )
+    def test_static_stage_metadata_passes(self, has_dtensors, grads, has_backward):
+        stage = types.SimpleNamespace(stage_index=0, _user_meta=self._user_meta(has_dtensors, grads))
+
+        _check_stage_reinit_is_static(types.SimpleNamespace(_has_backward=has_backward), [stage])
+
+    def test_stage_without_torch_stage_meta_is_skipped(self):
+        """Stages on the older metadata API carry no ``_StageMeta`` and are not checked."""
+        _check_stage_reinit_is_static(types.SimpleNamespace(_has_backward=True), [Mock()])
+
+    def test_reset_raises_before_reinitializing_schedule(self):
+        """reset_pp_stage_shapes runs the check before it marks the schedule for re-initialization."""
+
+        class _StageModel(torch.nn.Module):
+            def get_pipeline_stage_metas(self, **kwargs):
+                hidden = torch.empty(2, 8, 4, device="meta", dtype=kwargs["dtype"])
+                return (hidden,), (hidden,)
+
+        stage = types.SimpleNamespace(
+            stage_index=1, is_first=False, submod=_StageModel(), _user_meta=self._user_meta(has_dtensors=True)
+        )
+        schedule = types.SimpleNamespace(
+            _has_backward=True, _stage_forward_initialized=True, _stage_backward_initialized=True
+        )
+        config = types.SimpleNamespace(hidden_size=4, vocab_size=16)
+
+        with pytest.raises(ValueError, match="dynamic metadata inference"):
+            reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=2, seq_len=8)
+
+        assert schedule._stage_forward_initialized is True
+
+
+def test_explicit_partition_must_list_every_decoder_layer_once():
+    from nemo_automodel.components.distributed.pipelining.functional import _check_partition_lists_every_layer_once
+
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.layers.0", "model.layers.1"], ["model.layers.2", "model.lm_head"]], "model.", 3
+    )
+    with pytest.raises(ValueError, match=r"missing \[1\]"):
+        _check_partition_lists_every_layer_once([["model.layers.0"], ["model.layers.2"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[1\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers.0", "model.layers.1"], ["model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    with pytest.raises(ValueError, match=r"beyond the model \[3\]"):
+        _check_partition_lists_every_layer_once([[f"model.layers.{i}" for i in range(4)]], "model.", 3)
+    # A listed ancestor retains the whole container, as the splitter does.
+    _check_partition_lists_every_layer_once(
+        [["model.embed_tokens", "model.rotary_emb", "model.layers"], ["model.norm", "lm_head"]], "model.", 3
+    )
+    _check_partition_lists_every_layer_once([["model"], ["lm_head"]], "model.", 3)
+    with pytest.raises(ValueError, match=r"repeated \[0, 1, 2\]"):
+        _check_partition_lists_every_layer_once(
+            [["model.layers"], ["model.layers.0", "model.layers.1", "model.layers.2"]], "model.", 3
+        )
+    # Only the canonical decimal key retains a ModuleDict layer: "04" is not "4".
+    with pytest.raises(ValueError, match=r"missing \[4\]"):
+        _check_partition_lists_every_layer_once(
+            [[f"model.layers.{i}" for i in range(4)], ["model.layers.04", "model.layers.5"]], "model.", 6
+        )
+    # The whole FQN must match: with a trailing newline it is another string than the ModuleDict key.
+    with pytest.raises(ValueError, match=r"missing \[4\]"):
+        _check_partition_lists_every_layer_once(
+            [[f"model.layers.{i}" for i in range(4)], ["model.layers.4\n", "model.layers.5"]], "model.", 6
+        )
+    # Stages must own increasing layer ranges: [0,4), [5,6), [4,5), [6,8) covers every layer once but reorders.
+    with pytest.raises(ValueError, match=r"increasing order.*\(0, 3\), \(5, 5\), \(4, 4\), \(6, 7\)"):
+        _check_partition_lists_every_layer_once(
+            [
+                [f"model.layers.{i}" for i in range(0, 4)],
+                ["model.layers.5"],
+                ["model.layers.4"],
+                [f"model.layers.{i}" for i in range(6, 8)],
+            ],
+            "model.",
+            8,
+        )

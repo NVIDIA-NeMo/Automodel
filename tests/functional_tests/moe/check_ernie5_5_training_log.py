@@ -18,7 +18,8 @@ The run trains a randomly initialized proxy on one repeated batch of two documen
 the loss. The two loss bounds were measured on two GPUs with seed 1234: the loss starts at 8.349 and ends at 5.017
 with eager DSA and at 5.027 with cuDNN DSA, 0.60 of its first value.
 
-Called by ``L2_Ernie5_5_MoE_EP2.sh`` after the torchrun invocation.
+Called by ``L2_Ernie5_5_MoE_EP2.sh`` after the torchrun invocation. ``run_ernie5_5_lora_training.py`` imports
+``check_training_log`` and passes its own bound.
 
 Usage:
     python check_ernie5_5_training_log.py training.jsonl --expected-steps 8 --vocab-size 4096
@@ -29,13 +30,16 @@ import json
 import math
 
 
-def check_training_log(path: str, expected_steps: int, vocab_size: int) -> None:
+def check_training_log(path: str, expected_steps: int, vocab_size: int, max_final_fraction: float = 0.7) -> None:
     """Assert that the logged steps show a randomly initialized model that trained.
 
     Args:
         path: Path to the ``training.jsonl`` written by the recipe.
         expected_steps: Number of optimizer steps the run was asked for.
         vocab_size: Vocabulary size of the proxy configuration.
+        max_final_fraction: The loss has to end below this fraction of its first value. The full fine-tuning run
+            passes the default two steps before its end; the LoRA run passes 0.85 at the seventh of its sixteen
+            updates.
 
     Raises:
         AssertionError: If a step is missing, a loss or a gradient norm is not finite, a gradient norm is zero,
@@ -61,10 +65,9 @@ def check_training_log(path: str, expected_steps: int, vocab_size: int) -> None:
         f"The first loss {losses[0]:.6f} is not that of a randomly initialized model, "
         f"ln({vocab_size}) = {uniform_loss:.6f}"
     )
-    # The loss passes 0.7 of its first value two steps before the end.
-    assert losses[-1] < 0.7 * losses[0], (
+    assert losses[-1] < max_final_fraction * losses[0], (
         f"Training loss fell too little on a repeated batch: {losses[0]:.6f} -> {losses[-1]:.6f}, "
-        f"expected less than {0.7 * losses[0]:.6f}"
+        f"expected less than {max_final_fraction * losses[0]:.6f}"
     )
     print(f"ERNIE 5.5 EP2 training OK: loss {losses[0]:.6f} -> {losses[-1]:.6f} over {expected_steps} steps")
 
