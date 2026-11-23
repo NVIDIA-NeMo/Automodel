@@ -110,6 +110,8 @@ class RouterReplay:
             # capture never pins the forward graph.
             recorded = indices.detach()
             previous = self.recorded_indices
+            if previous is not None and previous.shape[-recorded.dim() :] != recorded.shape:
+                previous = None  # a record of another batch
             if previous is not None and (self.visit or previous.dim() > recorded.dim()):
                 # One slot per visit, so the activation-checkpoint recompute of a visit rewrites its own.
                 previous = previous.reshape(-1, *recorded.shape)

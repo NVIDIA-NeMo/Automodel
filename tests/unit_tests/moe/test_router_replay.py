@@ -192,6 +192,19 @@ def test_layer_run_several_times_keeps_one_selection_per_visit():
             assert torch.equal(run(gate, x_train)[1], recorded[visit])
 
 
+def test_recording_another_batch_length_starts_over():
+    torch.manual_seed(0)
+    gate = make_gate()
+    for tokens in (6, 9, 3):  # no record() block in between, so nothing empties the stored selections
+        RouterReplay.set_mode(RouterReplayMode.RECORD)
+        recorded = []
+        for visit in range(3):
+            gate.router_replay.visit = visit
+            recorded.append(run(gate, torch.randn(tokens, 16))[1])
+        RouterReplay.set_mode(None)
+        assert torch.equal(RouterReplay.collect()[0], torch.stack(recorded))
+
+
 def test_replay_recomputes_weights_from_live_scores():
     """Weights under replay come from the *current* scores at the replayed indices."""
     torch.manual_seed(1)
