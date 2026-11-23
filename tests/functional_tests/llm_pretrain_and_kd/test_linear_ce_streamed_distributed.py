@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-GPU NCCL checks that FusedLinearCrossEntropy(impl="cce") streams a sharded LM head.
+"""Two-GPU NCCL checks that the linear CE losses stream a sharded LM head.
 
 The cut_cross_entropy kernels need CUDA, so the CPU/Gloo unit tests cover the
-streaming machinery with the PyTorch chunk kernel, and this test covers the
-cut_cross_entropy chunk kernel and the memory bound that motivated streaming.
+streaming machinery with the PyTorch chunk kernel run eagerly, and this test
+covers the cut_cross_entropy chunk kernel, the compiled PyTorch chunk kernel the
+losses use by default, and the memory bound that motivated streaming.
 """
 
 import os
@@ -36,14 +37,33 @@ def _forbid_full_tensor(*args, **kwargs):
     raise AssertionError("DTensor.full_tensor was called")
 
 
-def _check_parity(rank: int, world: int, device: torch.device, mesh, *, softcap: float, chunk_bytes: int) -> None:
-    """Compare the streamed loss and gradients with dense cut_cross_entropy and an FP32 loss.
+def _check_parity(
+    rank: int,
+    world: int,
+    device: torch.device,
+    mesh,
+    *,
+    loss_fn: torch.nn.Module,
+    softcap: float,
+    chunk_bytes: int,
+    dense_rtol: float = 1e-5,
+) -> None:
+    """Compare the streamed loss and gradients with the same loss on the dense head, and with an FP32 loss.
 
     The vocabulary of 1001 rows shards unevenly over two ranks, and the last
     rank has no supervised tokens but still enters every collective.
+
+    Args:
+        rank: This process's rank.
+        world: Number of ranks, each holding one shard of the head.
+        device: This rank's CUDA device.
+        mesh: One-dimensional mesh the head is sharded over.
+        loss_fn: Linear cross-entropy loss under test.
+        softcap: Logit softcapping ``loss_fn`` applies, or 0.0 for none.
+        chunk_bytes: Size of a streamed vocabulary chunk across all ranks.
+        dense_rtol: Relative tolerance between the streamed loss and the same loss on the dense head.
     """
     import nemo_automodel.components.loss.linear_ce_base as linear_ce_base
-    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 
     linear_ce_base._STREAM_CHUNK_BYTES = chunk_bytes
     vocab, hidden_dim = 1001, 256
@@ -54,7 +74,6 @@ def _check_parity(rank: int, world: int, device: torch.device, mesh, *, softcap:
     labels[0, 0, :7] = -100
     labels[-1] = -100
     normalizer = int((labels != -100).sum())
-    loss_fn = FusedLinearCrossEntropy(logit_softcapping=softcap)
 
     sharded = torch.nn.Parameter(distribute_tensor(weight, mesh, [Shard(0)]))
     local_hidden = hidden[rank].clone().requires_grad_()
@@ -80,7 +99,7 @@ def _check_parity(rank: int, world: int, device: torch.device, mesh, *, softcap:
 
     total = loss.detach().clone()
     dist.all_reduce(total)
-    torch.testing.assert_close(total, dense.detach(), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(total, dense.detach(), rtol=dense_rtol, atol=1e-5)
     torch.testing.assert_close(total, fp32, rtol=1e-4, atol=1e-4)
     # Both gradients are bf16; streaming adds at most one bf16 rounding per chunk sum.
     torch.testing.assert_close(sharded.grad.full_tensor(), dense_weight.grad, rtol=2e-2, atol=2e-4)
@@ -144,11 +163,24 @@ def _worker() -> None:
         rank, world = dist.get_rank(), dist.get_world_size()
         torch.cuda.set_device(rank)
         device = torch.device("cuda", rank)
+        from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
         mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp_cp",))
         # 2 * 61 * 256 * 2 bytes: 61 rows per rank per chunk, so nine chunks with a short last one.
+        nine_chunks = 2 * 61 * 256 * 2
         for softcap in (0.0, 30.0):
-            _check_parity(rank, world, device, mesh, softcap=softcap, chunk_bytes=2 * 61 * 256 * 2)
-        _check_parity(rank, world, device, mesh, softcap=0.0, chunk_bytes=1 << 30)
+            loss_fn = FusedLinearCrossEntropy(logit_softcapping=softcap)
+            _check_parity(rank, world, device, mesh, loss_fn=loss_fn, softcap=softcap, chunk_bytes=nine_chunks)
+        _check_parity(rank, world, device, mesh, loss_fn=FusedLinearCrossEntropy(), softcap=0.0, chunk_bytes=1 << 30)
+        # The losses' default compiled PyTorch chunk kernel. The dense torch_compile path sits about 1.6e-5 from the
+        # FP32 loss, where the streamed one sits within 4e-6, so the two differ by up to 2e-5.
+        compiled = FusedLinearCrossEntropy(impl="torch_compile", logit_softcapping=30.0)
+        _check_parity(
+            rank, world, device, mesh, loss_fn=compiled, softcap=30.0, chunk_bytes=nine_chunks, dense_rtol=5e-5
+        )
+        chunked = ChunkedCrossEntropy(16, compile=True)
+        _check_parity(rank, world, device, mesh, loss_fn=chunked, softcap=0.0, chunk_bytes=nine_chunks)
         _check_memory(world, device, mesh)
         if rank == 0:
             print("LINEAR_CE_STREAMED_DISTRIBUTED_PASS", flush=True)

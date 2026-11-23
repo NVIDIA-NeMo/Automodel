@@ -44,6 +44,7 @@ _SCENARIOS = (
     "masked_ce_mean_and_none_with_empty_shard",
     "masked_ce_loss_weights",
     "kd_loss",
+    "kd_loss_reads_a_sharded_teacher_whole",
     "kd_loss_rejects_mixed_layouts",
     "large_logit_offsets",
     "target_validation",
@@ -139,6 +140,7 @@ def _check_parity(
     upstream: torch.Tensor | None = None,
     rtol: float = 1e-5,
     atol: float = 1e-6,
+    gathers: bool = False,
 ) -> None:
     """Compare ``loss`` on sharded logits with ``loss`` on the dense logits.
 
@@ -149,6 +151,8 @@ def _check_parity(
         upstream: Optional gradient for a non-scalar loss, identical on every rank.
         rtol: Relative tolerance for the loss and gradient.
         atol: Absolute tolerance for the loss and gradient.
+        gathers: Whether ``loss`` may gather the sharded logits; otherwise a gather or a saved
+            full-vocabulary tensor fails the check.
     """
     vocab = full_logits.shape[-1]
     local, sharded = _as_sharded(mesh, full_logits, requires_grad=True)
@@ -158,7 +162,7 @@ def _check_parity(
         value.backward(upstream)
         return value
 
-    actual = _guarded(vocab, run)
+    actual = run() if gathers else _guarded(vocab, run)
     dense = full_logits.detach().clone().requires_grad_()
     expected = loss(dense)
     expected.backward(upstream)
@@ -198,9 +202,19 @@ def _run_scenarios(rank: int) -> dict[str, str]:
     generator = torch.Generator().manual_seed(1234)
 
     def randn(*shape: int) -> torch.Tensor:
+        """Draw the same normal values on every rank.
+
+        Returns:
+            FP32 Tensor of shape ``shape``.
+        """
         return torch.randn(*shape, generator=generator)
 
     def randint(high: int, *shape: int) -> torch.Tensor:
+        """Draw the same integers in ``[0, high)`` on every rank.
+
+        Returns:
+            Int64 Tensor of shape ``shape``.
+        """
         return torch.randint(high, shape, generator=generator)
 
     def masked_ce_sum_with_mask() -> None:
@@ -250,6 +264,15 @@ def _run_scenarios(rank: int) -> dict[str, str]:
             return loss_fn(x, teacher if isinstance(x, DTensor) else dense_teacher, labels, 7)
 
         _check_parity(mesh, student, loss)
+
+    def kd_loss_reads_a_sharded_teacher_whole() -> None:
+        # A student whose TP plan replicates its logits trains against a teacher whose plan shards them.
+        student = randn(2, 5, 13)
+        labels = randint(13, 2, 5)
+        labels[0, :2] = -100
+        loss_fn = KDLoss(temperature=2.0)
+        # The student already holds [tokens, vocab], so gathering the teacher adds no larger tensor.
+        _check_parity(mesh, randn(2, 5, 13), lambda teacher: loss_fn(student, teacher, labels), gathers=True)
 
     def kd_loss_rejects_mixed_layouts() -> None:
         _, student = _as_sharded(mesh, randn(2, 5, 13), requires_grad=False)
@@ -353,29 +376,31 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         _check_parity(mesh, logits, lambda x: loss_fn(x, targets, answer, valid, seq_len=5).total_loss)
 
     def scdd() -> None:
-        # The [MASK] id 5 lives on the second rank (ids 4..7); chunks of 3 positions run checkpointed.
-        logits = randn(2, 5, 13)
-        clean = randint(13, 2, 5)
-        noisy = clean.clone()
-        noisy[0, 1] = 5
-        noisy[1, 3] = 5
-        noisy[1, 0] = (clean[1, 0] + 3) % 13
-        p_mask = torch.tensor([[0.4] * 5, [0.8] * 5])
-        loss_mask = torch.ones(2, 5, dtype=torch.long)
-        scdd_loss = SCDDLoss(mask_token_id=5, num_timesteps=10, max_ratio=0.2, chunk_size=3)
+        # The [MASK] id 5 lives on the second rank, and chunks of 3 positions run checkpointed. A vocabulary of 9
+        # leaves the last rank no ids, which must still recompute and reduce in step with the others.
+        for vocab in (13, 9):
+            logits = randn(2, 5, vocab)
+            clean = randint(vocab, 2, 5)
+            noisy = clean.clone()
+            noisy[0, 1] = 5
+            noisy[1, 3] = 5
+            noisy[1, 0] = (clean[1, 0] + 3) % vocab
+            p_mask = torch.tensor([[0.4] * 5, [0.8] * 5])
+            loss_mask = torch.ones(2, 5, dtype=torch.long)
+            scdd_loss = SCDDLoss(mask_token_id=5, num_timesteps=10, max_ratio=0.2, chunk_size=3)
 
-        def loss(x: torch.Tensor) -> torch.Tensor:
-            """Compute SCDD.
+            def loss(x: torch.Tensor) -> torch.Tensor:
+                """Compute SCDD.
 
-            Args:
-                x: Logits of global shape [batch, sequence, vocab].
+                Args:
+                    x: Logits of global shape [batch, sequence, vocab].
 
-            Returns:
-                Scalar diffusion loss.
-            """
-            return scdd_loss(x, clean, None, p_mask, loss_mask, noisy_input_ids=noisy).total_loss
+                Returns:
+                    Scalar diffusion loss.
+                """
+                return scdd_loss(x, clean, None, p_mask, loss_mask, noisy_input_ids=noisy).total_loss
 
-        _check_parity(mesh, logits, loss, rtol=1e-5, atol=1e-5)
+            _check_parity(mesh, logits, loss, rtol=1e-5, atol=1e-5)
 
     def uno_tv_and_reverse_kl() -> None:
         logits = randn(2, 10, 13)
@@ -422,6 +447,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "masked_ce_mean_and_none_with_empty_shard": masked_ce_mean_and_none_with_empty_shard,
         "masked_ce_loss_weights": masked_ce_loss_weights,
         "kd_loss": kd_loss,
+        "kd_loss_reads_a_sharded_teacher_whole": kd_loss_reads_a_sharded_teacher_whole,
         "kd_loss_rejects_mixed_layouts": kd_loss_rejects_mixed_layouts,
         "large_logit_offsets": large_logit_offsets,
         "target_validation": target_validation,

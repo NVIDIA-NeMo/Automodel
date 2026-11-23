@@ -24,13 +24,14 @@ the local shard.
 """
 
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.loss.vocab_parallel import validate_targets
@@ -116,11 +117,15 @@ class ShardedLMHeadWeight:
             all-gather; the weight gradient keeps ``weight.dtype``.
         vocab_size: Usable vocabulary prefix, excluding padded rows from the
             loss without changing the physical shard boundaries. None uses all rows.
+        reduce_dtype: Dtype the weight gradient is averaged over the mesh in,
+            before it is written to the shard in ``weight.dtype``. None reduces in
+            ``weight.dtype``.
     """
 
     weight: DTensor
     dtype: torch.dtype
     vocab_size: int | None = None
+    reduce_dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
         if self.vocab_size is not None and not 0 < self.vocab_size <= self.weight.shape[0]:
@@ -130,6 +135,26 @@ class ShardedLMHeadWeight:
     def shape(self) -> torch.Size:
         """Effective global ``[vocab, hidden]`` shape, excluding padding rows."""
         return torch.Size((self.vocab_size, self.weight.shape[1])) if self.vocab_size is not None else self.weight.shape
+
+    def with_head_precision(self, lm_head: nn.Module | None) -> "ShardedLMHeadWeight":
+        """Adopt the mixed-precision policy of the FSDP unit that owns the head.
+
+        A head that ran in the forward computes in the policy's ``param_dtype`` and FSDP
+        reduces its gradient in ``reduce_dtype``; a head the forward skipped is still
+        sharded in its master dtype, so the streamed loss applies the same policy.
+
+        Args:
+            lm_head: Module whose ``weight`` this operand streams; only an FSDP unit
+                carries a policy.
+
+        Returns:
+            A copy that projects in the policy's ``param_dtype`` and reduces the weight
+            gradient in its ``reduce_dtype``, or this operand for a head without a policy.
+        """
+        if not isinstance(lm_head, FSDPModule):
+            return self
+        policy = lm_head._get_fsdp_state()._mp_policy
+        return replace(self, dtype=policy.param_dtype or self.dtype, reduce_dtype=policy.reduce_dtype)
 
 
 class _PendingChunk:
@@ -151,10 +176,11 @@ class _PendingChunk:
         self._num_rows = num_rows
 
     def wait(self) -> torch.Tensor:
-        """Return the gathered chunk of shape [chunk_vocab, hidden].
+        """Wait for the all-gather and return the gathered chunk.
 
-        The result is a contiguous view of the receive buffer without the padding
-        rows of short trailing shards.
+        Returns:
+            Tensor of shape [chunk_vocab, hidden]: a contiguous view of the receive
+            buffer without the padding rows of short trailing shards.
         """
         self._work.wait()
         self._send = None
@@ -243,6 +269,7 @@ class _VocabShardLayout:
         self.world_size = mesh.size(shard_dim)
         self.reduce_world_size = mesh.size()
         self.dtype = lm_weight.dtype
+        self.reduce_dtype = lm_weight.reduce_dtype
         self.padded_vocab, self.hidden = weight.shape
         self.vocab = lm_weight.shape[0]
         self.rows_per_rank = -(-self.padded_vocab // self.world_size)
@@ -334,17 +361,19 @@ class _VocabShardLayout:
                 padding or dtype change is needed it is scaled in place and sent.
             chunk: Chunk index.
             grad_shard: Tensor of shape [local_vocab, hidden], this rank's
-                gradient shard; it fixes the reduction dtype.
+                gradient shard; its dtype is the reduction dtype unless the
+                layout sets ``reduce_dtype``.
 
         Returns:
             The pending reduce-scatter.
         """
         rows = self.chunk_size(chunk)
         start = chunk * self.chunk_rows
-        if grad_chunk.shape[0] == self.world_size * rows and grad_chunk.dtype == grad_shard.dtype:
+        reduce_dtype = self.reduce_dtype or grad_shard.dtype
+        if grad_chunk.shape[0] == self.world_size * rows and grad_chunk.dtype == reduce_dtype:
             send = grad_chunk  # the kernel's own buffer; nothing else reads it
         else:
-            send = grad_chunk.new_zeros(self.world_size * rows, self.hidden, dtype=grad_shard.dtype)
+            send = grad_chunk.new_zeros(self.world_size * rows, self.hidden, dtype=reduce_dtype)
             send[: grad_chunk.shape[0]] = grad_chunk
         # Recipes scale each rank's loss by the reduction world size to cancel
         # FSDP's averaged-gradient convention, so average rather than sum.

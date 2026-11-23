@@ -15,10 +15,12 @@
 
 The reviewer's scenario on #4288: a native model with FP32 parameters under
 ``MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32, output_dtype=fp32, cast_forward_inputs=True)``,
-``reshard_after_forward=True`` and ``wrap_outer_model=False``. The recipes prepare the head's weight with
-``prepare_lm_weight`` *after* the forward, when the head has been resharded back to its FP32 master, so the
-loss streams that sharded master in vocabulary chunks and the hidden states the model hands out must be
-projected in its dtype; the ``torch_compile`` projection ``e @ c.T`` aligns nothing itself. The CPU stand-in for the reviewer's Qwen3MoE is a
+``reshard_after_forward=True`` and ``wrap_outer_model=False``. The recipes call the model with
+``compute_logits=False``, so the head never runs: the forward returns it sharded in its FP32 master dtype, and
+``prepare_lm_weight`` applies the head's policy instead, as FSDP would have. The loss streams the master in
+vocabulary chunks that it projects in BF16, with the hidden states the model hands out cast to match (the
+``torch_compile`` projection ``e @ c.T`` aligns nothing itself), and averages the head's gradient in FP32. The
+CPU stand-in for the reviewer's Qwen3MoE is a
 tiny dense DeepSeek-V3 (Qwen3MoE builds its rotary cache on the current CUDA device): the same
 ``LMHead`` projection path, the same standalone FSDP ``lm_head`` unit under the policy.
 """
@@ -34,6 +36,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -90,7 +93,7 @@ def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, lm_h
     return linear_ce_base._chunk_lse_and_target(hidden, weight, targets, softcap, logits_dtype, lm_head)
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, master_dtype: torch.dtype) -> None:
     torch.set_num_threads(1)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -107,7 +110,7 @@ def _worker(rank: int, port: int) -> None:
         torch.manual_seed(3)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
         model = DeepseekV3ForCausalLM(_config(), backend=backend)
-        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=master_dtype)
         mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("dp",))
         policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
@@ -130,21 +133,46 @@ def _worker(rank: int, port: int) -> None:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         input_ids = torch.randint(0, _VOCAB, (2, 8), generator=torch.Generator().manual_seed(100 + rank))
         labels = input_ids.roll(-1, dims=1)
-        for _ in range(2):  # the second step streams a resharded head again
-            out = model(input_ids, logits_to_keep=1, output_hidden_states=True)
+        reduce_scatter = dist.reduce_scatter_tensor
+        reduced_dtypes = []
+
+        def record_reduce_scatter(output: torch.Tensor, input: torch.Tensor, *args, **kwargs):
+            """Record the dtype of each gradient reduce-scatter, then run it.
+
+            Args:
+                output: Tensor of shape [chunk_rows, hidden] receiving this rank's rows.
+                input: Tensor of shape [ranks * chunk_rows, hidden] holding every rank's rows.
+                *args: Remaining ``reduce_scatter_tensor`` arguments.
+                **kwargs: Remaining ``reduce_scatter_tensor`` options.
+
+            Returns:
+                The collective's work handle.
+            """
+            reduced_dtypes.append(input.dtype)
+            return reduce_scatter(output, input, *args, **kwargs)
+
+        dist.reduce_scatter_tensor = record_reduce_scatter
+        for _ in range(2):  # the second step streams the head again
+            out = model(input_ids, compute_logits=False, output_hidden_states=True)
             hidden = get_final_hidden_states(out)
             assert hidden.shape == (2, 8, 64)
-            # The recipes prepare the weight after the forward: the head is resharded, its master dtype is fp32,
-            # and the loss streams it instead of gathering it.
-            lm_weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=dist.group.WORLD)
+            # The forward skipped the head: it returns the weight sharded in its master dtype, and the loss streams
+            # it under the head's policy instead of gathering it.
+            assert isinstance(out.lm_head_weight, DTensor) and out.lm_head_weight.dtype == master_dtype
+            lm_weight = prepare_lm_weight(
+                loss_fn, model, lm_head_weight=out.lm_head_weight, grad_reduce_group=dist.group.WORLD
+            )
             assert isinstance(lm_weight, ShardedLMHeadWeight)
-            assert lm_weight.dtype == torch.float32 and lm_weight.shape == (_VOCAB, 64)
+            assert lm_weight.dtype == torch.bfloat16 and lm_weight.shape == (_VOCAB, 64)
+            reduced_dtypes.clear()
             loss = loss_fn(
                 hidden, labels, lm_weight, num_label_tokens=labels.numel(), grad_reduce_group=dist.group.WORLD
             )
             assert torch.isfinite(loss)
             loss.backward()
-            assert model.lm_head.weight.grad is not None
+            assert model.lm_head.weight.grad is not None and model.lm_head.weight.grad.dtype == master_dtype
+            # The head's gradient is averaged in the policy's reduce_dtype, as FSDP reduces an unsharded head's.
+            assert reduced_dtypes and set(reduced_dtypes) == {torch.float32}
             assert sum(parameter.grad is not None for parameter in model.parameters()) > 1  # the backbone too
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -158,5 +186,6 @@ def _worker(rank: int, port: int) -> None:
     hard_timeout=60,
     reason="spawns two Gloo FSDP2 workers for a tiny Qwen3MoE forward/backward/step twice",
 )
-def test_fused_loss_consumes_the_resharded_fp32_head_under_a_bf16_policy() -> None:
-    mp.spawn(_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
+@pytest.mark.parametrize("master_dtype", [torch.float32, torch.bfloat16], ids=["fp32_master", "bf16_master"])
+def test_fused_loss_streams_the_head_under_its_fsdp_policy(master_dtype: torch.dtype) -> None:
+    mp.spawn(_worker, args=(_free_port(), master_dtype), nprocs=_WORLD_SIZE, join=True)

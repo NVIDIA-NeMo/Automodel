@@ -83,7 +83,7 @@ def _linear_cross_entropy(
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    logits = _chunk_logits(hidden, weight, None, logits_dtype, lm_head)
+    logits = _chunk_logits(hidden, weight, softcap=None, logits_dtype=logits_dtype, lm_head=lm_head)
     return compute_cross_entropy(logits, labels, ignore_index, "none")
 
 
@@ -244,8 +244,8 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
     def prepare_lm_weight(
         self,
         lm_head: nn.Module | None,
-        weight: torch.Tensor,
         *,
+        weight: torch.Tensor | None = None,
         model_config: PretrainedConfig | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor | ShardedLMHeadWeight:
@@ -254,8 +254,8 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         Args:
             lm_head: Plain linear head with weight of global shape [vocab, hidden].
                 Its FSDP policy, when present, owns the compute dtype.
-            weight: The head's weight of global shape [vocab, hidden], as the module holds it: the one a forward
-                called with ``compute_logits=False`` returned, or ``lm_head.weight``.
+            weight: The head's weight of global shape [vocab, hidden], as the module holds it, that a forward
+                called with ``compute_logits=False`` returned; None uses ``lm_head.weight``.
             model_config: Owning model config, used to reject post-projection transforms.
             grad_reduce_group: Group contributing independent token losses.
 
@@ -263,15 +263,17 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             The ``resolve_lm_weight`` result in the compute dtype. A dense
             [vocab, hidden] weight is converted once and stays differentiable,
             so share it across main and MTP losses. A sharded head records the
-            dtype and casts each streamed chunk instead.
+            head's FSDP policy, and casts each streamed chunk instead.
         """
         lm_head = self.validate_lm_head(lm_head, model_config=model_config)
         compute_dtype = lm_head.weight.dtype
         if isinstance(lm_head, FSDPModule):
             compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype or compute_dtype
-        weight = self.resolve_lm_weight(weight, grad_reduce_group=grad_reduce_group)
+        weight = self.resolve_lm_weight(
+            lm_head.weight if weight is None else weight, grad_reduce_group=grad_reduce_group
+        )
         if isinstance(weight, ShardedLMHeadWeight):
-            return dataclasses.replace(weight, dtype=compute_dtype)
+            return weight.with_head_precision(lm_head)
         return weight.to(compute_dtype)
 
     def forward(
@@ -306,8 +308,9 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             logits_dtype: Optional output cast after projection, matching the
                 owning model. Projection uses lm_weight.dtype; mixed-dtype
                 hidden states are converted per chunk, never the full weight.
-            lm_head: The model's ``LMHead``, whose ``project`` each chunk calls with the
-                materialized weight; None projects like a plain bias-free linear head.
+            lm_head: The model's ``LMHead``, whose ``project`` each token block calls with
+                the weight, or with a gathered chunk of its rows when the head is streamed;
+                None projects like a plain bias-free linear head.
 
         Returns:
             FP32 scalar, or losses shaped [...] for reduction="none". Inputs

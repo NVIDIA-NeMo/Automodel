@@ -138,19 +138,6 @@ def _get_final_hidden_states(model_output: Any) -> Any | None:
     return hidden_states
 
 
-def projected_logits_dtype(logits: torch.Tensor | None) -> torch.dtype | None:
-    """Return the dtype of the logits a model's forward returned, or None when it skipped the LM head.
-
-    Args:
-        logits: The output's logits, a Tensor of shape [..., vocab]; an empty Tensor of shape [..., 0], from a forward
-            called with ``compute_logits=False``; or None for an output without logits.
-
-    Returns:
-        The logits' dtype, or None when there are no logits to take it from.
-    """
-    return None if logits is None or logits.shape[-1] == 0 else logits.dtype
-
-
 def prepare_lm_weight(
     loss_fn: LinearCrossEntropy,
     model: nn.Module,
@@ -171,22 +158,27 @@ def prepare_lm_weight(
     Returns:
         The ``resolve_lm_weight`` result: a dense [vocab, hidden] weight, or a
         ShardedLMHeadWeight that each loss streams without gathering it whole.
-        No collective runs here. Chunked CE also honors the head's compute
-        dtype; share this result across loss calls to convert a dense head once.
+        A streamed head computes and reduces its gradient under the head's FSDP
+        mixed-precision policy. No collective runs here. Chunked CE also converts a
+        dense head to its compute dtype; share this result across loss calls to
+        convert it once.
     """
     # Match setup's head/config lookup without changing the training wrapper.
     if isinstance(model, nn.parallel.DistributedDataParallel):
         model = model.module
-    if lm_head_weight is None:
-        lm_head_weight = _get_lm_head_weight(model)
     if isinstance(loss_fn, ChunkedCrossEntropy):
         return loss_fn.prepare_lm_weight(
             _get_lm_head_module(model),
-            lm_head_weight,
+            weight=lm_head_weight,
             model_config=getattr(model, "config", None),
             grad_reduce_group=grad_reduce_group,
         )
-    return loss_fn.resolve_lm_weight(lm_head_weight, grad_reduce_group=grad_reduce_group)
+    if lm_head_weight is None:
+        lm_head_weight = _get_lm_head_weight(model)
+    weight = loss_fn.resolve_lm_weight(lm_head_weight, grad_reduce_group=grad_reduce_group)
+    if isinstance(weight, ShardedLMHeadWeight):
+        weight = weight.with_head_precision(_get_lm_head_module(model))
+    return weight
 
 
 def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
@@ -221,10 +213,11 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         if lm_weight is None:
             lm_weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
         if isinstance(loss_fn, ChunkedCrossEntropy):
-            # A dict output without logits arrives here as the logits argument itself.
+            # A dict output without logits arrives here as the logits argument itself, and a forward called with
+            # compute_logits=False returns empty logits, whose dtype is not the head's.
             logits = kwargs.get("logits")
-            logits = logits if isinstance(logits, torch.Tensor) else None
-            loss_fn_kwargs["logits_dtype"] = kwargs.pop("logits_dtype", projected_logits_dtype(logits))
+            logits_dtype = logits.dtype if isinstance(logits, torch.Tensor) and logits.shape[-1] else None
+            loss_fn_kwargs["logits_dtype"] = kwargs.pop("logits_dtype", logits_dtype)
             unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
             head = _get_lm_head_module(unwrapped)
             loss_fn_kwargs["lm_head"] = head if isinstance(head, LMHead) else None

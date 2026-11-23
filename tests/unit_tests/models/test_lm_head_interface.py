@@ -209,4 +209,3 @@ def test_registered_lm_class_can_skip_its_logits(module, name):
     if "logits_to_keep" not in forward:
         pytest.skip("the recipe uses MaskedCrossEntropy for models without logits_to_keep")
     assert forward["compute_logits"].default is True
-

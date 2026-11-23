@@ -134,7 +134,9 @@ def materialize_teacher_logits(
 
     Returns:
         On the transport rank, a detached contiguous tensor of shape
-        ``[batch, sequence_length, vocab]``; None on every other rank.
+        ``[batch, sequence_length, vocab]``; None on the other ranks of the TP
+        and CP groups the logits are sharded over. Logits replicated over TP
+        come back whole on every TP rank of CP coordinate 0.
     """
     shard = vocab_shard(logits)
     local = shard.local.detach()

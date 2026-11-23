@@ -84,9 +84,10 @@ def vocab_shard(logits: torch.Tensor) -> VocabShard:
             replicated over any others. Shards follow ``torch.chunk`` semantics.
 
     Returns:
-        The local slice. Regular tensors, fully replicated DTensors, and
-        DTensors on a one-rank shard dimension hold the whole vocabulary and
-        have no group.
+        A VocabShard whose ``local`` is this rank's Tensor of shape
+        [..., local_vocab], holding vocabulary ids ``[start, start + local_vocab)``.
+        Regular tensors, fully replicated DTensors, and DTensors on a one-rank
+        shard dimension hold the whole vocabulary and have no group.
 
     Raises:
         ValueError: If a DTensor has any other placement, or its local shard
@@ -334,11 +335,13 @@ def gather(local: torch.Tensor, index: torch.Tensor, *, start: int, group: dist.
     """
     if group is None:
         return local.gather(-1, index.unsqueeze(-1)).squeeze(-1)
-    if not local.shape[-1]:
-        # Stay connected to the graph so this rank enters the backward all-reduce too.
-        return sum_over_group(local.sum(dim=-1), group)
+    width = local.shape[-1]
+    if not width:
+        # An empty shard runs, and saves for backward, what the other ranks do, so activation checkpointing
+        # recomputes the forward, and enters its collectives, at the same point on every rank.
+        local = F.pad(local, (0, 1))
     offset = index - start
-    owned = (offset >= 0) & (offset < local.shape[-1])
+    owned = (offset >= 0) & (offset < width)
     picked = local.gather(-1, offset.clamp(0, local.shape[-1] - 1).unsqueeze(-1)).squeeze(-1)
     return sum_over_group(torch.where(owned, picked, torch.zeros_like(picked)), group)
 

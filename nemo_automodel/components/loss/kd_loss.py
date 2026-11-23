@@ -202,7 +202,8 @@ class KDLoss(nn.Module):
                 leading dimensions. Under TP, the local tensor has shape
                 ``[..., local_vocab]`` with ``Shard(-1)`` placement.
             teacher_logits: Tensor with the same global and local shape contract
-                as ``student_logits``.
+                as ``student_logits``. When the student holds the whole
+                vocabulary, a ``Shard(-1)`` teacher is gathered whole.
             labels: Tensor of shape ``[...]`` matching the logits' leading
                 dimensions. Positions equal to ``ignore_index`` are excluded.
             num_batch_labels: Total number of valid tokens across all gradient-accumulation steps.
@@ -222,6 +223,9 @@ class KDLoss(nn.Module):
         if tp_group is None:
             student = vocab_parallel.vocab_shard(student_logits)
             teacher = vocab_parallel.vocab_shard(teacher_logits)
+            if student.group is None and teacher.group is not None and isinstance(teacher_logits, DTensor):
+                # A student whose plan replicates its logits reads the vocabulary-sharded teacher whole.
+                teacher = vocab_parallel.vocab_shard(teacher_logits.full_tensor())
             if _vocab_layout(student) != _vocab_layout(teacher):
                 raise ValueError(
                     "KDLoss needs student and teacher logits with one vocabulary layout: both sharded on the "

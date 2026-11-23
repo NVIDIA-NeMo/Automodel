@@ -696,7 +696,9 @@ class HybridDiffusionLLMLoss(nn.Module):
         Args:
             logits: Model output logits, shape ``[B, L, V]`` or
                 ``[B, L+L_ar, V]`` if the model produces both diffusion and AR
-                logits in a single concatenated tensor (legacy path).
+                logits in a single concatenated tensor (legacy path). A
+                ``Shard(-1)`` DTensor holds local shape ``[B, ..., local_vocab]``,
+                and both halves are reduced over its group without a gather.
             target_ids: Clean token IDs, shape ``[B, L]``.
             noise_mask: Boolean mask of corrupted positions, shape ``[B, L]``.
             p_mask: Per-position masking probability, shape ``[B, L]``.
@@ -704,8 +706,9 @@ class HybridDiffusionLLMLoss(nn.Module):
             loss_mask_ar: AR loss mask, shape ``[B, L]``. If None, no AR loss.
             num_diffusion_tokens: Total diffusion label tokens for normalization.
             num_ar_tokens: Total AR label tokens for normalization.
-            causal_logits: Optional separate AR logits, shape ``[B, L, V]``.
-                When provided, avoids the concat/split of the legacy layout.
+            causal_logits: Optional separate AR logits, shape ``[B, L, V]``,
+                with the same DTensor contract as ``logits``. When provided,
+                avoids the concat/split of the legacy layout.
             noisy_input_ids: Ignored (the model applies masking internally),
                 shape ``[B, L]`` when supplied.
 
@@ -1181,7 +1184,8 @@ class DFlashDecayLoss(nn.Module):
 
         Args:
             logits: Draft logits shaped ``[batch, blocks, k, vocab]`` or legacy
-                flattened ``[batch, tokens, vocab]``.
+                flattened ``[batch, tokens, vocab]``. A ``Shard(-1)`` DTensor holds
+                local ``[..., local_vocab]``; the NLL and argmax reduce over its group.
             target_ids: Token IDs shaped ``[batch, blocks, k]`` or ``[batch, tokens]``.
             block_mask: Valid-position mask with the same leading shape as
                 ``target_ids``; zero entries are excluded.
@@ -1225,7 +1229,8 @@ class DFlashDecayLoss(nn.Module):
 
         Args:
             logits: Draft logits shaped ``[batch, blocks, k, vocab]`` or legacy
-                flattened ``[batch, tokens, vocab]``.
+                flattened ``[batch, tokens, vocab]``. A ``Shard(-1)`` DTensor holds
+                local ``[..., local_vocab]``; the NLL and argmax reduce over its group.
             target_ids: Token IDs shaped ``[batch, blocks, k]`` or ``[batch, tokens]``.
             block_mask: Valid-position mask with the same leading shape as
                 ``target_ids``; zero entries are excluded.
