@@ -31,21 +31,25 @@ def _write_json(path: str, contents: dict) -> None:
         stream.write("\n")
 
 
-def tokenizer_source_path(tokenizer: "PreTrainedTokenizerBase", original_model_path: str | None) -> str | None:
+def tokenizer_source_path(
+    tokenizer: "PreTrainedTokenizerBase", model_name_or_path: str | None, original_model_path: str | None
+) -> str | None:
     """Locate the snapshot the tokenizer was loaded from.
 
     The tokenizer can come from a different snapshot than the model weights. A tokenizer without a
-    ``name_or_path`` was built in memory and takes the model snapshot.
+    ``name_or_path``, or one that names the same source as the model, takes the snapshot already resolved for the
+    model, which honors the revision and cache directory of the load.
 
     Args:
         tokenizer: Tokenizer being saved.
+        model_name_or_path: ``name_or_path`` of the model being saved, or None.
         original_model_path: Local snapshot of the model weights, or None.
 
     Returns:
         The local directory holding the tokenizer's own files, or None when it is not available locally.
     """
     name_or_path = tokenizer.name_or_path
-    if not name_or_path:
+    if not name_or_path or name_or_path == model_name_or_path:
         return original_model_path
     if os.path.isdir(name_or_path):
         return name_or_path

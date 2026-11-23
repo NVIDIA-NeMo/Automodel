@@ -126,6 +126,12 @@ def _has_metadata_exporter_hook(model_part: nn.Module) -> bool:
     return any(callable(getattr(candidate, "_get_consolidated_hf_metadata_exporter", None)) for candidate in candidates)
 
 
+def _model_name_or_path(model_part: nn.Module) -> str | None:
+    """The ``name_or_path`` the model was loaded from, or None when it was built without one."""
+    model = unwrap_ddp_model(model_part)
+    return getattr(model, "name_or_path", None) or getattr(getattr(model, "config", None), "name_or_path", None)
+
+
 class CheckpointAddon(Protocol):
     """
     Optional hooks that run around backend IO (used for PEFT and consolidated HF metadata).
@@ -226,7 +232,8 @@ class ConsolidatedHFAddon:
                     # around a module that has one, are left as they are, also when the hook declines: for the
                     # retrieval encoders the reference directory is not always the source snapshot.
                     restore_source_tokenizer_truncation_and_padding(
-                        tokenizer_source_path(tokenizer, original_model_path), hf_metadata_dir
+                        tokenizer_source_path(tokenizer, _model_name_or_path(model_part), original_model_path),
+                        hf_metadata_dir,
                     )
 
             # save the fqn_to_file_index_mapping file
@@ -322,7 +329,8 @@ class PeftAddon:
                 # As in the full-model save of ConsolidatedHFAddon.
                 if not _has_metadata_exporter_hook(model_part):
                     restore_source_tokenizer_truncation_and_padding(
-                        tokenizer_source_path(tokenizer, original_model_path), model_path
+                        tokenizer_source_path(tokenizer, _model_name_or_path(model_part), original_model_path),
+                        model_path,
                     )
             # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
             with open(os.path.join(model_path, "adapter_config.json"), "w") as f:

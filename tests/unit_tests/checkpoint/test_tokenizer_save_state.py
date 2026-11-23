@@ -298,6 +298,25 @@ def test_saved_tokenizer_keeps_the_state_of_its_own_snapshot_not_the_model_snaps
     assert _saved_state(directory) == tokenizer_state
 
 
+@pytest.mark.parametrize("pre_save", [_pre_save_full_model, _pre_save_peft_adapter], ids=["full_model", "peft_adapter"])
+def test_saved_tokenizer_of_the_same_hub_repo_as_the_model_keeps_the_resolved_model_snapshot(
+    tmp_path: Path, pre_save: Callable[..., None]
+) -> None:
+    """A tokenizer that names the model's repo is not looked up again, as a pinned revision would be missed."""
+    source, source_state = _source_snapshot_with_state(tmp_path)
+    tokenizer = _tokenizer()
+    tokenizer.name_or_path = "org/repo-not-in-any-cache"
+    _call_like_training(tokenizer)
+    model = _Model()
+    model.name_or_path = "org/repo-not-in-any-cache"
+    directory = tmp_path / "saved"
+    directory.mkdir()
+
+    pre_save(model, tokenizer, directory, str(source))
+
+    assert _saved_state(directory) == source_state
+
+
 @_SAVE_SITES
 def test_saved_tokenizer_gets_the_state_of_the_source_when_the_last_call_left_none(
     tmp_path: Path, save: SaveFn
