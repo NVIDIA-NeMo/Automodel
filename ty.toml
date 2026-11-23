@@ -78,6 +78,8 @@ include = [
     "nemo_automodel/components/distributed/grad_utils.py",
     "nemo_automodel/components/distributed/init_utils.py",
     "nemo_automodel/components/distributed/tensor_utils.py",
+    "nemo_automodel/components/distributed/thd_utils.py",
+    "nemo_automodel/components/distributed/tp_replicas.py",
     "nemo_automodel/components/distributed/utils.py",
     "nemo_automodel/components/eval/tool_call_evaluator.py",
     "nemo_automodel/components/loss/kd_loss.py",

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
+
 import torch
 
 
@@ -86,7 +88,7 @@ def process_input_for_thd(
     batch: dict[str, torch.Tensor],
     seq_lens_padding_value: int = -1000,
     padding_token_id: int = 0,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | bool]:
     """
     Process inputs for THD (total, hidden, depth) format.
 
@@ -262,7 +264,7 @@ def process_input_for_thd(
             device=input_ids_thd.device,
         )
 
-    result = {
+    result: dict[str, torch.Tensor | bool] = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
         "cu_seqlens": cu_seqlens,
@@ -301,7 +303,7 @@ def split_batch_into_thd_chunks(
     num_chunks: int,
     seq_lens_padding_value: int = -1000,
     padding_token_id: int = 0,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | bool]:
     """
     Process inputs for THD format by splitting batch into chunks for context parallelism.
 
@@ -372,7 +374,7 @@ def split_batch_into_thd_chunks(
     if num_chunks <= 1:
         return process_input_for_thd(batch, seq_lens_padding_value, padding_token_id)
 
-    def pad_and_stack(tensor_list, padding_value):
+    def pad_and_stack(tensor_list: Sequence[torch.Tensor], padding_value: int) -> torch.Tensor:
         """Pad tensors to same length and stack them."""
         max_len = max(len(t) for t in tensor_list)
         padded = []
@@ -398,24 +400,27 @@ def split_batch_into_thd_chunks(
         for i in range(num_chunks)
     ]
 
-    stacked: dict = {
-        "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
-        "labels": torch.stack([c["labels"] for c in chunk_results]),
-        "position_ids": torch.stack([c["position_ids"] for c in chunk_results]),
-        "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
-        "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
+    def _chunk_tensors(key: str) -> list[torch.Tensor]:
+        return [t for c in chunk_results if isinstance((t := c[key]), torch.Tensor)]
+
+    stacked: dict[str, torch.Tensor | bool] = {
+        "input_ids": torch.stack(_chunk_tensors("input_ids")),
+        "labels": torch.stack(_chunk_tensors("labels")),
+        "position_ids": torch.stack(_chunk_tensors("position_ids")),
+        "cu_seqlens": pad_and_stack(_chunk_tensors("cu_seqlens"), seq_lens_padding_value),
+        "padding_mask": torch.stack(_chunk_tensors("padding_mask")),
     }
     # Stack physical boundaries independently of the per-microbatch padding decision.
     if any("cu_seqlens_padded" in c for c in chunk_results):
-        stacked["cu_seqlens_padded"] = pad_and_stack(
-            [c.get("cu_seqlens_padded", c["cu_seqlens"]) for c in chunk_results],
-            seq_lens_padding_value,
-        )
+        padded_tensors: list[torch.Tensor] = [
+            t for c in chunk_results if isinstance((t := c.get("cu_seqlens_padded", c["cu_seqlens"])), torch.Tensor)
+        ]
+        stacked["cu_seqlens_padded"] = pad_and_stack(padded_tensors, seq_lens_padding_value)
     if all("max_seqlen" in c for c in chunk_results):
-        stacked["max_seqlen"] = torch.stack([c["max_seqlen"] for c in chunk_results])
+        stacked["max_seqlen"] = torch.stack(_chunk_tensors("max_seqlen"))
     for key in ("_packed_seq_ids", "document_ids"):
         if all(key in c for c in chunk_results):
-            stacked[key] = torch.stack([c[key] for c in chunk_results])
+            stacked[key] = torch.stack(_chunk_tensors(key))
     stacked.update(
         {k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor) and k != "pad_between_seqs"}
     )
