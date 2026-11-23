@@ -23,7 +23,7 @@ from torch.autograd.function import FunctionCtx
 from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import set_is_first_microbatch
+from nemo_automodel.components.models.common.utils import TENvfp4Config, set_is_first_microbatch
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.shared.import_utils import is_te_min_version
@@ -96,6 +96,10 @@ def _experts(*, native: bool, counts: list[int], bias: bool = True) -> GroupedEx
     module.ep_size = 1
     module.token_dispatcher = _GroupedInputDispatcher(counts)
     return module
+
+
+# Relative L2 error of NVFP4 GEMMs against FP32 on the Gaussian test data below; 0.24 to 0.26 on GB300.
+NVFP4_ORACLE_TOLERANCE = 0.4
 
 
 def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -306,6 +310,100 @@ def test_native_te_grouped_tensor_numerics(precision: str, checkpointed: bool, b
     finally:
         set_is_first_microbatch(None)
         torch.set_float32_matmul_precision(original_precision)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_native_te_grouped_tensor_matches_the_split_path_under_nvfp4(checkpointed: bool) -> None:
+    """NVFP4 experts compute the same through the grouped-tensor GEMMs as through one GEMM per expert.
+
+    The recipe is the ``te_nvfp4`` default (random Hadamard transform, 16x16 weight blocks) with stochastic
+    rounding off: the two paths draw different random numbers for it, so only round-to-nearest gradients
+    can be compared value by value.
+
+    Args:
+        checkpointed: Whether to recompute the expert forward during backward.
+    """
+    te = pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
+    if not is_te_min_version("2.19.0"):
+        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
+    from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
+
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("NVFP4 GEMMs require a Blackwell GPU")
+    recipe = TENvfp4Config(stochastic_rounding=False).build_recipe()
+    if not is_module_grouped_tensor_path_supported(recipe, torch.bfloat16):
+        pytest.skip("The native grouped-tensor path does not support NVFP4 on this device")
+
+    torch.manual_seed(13)
+    # Padded to the NVFP4 alignment of 128 rows: one group, an empty expert, one group, three groups.
+    counts = [17, 0, 63, 300]
+    reference = _experts(native=False, counts=counts, bias=False)
+    candidate = _experts(native=True, counts=counts, bias=False)
+    with torch.no_grad():
+        for reference_parameter, parameter in zip(reference.parameters(), candidate.parameters(), strict=True):
+            parameter.copy_(reference_parameter)
+    mask = torch.ones(sum(counts), device="cuda", dtype=torch.bool)
+    indices = torch.cat([torch.full((count, 1), expert) for expert, count in enumerate(counts)]).cuda()
+    try:
+        for microbatch in range(2):
+            set_is_first_microbatch(microbatch == 0)
+            x = torch.randn(sum(counts), 256, dtype=torch.bfloat16, device="cuda")
+            probs = torch.rand(sum(counts), 1, dtype=torch.bfloat16, device="cuda")
+            upstream = torch.randn_like(x)
+            results: list[dict[str, torch.Tensor]] = []
+            for module in (reference, candidate):
+                module.zero_grad(set_to_none=True)
+                hidden = x.detach().clone().requires_grad_()
+                probability = probs.detach().clone().requires_grad_()
+
+                def run(
+                    hidden: torch.Tensor, probability: torch.Tensor, *, module: GroupedExpertsTE = module
+                ) -> torch.Tensor:
+                    """Evaluate the experts under the NVFP4 recipe, also during checkpoint recomputation.
+
+                    Args:
+                        hidden: Tensor of shape [tokens, hidden], grouped by expert.
+                        probability: Tensor of shape [tokens, 1] with routing probabilities.
+                        module: Expert module bound for this checkpoint evaluation.
+
+                    Returns:
+                        Tensor of shape [tokens, hidden].
+                    """
+                    with te.autocast(enabled=True, recipe=recipe):
+                        return module(hidden, mask, probability, indices)
+
+                # The backward runs under the recipe as well, as it does in the training recipes.
+                with te.autocast(enabled=True, recipe=recipe):
+                    if checkpointed:
+                        output = checkpoint(run, hidden, probability, use_reentrant=False)
+                    else:
+                        output = run(hidden, probability)
+                    output.backward(upstream)
+                assert hidden.grad is not None and probability.grad is not None
+                values = {"output": output.detach(), "input_grad": hidden.grad, "probability_grad": probability.grad}
+                for name, parameter in module.named_parameters():
+                    assert parameter.grad is not None, name
+                    values[name] = parameter.grad
+                results.append(values)
+            split, grouped = results
+            # Same quantized operands in both paths: the forward and the input gradient agree bit for bit.
+            assert torch.equal(grouped["output"], split["output"])
+            assert torch.equal(grouped["input_grad"], split["input_grad"])
+            for name, expected in split.items():
+                # One grouped GEMM sums each weight gradient in another order than one GEMM per expert.
+                assert _relative_l2(grouped[name], expected) < 1e-4, name
+                if name.endswith("weight1"):
+                    assert torch.count_nonzero(grouped[name]).item() == 0, name
+            # Both must approximate the unquantized computation equally well.
+            oracle = _fp32_reference(reference, x, probs, upstream, counts)
+            for name, expected in oracle.items():
+                split_error = _relative_l2(split[name], expected)
+                grouped_error = _relative_l2(grouped[name], expected)
+                assert max(split_error, grouped_error) < NVFP4_ORACLE_TOLERANCE, name
+                assert abs(grouped_error - split_error) < 1e-3, name
+    finally:
+        set_is_first_microbatch(None)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 recipe switching requires CUDA")
