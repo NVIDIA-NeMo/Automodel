@@ -16,12 +16,14 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_5 import modeling_qwen3_5
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
@@ -202,6 +204,15 @@ def test_spec_generate_verifies_qwen3_5_image_prompt_after_rejections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed: int, max_new_tokens: int
 ) -> None:
     """Match greedy decoding through multiple rejected blocks and committed prefixes."""
+    # Transformers binds the CUDA-only causal_conv1d/fla kernels at import whenever they are installed, but this
+    # test runs on CPU tensors, so use its reference torch ops.
+    for name in (
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
+        "torch_chunk_gated_delta_rule",
+        "torch_recurrent_gated_delta_rule",
+    ):
+        monkeypatch.setattr(modeling_qwen3_5, name, inspect.unwrap(getattr(modeling_qwen3_5, name)))
     torch.manual_seed(seed)
     config = Qwen3_5Config(
         text_config=Qwen3_5TextConfig(
