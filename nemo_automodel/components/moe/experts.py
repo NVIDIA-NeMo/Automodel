@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -27,7 +28,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe import swiglu_triton
-from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig, NcclEpConfig
 from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_combine_output_cached
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
@@ -41,9 +42,10 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
+from nemo_automodel.shared.import_utils import is_te_min_version, safe_import, safe_import_te
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
+_HAVE_TE, transformer_engine = safe_import_te()
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
@@ -255,6 +257,9 @@ class _AllGatherConcatVarlenFn(Function):
 if TYPE_CHECKING:
     from transformer_engine.common.recipe import Recipe
     from transformer_engine.pytorch import GroupedLinear
+else:
+    # Without Transformer Engine this is a placeholder: it can be subclassed and raises when constructed.
+    GroupedLinear = transformer_engine.pytorch.GroupedLinear if _HAVE_TE else transformer_engine
 
     from nemo_automodel.components.models.common.utils import BackendConfig
 
@@ -1468,6 +1473,8 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
+    token_dispatcher: MoEFlexTokenDispatcher | None
+
     def __init__(
         self,
         config: MoEConfig,
@@ -1503,6 +1510,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1521,6 +1529,9 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         )
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
+        self.dispatcher_hybridep_max_tokens_per_rank = (
+            backend.dispatcher_hybridep_max_tokens_per_rank if backend is not None else None
         )
         # HybridEP capacity mode (BackendConfig.dispatcher_capacity_factor): the dispatcher returns
         # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
@@ -1575,6 +1586,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
 
+        self.token_dispatcher = None
         self.expert_activation = get_expert_activation_for_deepep(config)
 
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
@@ -1588,6 +1600,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -1597,6 +1610,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_max_tokens_per_rank=self.dispatcher_hybridep_max_tokens_per_rank,
             moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
             moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
@@ -1615,6 +1629,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             local_expert_indices=local_expert_indices,
             config=config,
             ep_group=ep_group,
+            hidden_dim=self.config.expert_dim,
         )
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
@@ -1648,6 +1663,8 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             empty probabilities use the configured compute dtype.
         """
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        if self.token_dispatcher is None:
+            raise RuntimeError("token_dispatcher is not initialized. Call init_token_dispatcher first.")
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,
             num_local_tokens=x.size(0),
@@ -1662,6 +1679,27 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
         return permuted_local_hidden_states, tokens_per_expert, permuted_probs
+
+    def _has_dispatched_rows(self, hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor) -> bool:
+        """Return whether this rank received routed rows, reading the device only when needed.
+
+        Static routing and capacity buffers always dispatch rows. NCCL-EP sizes its receive
+        buffer to the routed rows, so the buffer's leading extent already answers on the
+        host. Other dispatchers need a device-to-host read of the per-expert counts.
+
+        Args:
+            hidden_states: Dispatched activations of shape [received_rows, hidden].
+            tokens_per_expert: Integer tensor of shape [local_experts] with the routed rows
+                of each local expert.
+
+        Returns:
+            True when the grouped expert GEMMs have routed rows to process.
+        """
+        if self.dispatch_rows_never_empty:
+            return True
+        if self.dispatcher_backend == "nccl_ep":
+            return hidden_states.shape[0] > 0
+        return bool(torch.count_nonzero(tokens_per_expert) > 0)
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
         """Return dispatcher-owned resources that must be ready before a PP step.
@@ -1704,6 +1742,9 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             torch.Tensor: Output tensor after expert computation.
                 Shape is [num_tokens, model_dim]
         """
+        if self.token_dispatcher is None:
+            raise RuntimeError("token_dispatcher is not initialized. Call init_token_dispatcher first.")
+
         assert not isinstance(x, DTensor)
 
         assert self.n_routed_experts % self.ep_size == 0, (
@@ -1726,9 +1767,8 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if self._has_dispatched_rows(permuted_local_hidden_states, tokens_per_expert):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]
@@ -1793,9 +1833,20 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                     defer_down_proj=self.dispatcher_recompute_cache == "moe_tail" and post_expert_output is None,
                 )
         else:
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
+            # Preserve the dispatch autograd edge even when this rank receives no
+            # tokens: its backward must still participate in EP communication.
+            output1 = torch.matmul(permuted_local_hidden_states, gate_and_up_projs[0])
+            if self.expert_bias:
+                output1 = _apply_bias(output1, self.gate_up_proj_bias.to_local(), tokens_per_expert)
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
+            if self.expert_bias:
+                output2 = _apply_bias(
+                    output2,
+                    self.down_proj_bias.to_local(),
+                    tokens_per_expert,
+                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                )
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
@@ -1872,6 +1923,54 @@ def _torch_mm_experts_fwd(
     return output2
 
 
+_TE_EXPERT_PARAMETER = re.compile(r"(weight|bias)(\d+)")
+
+
+def _global_expert_name(name: str, first_expert: int) -> str:
+    """Shift the expert index in a ``GroupedLinear`` parameter name from local to global.
+
+    Args:
+        name: An attribute name. ``weight{i}`` and ``bias{i}`` with ``i < first_expert`` are TE's names for the
+            parameters of local expert ``i``.
+        first_expert: Global index of the module's first expert.
+
+    Returns:
+        ``weight{first_expert + i}`` or ``bias{first_expert + i}`` for such a name; any other name unchanged.
+    """
+    match = _TE_EXPERT_PARAMETER.fullmatch(name)
+    if match is None or int(match[2]) >= first_expert:
+        return name
+    return f"{match[1]}{first_expert + int(match[2])}"
+
+
+class _ExpertGroupedLinear(GroupedLinear):
+    """``GroupedLinear`` whose expert parameters are named by their global expert index.
+
+    TE registers the parameters of GEMM ``i`` as ``weight{i}`` and ``bias{i}`` and reads them back under those
+    names. With expert parallelism every rank would hold a ``weight0``, each for a different expert, and state
+    that is kept per parameter name, such as the optimizer state in a checkpoint, would collide between ranks.
+    Here they are registered as ``weight{first_expert + i}``, so their names are unique across expert-parallel
+    ranks, and the names TE uses resolve to them.
+    """
+
+    def __init__(self, *args: Any, first_expert: int, **kwargs: Any) -> None:
+        """
+        Args:
+            *args: ``GroupedLinear`` arguments.
+            first_expert: Global index of the expert computed by GEMM 0: 0, or at least the number of GEMMs, so
+                that the registered names of this module never read as TE's local names.
+            **kwargs: ``GroupedLinear`` arguments.
+        """
+        self.first_expert = first_expert  # TE registers the parameters in its __init__.
+        super().__init__(*args, **kwargs)
+
+    def register_parameter(self, name: str, param: nn.Parameter | None, **kwargs: Any) -> None:
+        super().register_parameter(_global_expert_name(name, self.first_expert), param, **kwargs)
+
+    def __getattr__(self, name: str) -> torch.Tensor | nn.Module:
+        return super().__getattr__(_global_expert_name(name, self.first_expert))
+
+
 class GroupedExpertsTE(nn.Module):
     """
     MoE experts using TE's GroupedLinear module directly.
@@ -1903,12 +2002,17 @@ class GroupedExpertsTE(nn.Module):
         Args:
             config: MoE configuration containing expert parameters.
             backend: Backend configuration; reads ``benchmark_static_routing``
-                (cache the per-microbatch split list under forced-balanced routing) and
-                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs).
+                (cache the per-microbatch split list under forced-balanced routing),
+                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs) and
+                ``dispatcher_equal_token_counts`` (passed to the HybridEP dispatcher).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
+
+        Raises:
+            ValueError: If ``te_grouped_tensor`` is requested with Transformer Engine older than 2.19.0, or if
+                ``dispatcher_capacity_factor`` is set, which these experts cannot use.
         """
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
@@ -1935,9 +2039,12 @@ class GroupedExpertsTE(nn.Module):
         self._static_m_splits: list | None = None
         if backend is not None and backend.compile_router_weight:
             _compile_router_weight_cores()
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
+        # Set when NVFP4 is enabled; caps the experts per rank.
+        self.te_nvfp4 = backend.te_nvfp4 if backend is not None else None
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1957,6 +2064,21 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        # BackendConfig.dispatcher_equal_token_counts (HybridEP only): every EP rank dispatches the same row
+        # count, so the dispatcher derives its pad size locally instead of all-reducing it on every dispatch.
+        self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
+        if backend is not None and backend.dispatcher_capacity_factor is not None:
+            # Capacity mode pads the dispatched buffer past the routed rows while tokens_per_expert counts only
+            # those rows. TE's GroupedLinear needs split sizes that cover every input row and reads them on the
+            # host, so the factor would neither run nor remove a sync here.
+            raise ValueError(
+                "dispatcher_capacity_factor is not supported by the TE grouped experts "
+                f"(experts={backend.experts!r} with dispatcher={backend.dispatcher!r}); use experts='torch_mm' "
+                "or leave it at None."
+            )
+        self.dispatcher_hybridep_max_tokens_per_rank = (
+            backend.dispatcher_hybridep_max_tokens_per_rank if backend is not None else None
+        )
 
         # BackendConfig.dispatcher_recompute_cache: the HybridEP combine output of a checkpoint forward is served
         # in the recompute ("combine"); "moe_tail" is refused by BackendConfig for this backend (no deferred GEMM
@@ -1965,7 +2087,7 @@ class GroupedExpertsTE(nn.Module):
             str(getattr(backend, "dispatcher_recompute_cache", "none")) if backend is not None else "none"
         )
 
-        self._init_grouped_layers(self.num_local_experts)
+        self._init_grouped_layers(self.num_local_experts, first_expert=0)
         self.expert_activation = get_expert_activation_for_deepep(config)
         self._grouped_tensor_signature: tuple["Recipe | None", torch.dtype] | None = None
 
@@ -1974,15 +2096,20 @@ class GroupedExpertsTE(nn.Module):
         self.moe_mesh = None
         self.ep_rank = 0
 
-    def _init_grouped_layers(self, num_local_experts: int) -> None:
-        """Construct both TE projections and their padding for this EP partition."""
-        from transformer_engine.pytorch import GroupedLinear
+    def _init_grouped_layers(self, num_local_experts: int, first_expert: int) -> None:
+        """Construct both TE projections and their padding for this EP partition.
 
+        Args:
+            num_local_experts: Number of experts held by this rank.
+            first_expert: Global index of this rank's first expert; the parameters of local expert ``i`` are
+                named ``weight{first_expert + i}`` and ``bias{first_expert + i}``.
+        """
         grouped_linear_kwargs = {"use_grouped_tensor": True} if self.use_grouped_tensor else {}
         gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
 
         # Create both projections on meta for the current local expert count.
-        self.gate_up_linear = GroupedLinear(
+        self.gate_up_linear = _ExpertGroupedLinear(
+            first_expert=first_expert,
             num_gemms=num_local_experts,
             in_features=self.config.expert_dim,
             out_features=gate_up_out_features,
@@ -1992,7 +2119,8 @@ class GroupedExpertsTE(nn.Module):
             **grouped_linear_kwargs,
         )
         # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
+        self.down_linear = _ExpertGroupedLinear(
+            first_expert=first_expert,
             num_gemms=num_local_experts,
             in_features=self.config.moe_inter_dim,
             out_features=self.config.expert_dim,
@@ -2248,8 +2376,15 @@ class GroupedExpertsTE(nn.Module):
             f"n_routed_experts ({self.config.n_routed_experts}) must be divisible by ep_size ({self.ep_size})"
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
+        if self.te_nvfp4 is not None and self.num_local_experts > self.te_nvfp4.max_grouped_tensors:
+            raise ValueError(
+                f"te_nvfp4 supports at most {self.te_nvfp4.max_grouped_tensors} experts per rank (the limit of "
+                f"Transformer Engine's NVFP4 grouped quantization), got {self.num_local_experts}; "
+                "use a larger ep_size."
+            )
+        local_expert_indices_offset = self.ep_rank * self.num_local_experts
 
-        self._init_grouped_layers(self.num_local_experts)
+        self._init_grouped_layers(self.num_local_experts, first_expert=local_expert_indices_offset)
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -2257,6 +2392,7 @@ class GroupedExpertsTE(nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -2266,11 +2402,12 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
+            moe_hybridep_max_tokens_per_rank=self.dispatcher_hybridep_max_tokens_per_rank,
             moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
 
-        local_expert_indices_offset = self.ep_rank * self.num_local_experts
         local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
 
         self.token_dispatcher = MoEFlexTokenDispatcher(
@@ -2278,6 +2415,7 @@ class GroupedExpertsTE(nn.Module):
             local_expert_indices=local_expert_indices,
             config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
+            hidden_dim=self.config.expert_dim,
         )
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
@@ -2432,8 +2570,10 @@ class GroupedExpertsTE(nn.Module):
                 else:
                     return tensor
 
-            # Cast like the TE path above: FP32 master weights meet BF16 tokens here too.
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
+            # Empty dispatched rows retain the collective backward edge and also
+            # work when the local input itself has zero rows. Cast like the TE path
+            # above: FP32 master weights meet BF16 tokens here too.
+            output1 = torch.matmul(permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
             all_expert_dependency = output2.new_zeros(())
@@ -2470,9 +2610,9 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         else:
             return tensor
 
-    # mxfp4-resident experts hold packed base weights (no gate_and_up_projs /
+    # mxfp4- / nvfp4-resident experts hold packed base weights (no gate_and_up_projs /
     # down_projs); those are filled from the checkpoint, nothing to init here.
-    if getattr(module, "_mxfp4_resident", False):
+    if getattr(module, "_mxfp4_resident", False) or getattr(module, "_nvfp4_resident", False):
         return
 
     with torch.device(buffer_device):

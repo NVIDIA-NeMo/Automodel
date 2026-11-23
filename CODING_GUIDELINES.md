@@ -58,7 +58,24 @@ not yet comply; use these guidelines to guide changes within your task's scope.
 
 - **Prefer explicit types.** Annotate public inputs and returns with concrete, meaningful types.
 - **Type annotations still apply to excluded files.** Add types to new and modified
-  signatures even when `pyproject.toml` excludes the file or relaxes its type checks.
+  signatures even when `ty.toml` excludes the file or relaxes its type checks.
+- **Run all type gates.** Use `uv run --group linting python tools/check_types.py`.
+  CI uses the same entry point. `ty.toml` owns checker settings and the opt-in
+  module list; `tools/annotation_policy.toml` owns the separate annotation policy.
+  In the opt-in scope, Ruff requires annotations on every function parameter
+  (except implicit `self`/`cls`) and return, including private/nested functions,
+  constructors, and variadic arguments. Existing omissions must be fixed when
+  opting in; there are no baselines or `noqa` allowances for missing annotations.
+  `ty` checks type consistency but does not require annotations by itself.
+- **All `object` annotations require review.** The policy checker rejects direct,
+  nested, quoted, and locally aliased `object` annotations across `nemo_automodel`
+  and `examples`, including type comments. Use a precise contract when operations
+  or a schema are known. For genuinely opaque values, add an exact path, symbol,
+  and annotation-slot exception with a reason in `tools/annotation_policy.toml`.
+  Existing annotations are checked under the same policy; there are no legacy allowances.
+  This is a syntax check, not type inference or cross-module alias resolution;
+  `ty` and caller/implementation review remain necessary. Runtime `object()`
+  sentinels and `Literal`/`Annotated` metadata are unaffected.
 - **Avoid `Any`.** It effectively bypasses type checking for affected values and hides errors.
 - **Avoid reflection.** Do not access members by string name or choose behavior by inspecting objects at runtime,
   as with `getattr`, `hasattr`, `setattr`, `isinstance` or `type()` dispatch, `inspect.signature`, `__dict__`, or

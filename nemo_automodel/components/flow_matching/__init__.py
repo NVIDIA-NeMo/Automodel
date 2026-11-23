@@ -20,6 +20,7 @@ diffusion models using the flow matching objective.
 """
 
 import importlib
+from typing import Any
 
 _LAZY_ATTRS = {
     "FlowMatchingPipeline": (".pipeline", "FlowMatchingPipeline"),
@@ -35,7 +36,7 @@ _LAZY_ATTRS = {
 __all__ = sorted(_LAZY_ATTRS.keys())
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     if name in _LAZY_ATTRS:
         module_path, attr_name = _LAZY_ATTRS[name]
         module = importlib.import_module(module_path, __name__)
@@ -45,5 +46,5 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def __dir__():
+def __dir__() -> list[str]:
     return sorted(__all__)

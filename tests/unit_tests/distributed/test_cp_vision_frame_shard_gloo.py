@@ -401,3 +401,30 @@ def test_cp_vision_frame_shard_two_rank_gloo_pad_path_parity(tmp_path: Path) -> 
 )
 def test_cp_vision_frame_shard_two_rank_gloo_local_patch_floor_parity(tmp_path: Path) -> None:
     mp.spawn(_local_patch_floor_worker, args=(2, (tmp_path / "rendezvous").as_uri()), nprocs=2, join=True)
+
+
+def _gather_axis_worker(rank: int, world_size: int, init_method: str) -> None:
+    """The single-buffer gather must preserve arbitrary axes and reverse uses."""
+    from nemo_automodel.components.distributed.cp_vision_frame_shard import _AllGatherSeqDiff
+
+    try:
+        _init_gloo(rank, world_size, init_method)
+        torch.set_num_threads(1)
+        generator = torch.Generator().manual_seed(52)
+        full = torch.randn(4, 6, 8, generator=generator)
+        for axis in (0, 1, 2, -2):
+            width = full.shape[axis] // world_size
+            local = full.narrow(axis, rank * width, width).detach().requires_grad_()
+            output = _AllGatherSeqDiff.apply(local, dist.group.WORLD, axis)
+            torch.testing.assert_close(output, full, rtol=0, atol=0)
+            upstream = torch.randn(full.shape, generator=torch.Generator().manual_seed(61 + rank))
+            (output * upstream).sum().backward()
+            dist.all_reduce(upstream)
+            torch.testing.assert_close(local.grad, upstream.narrow(axis, rank * width, width), rtol=0, atol=0)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_single_buffer_gather_axes_and_gradients(tmp_path):
+    mp.spawn(_gather_axis_worker, args=(2, (tmp_path / "gather_axes").as_uri()), nprocs=2, join=True)

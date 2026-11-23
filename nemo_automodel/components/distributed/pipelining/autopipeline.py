@@ -308,6 +308,7 @@ class AutoPipeline:
         *,
         target: torch.Tensor | None = None,
         losses: list[torch.Tensor] | None = None,
+        return_outputs: bool = False,
         **kwargs: Any,
     ) -> Any:
         """Run one pipeline schedule step with model-owned input chunking.
@@ -319,12 +320,19 @@ class AutoPipeline:
                 ranks without the last pipeline stage.
             losses: Mutable list populated with scalar loss tensors, or ``None``
                 on ranks without the last pipeline stage.
+            return_outputs: Whether the last stage keeps every microbatch's output
+                and returns them merged. This costs two copies of the last stage's
+                output for the whole local batch, so pass ``True`` only when the
+                caller reads it.
             **kwargs: Keyword schedule inputs. Tensor values may have arbitrary
                 model-defined layouts; model-owned metadata identifies any
                 nonstandard batch axis.
 
         Returns:
-            The value returned by the underlying PyTorch pipeline schedule.
+            The last stage's output for the whole local batch, merged along the
+            batch axis in the model's output layout, when this rank owns the last
+            stage and ``return_outputs`` is ``True``; otherwise ``None``. PyTorch
+            releases before 2.10 always return it on the last stage.
         """
         schedule = self._info.schedule
         if schedule is None:
@@ -333,12 +341,12 @@ class AutoPipeline:
         schedule_args = (model_input,) if self._info.has_first_stage else ()
         kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
         if kwargs_chunk_spec is None:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+            return schedule.step(*schedule_args, target=target, losses=losses, return_outputs=return_outputs, **kwargs)
 
         previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
         schedule._kwargs_chunk_spec = kwargs_chunk_spec
         try:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+            return schedule.step(*schedule_args, target=target, losses=losses, return_outputs=return_outputs, **kwargs)
         finally:
             schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
 

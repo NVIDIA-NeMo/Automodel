@@ -125,6 +125,14 @@ mixed-precision, prefetch, CP, EP, and root-wrapping behavior.
   the complete dense FSDP2 flow. Call `super()._apply(...)` to retain the common
   ordering and validations. The public `parallelize(model, context)` method
   remains unchanged.
+- Override `_apply_unsharded(model, mesh_context)` only when the model's blocks do
+  not live in one decoder `layers` stack. On a single-rank mesh the shared flow
+  skips `fully_shard`, installs activation checkpointing on that stack and wraps
+  the forward in autocast; the override prepares its own towers instead.
+- Override `_apply_moe(model, mesh_context)` only when the model's MoE blocks do
+  not live in one decoder `layers` stack, so the shared expert-parallel flow
+  cannot walk them. The hook receives the resolved `MeshContext` and returns the
+  parallelized model.
 
 <Note>
 The leading underscores mark model-author extension points, not general

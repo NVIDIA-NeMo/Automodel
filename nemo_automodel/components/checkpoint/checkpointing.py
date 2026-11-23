@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -50,12 +51,12 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
-from torch.nn.parallel import DistributedDataParallel
 from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
@@ -91,8 +92,10 @@ from nemo_automodel.components.checkpoint.utils import (
     is_cloud_path,
     is_rank_0,
     materialize_missing_tied_lm_head,
+    unwrap_ddp_model,
 )
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
+from nemo_automodel.shared.import_utils import get_torch_version
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -222,13 +225,6 @@ def load_torch_ckpt(
         raise RuntimeError(_format_restricted_load_error(f)) from err
 
 
-def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
-    """Return the module that owns model metadata hidden by DDP."""
-    if isinstance(model, DistributedDataParallel):
-        return model.module
-    return model
-
-
 def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None) -> bool:
     """Return whether this load requires checkpoint dequantization.
 
@@ -248,7 +244,7 @@ def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None)
     if requested is False:
         return False
 
-    quantization_config = getattr(getattr(_unwrap_ddp_model(model), "config", None), "quantization_config", None)
+    quantization_config = getattr(getattr(unwrap_ddp_model(model), "config", None), "quantization_config", None)
     if isinstance(quantization_config, dict):
         quantization_method = quantization_config.get("quant_method")
     else:
@@ -273,9 +269,29 @@ def _get_shared_parameter_names(model_parts: list[nn.Module]) -> list[list[str]]
     """
     names_by_parameter: dict[int, list[str]] = {}
     for part in model_parts:
-        for name, parameter in _unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
+        for name, parameter in unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
             names_by_parameter.setdefault(id(parameter), []).append(canonical_parameter_fqn(name))
     return [names for names in names_by_parameter.values() if len(names) > 1]
+
+
+def _get_task_head_keys(model: nn.Module, state_dict_keys: Iterable[str]) -> list[str]:
+    """Return keys outside the backbone when the model's class differs from its checkpoint architecture.
+
+    E.g. ``score.*`` of ``Qwen2ForTokenClassification`` built on a ``Qwen2ForCausalLM`` checkpoint.
+    """
+    unwrapped = unwrap_ddp_model(model)
+    prefix = getattr(unwrapped, "base_model_prefix", "")
+    backbone = getattr(unwrapped, prefix, None) if prefix else None
+    # A model that is its own backbone (e.g. T5ForConditionalGeneration) has no task heads.
+    if not isinstance(backbone, nn.Module) or backbone is unwrapped:
+        return []
+    checkpoint_architectures = getattr(getattr(unwrapped, "config", None), "architectures", None) or []
+    # FSDP2 swaps in a generated subclass, so match any class in the MRO.
+    if not checkpoint_architectures or any(cls.__name__ in checkpoint_architectures for cls in type(unwrapped).__mro__):
+        return []
+    return sorted(
+        key for key in state_dict_keys if not key.startswith(f"{prefix}.") and not key.endswith("_extra_state")
+    )
 
 
 def _normalize_dtype_mapping_to_state_dict_keys(
@@ -305,7 +321,7 @@ def _apply_adapter_forced_dtype_mapping(
     fqn_to_dtype_mapping: dict[str, str],
 ) -> dict[str, str]:
     """Let model adapters override original HF dtype metadata for export-only keys."""
-    model = _unwrap_ddp_model(model)
+    model = unwrap_ddp_model(model)
     adapter = getattr(model, "state_dict_adapter", None)
     forced_dtype_mapping = getattr(adapter, "forced_hf_dtype_mapping", None)
     if not callable(forced_dtype_mapping):
@@ -321,6 +337,59 @@ def _apply_adapter_forced_dtype_mapping(
         if fqn in state_dict_key_set:
             normalized[fqn] = dtype_str
     return normalized
+
+
+def _collect_global_dtype_mapping(
+    fqn_to_dtype_mapping: dict[str, str],
+    process_group: torch.distributed.ProcessGroup | None,
+) -> dict[str, str]:
+    """Collect the export dtypes of all tensors across the ranks that save a model.
+
+    Each rank derives export dtypes only for the tensors it exports, and ranks can export different tensors, such as
+    the experts of one expert-parallel rank or the layers of one pipeline stage. Consolidation applies the mapping of
+    one rank to tensors of other ranks, so every rank needs the entries of all ranks. Every rank of a multi-rank group
+    must call this at the same point of the save.
+
+    Args:
+        fqn_to_dtype_mapping: This rank's mapping from exported tensor names to safetensors dtype strings.
+        process_group: Process group whose ranks save the model, or ``None`` for the default group.
+
+    Returns:
+        ``fqn_to_dtype_mapping`` when one rank saves the model or all ranks derived the same mapping. Otherwise the
+        union of the mappings of all ranks in ``process_group``; when ranks disagree on a tensor name, every rank uses
+        the entry of the lowest rank and rank 0 of the group logs a warning.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return fqn_to_dtype_mapping
+    world_size = torch.distributed.get_world_size(group=process_group)
+    if world_size == 1:
+        return fqn_to_dtype_mapping
+
+    # Ranks that export the same tensors derive the same mapping, so digests are compared first and the mappings
+    # are exchanged only when they differ. Every rank sees the same digests and takes the same branch.
+    local_digest = hashlib.sha256(json.dumps(sorted(fqn_to_dtype_mapping.items())).encode()).hexdigest()
+    digests = [""] * world_size
+    torch.distributed.all_gather_object(digests, local_digest, group=process_group)
+    if len(set(digests)) == 1:
+        return fqn_to_dtype_mapping
+
+    gathered_mappings: list[dict[str, str]] = [{} for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered_mappings, fqn_to_dtype_mapping, group=process_group)
+    global_mapping: dict[str, str] = {}
+    conflicting_fqns: dict[str, None] = {}
+    for rank_mapping in gathered_mappings:
+        for fqn, dtype_str in rank_mapping.items():
+            if global_mapping.setdefault(fqn, dtype_str) != dtype_str:
+                conflicting_fqns[fqn] = None
+    if conflicting_fqns and torch.distributed.get_rank(group=process_group) == 0:
+        logger.warning(
+            "The %d ranks that save the model report different export dtypes for %d tensor(s), the first being %s; "
+            "every rank uses the dtype of the lowest rank that reports a tensor.",
+            world_size,
+            len(conflicting_fqns),
+            next(iter(conflicting_fqns)),
+        )
+    return global_mapping
 
 
 def _ensure_msc_available() -> None:
@@ -775,6 +844,7 @@ class Checkpointer:
                 hf_metadata_dir=hf_metadata_dir,
                 tokenizer=tokenizer,
                 peft_config=peft_config,
+                exported_tensor_names=tuple(state_dict),
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
@@ -1075,7 +1145,7 @@ class Checkpointer:
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
-        has_state_dict_adapter = hasattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter")
+        has_state_dict_adapter = hasattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter")
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
@@ -1112,7 +1182,7 @@ class Checkpointer:
             world_size = torch.distributed.get_world_size()
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        state_dict_adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         uses_standard_hf_state_dict = state_dict_adapter is None
         can_use_low_memory_dcp = not should_dequantize_base_checkpoint and (
             uses_standard_hf_state_dict
@@ -1277,7 +1347,7 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
-        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         checkpoint_key_aliases = dict(getattr(adapter, "checkpoint_key_aliases", {}))
         applied_key_aliases: dict[str, str] = {}
         checkpoint_metadata = {}
@@ -1287,12 +1357,18 @@ class Checkpointer:
         shared_parameter_names = (
             _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
         )
+        task_head_keys = (
+            _get_task_head_keys(model_state.model[0], state_dict)
+            if is_init_step and uses_standard_hf_state_dict and not allow_checkpoint_key_subset
+            else []
+        )
         if (
             should_try_tied_lm_head_compat
             or allow_checkpoint_key_subset
             or extra_state_keys
             or shared_parameter_names
             or checkpoint_key_aliases
+            or task_head_keys
         ):
             checkpoint_metadata = _get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata
             checkpoint_metadata_keys = set(checkpoint_metadata)
@@ -1367,6 +1443,21 @@ class Checkpointer:
                     state_dict.setdefault(source_name, state_dict.pop(name))
                     shared_alias_sources[name] = source_name
 
+        # Like HF from_pretrained, keep new task heads absent from a base checkpoint at their init.
+        new_task_head_keys = [
+            key for key in task_head_keys if key in state_dict and key not in checkpoint_metadata_keys
+        ]
+        if new_task_head_keys:
+            for key in new_task_head_keys:
+                state_dict.pop(key)
+            logging.warning(
+                "Checkpoint %s has no weights for %d task-head keys outside the model backbone. "
+                "Keeping their initialization (examples=%s).",
+                model_path,
+                len(new_task_head_keys),
+                new_task_head_keys[:10],
+            )
+
         if allow_checkpoint_key_subset:
             missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
             # A subset load tolerates a few absent keys (e.g. heads excluded at save time);
@@ -1437,12 +1528,13 @@ class Checkpointer:
         # them), so they are absent from the returned state_dict but ARE loaded. The adapter
         # tracks them (reset + populated entirely inside from_hf); count them as loaded for the
         # diff to avoid false "missing" warnings while genuinely unloaded params are still flagged.
-        _adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        _adapter = getattr(unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         loaded_keys_for_diff |= getattr(_adapter, "view_loaded_native_keys", None) or set()
         if allow_checkpoint_key_subset:
             # Keys deliberately kept at init were already warned about above; keep
             # reporting unexpected keys, which nothing else surfaces.
             expected_keys_for_diff &= loaded_keys_for_diff
+        expected_keys_for_diff.difference_update(new_task_head_keys)
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             safe_moe_tp_requires_complete_checkpoint = any(
@@ -1469,7 +1561,12 @@ class Checkpointer:
         state_dict.update(preserved_extra_state)
         model_state.load_state_dict(
             state_dict,
-            strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
+            strict=not (
+                len(model_state.model) > 1
+                or has_state_dict_adapter
+                or allow_checkpoint_key_subset
+                or bool(new_task_head_keys)
+            ),
             broadcast_from_rank0=self.process_group is None and torch.distributed.is_initialized(),
         )
         install_complete = time.monotonic()
@@ -1688,6 +1785,9 @@ class Checkpointer:
                 is_init_step=True,
                 key_mapping=key_mapping,
             )
+            # DoRA magnitudes are derived from the base weight, which only now holds checkpoint values.
+            # An adapter checkpoint restored later still overwrites them.
+            _init_dora_magnitudes(model)
 
         _reinit_non_persistent_buffers(model, device, model_type=model_type)
 
@@ -2045,8 +2145,12 @@ set -euo pipefail
 # Slurm example:
 #   sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/consolidate.sh'
 # Optional: set CAST_DTYPE=bf16 to request a floating-point dtype cast during export.
+# TIMEOUT_MINUTES caps the distributed barrier wait (default 30). With imbalanced
+# shard sizes ranks finish minutes apart; keep it comfortably above the slowest
+# rank's runtime or fast ranks time out and the run tears down.
 NPROC_PER_NODE="${{NPROC_PER_NODE:-1}}"
 NUM_THREADS="${{NUM_THREADS:-5}}"
+TIMEOUT_MINUTES="${{TIMEOUT_MINUTES:-30}}"
 CAST_DTYPE="${{CAST_DTYPE:-}}"
 PYTHON="${{PYTHON:-python3}}"
 TORCHRUN="${{TORCHRUN:-torchrun}}"
@@ -2065,6 +2169,7 @@ if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
   "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
+    --timeout-minutes "${{TIMEOUT_MINUTES}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
     --output-dir "{output_dir}"{diffusers_arg} \\
@@ -2073,6 +2178,7 @@ else
   "${{PYTHON}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
+    --timeout-minutes "${{TIMEOUT_MINUTES}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
     --output-dir "{output_dir}"{diffusers_arg} \\
@@ -2232,11 +2338,21 @@ fi
         Original HF safetensors headers provide the baseline mapping when available.
         Model-owned adapter overrides are applied even for config-only runs so
         intrinsically fp32 tensors retain their required export dtype.
+
+        Args:
+            model_state: Wrapper exposing the primary model part.
+            state_dict: This rank's subset of the exported state dict, such as one pipeline stage or the experts of
+                one expert-parallel rank. Each value is a tensor of arbitrary shape; only its name and, through the
+                adapter, its dtype are read.
+
+        Returns:
+            Mapping from FQN to safetensors dtype string for the tensors exported by all ranks that save the model,
+            or None when there is no entry or no HF metadata is written.
         """
         if not _should_write_hf_metadata(self.config):
             return None
 
-        model = _unwrap_ddp_model(model_state.model[0])
+        model = unwrap_ddp_model(model_state.model[0])
         normalized_dtype_mapping: dict[str, str] = {}
         reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
@@ -2251,6 +2367,10 @@ fi
                     dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
                 )
         normalized_dtype_mapping = _apply_adapter_forced_dtype_mapping(model, state_dict, normalized_dtype_mapping)
+        # The entries so far cover only the tensors this rank exports. Rank 0 writes the mapping for offline
+        # consolidation and every rank consolidates shards that hold tensors of other ranks, so all ranks that save
+        # the model share one mapping. ``process_group=None`` saves across the default group, as in ``dcp.save``.
+        normalized_dtype_mapping = _collect_global_dtype_mapping(normalized_dtype_mapping, self.process_group)
         return normalized_dtype_mapping or None
 
     def _get_storage_writer(
@@ -2300,8 +2420,9 @@ fi
         Prefers the upstream ``torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader``
         when no ``key_mapping`` is needed, since it uses safetensors' native ``get_slice()`` for
         efficient partial reads (only the bytes for the local DTensor shard are read from disk).
-        Falls back to the backported reader when ``key_mapping`` is required or when the upstream
-        reader is not available.
+        Falls back to the backported reader when ``key_mapping`` is required, and for base-model
+        loads the upstream reader cannot serve: remote paths, torch before 2.9, integrated GPUs, and
+        checkpoints with dtypes the safetensors package does not decode.
 
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
@@ -2321,23 +2442,21 @@ fi
             is_safetensors = _is_safetensors_checkpoint(model_path)
         if not is_init_step and not is_safetensors:
             return None
-        # The upstream HuggingFaceStorageReader delegates dtype decoding to
-        # safetensors.torch._TYPES, which does not yet recognize the FP8
-        # scale dtypes emitted by some quantized HF checkpoints (e.g.
-        # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
-        # read_metadata → DCP ends up with metadata=None on every rank).
-        # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
-        # so prefer it for base-model HF loads. Mid-training DCP loads may
-        # still use the faster upstream reader.
         if key_mapping is None and not is_init_step:
+            return _CachedMetadataHFReader(path=model_path)
+        # Base-model loads use the upstream reader too: each read is a safetensors slice copy, several times faster
+        # than the backport's mmap page-fault path on network filesystems. The upstream reader decodes dtypes with the
+        # safetensors package, which does not know some quantized-checkpoint scale dtypes (DeepSeek V4's F8_E8M0):
+        # reading the metadata then raises KeyError, and those checkpoints stay on the backport, whose DTYPE_MAP
+        # covers them. The metadata read here is cached for the dcp.load calls that follow.
+        if key_mapping is None and is_safetensors and _can_use_upstream_hf_reader(model_path):
+            reader = _CachedMetadataHFReader(path=model_path)
             try:
-                from torch.distributed.checkpoint.hf_storage import (
-                    HuggingFaceStorageReader as _UpstreamHFReader,
-                )
-
-                return _UpstreamHFReader(path=model_path)
-            except ImportError:
-                pass
+                reader.read_metadata()
+            except KeyError as error:
+                logger.info("Loading %s with the in-tree reader: safetensors cannot decode dtype %s", model_path, error)
+            else:
+                return reader
         return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
@@ -2364,6 +2483,58 @@ fi
         # fall back to the standard HF hub cache root.
         cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
         return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
+
+
+class _CachedMetadataHFReader(HuggingFaceStorageReader):
+    """The upstream safetensors reader, parsing the checkpoint metadata once per checkpoint path.
+
+    ``dcp.load`` calls ``read_metadata`` on every load, and the upstream reader rescans every shard header each time.
+    The part-by-part base load issues one ``dcp.load`` per part with one reader, so it relies on this cache, as on the
+    backport reader's.
+    """
+
+    def __init__(self, path: str) -> None:
+        """Bind the reader to one checkpoint directory.
+
+        Args:
+            path: Local checkpoint directory.
+        """
+        super().__init__(path=path)
+        self._metadata_cache: Metadata | None = None
+
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        """Reset reader state and discard the cached metadata only when the checkpoint changes."""
+        previous_path = str(self.path)
+        super().reset(checkpoint_id)
+        if checkpoint_id is not None and str(self.path) != previous_path:
+            self._metadata_cache = None
+
+    def read_metadata(self) -> Metadata:
+        """Return the checkpoint metadata, parsing the safetensors headers on the first call only."""
+        if self._metadata_cache is None:
+            self._metadata_cache = super().read_metadata()
+        elif self._metadata_cache.storage_meta is not None:
+            self._metadata_cache.storage_meta.load_id = self.load_id
+        return self._metadata_cache
+
+
+def _can_use_upstream_hf_reader(model_path: str) -> bool:
+    """Whether a base-model load from ``model_path`` may use the upstream safetensors reader.
+
+    Before torch 2.9 the upstream reader reads whole shard files and decodes dtypes with a table that has no FP8. It
+    reads local directories only, and on integrated GPUs the backport stages reads through host memory instead.
+
+    Args:
+        model_path: Checkpoint directory or remote path.
+
+    Returns:
+        True for a local directory on torch 2.9 or later without an integrated CUDA device.
+    """
+    if get_torch_version().release < (2, 9) or not os.path.isdir(model_path):
+        return False
+    if not torch.cuda.is_available():
+        return True
+    return not _is_integrated_cuda_device(torch.device("cuda", torch.cuda.current_device()))
 
 
 def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
@@ -2545,8 +2716,22 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
         if hasattr(module, "init_lora_weights"):
             try:
                 module.init_lora_weights(peft_init_method)
+            except ValueError:
+                raise
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _init_dora_magnitudes(model: nn.Module) -> None:
+    """
+    Set every DoRA magnitude vector to the row-wise L2 norm of its module's current base weight.
+
+    Args:
+        model: Model whose DoRA modules (``use_dora=True`` with an ``init_dora_magnitude`` method) are updated.
+    """
+    for module in model.modules():
+        if getattr(module, "use_dora", False) and hasattr(module, "init_dora_magnitude"):
+            module.init_dora_magnitude()
 
 
 _MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(
@@ -2991,7 +3176,7 @@ def _maybe_adapt_state_dict_to_hf(
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
-    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    adapter = getattr(unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
@@ -3186,6 +3371,7 @@ def _load_hf_safetensors_checkpoint(
     model_path: str,
     *,
     prefault_mmap: bool = False,
+    key_filter: Callable[[str], bool] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """
     Load a safetensors checkpoint into a state dict.
@@ -3193,6 +3379,9 @@ def _load_hf_safetensors_checkpoint(
     On integrated CUDA systems, ``prefault_mmap`` reads every file-backed tensor
     once before installation. This keeps the returned tensors mmap-backed and
     reclaimable while avoiding page-by-page migration during the later CUDA copy.
+
+    ``key_filter`` keeps only the tensors it accepts; an index-sharded directory
+    then opens only the shards that hold one.
     """
     from safetensors import safe_open
 
@@ -3205,13 +3394,16 @@ def _load_hf_safetensors_checkpoint(
             del prefaulted
         return tensor
 
+    def wanted(key: str) -> bool:
+        return key_filter is None or key_filter(key)
+
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
-        if not prefault_mmap:
+        if not prefault_mmap and key_filter is None:
             return dict(load_file(model_path))
-        # load_file hides per-tensor access; safe_open lets us prefault each view.
+        # load_file hides per-tensor access; safe_open lets us prefault or skip each view.
         with safe_open(model_path, framework="pt", device="cpu") as f:
-            return {key: get_tensor(f, key) for key in f.keys()}
+            return {key: get_tensor(f, key) for key in f.keys() if wanted(key)}
     # Directory: try index first, then glob
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.isfile(index_file):
@@ -3221,7 +3413,8 @@ def _load_hf_safetensors_checkpoint(
             index = json.load(f)
         keys_by_filename: dict[str, list[str]] = {}
         for key, filename in index.get("weight_map", {}).items():
-            keys_by_filename.setdefault(filename, []).append(key)
+            if wanted(key):
+                keys_by_filename.setdefault(filename, []).append(key)
         for filename, keys in keys_by_filename.items():
             sf_path = os.path.join(model_path, filename)
             if not os.path.isfile(sf_path):
@@ -3235,7 +3428,8 @@ def _load_hf_safetensors_checkpoint(
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    out[key] = get_tensor(f, key)
+                    if wanted(key):
+                        out[key] = get_tensor(f, key)
     return out if out else None
 
 
@@ -3320,7 +3514,7 @@ def _maybe_adapt_state_dict_from_hf(
     the checkpoint's automodel_peft_config.json (see _read_paramwrapper_layout_metadata),
     so the adapter resolves the peft ParamWrapper layout from metadata instead of shapes.
     """
-    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    adapter = getattr(unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh

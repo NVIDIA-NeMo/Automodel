@@ -365,6 +365,40 @@ def test_load_indexed_safetensors_opens_each_shard_once(tmp_path):
         torch.testing.assert_close(loaded[key], tensor)
 
 
+def test_safetensors_key_filter_reads_a_single_file(tmp_path):
+    save_file({"draft.weight": torch.ones(2), "target.weight": torch.zeros(2)}, tmp_path / "model.safetensors")
+
+    loaded = _load_hf_safetensors_checkpoint(
+        str(tmp_path / "model.safetensors"), key_filter=lambda key: key.startswith("draft.")
+    )
+
+    assert set(loaded) == {"draft.weight"}
+
+
+def test_safetensors_key_filter_reads_a_flat_directory(tmp_path):
+    save_file({"draft.weight": torch.ones(2), "target.weight": torch.zeros(2)}, tmp_path / "a.safetensors")
+    save_file({"target.bias": torch.zeros(2)}, tmp_path / "b.safetensors")
+
+    loaded = _load_hf_safetensors_checkpoint(str(tmp_path), key_filter=lambda key: key.startswith("draft."))
+
+    assert set(loaded) == {"draft.weight"}
+
+
+def test_safetensors_key_filter_opens_only_the_shards_it_needs(tmp_path):
+    save_file({"draft.weight": torch.ones(2), "target.bias": torch.zeros(2)}, tmp_path / "a.safetensors")
+    save_file({"target.weight": torch.zeros(2)}, tmp_path / "b.safetensors")
+    weight_map = {"draft.weight": "a.safetensors", "target.bias": "a.safetensors", "target.weight": "b.safetensors"}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+    from safetensors import safe_open
+
+    with patch("safetensors.safe_open", wraps=safe_open) as mock_safe_open:
+        loaded = _load_hf_safetensors_checkpoint(str(tmp_path), key_filter=lambda key: key.startswith("draft."))
+
+    assert set(loaded) == {"draft.weight"}
+    assert mock_safe_open.call_count == 1
+
+
 def test_prefault_safetensors_reads_tensor_without_replacing_returned_view(tmp_path):
     checkpoint_path = tmp_path / "model.safetensors"
     checkpoint_path.touch()
@@ -2925,6 +2959,7 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert os.access(script_path, os.X_OK)
         assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-1}"' in script
         assert 'NUM_THREADS="${NUM_THREADS:-5}"' in script
+        assert 'TIMEOUT_MINUTES="${TIMEOUT_MINUTES:-30}"' in script
         assert 'CAST_DTYPE="${CAST_DTYPE:-}"' in script
         assert 'PYTHON="${PYTHON:-python3}"' in script
         assert 'CONSOLIDATION_TOOL="${CONSOLIDATION_TOOL:-tools/offline_hf_consolidation.py}"' in script
@@ -2938,6 +2973,7 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert '"${PYTHON}" "${CONSOLIDATION_TOOL}" \\' in script
         assert "Run from the AutoModel repo root or set CONSOLIDATION_TOOL=" in script
         assert "--backend gloo \\" in script
+        assert '--timeout-minutes "${TIMEOUT_MINUTES}" \\' in script
         assert '--model-name "test/model" \\' in script
         assert f'--input-dir "{model_dir}" \\' in script
         assert f'--output-dir "{model_dir / "consolidated"}"' in script
@@ -3359,16 +3395,11 @@ class TestOfflineHFConsolidationTool:
 
 
 class TestGetStorageReaderInitStep:
-    """``_get_storage_reader`` must prefer the in-tree backport when ``is_init_step=True``.
+    """``_get_storage_reader`` selects between the upstream and the in-tree safetensors readers.
 
-    The upstream ``HuggingFaceStorageReader`` (in ``torch.distributed.checkpoint.hf_storage``)
-    delegates dtype decoding to ``safetensors.torch._TYPES``, which does not
-    yet recognise the FP8 scale dtypes (``F8_E5M2``/``F8_E8M0``) emitted by
-    quantised HF checkpoints such as DSV4.  For base-model HF loads
-    (``is_init_step=True``) we must therefore use the in-tree backport whose
-    ``DTYPE_MAP`` was extended for those dtypes.  Mid-training DCP loads
-    (``is_init_step=False`` and no key remap) may still use the faster upstream
-    reader.
+    A key mapping always needs the in-tree backport. Base-model loads (``is_init_step=True``) use the upstream reader
+    only for a local checkpoint whose dtypes the safetensors package decodes (``test_init_load_reader_selection.py``);
+    mid-training loads use it whenever no key mapping is needed.
     """
 
     def _make_checkpointer(self):
@@ -3432,16 +3463,13 @@ class TestGetStorageReaderInitStep:
     def test_non_init_step_no_keymap_uses_upstream(self):
         """For mid-training safetensors loads (is_init_step=False, no key_mapping),
         the faster upstream reader is preferred."""
+        from nemo_automodel.components.checkpoint.checkpointing import _CachedMetadataHFReader
+
         checkpointer = self._make_checkpointer()
 
-        upstream_marker = MagicMock(name="UpstreamHFReader")
         backport_marker = MagicMock(name="BackportHFReader")
 
         with (
-            patch(
-                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
-                upstream_marker,
-            ),
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
                 backport_marker,
@@ -3453,9 +3481,9 @@ class TestGetStorageReaderInitStep:
         ):
             reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=False)
 
-        upstream_marker.assert_called_once_with(path="/fake/path")
+        assert isinstance(reader, _CachedMetadataHFReader)
+        assert str(reader.path) == "/fake/path"
         backport_marker.assert_not_called()
-        assert reader is upstream_marker.return_value
 
     def test_non_init_step_non_safetensors_dir_returns_none(self):
         """A safetensors-configured checkpointer pointed at a torch_save DCP directory

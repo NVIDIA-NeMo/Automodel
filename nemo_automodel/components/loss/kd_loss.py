@@ -17,15 +17,7 @@ import torch
 import torch.distributed.nn.functional as dist_nn_func
 import torch.nn as nn
 import torch.nn.functional as F
-
-try:
-    from torch.distributed.tensor import DTensor, Shard
-
-    _HAVE_DTENSOR = True
-except Exception:
-    DTensor = None  # type: ignore[assignment, misc]
-    Shard = None  # type: ignore[assignment, misc]
-    _HAVE_DTENSOR = False
+from torch.distributed.tensor import DTensor, Shard
 
 
 def _infer_tp_group_from_dtensor(logits: torch.Tensor) -> torch.distributed.ProcessGroup | None:
@@ -35,7 +27,7 @@ def _infer_tp_group_from_dtensor(logits: torch.Tensor) -> torch.distributed.Proc
     ``Shard`` and returns the corresponding process group.  Returns ``None`` for plain tensors
     or DTensors that are not vocab-sharded.
     """
-    if not _HAVE_DTENSOR or not isinstance(logits, DTensor):
+    if not isinstance(logits, DTensor):
         return None
     vocab_dim = logits.ndim - 1
     for mesh_dim, placement in enumerate(logits.placements):
@@ -70,7 +62,9 @@ class _AllReduceForwardPassThroughBackward(torch.autograd.Function):
     """All-reduce a tensor in forward while preserving its local gradient."""
 
     @staticmethod
-    def forward(ctx, input_tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx, input_tensor: torch.Tensor, group: torch.distributed.ProcessGroup
+    ) -> torch.Tensor:
         """Reduce a clone of the input tensor without mutating its autograd value.
 
         Args:
@@ -86,7 +80,9 @@ class _AllReduceForwardPassThroughBackward(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, *grad_outputs: torch.Tensor | None) -> tuple[torch.Tensor | None, None]:
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, *grad_outputs: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, None]:
         """Pass the output gradient through without a second distributed reduction.
 
         Args:
@@ -245,7 +241,7 @@ class KDLoss(nn.Module):
         fp32_upcast: bool = True,
         tp_group: torch.distributed.ProcessGroup | None = None,
         chunk_size: int = 0,
-    ):
+    ) -> None:
         super().__init__()
         self.ignore_index = ignore_index
         self.temperature = temperature
@@ -253,7 +249,7 @@ class KDLoss(nn.Module):
         self.tp_group = tp_group
         self.chunk_size = chunk_size
 
-    def forward(
+    def forward(  # ty: ignore[invalid-mutable-override]
         self,
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
@@ -282,7 +278,7 @@ class KDLoss(nn.Module):
         if valid_mask.sum() == 0:
             # Keep a zero student gradient without reducing the ignored logits. Return float32 like the
             # valid-token path, so ranks that mix empty and non-empty shards reduce the same dtype.
-            if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
+            if isinstance(student_logits, DTensor):
                 student_logits = student_logits.to_local()
             return student_logits[..., :0].sum().float()
 
@@ -295,22 +291,22 @@ class KDLoss(nn.Module):
 
         # Determine TP group: prefer explicit argument, then auto-detect from DTensor.
         tp_group = self.tp_group
-        if tp_group is None and _HAVE_DTENSOR and isinstance(student_logits, DTensor):
+        if tp_group is None and isinstance(student_logits, DTensor):
             tp_group = _infer_tp_group_from_dtensor(student_logits)
 
         if tp_group is not None:
             # TP path: keep local shards to avoid gathering the full vocabulary.
-            if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
+            if isinstance(student_logits, DTensor):
                 student_logits = student_logits.to_local()
-            if _HAVE_DTENSOR and isinstance(teacher_logits, DTensor):
+            if isinstance(teacher_logits, DTensor):
                 teacher_logits = teacher_logits.to_local()
         else:
             # Non-TP path: materialise full tensors.
-            if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
+            if isinstance(student_logits, DTensor):
                 student_logits = student_logits.full_tensor()
-            if _HAVE_DTENSOR and isinstance(teacher_logits, DTensor):
+            if isinstance(teacher_logits, DTensor):
                 teacher_logits = teacher_logits.full_tensor()
-            if _HAVE_DTENSOR and isinstance(labels, DTensor):
+            if isinstance(labels, DTensor):
                 labels = labels.full_tensor()
 
         t_logits = teacher_logits[valid_mask]

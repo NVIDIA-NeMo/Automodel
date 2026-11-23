@@ -70,8 +70,17 @@ Full-length mock sequences; no padding.
 | [Llama3 70B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) | Mock | 64 | 128 | 1 | 1 | 4 | 8192 | 1 | 1 | 2 | - | - | 32 | TE + fsdp2_prefetch | 18.90 | 389 | 55,473 | 866.77 |
 | [Qwen3.8-Flash-Next](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/qwen3_8_flash_next_fa4_ep64.yaml) | Mock, balanced routing | 64 | 64 | 1 | 1 | 1 | 8192 | 1 | 1 | 1 | 64 | - | 64 | FA4 QSA (`cute`) + torch + gmm + HybridEP | 3.931 | 86.85 | 133,364 | 2,083.81 |
 
-- Full-length mock sequences; balanced MoE routing.
-- Qwen3.8-Flash-Next: 20 warmup and 30 measured steps; label-token rate; TFLOPs derived from MFU.
+- Full-length mock sequences; balanced Mixture-of-Experts (MoE) routing.
+- Qwen3.8-Flash-Next: 20 warmup and 30 measured steps; label-token rate; TFLOPs derived from Model FLOPs Utilization (MFU).
+
+### GPU: NVIDIA GB200, Precision: BF16
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Qwen3 MoE 30B](https://github.com/NVIDIA-NeMo/Automodel/blob/4efe60c457798d92d891a3391e5e0455b72f18d1/examples/llm_benchmark/qwen/qwen3_moe_30b_te_bf16_gb200.yaml) | Mock, balanced routing | 8 | 512 | 16 | 16 | 4 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + HybridEP | 9.505 | 634.49 | 220,637 | 27,579.59 |
+
+- Full-length mock sequences; balanced MoE routing; 10 warmup and 20 measured steps.
+- TFLOPs derive from MFU and the 2,500 TFLOPs/s GB200 BF16 dense peak set in the recipe; the H100 BF16 rows use 989.
 
 ### GPU: NVIDIA H100 80GB, Precision: FP8
 
@@ -92,7 +101,7 @@ TE current scaling; 10 warmup and 20 measured steps.
 | [GPT-OSS 120B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml) | Mock, balanced routing | 32 | 1280 | 8 | 8 | 5 | 4096 | 1 | 1 | 1 | 16 | - | 32 | TE MXFP8 + HybridEP | 7.840 | 681.95 | 668,735 | 20,897.96 |
 
 - TE MXFP8 block scaling; 10 warmup and 20 measured steps, except Qwen3 MoE 235B (two warmup and three measured steps).
-- FP8/MXFP8 token rates count full sequences; TFLOPs derive from MFU and the configured peak.
+- FP8 and MXFP8 token rates count full sequences; TFLOPs derive from MFU and the configured peak.
 
 ## Image Generation Performance
 
@@ -110,26 +119,26 @@ Naruto BLIP, 1024 x 1024, FSDP2. Author-reported 1,000-step run; warmup exclusio
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
 | [HunyuanImage-3.0](https://github.com/NVIDIA-NeMo/Automodel/blob/aae8680a20ca5b1deeec218fde64b1dea0286ad3/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | LoRA, rank 64 | 8 | 8 | 1 | 1 | 1 | 1 | 1 | 1 | 8 | TE FusedAdam, 16-bit remainders | 2.226 | 0.449 |
 
-FSDP2; 100 steps, averaging steps 10-99. Cached 1024 x 1024 Naruto BLIP inputs; synchronized maximum-rank timing excludes setup and checkpoint I/O.
+FSDP2; 100 steps, averaging steps 10–99. Cached 1024 x 1024 Naruto BLIP inputs; synchronized maximum-rank timing excludes setup and checkpoint I/O.
 
 ## Glossary
 
-- **NR**: Not recorded or not verified
-- **MFU**: Model FLOPs Utilization - ratio of achieved compute to peak hardware capability
-- **TP**: Tensor Parallelism - splits individual layers across GPUs
-- **PP**: Pipeline Parallelism - splits model layers into stages
-- **CP**: Context Parallelism - splits the sequence across GPUs
-- **FSDP**: Fully Sharded Data Parallelism - the table column gives the shard degree when verified
-- **EP**: Expert Parallelism - distributes MoE experts across GPUs
-- **DP**: Data Parallelism - replicates model and splits data
-- **VP**: Virtual Pipeline - number of pipeline stages per GPU for interleaving
-- **MBS**: Micro-Batch Size - size of one forward pass in pipeline
-- **LBS**: Local Batch Size - size of one step per GPU
-- **GBS**: Global Batch Size - total batch size across all GPUs
-- **GA**: Gradient Accumulation - number of local-batches before optimizer step
-- **TE**: Transformer Engine kernel optimizations - RMSNorm, Linear and DotProductAttention
-- **[DeepEP](https://github.com/deepseek-ai/DeepEP)**: Expert-parallel communication library for MoE token dispatch and combine
-- **FlexAttn**: PyTorch's [Flex Attention](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html)
+- **NR**: Not recorded or not verified.
+- **MFU**: Model FLOPs Utilization. Ratio of achieved compute to peak hardware capability.
+- **TP**: Tensor Parallelism. Splits individual layers across GPUs.
+- **PP**: Pipeline Parallelism. Splits model layers into stages.
+- **CP**: Context Parallelism. Splits the sequence across GPUs.
+- **FSDP**: Fully Sharded Data Parallelism. The table column gives the shard degree when verified.
+- **EP**: Expert Parallelism. Distributes MoE experts across GPUs.
+- **DP**: Data Parallelism. Replicates the model and splits the data.
+- **VP**: Virtual Pipeline. Number of pipeline stages per GPU for interleaving.
+- **MBS**: Micro-Batch Size. Size of one forward pass in a pipeline.
+- **LBS**: Local Batch Size. Size of one step per GPU.
+- **GBS**: Global Batch Size. Total batch size across all GPUs.
+- **GA**: Gradient Accumulation. Number of local batches before the optimizer step.
+- **TE**: Transformer Engine kernel optimizations. RMSNorm, Linear, and DotProductAttention.
+- **[DeepEP](https://github.com/deepseek-ai/DeepEP)**: Expert-parallel communication library for MoE token dispatch and combine.
+- **FlexAttn**: PyTorch's [Flex Attention](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html).
 
 ## Configuration Files
 
@@ -137,6 +146,6 @@ Model names in the tables link directly to their YAML recipes. Mock-data benchma
 
 ## Version Information
 
-- **Last Updated**: 2026-10-14
-- **Default Recipe Snapshot**: [`b203f3f9`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856)
+- **Last Updated**: November 2, 2026.
+- **Default Recipe Snapshot**: [`b203f3f9`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856).
 - **Measurements**: Historical development and benchmark runs; source commits vary.

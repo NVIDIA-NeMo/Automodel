@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
+import pytest
 import torch
 from torch.utils.data import get_worker_info
 
@@ -322,3 +323,61 @@ def test_get_worker_id_and_total_workers():
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 2
         assert total_workers == 3
+
+
+def test_nanogpt_dataset_raises_when_no_sample_possible():
+    # A shard with exactly seq_len tokens cannot yield a sample (needs seq_len + 1); must not spin forever.
+    toks = np.arange(4, dtype=np.uint16)
+    with tempfile.TemporaryDirectory() as tmp:
+        shard = _make_fake_shard(Path(tmp), toks)
+        ds = NanogptDataset(str(shard), seq_len=4)
+        with pytest.raises(ValueError, match="no sample fits"):
+            next(iter(ds))
+
+
+def test_nanogpt_dataset_raises_when_align_to_bos_finds_no_bos():
+    # Plenty of tokens, but no BOS present: alignment skips to the end, so no sample can ever be produced.
+    toks = np.arange(1, 101, dtype=np.uint16)
+    with tempfile.TemporaryDirectory() as tmp:
+        shard = _make_fake_shard(Path(tmp), toks)
+        ds = NanogptDataset(str(shard), seq_len=4, align_to_bos=True, bos_token=0)
+        with pytest.raises(ValueError, match="no sample fits"):
+            next(iter(ds))
+
+
+def _write_shard(path: Path, tokens: np.ndarray) -> None:
+    header = np.zeros(256, dtype=np.int32)
+    header[0], header[1], header[2], header[3] = MAGIC, VERSION, len(tokens), 2
+    with open(path, "wb") as f:
+        f.write(header.tobytes())
+        f.write(tokens.astype(np.uint16).tobytes())
+
+
+@pytest.mark.parametrize("world_size, n_shards", [(2, 3), (4, 6), (8, 12)])
+def test_nanogpt_dataset_ranks_read_every_token_of_uneven_shards(tmp_path, world_size, n_shards):
+    # The shard count does not divide evenly across the data-parallel ranks, so some ranks own
+    # exactly one shard. Those ranks must still read that whole shard, not a 1/world_size slice.
+    seq_len, samples_per_shard = 3, 10
+    tokens_per_shard = samples_per_shard * (seq_len + 1)
+    for s in range(n_shards):
+        _write_shard(tmp_path / f"shard_{s:02d}.bin", s * 1000 + np.arange(tokens_per_shard))
+
+    seen = set()
+    for rank in range(world_size):
+        ds = NanogptDataset(str(tmp_path / "shard_*.bin"), seq_len=seq_len)
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+            patch("torch.distributed.get_rank", return_value=rank),
+        ):
+            it = iter(ds)
+            # One pass over this rank's shards (the iterator is infinite, so take exactly that many samples).
+            for _ in range(len(range(rank, n_shards, world_size)) * samples_per_shard):
+                seen.update(next(it)["input_ids"])
+
+    # Each sample reads seq_len inputs and then skips one token, so the inputs of a shard are every
+    # token except the last of each (seq_len + 1)-token window.
+    expected = {
+        s * 1000 + i for s in range(n_shards) for i in range(tokens_per_shard) if i % (seq_len + 1) != seq_len
+    }
+    assert expected - seen == set()

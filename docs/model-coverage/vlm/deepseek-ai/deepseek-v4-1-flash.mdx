@@ -29,7 +29,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=64 |
 | Nodes | 16 |
 | Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
-| Advanced | bfloat16, attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep |
+| Advanced | bfloat16, attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep, compile_hc=true |
 
 ## Model Reference
 

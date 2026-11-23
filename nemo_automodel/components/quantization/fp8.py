@@ -4,10 +4,12 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any, Dict, List, Literal
+from typing import Literal, Protocol, TypedDict, overload
 
 import torch
 import torch.nn as nn
@@ -24,6 +26,58 @@ except ImportError:
     HAVE_TORCHAO = False
 
 
+FP8RecipeName = Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"]
+
+
+class _FP8ModuleInfo(TypedDict):
+    name: str
+    type: str
+    weight_shape: list[int] | None
+
+
+class _FP8ConversionStats(TypedDict):
+    linear_count: int
+    fp8_count: int
+    conversion_rate: float
+    fp8_modules: list[_FP8ModuleInfo]
+    success: bool
+
+
+class _FP8ConfigDict(TypedDict):
+    enabled: bool
+    fp8_recipe_name: FP8RecipeName | None
+    enable_fsdp_float8_all_gather: bool
+    precompute_float8_dynamic_scale_for_fsdp: bool
+    force_recompute_fp8_weight_in_bwd: bool
+    fp8_filter_fqns: list[str]
+    fp8_emulate: bool
+
+
+class _FP8ConfigSource(Protocol):
+    """Mapping-like FP8 configuration source; ``ConfigNode`` satisfies it."""
+
+    @overload
+    def get(self, key: Literal["enabled"], default: bool = ...) -> bool: ...
+
+    @overload
+    def get(self, key: Literal["recipe_name"], default: FP8RecipeName | None = ...) -> FP8RecipeName | None: ...
+
+    @overload
+    def get(self, key: Literal["enable_fsdp_float8_all_gather"], default: bool = ...) -> bool: ...
+
+    @overload
+    def get(self, key: Literal["precompute_float8_dynamic_scale_for_fsdp"], default: bool = ...) -> bool: ...
+
+    @overload
+    def get(self, key: Literal["force_recompute_fp8_weight_in_bwd"], default: bool = ...) -> bool: ...
+
+    @overload
+    def get(self, key: Literal["filter_fqns"], default: list[str] = ...) -> list[str]: ...
+
+    @overload
+    def get(self, key: Literal["emulate"], default: bool = ...) -> bool: ...
+
+
 @dataclass
 class FP8Config:
     """Configuration for FP8 quantization settings."""
@@ -31,7 +85,7 @@ class FP8Config:
     enabled: bool = False
     """Whether FP8 quantization is enabled."""
 
-    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None
+    recipe_name: FP8RecipeName | None = None
     """FP8 recipe to use. If None, uses tensorwise scaling with manual configuration."""
 
     enable_fsdp_float8_all_gather: bool = False
@@ -43,7 +97,7 @@ class FP8Config:
     force_recompute_fp8_weight_in_bwd: bool = False
     """Whether to force the recomputation of FP8 weights during backward pass."""
 
-    filter_fqns: List[str] = field(default_factory=list)
+    filter_fqns: list[str] = field(default_factory=list)
     """
     List of fully qualified names of modules to skip applying float8 training to.
     nn.Linear modules with any dim size not divisible by 16 are always skipped due to hardware requirements.
@@ -56,13 +110,13 @@ class FP8Config:
     def __init__(
         self,
         enabled: bool = False,
-        recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None,
+        recipe_name: FP8RecipeName | None = None,
         enable_fsdp_float8_all_gather: bool = False,
         precompute_float8_dynamic_scale_for_fsdp: bool = False,
         force_recompute_fp8_weight_in_bwd: bool = False,
-        filter_fqns: List[str] = None,
+        filter_fqns: list[str] | None = None,
         emulate: bool = False,
-    ):
+    ) -> None:
         self.enabled = enabled
         self.recipe_name = recipe_name
         self.enable_fsdp_float8_all_gather = enable_fsdp_float8_all_gather
@@ -71,7 +125,7 @@ class FP8Config:
         self.filter_fqns = filter_fqns or []
         self.emulate = emulate
 
-    def to_dict(self):
+    def to_dict(self) -> _FP8ConfigDict:
         return {
             "enabled": self.enabled,
             "fp8_recipe_name": self.recipe_name,
@@ -93,7 +147,7 @@ def _has_cuda_capability(major: int, minor: int) -> bool:
     return capability >= (major, minor)
 
 
-def _module_filter_fn(module, name, filter_fqns: List[str] = None):
+def _module_filter_fn(module: nn.Module, name: str, filter_fqns: list[str] | None = None) -> bool:
     """
     Filter function to exclude certain modules from FP8 conversion.
 
@@ -131,8 +185,8 @@ def apply_fp8_to_model(
     model: nn.Module,
     config: FP8Config | None = None,
     # Individual parameter options for backward compatibility
-    filter_fqns: List[str] | None = None,
-    recipe_name: str | None = None,
+    filter_fqns: list[str] | None = None,
+    recipe_name: FP8RecipeName | None = None,
     force_recompute_fp8_weight_in_bwd: bool = False,
     enable_fsdp_float8_all_gather: bool = False,
     emulate: bool = False,
@@ -190,11 +244,14 @@ def apply_fp8_to_model(
     if not HAVE_TORCHAO:
         raise ImportError(MISSING_TORCHAO_MSG)
 
-    # Set precompute attribute on model
-    model.precompute_float8_dynamic_scale_for_fsdp = (
+    # Set precompute attribute on model. FSDP/torchao reads this dynamic flag;
+    # it is not part of nn.Module's declared interface.
+    setattr(
+        model,
+        "precompute_float8_dynamic_scale_for_fsdp",
         fp8_config.precompute_float8_dynamic_scale_for_fsdp
         and fp8_config.recipe_name == "tensorwise"
-        and fp8_config.enable_fsdp_float8_all_gather
+        and fp8_config.enable_fsdp_float8_all_gather,
     )
 
     # Handle config creation or recipe-based configuration
@@ -252,7 +309,7 @@ def apply_fp8_to_model(
         return model
 
 
-def verify_fp8_conversion(model: nn.Module) -> dict:
+def verify_fp8_conversion(model: nn.Module) -> _FP8ConversionStats:
     """
     Verify that FP8 conversion was successful by counting converted modules.
 
@@ -265,7 +322,7 @@ def verify_fp8_conversion(model: nn.Module) -> dict:
     from torchao.float8.float8_linear import Float8Linear
 
     total_linear = 0
-    fp8_modules = []
+    fp8_modules: list[_FP8ModuleInfo] = []
 
     for name, module in model.named_modules():
         module_type = type(module).__name__
@@ -299,17 +356,18 @@ def verify_fp8_conversion(model: nn.Module) -> dict:
     return {
         "linear_count": total_linear,
         "fp8_count": len(fp8_modules),
-        "conversion_rate": (len(fp8_modules) / total_linear * 100) if total_linear > 0 else 0,
+        "conversion_rate": (len(fp8_modules) / total_linear * 100) if total_linear > 0 else 0.0,
         "fp8_modules": fp8_modules,
         "success": len(fp8_modules) > 0,
     }
 
 
-def create_fp8_config_from_dict(config_dict: Dict[str, Any]) -> FP8Config:
-    """Create a FP8Config from a dictionary.
+def create_fp8_config_from_dict(config_dict: _FP8ConfigSource) -> FP8Config:
+    """Create a FP8Config from a mapping-like configuration source.
 
     Args:
-        config_dict: Dictionary containing FP8 configuration.
+        config_dict: Configuration source for FP8 quantization. A ``ConfigNode``
+            satisfies this protocol.
 
     Returns:
         FP8Config instance.
@@ -326,11 +384,12 @@ def create_fp8_config_from_dict(config_dict: Dict[str, Any]) -> FP8Config:
     )
 
 
-def build_fp8_config(cfg: Dict[str, Any] | None) -> FP8Config:
+def build_fp8_config(cfg: _FP8ConfigSource | None) -> FP8Config:
     """Build a FP8 config from configuration.
 
     Args:
-        cfg: Configuration dictionary for FP8 quantization.
+        cfg: Configuration source for FP8 quantization. ``None`` returns a
+            disabled config.
 
     Returns:
         FP8Config instance.

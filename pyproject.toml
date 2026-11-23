@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 83.0.0"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -72,25 +72,28 @@ classifiers = [
     'Operating System :: OS Independent',
 ]
 dependencies = [
+    "zephon>=0.2.1",
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]>=1.13.0",
     "ninja",
     "pyyaml",
     "tiktoken",
-    "torch>=2.8.0",
+    "torch>=2.10.0",
     "torchdata",
     # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
     # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
     # retrieval and ordinary Mistral VLMs need output/gradient parity and image isolation (FA2/FA3).
     # Remove the backport and affected-release CI checks only after the upstream fix passes those tests.
     "transformers==5.18.0",
-    # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
+    # 0.16.0 is the first torchao built against torch 2.10, the torch floor. Older releases skip
+    # loading their C++/CUDA extensions under torch>=2.10 (pytorch/ao#2919).
     "torchao>=0.16.0",
     "flashoptim>=0.1.3; sys_platform == 'linux'",
-    # 0.6.4 pins nvidia-cutlass-dsl==4.6.2, matching what flash_attn.cute requires at the
-    # pinned FLASH_ATTN_REF. Both import `cutlass`, so they have to agree. (0.6.1 pinned 4.6.0.)
-    "quack-kernels==0.6.4; sys_platform == 'linux'",
+    # 0.6.5 is the release for nvidia-cutlass-dsl 4.7-4.8 (pinned to 4.8.0 below); magi-attention
+    # accepts 4.8.0 only with it. It drops quack.activation.sub_packed_f32x2, which
+    # nemo_automodel/shared/quack_patches.py restores for the ffpa-attn and MSA SM100 kernels.
+    "quack-kernels==0.6.5; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -112,7 +115,7 @@ diffusion_kernels = [
 cuda = [
     "causal-conv1d",
     "mamba-ssm",
-    "nvidia-cudnn-frontend[cutedsl]>=1.27.0",
+    "nvidia-cudnn-frontend[cutedsl]>=1.30.0",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]>=2.19.0",
@@ -137,13 +140,15 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-# ffpa-attn 0.2.3 first aligned on nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4,
-# i.e. the same cutlass-dsl flash_attn.cute (FA4) needs. 0.2.4 also fixes the persistent
-# CuTe cache callable ABI. 0.2.2 hard-pinned 4.6.0/0.6.1 and was unsatisfiable alongside
-# FA4, so do not relax this floor.
-ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.6.2"]
+# ffpa-attn 0.2.3 first aligned on nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4, the
+# versions flash_attn.cute (FA4) used; both pins are overridden below (4.8.0, 0.6.5). 0.2.4 also
+# fixes the persistent CuTe cache callable ABI. 0.2.2 hard-pinned 4.6.0/0.6.1 and was
+# unsatisfiable alongside FA4, so do not relax this floor.
+ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.8.0"]
 fla = [
-    "flash-linear-attention>=0.4.2",
+    # 0.5.2 is the first release without Triton block pointers, which Triton 3.9 removed.
+    # docker/common/fla-autotune-keys.patch and the CP prewarm launches target 0.5.x.
+    "flash-linear-attention>=0.5.2,<0.6",
 ]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
@@ -208,7 +213,7 @@ mlflow = [
 mlflow-full = [
     # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
     # Use when you need the MLflow server or UI.
-    "mlflow>=3.16.1",
+    "mlflow>=3.17.2",
 ]
 wandb = ["wandb>=0.30.0"]
 trackio = ["trackio[gpu]>=0.40.0"]  # [gpu] adds nvidia-ml-py for automatic GPU metrics
@@ -222,10 +227,10 @@ tracking = [
     "nemo-automodel[trackio]",
     "nemo-automodel[wandb]",
 ]
-# Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL 4.6.2 fmax fix.
+# Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL (4.6.2 and later) fmax fix.
 msa = [
     "fmha-sm100; sys_platform == 'linux'",
-    "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]==4.8.0; sys_platform == 'linux'",
 ]
 all = [
     "nemo-automodel[cli]",
@@ -249,7 +254,10 @@ automodel = "nemo_automodel.cli.app:main"
 am = "nemo_automodel.cli.app:main"
 
 [dependency-groups]
-build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
+# Pins torch in uv.lock; the published package accepts torch>=2.10. torchao 0.17+ (uv.lock has
+# 0.18.0) loads its C++/CUDA extensions only with torch>=2.11 (pytorch/ao#2919), and torch 2.11
+# and 2.12 declare setuptools<82, which conflicts with the setuptools>=84.1.0 security floor.
+build = ["setuptools>=84.1.0", "torch==2.13.0", "packaging", "psutil"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -273,7 +281,7 @@ test = [
     "pytest-shard",
     "pytest-timeout",
     "pytest-xdist>=3.8",
-    "peft>=0.20.0",
+    "peft>=0.22.0",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "sentence-transformers>=5.6.0",
@@ -319,34 +327,34 @@ constraint-dependencies = [
     "multidict>=6.9.1", # Address CVE-2026-104874
     "python-dotenv>=1.2.2", # Address CVE-2026-28684
     "requests>=2.33.0", # Address CVE-2026-25645
-    "virtualenv>=21.7.13", # Address activation, seed-wheel, and directory-creation CVEs
+    "virtualenv>=21.14.13", # Address activation, seed-wheel, and directory-creation CVEs
     "werkzeug>=3.1.9", # Address Windows safe_join security fixes through CVE-2026-102598
     "accelerate>=1.15.0", # Security floor requested by AUT-2490
     "click>=8.3.3", # Security floor requested by AUT-2490
     "anyio>=4.14.2", # Security floor requested by AUT-2465
-    "aiohttp>=3.14.3", # Address aiohttp security fixes through CVE-2026-69244
+    "aiohttp>=3.14.4", # Address aiohttp security fixes through CVE-2026-69244
     "cryptography>=50.0.0", # Security floor requested by AUT-2490
     "diffusers>=0.38.0",
     "fsspec>=2026.6.0", # Security floor requested by AUT-2490
-    "gitpython>=3.1.60",
+    "gitpython>=3.2.1",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.4.2", # Address CVE-2026-102991
-    "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
+    "msgpack>=1.2.3", # Address CVE GHSA-6v7p-g79w-8964
     "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
     # PyArrow 26 requires NumPy 2; retain this cap while the build uses NumPy 1.26.
     "pyarrow>=23.0.1,<26", # Address CVE GHSA-rgxp-2hwp-jwgg
-    "pyasn1>=0.6.4", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
+    "pyasn1>=0.6.5", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
     "ray>=2.56.0", # Address CVE-2026-57516
     "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes
-    "setuptools>=83.0.0", # Address CVE-2026-59890
+    "setuptools>=84.1.0", # Address CVE-2026-59890
     "soupsieve>=2.8.4", # Address GHSA-836r-79rf-4m37 and GHSA-2wc2-fm75-p42x
     "sqlparse>=0.6.0", # Security floor requested by AUT-2465
     "urllib3>=2.8.0", # Address CVE GHSA-gm62-xv2j-4w53
     "wandb>=0.30.0", # Address GO-2026-5970 in the golang.org/x/text bundled by wandb-core
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
     "fonttools>=4.60.2", # Address CVE-2025-66034
-    "mlflow>=3.16.1", # Security floor requested by AUT-2465
+    "mlflow>=3.17.2", # Security floor requested by AUT-2465
     "mlflow-skinny>=3.16.1", # Keep the tracking-only extra on the same security floor
     "thrift>=0.25.0", # Security floor for patched Apache Thrift releases
     "tornado>=6.5.5",
@@ -360,10 +368,22 @@ constraint-dependencies = [
     # bundled TVM and breaks the tilelang kernels (SIGABRT/instability on the GPU
     # paths). Upstream capped it to <=0.1.11 (tile-ai/tilelang#2373); mirror that.
     "apache-tvm-ffi<=0.1.11",
+    "brotli>=1.2.1",
+    "certifi>=2026.10.18",
+    "filelock>=4.2.1",
+    "graphql-core>=3.2.12",
+    "oauthlib>=4.0.1",
+    "opentelemetry-api>=1.45.2",
 ]
 override-dependencies = [
     # Override Trackio's Pillow<13 cap to enforce the security update.
     "pillow==13.0.0",
+    # ffpa-attn (<=0.2.5) pins nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4. 4.6.2 has no sm_107
+    # (VR200) target: PyTorch 2.15's CuTe-DSL RMSNorm override and flash_attn.cute fail there with
+    # KeyError: 'sm_107a'. 4.8.0 is the 26.11 base's version and the first with sm_107, and
+    # quack-kernels 0.6.5 is its pair (magi-attention rejects 4.8.0 with 0.6.4).
+    "nvidia-cutlass-dsl[cu13]==4.8.0; sys_platform == 'linux'",
+    "quack-kernels==0.6.5; sys_platform == 'linux'",
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
     # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.
@@ -675,101 +695,4 @@ forbidden_modules = [
 ]
 allow_indirect_imports = true
 
-# ty: type checking (https://github.com/astral-sh/ty)
-# Default: permissive. Strict checks are opt-in per-file via overrides below.
-# Phase 1 modules: launcher, attention, config, optim, loggers
-# To advance to the next phase, move module paths from the "Phase 2" comment
-# into the active overrides list and fix any new errors.
-[tool.ty.environment]
-python-version = "3.11"
-
-[tool.ty.src]
-include = ["nemo_automodel", "examples"]
-exclude = [
-    "tests/**",
-    "nemo_automodel/components/checkpoint/_backports/**",
-]
-
-[tool.ty.analysis]
-# Optional dependencies that ty cannot resolve in this env but are legitimately
-# imported under try/except or feature gates. Keep this list narrow so that
-# accidental stale imports (e.g. after a package reorg) are still surfaced.
-allowed-unresolved-imports = [
-    "bitsandbytes",
-    "causal_conv1d",
-    "comet_ml",
-    "cut_cross_entropy",
-    "cut_cross_entropy.**",
-    "databricks",
-    "databricks.**",
-    "deep_ep",
-    "deep_ep.**",
-    "dion",
-    "dion.**",
-    "fast_hadamard_transform",
-    "ffpa_attn",
-    "ffpa_attn.**",
-    "fla.**",
-    "flash_attn",
-    "liger_kernel.**",
-    "lmdb",
-    "mamba_ssm.**",
-    "megatron.**",
-    "mlflow",
-    "mlflow.**",
-    "nemo_run",
-    "pynvml",
-    "sky",
-    "torch.distributed._mesh_layout",
-    "transformer_engine",
-    "transformer_engine.**",
-    "transformer_engine_torch",
-    "transformers.tokenization_utils",
-    "uccl",
-    "uccl.**",
-    "wandb",
-    "wandb.**",
-]
-
-[tool.ty.rules]
-unused-ignore-comment = "warn"
-possibly-missing-attribute = "ignore"
-
-# Phase 1: small, well-typed, leaf-dependency modules
-[[tool.ty.overrides]]
-include = [
-    "nemo_automodel/components/attention/**",
-    "nemo_automodel/components/_peft/**",
-    "nemo_automodel/components/config/**",
-    "nemo_automodel/components/launcher/**",
-    "nemo_automodel/components/loggers/**",
-    "nemo_automodel/components/optim/**",
-]
-
-[tool.ty.overrides.rules]
-# Stricter checking for Phase 1 modules
-possibly-unresolved-reference = "error"
-unresolved-import = "error"
-
-# Phase 2 (uncomment when ready):
-# [[tool.ty.overrides]]
-# include = [
-#     "nemo_automodel/components/loss/**",
-#     "nemo_automodel/components/quantization/**",
-# ]
-#
-# [tool.ty.overrides.rules]
-# possibly-unresolved-reference = "error"
-# unresolved-import = "error"
-
-# Phase 3 (uncomment when ready):
-# [[tool.ty.overrides]]
-# include = [
-#     "nemo_automodel/components/training/**",
-#     "nemo_automodel/components/distributed/**",
-#     "nemo_automodel/components/utils/**",
-# ]
-#
-# [tool.ty.overrides.rules]
-# possibly-unresolved-reference = "error"
-# unresolved-import = "error"
+# Type checking is configured in ty.toml; annotation policy in tools/annotation_policy.toml.

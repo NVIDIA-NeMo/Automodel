@@ -47,6 +47,10 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
+    CudnnDsaPackedMetadata,
+    prepare_cudnn_dsa_packed_metadata,
+)
 
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
@@ -85,6 +89,40 @@ class KimiPackedContext:
         self._has_multiple_documents: bool | None = None
         self._fla_contexts: dict[tuple[int, dist.ProcessGroup, int], FLACPContext] = {}
         self._mla_block_mask: BlockMask | None = None
+        self._cudnn_dsa_metadata: dict[int, CudnnDsaPackedMetadata] = {}
+
+    def cudnn_dsa_metadata(self, row: int) -> CudnnDsaPackedMetadata:
+        """Cache cuDNN metadata for one row's local queries and global keys.
+
+        Args:
+            row: Batch row in the document map of shape [batch, global_sequence].
+
+        Returns:
+            Segmented cuDNN metadata with row-local global key coordinates.
+            Padding runs are separate segments with no valid queries.
+        """
+        cached = self._cudnn_dsa_metadata.get(row)
+        if cached is None:
+            boundaries, _ = self.row_cu_seqlens(row)
+            run_ids = self.doc_ids[row].index_select(0, boundaries[:-1])
+            documents = run_ids[run_ids > 0]
+            if documents.unique().numel() != documents.numel():
+                raise ValueError(
+                    "Kimi cuDNN DSA requires contiguous documents without interior masked holes; "
+                    "use backend.attn='sdpa' for that mask layout."
+                )
+            local_length = self.local_doc_ids.shape[1]
+            positions = torch.arange(
+                self.seq_start, self.seq_start + local_length, device=self.doc_ids.device, dtype=torch.int64
+            )
+            cached = prepare_cudnn_dsa_packed_metadata(
+                boundaries.to(torch.int32),
+                self.doc_ids.shape[1],
+                query_indices=positions,
+                padding_mask=self.local_doc_ids[row].eq(0).contiguous(),
+            )
+            self._cudnn_dsa_metadata[row] = cached
+        return cached
 
     @property
     def mla_block_mask(self) -> BlockMask:
@@ -297,6 +335,33 @@ def all_gather_sequence(tensor: torch.Tensor, cp_group: Any, *, dim: int = 1) ->
     return _AllGatherSequence.apply(tensor, cp_group, dim)
 
 
+def document_causal_allowed(
+    q_doc_ids: torch.Tensor,
+    kv_doc_ids: torch.Tensor,
+    *,
+    q_global_start: int,
+) -> torch.Tensor:
+    """Mark the keys each query may attend to: causal and within its own document.
+
+    Args:
+        q_doc_ids: Tensor of shape [batch, query_sequence] with 1-based document ids.
+        kv_doc_ids: Tensor of shape [batch, key_sequence] with 1-based document ids.
+        q_global_start: Global sequence offset of the first query token.
+
+    Returns:
+        Boolean tensor of shape [batch, query_sequence, key_sequence], true where attention is allowed.
+    """
+    device = q_doc_ids.device
+    q_positions = torch.arange(q_doc_ids.shape[1], device=device) + q_global_start
+    kv_positions = torch.arange(kv_doc_ids.shape[1], device=device)
+    allowed = kv_positions[None, :] <= q_positions[:, None]
+    allowed = allowed[None, :, :] & (q_doc_ids[:, :, None] == kv_doc_ids[:, None, :]) & (kv_doc_ids[:, None, :] > 0)
+    # A padding query has no document to attend to; let it read position 0 so the
+    # softmax stays finite. Its output is discarded by the loss mask.
+    is_padding_query = (q_doc_ids <= _PAD_DOC_ID)[:, :, None]
+    return torch.where(is_padding_query, kv_positions[None, None, :] == 0, allowed)
+
+
 def build_document_causal_mask(
     q_doc_ids: torch.Tensor,
     kv_doc_ids: torch.Tensor,
@@ -315,17 +380,9 @@ def build_document_causal_mask(
     Returns:
         Additive mask tensor of shape [batch, 1, query_sequence, key_sequence].
     """
-    device = q_doc_ids.device
-    q_positions = torch.arange(q_doc_ids.shape[1], device=device) + q_global_start
-    kv_positions = torch.arange(kv_doc_ids.shape[1], device=device)
-    allowed = kv_positions[None, :] <= q_positions[:, None]
-    allowed = allowed[None, :, :] & (q_doc_ids[:, :, None] == kv_doc_ids[:, None, :]) & (kv_doc_ids[:, None, :] > 0)
-    # A padding query has no document to attend to; let it read position 0 so the
-    # softmax stays finite. Its output is discarded by the loss mask.
-    is_padding_query = (q_doc_ids <= _PAD_DOC_ID)[:, :, None]
-    allowed = torch.where(is_padding_query, kv_positions[None, None, :] == 0, allowed)
+    allowed = document_causal_allowed(q_doc_ids, kv_doc_ids, q_global_start=q_global_start)
     min_value = torch.finfo(dtype).min
-    return torch.zeros(allowed.shape, dtype=dtype, device=device).masked_fill_(~allowed, min_value).unsqueeze(1)
+    return torch.zeros(allowed.shape, dtype=dtype, device=allowed.device).masked_fill_(~allowed, min_value).unsqueeze(1)
 
 
 def _document_causal_block_mask(
@@ -372,6 +429,42 @@ def _document_causal_block_mask(
         device=q_doc_ids.device,
     )
     return block_mask
+
+
+def sparse_keep_block_mask(keep: torch.Tensor) -> BlockMask:
+    """Build a FlexAttention mask from a dense DSA keep-mask.
+
+    Args:
+        keep: Boolean tensor of shape [batch, query_sequence, key_sequence], true where a query
+            attends. It already folds in the causal and document constraints.
+
+    Returns:
+        BlockMask for local queries against global keys that reads ``keep`` directly.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        """Look up one (query, key) pair of ``keep``.
+
+        Args:
+            batch_idx: Scalar tensor indexing the batch axis.
+            head_idx: Scalar tensor indexing the head axis (the mask is head independent).
+            q_idx: Scalar tensor indexing the local query axis.
+            kv_idx: Scalar tensor indexing the global key axis.
+
+        Returns:
+            Scalar boolean tensor, true where the query attends to the key.
+        """
+        return keep[batch_idx, q_idx, kv_idx]
+
+    return create_block_mask(
+        mask_mod,
+        B=keep.shape[0],
+        H=None,
+        Q_LEN=keep.shape[1],
+        KV_LEN=keep.shape[2],
+        device=keep.device,
+    )
 
 
 _COMPILED_FLEX_ATTENTION: list[Any] = [None]

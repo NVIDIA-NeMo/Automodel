@@ -82,4 +82,5 @@ checkpoint:
 #   name: qwen3-8b-domino
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

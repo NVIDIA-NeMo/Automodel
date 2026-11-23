@@ -101,7 +101,7 @@ distributed:
   pp_size: 1
   cp_size: 1
   ep_size: 32
-  defer_fsdp_grad_sync: true
+  defer_fsdp_grad_sync: false
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -131,7 +131,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  num_samples_limit: 16384
+  limit_dataset_samples: 16384
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -154,7 +154,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -202,6 +202,7 @@ wandb:
   dir: ../logs/wandb
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   nodes: 8
   cluster_tag: gb200

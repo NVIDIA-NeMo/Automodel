@@ -17,11 +17,14 @@ import logging
 import math
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Literal, Tuple
+from dataclasses import dataclass, field
+from typing import Literal, Tuple
 
 import torch
 from torch import nn
+
+from nemo_automodel.components.moe.config import NcclEpConfig
+from nemo_automodel.components.moe.nccl_ep import NcclEpManager
 
 from .fused_a2a import (
     fused_combine,
@@ -496,6 +499,7 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_sms_preprocessing: int | None = None,
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
+        moe_hybridep_max_tokens_per_rank: int | None = None,
         benchmark_static_routing: bool = False,
         moe_hybridep_capacity_factor: float | None = None,
         moe_hybridep_equal_token_counts: bool = False,
@@ -512,6 +516,11 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
+        if moe_hybridep_max_tokens_per_rank is not None and moe_hybridep_max_tokens_per_rank <= 0:
+            raise ValueError(
+                f"moe_hybridep_max_tokens_per_rank must be positive, got {moe_hybridep_max_tokens_per_rank}"
+            )
+        self.moe_hybridep_max_tokens_per_rank = moe_hybridep_max_tokens_per_rank
         # Capacity mode (dynamic routing): after one blocking calibration dispatch, later dispatches
         # pass this many rows as num_permuted_tokens and run non-blocking (see dispatch()).
         if moe_hybridep_capacity_factor is not None and benchmark_static_routing:
@@ -681,6 +690,7 @@ class _HybridEPManager(_DispatchManager):
             num_sms_preprocessing_api=self.moe_hybridep_num_sms_preprocessing,
             num_blocks_permute=self.moe_hybridep_num_blocks_permute,
             num_blocks_unpermute=self.moe_hybridep_num_blocks_unpermute,
+            max_tokens_per_rank=self.moe_hybridep_max_tokens_per_rank,
         )
 
         self.tokens_per_expert = tokens_per_expert
@@ -694,8 +704,9 @@ class _HybridEPManager(_DispatchManager):
             # one blocking calibration dispatch and the overflow check happen after the call.
             if self._hybridep_capacity is None:
                 self._calibrate_hybridep_capacity(tokens_per_expert, dispatched_hidden.device)
-            else:
-                _assert_no_hybridep_overflow(self.handle, self._hybridep_capacity)
+            # Run the guard on calibration too: checkpoint recompute must see
+            # the same device-side validation ops as its original forward.
+            _assert_no_hybridep_overflow(self.handle, self._hybridep_capacity)
             return dispatched_hidden
         self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
@@ -872,7 +883,7 @@ class HybridEPPipelineRuntimeInitializer:
         return (HybridEPPipelineRuntimeInitializer, "process_global_buffer")
 
     @property
-    def signature(self) -> tuple[object, ...]:
+    def signature(self) -> tuple[int | torch.dtype | None, ...]:
         """Return the immutable configuration served by the global buffer."""
         return (
             id(self.manager.group),
@@ -887,6 +898,7 @@ class HybridEPPipelineRuntimeInitializer:
             self.manager.moe_hybridep_num_sms_preprocessing,
             self.manager.moe_hybridep_num_blocks_permute,
             self.manager.moe_hybridep_num_blocks_unpermute,
+            self.manager.moe_hybridep_max_tokens_per_rank,
             self.manager.pad_multiple,
             int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64")),
         )
@@ -999,8 +1011,10 @@ class TokenDispatcherConfig:
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
-    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
-    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
+    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep", "nccl_ep"] = "deepep"
+    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', 'uccl_ep', or 'nccl_ep'."""
+
+    nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
 
     moe_hybridep_capacity_factor: float | None = None
     """HybridEP capacity mode (mirrors BackendConfig.dispatcher_capacity_factor): after one blocking
@@ -1036,6 +1050,9 @@ class TokenDispatcherConfig:
     each MoE layer's combine output of the checkpoint forward in the recompute ("combine"), and with
     "moe_tail" also skip the down projection's GEMM there. "none" recomputes the whole layer."""
 
+    moe_hybridep_max_tokens_per_rank: int | None = None
+    """Pre-size the HybridEP buffer for this many tokens per rank on the first dispatch (None = first micro-batch)."""
+
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
 
@@ -1061,18 +1078,20 @@ class MoEFlexTokenDispatcher:
     def __init__(
         self,
         num_local_experts: int,
-        local_expert_indices: List[int],
+        local_expert_indices: list[int],
         config: TokenDispatcherConfig,
         ep_group: torch.distributed.ProcessGroup,
-    ):
+        hidden_dim: int | None = None,
+    ) -> None:
         """
         Initialize the Flex token dispatcher.
 
         Args:
             num_local_experts (int): Number of local experts on the current device.
-            local_expert_indices (List[int]): Indices of local experts on the current device.
+            local_expert_indices (list[int]): Indices of local experts on the current device.
             config (TokenDispatcherConfig): Configuration for the transformer model.
             ep_group (torch.distributed.ProcessGroup): Process group for MoE operations.
+            hidden_dim: Dispatched token width; required for NCCL-EP initialization.
         """
         self.config = config
         self.shared_experts = None
@@ -1089,7 +1108,21 @@ class MoEFlexTokenDispatcher:
 
         backend = self.config.moe_flex_dispatcher_backend
 
-        if backend == "uccl_ep":
+        if backend == "nccl_ep":
+            if hidden_dim is None:
+                raise ValueError("NCCL-EP requires the dispatched hidden dimension at initialization")
+            if self.config.moe_expert_capacity_factor is not None or self.config.moe_router_expert_pad_multiple:
+                raise ValueError("NCCL-EP currently supports eager dropless dispatch without expert padding")
+            if self.config.moe_deepep_async_dispatch:
+                raise ValueError("NCCL-EP does not support dispatcher_async_dispatch")
+            self._comm_manager = NcclEpManager(
+                self.config.nccl_ep,
+                group=ep_group,
+                hidden_dim=hidden_dim,
+                num_experts=self.config.num_moe_experts,
+                top_k=self.config.moe_router_topk,
+            )
+        elif backend == "uccl_ep":
             if set_uccl_num_sms is not None:
                 set_uccl_num_sms(self.config.moe_deepep_num_sms)
             dispatch_fn = uccl_fused_dispatch
@@ -1154,6 +1187,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                        moe_hybridep_max_tokens_per_rank=self.config.moe_hybridep_max_tokens_per_rank,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                         moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
@@ -1166,6 +1200,7 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.moe_hybridep_num_sms_preprocessing,
                     self._comm_manager.moe_hybridep_num_blocks_permute,
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
+                    self._comm_manager.moe_hybridep_max_tokens_per_rank,
                     self._comm_manager.hybridep_capacity_factor,
                     self._comm_manager.equal_token_counts,
                     self._comm_manager.moe_hybridep_recompute_cache,
@@ -1175,6 +1210,7 @@ class MoEFlexTokenDispatcher:
                     self.config.moe_hybridep_num_sms_preprocessing,
                     self.config.moe_hybridep_num_blocks_permute,
                     self.config.moe_hybridep_num_blocks_unpermute,
+                    self.config.moe_hybridep_max_tokens_per_rank,
                     self.config.moe_hybridep_capacity_factor,
                     self.config.moe_hybridep_equal_token_counts,
                     self.config.moe_hybridep_recompute_cache,
@@ -1196,6 +1232,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                    moe_hybridep_max_tokens_per_rank=self.config.moe_hybridep_max_tokens_per_rank,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
@@ -1208,7 +1245,7 @@ class MoEFlexTokenDispatcher:
             )
         else:
             raise ValueError(
-                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
+                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', 'uccl_ep', or 'nccl_ep'"
             )
 
     def get_pipeline_runtime_initializers(

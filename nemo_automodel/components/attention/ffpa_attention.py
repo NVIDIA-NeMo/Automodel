@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, Callable, cast
 import torch
 from torch import nn
 
+from nemo_automodel.shared.quack_patches import restore_quack_sub_packed_f32x2
+
 if TYPE_CHECKING:
     from torch.nn.attention.flex_attention import BlockMask
 
@@ -107,6 +109,8 @@ def _ffpa_low_level_ready() -> bool:
 
             _ = torch.ops.ffpa_attn._fwd_cute
             _ = torch.ops.ffpa_attn._bwd_cute
+            # ffpa-attn's SM100 head-dim-512 forward calls a helper quack-kernels 0.6.5 removed.
+            restore_quack_sub_packed_f32x2()
             _FFPA_LOW_LEVEL_READY = True
         except Exception:
             _FFPA_LOW_LEVEL_READY = False
@@ -530,7 +534,7 @@ def ffpa_attention_forward(
             raise RuntimeError("ffpa_attention_forward: flex_attention is unavailable for sliding-window layers")
         return flex(module, query, key, value, attention_mask, scaling=scaling, softcap=softcap, **kwargs)
 
-    def _fallback():
+    def _fallback() -> tuple[torch.Tensor, torch.Tensor | None]:
         if softcap is None:
             sdpa = _get_sdpa()
             if sdpa is not None:

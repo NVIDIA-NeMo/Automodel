@@ -51,7 +51,7 @@ class QwenImageAdapter(ModelAdapter):
         self,
         guidance_scale: float = 3.5,
         use_guidance_embeds: bool = False,
-    ):
+    ) -> None:
         """
         Initialize QwenImageAdapter.
 

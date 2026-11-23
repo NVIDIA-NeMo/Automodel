@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -32,7 +33,11 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
 )
-from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
+from nemo_automodel.components.datasets.vlm.datasets import (
+    CordV2DatasetConfig,
+    PreTokenizedDatasetWrapperConfig,
+    RobustDatasetWrapper,
+)
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
@@ -42,6 +47,7 @@ from nemo_automodel.components.datasets.vlm.loader import (
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -184,6 +190,28 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert result.processor is processor
     assert batch == ["item:one", "item:two"]
     assert padding_idx == processor.tokenizer.pad_token_id
+
+
+@dataclass
+class _RobustDatasetConfig:
+    def build(self):
+        return RobustDatasetWrapper(["one", "two"])
+
+
+def test_vlm_dataloader_robust_collate_runs_in_spawn_workers():
+    """The robust collate wrapper must survive pickling into spawn/forkserver workers."""
+    config = VlmDataloaderConfig(
+        dataset_config=_RobustDatasetConfig(),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        collator=VlmCollatorConfig(factory=_collate_prefixed_examples, kwargs={"prefix": "item:"}),
+        shuffle=False,
+        num_workers=1,
+    )
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2)
+    result.dataloader.multiprocessing_context = "spawn"
+
+    assert list(result.dataloader) == [(["item:one", "item:two"], 0)]
 
 
 @pytest.mark.parametrize(
@@ -764,9 +792,9 @@ def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
         shuffle=False,
     )
 
-    packing = SimpleNamespace(
+    packing = PackingCapabilities(
         packed_mask_type="block_causal",
-        requires_packed_sequence_metadata=False,
+        return_packed_sequence_metadata=False,
     )
     result = config.build(
         pretrained_model_name_or_path="unused",

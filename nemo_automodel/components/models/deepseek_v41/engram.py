@@ -21,6 +21,7 @@ V4.1 omits the short convolution used by earlier Engram architectures.
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import _disable_current_modes
 from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
@@ -139,7 +141,39 @@ def compile_engram_gate() -> None:
     global _engram_gate, _ENGRAM_GATE_COMPILED
     if _ENGRAM_GATE_COMPILED:
         return
-    _engram_gate = torch.compile(_engram_gate_core, dynamic=False)
+    compiled_gate = torch.compile(_engram_gate_core, dynamic=False)
+
+    def checkpoint_safe_gate(
+        hidden_states: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        eps: float,
+        token_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Recompute the pure gate without recording compiler scratch operations.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hc_mult, hidden].
+            key: Tensor of shape [batch, sequence, hc_mult * hidden].
+            value: Tensor of shape [batch, sequence, hidden].
+            q_weight: Tensor of shape [hc_mult, hidden].
+            k_weight: Tensor of shape [hc_mult, hidden].
+            eps: RMS normalization epsilon.
+            token_mask: Optional bool tensor of shape [batch, sequence].
+
+        Returns:
+            Tensor with the shape and dtype of hidden_states.
+        """
+        # Cold Inductor autotuning may execute scratch zero_ operations only
+        # during recomputation. They have no matching SAC forward record.
+        # This gate has no collectives or routing decisions to cache; exclude
+        # its pure math in both passes while retaining autograd and outer AC.
+        with _disable_current_modes():
+            return compiled_gate(hidden_states, key, value, q_weight, k_weight, eps, token_mask)
+
+    _engram_gate = checkpoint_safe_gate
     _ENGRAM_GATE_COMPILED = True
 
 
@@ -323,6 +357,39 @@ class DeepseekV41Engram(nn.Module):
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
         self.init_weights()
 
+    def __deepcopy__(self, memo: dict[int, object]) -> DeepseekV41Engram:
+        """Copy a stage shell while retaining the existing communicator by reference."""
+        if self.embed.process_group is not None:
+            memo[id(self.embed.process_group)] = self.embed.process_group
+        result = type(self).__new__(type(self))
+        memo[id(self)] = result
+        result.__dict__.update(copy.deepcopy(self.__dict__, memo))
+        return result
+
+    def set_owner_group(self, process_group: dist.ProcessGroup | None) -> None:
+        """Bind an unmaterialized table to its stage-local owner group, or to one local owner for ``None``.
+
+        This runs after pipeline trimming, before FSDP and checkpoint loading.
+        A populated table cannot be rebound: silently discarding its old owner
+        shard would corrupt checkpoint loading and optimizer parameter identities.
+        """
+        old = self.embed
+        ranks = () if process_group is None else tuple(dist.get_process_group_ranks(process_group))
+        old_ranks = () if old.process_group is None else tuple(dist.get_process_group_ranks(old.process_group))
+        if old_ranks == ranks:
+            return
+        if not old.weight.is_meta:
+            raise ValueError("Changing the Engram owner group requires an unmaterialized meta table")
+        owner_size = max(len(ranks), 1)
+        self.embed = Qwen3_8_FlashNextEngramTableConfig(
+            num_embeddings=-(-self.num_embeddings // owner_size) * owner_size,
+            embedding_dim=old.embedding_dim,
+            initializer_range=old.initializer_range,
+            strict_validation=old.strict_validation,
+            capacity_mode=old.capacity_mode,
+        ).build(process_group=process_group, device="meta", dtype=old.weight.dtype)
+        self.embed.weight.requires_grad_(old.weight.requires_grad)
+
     @torch.no_grad()
     def init_weights(self) -> None:
         """Initialize the table, projection, and learned branch normalization weights."""
@@ -335,7 +402,6 @@ class DeepseekV41Engram(nn.Module):
         nn.init.normal_(self.wkv.weight, mean=0.0, std=self.initializer_range)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
-        self.embed.mark_sharding_contract()
 
     def _validates_on_device(self, hash_ids: torch.Tensor) -> bool:
         """Whether hash IDs are checked with device-side asserts (CUDA, strict validation off).

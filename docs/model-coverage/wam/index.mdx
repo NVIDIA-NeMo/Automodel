@@ -1,0 +1,39 @@
+---
+title: "World Action Models"
+description: ""
+position: 6
+---
+World action models are robot policies built on video generation: a video diffusion transformer predicts the next frames of the
+robot's cameras from the task description and the current observation, and an action expert turns those predictions into the next
+chunk of actions. Fine-tuning teaches both halves at once: the trunk learns the new scene and controller, the action expert learns
+the new action space.
+
+## Run World Action Models with NeMo AutoModel
+
+Use a source checkout of NeMo AutoModel so that the package and its example recipes stay on one revision:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
+```
+
+For other installation options, see our [NeMo AutoModel Installation Guide](/get-started/installation).
+
+<Note>
+The recipes load the frozen encoders of each model (for Praxis-1, the Wan2.2 VAE and the Qwen3.5 text encoder) through the model
+builder's reference package, which must be on the Python path. The model cards below name it.
+</Note>
+
+## Supported Models
+
+This table combines recipe-backed checkpoints with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for recipe-backed checkpoints of every model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+{/* END GENERATED MODEL SUPPORT LOG */}
+
+## Fine-Tune World Action Models
+
+The checked-in recipes fine-tune all weights with FSDP2 and expert parallelism on one 8-GPU node, or train LoRA
+adapters on the trunk and the action expert. The [Praxis-1 LIBERO tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/praxis-1-libero/README.md) walks
+through converting a benchmark's demonstrations, training, and evaluating before and after.

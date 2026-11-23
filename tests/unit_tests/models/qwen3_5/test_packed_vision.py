@@ -202,7 +202,10 @@ def check_packed_media_parity(
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(batch["cu_seqlens"], original_boundaries)
 
-    upstream = torch.randn_like(actual) / actual.numel()
+    # Static loss scaling, as fp16 training uses: linear-attention gate gradients are otherwise
+    # small enough to land in fp16's subnormal range. Gradients are unscaled before comparing.
+    loss_scale = 1024.0 if dtype == torch.float16 else 1.0
+    upstream = torch.randn_like(actual) * loss_scale / actual.numel()
     actual.backward(upstream)
     expected.backward(upstream)
     for name, param in model.named_parameters():
@@ -211,8 +214,10 @@ def check_packed_media_parity(
             assert param.grad is None, name
         else:
             assert param.grad is not None, name
+            grad = param.grad.float() / loss_scale
+            reference_grad = reference_grad.float() / loss_scale
             torch.testing.assert_close(
-                param.grad,
+                grad,
                 reference_grad,
                 rtol=1e-4 if dtype == torch.float32 else rtol,
                 atol=2e-6 if dtype == torch.float32 else atol,
@@ -220,8 +225,8 @@ def check_packed_media_parity(
             )
             # Elementwise atol alone can accept an entirely missing small gradient.
             # Bound each tensor's relative L2 error without an absolute floor too.
-            grad_error = torch.linalg.vector_norm(param.grad.float() - reference_grad.float())
-            grad_scale = torch.linalg.vector_norm(reference_grad.float())
+            grad_error = torch.linalg.vector_norm(grad - reference_grad)
+            grad_scale = torch.linalg.vector_norm(reference_grad)
             assert grad_error <= (1e-4 if dtype == torch.float32 else rtol) * grad_scale, (
                 f"{name}: gradient L2 error {grad_error.item()} exceeds relative tolerance "
                 f"for reference norm {grad_scale.item()}"
@@ -243,7 +248,7 @@ def test_packing_contract_selects_collator_mask(causal_lm: bool, attn: str) -> N
     # Inspect the data contract without constructing optional TE kernels on CPU.
     model.backend.attn = attn
     contract = configure_packing_for_models([model])
-    assert contract.requires_packed_sequence_metadata
+    assert contract.return_packed_sequence_metadata
     assert contract.packed_mask_type == ("document_ids" if attn == "te" else "block_causal")
 
     pack = {

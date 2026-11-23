@@ -37,6 +37,7 @@ class MockQwen3NextGatedDeltaNet(torch.nn.Module):
         self.in_proj_qkvz = torch.nn.Linear(config.hidden_size, config.hidden_size * 4, bias=False)
         self.in_proj_ba = torch.nn.Linear(config.hidden_size, config.hidden_size * 2, bias=False)
         self.out_proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.conv1d = torch.nn.Conv1d(config.hidden_size, config.hidden_size, 4, groups=config.hidden_size, bias=False)
         self.norm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, attention_mask=None):
@@ -278,6 +279,15 @@ class TestBlock:
         mock_in.assert_called_once()
         mock_post.assert_called_once()
         mock_mlp.assert_called_once()
+
+    def test_init_weights_initializes_linear_attention_conv1d(self, qwen_config, backend_config):
+        block = Block(layer_idx=1, config=qwen_config, moe_config=magic_moe_config(qwen_config), backend=backend_config)
+        assert block.layer_type == "linear_attention"
+        with torch.no_grad():
+            block.linear_attn.conv1d.weight.fill_(float("nan"))
+        with patch.object(block.mlp, "init_weights"):
+            block.init_weights(torch.device("cpu"))
+        assert torch.isfinite(block.linear_attn.conv1d.weight).all()
 
 
 class TestQwen3NextModel:

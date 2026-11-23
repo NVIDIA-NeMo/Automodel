@@ -193,9 +193,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         self._kd_loss_buffer = []
         self._ce_loss_buffer = []
 
-    def _configure_packing(self) -> PackingCapabilities:
+    @property
+    def _packing_contract(self) -> PackingCapabilities:
         """Emit metadata for the teacher as well as the student."""
-        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+        return replace(super()._packing_contract, return_packed_sequence_metadata=True)
 
     def _configure_teacher_packing(self) -> None:
         """Configure the teacher after construction and check its mask contract."""

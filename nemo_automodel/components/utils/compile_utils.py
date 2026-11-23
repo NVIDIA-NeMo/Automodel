@@ -15,13 +15,32 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any, Dict, Protocol, TypeAlias, TypedDict
 
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+# Inductor option values, as typed by ``torch.compile(options=...)`` for options set from config.
+CompileOptionValue: TypeAlias = str | int | bool
+
+
+class _ConfigNodeOptions(Protocol):
+    """YAML-backed options container, such as a ``ConfigNode``; its values are validated before use."""
+
+    def to_dict(self) -> Mapping[str, object]: ...
+
+
+class _CompileKwargs(TypedDict, total=False):
+    """``torch.compile`` keyword arguments other than ``options``."""
+
+    fullgraph: bool
+    dynamic: bool
+    mode: str
+    backend: str
 
 
 @dataclass
@@ -33,7 +52,7 @@ class CompileConfig:
     fullgraph: bool = False
     dynamic: bool = False
     backend: str | None = None
-    options: Dict[str, Any] | None = None
+    options: Mapping[str, CompileOptionValue] | _ConfigNodeOptions = field(default_factory=dict)
     dynamo_cache_size_limit: int = 256
 
     def __init__(
@@ -43,9 +62,9 @@ class CompileConfig:
         fullgraph: bool = False,
         dynamic: bool = False,
         backend: str | None = None,
-        options: Dict[str, Any] | None = None,
+        options: Mapping[str, CompileOptionValue] | _ConfigNodeOptions | None = None,
         dynamo_cache_size_limit: int = 256,
-    ):
+    ) -> None:
         self.enabled = enabled
         self.mode = mode
         self.fullgraph = fullgraph
@@ -67,7 +86,7 @@ class CompileConfig:
         }
 
 
-def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: bool = True):
+def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: bool = True) -> None:
     """Configure torch._dynamo settings for compilation.
 
     Args:
@@ -90,7 +109,7 @@ def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: 
         logger.warning("torch._dynamo not available, skipping dynamo configuration")
 
 
-def enable_torch_dynamo_scalar_outputs():
+def enable_torch_dynamo_scalar_outputs() -> None:
     """Enable torch.dynamo to capture scalar outputs for better Flash Attention + torch.compile compatibility."""
     try:
         import torch._dynamo.config
@@ -100,7 +119,7 @@ def enable_torch_dynamo_scalar_outputs():
         logger.warning("torch._dynamo not available, skipping scalar output capture configuration")
 
 
-def patch_prepare_fa2_from_position_ids():
+def patch_prepare_fa2_from_position_ids() -> bool:
     """
     Apply a simple targeted patch to fix the prepare_fa2_from_position_ids function
     for torch.compile compatibility.
@@ -110,7 +129,16 @@ def patch_prepare_fa2_from_position_ids():
     try:
         import transformers.modeling_flash_attention_utils as fa_utils
 
-        def prepare_fa2_from_position_ids(query, key, value, position_ids):
+        def prepare_fa2_from_position_ids(
+            query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, position_ids: torch.Tensor
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            tuple[torch.Tensor, torch.Tensor],
+            tuple[float, float],
+        ]:
             """
             This function returns necessary arguments to call `flash_attn_varlen_func`.
             All three query, key, value states will be flattened.
@@ -119,6 +147,16 @@ def patch_prepare_fa2_from_position_ids():
             NOTE: ideally cumulative lengths should be prepared at the data collator stage
 
             This version includes the torch.compile fix for max_length computation.
+
+            Args:
+                query: Query states, shape ``[batch, seq, heads, head_dim]``.
+                key: Key states with the same leading dims as ``query``.
+                value: Value states with the same leading dims as ``key``.
+                position_ids: Position ids, shape ``[batch, seq]``; a new sequence starts wherever the value is 0.
+
+            Returns:
+                ``(query, key, value, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k))`` with
+                integer-valued max lengths and the states flattened to ``[batch * seq, heads, head_dim]`` and int32 cumulative lengths.
             """
             query = query.view(-1, query.size(-2), query.size(-1))
             key = key.contiguous().view(-1, key.size(-2), key.size(-1))
@@ -138,8 +176,12 @@ def patch_prepare_fa2_from_position_ids():
 
             return (query, key, value, indices_q, (cu_seq_lens, cu_seq_lens), (max_length, max_length))
 
-        # Apply the patch
-        fa_utils.prepare_fa2_from_position_ids = prepare_fa2_from_position_ids
+        # Patch only releases that still define the function; newer transformers
+        # (including the pinned 5.18) no longer have it, so there is nothing to fix.
+        if hasattr(fa_utils, "prepare_fa2_from_position_ids"):
+            fa_utils.prepare_fa2_from_position_ids = prepare_fa2_from_position_ids
+        else:
+            logger.debug("transformers does not define prepare_fa2_from_position_ids; nothing to patch")
 
         return True
 
@@ -148,7 +190,7 @@ def patch_prepare_fa2_from_position_ids():
         return False
 
 
-def apply_flash_attention_compile_fix():
+def apply_flash_attention_compile_fix() -> bool:
     """
     Apply the Flash Attention + torch.compile compatibility fix.
 
@@ -168,31 +210,45 @@ def apply_flash_attention_compile_fix():
     return success
 
 
-def _resolve_compile_kwargs(config: CompileConfig) -> Dict[str, Any]:
-    """Translate a CompileConfig into torch.compile keyword arguments.
+def _compile_options(options: Mapping[str, CompileOptionValue] | _ConfigNodeOptions) -> dict[str, CompileOptionValue]:
+    """Return inductor options as a plain dict, validating the values of a YAML-backed container."""
+    if isinstance(options, Mapping):
+        return dict(options)
+    validated: dict[str, CompileOptionValue] = {}
+    for key, value in options.to_dict().items():
+        if not isinstance(value, (str, int, bool)):
+            raise TypeError(f"CompileConfig.options[{key!r}] must be a str, int or bool, got {type(value).__name__}")
+        validated[key] = value
+    return validated
+
+
+def _resolve_compile_kwargs(config: CompileConfig) -> tuple[_CompileKwargs, dict[str, CompileOptionValue]]:
+    """Translate a CompileConfig into torch.compile keyword arguments and inductor options.
 
     ``torch.compile`` is keyword-only, rejects unknown kwargs, and treats
     ``mode`` and ``options`` as mutually exclusive -- inductor options must go
     through the ``options`` dict, not be flattened into the call. A non-empty
     ``CompileConfig.options`` therefore replaces ``mode``, and combining
     options with a non-default mode is an explicit error.
+
+    Returns:
+        The keyword arguments other than ``options``, and the options to pass when non-empty.
     """
-    options_dict = config.options.to_dict() if hasattr(config.options, "to_dict") else dict(config.options)
-    compile_kwargs: Dict[str, Any] = {
+    options = _compile_options(config.options)
+    compile_kwargs: _CompileKwargs = {
         "fullgraph": config.fullgraph,
         "dynamic": config.dynamic,
     }
-    if options_dict:
+    if options:
         if config.mode and config.mode != "default":
             raise ValueError(
                 "CompileConfig.mode and CompileConfig.options are mutually exclusive in torch.compile; set only one."
             )
-        compile_kwargs["options"] = options_dict
     else:
         compile_kwargs["mode"] = config.mode
     if config.backend is not None:
         compile_kwargs["backend"] = config.backend
-    return compile_kwargs
+    return compile_kwargs, options
 
 
 def compile_module_inplace(module: nn.Module, config: CompileConfig) -> None:
@@ -211,11 +267,14 @@ def compile_module_inplace(module: nn.Module, config: CompileConfig) -> None:
     configure_torch_dynamo(cache_size_limit=config.dynamo_cache_size_limit)
     apply_flash_attention_compile_fix()
 
-    compile_kwargs = _resolve_compile_kwargs(config)
+    compile_kwargs, options = _resolve_compile_kwargs(config)
     logger.info(
         f"Compiling module in place with backend={config.backend}, mode={config.mode}, dynamic={config.dynamic}"
     )
-    module.compile(**compile_kwargs)
+    if options:
+        module.compile(options=options, **compile_kwargs)
+    else:
+        module.compile(**compile_kwargs)
 
 
 def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
@@ -238,12 +297,18 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
     # Apply Flash Attention compatibility fix
     apply_flash_attention_compile_fix()
 
-    compile_kwargs = _resolve_compile_kwargs(config)
+    compile_kwargs, options = _resolve_compile_kwargs(config)
 
     logger.info(f"Compiling model with backend={config.backend}, mode={config.mode}, dynamic={config.dynamic}")
 
     try:
-        compiled_model = torch.compile(model, **compile_kwargs)
+        if options:
+            # torch.compile types ``options`` as an invariant dict whose values may also be callables.
+            compiled_model = torch.compile(model, options=dict(options), **compile_kwargs)
+        else:
+            compiled_model = torch.compile(model, **compile_kwargs)
+        if not isinstance(compiled_model, nn.Module):
+            raise TypeError(f"torch.compile returned {type(compiled_model).__name__}, expected nn.Module")
         logger.info("Model compilation successful")
         return compiled_model
     except Exception as e:

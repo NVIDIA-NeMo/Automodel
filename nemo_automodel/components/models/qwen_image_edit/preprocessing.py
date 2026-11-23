@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import multiprocessing
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,10 @@ _DTYPES = {
 _DEFAULT_MODEL_NAME = "Qwen/Qwen-Image-Edit-2511"
 
 
+# Manifest metadata and emitted cache JSON contain only JSON-serializable values.
+_JSONValue = str | int | float | bool | None | Sequence["_JSONValue"] | Mapping[str, "_JSONValue"]
+
+
 class _CompoundBucketSignature(TypedDict):
     target: list[int]
     contexts: list[list[int]]
@@ -88,7 +93,7 @@ class _ManifestSample:
     identifier: str
     prompt: str
     media: tuple[_MediaReference, ...]
-    metadata: dict[str, object]
+    metadata: dict[str, _JSONValue]
     row_index: int
 
 
@@ -852,7 +857,7 @@ def _write_metadata_shards(records: list[_CacheRecord], output_dir: Path) -> lis
     return shard_names
 
 
-def _write_json_atomic(path: Path, value: object) -> None:
+def _write_json_atomic(path: Path, value: _JSONValue | list[_CacheRecord]) -> None:
     """Write one JSON value through a same-directory temporary file."""
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     temporary_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")

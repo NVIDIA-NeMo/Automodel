@@ -57,7 +57,7 @@ class Flux2Adapter(ModelAdapter):
         self,
         guidance_scale: float = 3.5,
         use_guidance_embeds: bool = True,
-    ):
+    ) -> None:
         """
         Args:
             guidance_scale: Guidance scale value (3.5 matches FLUX.2-dev default).

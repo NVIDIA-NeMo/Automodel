@@ -18,6 +18,7 @@ import argparse
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -25,6 +26,13 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+# The CI pipeline generator owns the `ci.nemo_ci_schedule` values it reads.
+from tests.ci_tests.utils.generate_ci_tests import (  # noqa: E402
+    NEMO_CI_SCHEDULE_FOLDERS,
+    nemo_ci_schedule_folder,
+    nemo_ci_schedule_scopes,
+)
 
 
 @dataclass(frozen=True)
@@ -45,7 +53,7 @@ EXCLUDED_RECIPE_FILES = {
     Path("examples/retrieval/data_utils/mining_config.yaml"),
     Path("examples/retrieval/data_utils/mining_multimodal_config.yaml"),
     # Command-only configs: launched via
-    # `python -m nemo_automodel.recipes.llm.precompute_dspark_dist -c <config>`
+    # `python -m nemo_automodel.recipes.speculative_decoding.precompute_dspark_dist -c <config>`
     # (torchrun for multi-node), so they have no recipe-class entry point by design.
     Path("examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml"),
     Path("examples/speculative/dspark/glm_5.2_dspark_precompute.yaml"),
@@ -89,7 +97,7 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
     if document is None:
         if _relative_path(path, automodel_dir) in EXCLUDED_RECIPE_FILES:
             return []
-        return _lint_ci_cluster_tag(path, {}, [])
+        return [*_lint_ci_cluster_tag(path, {}, []), *_lint_ci_nemo_ci_schedule(path, {}, None, [], automodel_dir)]
     if not isinstance(document, yaml.MappingNode):
         return [LintError(path, document.start_mark.line + 1, "Top-level YAML document must be a mapping.")]
     if not isinstance(data, dict):
@@ -100,6 +108,8 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
     errors.extend(_lint_wandb_disabled(path, data, key_lines))
     if _relative_path(path, automodel_dir) not in EXCLUDED_RECIPE_FILES:
         errors.extend(_lint_ci_cluster_tag(path, data, key_lines))
+        errors.extend(_lint_ci_perf_testing(path, data, document, key_lines))
+        errors.extend(_lint_ci_nemo_ci_schedule(path, data, document, key_lines, automodel_dir))
     if _should_require_recipe(path, automodel_dir):
         errors.extend(_lint_recipe_target(path, data, key_lines, automodel_dir))
     return errors
@@ -151,6 +161,186 @@ def _lint_ci_cluster_tag(path: Path, data: dict, key_lines: list[tuple[str, int]
             "Recipe must declare a nonempty `ci.cluster_tag` (e.g. h100, gb200, gb10) or `ci.deprecated: true`.",
         )
     ]
+
+
+def _lint_ci_nemo_ci_schedule(
+    path: Path,
+    data: dict,
+    document: yaml.MappingNode | None,
+    key_lines: list[tuple[str, int]],
+    automodel_dir: Path,
+) -> list[LintError]:
+    """Require ``ci.nemo_ci_schedule``, the NeMo-CI scopes that run the recipe.
+
+    The value is ``nightly``, ``release``, ``nightly,release``, or ``skipped``. A deprecated
+    recipe, or one outside ``NEMO_CI_SCHEDULE_FOLDERS``, runs in neither scope, so it
+    must declare ``skipped``.
+
+    Args:
+        path: Path of the YAML file being linted.
+        data: The parsed YAML mapping.
+        document: The composed top-level YAML mapping node, used for line numbers.
+        key_lines: ``(key, line)`` pairs for the document's top-level keys.
+        automodel_dir: Repository root, used to locate the recipe's test folder.
+
+    Returns:
+        A lint error for a missing, invalid, or inapplicable value; empty if the value is valid.
+    """
+    ci = data.get("ci")
+    ci = ci if isinstance(ci, dict) else {}
+    line = _mapping_key_lines(_child_node(document, "ci")).get("nemo_ci_schedule", dict(key_lines).get("ci", 1))
+    try:
+        scopes = nemo_ci_schedule_scopes(ci)
+    except ValueError as exc:
+        return [LintError(path, line, f"{exc}.")]
+    if not scopes:
+        return []
+    if ci.get("deprecated") is True:
+        return [LintError(path, line, "A deprecated recipe runs no tests; set `ci.nemo_ci_schedule: skipped`.")]
+    if nemo_ci_schedule_folder(_relative_path(path, automodel_dir)) is None:
+        folders = ", ".join(f"examples/{subpath}" for subpath in NEMO_CI_SCHEDULE_FOLDERS.values())
+        return [
+            LintError(
+                path,
+                line,
+                f"NeMo-CI schedules run only recipes under {folders}; set `ci.nemo_ci_schedule: skipped`.",
+            )
+        ]
+    return []
+
+
+PERF_TESTING_KEYS = ("schedule", "time", "fake_balanced_gate", "validation")
+PERF_TESTING_SCHEDULES = ("nightly", "weekly", "disabled")
+CI_TIME_FORMAT = "%H:%M:%S"  # Same format that tests/ci_tests/utils/generate_ci_tests.py parses for `ci.time`.
+
+
+def _lint_ci_perf_testing(
+    path: Path, data: dict, document: yaml.MappingNode, key_lines: list[tuple[str, int]]
+) -> list[LintError]:
+    """Validate the optional ``ci.perf_testing`` section.
+
+    The section configures automatic performance measurements of the recipe:
+
+    - ``schedule``: required, one of ``PERF_TESTING_SCHEDULES``. ``disabled`` keeps the settings but pauses the runs.
+    - ``time``: ``HH:MM:SS`` wall time of the run, parsed like ``ci.time``.
+    - ``fake_balanced_gate``: optional boolean; the only performance-specific model override.
+    - ``validation``: optional boolean, default false; true preserves the recipe's validation cadence.
+
+    ``ci.deprecated: true`` applies to the section as well: a deprecated recipe runs no tests.
+
+    Args:
+        path: Path of the YAML file being linted.
+        data: The parsed YAML mapping.
+        document: The composed top-level YAML mapping node, used for line numbers and duplicate keys.
+        key_lines: ``(key, line)`` pairs for the document's top-level keys.
+
+    Returns:
+        Lint errors for every invalid field. Empty if the section is absent or valid.
+    """
+    ci = data.get("ci")
+    if not isinstance(ci, dict) or "perf_testing" not in ci:
+        return []
+    ci_node = _child_node(document, "ci")
+    section_node = _child_node(ci_node, "perf_testing")
+    section_line = section_node.start_mark.line + 1 if section_node is not None else dict(key_lines).get("ci", 1)
+    # Only `perf_testing` is checked here; duplicates of other `ci` keys are out of scope for this section.
+    perf_lines = [key_node.start_mark.line + 1 for key_node, _ in ci_node.value if key_node.value == "perf_testing"]
+    errors = [
+        LintError(path, line, f"Duplicate key `perf_testing` in `ci`; first defined on line {perf_lines[0]}.")
+        for line in perf_lines[1:]
+    ]
+    section = ci["perf_testing"]
+    if not isinstance(section, dict):
+        return [*errors, LintError(path, section_line, "`ci.perf_testing` must be a mapping.")]
+
+    section_lines = _mapping_key_lines(section_node)
+
+    def error(message: str, line: int | None = None) -> None:
+        errors.append(LintError(path, line or section_line, f"`ci.perf_testing`: {message}"))
+
+    errors.extend(_lint_duplicate_keys(path, section_node, "ci.perf_testing"))
+    for key in section:
+        if not isinstance(key, str):
+            error(f"key `{key}` must be a string.", section_lines.get(str(key)))
+        elif key not in PERF_TESTING_KEYS:
+            error(f"unknown key `{key}`; allowed keys are {', '.join(PERF_TESTING_KEYS)}.", section_lines.get(key))
+
+    errors.extend(_lint_perf_testing_values(path, section, section_lines, default_line=section_line))
+    return errors
+
+
+def _lint_perf_testing_values(
+    path: Path, section: dict[str, object], section_lines: dict[str, int], *, default_line: int
+) -> list[LintError]:
+    """Validate performance field values after the container and key checks."""
+    errors: list[LintError] = []
+
+    def error(message: str, line: int | None = None) -> None:
+        errors.append(LintError(path, line or default_line, f"`ci.perf_testing`: {message}"))
+
+    if "schedule" not in section:
+        error("`schedule` is required.")
+    elif section["schedule"] not in PERF_TESTING_SCHEDULES:
+        error(f"`schedule` must be one of {', '.join(PERF_TESTING_SCHEDULES)}.", section_lines.get("schedule"))
+    if "time" in section and not _is_ci_time(section["time"]):
+        error('`time` must be a "HH:MM:SS" string, the same format as `ci.time`.', section_lines.get("time"))
+    for key in ("fake_balanced_gate", "validation"):
+        if key in section and not isinstance(section[key], bool):
+            error(f"`{key}` must be a boolean.", section_lines.get(key))
+    return errors
+
+
+def _is_ci_time(value: object) -> bool:
+    """Return whether ``value`` parses like ``ci.time`` (a ``%H:%M:%S`` string)."""
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.strptime(value, CI_TIME_FORMAT)
+    except ValueError:
+        return False
+    return True
+
+
+def _child_node(node: yaml.Node | None, key: str) -> yaml.Node | None:
+    """Return the value node of the last ``key`` in a mapping node, or None.
+
+    The last occurrence matches the value that ``yaml.safe_load`` keeps for a duplicate key.
+    """
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    value = None
+    for key_node, value_node in node.value:
+        if key_node.value == key:
+            value = value_node
+    return value
+
+
+def _mapping_key_lines(node: yaml.Node | None) -> dict[str, int]:
+    """Map each key text of a mapping node to the line of its last occurrence, the one ``yaml.safe_load`` keeps."""
+    lines: dict[str, int] = {}
+    if isinstance(node, yaml.MappingNode):
+        for key_node, _value_node in node.value:
+            lines[key_node.value] = key_node.start_mark.line + 1
+    return lines
+
+
+def _lint_duplicate_keys(path: Path, node: yaml.Node | None, name: str) -> list[LintError]:
+    """Report keys that appear more than once in a mapping node; YAML silently keeps the last one."""
+    errors: list[LintError] = []
+    seen: dict[str, int] = {}
+    if isinstance(node, yaml.MappingNode):
+        for key_node, _value_node in node.value:
+            line = key_node.start_mark.line + 1
+            if key_node.value in seen:
+                errors.append(
+                    LintError(
+                        path,
+                        line,
+                        f"Duplicate key `{key_node.value}` in `{name}`; first defined on line {seen[key_node.value]}.",
+                    )
+                )
+            seen.setdefault(key_node.value, line)
+    return errors
 
 
 def _lint_wandb_disabled(path: Path, data: dict, key_lines: list[tuple[str, int]]) -> list[LintError]:
