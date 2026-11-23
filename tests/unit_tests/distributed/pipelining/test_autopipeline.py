@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import faulthandler
+import os
+import socket
 import types
 from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
 
+from nemo_automodel.components.distributed.pipelining import autopipeline as autopipeline_module
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part,
@@ -243,8 +248,9 @@ class _KwargsChunkSchedule:
         self.args_during_step = None
         self.kwargs_chunk_spec_during_step = None
         self.kwargs_split = None
+        self.return_outputs_during_step = None
 
-    def step(self, *args, target=None, losses=None, **kwargs):
+    def step(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
         """Split schedule inputs using the chunk spec active during the call.
 
         Args:
@@ -253,6 +259,8 @@ class _KwargsChunkSchedule:
             target: Optional tensor of shape [batch, sequence] containing loss
                 targets.
             losses: Optional mutable list populated with scalar loss tensors.
+            return_outputs: Schedule option recorded for assertions; it defaults
+                to ``True`` like PyTorch's schedules.
             **kwargs: Keyword schedule inputs. Tensor values have arbitrary
                 model-defined layouts.
 
@@ -260,6 +268,7 @@ class _KwargsChunkSchedule:
             A sentinel string identifying the schedule result.
         """
         del target, losses
+        self.return_outputs_during_step = return_outputs
         self.args_during_step = args
         self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
         if self.fail_on_step:
@@ -315,6 +324,18 @@ class TestAutoPipelineKwargsChunkSpec:
         assert fixed_kwargs_split[1]["qkv_format"] == "thd"
         assert ap.info.schedule.args_during_step == (input_ids,)
         assert ap.info.schedule._kwargs_chunk_spec is None
+
+    @pytest.mark.parametrize(("step_kwargs", "expected"), [({}, False), ({"return_outputs": True}, True)])
+    def test_step_passes_return_outputs_to_schedule_outside_model_chunk_spec(
+        self, step_kwargs: dict[str, bool], expected: bool
+    ) -> None:
+        """return_outputs configures the schedule, so the model-owned chunk spec never sees it."""
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
+
+        ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8), **step_kwargs)
+
+        assert ap.info.schedule.return_outputs_during_step is expected
+        assert set(ap.info.schedule.kwargs_chunk_spec_during_step) == {"position_ids"}
 
     def test_step_without_model_hook_uses_pytorch_default_chunking(self):
         ap = self._pipeline_with_parts(nn.Module())
@@ -1161,3 +1182,173 @@ class TestAutoPipelineUpdateSeqLen:
             ("reset", 4),
             ("prepare", 8, torch.device("cpu")),
         ]
+
+
+def _free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, port: int) -> None:
+    import datetime
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    faulthandler.dump_traceback_later(90, exit=True)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    try:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=20))
+        mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("pp", "dp_replicate", "dp_shard"))
+        ap = AutoPipeline(
+            world_mesh=mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=1,
+            device=torch.device("cpu"),
+        )
+        ap._model_config = object()
+        ap._info.schedule = object()
+        ap._info.stages = []
+        ap._runtime_initializers = []
+        ap._pp_current_seq_len = 128
+
+        resets = []
+
+        def record_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
+            resets.append(seq_len)
+            return microbatch_size * seq_len
+
+        autopipeline_module.reset_pp_stage_shapes = record_reset
+
+        replica = mesh.get_local_rank("dp_replicate")
+        shard = mesh.get_local_rank("dp_shard")
+        # Replica 0 has two validation batches and replica 1 has one; only one shard of replica 0 changes length.
+        batch_seq_lens = [[[128, 64], [128, 128]], [[128], [128]]][replica][shard]
+        for seq_len in batch_seq_lens:
+            ap.update_seq_len(seq_len)
+
+        # Each rank resets only for its own length change.
+        expected = [[[64], []], [[], []]][replica][shard]
+        assert resets == expected, (rank, resets)
+
+        # Final validation reduction across replicas, reached after an uneven number of batches.
+        total = torch.ones(1)
+        dist.all_reduce(total)
+        assert total.item() == world_size
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
+@pytest.mark.timeout(150)
+def test_update_seq_len_hsdp_replicas_with_uneven_batches_gloo():
+    mp.spawn(_update_seq_len_hsdp_uneven_batches_worker, args=(8, _free_port()), nprocs=8, join=True)
+
+
+def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) -> None:
+    import datetime
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    faulthandler.dump_traceback_later(120, exit=True)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.set_num_threads(1)
+    vocab_size, batch_size = 256, 2
+    # Length of each evaluation batch per DP-shard rank: batches 1 and 3 change length only on
+    # DP rank 0, and batch 2 only on DP rank 1.
+    eval_seq_lens = ((64, 128, 128, 64), (64, 64, 96, 96))
+    # float32 throughout and FSDP all-gathers copy weights bit-exactly; the reference runs one sample per call
+    # like the 1-sample microbatches, so only the fp32 accumulation order of CPU kernels may differ.
+    rtol = atol = 1e-5
+    try:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=60))
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
+        dp_rank = mesh.get_local_rank("dp_shard")
+
+        def build_model() -> LlamaForCausalLM:
+            config = LlamaConfig(
+                vocab_size=vocab_size,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=256,
+                use_cache=False,
+            )
+            torch.manual_seed(0)
+            return LlamaForCausalLM(config).to(torch.float32)
+
+        def parallelize(model, world_mesh, dp_axis_names, **kwargs):
+            # Like the MoE parallelizer with wrap_outer_model: false, the stage root is not an FSDP module,
+            # and unsharded parameters stay resident after a no-backward forward, as in evaluation.
+            dp_mesh = world_mesh[dp_axis_names[0]]
+            for layer in model.model.layers.values():
+                fully_shard(layer, mesh=dp_mesh, reshard_after_forward=False)
+            for module in (model.model.embed_tokens, model.lm_head):
+                if module is not None:
+                    fully_shard(module, mesh=dp_mesh, reshard_after_forward=False)
+            fully_shard(model.model, mesh=dp_mesh, reshard_after_forward=False)
+
+        captured = []
+
+        def loss_fn(logits, target):
+            captured.append(logits.detach().clone())
+            return nn.functional.cross_entropy(logits.flatten(0, 1), target.flatten(0, 1))
+
+        reference = build_model().eval()
+        ap = AutoPipeline(
+            world_mesh=mesh,
+            pp_axis_name="pp",
+            dp_axis_names=("dp_shard",),
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=batch_size,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).build(build_model(), loss_fn=loss_fn, parallelize_fn=parallelize)
+        for part in ap.parts:
+            part.eval()
+
+        with torch.no_grad():
+            for batch_idx, seq_len in enumerate(eval_seq_lens[dp_rank]):
+                generator = torch.Generator().manual_seed(1000 * batch_idx + dp_rank)
+                input_ids = torch.randint(2, vocab_size, (batch_size, seq_len), generator=generator)
+                captured.clear()
+                # Same calls as the recipe's validation step.
+                ap.update_seq_len(seq_len)
+                if ap.info.has_first_stage:
+                    ap.info.schedule.eval(input_ids, target=input_ids)
+                else:
+                    ap.info.schedule.eval(target=input_ids, losses=[])
+
+                if ap.info.has_last_stage:
+                    logits = torch.cat(captured)
+                    expected = torch.cat([reference(input_ids=sample[None]).logits for sample in input_ids])
+                    torch.testing.assert_close(logits, expected, rtol=rtol, atol=atol)
+
+            # The validation epoch ends with a DP all-reduce of the loss totals.
+            total = torch.ones(1)
+            dist.all_reduce(total, group=mesh["dp_shard"].get_group())
+            assert total.item() == mesh["dp_shard"].size()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
+@pytest.mark.timeout(150)
+def test_update_seq_len_pp_fsdp_eval_with_rank_local_resets_gloo():
+    """PP2 x DP-shard2 FSDP2 evaluation with an unwrapped stage root finishes and matches the reference."""
+    mp.spawn(_pp_fsdp_eval_seq_len_reset_worker, args=(4, _free_port()), nprocs=4, join=True)

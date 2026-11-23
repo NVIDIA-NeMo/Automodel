@@ -421,6 +421,33 @@ def test_should_pack_validation_for_explicit_thd_collater(attn):
     assert _should_pack_validation(cfg.dataloader, cfg.validation_dataloaders["default"], nn.Module()) is True
 
 
+@pytest.mark.parametrize(
+    "validation_collate_fn,expected",
+    [
+        ("nemo_automodel.components.datasets.utils.neat_packed_collater", True),
+        ("nemo_automodel.components.datasets.utils.default_collater", False),
+    ],
+)
+@pytest.mark.parametrize("attn", ["fa4", "sdpa", "te"])
+def test_should_pack_validation_for_explicit_neat_collater(attn, validation_collate_fn, expected):
+    """A NEAT-collated validation loader is packed; ordinary collation stays unpacked."""
+    dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"}
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "model": {"backend": {"attn": attn}},
+                "dataset": dataset,
+                "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.neat_packed_collater"},
+                "validation_dataset": dataset,
+                "validation_dataloader": {"collate_fn": validation_collate_fn},
+                "packed_sequence": {"packed_sequence_size": 1024, "packing_strategy": "neat"},
+            }
+        )
+    )
+
+    assert _should_pack_validation(cfg.dataloader, cfg.validation_dataloaders["default"], nn.Module()) is expected
+
+
 def test_should_not_pack_validation_without_pack_size():
     dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"}
     cfg = RecipeConfig(
@@ -1550,7 +1577,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
         ),
     )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
 
     return recipe
 
@@ -2338,7 +2365,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "device_mesh", None)
         object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
-        object.__setattr__(recipe, "te_fp8", None)
+        object.__setattr__(recipe, "te_quantization", None)
         object.__setattr__(recipe, "model_parts", [nn.Linear(4, 4)])
         object.__setattr__(
             recipe,
@@ -3003,7 +3030,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "magi", SimpleNamespace(enabled=False))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())  # not FusedLinearCrossEntropy
@@ -3153,7 +3180,7 @@ def _make_mtp_forward_backward_recipe(model, monkeypatch, *, calculate_mtp_loss=
     object.__setattr__(recipe, "device_mesh", object())
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())
@@ -3374,7 +3401,7 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     object.__setattr__(recipe, "device_mesh", object())
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())
@@ -3762,7 +3789,7 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -3872,7 +3899,7 @@ def test_qwen35_hidden_state_request_in_recipe(monkeypatch, loss_kind):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -3963,7 +3990,7 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -4091,7 +4118,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     recipe.mesh_context = SimpleNamespace(cp_size=1)
     recipe.pp_enabled = False
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.distributed_config = None
     recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
@@ -4324,7 +4351,7 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
     )
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.model_parts = [model]
     recipe.loss_fn = base_loss
@@ -4691,7 +4718,7 @@ def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[l
         info=SimpleNamespace(has_first_stage=True, has_last_stage=False, schedule=SimpleNamespace(step=run_schedule)),
     )
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.model_parts = [model]
     recipe.loss_fn = MaskedCrossEntropy()

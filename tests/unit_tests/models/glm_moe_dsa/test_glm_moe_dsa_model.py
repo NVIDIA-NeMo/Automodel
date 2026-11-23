@@ -12,25 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.util
-import sys
-import types
 from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
-
-# Mock fast_hadamard_transform before importing GLM DSA modules
-try:
-    import fast_hadamard_transform  # noqa: F401
-except ImportError:
-    if "fast_hadamard_transform" not in sys.modules:
-        mock_hadamard = types.ModuleType("fast_hadamard_transform")
-        mock_hadamard.__spec__ = importlib.util.spec_from_loader("fast_hadamard_transform", loader=None)
-        mock_hadamard.hadamard_transform = lambda x, scale: x
-        sys.modules["fast_hadamard_transform"] = mock_hadamard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm_moe_dsa.model import Block, GlmMoeDsaForCausalLM, GlmMoeDsaModel

@@ -693,6 +693,10 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
         """Return native DSpark keys populated through checkpoint views."""
         return {re.sub(r"^layers\.(\d+)\.", r"mtp.\1.", key) for key in super().view_loaded_native_keys}
 
+    def is_draft_checkpoint_key(self, key: str) -> bool:
+        """Return whether a tensor in a released checkpoint belongs to the draft."""
+        return key in ("embed.weight", "head.weight") or key.startswith("mtp.")
+
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
         """Return released names for the draft's native state-dict keys."""
         keys: list[str] = []
@@ -731,11 +735,10 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
         """
         for key in list(hf_state_dict):
             expert = re.match(r"mtp\.\d+\.ffn\.experts\.(\d+)\.", key)
-            not_draft = key not in ("embed.weight", "head.weight") and not key.startswith("mtp.")
             nonlocal_expert = expert is not None and not should_load_expert_for_rank(
                 int(expert[1]), device_mesh, self.moe_config.n_routed_experts
             )
-            if not_draft or nonlocal_expert:
+            if not self.is_draft_checkpoint_key(key) or nonlocal_expert:
                 hf_state_dict.pop(key)
         self._dequantize(hf_state_dict)
 
