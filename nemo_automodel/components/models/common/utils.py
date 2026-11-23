@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import importlib.util
 import logging
 import math
@@ -32,7 +33,7 @@ from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 
 from nemo_automodel.components.moe.config import NcclEpConfig
-from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+from nemo_automodel.shared.import_utils import get_te_cublaslt_version, safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -379,6 +380,34 @@ class TEFp8Config(TEQuantizationConfig):
         return Float8CurrentScaling()
 
 
+def row_scaled_nvfp4_gemm_is_unreliable(cublaslt_version: int, capability: tuple[int, int]) -> bool:
+    """Whether NVFP4 GEMMs with FP32 output, which row-scaled activations use, can return wrong rows.
+
+    cuBLASLt 13.7.0 on GB300 returns wrong values for 6 of every 256 output rows once a GEMM has at least 4096
+    rows, input features and output features. cuBLASLt 13.8.1, 13.8.2 and 13.10.0 are correct, and so is GB200.
+
+    Args:
+        cublaslt_version: ``cublasLtGetVersion()``, e.g. 130700 for 13.7.0.
+        capability: CUDA compute capability of the device, ``(10, 3)`` on GB300.
+    """
+    return capability == (10, 3) and cublaslt_version < 130801
+
+
+@functools.cache
+def _warn_about_row_scaled_nvfp4_gemm() -> None:
+    """Warn once when the cuBLASLt under Transformer Engine has the defect of
+    :func:`row_scaled_nvfp4_gemm_is_unreliable`."""
+    if not torch.cuda.is_available():
+        return
+    version = get_te_cublaslt_version()
+    if row_scaled_nvfp4_gemm_is_unreliable(version, torch.cuda.get_device_capability()):
+        logger.warning(
+            "te_nvfp4.row_scaled_activation: cuBLASLt %d returns wrong rows from NVFP4 GEMMs with FP32 output on "
+            "this GPU once rows, input features and output features all reach 4096. Use cuBLAS 13.8.1 or newer.",
+            version,
+        )
+
+
 @dataclass(kw_only=True)
 class TENvfp4Config(TEQuantizationConfig):
     """Configuration for Transformer Engine NVFP4 quantization.
@@ -457,6 +486,8 @@ class TENvfp4Config(TEQuantizationConfig):
                 "te_nvfp4 requires transformer_engine.common.recipe.NVFP4BlockScaling "
                 "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
             )
+        if self.row_scaled_activation:
+            _warn_about_row_scaled_nvfp4_gemm()
         return recipe_cls(**self.recipe_kwargs())
 
 

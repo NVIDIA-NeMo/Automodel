@@ -490,6 +490,20 @@ def is_te_min_version(version, check_equality=True):
     return get_te_version() > PkgVersion(version)
 
 
+def get_te_cublaslt_version() -> int:
+    """``cublasLtGetVersion()`` of the cuBLASLt that Transformer Engine's GEMMs call, e.g. 130700 for 13.7.0.
+
+    Read from Transformer Engine's own extension module, so it is the library those GEMMs are linked against
+    whatever its file name is.
+
+    Raises:
+        ImportError: If Transformer Engine's PyTorch extension is not loaded.
+    """
+    import transformer_engine_torch
+
+    return int(transformer_engine_torch.get_cublasLt_version())
+
+
 def get_transformers_version():
     """Get transformers version from __version__."""
     try:

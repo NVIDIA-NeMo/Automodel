@@ -27,6 +27,7 @@ from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
     TENvfp4Config,
+    _warn_about_row_scaled_nvfp4_gemm,
     generation_config_from_model_config,
     get_is_first_microbatch,
     get_is_optim_step,
@@ -35,6 +36,7 @@ from nemo_automodel.components.models.common.utils import (
     initialize_rms_norm_module,
     load_pretrained_generation_config,
     restore_pretrained_generation_config,
+    row_scaled_nvfp4_gemm_is_unreliable,
     set_is_first_microbatch,
     set_is_optim_step,
 )
@@ -171,8 +173,11 @@ def _fake_te_autocast():
 
 
 @contextmanager
-def _fake_te_nvfp4_recipe(available: bool = True):
-    """Stand in for ``transformer_engine.common.recipe``, with or without ``NVFP4BlockScaling``."""
+def _fake_te_nvfp4_recipe(available: bool = True, cublaslt_version: int = 131000):
+    """Stand in for ``transformer_engine.common.recipe``, with or without ``NVFP4BlockScaling``.
+
+    ``cublaslt_version`` is what the stand-in reports as the cuBLASLt under Transformer Engine.
+    """
     recipe_module = types.ModuleType("transformer_engine.common.recipe")
     if available:
 
@@ -190,7 +195,12 @@ def _fake_te_nvfp4_recipe(available: bool = True):
         "transformer_engine.common": te_common,
         "transformer_engine.common.recipe": recipe_module,
     }
-    with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
+    module = "nemo_automodel.components.models.common.utils"
+    with (
+        patch(f"{module}.HAVE_TE", True),
+        patch(f"{module}.get_te_cublaslt_version", lambda: cublaslt_version),
+        patch.dict("sys.modules", modules),
+    ):
         yield
 
 
@@ -370,6 +380,45 @@ class TestTENvfp4Config:
         assert TENvfp4Config(exclude_fqns="score").module_excluded("model.score")
         with pytest.raises(ValueError, match="te_nvfp4.exclude_fqns"):
             TENvfp4Config(exclude_fqns=[""])
+
+
+class TestRowScaledNvfp4Gemm:
+    @pytest.mark.parametrize(
+        ("version", "capability", "unreliable"),
+        [
+            (130700, (10, 3), True),  # cuBLAS of the 26.10 image on GB300
+            (130800, (10, 3), True),
+            (130801, (10, 3), False),
+            (130802, (10, 3), False),
+            (131000, (10, 3), False),
+            (130700, (10, 0), False),  # GB200
+            (130700, (9, 0), False),
+        ],
+    )
+    def test_known_environments(self, version, capability, unreliable):
+        assert row_scaled_nvfp4_gemm_is_unreliable(version, capability) is unreliable
+
+    @pytest.mark.parametrize(("version", "warnings"), [(130700, 1), (130801, 0)])
+    def test_building_a_row_scaled_recipe_warns_once_about_the_library_under_transformer_engine(
+        self, monkeypatch, caplog, version, warnings
+    ):
+        """The version comes from Transformer Engine; the warning appears once however often a recipe is built."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 3))
+        _warn_about_row_scaled_nvfp4_gemm.cache_clear()
+        config = TENvfp4Config(row_scaled_activation=True, random_hadamard_transform=False)
+        try:
+            with _fake_te_nvfp4_recipe(cublaslt_version=version), caplog.at_level("WARNING"):
+                config.build_recipe()
+                config.build_recipe()
+                # A recipe without row scaling does not ask.
+                TENvfp4Config().build_recipe()
+        finally:
+            _warn_about_row_scaled_nvfp4_gemm.cache_clear()
+        messages = [record.getMessage() for record in caplog.records if "row_scaled_activation" in record.getMessage()]
+        assert len(messages) == warnings
+        if warnings:
+            assert f"cuBLASLt {version}" in messages[0]
 
 
 class TestBackendConfigTeNvfp4:
