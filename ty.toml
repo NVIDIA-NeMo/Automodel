@@ -75,6 +75,7 @@ include = [
     "nemo_automodel/components/training/**",
     "nemo_automodel/components/distributed/config.py",
     "nemo_automodel/components/eval/tool_call_evaluator.py",
+    "nemo_automodel/components/loss/kd_loss.py",
 ]
 
 [overrides.rules]
