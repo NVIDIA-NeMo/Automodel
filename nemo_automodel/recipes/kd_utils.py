@@ -451,12 +451,19 @@ class KDMeshBridge:
             non-TP student, otherwise a DTensor with the student's global shape,
             mesh, and placements, holding a contiguous local teacher slice of
             shape ``[batch, sequence, local_vocab]``.
+
+        Raises:
+            ValueError: A vocab-sharded student and the teacher have different global vocabulary sizes.
         """
         if not isinstance(student_logits, DTensor):
             return teacher_logits
         shard = vocab_shard(student_logits)
         if shard.group is None:
             return teacher_logits
+        if teacher_logits.size(-1) != shard.vocab:
+            raise ValueError(
+                f"KD vocabulary sizes must match: teacher={teacher_logits.size(-1)}, student={shard.vocab}"
+            )
         local = teacher_logits.narrow(-1, shard.start, shard.local.shape[-1]).contiguous()
         return DTensor.from_local(
             local,

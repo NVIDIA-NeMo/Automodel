@@ -43,6 +43,7 @@
 #
 # To run this recipe, from the repository root, on each of the 2 nodes with 4 GPUs, with
 # NODE_RANK set to 0 and 1 and MASTER_ADDR set to the first node:
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #   uv run torchrun --nnodes=2 --nproc-per-node=4 --node-rank=$NODE_RANK \
 #     --master-addr=$MASTER_ADDR --master-port=29500 \
 #     -m nemo_automodel.cli.app examples/llm_finetune/ernie5_5/ernie5_5_flash_tulu3_packed128k_cp8_lora.yaml
@@ -196,3 +197,6 @@ ci:
   nodes: 2
   time: "02:00:00"
   nproc_per_node: 4
+  env_vars:
+    # Without it, backward failed on a 12.28 GiB request with 20 to 24 GiB reserved but unallocated.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

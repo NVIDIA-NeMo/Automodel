@@ -180,7 +180,7 @@ class KDLoss(nn.Module):
         fp32_upcast: bool = True,
         tp_group: torch.distributed.ProcessGroup | None = None,
         chunk_size: int = 0,
-    ):
+    ) -> None:
         super().__init__()
         self.ignore_index = ignore_index
         self.temperature = temperature
@@ -188,7 +188,7 @@ class KDLoss(nn.Module):
         self.tp_group = tp_group
         self.chunk_size = chunk_size
 
-    def forward(
+    def forward(  # ty: ignore[invalid-mutable-override]
         self,
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
