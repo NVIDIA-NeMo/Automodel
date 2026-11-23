@@ -1,0 +1,284 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NVFP4 pretraining throughput recipe for the language model of Nemotron 3.5 Super VL (120B-A12B) from random
+# initialization on FineWeb, through Transformer Engine: 4 nodes x 4 GB300, tp1 / cp1 / pp1 / ep16, 16 x 8
+# sequences of 8192 tokens per optimizer step in two micro-batches of 4, the MTP head trained with two
+# prediction depths.
+# As written it measures training speed and saves nothing: checkpointing is off, there is no validation set,
+# and it stops after 900 steps. Enable checkpoint.enabled and add a validation dataset before a run whose
+# model is meant to be kept; neither was exercised with this configuration.
+# The text recipe is used on purpose: it runs the Transformer Engine autocast, the VLM finetune recipe does
+# not. The vision tower and projector are frozen and never run on text batches.
+#
+# Precision by module (te_nvfp4.precision_map), the layout published for this model family: Nemotron 3 Super
+# technical report, arXiv 2604.12374, section 2.2 "Precision by Layer Type"; the NVFP4 recipe itself is
+# described in arXiv 2509.25149. The language model has 88 layers: 40 Mamba, 40 MoE, 8 attention. Counts are
+# Transformer Engine GEMM modules on one rank.
+#   NVFP4, layers 0-73: Mamba input projection (34), routed experts (2 x 33), shared expert (2 x 33).
+#     Transformer Engine defaults: 16x16 block scales on weights, 1x16 on activations and gradients,
+#     random Hadamard transform on the operands of the weight-gradient GEMM, stochastic rounding of gradients.
+#   MXFP8, layers 0-73: Mamba output projection (34); NVFP4 underflows there.
+#   High precision (BF16): every GEMM of layers 74-87 (the last 14 layers, 15% of the network), the attention
+#     projections (4 x 8), the latent projections of the MoE layers (2 x 40) and the MTP head (11).
+#   Not Transformer Engine GEMMs, so unaffected: lm_head (a torch linear, BF16), the router (FP32), norms,
+#     embeddings, the Mamba convolution and scan, attention itself.
+# Parameters are BF16; FusedAdam keeps FP32 master weights and FP32 moments. store_param_remainders keeps each
+# master weight as the BF16 parameter plus its 16 low bits instead of a second FP32 copy: the same FP32
+# values, 2 bytes less per parameter. Rank 0 logs the resulting module counts once at startup ("te_nvfp4:
+# Transformer Engine GEMM modules by precision": 166 NVFP4, 34 MXFP8, 163 high precision).
+# Both `_target_` keys of the te_nvfp4 block are required: without them the block stays a plain mapping and
+# the run stops at startup.
+#
+# Hardware and software: Blackwell GPUs with NVFP4 kernels (validated on GB300 only), Transformer Engine 2.19
+# or newer. NVFP4 grouped GEMMs take at most 64 experts per rank, so the 512 experts need ep_size >= 8.
+# Leave te_nvfp4.row_scaled_activation at false with cuBLAS older than 13.8.1 on GB300.
+# The quantized GEMMs need every size to be a multiple of 32: the tokens of a micro-batch
+# (local_batch_size x seq_length) and the layer widths, which this model satisfies. Other sizes stop the run
+# with a Transformer Engine error. The routed experts pad their token groups to multiples of 128 themselves.
+#
+# Size limits. Transformer Engine's NVFP4 quantization kernels (2.19 to 2.21) address a tensor with 32-bit
+# element offsets and return wrong values, without an error, for a tensor of more than 2**32 elements.
+#   - Routed experts: the rows one rank receives in a micro-batch, times the 2688 columns of the intermediate
+#     tensor. With balanced routing that is 22 x 4 x 8192 rows = 1.9e9 elements (3.9e9 with local_batch_size:
+#     8); the learned gate of a randomly initialized model sent one rank up to 3.6 times the balanced rows
+#     (measured, below). A dispatch above 2**32 - 2**28 elements is quantized and multiplied in consecutive
+#     chunks of rows that each stay within that count, whatever its size. Rank 0 logs the first such dispatch
+#     and, at 256, 512, ... dispatches, how many there were.
+#   - Dense Transformer Engine linears stop the run with an error above 2**32 - 2**28 elements in their input
+#     or output. The largest one here, the Mamba input projection, holds 4 x 8192 x 18560 = 0.6e9.
+#   - The Mamba scan stops the run with an error above 2**31 - 1 projected elements: 15 or more sequences of
+#     8192 tokens in one micro-batch.
+#
+# Memory settings. The 8 sequences of a rank run as two micro-batches of 4, because of the learned gate: it
+# gives some ranks several times the rows of others, and the rows a rank receives decide its memory. On
+# 16 GB300 one micro-batch of 8 peaked at 276.5 GiB of 276.6 GiB on two GPUs, two micro-batches of 4 at
+# 215 GiB (measured, below). With forced balanced routing one micro-batch of 8 fits (260 GiB). Also in use:
+#   - the master weights are stored as remainders (see above),
+#   - the weight-tied MTP MoE block is checkpointed like the other blocks
+#     (distributed.moe.checkpoint_repeated_mtp_moe; valid here because ep_size covers all 16 ranks),
+#   - the loss is FusedLinearCrossEntropy, which does not keep the logits of the three heads.
+# distributed.defer_fsdp_grad_sync is false so that no unsharded gradient copy is held between the two
+# micro-batches.
+# Every memory figure in this header was taken with PYTORCH_ALLOC_CONF=expandable_segments:True in every rank
+# (ci.env_vars below); the file was not run without it. With the learned gate the buffer sizes of a rank
+# change from step to step.
+# model.mamba_ac_exempt_blocks: N (not set here) takes N Mamba blocks out of activation checkpointing: each
+# costs about 4 GiB at local_batch_size: 8 and saves about 0.15% of the step.
+#
+# Measured on mock tokens with NVTE_USE_FAST_MATH=1 and 2 learning-rate warm-up steps instead of 100, 26
+# steps of which the last 20 are timed. Loss and gradient norm were finite in every step of every run. All
+# of these runs had the shared expert on a side stream (backend.shared_expert_overlap: true), which this file
+# no longer sets; the step time of the file as written was not measured on 16 GPUs.
+#   - This file on 16 GB300 with the 512-expert model: 9.38 s per step (6,983 tokens/s/GPU), peak 215 GiB.
+#     On rank 0, 295 of 2,048 dispatches ran in chunks; the largest held 2,623,232 rows.
+#   - The same with local_batch_size: 8: 9.01 s per step (7,276 tokens/s/GPU), peak 276.5 GiB. The largest
+#     dispatch of rank 0 held 5,242,880 rows, 3.6 times the balanced 1,441,792: five times the 1,048,576
+#     tokens of the micro-batch, which is what five experts with a route from every token give.
+#   - 16 GB300 with forced balanced routing, which only a benchmark has (backend.fake_balanced_gate and
+#     backend.dispatcher_equal_token_counts, with one micro-batch of 8, no resharding after the forward and
+#     13 Mamba scans out of checkpointing; measured with te_grouped_tensor: true next to
+#     shared_expert_overlap, before the experts refused that pair): 4.67 s per step (14,025 tokens/s/GPU),
+#     peak 260 GiB.
+#   - This file on 4 GB300 with 128 of the 512 experts (ep4): 6.19 s per step (10,585 tokens/s/GPU), peak
+#     198 GiB; with local_batch_size: 8, 5.86 s per step (11,187 tokens/s/GPU), peak 238 GiB. From the fifth
+#     step on its loss and gradient norm stayed within 0.003 and 0.5% of the same run without te_nvfp4 (0.008
+#     and 2.4% in the first four steps).
+# The learned gate is slower than balanced routing because the rank with the most rows sets the pace of every
+# step. How the routing of a trained model on real text is spread was not measured. Running a dispatch in two
+# chunks instead of one call adds 2.5 ms to the 38 ms that the expert MLP of one layer takes for forward,
+# recompute and backward of 1.5e6 rows on one GB300.
+# Setting NVTE_USE_FAST_MATH=1 in the environment selects faster arithmetic in Transformer Engine's
+# quantization kernels: about 5% more throughput with balanced routing on 16 GB300. The loss of the first
+# step then differs in the fourth digit; the effect on convergence was not studied.
+#
+# Validation so far, all on mock tokens, none of it a convergence result:
+#   - A small model on 2 GB300 (tests/functional_tests/moe/run_nemotron_v3_te_nvfp4.py): every GEMM
+#     module ran the recipe above according to Transformer Engine's own state, loss and gradients were finite,
+#     and the loss was within 0.1% of the BF16 loss of the same weights and tokens (0.05% and 0.04% on the two
+#     ranks). The logits differ by 0.32 in relative norm: at random initialization the loss sits near
+#     ln(vocabulary size) and hides that difference. The two ranks held different values in each of the 73
+#     randomly initialized block weights.
+#   - The routed experts of one rank at the sizes above, against FP32, row by row and expert by expert
+#     (tests/functional_tests/moe/test_te_grouped_tensor.py): balanced and uneven dispatches of 1.9e9 to 4.4e9
+#     elements, one expert holding 4.3e9, experts without rows, with the shared expert on its side stream.
+#   - The 88-layer model on 16 GB300 and, with 128 of the 512 experts, on 4 GB300: the runs above.
+#   - Not run: real data, the 100 warm-up steps and 900 steps of this file, validation, checkpointing.
+#
+# Data: tokenize FineWeb with the model's tokenizer into a NanoGPT shard, then point dataset.file_pattern at
+# it. 1B tokens cover the 900 steps of 128 x 8192 tokens:
+#   python tools/nanogpt_data_processor.py --dataset HuggingFaceFW/fineweb --set-name sample-10BT \
+#     --max-tokens 1B --tokenizer nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 \
+#     --output-dir fineweb_nemotron_3_5_super_vl
+#
+# Launch on 4 nodes x 4 GPUs: on every node, from the repository root:
+#   torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=<first node>:<port> \
+#     -m nemo_automodel.cli.app \
+#     examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_gb300.yaml
+# The runs above also passed --numa-binding=node to torchrun and set OMP_NUM_THREADS=8 in every rank; the
+# effect of either was not measured.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 128
+  # Two micro-batches of 4 per rank and step; see "Memory settings" above.
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 900
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: bfloat16
+  # Two prediction depths through the one MTP block of the checkpoint.
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+    trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    # The Mamba input and output projections as Transformer Engine linears, so that the precision map below
+    # can quantize them. With the default (torch) the map stops the run at startup.
+    mamba_linear: te
+    rms_norm: te
+    experts: te
+    # One GEMM per expert. With the learned gate it was the faster setting on 4 GB300: 10,585 against 10,368
+    # tokens/s/GPU for te_grouped_tensor: true (one grouped GEMM per expert projection), both measured with
+    # the shared expert on a side stream, before the experts refused that pair.
+    te_grouped_tensor: false
+    dispatcher: hybridep
+    dispatcher_num_sms: 64
+    # The combine output of every MoE layer is kept for the activation-checkpoint recompute.
+    dispatcher_recompute_cache: combine
+    # The shared expert runs on the main stream. shared_expert_overlap: true moves it to a second CUDA stream
+    # during dispatch and combine. With cuBLASLt before 13.8.1 a grouped GEMM can leave part of a weight
+    # gradient unwritten while GEMMs run on a second stream, so the experts refuse te_grouped_tensor together
+    # with it there. With one GEMM per expert the pair is accepted, and 7,106 checked passes on cuBLASLt
+    # 13.7.0 lost no output; that excludes a rate above 0.04% per pass and no lower one, against 75,600
+    # passes per rank in the 900 steps of this file, so the side stream is off. It can be turned on from
+    # cuBLAS 13.8.1 on.
+    shared_expert_overlap: false
+    # Eight times the programs for the gated-RMSNorm backward kernel of the Mamba scan.
+    mamba_norm_backward_grid_scale: 8
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    te_nvfp4:
+      _target_: nemo_automodel.components.models.common.TENvfp4Config
+      row_scaled_activation: false
+      precision_map:
+        _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
+        high_precision_tail_layers: 14
+        mamba_in_proj: nvfp4
+        mamba_out_proj: mxfp8
+        routed_experts: nvfp4
+        shared_experts: nvfp4
+        attention: high_precision
+        latent_proj: high_precision
+        mtp: high_precision
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    checkpoint_repeated_mtp_moe: true
+  multimodal:
+    frozen_sharding: replicate
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+mtp:
+  scaling_factor: 0.3
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  # lm_head and the loss in one operation: the logits of 4 x 8192 tokens over 131072 entries (8 GiB in BF16
+  # for each of the three heads) are not kept.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: fineweb_nemotron_3_5_super_vl_max_tokens_1B/dataset.bin
+  seq_len: 8192
+  shuffle_files: false
+  align_to_bos: false
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: true
+  exp_avg_dtype: float32
+  exp_avg_sq_dtype: float32
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 100
+  min_lr: 3.0e-5
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: skipped
+  recipe_owner: HuiyingLi
+  time: "00:30:00"
+  nodes: 4
+  cluster_tag: gb300
+  nproc_per_node: 4
+  env_vars:
+    PYTORCH_ALLOC_CONF: expandable_segments:True
