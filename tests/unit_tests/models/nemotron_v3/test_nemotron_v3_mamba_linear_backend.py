@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``BackendConfig.mamba_linear``: which module type the Mamba projections use.
+"""``BackendConfig.mamba_linear`` and ``BackendConfig.mamba_fused_out_proj``: where the output projection runs.
 
-The comparison of Transformer Engine projections with the projection applied inside the scan kernel, on the
+The comparison of an output projection applied after the scan kernel with the one applied inside it, on the
 real kernel, is in ``tests/functional_tests/kernel_parity/test_nemotron_v3_mamba_projections.py``.
 """
 
@@ -26,10 +26,14 @@ from torch import nn
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block, NemotronV3Mamba2Mixer
+from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mamba_out_projection import (
+    _install_cpu_scan,
+    _pre_projection,
+)
 from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mtp import MockNemotronV3Config
 
 
-def _backend(mamba_linear: str) -> BackendConfig:
+def _backend(mamba_linear: str, mamba_fused_out_proj: bool = True) -> BackendConfig:
     return BackendConfig(
         attn="sdpa",
         linear="torch",
@@ -37,6 +41,7 @@ def _backend(mamba_linear: str) -> BackendConfig:
         experts="torch",
         dispatcher="torch",
         mamba_linear=mamba_linear,
+        mamba_fused_out_proj=mamba_fused_out_proj,
     )
 
 
@@ -152,6 +157,78 @@ def test_init_weights_restores_every_parameter_of_a_zeroed_mixer(mamba_linear):
     torch.testing.assert_close(mixer.D, torch.ones_like(mixer.D))
     torch.testing.assert_close(mixer.A_log, torch.log(torch.arange(1, config.mamba_num_heads + 1.0)))
     assert float(mixer.dt_bias.abs().min()) > 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fused", [True, False])
+def test_mamba_fused_out_proj_selects_where_the_output_projection_runs(monkeypatch, fused):
+    assert _backend("torch").mamba_fused_out_proj is True
+    torch.manual_seed(11)
+    mixer = NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=_backend("torch", fused)).float()
+    assert type(mixer.out_proj) is nn.Linear
+    calls = _install_cpu_scan(monkeypatch, mixer)
+    module_calls = []
+    mixer.out_proj.register_forward_pre_hook(lambda module, args: module_calls.append(tuple(args[0].shape)))
+
+    x = torch.randn(2, 7, mixer.hidden_size, requires_grad=True)
+    actual = mixer(x)
+    actual.square().sum().backward()
+
+    # Independent expectation: the stand-in scan without a projection, then plain matrix algebra.
+    with torch.no_grad():
+        normalized = _pre_projection(
+            mixer.in_proj(x), mixer.intermediate_size, mixer.norm.weight, mixer.norm.variance_epsilon
+        )
+        expected = normalized @ mixer.out_proj.weight.T
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    assert mixer.out_proj.weight.grad is not None and torch.count_nonzero(mixer.out_proj.weight.grad) > 0
+    if fused:
+        assert calls[0]["outproj_weight"] is mixer.out_proj.weight
+        assert module_calls == []
+    else:
+        assert calls[0]["outproj_weight"] is None and calls[0]["outproj_bias"] is None
+        assert module_calls == [(2, 7, mixer.intermediate_size)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fused", [True, False])
+def test_checkpoint_recompute_skips_an_output_projection_applied_after_the_kernel(monkeypatch, fused):
+    """Why ``mamba_fused_out_proj=False`` is faster under block activation checkpointing.
+
+    The non-reentrant checkpoint stops its recompute as soon as the last tensor the backward needs has
+    been saved again. ``torch.nn.Linear`` saves its input before its GEMM runs, so an output projection
+    that is the last operation of the checkpointed region is not executed a second time. Inside the
+    scan kernel the projection is part of the kernel's forward and runs in both passes.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    torch.manual_seed(13)
+    mixer = NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=_backend("torch", fused)).float()
+    calls = _install_cpu_scan(monkeypatch, mixer)
+    started, finished = [], []
+    mixer.out_proj.register_forward_pre_hook(lambda module, args: started.append(True))
+    mixer.out_proj.register_forward_hook(lambda module, args, output: finished.append(True))
+
+    x = torch.randn(2, 7, mixer.hidden_size, requires_grad=True)
+    out = checkpoint(mixer, x, use_reentrant=False)
+    out.square().sum().backward()
+    reference_grad = mixer.out_proj.weight.grad.clone()
+
+    assert len(calls) == 2, "the scan runs in the forward and in the recompute"
+    if fused:
+        # Both scan calls carried the projection: it was computed twice.
+        assert [call["outproj_weight"] is not None for call in calls] == [True, True]
+        assert started == [] and finished == []
+    else:
+        assert [call["outproj_weight"] is None for call in calls] == [True, True]
+        # The recompute entered the projection and left it before the GEMM produced an output.
+        assert len(started) == 2
+        assert len(finished) == 1
+
+    # The gradient is the one an uncheckpointed mixer produces.
+    mixer.zero_grad()
+    mixer(x).square().sum().backward()
+    torch.testing.assert_close(reference_grad, mixer.out_proj.weight.grad, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.run_only_on("GPU")

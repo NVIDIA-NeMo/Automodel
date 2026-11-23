@@ -748,6 +748,14 @@ class BackendConfig:
             inside the scan kernel. ``"te"`` builds both as Transformer Engine linears: the output
             projection then runs as a module after the scan kernel and ``te_fp8`` / ``te_nvfp4``
             quantize both GEMMs. Default ``"torch"``.
+        mamba_fused_out_proj: Whether a ``torch.nn.Linear`` Mamba output projection is applied inside
+            the scan kernel (NemotronV3). False applies it as a module after the kernel: the same
+            GEMMs, but under block activation checkpointing the recompute stops before the
+            projection's forward GEMM (``torch.nn.Linear`` saves its input before computing, and it
+            is the last operation of the block that saves anything), and the kernel's backward no
+            longer rebuilds the projection input. Ignored for ``mamba_linear="te"`` and for
+            adapter-wrapped projections, which always run after the kernel, and with context
+            parallelism, whose scan always applies the projection as a module. Default True.
     """
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -844,6 +852,7 @@ class BackendConfig:
     benchmark_static_routing: bool = False
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
     mamba_linear: Literal["torch", "te"] = "torch"
+    mamba_fused_out_proj: bool = True
 
     def __post_init__(self) -> None:
         if self.mamba_linear not in ("torch", "te"):

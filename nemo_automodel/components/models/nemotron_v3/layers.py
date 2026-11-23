@@ -270,15 +270,18 @@ class NemotronV3Mamba2Mixer(nn.Module):
     Requires mamba_ssm and causal_conv1d packages.
 
     The input and output projections follow ``backend.mamba_linear``. With ``"torch"`` (the default) both
-    are ``torch.nn.Linear`` and the training path applies the output projection inside the scan kernel.
-    With ``"te"`` both are Transformer Engine linears, the output projection runs as a module after the
-    scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize both GEMMs like every other TE linear.
+    are ``torch.nn.Linear`` and the training path applies the output projection inside the scan kernel
+    unless ``backend.mamba_fused_out_proj`` is False. With ``"te"`` both are Transformer Engine linears,
+    the output projection runs as a module after the scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize
+    both GEMMs like every other TE linear.
     """
 
     def __init__(self, config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.layer_idx = layer_idx
         mamba_linear = backend.mamba_linear if backend is not None else "torch"
+        # Whether a plain torch.nn.Linear output projection is applied inside the scan kernel.
+        self.fused_out_proj = backend.mamba_fused_out_proj if backend is not None else True
 
         # Model dimensions
         self.hidden_size = config.hidden_size
@@ -522,7 +525,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(A_log.float())
                 # Adapters and sharded wrappers must execute their module forward/hooks.
-                fuse_out_proj = type(self.out_proj) is nn.Linear
+                fuse_out_proj = self.fused_out_proj and type(self.out_proj) is nn.Linear
 
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
