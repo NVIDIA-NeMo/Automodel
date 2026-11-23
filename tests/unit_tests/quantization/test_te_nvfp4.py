@@ -14,9 +14,14 @@
 
 """``te_nvfp4`` through real Transformer Engine modules (Blackwell GPUs only)."""
 
+from collections import OrderedDict
+from collections.abc import Collection, Sequence
+
 import pytest
 import torch
+from torch import nn
 
+from nemo_automodel.components.models.common.te_precision import TEModulePrecision, TEPrecisionPlan
 from nemo_automodel.components.models.common.utils import HAVE_TE, TENvfp4Config
 from nemo_automodel.shared.import_utils import is_te_min_version
 
@@ -37,6 +42,56 @@ ROW_SCALED_OPTIONS = {
     "row_scaled_activation": True,
     "backward": "dequantized",
 }
+
+
+def _relative_error(value: torch.Tensor, reference: torch.Tensor) -> float:
+    return float((value.double() - reference.double()).norm() / reference.double().norm())
+
+
+class _SecondLayerInMxfp8:
+    """Precision map of the two-layer model below: ``layers.0`` in NVFP4, ``layers.1`` in MXFP8."""
+
+    def resolve(self, module_names: Sequence[str], gemm_module_names: Collection[str]) -> TEPrecisionPlan:
+        modules = tuple(
+            TEModulePrecision(
+                name=name,
+                module_class="linear",
+                layer=None,
+                precision="mxfp8" if name == "layers.1" else "nvfp4",
+                scope=name,
+            )
+            for name in sorted(gemm_module_names)
+        )
+        return TEPrecisionPlan(modules=modules, num_layers=0, high_precision_tail_layers=0)
+
+
+def test_modules_the_precision_map_gives_mxfp8_run_the_mxfp8_recipe_inside_the_nvfp4_autocast():
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch.quantization import autocast
+
+    def build() -> nn.ModuleDict:
+        # Transformer Engine modules keep the quantizers of their first forward, so every recipe gets its own copy.
+        torch.manual_seed(0)
+        layers = OrderedDict(
+            (str(index), te.Linear(512, 512, bias=False, params_dtype=torch.bfloat16)) for index in range(2)
+        )
+        return nn.ModuleDict({"layers": nn.ModuleDict(layers)}).to("cuda")
+
+    model, mxfp8_model = build(), build()
+    x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+    config = TENvfp4Config(precision_map=_SecondLayerInMxfp8())
+    config.prepare_modules(model)
+    with torch.no_grad():
+        with config.maybe_te_autocast():
+            outputs = [model.layers[index](x) for index in ("0", "1")]
+        with autocast(enabled=True, recipe=MXFP8BlockScaling()):
+            mxfp8_outputs = [mxfp8_model.layers[index](x) for index in ("0", "1")]
+        exact = [x.float() @ model.layers[index].weight.float().T for index in ("0", "1")]
+    assert torch.equal(outputs[1], mxfp8_outputs[1])
+    # The other module ran NVFP4: a different result with a larger error than MXFP8.
+    assert not torch.equal(outputs[0], mxfp8_outputs[0])
+    assert _relative_error(outputs[0], exact[0]) > 2 * _relative_error(mxfp8_outputs[0], exact[0])
 
 
 def test_large_default_gemms_have_no_wrong_rows():
