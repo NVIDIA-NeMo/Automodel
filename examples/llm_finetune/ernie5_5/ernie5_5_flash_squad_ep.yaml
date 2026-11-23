@@ -23,7 +23,8 @@
 # nvidia-cudnn-frontend[cutedsl] and FlashMLA; validated on SM100-class GPUs (GB200) only. The
 # other values of backend.attn (eager, torch, sdpa) select an eager DSA path that accepts at most
 # 512 tokens per document; multi-GPU training of the released model has been validated with the
-# cuDNN path only. The HCA layers run on the eager PyTorch path with every value.
+# cuDNN path only. On unpacked inputs the HCA layers run on the eager PyTorch path with every
+# value.
 #
 # The routed experts exchange tokens through HybridEP (backend.dispatcher: hybridep), which
 # requires DeepEP with HybridEP in the environment and compiles its kernels at the first dispatch
@@ -37,8 +38,9 @@
 # was validated with the two nodes of every expert group in one domain, and an expert group split
 # over two domains has not been run.
 #
-# Not supported: tensor, context and pipeline parallelism, activation checkpointing, packed
-# sequences and padded batches. The multi-token prediction (MTP) block of the released
+# Not used by this recipe: context parallelism, activation checkpointing and packed sequences,
+# which ernie5_5_flash_tulu3_packed128k_cp8.yaml enables. Not supported: tensor and
+# pipeline parallelism and padded batches. The multi-token prediction (MTP) block of the released
 # checkpoint is not loaded or trained. The parameters of the DSA indexers are frozen. The
 # router correction bias is a fixed buffer, not a parameter. For LoRA on 2 nodes see
 # ernie5_5_flash_squad_ep_lora.yaml.
@@ -103,7 +105,7 @@ distributed:
   pp_size: 1
   cp_size: 1
   ep_size: 8
-  # Not supported: the model's parallelizer rejects activation checkpointing.
+  # Not used by this recipe; the parallelizer accepts true, which checkpoints whole decoder layers.
   activation_checkpointing: false
   # No compute cast: every parameter is used in its storage dtype (BF16, and FP32 where the
   # model keeps FP32 parameters). Gradients are reduced in FP32.
@@ -156,7 +158,7 @@ dataset:
     trust_remote_code: false
 
 packed_sequence:
-  # Packed sequences are not supported.
+  # Not used by this recipe; see ernie5_5_flash_tulu3_packed128k_cp8.yaml.
   packed_sequence_size: 0
 
 dataloader:

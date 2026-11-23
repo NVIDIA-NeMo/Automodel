@@ -86,12 +86,14 @@ dependencies = [
     # retrieval and ordinary Mistral VLMs need output/gradient parity and image isolation (FA2/FA3).
     # Remove the backport and affected-release CI checks only after the upstream fix passes those tests.
     "transformers==5.18.0",
-    # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
+    # 0.16.0 is the first torchao built against torch 2.10, the torch floor. Older releases skip
+    # loading their C++/CUDA extensions under torch>=2.10 (pytorch/ao#2919).
     "torchao>=0.16.0",
     "flashoptim>=0.1.3; sys_platform == 'linux'",
-    # 0.6.4 pins nvidia-cutlass-dsl==4.6.2, matching what flash_attn.cute requires at the
-    # pinned FLASH_ATTN_REF. Both import `cutlass`, so they have to agree. (0.6.1 pinned 4.6.0.)
-    "quack-kernels==0.6.4; sys_platform == 'linux'",
+    # 0.6.5 is the release for nvidia-cutlass-dsl 4.7-4.8 (pinned to 4.8.0 below); magi-attention
+    # accepts 4.8.0 only with it. It drops quack.activation.sub_packed_f32x2, which
+    # nemo_automodel/shared/quack_patches.py restores for the ffpa-attn and MSA SM100 kernels.
+    "quack-kernels==0.6.5; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -138,11 +140,11 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-# ffpa-attn 0.2.3 first aligned on nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4,
-# i.e. the same cutlass-dsl flash_attn.cute (FA4) needs. 0.2.4 also fixes the persistent
-# CuTe cache callable ABI. 0.2.2 hard-pinned 4.6.0/0.6.1 and was unsatisfiable alongside
-# FA4, so do not relax this floor.
-ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.6.2"]
+# ffpa-attn 0.2.3 first aligned on nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4, the
+# versions flash_attn.cute (FA4) used; both pins are overridden below (4.8.0, 0.6.5). 0.2.4 also
+# fixes the persistent CuTe cache callable ABI. 0.2.2 hard-pinned 4.6.0/0.6.1 and was
+# unsatisfiable alongside FA4, so do not relax this floor.
+ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.8.0"]
 fla = [
     # 0.5.2 is the first release without Triton block pointers, which Triton 3.9 removed.
     # docker/common/fla-autotune-keys.patch and the CP prewarm launches target 0.5.x.
@@ -225,10 +227,10 @@ tracking = [
     "nemo-automodel[trackio]",
     "nemo-automodel[wandb]",
 ]
-# Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL 4.6.2 fmax fix.
+# Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL (4.6.2 and later) fmax fix.
 msa = [
     "fmha-sm100; sys_platform == 'linux'",
-    "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]==4.8.0; sys_platform == 'linux'",
 ]
 all = [
     "nemo-automodel[cli]",
@@ -252,7 +254,10 @@ automodel = "nemo_automodel.cli.app:main"
 am = "nemo_automodel.cli.app:main"
 
 [dependency-groups]
-build = ["setuptools>=84.1.0", "torch<=2.10.0", "packaging", "psutil"]
+# Pins torch in uv.lock; the published package accepts torch>=2.10. torchao 0.17+ (uv.lock has
+# 0.18.0) loads its C++/CUDA extensions only with torch>=2.11 (pytorch/ao#2919), and torch 2.11
+# and 2.12 declare setuptools<82, which conflicts with the setuptools>=84.1.0 security floor.
+build = ["setuptools>=84.1.0", "torch==2.13.0", "packaging", "psutil"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -276,7 +281,7 @@ test = [
     "pytest-shard",
     "pytest-timeout",
     "pytest-xdist>=3.8",
-    "peft>=0.20.0",
+    "peft>=0.22.0",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "sentence-transformers>=5.6.0",
@@ -373,6 +378,12 @@ constraint-dependencies = [
 override-dependencies = [
     # Override Trackio's Pillow<13 cap to enforce the security update.
     "pillow==13.0.0",
+    # ffpa-attn (<=0.2.5) pins nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4. 4.6.2 has no sm_107
+    # (VR200) target: PyTorch 2.15's CuTe-DSL RMSNorm override and flash_attn.cute fail there with
+    # KeyError: 'sm_107a'. 4.8.0 is the 26.11 base's version and the first with sm_107, and
+    # quack-kernels 0.6.5 is its pair (magi-attention rejects 4.8.0 with 0.6.4).
+    "nvidia-cutlass-dsl[cu13]==4.8.0; sys_platform == 'linux'",
+    "quack-kernels==0.6.5; sys_platform == 'linux'",
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
     # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.

@@ -284,16 +284,15 @@ def test_shared_flow_without_the_sidecar_leaves_the_hyper_head_in_the_root_unit(
         ),
         ({"strategy_config": DDPConfig()}, "requires distributed.strategy fsdp2.*got DDPConfig"),
         ({"tp_size": 2}, r"set these distributed sizes to 1: \{'tp_size': 2\}"),
-        ({"cp_size": 2}, r"set these distributed sizes to 1: \{'cp_size': 2\}"),
         ({"pp_size": 2}, r"set these distributed sizes to 1: \{'pp_size': 2\}"),
         ({"dp_replicate_size": 2}, r"set these distributed sizes to 1: \{'dp_replicate_size': 2\}"),
         ({"tp_size": 2, "pp_size": 4}, r"\{'tp_size': 2, 'pp_size': 4\}"),
         ({"ep_size": 1}, "set distributed.ep_size to a value greater than 1, got 1"),
-        ({"activation_checkpointing": True}, "set distributed.activation_checkpointing to false, got True"),
         (
             {"activation_checkpointing": "selective"},
-            "set distributed.activation_checkpointing to false, got 'selective'",
+            "set distributed.activation_checkpointing to true or false, got 'selective'",
         ),
+        ({"activation_checkpointing": "moe"}, "set distributed.activation_checkpointing to true or false, got 'moe'"),
         (
             {"strategy_config": FSDP2Config(mp_policy=FP16_POLICY)},
             r"set distributed\.mp_policy\.param_dtype to one of them, got torch\.float16",
@@ -315,6 +314,20 @@ def test_unsupported_topology_is_rejected_before_any_executor(monkeypatch, chang
     for executor in executors.values():
         executor.assert_not_called()
     _assert_untouched(model)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"cp_size": 2}, {"activation_checkpointing": True}, {"cp_size": 4, "activation_checkpointing": True}]
+)
+def test_context_parallelism_and_layer_checkpointing_are_admitted(monkeypatch, changes):
+    model, mesh = _model(), _Mesh()
+    context = _context(**changes)
+    _set_world_size(monkeypatch)
+    _record_sharding(monkeypatch)
+    executor = _fsdp_stage(mesh)
+    monkeypatch.setattr(model_parallelizer, "_parallelize_moe", executor)
+    assert parallelize_model(model, context) is model
+    executor.assert_called_once_with(model, context, parallelizer=PARALLELIZER)
 
 
 def test_rank_count_that_splits_dsa_heads_is_rejected_before_any_executor(monkeypatch):

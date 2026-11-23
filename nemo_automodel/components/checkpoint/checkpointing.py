@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -316,6 +317,59 @@ def _apply_adapter_forced_dtype_mapping(
         if fqn in state_dict_key_set:
             normalized[fqn] = dtype_str
     return normalized
+
+
+def _collect_global_dtype_mapping(
+    fqn_to_dtype_mapping: dict[str, str],
+    process_group: torch.distributed.ProcessGroup | None,
+) -> dict[str, str]:
+    """Collect the export dtypes of all tensors across the ranks that save a model.
+
+    Each rank derives export dtypes only for the tensors it exports, and ranks can export different tensors, such as
+    the experts of one expert-parallel rank or the layers of one pipeline stage. Consolidation applies the mapping of
+    one rank to tensors of other ranks, so every rank needs the entries of all ranks. Every rank of a multi-rank group
+    must call this at the same point of the save.
+
+    Args:
+        fqn_to_dtype_mapping: This rank's mapping from exported tensor names to safetensors dtype strings.
+        process_group: Process group whose ranks save the model, or ``None`` for the default group.
+
+    Returns:
+        ``fqn_to_dtype_mapping`` when one rank saves the model or all ranks derived the same mapping. Otherwise the
+        union of the mappings of all ranks in ``process_group``; when ranks disagree on a tensor name, every rank uses
+        the entry of the lowest rank and rank 0 of the group logs a warning.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return fqn_to_dtype_mapping
+    world_size = torch.distributed.get_world_size(group=process_group)
+    if world_size == 1:
+        return fqn_to_dtype_mapping
+
+    # Ranks that export the same tensors derive the same mapping, so digests are compared first and the mappings
+    # are exchanged only when they differ. Every rank sees the same digests and takes the same branch.
+    local_digest = hashlib.sha256(json.dumps(sorted(fqn_to_dtype_mapping.items())).encode()).hexdigest()
+    digests = [""] * world_size
+    torch.distributed.all_gather_object(digests, local_digest, group=process_group)
+    if len(set(digests)) == 1:
+        return fqn_to_dtype_mapping
+
+    gathered_mappings: list[dict[str, str]] = [{} for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered_mappings, fqn_to_dtype_mapping, group=process_group)
+    global_mapping: dict[str, str] = {}
+    conflicting_fqns: dict[str, None] = {}
+    for rank_mapping in gathered_mappings:
+        for fqn, dtype_str in rank_mapping.items():
+            if global_mapping.setdefault(fqn, dtype_str) != dtype_str:
+                conflicting_fqns[fqn] = None
+    if conflicting_fqns and torch.distributed.get_rank(group=process_group) == 0:
+        logger.warning(
+            "The %d ranks that save the model report different export dtypes for %d tensor(s), the first being %s; "
+            "every rank uses the dtype of the lowest rank that reports a tensor.",
+            world_size,
+            len(conflicting_fqns),
+            next(iter(conflicting_fqns)),
+        )
+    return global_mapping
 
 
 def _ensure_msc_available() -> None:
@@ -2237,6 +2291,16 @@ fi
         Original HF safetensors headers provide the baseline mapping when available.
         Model-owned adapter overrides are applied even for config-only runs so
         intrinsically fp32 tensors retain their required export dtype.
+
+        Args:
+            model_state: Wrapper exposing the primary model part.
+            state_dict: This rank's subset of the exported state dict, such as one pipeline stage or the experts of
+                one expert-parallel rank. Each value is a tensor of arbitrary shape; only its name and, through the
+                adapter, its dtype are read.
+
+        Returns:
+            Mapping from FQN to safetensors dtype string for the tensors exported by all ranks that save the model,
+            or None when there is no entry or no HF metadata is written.
         """
         if not _should_write_hf_metadata(self.config):
             return None
@@ -2256,6 +2320,10 @@ fi
                     dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
                 )
         normalized_dtype_mapping = _apply_adapter_forced_dtype_mapping(model, state_dict, normalized_dtype_mapping)
+        # The entries so far cover only the tensors this rank exports. Rank 0 writes the mapping for offline
+        # consolidation and every rank consolidates shards that hold tensors of other ranks, so all ranks that save
+        # the model share one mapping. ``process_group=None`` saves across the default group, as in ``dcp.save``.
+        normalized_dtype_mapping = _collect_global_dtype_mapping(normalized_dtype_mapping, self.process_group)
         return normalized_dtype_mapping or None
 
     def _get_storage_writer(
@@ -2601,6 +2669,8 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
         if hasattr(module, "init_lora_weights"):
             try:
                 module.init_lora_weights(peft_init_method)
+            except ValueError:
+                raise
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
 
@@ -3254,6 +3324,7 @@ def _load_hf_safetensors_checkpoint(
     model_path: str,
     *,
     prefault_mmap: bool = False,
+    key_filter: Callable[[str], bool] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """
     Load a safetensors checkpoint into a state dict.
@@ -3261,6 +3332,9 @@ def _load_hf_safetensors_checkpoint(
     On integrated CUDA systems, ``prefault_mmap`` reads every file-backed tensor
     once before installation. This keeps the returned tensors mmap-backed and
     reclaimable while avoiding page-by-page migration during the later CUDA copy.
+
+    ``key_filter`` keeps only the tensors it accepts; an index-sharded directory
+    then opens only the shards that hold one.
     """
     from safetensors import safe_open
 
@@ -3273,13 +3347,16 @@ def _load_hf_safetensors_checkpoint(
             del prefaulted
         return tensor
 
+    def wanted(key: str) -> bool:
+        return key_filter is None or key_filter(key)
+
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
-        if not prefault_mmap:
+        if not prefault_mmap and key_filter is None:
             return dict(load_file(model_path))
-        # load_file hides per-tensor access; safe_open lets us prefault each view.
+        # load_file hides per-tensor access; safe_open lets us prefault or skip each view.
         with safe_open(model_path, framework="pt", device="cpu") as f:
-            return {key: get_tensor(f, key) for key in f.keys()}
+            return {key: get_tensor(f, key) for key in f.keys() if wanted(key)}
     # Directory: try index first, then glob
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.isfile(index_file):
@@ -3289,7 +3366,8 @@ def _load_hf_safetensors_checkpoint(
             index = json.load(f)
         keys_by_filename: dict[str, list[str]] = {}
         for key, filename in index.get("weight_map", {}).items():
-            keys_by_filename.setdefault(filename, []).append(key)
+            if wanted(key):
+                keys_by_filename.setdefault(filename, []).append(key)
         for filename, keys in keys_by_filename.items():
             sf_path = os.path.join(model_path, filename)
             if not os.path.isfile(sf_path):
@@ -3303,7 +3381,8 @@ def _load_hf_safetensors_checkpoint(
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    out[key] = get_tensor(f, key)
+                    if wanted(key):
+                        out[key] = get_tensor(f, key)
     return out if out else None
 
 
