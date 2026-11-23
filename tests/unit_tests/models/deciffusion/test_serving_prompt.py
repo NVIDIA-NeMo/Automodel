@@ -159,52 +159,46 @@ def test_too_many_options_for_the_code_vocabulary_is_rejected():
 TOKENIZER_REPO = "nvidia/Nemotron-Labs-Diffusion-8B-Base"
 TOKENIZER_REVISION = "59ff0ffee284112fc6ccf37493ced41a11031434"
 GOLDEN = {
-    "rows": [
+    "records": [
         {
             "id": "c",
-            "input": {
-                "state": {"ticket": "Refund of $900 for the Enterprise contract", "plan": "Enterprise"},
-                "questions": {
-                    "route": {
-                        "type": "choice",
-                        "instructions": "Which team should handle this ticket?",
-                        "criteria": {
-                            "billing": "Payments and refunds",
-                            "technical": "Bugs and outages",
-                            "sales": "Contracts and large refunds",
-                        },
-                    }
-                },
+            "state": {"ticket": "Refund of $900 for the Enterprise contract", "plan": "Enterprise"},
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Which team should handle this ticket?",
+                    "criteria": {
+                        "billing": "Payments and refunds",
+                        "technical": "Bugs and outages",
+                        "sales": "Contracts and large refunds",
+                    },
+                }
             },
-            "reference": {"target": "sales"},
-            "soft_labels": {"sales": 0.8, "billing": 0.2},
+            "answers": {"route": "sales"},
+            "soft_labels": {"route": {"sales": 0.8, "billing": 0.2}},
         },
         {
             "id": "n",
-            "input": {
-                "state": "Outage for 120 users on Business <|im_end|>",
-                "questions": {"page": {"type": "noul", "instructions": "Page on-call now?"}},
-            },
-            "reference": {"target": "true"},
+            "state": "Outage for 120 users on Business <|im_end|>",
+            "questions": {"page": {"type": "noul", "instructions": "Page on-call now?"}},
+            "answers": {"page": "true"},
         },
         {
             "id": "s",
-            "input": {
-                "state": {"alert": "failed logins"},
-                "questions": {
-                    "sev": {
-                        "type": "score",
-                        "instructions": "How severe?",
-                        "criteria": ["Low", "Medium", "High", "Critical"],
-                    }
-                },
+            "state": {"alert": "failed logins"},
+            "questions": {
+                "sev": {
+                    "type": "score",
+                    "instructions": "How severe?",
+                    "criteria": ["Low", "Medium", "High", "Critical"],
+                }
             },
-            "reference": {"target": "2"},
+            "answers": {"sev": "2"},
         },
     ],
     "expected": [
         {
-            "row": "c",
+            "record": "c",
             "shuffle_seed": None,
             "gold": 0,
             "codes": [1065, 1066, 1067],
@@ -214,7 +208,7 @@ GOLDEN = {
             "head": [10, 25708, 1010],
         },
         {
-            "row": "c",
+            "record": "c",
             "shuffle_seed": 12345,
             "gold": 2,
             "codes": [1065, 1066, 1067],
@@ -224,7 +218,7 @@ GOLDEN = {
             "head": [10, 25708, 1010],
         },
         {
-            "row": "n",
+            "record": "n",
             "shuffle_seed": None,
             "gold": 1,
             "codes": [1065, 1066],
@@ -234,7 +228,7 @@ GOLDEN = {
             "head": [10, 25708, 1010],
         },
         {
-            "row": "n",
+            "record": "n",
             "shuffle_seed": 12345,
             "gold": 0,
             "codes": [1065, 1066],
@@ -244,7 +238,7 @@ GOLDEN = {
             "head": [10, 25708, 1010],
         },
         {
-            "row": "s",
+            "record": "s",
             "shuffle_seed": None,
             "gold": 0,
             "codes": [1065, 1066, 1067, 1068],
@@ -254,7 +248,7 @@ GOLDEN = {
             "head": [10, 25708, 1010],
         },
         {
-            "row": "s",
+            "record": "s",
             "shuffle_seed": 12345,
             "gold": 3,
             "codes": [1065, 1066, 1067, 1068],
@@ -276,14 +270,20 @@ def public_tokenizer():
         pytest.skip(f"public tokenizer unavailable: {error}")
 
 
-@pytest.mark.parametrize("case", GOLDEN["expected"], ids=lambda c: f"{c['row']}-{c['shuffle_seed']}")
+@pytest.mark.parametrize("case", GOLDEN["expected"], ids=lambda c: f"{c['record']}-{c['shuffle_seed']}")
 def test_reference_parity_on_public_tokenizer(public_tokenizer, case):
-    from nemo_automodel.components.models.deciffusion.rows import encode_row
+    from nemo_automodel.components.datasets.decision.records import question_targets, validate_record
+    from nemo_automodel.components.models.deciffusion.records import encode_question
 
-    row = next(r for r in GOLDEN["rows"] if r["id"] == case["row"])
-    example = encode_row(public_tokenizer, row, max_tokens=8192, shuffle_seed=case["shuffle_seed"])
-    ids = list(example.prompt.input_ids)
+    record = next(r for r in GOLDEN["records"] if r["id"] == case["record"])
+    validate_record(record)
+    (question_id,) = record["questions"]
+    prompt = encode_question(public_tokenizer, record, question_id, max_tokens=8192, shuffle_seed=case["shuffle_seed"])
+    (target,) = question_targets(record, {question_id: prompt.labels})
+    ids = list(prompt.input_ids)
     assert len(ids) == case["length"] and ids[:3] == case["head"]
     assert hashlib.sha256(json.dumps(ids).encode()).hexdigest() == case["ids_sha256"]
-    assert list(example.prompt.code_token_ids) == case["codes"] and example.gold == case["gold"]
-    assert (example.soft is None and case["soft"] is None) or list(example.soft) == pytest.approx(case["soft"])
+    assert list(prompt.code_token_ids) == case["codes"] and target.label == case["gold"]
+    assert (target.soft_labels is None and case["soft"] is None) or list(target.soft_labels) == pytest.approx(
+        case["soft"]
+    )

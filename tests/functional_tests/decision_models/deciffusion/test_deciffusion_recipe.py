@@ -79,8 +79,8 @@ def _tiny_checkpoint(root: Path, seed: int) -> None:
     (root / "config.json").write_text(json.dumps(saved, indent=2))
 
 
-def _rows(root: Path) -> None:
-    from nemo_automodel.components.models.deciffusion.rows import convert_simple_row, write_jsonl
+def _records(root: Path) -> None:
+    from nemo_automodel.components.models.deciffusion.records import convert_simple_line, write_jsonl
 
     teams = {"billing": "Payments and refunds", "technical": "Bugs and outages", "sales": "Contracts and quotes"}
     lines = []
@@ -118,30 +118,33 @@ def _rows(root: Path) -> None:
                 "group": f"g{i}",
             }
         )
-    rows = [convert_simple_row(line, n) for n, line in enumerate(lines)]
-    write_jsonl(root / "train.jsonl", rows[:96])
-    write_jsonl(root / "validation.jsonl", rows[96:120])
-    write_jsonl(root / "test.jsonl", rows[120:])
+    records = [convert_simple_line(line, n) for n, line in enumerate(lines)]
+    write_jsonl(root / "train.jsonl", records[:96])
+    write_jsonl(root / "validation.jsonl", records[96:120])
+    write_jsonl(root / "test.jsonl", records[120:])
 
 
-def _reference_probabilities(export_dir: Path, test_rows: Path, device: torch.device) -> dict[str, list[float]]:
+def _reference_probabilities(
+    export_dir: Path, test_records: Path, device: torch.device
+) -> dict[tuple[str, str], list[float]]:
     """Probabilities from the exported checkpoint with plain transformers and the reference bidirectional read."""
     from transformers import AutoModel, PreTrainedTokenizerFast
 
-    from nemo_automodel.components.models.deciffusion.rows import encode_row, read_jsonl
+    from nemo_automodel.components.models.deciffusion.records import encode_question, read_jsonl
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained(export_dir)
     model = AutoModel.from_pretrained(export_dir, trust_remote_code=True, dtype=torch.float32).to(device).eval()
     out = {}
     with torch.no_grad():
-        for row in read_jsonl(test_rows):
-            example = encode_row(tokenizer, row, max_tokens=8192)
-            ids = torch.tensor([[*example.prompt.input_ids, model.mask_token_id]], device=device)
-            hidden = model.encoder(
-                input_ids=ids, use_cache=False, use_causal_mask=False, is_training=False
-            ).last_hidden_state
-            logits = model.diffusion_head(hidden[:, -1]).float()[0][list(example.prompt.code_token_ids)]
-            out[example.row_id] = logits.softmax(-1).tolist()
+        for record in read_jsonl(test_records):
+            for question_id in record["questions"]:
+                prompt = encode_question(tokenizer, record, question_id, max_tokens=8192)
+                ids = torch.tensor([[*prompt.input_ids, model.mask_token_id]], device=device)
+                hidden = model.encoder(
+                    input_ids=ids, use_cache=False, use_causal_mask=False, is_training=False
+                ).last_hidden_state
+                logits = model.diffusion_head(hidden[:, -1]).float()[0][list(prompt.code_token_ids)]
+                out[(record["id"], question_id)] = logits.softmax(-1).tolist()
     return out
 
 
@@ -250,7 +253,9 @@ def _worker(root: Path, method: str) -> None:
     reloaded.setup()
     reloaded.run_train_validation_loop()
     metrics = json.loads((root / f"eval_{method}" / "metrics_test.json").read_text())
-    native = {p["id"]: p["probabilities"] for p in metrics["predictions"]}
+    assert metrics["overall"]["n"] == 24 and metrics["run"]["skipped_questions"] == 0
+    predictions = (root / f"eval_{method}" / "predictions_test.jsonl").read_text().splitlines()
+    native = {(p["record_id"], p["question_id"]): p["probs"] for p in map(json.loads, predictions)}
     failure = None
     if dist.get_rank() == 0:
         try:
@@ -278,7 +283,7 @@ def _main() -> None:
 def test_deciffusion_recipe_two_gpu(tmp_path, method):
     _tiny_checkpoint(tmp_path / "base", seed=0)
     _tiny_checkpoint(tmp_path / "other", seed=1)
-    _rows(tmp_path / "data")
+    _records(tmp_path / "data")
     env = {
         **os.environ,
         "PYTHONPATH": str(Path(__file__).resolve().parents[4]),

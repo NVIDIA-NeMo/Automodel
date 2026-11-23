@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Post-train Nemotron Deciffusion decision checkpoints on one-question decision rows (LoRA or full fine-tuning).
+"""Post-train Nemotron Deciffusion decision checkpoints on SystemOne records (LoRA or full fine-tuning).
 
-Each row is rendered with the serving prompt (one question, serving option order and codes), one mask token is
-appended, the backbone reads the sequence bidirectionally, and the frozen diffusion head's logits at the mask,
-restricted to the option codes, give the answer distribution. The loss is soft/hard cross-entropy, or gold
-cross-entropy plus a weighted KL to soft labels (``train.kl_weight > 0``). A ``train.canonical_fraction`` share of the
-training reads keep the serving option order; the rest are shuffled and re-coded by position.
+Every question of a record is its own read: the serving prompt (one question, serving option order and codes) plus
+one mask token. The backbone reads it bidirectionally, and the frozen diffusion head's logits at the mask, restricted
+to the option codes, give the answer distribution. Supervision, the objective and the metrics are the shared decision
+components: ``question_targets`` aligns answers, rewards and soft labels with each prompt's option order,
+``assemble_decision_batch`` and ``DecisionLoss`` (``loss.mode: sft``) compute the loss, and ``DecisionEvaluator``
+scores validation and test. A ``train.canonical_fraction`` share of the training reads keep the serving option order;
+the rest are shuffled and re-coded by position.
 
 * ``peft`` set: LoRA on the attention/MLP projections; embeddings and the diffusion head stay frozen.
 * ``peft: null``: full fine-tuning of the decoder layers and final norm; embeddings and the diffusion head stay frozen.
 * ``mode: eval`` scores the configured checkpoint (or ``init_from`` stage) on validation and test.
 
-Validation selects the published stage (``LOWEST_VAL``): highest accuracy, then lowest cross-entropy; for LoRA the
-starting checkpoint (step 0) is a saved, selectable stage; full fine-tuning selects among trained stages. Report the test split separately; the validation split is not an untouched
-test. Export a selected stage as a complete servable checkpoint with ``examples/decision/export_deciffusion.py``.
+Validation selects the published stage (``LOWEST_VAL``): most correct validation decisions, then lowest NLL; for LoRA
+the starting checkpoint (step 0) is a saved, selectable stage; full fine-tuning selects among trained stages. Report
+the test split separately; the validation split is not an untouched test. Export a selected stage as a complete
+servable checkpoint with ``examples/decision/export_deciffusion.py``.
 
 Run with::
 
@@ -53,18 +56,27 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, read_checkpoint_pointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.decision.records import (
+    QuestionTarget,
+    load_records,
+    pad_and_shard_records,
+    question_targets,
+    validate_record,
+)
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.eval.decision.metrics import DecisionEvaluator, save_summary
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loss.decision import DecisionLossConfig
+from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.deciffusion.export import checkpoint_fingerprint
-from nemo_automodel.components.models.deciffusion.objective import decision_loss
-from nemo_automodel.components.models.deciffusion.rows import DecisionExample, encode_row, read_jsonl
+from nemo_automodel.components.models.deciffusion.records import encode_question
 from nemo_automodel.components.models.deciffusion.scorer import (
     full_finetune_trainable,
     gather_head_rows,
     option_logits,
     require_bidirectional_text_config,
 )
-from nemo_automodel.components.models.deciffusion.serving_prompt import readout_token_ids
+from nemo_automodel.components.models.deciffusion.serving_prompt import PreparedQuestion, readout_token_ids
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -78,16 +90,31 @@ STAGE_FORMAT = "deciffusion-decision-stage-v1"
 
 
 def selection_value(correct: int, cross_entropy: float) -> float:
-    """Lower-is-better scalar that orders stages by correct validation rows, then by lower cross-entropy.
+    """Lower-is-better scalar that orders stages by correct validation decisions, then by lower cross-entropy.
 
-    The cross-entropy term lies in ``[0, 0.99]``, below the gap of one correct row, so the order is exactly
-    lexicographic for any validation size (every stage is scored on the same validation rows).
+    The cross-entropy term lies in ``[0, 0.99]``, below the gap of one correct decision, so the order is exactly
+    lexicographic for any validation size (every stage is scored on the same validation decisions).
 
     Args:
-        correct: Number of correctly decided validation rows.
-        cross_entropy: Mean validation cross-entropy (clipped to 99).
+        correct: Number of correctly decided labelled validation questions.
+        cross_entropy: Mean validation cross-entropy, the evaluator's ``nll`` (clipped to 99).
     """
     return -float(correct) + min(cross_entropy, 99.0) / 100.0
+
+
+@dataclasses.dataclass(frozen=True)
+class _Decision:
+    """One supervised question of a record, encoded in serving option order.
+
+    Attributes:
+        record: The validated SystemOne record that holds the question.
+        prompt: Serving prompt of the question (option labels and codes in prompt order).
+        target: Supervision aligned with ``prompt.labels``.
+    """
+
+    record: dict[str, Any]
+    prompt: PreparedQuestion
+    target: QuestionTarget
 
 
 class TrainDeciffusionDecisionRecipe(BaseRecipe):
@@ -110,6 +137,12 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
         if self.mode == "train" and not self.cfg.checkpoint.enabled:
             raise ValueError("training requires checkpoint.enabled=true for validation-selected stages")
+        self.loss_config: DecisionLossConfig = (
+            self.cfg.loss.instantiate() if self.cfg.get("loss", None) is not None else DecisionLossConfig()
+        )
+        if self.loss_config.mode != "sft":
+            raise ValueError("Deciffusion decision post-training supports loss.mode=sft only")
+        self.loss_fn = self.loss_config.build()
         self.seed = int(self.cfg.get("seed", 101))
         self.output_dir = Path(self.cfg.get("output_dir", f"runs/deciffusion_{self.mode}"))
         self.device = self.dist_env.device
@@ -156,32 +189,36 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision, trust_remote_code=True)
         self.max_tokens = int(self.cfg.get("data.max_tokens", 8192))
-        self.soft_gold_mask = bool(self.cfg.get("train.soft_gold_mask", False))
-        self.rows: dict[str, list[dict[str, Any]]] = {}
-        self.examples: dict[str, list[DecisionExample]] = {}
-        self.usable: list[int] = []
+        self.slice_keys = list(self.cfg.get("data.slice_keys", []) or [])
+        self.records: dict[str, list[dict[str, Any]]] = {}
+        self.decisions: dict[str, list[_Decision]] = {}
+        self.skipped: dict[str, int] = {}
         for split in ("train", "validation", "test"):
             path = self.cfg.get(f"data.{split}", None)
             if not path:
                 continue
-            rows = read_jsonl(path)
-            encoded = [self._encode(row) for row in rows]
-            self.rows[split] = rows
-            self.examples[split] = [example for example in encoded if example is not None]
-            if split == "train":
-                self.usable = [i for i, example in enumerate(encoded) if example is not None]
-            skipped = len(rows) - len(self.examples[split])
-            if skipped and self.dist_env.is_main:
+            records = load_records(path)
+            if not records:
+                raise ValueError(f"data.{split} must contain at least one record")
+            for record in records:
+                validate_record(record)
+            self.records[split] = records
+            self.decisions[split], self.skipped[split] = self._encode_split(records, train=split == "train")
+            if not self.decisions[split]:
+                raise ValueError(f"data.{split} has no supervised text decisions")
+            if self.skipped[split] and self.dist_env.is_main:
                 logger.warning(
-                    "data.%s: skipped %d of %d rows (not one text question with a label among its options, "
-                    "malformed, or over data.max_tokens=%d)",
+                    "data.%s: skipped %d questions (media, unreadable by the serving prompt, or over "
+                    "data.max_tokens=%d)",
                     split,
-                    skipped,
-                    len(rows),
+                    self.skipped[split],
                     self.max_tokens,
                 )
-        if self.mode == "train" and not self.usable:
-            raise ValueError("data.train has no usable rows")
+        if self.mode == "train" and "train" not in self.decisions:
+            raise ValueError("data.train is required for mode=train")
+        validation = self.decisions.get("validation", [])
+        if self.mode == "train" and validation and not any(d.target.label >= 0 for d in validation):
+            raise ValueError("data.validation needs gold answers: stages are selected by validation accuracy")
         token_ids = readout_token_ids(self.tokenizer)
         rows = gather_head_rows(self.model, token_ids).to(self.device)
         self.head_rows = {token: rows[i] for i, token in enumerate(token_ids)}
@@ -214,94 +251,106 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 self.model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None
             )
 
-    def _encode(self, row: dict[str, Any], shuffle_seed: int | None = None) -> DecisionExample | None:
-        return encode_row(
-            self.tokenizer,
-            row,
-            max_tokens=self.max_tokens,
-            shuffle_seed=shuffle_seed,
-            soft_gold_mask=self.soft_gold_mask,
+    def _encode_split(self, records: list[dict[str, Any]], *, train: bool) -> tuple[list[_Decision], int]:
+        """Encode every supervised question of ``records`` in serving option order.
+
+        Training keeps the questions the objective weights (a gold answer, or soft labels when they replace the
+        gold target); evaluation keeps the questions the evaluator scores (a gold answer or rewards).
+
+        Args:
+            records: Validated SystemOne records of one split.
+            train: Whether the split trains the model.
+
+        Returns:
+            The decisions, and the number of questions this model cannot read (media, a question that does not fit
+            the serving prompt, or a prompt longer than ``data.max_tokens``).
+        """
+        decisions, skipped = [], 0
+        for record in records:
+            for question_id in record["questions"]:
+                prompt = encode_question(self.tokenizer, record, question_id, max_tokens=self.max_tokens)
+                if prompt is None:
+                    skipped += 1
+                    continue
+                target = self._target(record, prompt)
+                if train:
+                    keep = float(self.loss_fn.normalization_weight(self._targets(record, target))) > 0
+                else:
+                    keep = target.label >= 0 or target.rewards is not None
+                if keep:
+                    decisions.append(_Decision(record, prompt, target))
+        return decisions, skipped
+
+    @staticmethod
+    def _target(record: dict[str, Any], prompt: PreparedQuestion) -> QuestionTarget:
+        """Supervision of ``prompt``'s question, aligned with the prompt's option order."""
+        return question_targets(record, {prompt.question_id: prompt.labels})[0]
+
+    def _targets(
+        self, record: dict[str, Any], target: QuestionTarget, device: torch.device | None = None
+    ) -> DecisionTargets:
+        """One-question loss targets with the configured question weights, on ``device`` (CPU by default)."""
+        return DecisionTargets.from_questions(
+            record_ids=[str(record["id"])],
+            questions=[[target]],
+            question_weights=self.loss_config.question_weights,
+            device=device,
         )
 
     # ------------------------------------------------------------------ scoring
-    def _logits(self, example: DecisionExample) -> torch.Tensor:
-        """Option logits of ``example``, fp32 tensor of shape ``[options]`` in prompt order."""
+    def _logits(self, prompt: PreparedQuestion) -> torch.Tensor:
+        """Option logits of ``prompt``, fp32 tensor of shape ``[options]`` in prompt order."""
         return option_logits(
             self.model,
-            example.prompt.input_ids,
-            example.prompt.code_token_ids,
+            prompt.input_ids,
+            prompt.code_token_ids,
             mask_token_id=self.mask_token_id,
             rows=self.head_rows,
             device=self.device,
         )
 
     @torch.no_grad()
-    def evaluate(self, split: str, *, predictions: bool = False) -> dict[str, Any]:
-        """Accuracy and cross-entropy on ``split`` (identical on every rank), optionally with per-row probabilities."""
+    def evaluate(self, split: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Score every decision of ``split`` with the shared ``DecisionEvaluator``.
+
+        Every rank runs the same number of forwards; padded duplicates are scored once.
+
+        Returns:
+            The evaluator summary and its per-decision predictions, identical on every rank.
+        """
         self.model.eval()
-        examples = self.examples[split]
-        rank, world = self._get_dp_rank(), self._get_dp_group_size()
-        shard = examples[rank::world]
-        stats = torch.zeros(3, dtype=torch.float64, device=self.device)
-        by_kind: dict[str, list[float]] = {}
-        local_predictions = []
-        for i in range(math.ceil(len(examples) / world)):  # same number of forwards on every rank
-            example = shard[i] if i < len(shard) else examples[0]
-            log_probs = self._logits(example).log_softmax(-1)
-            if i >= len(shard):
-                continue
-            correct = float(int(log_probs.argmax()) == example.gold)
-            stats += torch.tensor(
-                [correct, -float(log_probs[example.gold]), 1.0], dtype=torch.float64, device=self.device
-            )
-            by_kind.setdefault(example.prompt.kind, [0.0, 0.0])
-            by_kind[example.prompt.kind][0] += correct
-            by_kind[example.prompt.kind][1] += 1
-            if predictions:
-                local_predictions.append(
-                    {
-                        "id": example.row_id,
-                        "kind": example.prompt.kind,
-                        "labels": list(example.prompt.labels),
-                        "probabilities": log_probs.exp().tolist(),
-                        "gold": example.prompt.labels[example.gold],
-                    }
-                )
+        decisions = self.decisions[split]
+        world = self._get_dp_group_size()
+        shard = pad_and_shard_records(range(len(decisions)), rank=self._get_dp_rank(), world_size=world)
+        local = {index: self._logits(decisions[index].prompt).log_softmax(-1).tolist() for index in shard}
+        gathered: list[dict[int, list[float]]] = [local]
         if dist.is_initialized() and world > 1:
-            dist.all_reduce(stats, group=self._get_dp_group())
-            gathered: list[Any] = [None] * world
-            dist.all_gather_object(gathered, (by_kind, local_predictions), group=self._get_dp_group())
-        else:
-            gathered = [(by_kind, local_predictions)]
-        kinds: dict[str, list[float]] = {}
-        merged_predictions = []
-        for part_kinds, part_predictions in gathered:
-            for kind, (hits, count) in part_kinds.items():
-                kinds.setdefault(kind, [0.0, 0.0])
-                kinds[kind][0] += hits
-                kinds[kind][1] += count
-            merged_predictions += part_predictions
+            gathered = [{} for _ in range(world)]
+            dist.all_gather_object(gathered, local, group=self._get_dp_group())
+        log_probs: dict[int, list[float]] = {}
+        for part in gathered:
+            log_probs.update(part)
+        evaluator = DecisionEvaluator(slice_keys=self.slice_keys)
+        for index, decision in enumerate(decisions):
+            target = decision.target
+            evaluator.add(
+                str(decision.record["id"]),
+                target.question_id,
+                target.option_ids,
+                [math.exp(value) for value in log_probs[index]],
+                target.label,
+                target.rewards,
+                decision.record.get("meta"),
+            )
         self.model.train()
-        count = max(1.0, float(stats[2]))
-        summary: dict[str, Any] = {
-            "split": split,
-            "rows": int(stats[2]),
-            "correct": int(round(float(stats[0]))),
-            "skipped_rows": len(self.rows[split]) - len(examples),
-            "accuracy": float(stats[0]) / count,
-            "cross_entropy": float(stats[1]) / count,
-            "accuracy_by_type": {k: hits / n for k, (hits, n) in sorted(kinds.items())},
-        }
-        if predictions:
-            summary["predictions"] = sorted(merged_predictions, key=lambda p: p["id"])
-        return summary
+        return evaluator.summary(), evaluator.predictions()
 
     # ------------------------------------------------------------------ stage I/O
     def _save_stage(self, path: Path, validation: dict[str, Any] | None) -> None:
         """Publish the trainable weights (LoRA adapter or consolidated full weights) as an immutable stage."""
         self.checkpointer.lifecycle.reserve(str(path))
         self.checkpointer.save_model(self.model, str(path), peft_config=self.peft_config)
-        value = selection_value(validation["correct"], validation["cross_entropy"]) if validation else None
+        value = selection_value(validation["correct"], validation["nll"]) if validation else None
 
         def write_metadata() -> None:
             (path / "stage.json").write_text(json.dumps({**self.identity, "validation": validation}, indent=2))
@@ -336,22 +385,55 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
         if self.mode == "train":
             self._load_stage(self._train())
         for split in ("validation", "test"):
-            if split in self.examples:
-                summary = self.evaluate(split, predictions=True)
-                if self.dist_env.is_main:
-                    (self.output_dir / f"metrics_{split}.json").write_text(json.dumps(summary, indent=2))
-                    logger.info(
-                        "[%s] %s accuracy=%.4f ce=%.4f", self.mode, split, summary["accuracy"], summary["cross_entropy"]
-                    )
+            if split in self.decisions:
+                self._report(split)
         self.checkpointer.finalize()
         if dist.is_initialized():
             dist.barrier()
+
+    def _report(self, split: str) -> None:
+        """Write ``metrics_{split}.json`` (evaluator summary) and ``predictions_{split}.jsonl`` on the main rank."""
+        summary, predictions = self.evaluate(split)
+        summary["run"] = {
+            "mode": self.mode,
+            "split": split,
+            "init_from": str(self.cfg.get("init_from", None)),
+            "skipped_questions": self.skipped[split],
+        }
+        if self.dist_env.is_main:
+            save_summary(summary, self.output_dir / f"metrics_{split}.json")
+            with (self.output_dir / f"predictions_{split}.jsonl").open("w") as handle:
+                for row in predictions:
+                    handle.write(json.dumps(row) + "\n")
+            overall = summary["overall"]
+            logger.info(
+                "[%s] %s accuracy=%.4f nll=%.4f",
+                self.mode,
+                split,
+                overall.get("accuracy", float("nan")),
+                overall.get("nll", float("nan")),
+            )
 
     def _log(self, name: str, record: dict[str, Any]) -> None:
         if self.dist_env.is_main:
             with (self.output_dir / name).open("a") as handle:
                 handle.write(json.dumps(record) + "\n")
             logger.info("%s %s", name.split(".")[0], json.dumps(record))
+
+    def _validate(self, step: int) -> dict[str, Any] | None:
+        """Selection record of the current weights on the validation split, or ``None`` without one."""
+        if "validation" not in self.decisions:
+            return None
+        overall = self.evaluate("validation")[0]["overall"]
+        labelled = sum(decision.target.label >= 0 for decision in self.decisions["validation"])
+        record = {
+            "accuracy": overall["accuracy"],
+            "correct": round(overall["accuracy"] * labelled),
+            "nll": overall["nll"],
+            "decisions": labelled,
+        }
+        self._log("validation.jsonl", {"step": step, **record})
+        return record
 
     def _train(self) -> Path:
         """Train; returns the validation-selected stage (the last stage when there is no validation split)."""
@@ -360,16 +442,16 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
         batch = int(self.cfg.get("train.global_batch_size", 16))
         if batch <= 0 or batch % world:
             raise ValueError(f"train.global_batch_size={batch} must be a positive multiple of the DP size {world}")
-        if len(self.usable) < batch:
-            raise ValueError(f"{len(self.usable)} usable training rows < train.global_batch_size {batch}")
+        decisions = self.decisions["train"]
+        if len(decisions) < batch:
+            raise ValueError(f"{len(decisions)} training decisions < train.global_batch_size {batch}")
         accum = batch // world
-        steps_per_epoch = len(self.usable) // batch
+        steps_per_epoch = len(decisions) // batch
         total = int(self.cfg.get("train.max_steps", 0) or 0) or max(
             1, int(steps_per_epoch * float(self.cfg.get("train.epochs", 1.0)))
         )
         warmup = max(1, int(float(self.cfg.get("train.warmup_fraction", 0.05)) * total))
         canonical_fraction = float(self.cfg.get("train.canonical_fraction", 0.5))
-        kl_weight = float(self.cfg.get("train.kl_weight", 0.0))
         val_every = int(self.cfg.get("train.val_every_steps", 50))
         max_grad_norm = float(self.cfg.get("train.max_grad_norm", 1.0))
         is_lora = self.peft_config is not None
@@ -393,29 +475,21 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 "total_steps": total,
                 "warmup_steps": warmup,
                 "accumulation": accum,
-                "usable_train_rows": len(self.usable),
-                "train_rows": len(self.rows["train"]),
+                "train_decisions": len(decisions),
+                "train_records": len(self.records["train"]),
+                "skipped_train_questions": self.skipped["train"],
                 "trainable_parameters": sum(p.numel() for p in trainable),
                 **self.identity,
             }
             (self.output_dir / "run_config.json").write_text(json.dumps(config, indent=2))
 
-        def validate(step: int) -> dict[str, Any] | None:
-            if "validation" not in self.examples:
-                return None
-            summary = self.evaluate("validation")
-            record = {k: summary[k] for k in ("accuracy", "correct", "cross_entropy", "rows")}
-            self._log("validation.jsonl", {"step": step, **record})
-            return record
-
-        start = validate(0)
+        start = self._validate(0)
         # LoRA: the start is a saved, selectable stage (B is zero, so the adapter equals the base). Full fine-tuning
         # does not save the base weights, so selection is among trained stages, matching LOWEST_VAL.
         best: tuple[dict[str, Any] | None, int] = (start, 0) if is_lora else (None, 0)
         if is_lora:
             self._save_stage(self.output_dir / "step_00000000", start)
-        rows = self.rows["train"]
-        order = list(self.usable)
+        order = list(range(len(decisions)))
         random.Random(self.seed).shuffle(order)
         step, epoch, cursor = 0, 0, 0
         self.model.train()
@@ -424,20 +498,43 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             if cursor + batch > len(order):
                 epoch += 1
                 cursor = 0
-                order = list(self.usable)
+                order = list(range(len(decisions)))
                 random.Random(self.seed + epoch).shuffle(order)
             window = order[cursor : cursor + batch]
             cursor += batch
-            losses = []
+            reads = []
             for j in range(accum):
                 index = window[j * world + rank]
+                decision = decisions[index]
                 seed = index * 1000003 + self.seed + epoch
                 shuffle = None if random.Random(seed).random() < canonical_fraction else seed
-                example = self._encode(rows[index], shuffle) or self._encode(rows[index])
-                soft = torch.tensor(example.soft, device=self.device) if example.soft else None
-                loss = decision_loss(self._logits(example), example.gold, soft, kl_weight=kl_weight)
-                (loss / accum).backward()
-                losses.append(loss.detach())
+                prompt = (
+                    encode_question(
+                        self.tokenizer,
+                        decision.record,
+                        decision.prompt.question_id,
+                        max_tokens=self.max_tokens,
+                        shuffle_seed=shuffle,
+                    )
+                    or decision.prompt
+                )
+                targets = self._targets(decision.record, self._target(decision.record, prompt), self.device)
+                reads.append((decision, prompt, targets, self.loss_fn.normalization_weight(targets)))
+            # Normalize over the eligible question weights of the whole window on every DP rank.
+            window_weight = torch.stack([weight for *_, weight in reads]).sum()
+            if dist.is_initialized() and world > 1:
+                dist.all_reduce(window_weight, group=self._get_dp_group())
+            window_loss = torch.zeros((), device=self.device)
+            for decision, prompt, targets, weight in reads:
+                scores = QuestionLogits(
+                    str(decision.record["id"]), prompt.question_id, prompt.labels, self._logits(prompt)
+                )
+                assembled = assemble_decision_batch(logits=[[scores]], targets=targets)
+                loss, _ = self.loss_fn(assembled.logits, assembled.targets)
+                share = weight / window_weight
+                # FSDP averages gradients over the DP ranks; scaling by the DP size keeps each read's window share.
+                (loss * (world * share)).backward()
+                window_loss += loss.detach() * share
             grad_norm = clip_grad_norm(max_grad_norm, [self.model], device_mesh=self.device_mesh)
             for scheduler in schedulers:
                 scheduler.step(1)  # lr for this update: warmup (step+1)/warmup, then cosine to min_lr
@@ -445,29 +542,27 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             step += 1
-            mean_loss = torch.stack(losses).mean()
             if dist.is_initialized() and world > 1:
-                dist.all_reduce(mean_loss, group=self._get_dp_group())
-                mean_loss /= world
+                dist.all_reduce(window_loss, group=self._get_dp_group())
             grad_norm = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
             self._log(
                 "training.jsonl",
                 {
                     "step": step,
                     "epoch": epoch + 1,
-                    "loss": round(float(mean_loss), 5),
+                    "loss": round(float(window_loss), 5),
                     "grad_norm": round(float(grad_norm), 4),
                     "lr": self.optimizer[0].param_groups[0]["lr"],
                     "seconds": round(time.monotonic() - started, 2),
                 },
             )
             if step % val_every == 0 or step == total:
-                record = validate(step)
+                record = self._validate(step)
                 self._save_stage(self.output_dir / f"step_{step:08d}", record)
                 if record is not None and (
                     best[0] is None
-                    or selection_value(record["correct"], record["cross_entropy"])
-                    < selection_value(best[0]["correct"], best[0]["cross_entropy"])
+                    or selection_value(record["correct"], record["nll"])
+                    < selection_value(best[0]["correct"], best[0]["nll"])
                 ):
                     best = (record, step)
         if self.dist_env.is_main:

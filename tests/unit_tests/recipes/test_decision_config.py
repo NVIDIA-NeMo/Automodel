@@ -388,5 +388,50 @@ def test_deciffusion_examples_keep_the_reference_training_contract():
         assert (config["peft"]["dim"], config["peft"]["alpha"], config["peft"]["dropout"]) == (32, 64, 0.0)
         assert config["optimizer"]["lr"] == 1.0e-4 and config["optimizer"]["betas"] == [0.9, 0.95]
         assert config["seed"] == 101 and config["train"]["global_batch_size"] == 16
-        assert config["train"]["canonical_fraction"] == 0.5 and config["train"]["kl_weight"] == 0.0
+        assert config["train"]["canonical_fraction"] == 0.5
+        # Plain (soft-)cross-entropy over the options: the shared objective with its extra SFT terms disabled.
+        loss = config["loss"]
+        assert loss["mode"] == "sft" and loss["soft_label_kl_weight"] == 0.0
+        assert (loss["label_smoothing"], loss["brier_weight"], loss["ordinal_weight"]) == (0.0, 0.0, 0.0)
         assert not any("head" in module or "embed" in module for module in config["peft"]["target_modules"])
+
+
+@pytest.mark.parametrize("soft_label_kl_weight,trained", [(0.0, ["gold", "soft"]), (0.5, ["gold"])])
+def test_deciffusion_reads_each_supervised_question_and_counts_unreadable_ones(soft_label_kl_weight, trained):
+    from nemo_automodel.components.datasets.decision.records import validate_record
+    from nemo_automodel.components.loss.decision import DecisionLossConfig
+    from nemo_automodel.recipes.decision.train_deciffusion import TrainDeciffusionDecisionRecipe
+    from tests.unit_tests.models.deciffusion.char_tokenizer import CharTokenizer
+
+    record = {
+        "id": "r1",
+        "state": {"alert": "x"},
+        "questions": {
+            "gold": {"type": "noul", "instructions": "Escalate?"},
+            "soft": {"type": "noul", "instructions": "Page?"},
+            "reward": {"type": "noul", "instructions": "Close?"},
+            "unsupervised": {"type": "noul", "instructions": "Notify?"},
+            "unreadable": {"type": "noul"},  # the serving prompt needs instructions
+        },
+        "answers": {"gold": "true"},
+        "soft_labels": {"soft": {"true": 0.9, "false": 0.1}},
+        "rewards": {"reward": {"true": 1.0, "false": 0.0}},
+    }
+    validate_record(record)
+    recipe = TrainDeciffusionDecisionRecipe.__new__(TrainDeciffusionDecisionRecipe)
+    recipe.tokenizer = CharTokenizer()
+    recipe.max_tokens = 4096
+    recipe.loss_config = DecisionLossConfig(mode="sft", soft_label_kl_weight=soft_label_kl_weight)
+    recipe.loss_fn = recipe.loss_config.build()
+
+    decisions, skipped = recipe._encode_split([record], train=True)
+    assert [d.prompt.question_id for d in decisions] == trained and skipped == 1
+    for decision in decisions:
+        assert decision.target.option_ids == decision.prompt.labels
+    if "soft" in trained:
+        soft = decisions[trained.index("soft")]
+        assert dict(zip(soft.prompt.labels, soft.target.soft_labels, strict=True)) == pytest.approx(
+            {"true": 0.9, "false": 0.1}
+        )
+    decisions, skipped = recipe._encode_split([record], train=False)
+    assert [d.prompt.question_id for d in decisions] == ["gold", "reward"] and skipped == 1

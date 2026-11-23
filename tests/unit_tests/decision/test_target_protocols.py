@@ -33,6 +33,7 @@ class ExternalTarget:
     option_ids: tuple[str, ...] = ("b", "a")
     label: int = 1
     rewards: tuple[float, ...] | None = (-0.5, 0.75)
+    soft_labels: tuple[float, ...] | None = None
 
 
 def test_independent_target_works_for_loss_and_evaluation() -> None:

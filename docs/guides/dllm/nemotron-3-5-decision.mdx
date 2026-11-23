@@ -158,55 +158,14 @@ Each record holds one alert (`state`), its five `questions`, and the policy's `a
 
 (Two of the five questions and some `state` fields are shown.)
 
-### Convert to One-Question Rows
-
-The model is trained the way it is served: **one question per read**. Convert each alert into five rows:
-
-```bash
-uv run python examples/decision/prepare_deciffusion_data.py systemone \
-    --input-dir data/soc_triage --output data/soc_triage_rows
-```
-
-Expected output:
-```json
-{
-  "rows": {"train": 640, "validation": 160, "test": 160},
-  "groups": {"train": 128, "validation": 32, "test": 32},
-  "group_overlap": 0,
-  "types": {"choice": 576, "noul": 192, "score": 192},
-  "soft_label_rows": 0
-}
-```
-
-All five questions about one alert stay in the same split (`group_overlap: 0`), so the validation and test alerts
-are never seen in training. A converted row:
-
-```json
-{
-  "id": "fictional-7-00000/action",
-  "input": {
-    "state": {"asset": "host-00000.example", "behavior": "credential read attempt", "...": "..."},
-    "questions": {
-      "action": {
-        "type": "choice",
-        "instructions": "Which response follows the tutorial policy?",
-        "criteria": {
-          "close": "Close the alert.",
-          "contain": "Contain the affected asset.",
-          "escalate": "Ask an analyst to investigate.",
-          "monitor": "Monitor the asset without containment."
-        }
-      }
-    }
-  },
-  "reference": {"target": "close"},
-  "group": "fictional-7-00000"
-}
-```
+The recipe reads these SystemOne records directly, as the CLM and CLEF recipes do, so no conversion step is needed.
+The model is trained the way it is served: **one question per read**. Each alert gives five reads, so the splits
+hold 640 training, 160 validation, and 160 test questions. All five questions about one alert stay in the same split,
+so the validation and test alerts are never seen in training.
 
 ### Serving Prompt Format
 
-The recipe renders every row exactly as the serving path does:
+The recipe renders every question exactly as the serving path does:
 - a fixed system message, then a JSON user turn `{"state", "question", "options"}`;
 - options in a fixed position order, each with a single-token code (`A`, `B`, ...);
 - special tokens inside user text escaped, so they cannot act as control tokens;
@@ -223,15 +182,17 @@ For your own data, write one decision per line:
 ```
 
 `soft_labels` (a probability per option) is optional. Rows that share a `group` stay in the same split, which keeps
-near-duplicates out of validation and test. Convert with:
+near-duplicates out of validation and test. Convert the lines to single-question SystemOne records with:
 
 ```bash
-uv run python examples/decision/prepare_deciffusion_data.py simple \
-    --input my_decisions.jsonl --output data/my_rows --split three-way
+uv run python examples/decision/prepare_deciffusion_data.py \
+    --input my_decisions.jsonl --output data/my_records --split three-way
 ```
 
 `--split three-way` writes group-disjoint `train` / `validation` / `test` files. Then point the `data.*` paths of
-`examples/decision/deciffusion_support_routing_lora.yaml` (or the SOC config) at them.
+`examples/decision/deciffusion_support_routing_lora.yaml` (or the SOC config) at them. If your data is already in
+SystemOne records, use them as they are. Soft labels there map each question to option weights:
+`"soft_labels": {"verdict": {"malicious": 0.8, "false_positive": 0.2}}`.
 
 ---
 
@@ -284,32 +245,43 @@ checkpoint:
   save_consolidated: false  # LoRA stages save adapters; export_deciffusion.py merges them
 
 data:
-  train: data/soc_triage_rows/train.jsonl
-  validation: data/soc_triage_rows/validation.jsonl
-  test: data/soc_triage_rows/test.jsonl
-  max_tokens: 8192       # rows whose prompt + mask is longer are skipped and counted
+  train: data/soc_triage/train.jsonl
+  validation: data/soc_triage/validation.jsonl
+  test: data/soc_triage/test.jsonl
+  max_tokens: 8192       # questions whose prompt + mask is longer are skipped and counted
+  slice_keys: [evidence, verdict, family]
 
 train:
-  global_batch_size: 16  # rows per optimizer step over all ranks
+  global_batch_size: 16  # questions per optimizer step over all ranks
   epochs: 1.0
   warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
   min_lr_ratio: 0.1
   canonical_fraction: 0.5  # share of reads in serving option order; the rest are shuffled and re-coded
-  kl_weight: 0.0         # 0: cross-entropy; > 0: CE(gold) + kl_weight * KL(soft || p)
   max_grad_norm: 1.0
   val_every_steps: 50
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft
+  label_smoothing: 0.0
+  brier_weight: 0.0
+  ordinal_weight: 0.0
+  soft_label_kl_weight: 0.0    # 0: soft labels replace the gold target; > 0: CE(gold) + weight * KL(soft || p)
+  soft_label_gold_mask: false
 ```
 
 What the recipe trains:
 
-- **Loss**: cross-entropy over the options against the gold label, or against `soft_labels` when a row has them.
-  `train.kl_weight > 0` switches to gold cross-entropy plus a weighted KL term to the soft labels.
+- **Loss**: the shared decision objective (`DecisionLoss`) with label smoothing, Brier, and ranked-probability terms
+  off, which is cross-entropy over the options: against the gold answer, or against a question's `soft_labels` when
+  the record has them. `loss.soft_label_kl_weight > 0` switches to gold cross-entropy plus a weighted KL term to the
+  soft labels.
 - **Option shuffle**: half of the training reads (`canonical_fraction: 0.5`) keep the serving option order. The other
   half shuffle the options and re-code them by position. The model learns what the options *mean*, not which letter
   they had.
 - **Frozen readout**: the embeddings and diffusion head never train, and no new parameters are added. The exported
   checkpoint is scored by the unchanged serving path.
-- **Long rows**: rows longer than `data.max_tokens` are skipped and counted, never truncated.
+- **Long questions**: questions longer than `data.max_tokens` are skipped and counted, never truncated.
 
 With rank 32 on the attention and MLP projections of all 34 layers, LoRA trains **89.1M parameters (1.04% of the
 model)**.
@@ -341,8 +313,8 @@ automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 
 ```
 
 ```
-[eval] validation accuracy=0.7562 ce=0.5878
-[eval] test accuracy=0.7000 ce=0.6932
+[eval] validation accuracy=0.7562 nll=0.5878
+[eval] test accuracy=0.7000 nll=0.6932
 ```
 
 ### LoRA
@@ -353,7 +325,7 @@ automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 1 
     --output_dir runs/soc/lora
 ```
 
-One epoch of the 640 training rows at 16 rows per step is **40 optimizer steps**. Validation runs on the starting
+One epoch of the 640 training questions at 16 questions per step is **40 optimizer steps**. Validation runs on the starting
 checkpoint (step 0) and on the final step.
 
 ### Full Fine-Tuning
@@ -371,33 +343,33 @@ automodel examples/decision/deciffusion_soc_triage_lora.yaml --nproc-per-node 8 
 Trainable parameters: 89,128,960
 Trainable parameters percentage: 1.04%
 
-validation {"step": 0, "accuracy": 0.75625, "correct": 121, "cross_entropy": 0.5878, "rows": 160}
+validation {"step": 0, "accuracy": 0.75625, "correct": 121, "nll": 0.5878, "decisions": 160}
 training {"step": 1, "epoch": 1, "loss": 0.77054, "grad_norm": 34.7594, "lr": 5e-05, "seconds": 3.71}
 training {"step": 10, "epoch": 1, "loss": 0.0758, "grad_norm": 2.5217, "lr": 9.05e-05, "seconds": 3.23}
 training {"step": 20, "epoch": 1, "loss": 0.00376, "grad_norm": 0.1085, "lr": 5.87e-05, "seconds": 3.38}
 training {"step": 30, "epoch": 1, "loss": 0.00037, "grad_norm": 0.0433, "lr": 2.45e-05, "seconds": 3.22}
 training {"step": 40, "epoch": 1, "loss": 0.00014, "grad_norm": 0.0055, "lr": 1e-05, "seconds": 3.23}
-validation {"step": 40, "accuracy": 1.0, "correct": 160, "cross_entropy": 0.0001, "rows": 160}  <-- LOWEST_VAL
+validation {"step": 40, "accuracy": 1.0, "correct": 160, "nll": 0.0001, "decisions": 160}  <-- LOWEST_VAL
 
-[train] validation accuracy=1.0000 ce=0.0001
-[train] test accuracy=1.0000 ce=0.0001
+[train] validation accuracy=1.0000 nll=0.0001
+[train] test accuracy=1.0000 nll=0.0001
 ```
 
-Each step takes ~3.3 s on one B200 (16 rows, activation checkpointing).
+Each step takes ~3.3 s on one B200 (16 questions, activation checkpointing).
 
 ### Training Log for Full Fine-Tuning
 
 ```
-validation {"step": 0, "accuracy": 0.75625, "correct": 121, "cross_entropy": 0.5899, "rows": 160}
+validation {"step": 0, "accuracy": 0.75625, "correct": 121, "nll": 0.5899, "decisions": 160}
 training {"step": 1, "epoch": 1, "loss": 0.77494, "grad_norm": 151.8929, "lr": 5e-07, "seconds": 2.64}
 training {"step": 10, "epoch": 1, "loss": 0.06555, "grad_norm": 17.7863, "lr": 9.05e-07, "seconds": 0.9}
 training {"step": 20, "epoch": 1, "loss": 0.12657, "grad_norm": 15.5584, "lr": 5.87e-07, "seconds": 0.44}
 training {"step": 30, "epoch": 1, "loss": 0.03214, "grad_norm": 2.5924, "lr": 2.45e-07, "seconds": 0.49}
 training {"step": 40, "epoch": 1, "loss": 0.02368, "grad_norm": 1.5179, "lr": 1e-07, "seconds": 0.49}
-validation {"step": 40, "accuracy": 1.0, "correct": 160, "cross_entropy": 0.0251, "rows": 160}  <-- LOWEST_VAL
+validation {"step": 40, "accuracy": 1.0, "correct": 160, "nll": 0.0251, "decisions": 160}  <-- LOWEST_VAL
 
-[train] validation accuracy=1.0000 ce=0.0251
-[train] test accuracy=1.0000 ce=0.0269
+[train] validation accuracy=1.0000 nll=0.0251
+[train] test accuracy=1.0000 nll=0.0269
 ```
 
 The parameter summary printed when the model is built counts all 8.49B parameters. The recipe then freezes the
@@ -408,8 +380,8 @@ With a 100x lower learning rate, full fine-tuning reaches the same accuracy with
 
 ### How a Stage Is Selected
 
-Validation publishes the best stage as `LOWEST_VAL`: **most correct validation rows first, then lowest
-cross-entropy**. For LoRA the starting checkpoint (step 0) is a saved, selectable stage, so a run that does not help
+Validation publishes the best stage as `LOWEST_VAL`: **most correct validation questions first, then lowest
+cross-entropy (NLL)**. For LoRA the starting checkpoint (step 0) is a saved, selectable stage, so a run that does not help
 publishes the base unchanged. Full fine-tuning selects among its trained stages. The test split is scored once, on
 the selected stage, and is never used for selection.
 
@@ -430,8 +402,10 @@ runs/soc/lora/
   training.jsonl
   validation.jsonl
   selected.json             # the published step and its validation record
-  metrics_validation.json   # accuracy, cross-entropy, per-type accuracy, per-row probabilities
+  metrics_validation.json   # accuracy, exact match, NLL, Brier, ECE, reward; per question and per slice
   metrics_test.json
+  predictions_validation.jsonl  # per-question option probabilities
+  predictions_test.jsonl
 ```
 
 A full fine-tuning stage holds `model/consolidated/` (a Hugging Face export of the trained weights) instead of the
@@ -535,24 +509,27 @@ as `"true"` / `"false"`.
 
 ### Evaluate the Test Split
 
-Score the converted test rows with the same read. `encode_row` builds the prompt and the gold option index exactly as
-the recipe does:
+Score every question of the test records with the same read. `encode_question` builds each prompt exactly as the
+recipe does:
 
 ```python
-from nemo_automodel.components.models.deciffusion import encode_row
-from nemo_automodel.components.models.deciffusion.rows import read_jsonl
+from nemo_automodel.components.datasets.decision.records import load_records
+from nemo_automodel.components.models.deciffusion import encode_question
 
 correct = total = 0
 with torch.inference_mode():
-    for row in read_jsonl("data/soc_triage_rows/test.jsonl"):
-        example = encode_row(tokenizer, row, max_tokens=8192)
-        if example is None:
-            continue
-        ids = torch.tensor([[*example.prompt.input_ids, model.mask_token_id]], device="cuda")
-        hidden = model.encoder(input_ids=ids, use_cache=False, use_causal_mask=False, is_training=False).last_hidden_state
-        logits = model.diffusion_head(hidden[:, -1]).float()[0, list(example.prompt.code_token_ids)]
-        correct += int(logits.argmax()) == example.gold
-        total += 1
+    for record in load_records("data/soc_triage/test.jsonl"):
+        for question_id in record["questions"]:
+            prompt = encode_question(tokenizer, record, question_id, max_tokens=8192)
+            if prompt is None:
+                continue
+            ids = torch.tensor([[*prompt.input_ids, model.mask_token_id]], device="cuda")
+            hidden = model.encoder(
+                input_ids=ids, use_cache=False, use_causal_mask=False, is_training=False
+            ).last_hidden_state
+            logits = model.diffusion_head(hidden[:, -1]).float()[0, list(prompt.code_token_ids)]
+            correct += prompt.labels[int(logits.argmax())] == record["answers"][question_id]
+            total += 1
 print(f"test accuracy {correct / total:.4f} ({correct}/{total})")
 ```
 
@@ -560,9 +537,10 @@ print(f"test accuracy {correct / total:.4f} ({correct}/{total})")
 test accuracy 1.0000 (160/160)
 ```
 
-The export reproduces the recipe's `metrics_test.json`: the same decision on all 160 test questions, with a maximum
-absolute probability difference of 5e-5. On the base checkpoint the same loop gives 0.7063 (113/160). One near-tie
-row resolves differently from the recipe's evaluation (0.7000), because the two runs round in bf16 differently.
+The export reproduces the recipe's test predictions (`predictions_test.jsonl`): the same decision on all 160 test
+questions, with a maximum absolute probability difference of 5e-5. On the base checkpoint the same loop gives 0.7063
+(113/160). One near-tie question resolves differently from the recipe's evaluation (0.7000), because the two runs
+round in bf16 differently.
 
 **Resources:** one GPU with ~16 GiB for the bf16 weights.
 **Runtime:** ~116 ms per question on 1x B200, one question at a time; the 160 test questions take ~19 s.

@@ -14,16 +14,13 @@
 
 """Typed-decision post-training support for Nemotron Deciffusion checkpoints."""
 
-from nemo_automodel.components.models.deciffusion.objective import decision_loss
-from nemo_automodel.components.models.deciffusion.rows import DecisionExample, encode_row
+from nemo_automodel.components.models.deciffusion.records import encode_question
 from nemo_automodel.components.models.deciffusion.scorer import require_bidirectional_text_config
 from nemo_automodel.components.models.deciffusion.serving_prompt import PreparedQuestion, prepare_question
 
 __all__ = [
-    "DecisionExample",
     "PreparedQuestion",
-    "decision_loss",
-    "encode_row",
+    "encode_question",
     "prepare_question",
     "require_bidirectional_text_config",
 ]

@@ -14,9 +14,10 @@
 
 # LoRA post-training of a Nemotron Deciffusion decision checkpoint on a synthetic support-routing dataset
 # (fictional help-desk tickets with choice and yes/no decisions, some with soft labels) in one-decision JSONL:
-# {"state", "question", "type", "options", "label", optional "soft_labels" and "group"}. Bring your own file.
+# {"state", "question", "type", "options", "label", optional "soft_labels" and "group"}. Bring your own file;
+# the prepare script converts it to single-question SystemOne records with group-disjoint splits.
 #
-#   uv run python examples/decision/prepare_deciffusion_data.py simple --input support_routing.jsonl \
+#   uv run python examples/decision/prepare_deciffusion_data.py --input support_routing.jsonl \
 #       --split three-way --output data/support_routing
 #   # before: score the starting checkpoint
 #   automodel examples/decision/deciffusion_support_routing_lora.yaml --mode eval --output_dir runs/support/base
@@ -90,19 +91,26 @@ data:
   train: data/support_routing/train.jsonl
   validation: data/support_routing/validation.jsonl
   test: data/support_routing/test.jsonl
-  max_tokens: 8192       # rows whose prompt + mask is longer are skipped and counted (no compaction)
+  max_tokens: 8192       # questions whose prompt + mask is longer are skipped and counted (no compaction)
 
 train:
-  global_batch_size: 16  # rows per optimizer step over all ranks (one row per forward)
+  global_batch_size: 16  # questions per optimizer step over all ranks (one question per forward)
   epochs: 1.0
   max_steps: 50          # 50 steps of 16 rows
   warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
   min_lr_ratio: 0.1
   canonical_fraction: 0.5  # share of training reads in serving option order; the rest are shuffled and re-coded
-  kl_weight: 0.0         # 0: soft/hard cross-entropy; > 0: CE(gold) + kl_weight * KL(soft || p)
-  soft_gold_mask: false
   max_grad_norm: 1.0
   val_every_steps: 25
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft                    # the recipe trains SFT stages only
+  label_smoothing: 0.0         # plain cross-entropy over the options, as in the reference fine-tuning
+  brier_weight: 0.0
+  ordinal_weight: 0.0
+  soft_label_kl_weight: 0.0    # 0: soft labels replace the gold target; > 0: CE(gold) + weight * KL(soft || p)
+  soft_label_gold_mask: false  # true: ignore soft labels whose top option is not the gold answer
 
 ci:
   nemo_ci_schedule: skipped  # needs a Deciffusion checkpoint; covered by the functional test

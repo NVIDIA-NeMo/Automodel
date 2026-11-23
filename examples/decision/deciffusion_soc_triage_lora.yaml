@@ -13,12 +13,10 @@
 # limitations under the License.
 
 # LoRA post-training of a Nemotron Deciffusion decision checkpoint on fictional SOC alert triage
-# (choice, yes/no and ordinal-score questions; one training row per question).
+# (choice, yes/no and ordinal-score questions; each question of an alert is read on its own).
 #
 #   PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
 #       --output-dir data/soc_triage --seed 7
-#   uv run python examples/decision/prepare_deciffusion_data.py systemone --input-dir data/soc_triage \
-#       --output data/soc_triage_rows
 #   automodel examples/decision/deciffusion_soc_triage_lora.yaml --mode eval --output_dir runs/soc/base
 #   automodel examples/decision/deciffusion_soc_triage_lora.yaml --output_dir runs/soc/lora
 #
@@ -83,22 +81,30 @@ checkpoint:
   save_consolidated: false  # LoRA stages save adapters; export_deciffusion.py merges them
 
 data:
-  train: data/soc_triage_rows/train.jsonl
-  validation: data/soc_triage_rows/validation.jsonl
-  test: data/soc_triage_rows/test.jsonl
-  max_tokens: 8192       # rows whose prompt + mask is longer are skipped and counted (no compaction)
+  train: data/soc_triage/train.jsonl
+  validation: data/soc_triage/validation.jsonl
+  test: data/soc_triage/test.jsonl
+  max_tokens: 8192       # questions whose prompt + mask is longer are skipped and counted (no compaction)
+  slice_keys: [evidence, verdict, family]
 
 train:
-  global_batch_size: 16  # rows per optimizer step over all ranks (one row per forward)
+  global_batch_size: 16  # questions per optimizer step over all ranks (one question per forward)
   epochs: 1.0
   max_steps: 0           # 0: train.epochs decide
   warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
   min_lr_ratio: 0.1
   canonical_fraction: 0.5  # share of training reads in serving option order; the rest are shuffled and re-coded
-  kl_weight: 0.0         # 0: soft/hard cross-entropy; > 0: CE(gold) + kl_weight * KL(soft || p)
-  soft_gold_mask: false
   max_grad_norm: 1.0
   val_every_steps: 50
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft                    # the recipe trains SFT stages only
+  label_smoothing: 0.0         # plain cross-entropy over the options, as in the reference fine-tuning
+  brier_weight: 0.0
+  ordinal_weight: 0.0
+  soft_label_kl_weight: 0.0    # 0: soft labels replace the gold target; > 0: CE(gold) + weight * KL(soft || p)
+  soft_label_gold_mask: false  # true: ignore soft labels whose top option is not the gold answer
 
 ci:
   nemo_ci_schedule: skipped  # needs a Deciffusion checkpoint; covered by the functional test

@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training rows for Deciffusion decision post-training: one text question, one label, optional soft labels.
+"""SystemOne records for Deciffusion decision post-training: one-question encoding and one-decision JSONL conversion.
 
-A row is ``{"id", "input": {"state", "questions": {key: question}}, "reference": {"target"}, "soft_labels"?, "group"?}``.
-Rows come from two public sources: SystemOne records (several questions per state, flattened here to one row per
-question) and simple one-decision-per-line JSONL (``state``, ``question``, ``type``, ``options``, ``label``).
+The recipe reads SystemOne records (``{"id", "state", "questions", "answers"}`` plus optional ``rewards``,
+``soft_labels`` and ``meta``) and reads every question of a record through its own serving prompt. Simple
+one-decision-per-line JSONL (``state``, ``question``, ``type``, ``options``, ``label``, optional ``soft_labels`` and
+``group``) converts to single-question records, with ``group`` kept in ``meta`` for group-disjoint splits.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -34,23 +34,7 @@ from nemo_automodel.components.models.deciffusion.serving_prompt import (
 )
 
 NOUL_ALIASES = {"true": "true", "yes": "true", "1": "true", "false": "false", "no": "false", "0": "false"}
-
-
-@dataclass(frozen=True)
-class DecisionExample:
-    """A tokenized training/evaluation example.
-
-    Attributes:
-        row_id: Identifier of the source row.
-        prompt: The serving prompt (labels in prompt order, option codes, token ids without the mask).
-        gold: Index of the gold label within ``prompt.labels``.
-        soft: Normalized soft-label distribution aligned with ``prompt.labels`` or ``None``.
-    """
-
-    row_id: str
-    prompt: PreparedQuestion
-    gold: int
-    soft: tuple[float, ...] | None
+SIMPLE_QUESTION_ID = "decision"
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -83,8 +67,17 @@ def normalize_label(kind: str, label: Any) -> str:
     return str(label)
 
 
-def convert_simple_row(line: dict[str, Any], number: int = 0) -> dict[str, Any]:
-    """Convert one simple decision line into a training row.
+def convert_simple_line(line: dict[str, Any], number: int = 0) -> dict[str, Any]:
+    """Convert one simple decision line into a single-question SystemOne record.
+
+    Args:
+        line: ``{"state", "question", "label"}`` plus optional ``id``, ``type`` (default ``choice``), ``options``,
+            ``soft_labels`` and ``group``.
+        number: Line number, used for the record ID when the line has none.
+
+    Returns:
+        A record whose only question is ``"decision"``. Soft labels are normalized over all options, and ``group``
+        is stored as ``meta["group"]``.
 
     Raises:
         ValueError: If a field is missing or the label/options are inconsistent.
@@ -114,10 +107,11 @@ def convert_simple_row(line: dict[str, Any], number: int = 0) -> dict[str, Any]:
     label = normalize_label(kind, line["label"])
     if label not in labels:
         raise ValueError(f"label {label!r} is not one of {labels}")
-    row: dict[str, Any] = {
+    record: dict[str, Any] = {
         "id": str(line.get("id", f"row-{number}")),
-        "input": {"state": line["state"], "questions": {"decision": question}},
-        "reference": {"target": label},
+        "state": line["state"],
+        "questions": {SIMPLE_QUESTION_ID: question},
+        "answers": {SIMPLE_QUESTION_ID: label},
     }
     soft = line.get("soft_labels")
     if soft:
@@ -125,89 +119,59 @@ def convert_simple_row(line: dict[str, Any], number: int = 0) -> dict[str, Any]:
         if set(soft) - set(labels) or any(v < 0 for v in soft.values()) or sum(soft.values()) <= 0:
             raise ValueError(f"soft_labels must be non-negative over the labels {labels}")
         total = sum(soft.values())
-        row["soft_labels"] = {name: soft.get(name, 0.0) / total for name in labels}
+        record["soft_labels"] = {SIMPLE_QUESTION_ID: {name: soft.get(name, 0.0) / total for name in labels}}
     if "group" in line:
-        row["group"] = str(line["group"])
-    return row
+        record["meta"] = {"group": str(line["group"])}
+    return record
 
 
-def rows_from_systemone(record: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flatten a SystemOne record (``state``, ``questions``, ``answers``) to one training row per answered question.
-
-    Questions without an answer are skipped. ``group`` is the record id, so all questions of a state stay together.
-    """
-    rows = []
-    for key, question in record["questions"].items():
-        if key not in record.get("answers", {}):
-            continue
-        rows.append(
-            {
-                "id": f"{record['id']}/{key}",
-                "input": {"state": record["state"], "questions": {key: question}},
-                "reference": {"target": normalize_label(question["type"], record["answers"][key])},
-                "group": str(record["id"]),
-            }
-        )
-    return rows
-
-
-def in_heldout(row: dict[str, Any], fraction: float, seed: str | int) -> bool:
-    """Deterministic group-disjoint split: hash of ``seed|group`` (or the state) below ``fraction``."""
-    key = row.get("group") or json.dumps(row["input"]["state"], sort_keys=True, ensure_ascii=False)
+def in_heldout(record: dict[str, Any], fraction: float, seed: str | int) -> bool:
+    """Deterministic group-disjoint split: hash of ``seed|meta.group`` (or the state) below ``fraction``."""
+    key = (record.get("meta") or {}).get("group") or json.dumps(record["state"], sort_keys=True, ensure_ascii=False)
     digest = int(hashlib.sha256(f"{seed}|{key}".encode()).hexdigest()[:8], 16) / 16**8
     return digest < fraction
 
 
-def has_image(row: dict[str, Any]) -> bool:
-    """True for image rows (top-level image(s) or ``state.image``): never trained as text decisions."""
-    state = (row.get("input") or {}).get("state")
-    return bool(row.get("image") or row.get("images") or (isinstance(state, dict) and state.get("image")))
+def has_media(record: dict[str, Any]) -> bool:
+    """True for records with images or videos (top-level, or ``state.image``): never read as text decisions."""
+    state = record.get("state")
+    return bool(
+        record.get("image")
+        or record.get("images")
+        or record.get("videos")
+        or (isinstance(state, dict) and state.get("image"))
+    )
 
 
-def encode_row(
+def encode_question(
     tokenizer: Any,
-    row: dict[str, Any],
+    record: dict[str, Any],
+    question_id: str,
     *,
     max_tokens: int,
     shuffle_seed: int | None = None,
-    soft_gold_mask: bool = False,
-) -> DecisionExample | None:
-    """Encode a row as a serving prompt, or ``None`` if it is not a trainable text decision.
+) -> PreparedQuestion | None:
+    """Encode one question of a record as its serving prompt, or ``None`` if this model cannot read it.
 
-    Rows with several questions, images, no label, a gold label outside the options, a malformed question or a prompt
-    (plus its mask) longer than ``max_tokens`` are not encodable; the caller counts and reports them.
+    A question is not readable when the record carries media, the question does not fit the serving prompt (no
+    instructions, or more options than single-token codes), or the prompt plus its mask slot is longer than
+    ``max_tokens``. The caller counts these questions.
 
     Args:
         tokenizer: Tokenizer of the checkpoint.
-        row: Training row.
+        record: Validated SystemOne record that holds the question.
+        question_id: Key of the question in ``record["questions"]``.
         max_tokens: Longest allowed prompt including the mask slot.
         shuffle_seed: Option-shuffle seed (``None`` keeps the serving order).
-        soft_gold_mask: Drop soft labels whose mode differs from the gold label (the row then trains on gold alone).
     """
-    questions = (row.get("input") or {}).get("questions")
-    if not isinstance(questions, dict) or len(questions) != 1 or has_image(row):
+    if has_media(record):
         return None
-    if "target" not in (row.get("reference") or {}):
-        return None
-    key, question = next(iter(questions.items()))
     try:
-        prompt = prepare_question(tokenizer, row["input"]["state"], key, question, shuffle_seed=shuffle_seed)
-        gold = normalize_label(prompt.kind, row["reference"]["target"])
+        prompt = prepare_question(
+            tokenizer, record["state"], question_id, record["questions"][question_id], shuffle_seed=shuffle_seed
+        )
     except ValueError:
         return None
-    if gold not in prompt.labels or len(prompt.input_ids) + 1 > max_tokens:
+    if len(prompt.input_ids) + 1 > max_tokens:
         return None
-    soft: tuple[float, ...] | None = None
-    given = row.get("soft_labels")
-    if given:
-        values = [float(given.get(label, 0.0)) for label in prompt.labels]
-        total = sum(values)
-        if total > 0:
-            soft = tuple(v / total for v in values)
-        if (
-            soft is not None
-            and soft_gold_mask
-            and max(range(len(soft)), key=soft.__getitem__) != prompt.labels.index(gold)
-        ):
-            soft = None
-    return DecisionExample(str(row.get("id")), prompt, prompt.labels.index(gold), soft)
+    return prompt
