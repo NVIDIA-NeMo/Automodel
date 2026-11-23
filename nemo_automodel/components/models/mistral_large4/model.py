@@ -33,7 +33,7 @@ from nemo_automodel.components.models.common import (
     LMHead,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -653,8 +653,9 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
             logits_to_keep: Zero for all, positive tail length, or int64 [kept_positions].
                 Labels require all positions. Index selection applies to the sequence axis.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: Return final [batch, sequence, hidden] activations.
             cu_seqlens: SDPA THD requires integer offsets [documents + 1]
                 strictly partitioning flattened storage. Prepared THD receives padded
@@ -793,7 +794,11 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
             logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         else:
             logits = hidden.new_empty((*hidden.shape[:-1], 0))
-        output = CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
+        output = CausalLMOutputWithLMHeadWeight(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
+        )
         if labels is not None:
             if labels.shape != (input_ids.shape if input_ids is not None else inputs_embeds.shape[:-1]):
                 raise ValueError("labels must match input token axes")

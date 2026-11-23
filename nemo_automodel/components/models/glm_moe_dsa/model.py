@@ -26,7 +26,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -619,8 +619,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             logits_to_keep: If ``0``, project all positions; else only the last ``logits_to_keep``.
                 A tensor value contains the one-dimensional token indices to project.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: When set (single-process), carry final hidden states on the output.
             **attn_kwargs: Additional attention metadata forwarded to the base model. Packed THD
                 uses an int32 ``cu_seqlens`` tensor of shape ``[sequences + 1]`` and
@@ -716,7 +717,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         else:
             logits = hidden.new_empty((*hidden.shape[:-1], 0))
-        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
+        return CausalLMOutputWithLMHeadWeight(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
+        )
 
     @torch.no_grad()
     def initialize_weights(

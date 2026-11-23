@@ -39,7 +39,7 @@ from nemo_automodel.components.models.common import (
     get_rope_config,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -813,15 +813,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
             logits_to_keep: Zero for every position, a positive count of trailing
                 positions, or integer indices of shape [kept_sequence] to project.
-            compute_logits: Whether to materialize logits. Fused-linear loss callers
-                disable it off-PP to skip the LM head and receive the hidden states.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP to skip the LM
+                head and receive the hidden states and the head's lm_head_weight.
             **kwargs: Attention metadata forwarded to the text model.
 
         Returns:
             Logits of shape [batch, sequence, vocab], or hidden states of shape
             [batch, sequence, hidden] on a pipeline stage without the LM head;
             under CP, sequence is the local shard. With compute_logits=False outside pipeline parallelism,
-            a dict whose "hidden_states" has shape [batch, sequence, hidden].
+            a CausalLMOutputWithLMHeadWeight with empty logits [batch, sequence, 0], hidden_states of shape
+            [batch, sequence, hidden], and the head's lm_head_weight [vocab, hidden] as the module holds it.
             During MTP training, a MiniMaxM3CausalLMOutput that also carries the
             per-depth MTP logits.
         """
@@ -895,7 +896,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                     "compute_logits=False (fused-loss path) is not supported together with MTP "
                     "modules, which need full logits; set text_config.num_mtp_modules=0."
                 )
-            return {"hidden_states": hidden}
+            return CausalLMOutputWithLMHeadWeight(
+                logits=hidden.new_empty((*hidden.shape[:-1], 0)),
+                hidden_states=hidden,
+                lm_head_weight=self.lm_head.weight,
+            )
 
         # lm_head is None on non-final pipeline stages -> forward hidden states.
         logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep)) if self.lm_head is not None else hidden

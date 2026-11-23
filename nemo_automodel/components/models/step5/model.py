@@ -33,7 +33,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -396,8 +396,9 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             padding_mask: Optional bool tensor of shape [batch, local_sequence], true for padding.
             logits_to_keep: Last-token count or tensor of sequence indices to project.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: Return final hidden states for native fused CE.
             labels: Optional tensor of shape [batch, local_sequence] for serial HF-style shifted CE.
             _packed_seq_ids: Optional [batch, local_sequence] document IDs from native packing.
@@ -446,7 +447,11 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         else:
             logits = hidden.new_empty((*hidden.shape[:-1], 0))
-        out = CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
+        out = CausalLMOutputWithLMHeadWeight(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
+        )
         if labels is not None:
             if self.cp_mesh is not None and self.cp_mesh.size() > 1:
                 raise ValueError("Use the native recipe's globally shifted loss with CP")

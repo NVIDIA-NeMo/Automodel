@@ -54,6 +54,18 @@ _PACKED_FLASH_ATTENTION_KWARGS = frozenset(
 )
 
 
+@dataclass
+class Qwen3VLCausalLMOutputWithLMHeadWeight(Qwen3VLCausalLMOutputWithPast):
+    """``Qwen3VLCausalLMOutputWithPast`` that also carries the LM head's weight when the forward skipped the head.
+
+    Attributes:
+        lm_head_weight: Tensor of shape [vocab, hidden], as the module holds it, or None when the forward
+            computed logits.
+    """
+
+    lm_head_weight: torch.Tensor | None = None
+
+
 class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditionalGeneration):
     """Dense Qwen3-VL with a DeepStack-aware context-parallel forward path."""
 
@@ -381,8 +393,10 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
             logits_to_keep: Number of trailing logits to return, or token indices
                 of shape ``[kept_sequence]``.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the logits are then empty, of shape [..., 0], and the output's
+                lm_head_weight is the head's weight of shape [vocab, hidden], as the module holds it. The forward that
+                delegates to Hugging Face (without CP or packed media) runs the head on the last position only; the
+                model-owned forward skips it.
             **kwargs: Additional Hugging Face language-model options. Packed
                 FlashAttention metadata contains cumulative sequence lengths of
                 shape ``[num_documents + 1]`` and scalar maximum lengths, or an
@@ -402,7 +416,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         )
         use_packed_media_path = cp_size <= 1 and has_media and has_packed_flash_metadata
         if cp_size <= 1 and not use_packed_media_path:
-            return super().forward(
+            output = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -416,9 +430,15 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                 mm_token_type_ids=mm_token_type_ids,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                logits_to_keep=logits_to_keep,
+                # Hugging Face's forward always runs the head: without logits, project one position and drop it.
+                logits_to_keep=logits_to_keep if compute_logits else 1,
                 **kwargs,
             )
+            if not compute_logits:
+                output.logits = output.logits[..., :0]
+                # Item assignment registers the key Hugging Face's output class does not declare.
+                output["lm_head_weight"] = self.lm_head.weight
+            return output
 
         if input_ids is None:
             if inputs_embeds is None:
@@ -477,13 +497,14 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
-        return Qwen3VLCausalLMOutputWithPast(
+        return Qwen3VLCausalLMOutputWithLMHeadWeight(
             loss=loss,
             logits=logits,
             past_key_values=text_outputs.past_key_values,
             hidden_states=text_outputs.hidden_states,
             attentions=text_outputs.attentions,
             rope_deltas=self.model.rope_deltas,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
 

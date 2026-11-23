@@ -51,14 +51,13 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -108,7 +107,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 @dataclass
-class DeepseekV4CausalLMOutput(CausalLMOutputWithPast):
+class DeepseekV4CausalLMOutput(CausalLMOutputWithLMHeadWeight):
     """Output of DeepseekV4ForCausalLM.forward.
 
     Subclasses ``transformers.modeling_outputs.CausalLMOutputWithPast`` so the
@@ -1476,8 +1475,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 and ``-1`` for text.
             logits_to_keep: Number or positions of logits to retain.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: Whether to expose final states.
 
         Returns:
@@ -1638,6 +1638,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             hidden_states=out_hidden_states,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     def update_moe_gate_bias(self) -> None:

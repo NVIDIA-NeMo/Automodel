@@ -34,7 +34,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -1325,8 +1325,9 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
                 Tensor of shape [kept] keeps those positions.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: Whether the output carries the final hidden states; None reads
                 ``config.output_hidden_states``.
             **kwargs: Backend metadata for the decoder: ``qkv_format``, int32 ``cu_seqlens`` and
@@ -1412,7 +1413,11 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             # therefore consumes [T,H], while logits retain the public [1,T,V]
             # shape. PP returns above and keeps [microbatch,T,H] for its schedule.
             hidden = hidden.squeeze(0)
-        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
+        return CausalLMOutputWithLMHeadWeight(
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
+        )
 
     def get_pipeline_stage_metas(
         self,

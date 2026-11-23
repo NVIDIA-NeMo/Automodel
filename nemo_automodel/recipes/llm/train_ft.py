@@ -1407,6 +1407,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     shared_lm_weight = prepare_lm_weight(
                         self.loss_fn,
                         model,
+                        # A forward that skipped its head returns the weight as the module holds it.
+                        lm_head_weight=getattr(out, "lm_head_weight", None),
                         grad_reduce_group=grad_reduce_group,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group

@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig
+from transformers.utils import ModelOutput
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
@@ -132,11 +133,9 @@ def _bf16_projection_gradients(
     return {name: parameter.grad for name, parameter in model.named_parameters()}
 
 
-def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
-    model = _fp32_logits_llama()
-    reference = copy.deepcopy(model)
-    control = copy.deepcopy(model)
-    recipe = SimpleNamespace(
+def _train_ft_recipe(model: nn.Module) -> SimpleNamespace:
+    """Stand in for a single-rank train_ft recipe that trains ``model`` with chunked cross-entropy."""
+    return SimpleNamespace(
         model_parts=[model],
         loss_fn=ChunkedCrossEntropy(8, compile=False),
         dist_env=SimpleNamespace(device=torch.device("cpu")),
@@ -150,6 +149,13 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         _get_dp_group_size=lambda **kw: 1,
         _get_dp_group=lambda **kw: None,
     )
+
+
+def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
+    model = _fp32_logits_llama()
+    reference = copy.deepcopy(model)
+    control = copy.deepcopy(model)
+    recipe = _train_ft_recipe(model)
     input_ids, labels, num_label_tokens = _batch()
     losses = []
     head_calls = []
@@ -178,6 +184,44 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         else:
             # A backward that projected in BF16 would be as far off as the control.
             assert error * 10 < (control_grads[name].float() - reference_grad).norm(), name
+
+
+def test_train_ft_step_projects_with_the_weight_the_forward_returns():
+    model = _fp32_logits_llama()
+    reference = copy.deepcopy(model)
+    with torch.no_grad():
+        reference.lm_head.weight.mul_(2)
+    returned = reference.lm_head.weight.detach()
+
+    def return_doubled_weight(module: nn.Module, args: tuple, output: ModelOutput) -> ModelOutput:
+        """Hand the loss a doubled head weight in place of the module's own.
+
+        Args:
+            module: The model the hook is registered on.
+            args: The forward's positional arguments; the step passes none.
+            output: The forward's output, whose ``lm_head_weight`` has shape [vocab, hidden].
+
+        Returns:
+            The same output, whose ``lm_head_weight`` is the doubled [vocab, hidden] weight.
+        """
+        output["lm_head_weight"] = returned
+        return output
+
+    model.register_forward_hook(return_doubled_weight)
+    input_ids, labels, num_label_tokens = _batch()
+    losses = []
+
+    TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
+        _train_ft_recipe(model),
+        0,
+        {"input_ids": input_ids, "labels": labels},
+        loss_buffer=losses,
+        num_label_tokens=num_label_tokens,
+        num_batches=1,
+    )
+
+    # The loss matches the head with the doubled weight, not the module's own.
+    _assert_matches_fp32_logits_ce(losses[0], reference, input_ids, labels, num_label_tokens)
 
 
 class _OneHotTeacher(nn.Module):
@@ -236,4 +280,3 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
     )
 
     _assert_matches_fp32_logits_ce(ce_loss, reference, input_ids, labels, num_label_tokens)
-

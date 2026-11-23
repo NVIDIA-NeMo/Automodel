@@ -38,6 +38,18 @@ LOGGER = logging.getLogger(__name__)
 # =============================================================================
 
 
+@dataclass
+class LlavaCausalLMOutputWithLMHeadWeight(LlavaCausalLMOutputWithPast):
+    """``LlavaCausalLMOutputWithPast`` that also carries the LM head's weight when the forward skipped the head.
+
+    Attributes:
+        lm_head_weight: Tensor of shape [vocab, hidden], as the module holds it, or None when the forward
+            computed logits.
+    """
+
+    lm_head_weight: torch.Tensor | None = None
+
+
 class MoonViTConfig(PretrainedConfig):
     """Configuration for MoonVit vision encoder."""
 
@@ -757,9 +769,10 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
                 targets must already be masked with -100.
             use_cache: Unused; kept for HF API compatibility.
             output_attentions: Unused; kept for HF API compatibility.
-            output_hidden_states: Include final hidden states when return_dict
-                is set.
-            return_dict: Return a LlavaCausalLMOutputWithPast instead of logits.
+            output_hidden_states: Include final hidden states when the forward
+                returns its output object.
+            return_dict: Return a LlavaCausalLMOutputWithLMHeadWeight instead of
+                logits; the forward always returns it when compute_logits is False.
             pixel_values: Optional tensor of shape [patches, channels,
                 patch_height, patch_width], where each image's height * width
                 patches are concatenated along axis 0 in image order. When None,
@@ -771,17 +784,19 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             logits_to_keep: Number of trailing positions to project, or indices
                 of shape [kept_sequence].
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             **kwargs: Attention metadata forwarded to the language model.
 
         Returns:
             Logits of shape [batch, kept_sequence, vocab], or hidden states of
             shape [batch, sequence, hidden] on a stage without the LM head.
             kept_sequence is restricted by logits_to_keep (0 keeps all). With
-            return_dict, a LlavaCausalLMOutputWithPast that also carries the
-            scalar loss and, when requested, hidden states
-            [batch, sequence, hidden].
+            return_dict or compute_logits=False, a
+            LlavaCausalLMOutputWithLMHeadWeight that also carries the scalar
+            loss, hidden states [batch, sequence, hidden] when requested, and,
+            without logits, the head's lm_head_weight [vocab, hidden].
         """
         output_hidden_states = (
             output_hidden_states
@@ -831,15 +846,17 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
 
         if return_dict is None:
             return_dict = False
-        if not return_dict:
+        # Empty logits alone would drop the hidden states and the head's weight a fused-linear loss needs.
+        if not return_dict and compute_logits:
             return logits
 
-        return LlavaCausalLMOutputWithPast(
+        return LlavaCausalLMOutputWithLMHeadWeight(
             loss=loss,
             logits=logits,
             past_key_values=None,
             hidden_states=hidden_states if output_hidden_states else None,
             attentions=None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()

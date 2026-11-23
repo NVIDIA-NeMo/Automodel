@@ -35,7 +35,6 @@ from dataclasses import dataclass
 from typing import Any, Union
 
 import torch
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniConfig,
     Qwen2_5OmniThinkerConfig,
@@ -46,6 +45,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
 
 from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -187,8 +187,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 — DTensor cannot slice a full range). Otherwise compute logits
                 only for the last ``logits_to_keep`` positions before ``lm_head``.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: When set, the returned output carries the
                 final hidden states spanning the full sequence.
 
@@ -289,11 +290,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size)
 
-        return CausalLMOutputWithPast(
+        return CausalLMOutputWithLMHeadWeight(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=hidden_states if output_hidden_states else None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
 

@@ -15,6 +15,7 @@
 """LM head whose logits dtype is independent of its weight dtype."""
 
 import math
+from dataclasses import dataclass
 from typing import Self
 
 import torch
@@ -23,6 +24,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from torch.utils.flop_counter import register_flop_formula
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 
@@ -268,6 +270,20 @@ class LMHead(nn.Linear):
         new_head = cls(head.in_features, head.out_features, logits_dtype=logits_dtype, device="meta")
         new_head.weight, new_head.bias = head.weight, head.bias
         return new_head.train(head.training)
+
+
+@dataclass
+class CausalLMOutputWithLMHeadWeight(CausalLMOutputWithPast):
+    """``CausalLMOutputWithPast`` that also carries the LM head's weight when the forward skipped the head.
+
+    A forward called with ``compute_logits=False`` returns empty logits of shape [..., 0] and the head's weight, as
+    the module holds it (a sharded DTensor under FSDP2), for a loss that projects the final hidden states itself.
+
+    Attributes:
+        lm_head_weight: Tensor of shape [vocab, hidden], or None when the forward computed logits.
+    """
+
+    lm_head_weight: torch.Tensor | None = None
 
 
 def slice_logits_to_keep(hidden_states: torch.Tensor, logits_to_keep: int | torch.Tensor) -> torch.Tensor:

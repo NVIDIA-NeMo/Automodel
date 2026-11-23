@@ -36,7 +36,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -44,7 +44,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -77,7 +77,7 @@ from .state_dict_adapter import Qwen3_8_FlashNextStateDictAdapter
 
 
 @dataclass
-class Qwen3_8_FlashNextCausalLMOutput(CausalLMOutputWithPast):
+class Qwen3_8_FlashNextCausalLMOutput(CausalLMOutputWithLMHeadWeight):
     """Causal-LM output with optional per-layer HC states for parity capture."""
 
 
@@ -806,8 +806,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
                 or an integer tensor of shape ``[kept_sequence]`` containing
                 explicit sequence indices.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: Explicit ``True`` returns the embedding,
                 every per-layer HC state, and the final state. When omitted,
                 ``config.output_hidden_states=True`` returns only the final
@@ -859,7 +860,12 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             hidden_states = outputs.hidden_states
         else:
             hidden_states = last_hidden_state if return_hidden_states else None
-        return Qwen3_8_FlashNextCausalLMOutput(logits=logits, past_key_values=None, hidden_states=hidden_states)
+        return Qwen3_8_FlashNextCausalLMOutput(
+            logits=logits,
+            past_key_values=None,
+            hidden_states=hidden_states,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
+        )
 
     @torch.no_grad()
     def initialize_weights(

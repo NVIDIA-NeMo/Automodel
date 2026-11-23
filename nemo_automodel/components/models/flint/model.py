@@ -31,7 +31,7 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_round_robin
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -481,8 +481,9 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             logits_to_keep: Zero projects all positions; a positive value projects
                 that many final positions. Labels require all positions.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             skip_logits: Return only final FP32 hidden states for an external
                 already-shifted linear loss; do not run the vocabulary projection.
             padding_mask: Boolean [batch, sequence] or THD [tokens], True for
@@ -598,10 +599,11 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
                 logits[:, :-1].reshape(-1, self.vocab_size), targets.reshape(-1), ignore_index=-100, reduction="sum"
             )
             loss = numerator / (targets != -100).sum().clamp_min(1)
-        return CausalLMOutputWithPast(
+        return CausalLMOutputWithLMHeadWeight(
             loss=loss,
             logits=logits,
             hidden_states=hidden_states.float() if final_hidden_only else outputs.hidden_states,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
 

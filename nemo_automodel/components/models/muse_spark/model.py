@@ -24,7 +24,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -864,8 +864,9 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             logits_to_keep: Final token count, or indices [kept_tokens]; zero
                 selects every position.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             kwargs: Attention/packing metadata and model-owned media coordinates.
                 _thd_local_indices [local_tokens] selects from the current
                 microbatch's global padded stream; global media masks cover that
@@ -1060,12 +1061,13 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             )
 
         loss_hidden_states = hidden_states * self.config.output_multiplier
-        result = CausalLMOutputWithPast(
+        result = CausalLMOutputWithLMHeadWeight(
             loss=loss,
             logits=logits,
             past_key_values=None,
             hidden_states=loss_hidden_states,
             attentions=None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
         return result if return_dict else result.to_tuple()
 

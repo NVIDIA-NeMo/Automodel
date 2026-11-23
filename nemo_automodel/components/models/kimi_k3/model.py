@@ -40,7 +40,7 @@ from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
     is_indexed_packed_mask,
@@ -2583,8 +2583,9 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
             logits_to_keep: Number of trailing sequence logits to compute, or tensor indices.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
-                [..., 0].
+                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
+                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
+                holds it.
             output_hidden_states: Whether to include hidden states in the output.
             **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
                 [batch, sequence] with 1-based document IDs and zero padding.
@@ -2643,7 +2644,11 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             )
         else:
             logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
-        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
+        return CausalLMOutputWithLMHeadWeight(
+            logits=logits,
+            hidden_states=hidden_states if output_hidden_states else None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
+        )
 
     def prepare_model_inputs_for_cp(
         self,

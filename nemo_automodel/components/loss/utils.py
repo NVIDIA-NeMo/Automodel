@@ -155,6 +155,7 @@ def prepare_lm_weight(
     loss_fn: LinearCrossEntropy,
     model: nn.Module,
     *,
+    lm_head_weight: torch.Tensor | None = None,
     grad_reduce_group: torch.distributed.ProcessGroup | None = None,
 ) -> torch.Tensor | ShardedLMHeadWeight:
     """Prepare one shared projection weight for main and auxiliary losses.
@@ -163,6 +164,8 @@ def prepare_lm_weight(
         loss_fn: Linear-projection loss that owns the weight's resolution.
         model: Model or DDP wrapper whose wrapped module owns the config and
             output head of global shape [vocab, hidden].
+        lm_head_weight: The head weight of global shape [vocab, hidden] that a forward called with
+            ``compute_logits=False`` returned, as the module holds it; None looks it up on the model.
         grad_reduce_group: Group contributing independent token losses.
 
     Returns:
@@ -174,13 +177,16 @@ def prepare_lm_weight(
     # Match setup's head/config lookup without changing the training wrapper.
     if isinstance(model, nn.parallel.DistributedDataParallel):
         model = model.module
+    if lm_head_weight is None:
+        lm_head_weight = _get_lm_head_weight(model)
     if isinstance(loss_fn, ChunkedCrossEntropy):
         return loss_fn.prepare_lm_weight(
             _get_lm_head_module(model),
+            lm_head_weight,
             model_config=getattr(model, "config", None),
             grad_reduce_group=grad_reduce_group,
         )
-    return loss_fn.resolve_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
+    return loss_fn.resolve_lm_weight(lm_head_weight, grad_reduce_group=grad_reduce_group)
 
 
 def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:

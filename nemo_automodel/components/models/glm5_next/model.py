@@ -12,7 +12,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -20,7 +19,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -56,7 +55,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 @dataclass
-class Glm5NextCausalLMOutputWithPast(CausalLMOutputWithPast):
+class Glm5NextCausalLMOutputWithPast(CausalLMOutputWithLMHeadWeight):
     """GLM-5.3 output extended with the MTP head's per-depth hidden states.
 
     Attributes:
@@ -486,6 +485,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             hidden_states=hidden if output_hidden_states else None,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None,
+            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     def _mtp_embed_inputs(

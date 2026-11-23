@@ -1137,6 +1137,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     prepare_lm_weight(
                         self.loss_fn,
                         model,
+                        # A forward that skipped its head returns the weight as the module holds it.
+                        lm_head_weight=getattr(out, "lm_head_weight", None),
                         grad_reduce_group=grad_reduce_group,
                     )
                     if isinstance(self.loss_fn, LinearCrossEntropy)
@@ -1408,14 +1410,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             else {"logits_to_keep": 1}
                         )
                         out = validation_model(**{**batch, **no_logits, "output_hidden_states": True})
+                        lm_weight = prepare_lm_weight(
+                            self.loss_fn, validation_model, lm_head_weight=getattr(out, "lm_head_weight", None)
+                        )
                     else:
                         out = self.model_parts[0](**batch)
+                        lm_weight = None
                     local_loss = calculate_loss(
                         self.loss_fn,
                         logits=getattr(out, "logits", out),
                         labels=labels,
                         model=self.model_parts[0],
                         hidden_states=get_final_hidden_states(out),
+                        lm_weight=lm_weight,
                         num_label_tokens=num_label_tokens,
                     )
                     # Mirror training: include the drafter term so validation
