@@ -26,11 +26,12 @@ about the two things that are easy to get wrong in a norm reduction:
 
 **Precision.** Values are widened to fp32 on load, so a BF16 gradient is never
 squared in BF16 (|g| > 256 overflows BF16's range once squared, and the
-mantissa loses most of its bits well before that). Within a tile the reduction
-is a ``tl.sum`` tree reduction carried out **in fp64** (reducing the tile in
-fp32 and widening only the tile total leaves fp32-level error, ~1e-7 relative,
-which is what this kernel exists to avoid); across tiles each program
-accumulates into an fp64 scalar; across programs the fp64 partials are summed
+mantissa loses most of its bits well before that). The squares are formed and
+accumulated **in fp64** throughout (accumulating in fp32 and widening only a
+partial total leaves fp32-level error, ~1e-7 relative, which is what this
+kernel exists to avoid): across tiles each of a program's ``_BLOCK`` lanes
+accumulates into its own fp64 slot, the lanes are combined by one ``tl.sum``
+tree reduction per program, and across programs the fp64 partials are summed
 by PyTorch. Accumulation error therefore stays at fp64 level regardless of how
 many elements a parameter has. ``max|x|`` accumulates nothing and stays in
 fp32, where it is already exact.
@@ -121,6 +122,10 @@ def _multi_tensor_reduce_kernel(
     end = tl.minimum(start + CHUNK, numel)
 
     acc = tl.zeros([], dtype=tl.float64)
+    # Sum of squares: one fp64 accumulator per tile lane, tree-reduced once after the
+    # last tile. A tl.sum per tile is a cross-thread reduction for each of the
+    # CHUNK / BLOCK tiles of a program.
+    lane_acc = tl.zeros([BLOCK], dtype=tl.float64)
     nan_count = tl.zeros([], dtype=tl.float64)
     for tile in range(0, CHUNK, BLOCK):
         offs = start + tile + tl.arange(0, BLOCK)
@@ -133,15 +138,15 @@ def _multi_tensor_reduce_kernel(
         # Literals, not the module constants: a @triton.jit body may only read
         # globals declared as tl.constexpr. 0 == _REDUCE_SUMSQ, 1 == _REDUCE_ABSMAX.
         if REDUCE_OP == 0:
-            # fp64 for the square and the in-tile tree reduction, not just for
-            # the tile total: reducing a 1024-element tile in fp32 and widening
-            # afterwards leaves fp32-level error (~1e-7 relative), which defeats
-            # the point of accumulating across tiles in fp64.
+            # fp64 for the square and for every accumulation, not just for the
+            # program total: accumulating a lane or reducing a tile in fp32 and
+            # widening afterwards leaves fp32-level error (~1e-7 relative), which
+            # defeats the point of accumulating in fp64.
             # NaN/Inf need no special handling here: NaN*NaN and Inf*Inf
             # propagate through fp64 addition, so a non-finite gradient reaches
             # the caller's error_if_nonfinite check intact.
             x = tl.load(base + offs, mask=mask, other=0.0).to(tl.float64)
-            acc += tl.sum(x * x)
+            lane_acc += x * x
         else:
             # max|x| accumulates nothing, so fp32 is already exact here.
             x = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32)
@@ -152,7 +157,9 @@ def _multi_tensor_reduce_kernel(
             # explicitly (x != x) and poison the partial below.
             nan_count += tl.sum((x != x).to(tl.float64))
 
-    if REDUCE_OP == 1:
+    if REDUCE_OP == 0:
+        acc = tl.sum(lane_acc)
+    else:
         acc = tl.where(nan_count > 0.0, float("nan"), acc)
     tl.store(partial_ptr + pid, acc)
 
