@@ -1,0 +1,138 @@
+# .github/workflows/review-stages.yml
+# Two review stages for PRs into main. The review bot runs under HuiyingLi's account; it reviews a
+# ready PR (not a draft) once 2h pass with no new commits, for at most 2 rounds. This workflow only manages who is asked to review.
+#   1. Bot stage: the PR carries the `pre-review` label and requests core-am-pre-review. Each push
+#      re-requests core-am-pre-review, so the request time marks the last push.
+#   2. Human stage: core-am-pre-review is swapped for core-am when the bot approves the PR's current
+#      head or has used its 2 rounds. core-am is also added if the bot has not reviewed 1h after it
+#      was due (2h quiet + 1h = 3h after the last push), e.g. because the bot's machine is off.
+# Remove the `pre-review` label by hand to skip the bot stage. A PR that has left the bot stage
+# does not return to it.
+name: Review stages
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, review_requested]
+    branches: [main]
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# No concurrency group: GitHub keeps only the newest pending run per group, which would drop
+# events from a burst (CODEOWNERS can request several teams at once). Every step is idempotent.
+
+jobs:
+  stage:
+    if: >-
+      github.repository == 'NVIDIA-NeMo/Automodel' &&
+      (github.event_name != 'pull_request_target' ||
+       (!github.event.pull_request.draft && github.event.pull_request.user.type != 'Bot'))
+    runs-on: ubuntu-latest
+    steps:
+      # GITHUB_TOKEN cannot reliably request team reviewers, so use the repo's GitHub App.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          owner: NVIDIA-NeMo
+          repositories: Automodel
+          permission-pull-requests: write
+          permission-issues: write
+          permission-members: read
+
+      # Reads and edits PR metadata only. Never check out or run PR code in this job.
+      - name: Apply review stage
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          PR: ${{ github.event.pull_request.number }}
+          BOT: HuiyingLi
+          # First line of the bot's reviews. Its approval is a comment starting "Suggestion: Approve".
+          BOT_REVIEW: '^(Suggestion: (Approve|Changes requested)|Bot review)'
+          BOT_APPROVE: '^Suggestion: Approve'
+          MAX_ROUNDS: "2"
+          DUE_PLUS_GRACE_SECONDS: "10800"  # bot waits 2h without new commits, then has 1h
+          PRE: core-am-pre-review
+          HUMANS: core-am
+          LABEL: pre-review
+        run: |
+          set -uo pipefail
+          request()   { gh api -X POST "repos/$REPO/pulls/$1/requested_reviewers" -f "team_reviewers[]=$2" --silent; }
+          unrequest() { gh api -X DELETE "repos/$REPO/pulls/$1/requested_reviewers" -f "team_reviewers[]=$2" --silent || true; }
+          has_label() { gh api "repos/$REPO/issues/$1/labels" --jq "any(.[]; .name == \"$LABEL\")"; }
+          unlabel()   { gh api -X DELETE "repos/$REPO/issues/$1/labels/$LABEL" --silent; }
+          # The label was removed before: the PR already went to core-am, or someone skipped the bot stage.
+          left_bot_stage() {
+            [ -n "$(gh api --paginate "repos/$REPO/issues/$1/timeline?per_page=100" \
+                     --jq ".[] | select(.event == \"unlabeled\" and .label.name == \"$LABEL\") | .created_at")" ]
+          }
+
+          # Label on, core-am off, core-am-pre-review requested afresh (its timestamp marks the last push).
+          enter_bot_stage() {
+            gh api -X POST "repos/$REPO/issues/$1/labels" -f "labels[]=$LABEL" --silent &&
+              unrequest "$1" "$HUMANS" && unrequest "$1" "$PRE" && request "$1" "$PRE"
+          }
+
+          swap_to_humans() {  # $1 PR, $2 reason
+            request "$1" "$HUMANS" && unlabel "$1" && unrequest "$1" "$PRE" &&
+              echo "#$1: $2; swapped $PRE for $HUMANS"
+          }
+
+          check_pr() {
+            local n=$1 pr head tagged reviews approved rounds late
+            pr=$(gh api "repos/$REPO/pulls/$n") || return 1
+            [ "$(jq -r .draft <<<"$pr")" = false ] || return 0
+            head=$(jq -r .head.sha <<<"$pr")
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$n/reviews?per_page=100" \
+              --jq ".[] | select(.user.login == \"$BOT\") | {commit_id, submitted_at, first: ((.body // \"\") | split(\"\n\")[0])}" \
+              | jq -s --arg r "$BOT_REVIEW" --arg a "$BOT_APPROVE" \
+                  'map(select(.first | test($r)) | {commit_id, submitted_at, approve: (.first | test($a))})') || return 1
+            approved=$(jq --arg h "$head" 'any(.[]; .approve and .commit_id == $h)' <<<"$reviews")
+            rounds=$(jq length <<<"$reviews")
+            if [ "$approved" = true ]; then swap_to_humans "$n" "bot approved ${head:0:12}"; return; fi
+            if [ "$rounds" -ge "$MAX_ROUNDS" ]; then swap_to_humans "$n" "bot used its $rounds rounds"; return; fi
+            tagged=$(gh api --paginate "repos/$REPO/issues/$n/timeline?per_page=100" \
+              --jq ".[] | select(.event == \"review_requested\" and .requested_team.slug == \"$PRE\") | .created_at" \
+              | sort | tail -n 1) || return 1
+            if [ -z "$tagged" ]; then enter_bot_stage "$n"; return; fi
+            late=$(jq --arg t "$tagged" --argjson limit "$DUE_PLUS_GRACE_SECONDS" \
+              '(now - ($t | fromdateiso8601)) > $limit and (any(.[]; .submitted_at > $t) | not)' <<<"$reviews")
+            if [ "$late" = true ]; then
+              request "$n" "$HUMANS" && unlabel "$n" &&
+                echo "#$n: no bot review 3h after the last push ($tagged); added $HUMANS"
+            else
+              unrequest "$n" "$HUMANS"  # backstop for a missed review_requested event
+            fi
+          }
+
+          if [ "$EVENT" = pull_request_target ]; then
+            case "$ACTION" in
+              opened)
+                enter_bot_stage "$PR" ;;
+              reopened|ready_for_review)
+                if left_bot_stage "$PR"; then exit 0; fi
+                enter_bot_stage "$PR" ;;
+              synchronize)
+                if [ "$(has_label "$PR")" != true ]; then exit 0; fi
+                enter_bot_stage "$PR" ;;
+              review_requested)
+                # CODEOWNERS requests core-am when the PR opens; keep it off during the bot stage.
+                if [ "$(has_label "$PR")" != true ]; then exit 0; fi
+                unrequest "$PR" "$HUMANS" ;;
+            esac
+            exit
+          fi
+
+          # Sweep (schedule / manual): hand bot-stage PRs to core-am.
+          status=0
+          for n in $(gh api --paginate "repos/$REPO/issues?state=open&labels=$LABEL&per_page=100" \
+                       --jq '.[] | select(.pull_request) | .number'); do
+            check_pr "$n" || { echo "::warning::PR #$n: review stage update failed"; status=1; }
+          done
+          exit "$status"
