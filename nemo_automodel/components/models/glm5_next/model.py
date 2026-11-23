@@ -474,7 +474,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             else bool(getattr(self.config.text_config, "output_hidden_states", False))
         )
         logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
-        return CausalLMOutputWithPast(
+        return Glm5NextCausalLMOutputWithPast(
             logits=logits,
             hidden_states=hidden if output_hidden_states else None,
             mtp_per_depth_h=mtp_per_depth_h,
