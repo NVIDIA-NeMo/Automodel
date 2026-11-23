@@ -234,3 +234,101 @@ class TestQwen3_5MoeMTP:
         assert len(out.mtp_per_depth_h) == len(reference) == 1
         assert torch.isfinite(reference[0]).all()
         torch.testing.assert_close(out.mtp_per_depth_h[0][:, :-1], reference[0][:, :-1], rtol=0, atol=0)
+
+
+def _media_config(mtp_num_hidden_layers):
+    cfg = _tiny_vl_config(mtp_num_hidden_layers=mtp_num_hidden_layers)
+    cfg.image_token_id, cfg.video_token_id = 5, 6
+    cfg.vision_start_token_id, cfg.vision_end_token_id = 7, 8
+    return cfg
+
+
+def _record_module_entries(model):
+    """Record the order in which the modules that FSDP wraps separately are entered."""
+    language_model = model.model.language_model
+    watched = {
+        "embed_tokens": language_model.embed_tokens,
+        "visual": model.model.visual,
+        "language_model": language_model,
+        "lm_head": model.lm_head,
+    }
+    calls: list[str] = []
+    handles = [
+        module.register_forward_pre_hook(lambda _module, _args, name=name: calls.append(name))
+        for name, module in watched.items()
+    ]
+    return calls, handles
+
+
+class TestQwen3_5MoeTextOnlyVisionTower:
+    @pytest.mark.parametrize(
+        ("mtp_num_hidden_layers", "training"), [(0, True), (1, True), (1, False)], ids=["no-mtp", "mtp", "mtp-eval"]
+    )
+    def test_trainable_tower_is_entered_in_one_order_for_text_and_media(self, mtp_num_hidden_layers, training):
+        """With a trainable vision tower, text-only and media batches enter the wrapped modules in one order.
+
+        A trainable tower is its own FSDP unit, so a rank that skipped it would skip its collectives.
+        """
+        model = Qwen3_5MoeForConditionalGeneration(_media_config(mtp_num_hidden_layers), backend=_backend())
+        model.initialize_weights()
+        model.train(training)
+        calls, handles = _record_module_entries(model)
+        try:
+            with torch.set_grad_enabled(training):
+                model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]))
+                text_calls = list(calls)
+                calls.clear()
+                # Four image placeholders for one 2x2-patch image; pixel_values has shape [patches, patch_features].
+                model(
+                    input_ids=torch.tensor([[7, 5, 5, 5, 5, 8, 10, 11]]),
+                    pixel_values=torch.randn(4, 12, dtype=model.lm_head.weight.dtype),
+                    image_grid_thw=torch.tensor([[1, 2, 2]]),
+                    mm_token_type_ids=torch.tensor([[0, 1, 1, 1, 1, 0, 0, 0]]),
+                )
+                media_calls = list(calls)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert text_calls == ["embed_tokens", "visual", "language_model", "lm_head"]
+        assert media_calls == text_calls
+
+    def test_frozen_tower_is_not_entered_for_text(self):
+        """A frozen tower stays in the root FSDP unit, so a text-only batch does not run it."""
+        model = Qwen3_5MoeForConditionalGeneration(_media_config(0), backend=_backend())
+        model.initialize_weights()
+        model.model.visual.requires_grad_(False)
+        model.train()
+        calls, handles = _record_module_entries(model)
+        try:
+            model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]))
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert calls == ["embed_tokens", "language_model", "lm_head"]
+
+    def test_text_only_step_gives_the_tower_zero_gradients_and_unchanged_logits(self):
+        """Entering the trainable tower changes neither the logits nor the language-model gradients."""
+        input_ids = torch.randint(1, 64, (2, 8), generator=torch.Generator().manual_seed(0))
+
+        def step(tower_trainable):
+            torch.manual_seed(0)
+            model = Qwen3_5MoeForConditionalGeneration(_media_config(0), backend=_backend())
+            model.initialize_weights()
+            model.model.visual.requires_grad_(tower_trainable)
+            model.train()
+            logits = model(input_ids=input_ids).logits
+            logits.float().square().mean().backward()
+            return model, logits.detach()
+
+        trainable, trainable_logits = step(True)
+        frozen, frozen_logits = step(False)
+
+        assert torch.isfinite(trainable_logits).all()
+        torch.testing.assert_close(trainable_logits, frozen_logits, rtol=0, atol=0)
+        tower_grads = [param.grad for param in trainable.model.visual.parameters()]
+        assert all(grad is not None and not grad.any() for grad in tower_grads)
+        frozen_grads = dict(frozen.model.language_model.named_parameters())
+        for name, param in trainable.model.language_model.named_parameters():
+            torch.testing.assert_close(param.grad, frozen_grads[name].grad, rtol=0, atol=0)

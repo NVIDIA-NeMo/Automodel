@@ -1553,6 +1553,39 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             ignore_index=ignore_index,
         )
 
+    def _vision_tower_is_trainable(self) -> bool:
+        """Whether any vision-tower parameter is trainable (the tower is then its own FSDP unit)."""
+        visual = self.model.visual
+        return visual is not None and any(param.requires_grad for param in visual.parameters())
+
+    def _anchor_unused_vision_tower(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        """Tie text-only embeddings to a trainable vision tower without changing their values.
+
+        A trainable tower is its own FSDP unit. A rank whose batch has no media would skip the
+        tower's all-gather and its gradient reduction while ranks with media issue both, and the
+        step deadlocks. Encoding one blank image and adding zero times its features makes every
+        rank enter the tower once and gives the tower's parameters a zero gradient on this rank.
+
+        Args:
+            inputs_embeds: Text embeddings of shape ``[batch, sequence, hidden]``.
+
+        Returns:
+            Embeddings of shape ``[batch, sequence, hidden]`` with the same values. The input
+            tensor itself is returned when the tower is absent or fully frozen.
+        """
+        if not self._vision_tower_is_trainable():
+            return inputs_embeds
+        vision_config = self.config.vision_config
+        merge = vision_config.spatial_merge_size
+        patch_dim = vision_config.in_channels * vision_config.temporal_patch_size * vision_config.patch_size**2
+        # One blank image of merge x merge patches: rows of shape [patches, patch_dim], grid [images, 3].
+        blank = inputs_embeds.new_zeros((merge * merge, patch_dim))
+        grid_thw = torch.tensor([[1, merge, merge]], device=inputs_embeds.device)
+        if hasattr(self.model.visual, "rotary_pos_emb"):
+            self.model.visual.rotary_pos_emb.to(inputs_embeds.device)
+        features = self._encode_vision_for_cp(blank, grid_thw, is_video=False)
+        return inputs_embeds + 0.0 * features.sum().to(inputs_embeds.dtype)
+
     def _embed_and_splice_for_cp(
         self,
         input_ids: torch.Tensor,
@@ -1590,6 +1623,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         with cp_dispatcher_suspended(self.cp_mesh):
+            if pixel_values is None and pixel_values_videos is None:
+                inputs_embeds = self._anchor_unused_vision_tower(inputs_embeds)
+
             if pixel_values is not None:
                 if hasattr(self.model.visual, "rotary_pos_emb"):
                     self.model.visual.rotary_pos_emb.to(pixel_values.device)
@@ -1780,20 +1816,20 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 kwargs.pop(media_key, None)
         elif (
             cp_size <= 1
-            and self.mtp is not None
-            and self.training
             and inputs_embeds is None
             and input_ids is not None
             and not torch.is_floating_point(input_ids)
             and pixel_values is None
             and pixel_values_videos is None
             and getattr(self.model.language_model, "embed_tokens", None) is not None
+            and ((self.mtp is not None and self.training) or self._vision_tower_is_trainable())
         ):
             # A text-only batch embeds here too, so MTP rolls these embeddings instead of calling
             # embed_tokens again after lm_head. Media batches call it once (above). FSDP2 prefetches
             # in backward by forward call order, so a rank that called it again would issue different
-            # all-gathers and deadlock a step that mixes media and text-only ranks.
-            inputs_embeds = self.model.language_model.embed_tokens(input_ids)
+            # all-gathers and deadlock a step that mixes media and text-only ranks. A trainable vision
+            # tower is entered here as well, for the same reason.
+            inputs_embeds = self._anchor_unused_vision_tower(self.model.language_model.embed_tokens(input_ids))
             input_ids = None
         if cp_size > 1 and inputs_embeds is None and input_ids is not None and not torch.is_floating_point(input_ids):
             is_first_stage = getattr(self.model.language_model, "embed_tokens", None) is not None
