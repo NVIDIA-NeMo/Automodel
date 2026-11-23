@@ -25,7 +25,7 @@ import torch
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import
 
 MSA_KERNEL_IMPORT_ERROR = (
-    "BackendConfig.sparse_attn='msa' backward requires nvidia-cutlass-dsl==4.6.2 and cuda-bindings from the "
+    "BackendConfig.sparse_attn='msa' backward requires nvidia-cutlass-dsl==4.8.0 and cuda-bindings from the "
     "msa optional dependency, which ship Linux wheels only. Install the project with uv sync --extra msa on a "
     "CUDA SM100 system."
 )

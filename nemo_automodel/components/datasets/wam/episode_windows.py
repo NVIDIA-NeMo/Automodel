@@ -109,9 +109,17 @@ class EpisodeWindowDataset(IterableDataset):
         info = get_worker_info()
         worker = 0 if info is None else int(info.id)
         rng = np.random.default_rng((self.seed, self.rank, worker))
+        too_short: set[Path] = set()
         while True:
             file = self.files[int(rng.integers(len(self.files)))]
             n = int(np.load(file, allow_pickle=False)["obs8"].shape[0])
             if n < self.window_frames:
+                too_short.add(file)
+                if len(too_short) == len(self.files):
+                    # Redrawing would never yield a window and training would spin without progress.
+                    raise ValueError(
+                        f"every episode for rank {self.rank} under {self.files[0].parent} is shorter than the "
+                        f"{self.window_frames}-frame window; record or convert episodes at least that long"
+                    )
                 continue
             yield self.window(file, int(rng.integers(0, n - self.window_frames + 1)))

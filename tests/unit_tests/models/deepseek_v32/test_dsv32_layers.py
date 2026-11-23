@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-import types
-import importlib.util
+from unittest.mock import MagicMock, Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 # Check if fast_hadamard_transform is available
 HADAMARD_AVAILABLE = False
@@ -25,12 +23,7 @@ try:
     from fast_hadamard_transform import hadamard_transform  # noqa: F401
     HADAMARD_AVAILABLE = True
 except ImportError:
-    # Mock fast_hadamard_transform before importing deepseek_v32 modules
-    if 'fast_hadamard_transform' not in sys.modules:
-        mock_hadamard = types.ModuleType('fast_hadamard_transform')
-        mock_hadamard.__spec__ = importlib.util.spec_from_loader('fast_hadamard_transform', loader=None)
-        mock_hadamard.hadamard_transform = lambda x, scale: x
-        sys.modules['fast_hadamard_transform'] = mock_hadamard
+    pass
 
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.layers import (

@@ -31,7 +31,7 @@ model:
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: fa4
     linear: te
     rms_norm: te
     rope_fusion: false # THD fused RoPE has documented NaN gradients; use the existing packed-recipe setting.

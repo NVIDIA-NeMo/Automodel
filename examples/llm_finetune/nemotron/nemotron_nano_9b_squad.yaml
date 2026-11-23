@@ -22,7 +22,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 8
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000  # will run every x number of gradient steps
   max_steps: 100
@@ -40,7 +40,11 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-Nano-9B-v2
   trust_remote_code: true
-  force_hf: true
+  force_hf: false  # Native hybrid kernels reset Mamba state between packed documents.
+
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
 
 checkpoint:
   enabled: true
@@ -71,24 +75,29 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  padding: false
 
 packed_sequence:
-  packed_sequence_size: 0
+  # local_batch_size counts packed rows, not individual documents.
+  packed_sequence_size: 4096
+  packing_strategy: thd
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: True
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
-  limit_dataset_samples: 64
+  limit_dataset_samples: 1024
+  padding: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  batch_size: 1
 
 optimizer:
   _target_: torch.optim.Adam
@@ -113,13 +122,10 @@ ci:
     # The vLLM deploy image uses Transformers v4, which cannot decode v5's
     # tagged Infinity in time_step_limit before passing it to Mamba (AMINT-439).
     checkpoint.v4_compatible: true
-    distributed.tp_size: 2
-    # Three TP2 x DP4 runs matched pre-update model, buffer, optimizer, scheduler,
-    # counter, and RNG state exactly while measuring 0.09%-0.45% first-forward
-    # drift across the independent BF16 resume process. Keep those exact state
-    # gates and use the shared 0.75% resume envelope for this full-SFT path.
-    # Remove this override when AMINT-314 resolves the remaining restarted-forward
-    # drift; the PEFT path stays on the strict profile because it does not show it.
+    distributed.tp_size: 1  # Native Nemotron-H currently advertises TP1 support.
+    # Retain the legacy remote-HF BF16 resume envelope (AMINT-314) during
+    # migration. Native packed TP1 checkpoint CI must establish whether the
+    # strict profile can replace it; the PEFT path already uses strict.
     resume_tolerance_profile: relaxed
     tokenizer_name: nvidia/NVIDIA-Nemotron-Nano-9B-v2
     trust_remote_code: true
