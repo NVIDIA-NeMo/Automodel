@@ -22,7 +22,8 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-ARCHITECTURE = "NemotronLabsDiffusionModel"
+from nemo_automodel.components.models.deciffusion.model import ARCHITECTURE
+
 FULL_FINETUNE_PREFIXES = ("encoder.layers.", "encoder.norm.")
 _WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module.", "_orig_mod.")
 
@@ -37,31 +38,29 @@ def full_finetune_trainable(parameter_name: str) -> bool:
     return parameter_name.startswith(FULL_FINETUNE_PREFIXES)
 
 
-def require_bidirectional_text_config(config: Any) -> None:
+def require_decision_config(config: Any) -> None:
     """Reject checkpoints whose runtime contract this recipe does not implement.
 
-    The recipe trains one question per read with fully bidirectional attention over a text prompt. Block-causal
-    checkpoints keep the same class and ``dlm_paradigm`` but need a different attention graph; vision and quantized
-    variants need their own input/storage paths. None of them is run silently as an ordinary bidirectional model.
+    The recipe trains Nemotron 3.5 Decision checkpoints: a text Ministral 3 encoder read with fully bidirectional
+    attention, one question per read, and the decision head at the mask token. Vision and quantized variants need
+    their own input and storage paths and are not run silently as the text model.
 
     Args:
         config: Hugging Face config (attribute access) of the checkpoint.
 
     Raises:
-        ValueError: If the architecture, attention graph or storage format is unsupported.
+        ValueError: If the architecture, attention or storage format is unsupported.
     """
     architectures = list(getattr(config, "architectures", None) or [])
     if architectures != [ARCHITECTURE]:
         raise ValueError(f"expected architectures == [{ARCHITECTURE!r}], got {architectures}")
-    if getattr(config, "dlm_paradigm", None) != "bidirectional":
-        raise ValueError(f"dlm_paradigm must be 'bidirectional', got {getattr(config, 'dlm_paradigm', None)!r}")
-    if getattr(config, "deciffusion_block_causal", None) or getattr(config, "deciffusion_bc_blocks", None):
-        raise ValueError(
-            "block-causal Deciffusion checkpoints are not supported: they need a block-causal attention mask"
-        )
+    if getattr(config, "model_type", None) != "ministral3":
+        raise ValueError(f"expected model_type 'ministral3', got {getattr(config, 'model_type', None)!r}")
+    if getattr(config, "is_causal", False):
+        raise ValueError("decision checkpoints are read bidirectionally; is_causal must be false")
     for name in ("vision_config", "quantization_config"):
         if getattr(config, name, None):
-            raise ValueError(f"{name} is set: vision and quantized Deciffusion variants are not supported")
+            raise ValueError(f"{name} is set: vision and quantized decision variants are not supported")
     if getattr(config, "mask_token_id", None) is None:
         raise ValueError("the checkpoint config has no mask_token_id")
 

@@ -24,7 +24,8 @@ from nemo_automodel.components.models.deciffusion.records import (
     encode_question,
     in_heldout,
 )
-from tests.unit_tests.models.deciffusion.char_tokenizer import CharTokenizer
+from nemo_automodel.components.models.deciffusion.serving_prompt import DecisionContract
+from tests.unit_tests.models.deciffusion.char_tokenizer import MASK, char_tokenizer, write_contract
 
 LINE = {
     "id": "t-1",
@@ -85,19 +86,25 @@ def test_heldout_split_is_deterministic_and_keeps_groups_together():
     assert all(len(v) == 1 for v in by_group.values()) and 0 < sum(first) < len(records)
 
 
-def test_targets_follow_the_shuffled_prompt_order():
-    tok = CharTokenizer()
+def test_targets_follow_the_shuffled_prompt_order(tmp_path):
+    tok = char_tokenizer()
+    contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt"))
+    mask = tok.convert_tokens_to_ids(MASK)
     record = convert_simple_line(LINE)
     for seed in (None, 1, 2, 3, 4, 5):
-        prompt = encode_question(tok, record, "decision", max_tokens=4096, shuffle_seed=seed)
+        prompt = encode_question(
+            tok, contract, record, "decision", mask_token_id=mask, max_tokens=4096, shuffle_seed=seed
+        )
         (target,) = question_targets(record, {prompt.question_id: prompt.labels})
         assert target.option_ids == prompt.labels and prompt.labels[target.label] == "billing"
         expected = record["soft_labels"]["decision"]
         assert dict(zip(prompt.labels, target.soft_labels, strict=True)) == pytest.approx(expected)
 
 
-def test_every_question_of_a_multi_question_record_is_encoded_on_its_own():
-    tok = CharTokenizer()
+def test_every_question_of_a_multi_question_record_is_encoded_on_its_own(tmp_path):
+    tok = char_tokenizer()
+    contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt"))
+    mask = tok.convert_tokens_to_ids(MASK)
     record = {
         "id": "r1",
         "state": {"alert": "x"},
@@ -105,14 +112,19 @@ def test_every_question_of_a_multi_question_record_is_encoded_on_its_own():
         "answers": {"a": "true"},
     }
     validate_record(record)
-    prompts = {qid: encode_question(tok, record, qid, max_tokens=4096) for qid in record["questions"]}
+    prompts = {
+        qid: encode_question(tok, contract, record, qid, mask_token_id=mask, max_tokens=4096)
+        for qid in record["questions"]
+    }
     assert prompts["a"].input_ids != prompts["b"].input_ids
     targets = question_targets(record, {qid: p.labels for qid, p in prompts.items()})
     assert [t.label for t in targets] == [prompts["a"].labels.index("true"), -100]
 
 
-def test_questions_this_model_cannot_read_are_not_encoded():
-    tok = CharTokenizer()
+def test_questions_this_model_cannot_read_are_not_encoded(tmp_path):
+    tok = char_tokenizer()
+    contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt"))
+    mask = tok.convert_tokens_to_ids(MASK)
     record = convert_simple_line(LINE)
     image = {**record, "state": {"image": "data:..."}}
     images = {**record, "images": ["data:..."]}
@@ -121,7 +133,9 @@ def test_questions_this_model_cannot_read_are_not_encoded():
         "questions": {"decision": {k: v for k, v in record["questions"]["decision"].items() if k != "instructions"}},
     }
     for bad in (image, images, no_instructions):
-        assert encode_question(tok, bad, "decision", max_tokens=4096) is None
-    length = len(encode_question(tok, record, "decision", max_tokens=4096).input_ids)
-    assert encode_question(tok, record, "decision", max_tokens=length + 1) is not None
-    assert encode_question(tok, record, "decision", max_tokens=length) is None  # the mask slot must fit too
+        assert encode_question(tok, contract, bad, "decision", mask_token_id=mask, max_tokens=4096) is None
+    length = len(encode_question(tok, contract, record, "decision", mask_token_id=mask, max_tokens=4096).input_ids)
+    assert encode_question(tok, contract, record, "decision", mask_token_id=mask, max_tokens=length + 1) is not None
+    assert (
+        encode_question(tok, contract, record, "decision", mask_token_id=mask, max_tokens=length) is None
+    )  # the mask slot must fit too

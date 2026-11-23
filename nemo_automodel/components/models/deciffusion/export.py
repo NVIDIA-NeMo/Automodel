@@ -27,15 +27,20 @@ from pathlib import Path
 
 import safetensors.torch as _st
 
+from nemo_automodel.components.models.deciffusion.serving_prompt import DECISION_CONFIG_FILE, DECISION_TEMPLATE_FILE
+
 # Base-checkpoint files replaced by the export (weights, their index, caches and receipts of an earlier export).
 _NOT_COPIED = ("*.safetensors", "*.safetensors.index.json", ".cache", "merge-receipt.json", "export-receipt.json")
+# Base files whose content, with the weights, defines the base identity.
+_FINGERPRINTED = ("config.json", DECISION_CONFIG_FILE, DECISION_TEMPLATE_FILE)
 
 
 def checkpoint_fingerprint(checkpoint_dir: str | Path, *, chunk_size: int = 1 << 24) -> str:
-    """SHA-256 over ``config.json`` and the full contents of every ``*.safetensors`` shard of a local checkpoint.
+    """SHA-256 over the configuration, the decision contract files and every ``*.safetensors`` shard of a checkpoint.
 
-    Reads every weight byte, so a base whose interior weights differ (for example, an ordinary fine-tune of the same
-    architecture) gets a different fingerprint.
+    Covers ``config.json``, ``decision.json`` and ``decision_template.jinja`` (each when present) and reads every
+    weight byte, so a base whose interior weights or decision prompt differ (for example, an ordinary fine-tune of the
+    same architecture) gets a different fingerprint.
 
     Args:
         checkpoint_dir: Local checkpoint directory.
@@ -51,7 +56,10 @@ def checkpoint_fingerprint(checkpoint_dir: str | Path, *, chunk_size: int = 1 <<
     shards = sorted(root.glob("*.safetensors"))
     if not shards:
         raise FileNotFoundError(f"{root} has no *.safetensors weights")
-    digest = hashlib.sha256((root / "config.json").read_bytes() if (root / "config.json").exists() else b"")
+    digest = hashlib.sha256()
+    for name in _FINGERPRINTED:
+        path = root / name
+        digest.update(f"{name}|".encode() + (path.read_bytes() if path.exists() else b"") + b"\0")
     for shard in shards:
         digest.update(f"{shard.name}|{shard.stat().st_size}".encode())
         with open(shard, "rb") as handle:

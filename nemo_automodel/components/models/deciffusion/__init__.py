@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed-decision post-training support for Nemotron Deciffusion checkpoints."""
+"""Typed-decision post-training support for Nemotron 3.5 Decision checkpoints."""
 
+from nemo_automodel.components.models.deciffusion.model import NemotronForDecision
 from nemo_automodel.components.models.deciffusion.records import encode_question
-from nemo_automodel.components.models.deciffusion.scorer import require_bidirectional_text_config
-from nemo_automodel.components.models.deciffusion.serving_prompt import PreparedQuestion, prepare_question
+from nemo_automodel.components.models.deciffusion.scorer import require_decision_config
+from nemo_automodel.components.models.deciffusion.serving_prompt import (
+    DecisionContract,
+    PreparedQuestion,
+    prepare_question,
+)
 
 __all__ = [
+    "DecisionContract",
+    "NemotronForDecision",
     "PreparedQuestion",
     "encode_question",
     "prepare_question",
-    "require_bidirectional_text_config",
+    "require_decision_config",
 ]

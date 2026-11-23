@@ -384,7 +384,7 @@ def test_deciffusion_examples_keep_the_reference_training_contract():
     root = Path(__file__).resolve().parents[3] / "examples" / "decision"
     for name in ("deciffusion_soc_triage_lora.yaml", "deciffusion_support_routing_lora.yaml"):
         config = yaml.safe_load((root / name).read_text())
-        assert config["model"]["dlm_paradigm"] == "bidirectional"
+        assert "dlm_paradigm" not in config["model"] and not config["model"].get("trust_remote_code")
         assert (config["peft"]["dim"], config["peft"]["alpha"], config["peft"]["dropout"]) == (32, 64, 0.0)
         assert config["optimizer"]["lr"] == 1.0e-4 and config["optimizer"]["betas"] == [0.9, 0.95]
         assert config["seed"] == 101 and config["train"]["global_batch_size"] == 16
@@ -397,11 +397,12 @@ def test_deciffusion_examples_keep_the_reference_training_contract():
 
 
 @pytest.mark.parametrize("soft_label_kl_weight,trained", [(0.0, ["gold", "soft"]), (0.5, ["gold"])])
-def test_deciffusion_reads_each_supervised_question_and_counts_unreadable_ones(soft_label_kl_weight, trained):
+def test_deciffusion_reads_each_supervised_question_and_counts_unreadable_ones(tmp_path, soft_label_kl_weight, trained):
     from nemo_automodel.components.datasets.decision.records import validate_record
     from nemo_automodel.components.loss.decision import DecisionLossConfig
+    from nemo_automodel.components.models.deciffusion.serving_prompt import DecisionContract
     from nemo_automodel.recipes.decision.train_deciffusion import TrainDeciffusionDecisionRecipe
-    from tests.unit_tests.models.deciffusion.char_tokenizer import CharTokenizer
+    from tests.unit_tests.models.deciffusion.char_tokenizer import MASK, char_tokenizer, write_contract
 
     record = {
         "id": "r1",
@@ -411,7 +412,7 @@ def test_deciffusion_reads_each_supervised_question_and_counts_unreadable_ones(s
             "soft": {"type": "noul", "instructions": "Page?"},
             "reward": {"type": "noul", "instructions": "Close?"},
             "unsupervised": {"type": "noul", "instructions": "Notify?"},
-            "unreadable": {"type": "noul"},  # the serving prompt needs instructions
+            "unreadable": {"type": "noul"},  # the decision contract needs instructions
         },
         "answers": {"gold": "true"},
         "soft_labels": {"soft": {"true": 0.9, "false": 0.1}},
@@ -419,7 +420,9 @@ def test_deciffusion_reads_each_supervised_question_and_counts_unreadable_ones(s
     }
     validate_record(record)
     recipe = TrainDeciffusionDecisionRecipe.__new__(TrainDeciffusionDecisionRecipe)
-    recipe.tokenizer = CharTokenizer()
+    recipe.tokenizer = char_tokenizer()
+    recipe.contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt"))
+    recipe.mask_token_id = recipe.tokenizer.convert_tokens_to_ids(MASK)
     recipe.max_tokens = 4096
     recipe.loss_config = DecisionLossConfig(mode="sft", soft_label_kl_weight=soft_label_kl_weight)
     recipe.loss_fn = recipe.loss_config.build()

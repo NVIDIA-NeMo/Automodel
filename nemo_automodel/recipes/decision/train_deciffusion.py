@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Post-train Nemotron Deciffusion decision checkpoints on SystemOne records (LoRA or full fine-tuning).
+"""Post-train Nemotron 3.5 Decision checkpoints on SystemOne records (LoRA or full fine-tuning).
 
-Every question of a record is its own read: the serving prompt (one question, serving option order and codes) plus
-one mask token. The backbone reads it bidirectionally, and the frozen diffusion head's logits at the mask, restricted
-to the option codes, give the answer distribution. Supervision, the objective and the metrics are the shared decision
+Every question of a record is its own read, rendered with the checkpoint's own decision contract
+(``decision_template.jinja`` and ``decision.json``: the question's option order and the checkpoint's codes), which
+ends in the mask token. The bidirectional Ministral 3 encoder reads it, and the frozen decision head's logits at the
+mask, restricted to the option codes, give the answer distribution. Supervision, the objective and the metrics are the shared decision
 components: ``question_targets`` aligns answers, rewards and soft labels with each prompt's option order,
 ``assemble_decision_batch`` and ``DecisionLoss`` (``loss.mode: sft``) compute the loss, and ``DecisionEvaluator``
-scores validation and test. A ``train.canonical_fraction`` share of the training reads keep the serving option order;
-the rest are shuffled and re-coded by position.
+scores validation and test. Training reads keep the checkpoint's option order unless ``train.canonical_fraction`` is
+below 1, in which case the remaining share is shuffled and re-coded by position.
 
-* ``peft`` set: LoRA on the attention/MLP projections; embeddings and the diffusion head stay frozen.
-* ``peft: null``: full fine-tuning of the decoder layers and final norm; embeddings and the diffusion head stay frozen.
+* ``peft`` set: LoRA on the attention/MLP projections; embeddings and the decision head stay frozen.
+* ``peft: null``: full fine-tuning of the decoder layers and final norm; embeddings and the decision head stay frozen.
 * ``mode: eval`` scores the configured checkpoint (or ``init_from`` stage) on validation and test.
 
 Validation selects the published stage (``LOWEST_VAL``): most correct validation decisions, then lowest NLL; for LoRA
@@ -74,9 +75,13 @@ from nemo_automodel.components.models.deciffusion.scorer import (
     full_finetune_trainable,
     gather_head_rows,
     option_logits,
-    require_bidirectional_text_config,
+    require_decision_config,
 )
-from nemo_automodel.components.models.deciffusion.serving_prompt import PreparedQuestion, readout_token_ids
+from nemo_automodel.components.models.deciffusion.serving_prompt import (
+    DecisionContract,
+    PreparedQuestion,
+    readout_token_ids,
+)
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -104,7 +109,7 @@ def selection_value(correct: int, cross_entropy: float) -> float:
 
 @dataclasses.dataclass(frozen=True)
 class _Decision:
-    """One supervised question of a record, encoded in serving option order.
+    """One supervised question of a record, encoded in the checkpoint's option order.
 
     Attributes:
         record: The validated SystemOne record that holds the question.
@@ -118,7 +123,7 @@ class _Decision:
 
 
 class TrainDeciffusionDecisionRecipe(BaseRecipe):
-    """LoRA or full post-training of Deciffusion decision checkpoints (see module docstring)."""
+    """LoRA or full post-training of Nemotron 3.5 Decision checkpoints (see module docstring)."""
 
     def __init__(self, cfg: RecipeConfig | ConfigNode) -> None:
         """Store the recipe configuration."""
@@ -150,13 +155,11 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
 
         model_path = self.cfg.get("model.pretrained_model_name_or_path")
         revision = self.cfg.get("model.revision", None)
-        if self.cfg.get("model.dlm_paradigm", "bidirectional") != "bidirectional":
-            raise ValueError("model.dlm_paradigm must be 'bidirectional' for decision post-training")
         from transformers import AutoConfig, AutoTokenizer
 
-        require_bidirectional_text_config(
-            AutoConfig.from_pretrained(model_path, revision=revision, trust_remote_code=True)
-        )
+        hf_config = AutoConfig.from_pretrained(model_path, revision=revision)
+        require_decision_config(hf_config)
+        self.contract = DecisionContract.from_pretrained(model_path, revision=revision)
 
         (
             self.distributed_setup,
@@ -176,19 +179,22 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
 
         self.peft_config = self.cfg.peft.instantiate() if self.cfg.get("peft", None) is not None else None
         self.model = self.cfg.model.instantiate(peft_config=self.peft_config, distributed_setup=self.distributed_setup)
-        require_bidirectional_text_config(self.model.config)
+        require_decision_config(self.model.config)
         self.mask_token_id = int(self.model.config.mask_token_id)
         if self.peft_config is None:
             for name, parameter in self.model.named_parameters():
                 parameter.requires_grad_(full_finetune_trainable(name))
         head = self.model.get_output_embeddings()
         if head is None or any(parameter.requires_grad for parameter in head.parameters()):
-            raise ValueError("the diffusion head must exist and stay frozen; exclude it from peft target modules")
+            raise ValueError("the decision head must exist and stay frozen; exclude it from peft target modules")
         if any(p.requires_grad for p in self.model.get_input_embeddings().parameters()):
             raise ValueError("the input embeddings must stay frozen")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision)
         self.max_tokens = int(self.cfg.get("data.max_tokens", 8192))
+        read_limit = min(self.contract.max_input_tokens, int(hf_config.max_position_embeddings))
+        if not 0 < self.max_tokens <= read_limit:
+            raise ValueError(f"data.max_tokens must be in [1, {read_limit}] (the checkpoint's read limit)")
         self.slice_keys = list(self.cfg.get("data.slice_keys", []) or [])
         self.records: dict[str, list[dict[str, Any]]] = {}
         self.decisions: dict[str, list[_Decision]] = {}
@@ -208,8 +214,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 raise ValueError(f"data.{split} has no supervised text decisions")
             if self.skipped[split] and self.dist_env.is_main:
                 logger.warning(
-                    "data.%s: skipped %d questions (media, unreadable by the serving prompt, or over "
-                    "data.max_tokens=%d)",
+                    "data.%s: skipped %d questions (media, outside the decision contract, or over data.max_tokens=%d)",
                     split,
                     self.skipped[split],
                     self.max_tokens,
@@ -219,7 +224,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
         validation = self.decisions.get("validation", [])
         if self.mode == "train" and validation and not any(d.target.label >= 0 for d in validation):
             raise ValueError("data.validation needs gold answers: stages are selected by validation accuracy")
-        token_ids = readout_token_ids(self.tokenizer)
+        token_ids = list(readout_token_ids(self.tokenizer, self.contract))
         rows = gather_head_rows(self.model, token_ids).to(self.device)
         self.head_rows = {token: rows[i] for i, token in enumerate(token_ids)}
 
@@ -240,6 +245,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             "method": "lora" if self.peft_config is not None else "full",
             "mask_token_id": self.mask_token_id,
             "readout_token_ids_sha256": hashlib.sha256(json.dumps(token_ids).encode()).hexdigest(),
+            "decision_contract_sha256": self.contract.sha256,
             "max_tokens": self.max_tokens,
         }
         init_from = self.cfg.get("init_from", None)
@@ -252,7 +258,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             )
 
     def _encode_split(self, records: list[dict[str, Any]], *, train: bool) -> tuple[list[_Decision], int]:
-        """Encode every supervised question of ``records`` in serving option order.
+        """Encode every supervised question of ``records`` in the checkpoint's option order.
 
         Training keeps the questions the objective weights (a gold answer, or soft labels when they replace the
         gold target); evaluation keeps the questions the evaluator scores (a gold answer or rewards).
@@ -263,12 +269,19 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
 
         Returns:
             The decisions, and the number of questions this model cannot read (media, a question that does not fit
-            the serving prompt, or a prompt longer than ``data.max_tokens``).
+            the checkpoint's decision contract, or a prompt longer than ``data.max_tokens``).
         """
         decisions, skipped = [], 0
         for record in records:
             for question_id in record["questions"]:
-                prompt = encode_question(self.tokenizer, record, question_id, max_tokens=self.max_tokens)
+                prompt = encode_question(
+                    self.tokenizer,
+                    self.contract,
+                    record,
+                    question_id,
+                    mask_token_id=self.mask_token_id,
+                    max_tokens=self.max_tokens,
+                )
                 if prompt is None:
                     skipped += 1
                     continue
@@ -451,7 +464,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             1, int(steps_per_epoch * float(self.cfg.get("train.epochs", 1.0)))
         )
         warmup = max(1, int(float(self.cfg.get("train.warmup_fraction", 0.05)) * total))
-        canonical_fraction = float(self.cfg.get("train.canonical_fraction", 0.5))
+        canonical_fraction = float(self.cfg.get("train.canonical_fraction", 1.0))
         val_every = int(self.cfg.get("train.val_every_steps", 50))
         max_grad_norm = float(self.cfg.get("train.max_grad_norm", 1.0))
         is_lora = self.peft_config is not None
@@ -511,8 +524,10 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 prompt = (
                     encode_question(
                         self.tokenizer,
+                        self.contract,
                         decision.record,
                         decision.prompt.question_id,
+                        mask_token_id=self.mask_token_id,
                         max_tokens=self.max_tokens,
                         shuffle_seed=shuffle,
                     )

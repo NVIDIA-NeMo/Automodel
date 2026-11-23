@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-GPU acceptance of the Deciffusion decision recipe on a tiny checkpoint built from the public model code.
+"""Two-GPU acceptance of the decision recipe on a tiny Nemotron 3.5 Decision-layout checkpoint.
 
-Real: NeMo model loading (trust_remote_code), FSDP2 over two ranks, LoRA or full fine-tuning scope, activation
-checkpointing, the training loop, validation selection, native stage save and reload, export to a complete
-checkpoint, and an independent Hugging Face reload of that export. Only the weights are random and tiny.
+Real: NeMo model loading (native ``NemotronForDecision``), FSDP2 over two ranks, LoRA or full fine-tuning scope,
+activation checkpointing, the training loop, validation selection, native stage save and reload, export to a complete
+checkpoint, and an independent Hugging Face reload of that export. The tokenizer is the public one these checkpoints
+ship; only the weights are random and tiny.
 
 Native -> stage -> export agreement: the recipe's test probabilities after reloading the selected stage must match
-probabilities computed from the exported checkpoint with plain ``transformers`` and the reference read
-(``encoder(use_causal_mask=False)`` + ``diffusion_head`` at the mask), and their decisions must agree.
+probabilities computed from the exported checkpoint with a stock ``transformers`` ``Ministral3Model`` with causal
+attention disabled plus the head at the mask, and their decisions must agree.
 """
 
 import argparse
@@ -37,46 +38,38 @@ import yaml
 
 PUBLIC_CODE_REPO = "nvidia/Nemotron-Labs-Diffusion-8B-Base"
 PUBLIC_CODE_REVISION = "59ff0ffee284112fc6ccf37493ced41a11031434"
-CODE_FILES = (
-    "config.json",
-    "configuration_nemotron_labs_diffusion.py",
-    "modeling_nemotron_labs_diffusion.py",
-    "modeling_ministral.py",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "chat_template.jinja",
-    "generation_config.json",
-)
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
 
 
 def _tiny_checkpoint(root: Path, seed: int) -> None:
-    """Download the public code/tokenizer files only and write a tiny fp32 random checkpoint with them."""
+    """Write a tiny fp32 random decision checkpoint with the public tokenizer and the decision contract files."""
     from huggingface_hub import hf_hub_download
-    from transformers import AutoConfig, AutoModel
+    from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
+
+    from nemo_automodel.components.models.deciffusion.model import NemotronForDecision
+    from tests.unit_tests.models.deciffusion.char_tokenizer import write_contract
 
     root.mkdir(parents=True)
-    for name in CODE_FILES:
+    for name in TOKENIZER_FILES:
         path = hf_hub_download(PUBLIC_CODE_REPO, name, revision=PUBLIC_CODE_REVISION)
         (root / name).write_bytes(Path(path).read_bytes())
-    config = json.loads((root / "config.json").read_text())
-    config.update(
-        num_hidden_layers=2,
+    config = Ministral3Config(
+        vocab_size=131072,
         hidden_size=64,
         intermediate_size=128,
+        num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=16,
+        max_position_embeddings=16384,
+        mask_token_id=100,
+        bos_token_id=1,
+        eos_token_id=11,
         torch_dtype="float32",
-        deciffusion_shared_context=True,
     )
-    (root / "config.json").write_text(json.dumps(config, indent=2))
     torch.manual_seed(seed)
-    model = AutoModel.from_config(AutoConfig.from_pretrained(root, trust_remote_code=True), trust_remote_code=True)
-    model.save_pretrained(root, safe_serialization=True)
-    saved = json.loads((root / "config.json").read_text())
-    saved["deciffusion_shared_context"] = True  # serving flag the export must keep
-    (root / "config.json").write_text(json.dumps(saved, indent=2))
+    NemotronForDecision(config).save_pretrained(root, safe_serialization=True)
+    write_contract(root)
 
 
 def _records(root: Path) -> None:
@@ -127,23 +120,36 @@ def _records(root: Path) -> None:
 def _reference_probabilities(
     export_dir: Path, test_records: Path, device: torch.device
 ) -> dict[tuple[str, str], list[float]]:
-    """Probabilities from the exported checkpoint with plain transformers and the reference bidirectional read."""
-    from transformers import AutoModel, PreTrainedTokenizerFast
+    """Probabilities from the exported checkpoint with a stock bidirectional Ministral 3 encoder and the head."""
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, PreTrainedTokenizerFast
+    from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 
     from nemo_automodel.components.models.deciffusion.records import encode_question, read_jsonl
+    from nemo_automodel.components.models.deciffusion.serving_prompt import DecisionContract
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained(export_dir)
-    model = AutoModel.from_pretrained(export_dir, trust_remote_code=True, dtype=torch.float32).to(device).eval()
+    contract = DecisionContract.from_pretrained(export_dir)
+    config = AutoConfig.from_pretrained(export_dir)
+    config.is_causal = False
+    weights = load_file(str(export_dir / "model.safetensors"))
+    encoder = Ministral3Model(config)
+    for layer in encoder.layers:
+        layer.self_attn.is_causal = False
+    encoder.load_state_dict({k.removeprefix("encoder."): v for k, v in weights.items() if k.startswith("encoder.")})
+    encoder = encoder.to(device=device, dtype=torch.float32).eval()
+    head = weights["diffusion_head.weight"].to(device=device, dtype=torch.float32)
     out = {}
     with torch.no_grad():
         for record in read_jsonl(test_records):
             for question_id in record["questions"]:
-                prompt = encode_question(tokenizer, record, question_id, max_tokens=8192)
-                ids = torch.tensor([[*prompt.input_ids, model.mask_token_id]], device=device)
-                hidden = model.encoder(
-                    input_ids=ids, use_cache=False, use_causal_mask=False, is_training=False
-                ).last_hidden_state
-                logits = model.diffusion_head(hidden[:, -1]).float()[0][list(prompt.code_token_ids)]
+                prompt = encode_question(
+                    tokenizer, contract, record, question_id, mask_token_id=config.mask_token_id, max_tokens=8192
+                )
+                ids = torch.tensor([[*prompt.input_ids, config.mask_token_id]], device=device)
+                positions = torch.arange(ids.shape[1], device=device)[None]
+                hidden = encoder(input_ids=ids, position_ids=positions, use_cache=False).last_hidden_state
+                logits = (head[list(prompt.code_token_ids)] @ hidden[0, -1]).float()
                 out[(record["id"], question_id)] = logits.softmax(-1).tolist()
     return out
 
@@ -178,7 +184,8 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
         ],
         check=True,
     )
-    assert json.loads((out / "config.json").read_text())["deciffusion_shared_context"] is True
+    assert (out / "decision.json").read_text() == (root / "base" / "decision.json").read_text()
+    assert json.loads((out / "config.json").read_text())["architectures"] == ["NemotronForDecision"]
     reference = _reference_probabilities(out, root / "data/test.jsonl", torch.device("cuda", 0))
     assert reference.keys() == native.keys()
     for key, probabilities in native.items():

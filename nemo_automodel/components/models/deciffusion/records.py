@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from nemo_automodel.components.models.deciffusion.serving_prompt import (
+    DecisionContract,
     PreparedQuestion,
     prepare_question,
     question_options,
@@ -145,30 +146,40 @@ def has_media(record: dict[str, Any]) -> bool:
 
 def encode_question(
     tokenizer: Any,
+    contract: DecisionContract,
     record: dict[str, Any],
     question_id: str,
     *,
+    mask_token_id: int,
     max_tokens: int,
     shuffle_seed: int | None = None,
 ) -> PreparedQuestion | None:
-    """Encode one question of a record as its serving prompt, or ``None`` if this model cannot read it.
+    """Encode one question of a record as its decision prompt, or ``None`` if this model cannot read it.
 
-    A question is not readable when the record carries media, the question does not fit the serving prompt (no
-    instructions, or more options than single-token codes), or the prompt plus its mask slot is longer than
+    A question is not readable when the record carries media, the question does not fit the checkpoint's contract (no
+    instructions, unsupported fields, or more options than codes), or the prompt plus its mask is longer than
     ``max_tokens``. The caller counts these questions.
 
     Args:
         tokenizer: Tokenizer of the checkpoint.
+        contract: The checkpoint's decision contract.
         record: Validated SystemOne record that holds the question.
         question_id: Key of the question in ``record["questions"]``.
+        mask_token_id: The checkpoint's mask token.
         max_tokens: Longest allowed prompt including the mask slot.
-        shuffle_seed: Option-shuffle seed (``None`` keeps the serving order).
+        shuffle_seed: Option-shuffle seed (``None`` keeps the checkpoint's option order).
     """
     if has_media(record):
         return None
     try:
         prompt = prepare_question(
-            tokenizer, record["state"], question_id, record["questions"][question_id], shuffle_seed=shuffle_seed
+            tokenizer,
+            contract,
+            record["state"],
+            question_id,
+            record["questions"][question_id],
+            mask_token_id=mask_token_id,
+            shuffle_seed=shuffle_seed,
         )
     except ValueError:
         return None

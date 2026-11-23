@@ -33,7 +33,7 @@ from nemo_automodel.components.models.deciffusion.scorer import (
     full_finetune_trainable,
     gather_head_rows,
     option_logits,
-    require_bidirectional_text_config,
+    require_decision_config,
 )
 
 HIDDEN, VOCAB = 8, 32
@@ -67,25 +67,24 @@ class TinyDiffusion(nn.Module):
 
 def _config(**overrides):
     base = {
-        "architectures": ["NemotronLabsDiffusionModel"],
-        "dlm_paradigm": "bidirectional",
+        "architectures": ["NemotronForDecision"],
+        "model_type": "ministral3",
+        "is_causal": False,
         "mask_token_id": 3,
-        "deciffusion_shared_context": True,
     }
     return SimpleNamespace(**{**base, **overrides})
 
 
-def test_bidirectional_text_checkpoint_is_accepted():
-    require_bidirectional_text_config(_config())
+def test_decision_checkpoint_is_accepted():
+    require_decision_config(_config())
 
 
 @pytest.mark.parametrize(
     "overrides,error",
     [
-        ({"deciffusion_block_causal": True}, "block-causal"),
-        ({"deciffusion_bc_blocks": [4096, 8192]}, "block-causal"),
-        ({"dlm_paradigm": "block_diff"}, "bidirectional"),
-        ({"dlm_paradigm": "autoregressive"}, "bidirectional"),
+        ({"architectures": ["NemotronLabsDiffusionModel"]}, "architectures"),
+        ({"model_type": "nemotron_labs_diffusion"}, "model_type"),
+        ({"is_causal": True}, "bidirectionally"),
         ({"vision_config": {"hidden_size": 8}}, "vision"),
         ({"quantization_config": {"quant_method": "modelopt"}}, "quantized"),
         ({"architectures": ["LlamaForCausalLM"]}, "architectures"),
@@ -94,7 +93,7 @@ def test_bidirectional_text_checkpoint_is_accepted():
 )
 def test_unsupported_variants_fail_clearly(overrides, error):
     with pytest.raises(ValueError, match=error):
-        require_bidirectional_text_config(_config(**overrides))
+        require_decision_config(_config(**overrides))
 
 
 def test_restricted_rows_equal_the_full_head_at_the_mask_and_train_only_the_backbone():
@@ -120,7 +119,7 @@ def test_head_with_bias_is_rejected():
         gather_head_rows(model, [1])
 
 
-def _write_base(root, seed=0, shared=True):
+def _write_base(root, seed=0):
     torch.manual_seed(seed)
     root.mkdir(parents=True)
     weights = {
@@ -128,12 +127,10 @@ def _write_base(root, seed=0, shared=True):
         "diffusion_head.weight": torch.randn(VOCAB, HIDDEN).to(torch.bfloat16),
     }
     save_file(weights, str(root / "model.safetensors"))
-    config = {
-        "architectures": ["NemotronLabsDiffusionModel"],
-        **({"deciffusion_shared_context": True} if shared else {}),
-    }
+    config = {"architectures": ["NemotronForDecision"], "model_type": "ministral3", "mask_token_id": 3}
     (root / "config.json").write_text(json.dumps(config))
     (root / "tokenizer.json").write_text("{}")
+    (root / "decision.json").write_text('{"labels": {}}')
     return weights
 
 
@@ -226,6 +223,13 @@ def test_fingerprint_detects_interior_weight_changes(tmp_path):
     assert checkpoint_fingerprint(tmp_path / "base", chunk_size=7) == checkpoint_fingerprint(tmp_path / "base")
 
 
+def test_fingerprint_covers_the_decision_contract(tmp_path):
+    _write_base(tmp_path / "a", seed=0)
+    before = checkpoint_fingerprint(tmp_path / "a")
+    (tmp_path / "a" / "decision_template.jinja").write_text("{{ decision_content }}")
+    assert checkpoint_fingerprint(tmp_path / "a") != before
+
+
 def test_full_export_casts_to_base_dtypes_and_rejects_mismatched_tensors(tmp_path):
     base = _write_base(tmp_path / "base")
     trained_dir = tmp_path / "consolidated"
@@ -237,7 +241,7 @@ def test_full_export_casts_to_base_dtypes_and_rejects_mismatched_tensors(tmp_pat
     for name, tensor in trained.items():
         assert out[name].dtype == torch.bfloat16
         torch.testing.assert_close(out[name], tensor.to(torch.bfloat16), atol=0, rtol=0)
-    assert json.loads((tmp_path / "out/config.json").read_text())["deciffusion_shared_context"] is True
+    assert (tmp_path / "out/decision.json").read_text() == (tmp_path / "base/decision.json").read_text()
     save_file({"diffusion_head.weight": torch.zeros(VOCAB, HIDDEN)}, str(trained_dir / "model.safetensors"))
     with pytest.raises(ValueError, match="do not match"):
         export_full_checkpoint(tmp_path / "base", trained_dir, tmp_path / "out2")

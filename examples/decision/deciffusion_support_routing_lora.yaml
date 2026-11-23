@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LoRA post-training of a Nemotron Deciffusion decision checkpoint on a synthetic support-routing dataset
+# LoRA post-training of a Nemotron 3.5 Decision checkpoint on a synthetic support-routing dataset
 # (fictional help-desk tickets with choice and yes/no decisions, some with soft labels) in one-decision JSONL:
 # {"state", "question", "type", "options", "label", optional "soft_labels" and "group"}. Bring your own file;
 # the prepare script converts it to single-question SystemOne records with group-disjoint splits.
@@ -27,8 +27,8 @@
 #   uv run python examples/decision/export_deciffusion.py --base <checkpoint> \
 #       --stage runs/support/lora/LOWEST_VAL --output exports/support_lora
 #
-# Supported checkpoints: bidirectional text Nemotron Deciffusion checkpoints (NemotronLabsDiffusionModel with
-# dlm_paradigm=bidirectional). Block-causal, vision and quantized variants are rejected at setup.
+# Supported checkpoints: text Nemotron 3.5 Decision checkpoints (NemotronForDecision, a bidirectional Ministral 3
+# encoder) that ship decision.json and decision_template.jinja. Vision and quantized variants are rejected at setup.
 # For full fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
 # checkpoint.save_consolidated: every (decoder layers and final norm train; embeddings and head stay frozen).
 
@@ -45,10 +45,8 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /path/to/deciffusion-checkpoint   # a bidirectional text checkpoint directory
+  pretrained_model_name_or_path: /path/to/nemotron-3.5-decision-8b   # a local Nemotron 3.5 Decision checkpoint directory
   torch_dtype: bfloat16
-  trust_remote_code: true
-  dlm_paradigm: bidirectional
   attn_implementation: sdpa
 
 peft:
@@ -99,7 +97,8 @@ train:
   max_steps: 50          # 50 steps of 16 rows
   warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
   min_lr_ratio: 0.1
-  canonical_fraction: 0.5  # share of training reads in serving option order; the rest are shuffled and re-coded
+  canonical_fraction: 0.5  # option shuffle (training only): this share of reads keeps the checkpoint's option
+                           # order, the rest are shuffled and re-coded by position; 1.0 disables it
   max_grad_norm: 1.0
   val_every_steps: 25
 
@@ -113,5 +112,5 @@ loss:
   soft_label_gold_mask: false  # true: ignore soft labels whose top option is not the gold answer
 
 ci:
-  nemo_ci_schedule: skipped  # needs a Deciffusion checkpoint; covered by the functional test
+  nemo_ci_schedule: skipped  # needs a Nemotron 3.5 Decision checkpoint; covered by the functional test
   cluster_tag: h100
