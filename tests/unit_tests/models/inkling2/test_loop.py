@@ -126,9 +126,10 @@ def test_routing_replay_follows_each_pass_through_checkpoint_recompute() -> None
         gate.register_forward_hook(
             lambda module, inputs, output, index=int(index): used.append((index, module.router_replay.visit, output[1]))
         )
+    ids = torch.randint(0, config.unpadded_vocab_size, (1, 9))
     try:
         with RouterReplay.record():
-            model(torch.randint(0, config.unpadded_vocab_size, (1, 9)))
+            model(ids)
         recorded = RouterReplay.collect()
         # Layers 2-5 are the loop core: one selection per pass.
         assert [selection.dim() for selection in recorded] == [2, 2, 3, 3, 3, 3, 2, 2]
@@ -136,6 +137,11 @@ def test_routing_replay_follows_each_pass_through_checkpoint_recompute() -> None
 
         for index, layer in list(model.layers.items()):
             model.layers[index] = checkpoint_wrapper(layer)
+        # Recording a whole step keeps the same selections: the recompute rewrites each visit in place.
+        with RouterReplay.record():
+            model(ids).sum().backward()
+        for whole_step, forward_only in zip(RouterReplay.collect(), recorded, strict=True):
+            assert torch.equal(whole_step, forward_only)
         used.clear()
         with RouterReplay.replay(recorded):
             model(torch.randint(0, config.unpadded_vocab_size, (1, 9))).sum().backward()
