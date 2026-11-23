@@ -299,9 +299,9 @@ command line:
 
 It trains **7.42B parameters**: all 34 encoder blocks and the final norm. The input embeddings and the output
 projection (the decision head) stay frozen. The head's rows for the option codes are the readout, so keeping them
-fixed keeps every code's meaning identical to the base checkpoint: the exported model reads its decision contract
-exactly as the base does, and training cannot move probability toward tokens that are not option codes. It keeps
-fp32 weights and AdamW state for the trained parameters, so it uses one node of 8 GPUs (see
+fixed keeps every code's meaning identical to the base checkpoint, so the exported model reads its decision contract
+exactly as the base does. It keeps fp32 weights and AdamW state for the trained parameters, so it uses one node of 8
+GPUs (see
 [Hardware Requirements](#hardware-requirements)).
 
 ---
