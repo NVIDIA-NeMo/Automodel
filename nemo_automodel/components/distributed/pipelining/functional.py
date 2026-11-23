@@ -463,23 +463,23 @@ def _use_static_pipeline_stage_metadata(schedule: _PipelineSchedule, stages: lis
 
 
 def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
-    """Keep accumulated gradients alive when stage infrastructure is rebuilt.
+    """Keep stage re-initialization free of FSDP side effects in static metadata mode.
 
     ``_initialize_pp_stages`` ends by calling ``_post_metadata_inference_cleanup``
-    on every stage, which sets ``param.grad = None`` on FSDP modules. Upstream that
-    is safe: it assumes initialization happens once, before any real backward, and
-    only clears the throwaway gradients left behind by dynamic metadata inference.
+    on every stage, which reshards every FSDP module of the stage and sets
+    ``param.grad = None``. Upstream that is safe: it assumes initialization happens
+    once, before any real step, and only undoes the side effects of dynamic
+    metadata inference.
 
     ``reset_pp_stage_shapes`` breaks that assumption. It re-initializes the stages
-    whenever the sequence length changes, which for VLM batches is most steps -- and
-    with gradient accumulation that lands *between* micro-batches, so the cleanup
-    discards everything accumulated so far and only the final micro-batch's
-    gradients reach the optimizer.
+    whenever this rank's sequence length changes. Under gradient accumulation the
+    cleanup would discard the gradients accumulated so far, and in evaluation the
+    reshard makes only the re-initialized rank gather again, so its DP peers never
+    post the matching all-gathers and the ranks hang.
 
-    With static metadata no inference forward/backward runs, so there are no stale
-    gradients to clear and the whole wipe is collateral damage. Restore the
-    gradients in that case, and leave dynamic mode alone, where the cleanup is doing
-    real work.
+    With static metadata no inference forward/backward runs, so nothing is gathered,
+    no gradients are stale and nothing is stored. Skip the cleanup in that case, and
+    leave dynamic mode alone, where the cleanup is doing real work.
 
     Args:
         stages: The local pipeline stages to protect.
@@ -495,15 +495,37 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
             continue
 
         def _cleanup_preserving_grads(self, *, _cleanup=cleanup) -> None:
-            if getattr(self, "_inference_mode", None) is not InferenceMode.STATIC:
-                _cleanup()
+            # STATIC: no metadata forward ran, so nothing is gathered, no grads are stale,
+            # and nothing is stored. Skipping keeps rank-local re-inits FSDP-neutral.
+            if getattr(self, "_inference_mode", None) is InferenceMode.STATIC:
                 return
-            saved = [(param, param.grad) for param in self.submod.parameters() if param.grad is not None]
             _cleanup()
-            for param, grad in saved:
-                param.grad = grad
 
         stage._post_metadata_inference_cleanup = types.MethodType(_cleanup_preserving_grads, stage)
+
+
+def _check_stage_reinit_is_static(schedule: _PipelineSchedule, stages: list[PipelineStage]) -> None:
+    """Fail fast if a stage re-initialization would run dynamic metadata inference.
+
+    ``reset_pp_stage_shapes`` runs on each rank when its own sequence length changes.
+    Dynamic inference would run a real forward/backward and an FSDP reshard on that
+    rank only, so its DP peers would never post the matching collectives.
+    """
+    try:
+        from torch.distributed.pipelining._utils import InferenceMode, _StageMeta
+    except ImportError:
+        return
+
+    has_backward = getattr(schedule, "_has_backward", True)
+    for stage in stages:
+        user_meta = getattr(stage, "_user_meta", None)
+        if isinstance(user_meta, _StageMeta) and InferenceMode.needs_dynamic(user_meta, has_backward):
+            raise ValueError(
+                f"Pipeline stage {getattr(stage, 'stage_index', '?')} needs dynamic metadata inference after a "
+                "sequence-length reset, which is unsupported: a rank-local re-initialization in dynamic mode "
+                "desynchronizes FSDP collectives across data-parallel ranks. Provide complete static stage "
+                "metadata (plus input_grads/output_grads for DTensor stage inputs or outputs with backward)."
+            )
 
 
 def reset_pp_stage_shapes(
@@ -565,6 +587,7 @@ def reset_pp_stage_shapes(
     local_num_tokens = _precompute_stage_shapes(
         stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype
     )
+    _check_stage_reinit_is_static(schedule, stages)
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
