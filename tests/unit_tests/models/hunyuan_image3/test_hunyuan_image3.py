@@ -292,6 +292,12 @@ def test_forward_shapes_and_text_logits(model):
     assert model.get_output_embeddings() is model.lm_head
 
 
+def test_forward_text_returns_the_requested_logits_dtype():
+    model = _model()
+    model.lm_head.logits_dtype = torch.bfloat16
+    assert model.forward_text(_sequence(5, 6)[None]).dtype == torch.bfloat16
+
+
 def test_forward_is_invariant_to_right_padding_and_batching(model):
     latents = torch.randn(2, 4, 2, 3)
     short, long = _sequence(3, 6), _sequence(7, 6)

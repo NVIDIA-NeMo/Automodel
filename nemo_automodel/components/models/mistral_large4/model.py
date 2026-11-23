@@ -30,9 +30,10 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
-    compute_lm_head_logits,
+    LMHead,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -204,11 +205,8 @@ class MistralLarge4PipelineMixin:
             )
         else:
             width = self.config.hidden_size if self._pp_return_hidden_states else self.config.vocab_size
-            outputs = (
-                torch.empty(
-                    *shape, width, device="meta", dtype=dtype if self._pp_return_hidden_states else torch.float32
-                ),
-            )
+            out_dtype = dtype if self._pp_return_hidden_states else (self.lm_head.logits_dtype or dtype)
+            outputs = (torch.empty(*shape, width, device="meta", dtype=out_dtype),)
         return inputs, outputs
 
     def _receive_pipeline_state(
@@ -273,17 +271,16 @@ class MistralLarge4PipelineMixin:
                 int64 keys [tokens, min(index_topk, tokens)].
 
         Returns:
-            Final FP32 logits [batch, sequence, vocab], or compute-dtype hidden
-            states [batch, sequence, hidden] for fused CE. Non-final stages emit
+            Final softcapped logits [batch, sequence, vocab] in the head's
+            logits_dtype (FP32 by default), or compute-dtype hidden states
+            [batch, sequence, hidden] for fused CE. Non-final stages emit
             the tuple documented by ``_pipeline_boundary_metas``; transported
             state owns fresh storage and remains connected to autograd.
         """
         if self.lm_head is not None:
             if self._pp_return_hidden_states:
                 return hidden
-            logits = compute_lm_head_logits(self.lm_head, hidden).logits
-            cap = self.config.final_logit_softcapping
-            return cap * torch.tanh(logits.float() / cap)
+            return self.lm_head(hidden)
         boundary = self._pipeline_layer_ids()[-1] + 1
         batch, sequence = hidden.shape[:2]
         tensors = [
@@ -488,7 +485,13 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         supports_ep: bool = True
         supports_thd: bool = True
 
-    def __init__(self, config: MistralLarge4Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: MistralLarge4Config,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = torch.float32,
+    ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         config.validate_architecture()
         super().__init__(config)
@@ -527,7 +530,14 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         self.model = MistralLarge4Model(config, self.backend, dtype=dtype)
         self.moe_config = next((block.moe_config for block in self.model.layers if block.moe_config is not None), None)
         self.cp_mesh: DeviceMesh | None = None
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+        # The head applies the final-logit softcap to its FP32 logits, which are FP32 by default.
+        self.lm_head = LMHead(
+            config.hidden_size,
+            config.vocab_size,
+            dtype=dtype,
+            logits_dtype=logits_dtype,
+            logit_softcapping=config.final_logit_softcapping,
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MistralLarge4StateDictAdapter(
                 dtype=dtype,
@@ -659,9 +669,9 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
             PP instead returns the tensor/tuple contract from
             ``_finish_pipeline_stage`` and requires an external loss. Packed
             PP inputs must pass through the model-owned sharder.
-            The hidden states are uncapped; external fused loss must set
-            logit_softcapping to config.final_logit_softcapping. Chunked CE is rejected
-            by the existing loss implementation for softcapped models.
+            The hidden states are uncapped: the head applies the softcap, so chunked
+            CE, which projects through the head, includes it, and an external fused
+            loss must set logit_softcapping to config.final_logit_softcapping.
         """
         if use_cache or qkv_format not in ("bshd", "thd"):
             raise ValueError("Large 4 baseline supports bshd/thd full-sequence execution without a KV cache")
@@ -775,9 +785,8 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
             raise ValueError("logits_to_keep must be nonnegative")
         if labels is not None and (not isinstance(logits_to_keep, int) or logits_to_keep != 0):
             raise ValueError("Labels require logits for all positions")
-        output = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
-        cap = self.config.final_logit_softcapping
-        output.logits = cap * torch.tanh(output.logits.float() / cap)
+        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        output = CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
         if labels is not None:
             if labels.shape != (input_ids.shape if input_ids is not None else inputs_embeds.shape[:-1]):
                 raise ValueError("labels must match input token axes")
