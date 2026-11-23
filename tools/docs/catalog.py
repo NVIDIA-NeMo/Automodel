@@ -137,6 +137,7 @@ MODEL_TYPE_ROUTE_CATEGORIES = {
     "Embedding": "embedding-models",
     "Reranking": "reranking-models",
     "WAM": "wam",
+    "Decision": "decision-models",
 }
 
 
