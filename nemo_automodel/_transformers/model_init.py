@@ -749,6 +749,9 @@ def _check_fp8_dequantize_will_fit(
     )
 
 
+_DOCUMENTATION_FILES = ["README.md", "LICENSE", ".gitattributes"]
+
+
 def _resolve_model_dir(
     pretrained_model_name_or_path: str,
     *,
@@ -760,7 +763,7 @@ def _resolve_model_dir(
 
     Raises:
         LocalEntryNotFoundError: If the cache holds no snapshot folder for the revision.
-        IncompleteSnapshotError: If the cached snapshot lacks a weight file the loader reads.
+        IncompleteSnapshotError: If the cached snapshot lacks a listed file other than documentation.
     """
     model_dir = pretrained_model_name_or_path
     if not os.path.isdir(model_dir):
@@ -768,32 +771,16 @@ def _resolve_model_dir(
             model_dir = snapshot_download(
                 pretrained_model_name_or_path, revision=revision, cache_dir=cache_dir, local_files_only=True
             )
-        except IncompleteSnapshotError as error:
-            # Weight-only downloads (e.g. vLLM's) skip listed files no loader reads, such as README.md.
-            if not _has_complete_weights(os.path.join(error.snapshot_path, subfolder)):
-                raise
-            model_dir = error.snapshot_path
+        except IncompleteSnapshotError:
+            # Weight-only downloads (e.g. vLLM's) skip documentation files; every other listed file must be cached.
+            model_dir = snapshot_download(
+                pretrained_model_name_or_path,
+                revision=revision,
+                cache_dir=cache_dir,
+                local_files_only=True,
+                ignore_patterns=_DOCUMENTATION_FILES,
+            )
     return os.path.join(model_dir, subfolder) if subfolder else model_dir
-
-
-def _has_complete_weights(model_dir: str) -> bool:
-    """Check whether every weight file a checkpoint loader may read is present in a model directory."""
-    found = False
-    # Check both formats: the loaders do not all prefer the same one, and they skip missing shards.
-    for weights_name in ("model.safetensors", "pytorch_model.bin"):
-        index_path = os.path.join(model_dir, f"{weights_name}.index.json")
-        if os.path.isfile(index_path):
-            try:
-                with open(index_path) as f:
-                    shard_names = set(json.load(f)["weight_map"].values())
-                if not shard_names or not all(os.path.isfile(os.path.join(model_dir, name)) for name in shard_names):
-                    return False
-            except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                return False
-            found = True
-        elif os.path.isfile(os.path.join(model_dir, weights_name)):
-            found = True
-    return found
 
 
 def _has_safetensors(model_dir: str) -> bool:

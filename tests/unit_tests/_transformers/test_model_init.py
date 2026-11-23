@@ -1694,6 +1694,44 @@ def test_model_dir_keeps_hub_error_for_incomplete_second_format(hf_config_hub, c
         _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root))
 
 
+@pytest.mark.parametrize("bin_index_cached", [True, False], ids=["bin_index_cached", "bin_index_absent"])
+def test_model_dir_keeps_hub_error_for_incomplete_bin_with_or_without_index(
+    hf_config_hub, cached_tree_listing, bin_index_cached
+):
+    from huggingface_hub.errors import IncompleteSnapshotError
+
+    root, cache, _, _ = hf_config_hub
+    snapshot = cache / "snapshots" / ("b" * 40)
+    bin_shards = ["pytorch_model-00001-of-00002.bin", "pytorch_model-00002-of-00002.bin"]
+    # Complete sharded safetensors; one of two listed .bin shards is cached, with or without its index.
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": dict(zip("ab", _SHARDS))}))
+    for name in _SHARDS:
+        (snapshot / name).write_bytes(b"")
+    (snapshot / bin_shards[0]).write_bytes(b"")
+    listed = ["config.json", "model.safetensors.index.json", *_SHARDS, "pytorch_model.bin.index.json", *bin_shards]
+    if bin_index_cached:
+        (snapshot / "pytorch_model.bin.index.json").write_text(json.dumps({"weight_map": dict(zip("ab", bin_shards))}))
+    cached_tree_listing(cache, "b" * 40, listed)
+
+    with pytest.raises(IncompleteSnapshotError, match=bin_shards[1]):
+        _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root))
+
+
+@pytest.mark.parametrize("subfolder", ["", "nested"])
+def test_model_dir_keeps_hub_error_for_missing_generation_config(hf_config_hub, cached_tree_listing, subfolder):
+    from huggingface_hub.errors import IncompleteSnapshotError
+
+    root, cache, _, _ = hf_config_hub
+    snapshot = cache / "snapshots" / ("b" * 40)
+    prefix = f"{subfolder}/" if subfolder else ""
+    (snapshot / subfolder).mkdir(exist_ok=True)
+    (snapshot / subfolder / "model.safetensors").write_bytes(b"")
+    cached_tree_listing(cache, "b" * 40, ["config.json", f"{prefix}model.safetensors", f"{prefix}generation_config.json"])
+
+    with pytest.raises(IncompleteSnapshotError, match="generation_config.json"):
+        _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root), subfolder=subfolder)
+
+
 @pytest.mark.parametrize("offline_setting", ["hub_offline_mode", "local_files_only"])
 def test_weight_download_accepts_snapshot_missing_unread_listed_files(
     hf_config_hub, cached_tree_listing, monkeypatch, offline_setting
