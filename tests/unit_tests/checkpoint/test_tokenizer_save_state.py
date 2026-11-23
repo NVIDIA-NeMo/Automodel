@@ -25,10 +25,11 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, ProcessorMixin
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon, _save_generated_hf_assets
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
 pytestmark = pytest.mark.cpu_only
@@ -315,6 +316,133 @@ def test_saved_tokenizer_of_the_same_hub_repo_as_the_model_keeps_the_resolved_mo
     pre_save(model, tokenizer, directory, str(source))
 
     assert _saved_state(directory) == source_state
+
+
+class _Processor(ProcessorMixin):
+    """A processor that holds a tokenizer only; like every processor it has no ``name_or_path`` of its own."""
+
+    attributes = ["tokenizer"]
+    tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, tokenizer: PreTrainedTokenizerFast | None = None, chat_template: str | None = None) -> None:
+        super().__init__(tokenizer, chat_template=chat_template)
+
+
+class _ProcessorWithoutTokenizer:
+    """Stands in for a processor that holds no tokenizer, such as an image processor."""
+
+    def save_pretrained(self, save_directory: str | Path) -> None:
+        (Path(save_directory) / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+
+
+def _model_snapshot_with_another_state(tmp_path: Path) -> Path:
+    """Write a model snapshot whose ``tokenizer.json`` ships other entries than the source snapshot."""
+    other = _tokenizer()
+    other.backend_tokenizer.enable_truncation(max_length=3)
+    other.backend_tokenizer.enable_padding(length=3, pad_id=1)
+    model_snapshot = tmp_path / "model_snapshot"
+    other.save_pretrained(model_snapshot)
+    return model_snapshot
+
+
+_CALLED = pytest.mark.parametrize("called", [False, True], ids=["no_call", "after_a_training_call"])
+
+
+@_SAVE_SITES
+@_CALLED
+def test_saved_tokenizer_of_a_processor_keeps_the_state_of_its_own_snapshot_not_the_model_snapshot(
+    tmp_path: Path, save: SaveFn, called: bool
+) -> None:
+    """The VLM recipes hand a processor to the save; its tokenizer names the snapshot it was loaded from."""
+    tokenizer_snapshot, tokenizer_state = _source_snapshot_with_state(tmp_path)
+    model_snapshot = _model_snapshot_with_another_state(tmp_path)
+    assert _saved_state(model_snapshot) != tokenizer_state
+    processor = _Processor(PreTrainedTokenizerFast.from_pretrained(tokenizer_snapshot))
+    assert not hasattr(processor, "name_or_path")
+    if called:
+        _call_like_training(processor.tokenizer)
+    directory = tmp_path / "saved"
+    directory.mkdir()
+
+    save(processor, directory, str(model_snapshot))
+
+    assert _saved_state(directory) == tokenizer_state
+
+
+@pytest.mark.parametrize("pre_save", [_pre_save_full_model, _pre_save_peft_adapter], ids=["full_model", "peft_adapter"])
+@_CALLED
+def test_saved_tokenizer_of_a_processor_of_the_same_hub_repo_as_the_model_keeps_the_resolved_model_snapshot(
+    tmp_path: Path, pre_save: Callable[..., None], called: bool
+) -> None:
+    """A processor whose tokenizer names the model's repo takes the snapshot resolved for the model."""
+    source, source_state = _source_snapshot_with_state(tmp_path)
+    tokenizer = _tokenizer()
+    tokenizer.name_or_path = "org/repo-not-in-any-cache"
+    if called:
+        _call_like_training(tokenizer)
+    model = _Model()
+    model.name_or_path = "org/repo-not-in-any-cache"
+    directory = tmp_path / "saved"
+    directory.mkdir()
+
+    pre_save(model, _Processor(tokenizer), directory, str(source))
+
+    assert _saved_state(directory) == source_state
+
+
+@pytest.mark.parametrize("is_peft", [False, True], ids=["full_model", "peft_adapter"])
+@_CALLED
+def test_checkpointer_saves_the_tokenizer_of_a_processor_with_the_state_of_its_own_snapshot(
+    tmp_path: Path, is_peft: bool, called: bool
+) -> None:
+    """The same through ``Checkpointer.save_model``, which resolves the model snapshot from the model's name."""
+    tokenizer_snapshot, tokenizer_state = _source_snapshot_with_state(tmp_path)
+    model_snapshot = _model_snapshot_with_another_state(tmp_path)
+    processor = _Processor(PreTrainedTokenizerFast.from_pretrained(tokenizer_snapshot))
+    if called:
+        _call_like_training(processor.tokenizer)
+    model = _Model()
+    model.name_or_path = str(model_snapshot)
+    if is_peft:
+        peft_config = PeftConfig(target_modules=["*.query"], dim=2, alpha=4, use_triton=False)
+        assert apply_lora_to_linear_modules(model, peft_config) == 1
+        config = CheckpointingConfig(is_peft=True, save_consolidated=False, checkpoint_dir=str(tmp_path / "run"))
+    else:
+        peft_config = None
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path / "run"),
+            model_save_format="safetensors",
+            save_consolidated="final",
+            is_async=False,
+        )
+    checkpointer = config.build(0, 0, 0)
+    try:
+        checkpointer.save_model(
+            model, str(tmp_path / "step_0"), peft_config=peft_config, tokenizer=processor, is_final_checkpoint=True
+        )
+    finally:
+        checkpointer.close()
+
+    model_directory = tmp_path / "step_0" / "model"
+    saved_directories = (
+        [model_directory] if is_peft else [model_directory / ".hf_metadata", model_directory / "consolidated"]
+    )
+    for directory in saved_directories:
+        assert _saved_state(directory) == tokenizer_state
+
+
+@pytest.mark.parametrize("pre_save", [_pre_save_full_model, _pre_save_peft_adapter], ids=["full_model", "peft_adapter"])
+def test_processor_without_a_tokenizer_is_saved_without_an_error(tmp_path: Path, pre_save: Callable[..., None]) -> None:
+    """An object with neither a ``name_or_path`` nor a tokenizer writes no ``tokenizer.json`` to reset."""
+    source, _ = _source_snapshot_with_state(tmp_path)
+    directory = tmp_path / "saved"
+    directory.mkdir()
+
+    pre_save(_Model(), _ProcessorWithoutTokenizer(), directory, str(source))
+
+    assert (directory / "preprocessor_config.json").is_file()
+    assert not (directory / "tokenizer.json").exists()
 
 
 @_SAVE_SITES

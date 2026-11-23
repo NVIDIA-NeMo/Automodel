@@ -38,17 +38,20 @@ def tokenizer_source_path(
 
     The tokenizer can come from a different snapshot than the model weights. A tokenizer without a
     ``name_or_path``, or one that names the same source as the model, takes the snapshot already resolved for the
-    model, which honors the revision and cache directory of the load.
+    model, which honors the revision and cache directory of the load. A processor, which the VLM recipes hand to
+    the save, has no ``name_or_path`` of its own, so the tokenizer it holds is looked at.
 
     Args:
-        tokenizer: Tokenizer being saved.
+        tokenizer: Tokenizer being saved, or the processor that holds it.
         model_name_or_path: ``name_or_path`` of the model being saved, or None.
         original_model_path: Local snapshot of the model weights, or None.
 
     Returns:
         The local directory holding the tokenizer's own files, or None when it is not available locally.
     """
-    name_or_path = tokenizer.name_or_path
+    if not hasattr(tokenizer, "name_or_path"):
+        tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    name_or_path = getattr(tokenizer, "name_or_path", None)
     if not name_or_path or name_or_path == model_name_or_path:
         return original_model_path
     if os.path.isdir(name_or_path):
