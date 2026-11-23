@@ -32,6 +32,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput, MaskedLMOutput
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.ministral_bidirectional.model import Ministral3BidirectionalModel
 
 ARCHITECTURE = "NemotronForDecision"
@@ -44,6 +45,7 @@ class NemotronForDecision(PreTrainedModel):
     base_model_prefix = "encoder"
     _no_split_modules = ["Ministral3DecoderLayer"]
     _supports_sdpa = True
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
     class ModelCapabilities:
