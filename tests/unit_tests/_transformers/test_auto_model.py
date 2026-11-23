@@ -1907,6 +1907,41 @@ class TestBuildModelRetryDepth:
         )
         assert ref.read_text() == "a" * 40
 
+    def test_checkpoint_loading_accepts_snapshot_missing_unread_listed_files(self, hf_config_hub, cached_tree_listing):
+        from nemo_automodel._transformers.auto_config import NeMoAutoConfig
+
+        root, cache, _, _ = hf_config_hub
+        config = NeMoAutoConfig.from_pretrained("test/config-race", cache_dir=str(root), revision="b" * 40)
+        config.name_or_path = "test/config-race"
+        # vLLM-style weight download: the listing names files this cache never fetched.
+        (cache / "snapshots" / ("b" * 40) / "model.safetensors").write_bytes(b"")
+        cached_tree_listing(
+            cache, "b" * 40, ["config.json", "model.safetensors", "README.md", "LICENSE", ".gitattributes"]
+        )
+        build_kwargs, _ = self._make_build_kwargs()
+        from transformers.utils.hub import resolve_revision
+
+        build_kwargs.update(
+            is_hf_model=False,
+            cache_dir=str(root),
+            revision=resolve_revision("test/config-race", "b" * 40, cache_dir=str(root)),
+        )
+        sentinel_model = MagicMock()
+        with (
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model
+            ) as apply,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            _BaseNeMoAutoModelClass._build_model("test/config-race", **build_kwargs)
+
+        assert apply.call_args.kwargs["pretrained_model_name_or_path"] == str(cache / "snapshots" / ("b" * 40))
+
     def test_custom_model_under_ddp_still_needs_its_checkpoint(self):
         """A MODEL_ARCH_MAPPING model under DDP reaches infrastructure unloaded and off meta.
 
