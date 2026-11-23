@@ -141,7 +141,16 @@ class Glm5NextMTP(MTPModule):
             raise ValueError(f"GLM-5.3 MTP uses one sublayer per depth (pattern '*'), got {mtp_config.layer_pattern!r}")
         base_layer_idx = config.num_hidden_layers
 
-        def build_sublayer(*, global_idx: int, **_: object) -> Glm5NextMTPSublayer:
+        def build_sublayer(
+            *,
+            global_idx: int,
+            depth: int,
+            sublayer_idx: int,
+            block_type: str,
+            has_fusion: bool,
+            has_final_norm: bool,
+        ) -> Glm5NextMTPSublayer:
+            del depth, sublayer_idx, block_type, has_fusion, has_final_norm
             return Glm5NextMTPSublayer(config, base_layer_idx + global_idx, moe_config, backend, dtype)
 
         super().__init__(mtp_config, ["*"], build_sublayer)
