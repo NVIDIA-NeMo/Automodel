@@ -30,6 +30,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.nemotron_v3.mamba_scan import split_conv1d_scan
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # Elements of the projected states that the Triton kernels of the Mamba2 training scan (mamba_ssm) can address:
@@ -274,6 +275,10 @@ class NemotronV3Mamba2Mixer(nn.Module):
     unless ``backend.mamba_fused_out_proj`` is False. With ``"te"`` both are Transformer Engine linears,
     the output projection runs as a module after the scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize
     both GEMMs like every other TE linear.
+
+    ``backend.mamba_norm_backward_grid_scale`` above 1 runs the training scan through
+    ``mamba_scan.split_conv1d_scan``, which launches the gated-RMSNorm backward kernel with that many times
+    the programs.
     """
 
     def __init__(self, config, layer_idx: int, backend: BackendConfig | None = None):
@@ -282,6 +287,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         mamba_linear = backend.mamba_linear if backend is not None else "torch"
         # Whether a plain torch.nn.Linear output projection is applied inside the scan kernel.
         self.fused_out_proj = backend.mamba_fused_out_proj if backend is not None else True
+        self.norm_backward_grid_scale = backend.mamba_norm_backward_grid_scale if backend is not None else 1
 
         # Model dimensions
         self.hidden_size = config.hidden_size
@@ -527,26 +533,47 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 # Adapters and sharded wrappers must execute their module forward/hooks.
                 fuse_out_proj = self.fused_out_proj and type(self.out_proj) is nn.Linear
 
-                out = mamba_split_conv1d_scan_combined(
-                    projected_states,
-                    self.conv1d.weight.squeeze(1),
-                    self.conv1d.bias,
-                    dt_bias,
-                    A,
-                    D=D,
-                    chunk_size=self.chunk_size,
-                    seq_idx=seq_idx,
-                    activation=self.activation,
-                    rmsnorm_weight=self.norm.weight,
-                    rmsnorm_eps=self.norm.variance_epsilon,
-                    outproj_weight=self.out_proj.weight if fuse_out_proj else None,
-                    outproj_bias=self.out_proj.bias if fuse_out_proj else None,
-                    headdim=self.head_dim,
-                    ngroups=self.n_groups,
-                    norm_before_gate=False,
-                    return_final_states=False,
-                    **dt_limit_kwargs,
-                )
+                if self.norm_backward_grid_scale > 1:
+                    out = split_conv1d_scan(
+                        projected_states,
+                        self.conv1d.weight.squeeze(1),
+                        self.conv1d.bias,
+                        dt_bias,
+                        A,
+                        D,
+                        chunk_size=self.chunk_size,
+                        seq_idx=seq_idx,
+                        dt_limit=tuple(self.time_step_limit),
+                        activation=self.activation,
+                        rmsnorm_weight=self.norm.weight,
+                        rmsnorm_eps=self.norm.variance_epsilon,
+                        outproj_weight=self.out_proj.weight if fuse_out_proj else None,
+                        outproj_bias=self.out_proj.bias if fuse_out_proj else None,
+                        headdim=self.head_dim,
+                        ngroups=self.n_groups,
+                        norm_backward_grid_scale=self.norm_backward_grid_scale,
+                    )
+                else:
+                    out = mamba_split_conv1d_scan_combined(
+                        projected_states,
+                        self.conv1d.weight.squeeze(1),
+                        self.conv1d.bias,
+                        dt_bias,
+                        A,
+                        D=D,
+                        chunk_size=self.chunk_size,
+                        seq_idx=seq_idx,
+                        activation=self.activation,
+                        rmsnorm_weight=self.norm.weight,
+                        rmsnorm_eps=self.norm.variance_epsilon,
+                        outproj_weight=self.out_proj.weight if fuse_out_proj else None,
+                        outproj_bias=self.out_proj.bias if fuse_out_proj else None,
+                        headdim=self.head_dim,
+                        ngroups=self.n_groups,
+                        norm_before_gate=False,
+                        return_final_states=False,
+                        **dt_limit_kwargs,
+                    )
                 if not fuse_out_proj:
                     out = self.out_proj(out)
                 if squeezed:

@@ -756,6 +756,13 @@ class BackendConfig:
             longer rebuilds the projection input. Ignored for ``mamba_linear="te"`` and for
             adapter-wrapped projections, which always run after the kernel, and with context
             parallelism, whose scan always applies the projection as a module. Default True.
+        mamba_norm_backward_grid_scale: Number of programs of the gated-RMSNorm backward kernel in the
+            Mamba training scan (NemotronV3), as a multiple of the number mamba_ssm launches (about one
+            per streaming multiprocessor, each looping over thousands of rows). 1 runs mamba_ssm's own
+            backward. Above 1 the scan runs through ``nemotron_v3.mamba_scan.split_conv1d_scan``: the
+            same kernels in the same order, with shorter row loops for this one. The output is
+            unchanged; of the gradients only the norm weight's changes, in its float32 summation
+            order. Not used with context parallelism. Default 1.
     """
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -853,12 +860,23 @@ class BackendConfig:
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
     mamba_linear: Literal["torch", "te"] = "torch"
     mamba_fused_out_proj: bool = True
+    mamba_norm_backward_grid_scale: int = 1
 
     def __post_init__(self) -> None:
         if self.mamba_linear not in ("torch", "te"):
             raise ValueError(f"Unsupported mamba_linear={self.mamba_linear!r}; expected 'torch' or 'te'.")
         if self.mamba_linear == "te" and not HAVE_TE:
             raise ValueError("mamba_linear='te' requires Transformer Engine")
+        if isinstance(self.mamba_norm_backward_grid_scale, bool) or not isinstance(
+            self.mamba_norm_backward_grid_scale, int
+        ):
+            raise ValueError(
+                f"mamba_norm_backward_grid_scale must be an integer, got {self.mamba_norm_backward_grid_scale!r}"
+            )
+        if self.mamba_norm_backward_grid_scale < 1:
+            raise ValueError(
+                f"mamba_norm_backward_grid_scale must be at least 1, got {self.mamba_norm_backward_grid_scale!r}"
+            )
 
         # benchmark_static_routing caches routing metadata across microbatches, which is
         # only sound when routing is constant by construction (forced balance, no noise).
