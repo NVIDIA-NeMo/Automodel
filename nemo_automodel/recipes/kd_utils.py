@@ -413,15 +413,25 @@ class KDMeshBridge:
             Replicated tensor of shape ``[batch, sequence, vocab]`` for a
             non-TP student, otherwise a contiguous tensor of shape
             ``[batch, sequence, local_vocab]`` matching this rank's shard.
+
+        Raises:
+            ValueError: A vocab-sharded student and the teacher have different global vocabulary sizes.
         """
         if not isinstance(student_logits, DTensor):
             return teacher_logits
         vocab_dim = student_logits.ndim - 1
         for mesh_dim, placement in enumerate(student_logits.placements):
             if isinstance(placement, Shard) and placement.dim in {-1, vocab_dim}:
-                group = student_logits.device_mesh.get_group(mesh_dim)
-                chunks = torch.tensor_split(teacher_logits, dist.get_world_size(group), dim=-1)
-                return chunks[dist.get_rank(group)].contiguous()
+                vocab_size = student_logits.size(vocab_dim)
+                if teacher_logits.size(-1) != vocab_size:
+                    raise ValueError(
+                        f"KD vocabulary sizes must match: teacher={teacher_logits.size(-1)}, student={vocab_size}"
+                    )
+                mesh = student_logits.device_mesh
+                size, offset = placement._local_shard_size_and_offset(
+                    vocab_size, mesh.size(mesh_dim), mesh.get_local_rank(mesh_dim)
+                )
+                return teacher_logits.narrow(-1, offset, size).contiguous()
         return teacher_logits
 
     def broadcast_command(self, command: int | None = None) -> int:
