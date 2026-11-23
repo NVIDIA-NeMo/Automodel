@@ -143,9 +143,10 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
 
     # Create wrapper class that looks identical to original
     namespace = {"__module__": model_class.__module__, "__qualname__": model_class.__qualname__}
-    # A forward that can limit its head to one position takes compute_logits, like the repo's forwards.
-    if "logits_to_keep" in inspect.signature(model_class.forward).parameters:
-        namespace["forward"] = with_compute_logits(model_class.forward)
+    forward = with_compute_logits(model_class.forward)
+    if forward is not model_class.forward:
+        # Define only a forward that gains compute_logits; any other stays inherited.
+        namespace["forward"] = forward
     wrapped_class = type(model_class.__name__, (HFCheckpointingMixin, model_class), namespace)
     return configure_parallelization_metadata(wrapped_class)
 

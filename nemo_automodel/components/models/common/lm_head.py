@@ -317,13 +317,17 @@ def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., Mo
     """Give a Hugging Face forward the ``compute_logits`` option that the repo's forwards take.
 
     Args:
-        forward: Hugging Face ``forward`` that takes ``logits_to_keep`` and always runs its head.
+        forward: Hugging Face ``forward``, which always runs its head.
 
     Returns:
         ``forward`` with a keyword-only ``compute_logits``, True by default. False projects the last position only
         and returns the output through :func:`drop_logits`. Its signature is ``forward``'s plus ``compute_logits``,
-        so signature-based checks see the parameters ``forward`` takes.
+        so signature-based checks see the parameters ``forward`` takes. A forward that already takes
+        ``compute_logits``, or takes no ``logits_to_keep`` to limit its head, is returned as is.
     """
+    signature = inspect.signature(forward)
+    if "compute_logits" in signature.parameters or "logits_to_keep" not in signature.parameters:
+        return forward
 
     @functools.wraps(forward)
     def forward_with_compute_logits(
@@ -344,7 +348,6 @@ def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., Mo
             return forward(self, *args, **kwargs)
         return drop_logits(forward(self, *args, **{**kwargs, "logits_to_keep": 1}), self.get_output_embeddings())
 
-    signature = inspect.signature(forward)
     parameters = list(signature.parameters.values())
     # A keyword-only parameter goes before **kwargs.
     end = next((i for i, p in enumerate(parameters) if p.kind is inspect.Parameter.VAR_KEYWORD), len(parameters))

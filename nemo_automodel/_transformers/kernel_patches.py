@@ -28,6 +28,7 @@ import types
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from nemo_automodel.components.models.common.lm_head import with_compute_logits
 from nemo_automodel.shared.import_utils import safe_import
 
 # Check availability without fully importing (avoids CUDA init at import time).
@@ -193,6 +194,10 @@ def _patch_liger_kernel(model):
             logger.info("Applied model-owned Liger kernel patch")
         else:
             liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
+            forward = with_compute_logits(model.forward.__func__)
+            if forward is not model.forward.__func__:
+                # Liger bound its forward to the instance, ahead of the class's: give it compute_logits too.
+                model.forward = types.MethodType(forward, model)
             logger.info("Applied liger-kernel to model")
         return model
     except Exception:
