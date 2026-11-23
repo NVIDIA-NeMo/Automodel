@@ -279,7 +279,7 @@ def _get_task_head_keys(model: nn.Module, state_dict_keys: Iterable[str]) -> lis
 
     E.g. ``score.*`` of ``Qwen2ForTokenClassification`` built on a ``Qwen2ForCausalLM`` checkpoint.
     """
-    unwrapped = _unwrap_ddp_model(model)
+    unwrapped = unwrap_ddp_model(model)
     prefix = getattr(unwrapped, "base_model_prefix", "")
     backbone = getattr(unwrapped, prefix, None) if prefix else None
     # A model that is its own backbone (e.g. T5ForConditionalGeneration) has no task heads.
