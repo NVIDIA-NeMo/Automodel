@@ -43,4 +43,25 @@ def test_parallelize_moe_forwards_the_moe_checkpointing_mode() -> None:
     kwargs = parallelize.call_args.kwargs
     assert kwargs["activation_checkpointing"] == "moe"
     assert kwargs["ignore_router_for_ac"] is True
+    assert kwargs["checkpoint_repeated_mtp_moe"] is False
     assert "checkpoint_moe_only" not in kwargs
+
+
+def test_parallelize_moe_forwards_checkpoint_repeated_mtp_moe() -> None:
+    """distributed.moe.checkpoint_repeated_mtp_moe must reach parallelize_model."""
+    model = nn.Linear(2, 2)
+    mesh_context = SimpleNamespace(
+        device_mesh=object(),
+        moe_mesh=object(),
+        moe_parallel_config=MoEParallelizerConfig(checkpoint_repeated_mtp_moe=True),
+        strategy_config=None,
+        activation_checkpointing=True,
+        reapply_trainability=None,
+        parallelize_axis_kwargs=lambda: {},
+    )
+    parallelizer = SimpleNamespace(_customizes_moe_fsdp=False)
+
+    with patch("nemo_automodel.components.moe.parallelizer.parallelize_model", return_value=model) as parallelize:
+        assert model_parallelizer._parallelize_moe(model, mesh_context, parallelizer=parallelizer) is model
+
+    assert parallelize.call_args.kwargs["checkpoint_repeated_mtp_moe"] is True
