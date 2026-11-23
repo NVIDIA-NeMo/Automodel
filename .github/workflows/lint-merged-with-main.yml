@@ -1,0 +1,120 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Lint every open pull request merged into the latest main and post the result as the
+# "Lint merged with main" commit status on its head. CI lints a pull request against main
+# as it was when that CI run started, so a pull request that stays open while main changes
+# could otherwise merge code that no longer lints.
+#
+# Pull request events lint that pull request. Pushes to main lint every open pull request,
+# since any of them may now conflict with main, and post only the statuses that change.
+#
+# Both triggers run with a token that can write commit statuses, so the job checks out main,
+# never the pull request. tools/lint_merged_with_main.py fetches pull request heads as data
+# and never executes them, and the step that reads them gets no token.
+
+name: Lint merged with main
+
+on:
+  # Posts statuses on pull requests from forks too, and never checks out or runs pull request code.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A newer main lints every pull request again, so main runs queue instead of cancelling.
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+jobs:
+  lint-merged-with-main:
+    name: Lint pull requests merged into main
+    if: ${{ !github.event.pull_request.draft }}
+    permissions:
+      contents: read # check out main
+      pull-requests: read # list open pull requests and the statuses already posted
+      statuses: write # post the "Lint merged with main" status
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.8.22
+
+      - name: Install the ruff version pinned in uv.lock
+        run: |
+          version=$(python -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("uv.lock", "rb"))["package"] if p["name"] == "ruff"))')
+          uv tool install "ruff==$version"
+
+      - name: List pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ -n "$PR_NUMBER" ]]; then
+            jq -n --argjson number "$PR_NUMBER" --arg head_sha "$PR_HEAD_SHA" '[{$number, $head_sha}]' > prs.json
+            exit 0
+          fi
+          # Each open pull request with the status already posted on its head, so that only changes get posted.
+          gh api graphql --paginate -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" -f query='
+            query($owner: String!, $name: String!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, baseRefName: "main", first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    number
+                    isDraft
+                    headRefOid
+                    commits(last: 1) { nodes { commit { status { context(name: "Lint merged with main") { state description } } } } }
+                  }
+                }
+              }
+            }' --jq '
+            .data.repository.pullRequests.nodes[]
+            | select(.isDraft | not)
+            | (.commits.nodes[0].commit.status.context // {}) as $posted
+            | {number, head_sha: .headRefOid, state: ($posted.state | if . then ascii_downcase else null end), description: $posted.description}
+          ' | jq -s . > prs.json
+
+      - name: Lint pull requests merged into main
+        run: |
+          python tools/lint_merged_with_main.py --base origin/main --prs prs.json --ruff "$(uv tool dir --bin)/ruff" \
+            --output-dir lint-merged-with-main
+          cat lint-merged-with-main/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          failed=0
+          while read -r status; do
+            if ! gh api --silent --method POST "repos/$GITHUB_REPOSITORY/statuses/$(jq -r .head_sha <<< "$status")" \
+              -f context="Lint merged with main" \
+              -f state="$(jq -r .state <<< "$status")" \
+              -f description="$(jq -r .description <<< "$status")" \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"; then
+              echo "::warning::Could not post the status of #$(jq -r .number <<< "$status")"
+              failed=1
+            fi
+            # GitHub allows about 80 content-creating requests a minute.
+            sleep 1
+          done < <(jq -c '.[]' lint-merged-with-main/results.json)
+          exit "$failed"

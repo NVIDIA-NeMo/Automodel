@@ -57,6 +57,14 @@ ruff check --fix nemo_automodel/components/models/llama/
 Tests (`tests/`) are excluded from Ruff, Bandit and the module-namespace
 check. Docstring rules (`D`) are also relaxed in test files.
 
+The CI lint jobs check a pull request against main as it was when that CI run
+started. The `Lint merged with main` commit status runs `ruff check` and
+`ruff format --check` on the pull request merged into the latest main, whenever
+the pull request or main changes, and reports only findings that main does not
+already have (`tools/lint_merged_with_main.py`). A new finding there usually
+means main renamed something your branch still uses, or main enabled a rule
+after your CI ran.
+
 ## Type Hints
 
 Required on all public API functions and methods.
