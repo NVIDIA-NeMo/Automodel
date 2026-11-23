@@ -1726,7 +1726,9 @@ def test_model_dir_keeps_hub_error_for_missing_generation_config(hf_config_hub, 
     prefix = f"{subfolder}/" if subfolder else ""
     (snapshot / subfolder).mkdir(exist_ok=True)
     (snapshot / subfolder / "model.safetensors").write_bytes(b"")
-    cached_tree_listing(cache, "b" * 40, ["config.json", f"{prefix}model.safetensors", f"{prefix}generation_config.json"])
+    cached_tree_listing(
+        cache, "b" * 40, ["config.json", f"{prefix}model.safetensors", f"{prefix}generation_config.json"]
+    )
 
     with pytest.raises(IncompleteSnapshotError, match="generation_config.json"):
         _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root), subfolder=subfolder)
