@@ -1778,6 +1778,23 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             input_ids = None
             for media_key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"):
                 kwargs.pop(media_key, None)
+        elif (
+            cp_size <= 1
+            and self.mtp is not None
+            and self.training
+            and inputs_embeds is None
+            and input_ids is not None
+            and not torch.is_floating_point(input_ids)
+            and pixel_values is None
+            and pixel_values_videos is None
+            and getattr(self.model.language_model, "embed_tokens", None) is not None
+        ):
+            # A text-only batch embeds here too, so MTP rolls these embeddings instead of calling
+            # embed_tokens again after lm_head. Media batches call it once (above). FSDP2 prefetches
+            # in backward by forward call order, so a rank that called it again would issue different
+            # all-gathers and deadlock a step that mixes media and text-only ranks.
+            inputs_embeds = self.model.language_model.embed_tokens(input_ids)
+            input_ids = None
         if cp_size > 1 and inputs_embeds is None and input_ids is not None and not torch.is_floating_point(input_ids):
             is_first_stage = getattr(self.model.language_model, "embed_tokens", None) is not None
             is_last_stage = getattr(self, "lm_head", None) is not None

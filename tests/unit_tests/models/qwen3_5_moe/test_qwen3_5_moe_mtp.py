@@ -152,3 +152,85 @@ class TestQwen3_5MoeMTP:
         assert out.mtp_per_depth_h is not None
         assert len(out.mtp_per_depth_h) == 1
         assert out.mtp_per_depth_h[0].shape == (1, 4, cfg.text_config.hidden_size)
+
+    def test_mtp_training_enters_modules_in_one_order_for_text_and_media(self):
+        """Text-only and media batches call ``embed_tokens`` once and enter the wrapped modules in one order.
+
+        FSDP2 gathers a module's parameters when it is entered and prefetches in backward by forward call
+        order, so ranks that enter these modules in different orders issue different collectives.
+        """
+        cfg = _tiny_vl_config(mtp_num_hidden_layers=1)
+        cfg.image_token_id, cfg.video_token_id = 5, 6
+        cfg.vision_start_token_id, cfg.vision_end_token_id = 7, 8
+        model = Qwen3_5MoeForConditionalGeneration(cfg, backend=_backend())
+        model.initialize_weights()
+        model.train()
+        language_model = model.model.language_model
+
+        calls: list[str] = []
+        watched = {
+            "embed_tokens": language_model.embed_tokens,
+            "language_model": language_model,
+            "lm_head": model.lm_head,
+            "mtp": model.mtp,
+        }
+        handles = [
+            module.register_forward_pre_hook(lambda _module, _args, name=name: calls.append(name))
+            for name, module in watched.items()
+        ]
+        try:
+            model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]))
+            text_calls = list(calls)
+            calls.clear()
+
+            # Four image placeholders for one 2x2-patch image; pixel_values has shape [patches, patch_features].
+            model(
+                input_ids=torch.tensor([[7, 5, 5, 5, 5, 8, 10, 11]]),
+                pixel_values=torch.randn(4, 12, dtype=model.lm_head.weight.dtype),
+                image_grid_thw=torch.tensor([[1, 2, 2]]),
+            )
+            media_calls = list(calls)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert text_calls == ["embed_tokens", "language_model", "lm_head", "mtp"]
+        assert media_calls == text_calls
+
+    def test_text_only_mtp_matches_the_token_id_reference(self):
+        """Rolling the backbone embeddings gives MTP the inputs that re-embedding rolled token IDs would.
+
+        The last position is excluded: it has no future token, the two forms fill it differently, and the
+        MTP loss ignores it.
+        """
+        model = Qwen3_5MoeForConditionalGeneration(_tiny_vl_config(mtp_num_hidden_layers=1), backend=_backend())
+        model.initialize_weights()
+        model.train()
+        language_model = model.model.language_model
+        batch, sequence = 2, 8
+        input_ids = torch.randint(1, 64, (batch, sequence), generator=torch.Generator().manual_seed(0))
+
+        backbone_output = []
+        handle = model.model.register_forward_hook(
+            lambda _module, _args, output: backbone_output.append(output.last_hidden_state)
+        )
+        try:
+            out = model(input_ids=input_ids)
+        finally:
+            handle.remove()
+
+        # Text positions on all three mRoPE axes: the layout the model derives when none is supplied.
+        position_ids = torch.arange(sequence).view(1, 1, -1).expand(3, batch, -1)
+        reference = model.mtp(
+            backbone_output[0],
+            input_ids=input_ids,
+            embed_fn=language_model.embed_tokens,
+            position_ids=position_ids,
+            attention_mask=None,
+            padding_mask=None,
+            rotary_emb=language_model.rotary_emb,
+        )
+
+        assert len(out.mtp_per_depth_h) == len(reference) == 1
+        assert torch.isfinite(reference[0]).all()
+        torch.testing.assert_close(out.mtp_per_depth_h[0][:, :-1], reference[0][:, :-1], rtol=0, atol=0)
