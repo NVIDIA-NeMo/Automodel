@@ -252,6 +252,18 @@ class NemotronV3Model(nn.Module):
         # seq_idx (no 2D mask); attention uses the 4D mask directly.
         _neat_packed = "seq_idx" in kwargs and attention_mask is not None and attention_mask.dim() == 4
 
+        # A [batch, sequence] padding mask without padding leaves every hidden state unchanged, so the
+        # Mamba layers skip their mask multiply: one elementwise pass over the hidden states per layer in
+        # the forward and one in the backward. Resolved once per forward with a single host read.
+        mamba_mask = attention_mask
+        if (
+            past_key_values is None
+            and attention_mask is not None
+            and attention_mask.dim() == 2
+            and bool((attention_mask == 1).all())
+        ):
+            mamba_mask = None
+
         for layer in self.layers.values():
             if is_thd:
                 mask = None
@@ -263,7 +275,7 @@ class NemotronV3Model(nn.Module):
                 mask = causal_mask if causal_mask is not None else attention_mask
             elif layer.block_type == "mamba":
                 # Mamba layers use 2D padding mask during prefill, None during decode
-                mask = None if (past_key_values is not None and past_key_values.has_previous_state) else attention_mask
+                mask = None if (past_key_values is not None and past_key_values.has_previous_state) else mamba_mask
             else:
                 # MLP/MoE layers don't use mask
                 mask = None
