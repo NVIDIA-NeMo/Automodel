@@ -87,7 +87,6 @@ from nemo_automodel.components.loss.utils import (
     _get_loss_ignore_index,
     calculate_loss,
     prepare_lm_weight,
-    projected_logits_dtype,
 )
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
@@ -106,12 +105,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import (
-    VLM_INPUT_KEYS,
-    _supports_compute_logits,
-    _supports_logits_to_keep,
-    filter_forward_kwargs,
-)
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -1120,10 +1114,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # The loss projects the hidden states itself: skip the LM head, and its FSDP all-gather, where the
-                    # model can, else project a single position.
-                    no_logits = {"compute_logits": False} if _supports_compute_logits(model) else {"logits_to_keep": 1}
-                    out = model(**{**batch, **no_logits, "output_hidden_states": True})
+                    # The loss projects the final hidden states itself, with the head weight the model returns.
+                    out = model(**{**batch, "compute_logits": False, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
@@ -1137,8 +1129,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     prepare_lm_weight(
                         self.loss_fn,
                         model,
-                        # A forward that skipped its head returns the weight as the module holds it.
-                        lm_head_weight=getattr(out, "lm_head_weight", None),
+                        lm_head_weight=out.lm_head_weight,
                         grad_reduce_group=grad_reduce_group,
                     )
                     if isinstance(self.loss_fn, LinearCrossEntropy)
@@ -1185,7 +1176,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
                         lm_weight=shared_lm_weight,
-                        logits_dtype=projected_logits_dtype(getattr(out, "logits", None)),
                         grad_reduce_group=grad_reduce_group,
                         cu_seqlens=mtp_cu_seqlens,
                     )
@@ -1403,15 +1393,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, LinearCrossEntropy):
-                        validation_model = self.model_parts[0]
-                        no_logits = (
-                            {"compute_logits": False}
-                            if _supports_compute_logits(validation_model)
-                            else {"logits_to_keep": 1}
-                        )
-                        out = validation_model(**{**batch, **no_logits, "output_hidden_states": True})
+                        out = self.model_parts[0](**{**batch, "compute_logits": False, "output_hidden_states": True})
                         lm_weight = prepare_lm_weight(
-                            self.loss_fn, validation_model, lm_head_weight=getattr(out, "lm_head_weight", None)
+                            self.loss_fn, self.model_parts[0], lm_head_weight=out.lm_head_weight
                         )
                     else:
                         out = self.model_parts[0](**batch)

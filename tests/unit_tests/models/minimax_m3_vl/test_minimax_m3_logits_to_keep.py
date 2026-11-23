@@ -18,8 +18,8 @@ The recipe decides whether a memory-efficient loss is usable by inspecting the
 forward signature (``_supports_logits_to_keep``), so absorbing the kwarg into
 ``**kwargs`` silently downgrades the configured ``loss_fn`` to a default
 ``MaskedCrossEntropy`` -- along with its ``fp32_upcast`` setting -- and
-materialises the ``[tokens, vocab_size]`` logits tensor. A forward that declares
-``compute_logits`` (``_supports_compute_logits``) is then called without logits.
+materialises the ``[tokens, vocab_size]`` logits tensor. The recipe then calls
+the forward with ``compute_logits=False``.
 """
 
 import pytest
@@ -27,7 +27,7 @@ import torch
 
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
-from nemo_automodel.components.utils.model_utils import _supports_compute_logits, _supports_logits_to_keep
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
 from .conftest import (
     IMAGE_TOKEN_INDEX,
@@ -63,9 +63,8 @@ def mtp_vlm_model(backend):
 
 
 def test_recipe_detects_logits_to_keep_support(vlm_model):
-    """The probes the trainer actually runs before keeping a fused loss and skipping the head."""
+    """The probe the trainer actually runs before keeping a fused loss."""
     assert _supports_logits_to_keep(vlm_model)
-    assert _supports_compute_logits(vlm_model)
 
 
 def test_compute_logits_false_returns_hidden_states_and_skips_lm_head(vlm_model):

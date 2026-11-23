@@ -37,7 +37,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, drop_logits, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -434,11 +434,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                 logits_to_keep=logits_to_keep if compute_logits else 1,
                 **kwargs,
             )
-            if not compute_logits:
-                output.logits = output.logits[..., :0]
-                # Item assignment registers the key Hugging Face's output class does not declare.
-                output["lm_head_weight"] = self.lm_head.weight
-            return output
+            return output if compute_logits else drop_logits(output, self.lm_head)
 
         if input_ids is None:
             if inputs_embeds is None:

@@ -81,22 +81,6 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     return sig is not None and "logits_to_keep" in sig.parameters
 
 
-def _supports_compute_logits(model: nn.Module) -> bool:
-    """Check whether ``model.forward`` can skip its LM head with ``compute_logits=False``.
-
-    Fused-linear losses project the final hidden states themselves, so they ask such models for no logits.
-    A ``**kwargs`` catch-all does not count: a Hugging Face forward would pass the flag on unread.
-
-    Args:
-        model: The model to check.
-
-    Returns:
-        True if ``model.forward`` declares a ``compute_logits`` parameter.
-    """
-    sig = _get_forward_signature(model)
-    return sig is not None and "compute_logits" in sig.parameters
-
-
 def _supports_seq_lens(model: nn.Module) -> bool:
     """
     Check if the model's forward() accepts seq_lens.

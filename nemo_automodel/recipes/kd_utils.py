@@ -138,8 +138,7 @@ def materialize_teacher_logits(
     """
     shard = vocab_shard(logits)
     local = shard.local.detach()
-    mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None) or ()
-    if device_mesh is not None and "cp" in mesh_dim_names and device_mesh["cp"].size() > 1:
+    if device_mesh is not None and "cp" in (device_mesh.mesh_dim_names or ()) and device_mesh["cp"].size() > 1:
         local = gather_context_parallel_tensor(device_mesh["cp"], local, seq_dim=1)
         if local is None:
             return None

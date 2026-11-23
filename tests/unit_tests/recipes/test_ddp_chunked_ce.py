@@ -23,6 +23,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import GPTNeoXConfig, GPTNeoXForCausalLM, MistralConfig, MistralForCausalLM
 
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -44,18 +45,26 @@ def ddp_group(tmp_path):
         dist.destroy_process_group()
 
 
+def _as_loaded(model: nn.Module) -> nn.Module:
+    """Give a Hugging Face model the class the loader builds for it, whose forward takes compute_logits."""
+    model.__class__ = _get_mixin_wrapped_class(type(model))
+    return model
+
+
 def _mistral(*, tied=False):
-    return MistralForCausalLM(
-        MistralConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=2,
-            use_cache=False,
-            attention_dropout=0.0,
-            tie_word_embeddings=tied,
+    return _as_loaded(
+        MistralForCausalLM(
+            MistralConfig(
+                vocab_size=32,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                use_cache=False,
+                attention_dropout=0.0,
+                tie_word_embeddings=tied,
+            )
         )
     )
 
@@ -65,16 +74,18 @@ def _tied_mistral():
 
 
 def _gpt_neox():
-    return GPTNeoXForCausalLM(
-        GPTNeoXConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            use_cache=False,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
+    return _as_loaded(
+        GPTNeoXForCausalLM(
+            GPTNeoXConfig(
+                vocab_size=32,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                use_cache=False,
+                attention_dropout=0.0,
+                hidden_dropout=0.0,
+            )
         )
     )
 
@@ -163,7 +174,7 @@ def _check_ddp_chunked_ce_training(rank, world_size, model_factory):
             args: Empty positional arguments.
             kwargs: Forward arguments including input_ids of shape [batch, sequence].
         """
-        forwarded.append(kwargs["logits_to_keep"])
+        forwarded.append(kwargs["compute_logits"])
 
     handle = wrapped.register_forward_pre_hook(record_forward, with_kwargs=True)
     optimizer = torch.optim.SGD(wrapped.parameters(), lr=0.1)
@@ -206,7 +217,8 @@ def _check_ddp_chunked_ce_training(rank, world_size, model_factory):
             ref_optimizer.zero_grad()
     finally:
         handle.remove()
-    assert forwarded == [1, 1, 1, 1]
+    # The step asks the wrapped forward for no logits; the loss projects the hidden states.
+    assert forwarded == [False, False, False, False]
 
 
 @pytest.mark.parametrize("model_factory", [_mistral, _tied_mistral, _gpt_neox])

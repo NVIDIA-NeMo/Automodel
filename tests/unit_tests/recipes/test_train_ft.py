@@ -33,7 +33,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.mfu import MFUConfig
-from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class, resolve_sdpa_method
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
@@ -3778,7 +3778,9 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
         tie_word_embeddings=tied,
         use_cache=False,
     )
+    # The loader gives a Hugging Face model's forward the compute_logits option.
     model = LlamaForCausalLM(config)
+    model.__class__ = _get_mixin_wrapped_class(LlamaForCausalLM)
     reference = LlamaForCausalLM(config)
     reference.load_state_dict(model.state_dict())
     recipe = SimpleNamespace(
@@ -3958,7 +3960,9 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
     config._attn_implementation = "eager"
     config.text_config._attn_implementation = "eager"
     if implementation == "hf":
+        # The loader gives a Hugging Face model's forward the compute_logits option.
         model = Gemma4ForConditionalGeneration(config)
+        model.__class__ = _get_mixin_wrapped_class(Gemma4ForConditionalGeneration)
     else:
         model = AutoModelGemma4(
             config,

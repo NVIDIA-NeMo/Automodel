@@ -18,6 +18,8 @@ Fused-linear losses project the hidden states with that weight themselves. Forwa
 whose forward always runs the head, project a single position and return empty logits.
 """
 
+import copy
+import inspect
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -25,9 +27,11 @@ import pytest
 import torch
 from torch import nn
 
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 
 pytestmark = pytest.mark.cpu_only
 
@@ -131,3 +135,51 @@ def test_kimi_vl_without_logits_returns_its_output_without_return_dict():
     assert output.logits.shape == (2, 5, 0)
     assert output.hidden_states is hidden_states
     assert output.lm_head_weight is head.weight
+
+
+def test_loaded_hugging_face_class_takes_compute_logits():
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        use_cache=False,
+    )
+    torch.manual_seed(0)
+    reference = LlamaForCausalLM(config).eval()
+    model = copy.deepcopy(reference)
+    # The loader builds every Hugging Face model with this class.
+    model.__class__ = _get_mixin_wrapped_class(LlamaForCausalLM)
+    projected = []
+    model.lm_head.register_forward_pre_hook(lambda module, args: projected.append(args[0].shape[:-1]))
+    input_ids = torch.randint(0, 64, (2, 6), generator=torch.Generator().manual_seed(1))
+
+    with torch.no_grad():
+        expected = reference(input_ids=input_ids, output_hidden_states=True)
+        with_logits = model(input_ids=input_ids, output_hidden_states=True)
+        projected.clear()
+        output = model(input_ids=input_ids, output_hidden_states=True, compute_logits=False)
+
+    assert type(model).__name__ == "LlamaForCausalLM"
+    # Signature-based checks still see Hugging Face's parameters, and the new option.
+    parameters = inspect.signature(model.forward).parameters
+    assert "logits_to_keep" in parameters and parameters["compute_logits"].default is True
+    assert _supports_logits_to_keep(model)
+    torch.testing.assert_close(with_logits.logits, expected.logits, rtol=0, atol=0)
+    assert "lm_head_weight" not in with_logits
+    assert projected == [torch.Size([2, 1])]
+    assert output.logits.shape == (2, 1, 0)
+    assert output.lm_head_weight is model.lm_head.weight
+    torch.testing.assert_close(output.hidden_states[-1], expected.hidden_states[-1], rtol=0, atol=0)
+
+
+def test_hugging_face_forward_without_logits_to_keep_is_not_wrapped():
+    from transformers import BertForMaskedLM
+
+    # Without logits_to_keep the head cannot be limited, and the recipe keeps a logits loss for the model.
+    assert "logits_to_keep" not in inspect.signature(BertForMaskedLM.forward).parameters
+    assert _get_mixin_wrapped_class(BertForMaskedLM).forward is BertForMaskedLM.forward

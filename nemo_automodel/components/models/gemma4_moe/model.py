@@ -94,7 +94,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight
+from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, drop_logits
 from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -1497,10 +1497,7 @@ class Gemma4ForConditionalGeneration(
                     image_hidden_states=None,
                     audio_hidden_states=None,
                 )
-                if not compute_logits:
-                    # Item assignment registers the key Hugging Face's output class does not declare.
-                    output["lm_head_weight"] = self.lm_head.weight
-                return output
+                return output if compute_logits else drop_logits(output, self.lm_head)
 
             if (
                 mm_token_type_ids is None
@@ -1556,11 +1553,7 @@ class Gemma4ForConditionalGeneration(
                 past_key_values=kv_share_holder,
                 **kwargs,
             )
-            if not compute_logits:
-                output.logits = output.logits[..., :0]
-                # Item assignment registers the key Hugging Face's output class does not declare.
-                output["lm_head_weight"] = self.lm_head.weight
-            return output
+            return output if compute_logits else drop_logits(output, self.lm_head)
 
         # --- MoE forward path ---
         if cp_enabled:

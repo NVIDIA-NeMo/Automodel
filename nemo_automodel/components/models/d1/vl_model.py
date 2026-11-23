@@ -27,7 +27,7 @@ from transformers.models.lfm2_vl.modeling_lfm2_vl import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead
+from nemo_automodel.components.models.common.lm_head import LMHead, with_compute_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -92,6 +92,9 @@ class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, HFLfm2VlForConditiona
         reject_unsupported_tie_word_embeddings(type(self), self.config)
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
+
+    # Hugging Face's forward always runs the head; give it the compute_logits option the repo's forwards take.
+    forward = with_compute_logits(HFLfm2VlForConditionalGeneration.forward)
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the released text embedding table."""

@@ -2581,25 +2581,6 @@ class _ModelOutput:
         return hasattr(self, key) and getattr(self, key) is not None
 
 
-class _ModelWithHiddenStates(torch.nn.Module):
-    """Model that outputs hidden states for FusedLinearCE testing."""
-
-    def __init__(self):
-        super().__init__()
-        self.linear = torch.nn.Linear(10, 10)
-        self.lm_head = torch.nn.Linear(10, 50)
-
-    def forward(self, logits_to_keep=None, **kwargs):
-        hidden = torch.randn(2, 5, 10)
-        return _ModelOutput(
-            logits=self.lm_head(hidden),
-            hidden_states=[hidden],
-        )
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-
 def _create_non_pp_recipe(model, device="cpu"):
     """Helper to create a non-PP recipe bypassing BaseRecipe tracking."""
     recipe = object.__new__(FinetuneRecipeForVLM)
@@ -2765,9 +2746,10 @@ class TestForwardBackwardStepNonPP:
 
         # Model output class that supports both attribute access and 'in' operator
         class ModelOutput:
-            def __init__(self, logits, hidden_states):
+            def __init__(self, logits, hidden_states, lm_head_weight):
                 self.logits = logits
                 self.hidden_states = hidden_states
+                self.lm_head_weight = lm_head_weight
 
             def __contains__(self, key):
                 return hasattr(self, key)
@@ -2779,13 +2761,14 @@ class TestForwardBackwardStepNonPP:
                 # Keep lm_head in bfloat16 to match hidden states
                 self.lm_head = torch.nn.Linear(10, 50)
 
-            def forward(self, logits_to_keep=None, **kwargs):
+            def forward(self, logits_to_keep=None, *, compute_logits=True, **kwargs):
                 # FusedLinearCE requires bf16/fp16 hidden states
                 hidden = torch.randn(2, 5, 10, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-                # lm_head is already bfloat16, so no conversion needed
+                # Like the repo's forwards, skip the head without logits and return its weight.
                 return ModelOutput(
-                    logits=self.lm_head(hidden),
+                    logits=self.lm_head(hidden) if compute_logits else hidden[..., :0],
                     hidden_states=[hidden],
+                    lm_head_weight=None if compute_logits else self.lm_head.weight,
                 )
 
             def get_output_embeddings(self):

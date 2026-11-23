@@ -197,20 +197,16 @@ def test_registered_lm_class_takes_logits_dtype(module, name, monkeypatch):
     assert model.get_output_embeddings().logits_dtype == torch.float64
 
 
-# Registered classes that inherit a Hugging Face forward, which cannot skip its head; the recipe keeps one position.
-_HF_FORWARD = {"Lfm2VlForConditionalGeneration"}
-
-
 @pytest.mark.parametrize(
     ("module", "name"), [pytest.param(*entry, id=f"{entry[0].split('.')[-2]}.{entry[1]}") for entry in _LM_CLASSES]
 )
 def test_registered_lm_class_can_skip_its_logits(module, name):
-    # Fused-linear losses call a forward without logits when it declares compute_logits, sparing the head's
-    # FSDP all-gather; a forward with only logits_to_keep still runs the head for one position.
+    # Fused-linear losses call every forward with compute_logits=False, which spares the head's FSDP all-gather
+    # where the forward is the repo's own. A class that inherits a Hugging Face forward wraps it with_compute_logits.
     if name in _NEEDS_MODULE:
         pytest.importorskip(_NEEDS_MODULE[name])
     forward = inspect.signature(getattr(importlib.import_module(module), name).forward).parameters
     if "logits_to_keep" not in forward:
         pytest.skip("the recipe uses MaskedCrossEntropy for models without logits_to_keep")
-    assert ("compute_logits" in forward) != (name in _HF_FORWARD)
+    assert forward["compute_logits"].default is True
 
