@@ -1,0 +1,134 @@
+---
+title: "Decision Models"
+description: "Post-train decision models that return a probability for every allowed option of typed questions, using NeMo AutoModel recipes for CLM, Clef, and D1."
+position: 7
+---
+Decision models read a state, such as a security alert or a support ticket, together with a set of typed questions.
+Instead of generating text, they return a probability for every allowed option of every question, so their output
+needs no parsing. NeMo AutoModel post-trains released decision models on labeled records. A typical workflow
+evaluates the released checkpoint, runs supervised fine-tuning (SFT), and can then continue the best SFT checkpoint
+with reinforcement learning (RL) on per-option rewards.
+
+## Supported Models
+
+NeMo AutoModel supports four decision-model variants: Contrastive Language Model (CLM), Clef, D1-3B, and D1 Omni. They
+read the same records and report the same core metrics, but they differ in how a forward pass becomes option scores,
+which weights train, and how the work is distributed.
+
+| Variant | Checkpoint | How It Scores Options | What Trains | Entry Point | Parallelism |
+| --- | --- | --- | --- | --- | --- |
+| CLM | [`CLM-v0.1-8B`](/model-coverage/decision-models/contrastive-lm/CLM-v0.1-8B) | A frozen Qwen3-8B encoder embeds the state with each question and embeds each option separately, and two projection heads compare the embeddings. | Projection heads (about 20M parameters) | [`clm_soc_triage.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clm_soc_triage.yaml) | Embedding on every GPU, then head training on rank 0 |
+| Clef | [`clef`](/model-coverage/decision-models/cloudflare/clef) | A 27B multimodal backbone reads the state and all questions in one forward pass, and a joint schema head scores every option. | Joint schema head (about 128M parameters) on a frozen backbone, or low-rank adaptation (LoRA) adapters and the head | [`clef_soc_triage_heads.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clef_soc_triage_heads.yaml) or [`clef_soc_triage_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/clef_soc_triage_lora.yaml) | FSDP2 data parallelism |
+| D1-3B (experimental) | [`d1-3B`](/model-coverage/decision-models/liquidai/d1-3B) | A frozen vision-language backbone reads one question per forward pass, and additive answer-token rows score the options. | Answer-token rows | [`d1_posttrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/d1_posttrain.py) with `--model d1-3b` | Single GPU |
+| D1 Omni (experimental) | [`d1-omni-600M`](/model-coverage/decision-models/liquidai/d1-3B) | A frozen backbone with vision and audio modules reads one question per forward pass, and its released marker head scores the options. | Marker head | [`d1_posttrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/d1_posttrain.py) with `--model d1-omni` | Single GPU |
+
+The d1-3B model card covers both D1 checkpoints.
+
+The following table lists each documented checkpoint with the date it was added. It combines recipe-backed checkpoints
+with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a
+documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for every
+model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+{/* END GENERATED MODEL SUPPORT LOG */}
+
+## Run Decision Models with NeMo AutoModel
+
+Use a source checkout of NeMo AutoModel so that the package, the example configurations, and the tutorial data
+generator stay on one revision:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --extra all
+```
+
+For other installation options, see the [NeMo AutoModel Installation Guide](/get-started/installation).
+
+## Prepare Decision Records
+
+Each record is one line of a JSON Lines file. The example configurations read `train.jsonl`, `validation.jsonl`, and
+`test.jsonl` from one data directory. A record contains an ID, the input that the model scores, its supervision, and
+optional metadata:
+
+- `id`: a nonempty record ID that is unique within its file.
+- `state`: any JSON value that describes the situation.
+- `questions`: typed questions, keyed by question ID. A `noul` question has the options `"true"` and `"false"`, a
+  `choice` question names its options in `criteria`, and a `score` question lists K ordered levels in `criteria`,
+  whose option IDs are `"0"` through `"K-1"`.
+- `answers`: the gold option for each question, used by SFT.
+- `rewards`: optional per-option rewards for RL. A question with rewards must list a reward for every option.
+- `meta`: optional metadata. The CLM and Clef reports slice their metrics by the `meta` keys listed in
+  `data.slice_keys`.
+
+The following record is abridged from the first record of the fictional alert-triage data that the examples use. It
+keeps three of the five questions, two of the state fields, and one reward table, and it is shown on several lines
+for readability:
+
+```json
+{
+  "id": "fictional-7-00000",
+  "state": {
+    "behavior": "credential read attempt",
+    "evidence": "A signed maintenance ticket and the approved schedule explain the activity."
+  },
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "What explains the observed security alert?",
+      "criteria": {
+        "malicious": "The evidence supports an unauthorized attack.",
+        "benign_authorized": "The activity is authorized and expected.",
+        "false_positive": "A sensor artifact explains the alert."
+      }
+    },
+    "needs_human": {
+      "type": "noul",
+      "instructions": "Does the tutorial policy require analyst review?",
+      "criteria": {"true": "An analyst must review the alert.", "false": "No analyst review is required."}
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is the event under the tutorial policy?",
+      "criteria": ["Informational", "Low", "Medium", "High", "Critical"]
+    }
+  },
+  "answers": {"verdict": "benign_authorized", "needs_human": "false", "severity": "1"},
+  "rewards": {"severity": {"0": 0.75, "1": 1.0, "2": 0.75, "3": 0.5, "4": 0.25}},
+  "meta": {"family": "credential_access"}
+}
+```
+
+To generate the complete fictional dataset, with 128 training, 32 validation, and 32 test records, run the following
+command from the repository root. It needs no model, API key, or GPU, and it rejects an existing output directory.
+
+```bash
+PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+    --output-dir data/soc_triage --seed 7
+```
+
+<Note>
+The tutorial labels and rewards come from a fictional policy. They check the mechanics of each workflow and do not
+measure operational security performance.
+</Note>
+
+## Post-Train Decision Models
+
+Each variant runs the same sequence of stages, and each stage writes `metrics_validation.json` and
+`metrics_test.json` to its output directory:
+
+1. Evaluate the released checkpoint to record the baseline.
+2. Run SFT on the gold answers.
+3. Optionally, continue with RL from the SFT checkpoint that scores best on the validation split. The RL objective
+   maximizes the exact expected reward over all options. A Kullback-Leibler (KL) penalty keeps the policy close to the
+   SFT checkpoint it starts from, and a supervised term on the gold answer anchors it. To use a sampled group relative
+   policy optimization (GRPO) objective instead, pass `--loss.rl_objective grpo` to the CLM or Clef recipe.
+
+The reports include decision accuracy, exact record match, negative log-likelihood, Brier score, expected calibration
+error (ECE), and reward, overall and for each question. The CLM and Clef reports also include per-slice metrics. Use
+the validation split to select a checkpoint, and use the test split only for final reporting. The model cards show how to
+run each variant, and the
+[decision post-training examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/README.md)
+describe the configuration options. The
+[decision-model tutorials](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/README.md)
+show you how to run each workflow in a notebook.
