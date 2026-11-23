@@ -1013,9 +1013,6 @@ navigation:
           - page: "Fine-Tuning DiffusionGemma"
             path: ../../guides/dllm/diffusiongemma.mdx
             slug: recipes-e2e-examples/diffusiongemma
-          - page: "NVIDIA Nemotron 3.5 Decision"
-            path: ../../guides/decision/nemotron-3-5-decision.mdx
-            slug: recipes-e2e-examples/nemotron-3-5-decision
       - section: "Vision & Multimodal Models"
         skip-slug: true
         contents:
@@ -1058,6 +1055,12 @@ navigation:
           - page: "ASR with Qwen3-Omni"
             path: ../../guides/audio/qwen3-omni-asr.mdx
             slug: recipes-e2e-examples/qwen3-omni-asr
+      - section: "Decision Models"
+        skip-slug: true
+        contents:
+          - page: "NVIDIA Nemotron 3.5 Decision"
+            path: ../../guides/decision/nemotron-3-5-decision.mdx
+            slug: recipes-e2e-examples/nemotron-3-5-decision
   - section: "Training Recipes"
     slug: recipes-e2e-examples
     contents:

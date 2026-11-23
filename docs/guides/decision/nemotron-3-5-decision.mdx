@@ -159,7 +159,8 @@ Each record holds one alert (`state`), its five `questions`, and the policy's `a
 
 (Two of the five questions and some `state` fields are shown.)
 
-The recipe reads these SystemOne records directly, as the CLM and CLEF recipes do, so no conversion step is needed.
+The recipe reads these SystemOne records directly, as the [CLM and Clef recipes](/model-coverage/decision-models/overview)
+do, so no conversion step is needed.
 The model is trained the way the checkpoint reads decisions: **one question per read**. Each alert gives five reads, so the splits
 hold 640 training, 160 validation, and 160 test questions. All five questions about one alert stay in the same split,
 so the validation and test alerts are never seen in training.
