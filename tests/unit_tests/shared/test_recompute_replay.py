@@ -13,11 +13,19 @@
 # limitations under the License.
 
 
+import threading
 from contextlib import contextmanager
 
 import pytest
+import torch
+from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
+from nemo_automodel.shared.recompute_replay import (
+    RecomputeReplay,
+    RecomputeReplayRecorder,
+    in_checkpoint_recompute,
+    mark_checkpoint_recompute,
+)
 
 
 def test_recorder_replays_in_order_then_reports_misses() -> None:
@@ -135,3 +143,72 @@ def test_checkpoint_context_fn_without_inner_contexts() -> None:
         assert channel.current() is not None and channel.current()[1] == "record"
     with recompute_ctx:
         assert channel.current() is not None and channel.current()[1] == "replay"
+
+
+def test_mark_checkpoint_recompute_marks_only_the_recompute_context() -> None:
+    events: list[str] = []
+
+    @contextmanager
+    def tracked(name: str):
+        events.append(f"enter {name}")
+        yield
+        events.append(f"exit {name}")
+
+    wrapped = mark_checkpoint_recompute(lambda: (tracked("forward"), tracked("recompute")))
+    forward_ctx, recompute_ctx = wrapped()
+    assert not in_checkpoint_recompute()
+    with forward_ctx:
+        assert not in_checkpoint_recompute()
+    with recompute_ctx:
+        assert in_checkpoint_recompute()
+        # The mark belongs to the thread that runs the recompute.
+        seen_in_other_thread: list[bool] = []
+        worker = threading.Thread(target=lambda: seen_in_other_thread.append(in_checkpoint_recompute()))
+        worker.start()
+        worker.join()
+        assert seen_in_other_thread == [False]
+    assert not in_checkpoint_recompute()
+    # The supplied contexts are entered unchanged, the recompute one inside the mark.
+    assert events == ["enter forward", "exit forward", "enter recompute", "exit recompute"]
+
+
+def test_mark_checkpoint_recompute_is_cleared_when_the_recompute_raises() -> None:
+    _, recompute_ctx = mark_checkpoint_recompute(None)()
+    with pytest.raises(RuntimeError, match="early stop"):
+        with recompute_ctx:
+            assert in_checkpoint_recompute()
+            raise RuntimeError("early stop")
+    assert not in_checkpoint_recompute()
+
+
+def test_mark_checkpoint_recompute_nests() -> None:
+    _, outer = mark_checkpoint_recompute(None)()
+    _, inner = mark_checkpoint_recompute(None)()
+    with outer:
+        with inner:
+            assert in_checkpoint_recompute()
+        assert in_checkpoint_recompute()
+    assert not in_checkpoint_recompute()
+
+
+def test_mark_checkpoint_recompute_follows_a_non_reentrant_checkpoint() -> None:
+    weight = torch.nn.Parameter(torch.tensor([2.0]))
+    seen: list[bool] = []
+
+    def body(x: torch.Tensor) -> torch.Tensor:
+        seen.append(in_checkpoint_recompute())
+        return (x * weight).sin()
+
+    x = torch.tensor([1.0], requires_grad=True)
+    y = checkpoint(body, x, use_reentrant=False, context_fn=mark_checkpoint_recompute(None))
+    assert seen == [False]
+    y.backward()
+    # The backward replays the body once, inside the mark, and leaves no mark behind.
+    assert seen == [False, True]
+    assert not in_checkpoint_recompute()
+    assert weight.grad is not None
+
+    # An unmarked checkpoint replays outside the mark.
+    seen.clear()
+    checkpoint(body, x, use_reentrant=False).backward()
+    assert seen == [False, False]

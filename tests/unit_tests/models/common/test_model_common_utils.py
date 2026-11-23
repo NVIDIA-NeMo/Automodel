@@ -41,6 +41,7 @@ from nemo_automodel.components.models.common.utils import (
     row_scaled_nvfp4_gemm_is_unreliable,
     set_is_first_microbatch,
     set_is_optim_step,
+    weight_cache_flag_for_forward,
 )
 
 
@@ -107,6 +108,25 @@ class TestIsOptimStep:
         set_is_optim_step(True)
         set_is_optim_step(False)
         assert get_is_optim_step() is False
+
+
+class TestWeightCacheFlagForForward:
+    @pytest.mark.parametrize(
+        ("is_first_microbatch", "in_recompute", "expected"),
+        [
+            # A forward gets the process-wide flag unchanged.
+            (True, False, True),
+            (False, False, False),
+            (None, False, None),
+            # The recompute of a first micro-batch reuses what its forward stored.
+            (True, True, False),
+            (False, True, False),
+            # Without a stored copy there is nothing to reuse.
+            (None, True, None),
+        ],
+    )
+    def test_flag(self, is_first_microbatch, in_recompute, expected):
+        assert weight_cache_flag_for_forward(is_first_microbatch, in_recompute) is expected
 
 
 class TestIsFirstMicrobatch:

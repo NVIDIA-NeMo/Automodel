@@ -41,6 +41,7 @@ from nemo_automodel.components.models.common.te_precision import (
 from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.shared.import_utils import get_te_cublaslt_version, safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.recompute_replay import in_checkpoint_recompute
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -98,6 +99,29 @@ def get_is_first_microbatch() -> bool | None:
         True/False/None indicating microbatch position for FP8 weight caching.
     """
     return IS_FIRST_MICROBATCH
+
+
+def weight_cache_flag_for_forward(is_first_microbatch: bool | None, in_recompute: bool) -> bool | None:
+    """The ``is_first_microbatch`` value a Transformer Engine GEMM module gets for one forward.
+
+    Transformer Engine quantizes the weight and stores the result on ``True``, reuses the stored copy on
+    ``False`` and neither stores nor reuses on ``None``. The recompute forward of an activation checkpoint
+    replays a forward of the same micro-batch, and the optimizer does not step in between, so the copy
+    that forward stored under ``True`` is the quantization of the weight the recompute sees: the recompute
+    reuses it. Weights are rounded to nearest without a random transform, so the reused copy equals the
+    one a second quantization would give.
+
+    Args:
+        is_first_microbatch: The process-wide flag (:func:`get_is_first_microbatch`).
+        in_recompute: Whether this forward is the recompute of a marked activation checkpoint
+            (:func:`nemo_automodel.shared.recompute_replay.in_checkpoint_recompute`).
+
+    Returns:
+        ``False`` for the recompute of a first micro-batch, else ``is_first_microbatch`` unchanged.
+    """
+    if is_first_microbatch and in_recompute:
+        return False
+    return is_first_microbatch
 
 
 # Hub loading options ``PreTrainedModel.from_pretrained`` threads into every file it
@@ -1531,6 +1555,8 @@ def _make_lazy_te_patcher():
     2. is_first_microbatch injection: Reads the global IS_FIRST_MICROBATCH flag and
        passes it to TE Linear/GroupedLinear for FP8 weight caching during
        gradient accumulation (quantize on first microbatch, reuse cached on rest).
+       The recompute forward of a marked activation checkpoint reuses the copy its
+       forward cached (see ``weight_cache_flag_for_forward``).
     """
     patched = False
 
@@ -1561,12 +1587,16 @@ def _make_lazy_te_patcher():
                 out_shape = x.shape[:-1] + (self.weight.shape[0],)
                 return torch.empty(out_shape, dtype=x.dtype, device=x.device)
             if is_first_microbatch is None:
-                is_first_microbatch = get_is_first_microbatch()
+                is_first_microbatch = weight_cache_flag_for_forward(
+                    get_is_first_microbatch(), in_checkpoint_recompute()
+                )
             return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
 
         def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None):
             if is_first_microbatch is None:
-                is_first_microbatch = get_is_first_microbatch()
+                is_first_microbatch = weight_cache_flag_for_forward(
+                    get_is_first_microbatch(), in_checkpoint_recompute()
+                )
             return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
 
         TERMSNorm.forward = _patched_rmsnorm_forward
@@ -2140,5 +2170,6 @@ __all__ = [
     "initialize_rms_norm_module",
     "prepare_frozen_parameters_for_sharding",
     "set_is_first_microbatch",
+    "weight_cache_flag_for_forward",
     "set_is_optim_step",
 ]
