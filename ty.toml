@@ -78,6 +78,7 @@ include = [
     "nemo_automodel/components/distributed/grad_utils.py",
     "nemo_automodel/components/distributed/tensor_utils.py",
     "nemo_automodel/components/eval/tool_call_evaluator.py",
+    "nemo_automodel/components/loss/kd_loss.py",
 ]
 
 [overrides.rules]
