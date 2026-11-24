@@ -32,6 +32,7 @@ from nemo_automodel.components.models.mistral4.model import (
     _get_llama_4_attn_scale,
 )
 from nemo_automodel.components.moe.config import MoEConfig
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -314,14 +315,11 @@ class TestMistral4ForCausalLM:
         batch, seq = 1, 5
         input_ids = torch.randint(0, text_config.vocab_size, (batch, seq), device=device)
         position_ids = torch.arange(seq, device=device).unsqueeze(0)
-        hidden = torch.randn(seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
-        with patch.object(model.model, "forward", return_value=hidden):
-            out = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                output_hidden_states=True,
-            )
+        out, layer_inputs = run_with_passthrough_layers(
+            model, input_ids, position_ids=position_ids, qkv_format="thd", output_hidden_states=True
+        )
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq, text_config.hidden_size) for shape in layer_inputs)
         assert out.logits.shape == (batch, seq, text_config.vocab_size)
         assert out.hidden_states.shape == (batch, seq, text_config.hidden_size)
 
@@ -723,6 +721,36 @@ class TestMistral3ForConditionalGeneration:
         input_ids = torch.randint(0, 256, (1, 8), device=device)
         logits = model(input_ids)
         assert logits.shape == (1, 8, 256)
+
+    def test_forward_thd_keeps_one_batch_axis(self, multimodal_config, backend, device):
+        """Packed (THD) text: the decoder layers see [tokens, hidden]; logits and headless output are [1, tokens, ...]."""
+        from contextlib import ExitStack
+
+        from nemo_automodel.components.models.mistral4.model import (
+            Mistral3ForConditionalGeneration as OurMistral3ForCG,
+        )
+
+        model = OurMistral3ForCG(multimodal_config, backend=backend).to(device).to(torch.bfloat16)
+        tokens = 5
+        input_ids = torch.arange(11, 11 + tokens, device=device).unsqueeze(0)  # no image token (10)
+        position_ids = torch.arange(tokens, device=device).unsqueeze(0)
+        layer_inputs = []
+
+        def passthrough(*args, **kwargs):
+            hidden = args[0] if args else kwargs["x"]
+            layer_inputs.append(tuple(hidden.shape))
+            return hidden
+
+        with ExitStack() as stack:
+            for layer in model.model.language_model.layers.values():
+                stack.enter_context(patch.object(layer, "forward", side_effect=passthrough))
+            logits = model(input_ids, position_ids=position_ids, qkv_format="thd")
+            model.set_output_embeddings(None)  # a pipeline stage without the head returns hidden states
+            hidden = model(input_ids, position_ids=position_ids, qkv_format="thd")
+
+        assert layer_inputs and all(shape == (tokens, 64) for shape in layer_inputs)
+        assert logits.shape == (1, tokens, 256)
+        assert hidden.shape == (1, tokens, 64)
 
     def test_from_config(self, multimodal_config, backend):
         from nemo_automodel.components.models.mistral4.model import (

@@ -660,6 +660,10 @@ def test_pipeline_metadata_and_fused_loss() -> None:
     inputs, outputs = last.get_pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=12, dtype=torch.bfloat16)
     assert inputs[0].shape == (2, 12, 32) and inputs[0].dtype == torch.float32
     assert outputs[0].shape == (2, 12, 64) and outputs[0].dtype == torch.bfloat16
+    # The last stage declares the dtype its head returns.
+    last.lm_head.logits_dtype = torch.float32
+    _, outputs = last.get_pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=12, dtype=torch.bfloat16)
+    assert outputs[0].dtype == last(torch.randn(2, 12, 32, dtype=torch.float32)).logits.dtype == torch.float32
     last._pp_return_hidden_states = True
     _, outputs = last.get_pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=12, dtype=torch.bfloat16)
     hidden = last(torch.randn(2, 12, 32, dtype=torch.float32))

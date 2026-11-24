@@ -36,6 +36,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
+from nemo_automodel.components.moe.quantized_experts import GroupedExpertsTENVFP4
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
@@ -837,8 +838,11 @@ class MoE(nn.Module):
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
-                # All other expert backends use the TE grouped implementation.
-                self.experts = GroupedExpertsTE(
+                # All other expert backends use the TE grouped implementation; with
+                # te_nvfp4.resident_weights its weights are NVFP4 tensors.
+                resident = backend.te_nvfp4 is not None and backend.te_nvfp4.resident_weights
+                experts_cls = GroupedExpertsTENVFP4 if resident else GroupedExpertsTE
+                self.experts = experts_cls(
                     config,
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
@@ -849,6 +853,16 @@ class MoE(nn.Module):
         else:
             # Default to torch experts
             self.experts = GroupedExperts(config, backend=backend)
+
+        if (
+            backend.te_nvfp4 is not None
+            and backend.te_nvfp4.resident_weights
+            and not isinstance(self.experts, GroupedExpertsTENVFP4)
+        ):
+            raise ValueError(
+                "te_nvfp4.resident_weights needs Transformer Engine experts (backend.experts='te') with the deepep, "
+                f"hybridep or uccl_ep dispatcher on more than one rank; this setup builds {type(self.experts).__name__}."
+            )
 
         if config.n_shared_experts > 0:
             self.shared_experts = MLP(

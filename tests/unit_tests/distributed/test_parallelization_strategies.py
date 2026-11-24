@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
@@ -944,6 +945,60 @@ class TestNemotronHModelParallelizer:
         expected_checkpoint_calls = 3  # 2 MLP (from MockNemotronHModel) + 1 Mamba layer
         assert mock_checkpoint.call_count == expected_checkpoint_calls
 
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
+    def test_activation_checkpointing_native_layout_wraps_every_block(
+        self,
+        mock_fully_shard_by_dtype,
+        mock_fully_shard,
+        strategy,
+        mock_device_mesh,
+    ):
+        """Without EP, native Nemotron-V3 checkpoints attention and MoE blocks too, like the EP path."""
+        mesh, _, _, _ = mock_device_mesh
+        mock_fully_shard.side_effect = lambda model, **kwargs: model
+        mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+        block_types = ["mamba", "moe", "attention", "mlp"]
+        model = MockNemotronV3Model(num_layers=len(block_types))
+        for layer, block_type in zip(model.model.layers.values(), block_types):
+            setattr(layer, "block_type", block_type)
+        model.config = SimpleNamespace(hidden_size=8)
+        model.model.moe_config = SimpleNamespace(n_routed_experts=4)
+
+        strategy._apply(model=model, device_mesh=mesh, activation_checkpointing=True)
+
+        blocks = list(model.model.layers.values())
+        assert all(isinstance(block, CheckpointWrapper) for block in blocks)
+        assert [block._checkpoint_wrapped_module.block_type for block in blocks] == block_types
+
+    @pytest.mark.parametrize("activation_checkpointing", [True, "selective"])
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
+    def test_activation_checkpointing_native_dense_layout_wraps_every_block(
+        self,
+        mock_fully_shard_by_dtype,
+        mock_fully_shard,
+        activation_checkpointing,
+        strategy,
+        mock_device_mesh,
+    ):
+        """Dense native Nemotron-H (Nano 4B/9B/12B) has moe_config=None and no expert-count config fields."""
+        mesh, _, _, _ = mock_device_mesh
+        mock_fully_shard.side_effect = lambda model, **kwargs: model
+        mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+        block_types = ["mamba", "attention", "mlp", "mamba"]
+        model = MockNemotronV3Model(num_layers=len(block_types))
+        for layer, block_type in zip(model.model.layers.values(), block_types):
+            setattr(layer, "block_type", block_type)
+        model.config = SimpleNamespace(hidden_size=8)
+        model.model.moe_config = None
+
+        strategy._apply(model=model, device_mesh=mesh, activation_checkpointing=activation_checkpointing)
+
+        blocks = list(model.model.layers.values())
+        assert all(isinstance(block, CheckpointWrapper) for block in blocks)
+        assert [block._checkpoint_wrapped_module.block_type for block in blocks] == block_types
+
 
 class _MockQwen35Model(nn.Module):
     """Minimal Qwen3.5-shaped model: a decoder ``layers`` list under ``model``."""
@@ -1582,6 +1637,107 @@ class TestQwenImageEditModelParallelizer:
             "transformer_blocks.0.txt_mlp.net.0.proj.weight",
         }
         assert expected_branch_parameters <= set(actual_state)
+
+    @pytest.mark.parametrize("holds_te_linear", [True, False])
+    def test_block_checkpointing_uses_te_checkpoint_only_for_te_models(self, monkeypatch, holds_te_linear):
+        """FP8 recompute must replay Transformer Engine state, so only TE-converted models use TE's checkpoint."""
+        import torch
+
+        class FakeTELinear(torch.nn.Linear):
+            """Stands in for transformer_engine.pytorch.Linear."""
+
+        def fake_te_checkpoint(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        fake_te = SimpleNamespace(
+            pytorch=SimpleNamespace(Linear=FakeTELinear, distributed=SimpleNamespace(checkpoint=fake_te_checkpoint))
+        )
+        monkeypatch.setattr(diffusers_parallelization, "safe_import_te", lambda: (True, fake_te))
+        model = self._tiny_transformer()
+        if holds_te_linear:
+            model.add_module("fp8_probe", FakeTELinear(4, 4))
+
+        diffusers_parallelization._apply_qwen_block_activation_checkpointing(model)
+
+        checkpoint_fn = model.transformer_blocks[0].checkpoint_fn
+        assert (checkpoint_fn.func is fake_te_checkpoint) is holds_te_linear
+        if holds_te_linear:
+            assert checkpoint_fn.keywords == {"use_reentrant": False}
+
+    @pytest.mark.run_only_on("GPU")
+    def test_fp8_block_checkpointing_matches_the_non_checkpointed_reference(self):
+        """Checkpointed FP8 blocks recompute with the forward's FP8 state, so gradients match the reference."""
+        import copy
+
+        import torch
+
+        te = pytest.importorskip("transformer_engine.pytorch")
+        te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+        te_quantization = pytest.importorskip("transformer_engine.pytorch.quantization")
+        dim, tokens = 128, 64
+
+        class DualStreamBlock(nn.Module):
+            """Minimal stand-in for a Qwen dual-stream block, built from Transformer Engine linears."""
+
+            def __init__(self):
+                super().__init__()
+                self.attn = te.Linear(dim, dim)
+                self.img_mlp = nn.Sequential(te.Linear(dim, 4 * dim), nn.GELU(), te.Linear(4 * dim, dim))
+                self.txt_mlp = te.Linear(dim, dim)
+
+            def forward(self, hidden_states):
+                """Run the block.
+
+                Args:
+                    hidden_states: Tensor of shape [tokens, hidden].
+
+                Returns:
+                    Tensor of shape [tokens, hidden].
+                """
+                return hidden_states + self.img_mlp(self.attn(hidden_states)) + self.txt_mlp(hidden_states)
+
+        class TinyQwenTransformer(nn.Module):
+            """Exposes ``transformer_blocks`` the way the Qwen parallelizer expects."""
+
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(DualStreamBlock() for _ in range(2))
+
+            def forward(self, hidden_states):
+                """Run all blocks.
+
+                Args:
+                    hidden_states: Tensor of shape [tokens, hidden].
+
+                Returns:
+                    Tensor of shape [tokens, hidden].
+                """
+                for block in self.transformer_blocks:
+                    hidden_states = block(hidden_states)
+                return hidden_states
+
+        def forward_backward(model, hidden_states):
+            with te_quantization.autocast(enabled=True, recipe=te_recipe.Float8CurrentScaling()):
+                output = model(hidden_states)
+            output.float().pow(2).mean().backward()
+            return output.detach()
+
+        torch.manual_seed(0)
+        reference = TinyQwenTransformer().cuda().bfloat16()
+        checkpointed = copy.deepcopy(reference)
+        diffusers_parallelization._apply_qwen_block_activation_checkpointing(checkpointed)
+        # In the real model the block input comes from a trainable projection, so it requires grad.
+        hidden_states = torch.randn(tokens, dim, device="cuda", dtype=torch.bfloat16)
+
+        reference_output = forward_backward(reference, hidden_states.clone().requires_grad_(True))
+        checkpointed_output = forward_backward(checkpointed, hidden_states.clone().requires_grad_(True))
+
+        torch.testing.assert_close(checkpointed_output, reference_output)
+        reference_grads = {name: param.grad for name, param in reference.named_parameters()}
+        for name, param in checkpointed.named_parameters():
+            name = name.replace("_checkpoint_wrapped_module.", "")
+            assert param.grad is not None, name
+            torch.testing.assert_close(param.grad, reference_grads[name], rtol=1e-3, atol=1e-3)
 
     def test_parallelizer_checkpoints_blocks_before_standard_fsdp_flow(self, monkeypatch):
         """Cover complete Qwen blocks before delegating to repository FSDP2."""

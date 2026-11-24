@@ -217,7 +217,7 @@ def test_forward_parity_with_hf():
             decoder_masks=decoder_masks,
             self_conditioning_logits=None,
         )
-        native_logits = native_model._softcap_logits(hidden)
+        native_logits = native_model.lm_head(hidden)
 
     assert native_logits.shape == hf_logits.shape
     max_diff = (native_logits - hf_logits).abs().max().item()

@@ -113,7 +113,7 @@ def _optimizer_parity_worker(
         apply_te_patches()
         patched_applier = fused_adam.multi_tensor_applier
         options = dict(lr=1e-2, weight_decay=0.01, master_weights=master_weights)
-        # Construct directly: FusedAdamConfig would drop empties before this test.
+        # Construct directly: this test exercises the native boundary, not the optimizer configs.
         optimizer = fused_adam.FusedAdam(parameters, **options)
         reference = fused_adam.FusedAdam(reference_parameters, **options)
         initial_values = [_local(parameter).detach().clone() for parameter in reference_parameters]

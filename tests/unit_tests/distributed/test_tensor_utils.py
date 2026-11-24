@@ -123,6 +123,8 @@ def test_to_cpu_passthrough_other_types():
 
     sentinel = object()
     assert to_cpu(sentinel) is sentinel
+    assert to_cpu(42) == 42
+    assert to_cpu("string") == "string"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")

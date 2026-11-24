@@ -30,6 +30,7 @@ from nemo_automodel.components.models.hy_mt2.model import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -219,46 +220,11 @@ class TestHyMT2ForCausalLM:
         assert hasattr(model, "model")
         assert hasattr(model, "lm_head")
         assert model.config is config
-        assert model._enable_lm_head_fp32 is True
-
-    def test_enable_lm_head_fp32_default_false_without_config_flag(self, backend_config):
-        # When the config does not declare the flag, default to False.
-        class _Cfg:
-            vocab_size = 32
-            hidden_size = HIDDEN
-            intermediate_size = INTER
-            moe_intermediate_size = MOE_INTER
-            num_hidden_layers = 1
-            num_attention_heads = N_HEADS
-            num_key_value_heads = N_KV
-            head_dim = HEAD_DIM
-            num_experts = N_EXPERTS
-            num_experts_per_tok = 2
-            num_shared_experts = 1
-            first_k_dense_replace = 1
-            max_position_embeddings = 128
-            rope_theta = 10000.0
-            # PretrainedConfig populates ``rope_parameters`` from ``rope_theta``
-            # in its ``__init__``; this bare mock skips that, so declare it
-            # explicitly to match what ``get_rope_config`` reads.
-            rope_parameters = {"rope_theta": 10000.0, "rope_type": "default"}
-            rms_norm_eps = 1e-5
-            torch_dtype = "bfloat16"
-            attention_bias = False
-            qk_norm = True
-            route_norm = False
-            router_scaling_factor = 1.0
-            moe_router_enable_expert_bias = False
-            moe_router_use_sigmoid = True
-
-        model = HyMT2ForCausalLM(_Cfg(), backend=backend_config)
-        assert model._enable_lm_head_fp32 is False
 
     def test_lm_head_fp32_upcast_when_weight_promoted(self, config, backend_config, device):
         """When the parallelizer has promoted lm_head.weight to fp32 (the
-        ``distributed.moe.lm_head_precision: float32`` path), the in-model
-        fallback feeds the bf16 hidden state up to fp32, runs lm_head, and
-        casts logits back to bf16."""
+        ``distributed.moe.lm_head_precision: float32`` path), the bf16 hidden
+        state is projected in fp32 and the head's fp32 logits are returned."""
         model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
         # Simulate the parallelizer's promotion of lm_head.weight to fp32.
         model.lm_head = model.lm_head.to(torch.float32)
@@ -266,47 +232,41 @@ class TestHyMT2ForCausalLM:
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
             logits = model(input_ids).logits
-        # Output dtype must be the input dtype (bf16), not fp32.
-        assert logits.dtype == torch.bfloat16
+        assert logits.dtype == torch.float32
+        torch.testing.assert_close(logits, bf16_hidden.float() @ model.lm_head.weight.t())
 
-    def test_lm_head_no_upcast_when_weight_is_bf16(self, config, backend_config, device):
-        """If the parallelizer did NOT promote lm_head.weight, the model must
-        fall through to ``self.lm_head(hidden)`` without trying to upcast,
-        to avoid the dtype mismatch (fp32 input vs bf16 weight) and the
-        ``F.linear`` DTensor mixing crash that the prior implementation hit."""
-        model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
-        # lm_head.weight is bf16 (no promotion). Even though enable_lm_head_fp32
-        # is True on the config, the in-model path must NOT activate.
+    @pytest.mark.parametrize(
+        ("enable_lm_head_fp32", "logits_dtype", "expected"),
+        [
+            pytest.param(True, None, torch.float32, id="config-upcasts"),
+            pytest.param(False, None, torch.bfloat16, id="config-keeps-weight-dtype"),
+            pytest.param(True, torch.bfloat16, torch.bfloat16, id="argument-overrides-config"),
+        ],
+    )
+    def test_enable_lm_head_fp32_sets_the_default_logits_dtype(
+        self, config, backend_config, device, enable_lm_head_fp32, logits_dtype, expected
+    ):
+        """The reference upcasts the head when the config enables it, so FP32 logits are the default."""
+        config.enable_lm_head_fp32 = enable_lm_head_fp32
+        model = HyMT2ForCausalLM(config, backend=backend_config, logits_dtype=logits_dtype).to(device)
+        model = model.to(torch.bfloat16)
+        bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
+        with patch.object(model.model, "forward", return_value=bf16_hidden):
+            input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
+            logits = model(input_ids).logits
         assert model.lm_head.weight.dtype == torch.bfloat16
-        assert model._enable_lm_head_fp32 is True
-        bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
-        with patch.object(model.model, "forward", return_value=bf16_hidden):
-            input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids).logits
-        assert logits.dtype == torch.bfloat16
-
-    def test_lm_head_no_upcast_when_disabled(self, config, backend_config, device):
-        config.enable_lm_head_fp32 = False
-        model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
-        bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
-        with patch.object(model.model, "forward", return_value=bf16_hidden):
-            input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
-            logits = model(input_ids).logits
-        assert logits.dtype == torch.bfloat16
+        assert logits.dtype == expected
 
     def test_forward_thd_hidden_states_match_logits_layout(self, config, backend_config, device):
         model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
         batch, seq = 1, 5
         input_ids = torch.randint(0, config.vocab_size, (batch, seq), device=device)
         position_ids = torch.arange(seq, device=device).unsqueeze(0)
-        hidden = torch.randn(seq, HIDDEN, device=device, dtype=torch.bfloat16)
-        with patch.object(model.model, "forward", return_value=hidden):
-            out = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                output_hidden_states=True,
-            )
+        out, layer_inputs = run_with_passthrough_layers(
+            model, input_ids, position_ids=position_ids, qkv_format="thd", output_hidden_states=True
+        )
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq, HIDDEN) for shape in layer_inputs)
         assert out.logits.shape == (batch, seq, config.vocab_size)
         assert out.hidden_states.shape == (batch, seq, HIDDEN)
 

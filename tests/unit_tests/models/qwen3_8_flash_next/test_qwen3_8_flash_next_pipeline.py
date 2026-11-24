@@ -204,6 +204,14 @@ def test_stage_metas_exchange_hc_width() -> None:
     assert inputs_meta[0].shape == (2, 5, hc_width)
     assert outputs_meta[0].shape == (2, 5, text.vocab_size)
 
+    # The last stage declares the dtype its head returns: the activation dtype unless logits_dtype is set.
+    for logits_dtype, expected in ((None, torch.bfloat16), (torch.float32, torch.float32)):
+        last.lm_head.logits_dtype = logits_dtype
+        _, outputs_meta = last.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=2, seq_len=5, dtype=torch.bfloat16
+        )
+        assert outputs_meta[0].dtype == expected
+
 
 def test_two_stage_forward_matches_single_model() -> None:
     model = _build_model()
