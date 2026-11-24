@@ -475,7 +475,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             size and streams is ``hc_mult``. The output is that stream shape
             on stages without the final norm, otherwise [microbatch,
             local_sequence, hidden] for hidden-state returns or [microbatch,
-            local_sequence, vocab] for logits.
+            local_sequence, vocab] for logits, which use the head's
+            ``logits_dtype`` when it sets one. Every other tensor uses ``dtype``.
         """
         config = self.config.text_config
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
@@ -488,10 +489,14 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         )
         if self.language_model.norm is None:
             output_shape = hidden_shape
+            output_dtype = dtype
+        elif self.lm_head is None or self._pp_return_hidden_states:
+            output_shape = (microbatch_size, local_length, config.hidden_size)
+            output_dtype = dtype
         else:
-            width = config.hidden_size if self._pp_return_hidden_states else config.vocab_size
-            output_shape = (microbatch_size, local_length, width)
-        return (inputs,), (torch.empty(output_shape, device="meta", dtype=dtype),)
+            output_shape = (microbatch_size, local_length, config.vocab_size)
+            output_dtype = self.lm_head.logits_dtype or dtype
+        return (inputs,), (torch.empty(output_shape, device="meta", dtype=output_dtype),)
 
     def forward(
         self,
@@ -556,8 +561,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                 whose activations are already local. When None, a non-CP
                 context is built from ``input_ids``, ``attention_mask``,
                 ``padding_mask`` and ``cu_seqlens``/``_packed_seq_ids``.
-            **kwargs: ``qkv_format="thd"`` restores a batch axis on THD
-                logits; ``cu_seqlens`` and ``_packed_seq_ids`` feed the
+            **kwargs: ``cu_seqlens`` and ``_packed_seq_ids`` feed the
                 fallback context. All kwargs reach the decoder layers.
 
         Returns:

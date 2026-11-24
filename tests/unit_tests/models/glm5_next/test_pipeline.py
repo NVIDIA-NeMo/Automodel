@@ -282,3 +282,45 @@ def test_pipeline_stage_with_mtp_head_raises(stage_index):
     value = ids if stage_index == 0 else torch.randn(1, 8, 2, 16)
     with pytest.raises(ValueError, match="MTP is not supported with pipeline parallelism"):
         stage(value, attention_mask=torch.ones_like(ids, dtype=torch.int32))
+
+
+def _bf16_pp_stages(logits_dtype: torch.dtype | None) -> list[Glm5NextForConditionalGeneration]:
+    config = tiny_glm5_next_config()
+    config.text_config.num_nextn_predict_layers = 0
+    model = Glm5NextForConditionalGeneration(config, backend=tiny_backend(), logits_dtype=logits_dtype)
+    model.initialize_weights(torch.device("cpu"), dtype=torch.bfloat16)
+    return split_stages(model.to(torch.bfloat16).eval(), 2)
+
+
+def _last_stage_output_and_meta(stages: list[Glm5NextForConditionalGeneration]) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+    docs = torch.ones_like(ids, dtype=torch.int32)
+    with torch.no_grad():
+        streams = stages[0](ids, attention_mask=docs).logits
+        output = stages[1](streams, attention_mask=docs)
+    output = output if isinstance(output, torch.Tensor) else output.logits
+    _, outputs_meta = stages[1].get_pipeline_stage_metas(
+        is_first=False, microbatch_size=1, seq_len=8, dtype=torch.bfloat16
+    )
+    return output, outputs_meta[0]
+
+
+@pytest.mark.parametrize(
+    ("logits_dtype", "expected"),
+    [(None, torch.bfloat16), (torch.float32, torch.float32), (torch.bfloat16, torch.bfloat16)],
+)
+def test_last_stage_logits_meta_follows_the_head_logits_dtype(logits_dtype, expected):
+    """The declared last-stage logits meta equals what forward returns, in the head's logits dtype."""
+    output, meta = _last_stage_output_and_meta(_bf16_pp_stages(logits_dtype))
+    assert output.dtype == expected
+    assert meta.dtype == output.dtype
+    assert meta.shape == output.shape
+
+
+def test_last_stage_hidden_return_meta_keeps_the_activation_dtype():
+    stages = _bf16_pp_stages(torch.float32)
+    stages[1]._pp_return_hidden_states = True
+    output, meta = _last_stage_output_and_meta(stages)
+    assert output.dtype == torch.bfloat16
+    assert meta.dtype == torch.bfloat16
+    assert meta.shape == output.shape
