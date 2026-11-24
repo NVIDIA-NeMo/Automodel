@@ -140,3 +140,24 @@ def test_block_keys_reject_gpus_without_fa4_qsa(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(fa4_qsa.torch.cuda, "get_device_capability", lambda device: capability)
     with pytest.raises(RuntimeError, match=f"SM90 and SM100-family.*got SM{capability[0]}{capability[1]}"):
         fa4_qsa._block_keys(torch.device("cuda", 0))
+
+
+@pytest.mark.runtime_budget(
+    30, hard_timeout=90, reason="Dynamo traces preprocessing twice (static, then symbolic width)"
+)
+def test_preprocess_traces_one_symbolic_route_width() -> None:
+    """Packed batches trim routes to their longest document, so the width changes every step. Under Dynamo's
+    default shape policy preprocessing compiles a static graph, then one symbolic-width graph that every later
+    width reuses. The function is re-wrapped with the eager backend so the test measures the trace, not inductor's
+    CPU build; fullgraph turns a third compile into FailOnRecompileLimitHit."""
+    torch._dynamo.reset()
+    torch.manual_seed(6)
+    preprocess = torch.compile(fa4_qsa._preprocess.__wrapped__, fullgraph=True, backend="eager")
+    limit_name = "recompile_limit" if hasattr(torch._dynamo.config, "recompile_limit") else "cache_size_limit"
+    with torch._dynamo.config.patch(**{limit_name: 2}):
+        for width in range(3, 9):  # six distinct widths against a limit of two graphs
+            routes = torch.randint(-2, 70, (1, 5, width))
+            actual = preprocess(routes, 65, 80, 64)
+            expected = fa4_qsa._preprocess.__wrapped__(routes, 65, 80, 64)
+            for result, reference in zip(actual, expected):
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)

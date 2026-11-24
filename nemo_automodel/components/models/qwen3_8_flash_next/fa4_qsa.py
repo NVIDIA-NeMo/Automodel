@@ -133,7 +133,11 @@ def _block_keys(device: torch.device) -> tuple[int, int]:
     raise RuntimeError(f"FA4 QSA supports SM90 and SM100-family (10.x/11.x) GPUs only; got SM{major}{minor}")
 
 
-@torch.compile(dynamic=False)
+# Packed batches trim the route width to their longest document, so it changes from step to step.
+# Dynamo's default shape policy compiles a static graph, then recompiles once with a symbolic width
+# that every later batch reuses. dynamic=False recompiled and re-autotuned (~0.5 s) for every new
+# width, which made FA4 QSA training slower than flex attention.
+@torch.compile
 def _preprocess(
     routes: torch.Tensor, kv_length: int, forward_block_keys: int, backward_block_keys: int
 ) -> tuple[torch.Tensor, ...]:
@@ -142,7 +146,8 @@ def _preprocess(
     Args:
         routes: Signed int32/int64 tensor [batch, queries, routes_per_query].
             Duplicate IDs collapse; invalid IDs, including large int64 values,
-            are discarded before indexing.
+            are discarded before indexing. routes_per_query may differ between
+            calls.
         kv_length: Positive number of physical key/value positions.
         forward_block_keys: Keys per forward block (see _block_keys).
         backward_block_keys: Keys per backward block (see _block_keys).

@@ -177,6 +177,26 @@ def test_deterministic_mode_rejected() -> None:
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
+def test_new_route_widths_reuse_the_compiled_preprocessing() -> None:
+    """Packed batches trim routes to their longest document, so the width changes every step.
+
+    Preprocessing compiles at most twice (static, then symbolic width) instead of recompiling and re-autotuning
+    for every width, which cost ~0.5 s per training step on VR200.
+    """
+    torch._dynamo.reset()
+    torch.manual_seed(89)
+    q = torch.randn(1, 256, 24, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 256, 2, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    for width in (17, 33, 65, 129, 200):
+        routes = torch.randint(-1, 256, (1, 256, width), device="cuda", dtype=torch.int32)
+        out = fa4_sparse_gqa_attention(q, k, v, routes)
+        ref, _ = _reference(q.double(), k.double(), v.double(), routes, scale=256**-0.5)
+        _assert_parity(out, ref)
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] - before <= 2
+
+
 def test_4k_routes_with_sampled_fp64_backward() -> None:
     torch.manual_seed(73)
     q = torch.randn(1, 4096, 24, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
