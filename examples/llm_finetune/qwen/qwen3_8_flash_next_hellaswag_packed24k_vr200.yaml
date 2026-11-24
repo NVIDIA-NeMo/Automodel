@@ -28,7 +28,7 @@ model:
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: flex  # packed batches need flex or fa4, and the FA4 QSA kernel supports only SM90
+    attn: fa4  # packed QSA batches need flex or fa4; FA4 QSA runs on SM90 and SM100-family GPUs
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
