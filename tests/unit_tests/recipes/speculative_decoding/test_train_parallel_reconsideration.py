@@ -109,8 +109,9 @@ def _write_target_cache(root: Path) -> tuple[Path, Path]:
 
 @pytest.mark.cpu_only
 def test_reconsideration_recipe_trains_and_resumes_from_native_checkpoint(tmp_path: Path) -> None:
-    target, cache = _write_target_cache(tmp_path)
     config = yaml.safe_load((_ROOT / "examples/speculative/parallel_reconsideration/qwen3_0_6b_mvp.yaml").read_text())
+    assert not config["recipe_args"].get("ckpt_every_steps")
+    target, cache = _write_target_cache(tmp_path)
     output = tmp_path / "run"
     config["dist_env"]["backend"] = "gloo"
     config["recipe_args"].update(
@@ -120,7 +121,6 @@ def test_reconsideration_recipe_trains_and_resumes_from_native_checkpoint(tmp_pa
         seq_length=6,
         num_epochs=1,
         log_every_steps=1,
-        ckpt_every_steps=1,
     )
     checkpoints = output / "checkpoints"
     config["checkpoint"]["checkpoint_dir"] = str(checkpoints)
@@ -138,7 +138,7 @@ def test_reconsideration_recipe_trains_and_resumes_from_native_checkpoint(tmp_pa
         return result.stdout + result.stderr
 
     assert "step=1 train_loss=" in run()
-    assert list(checkpoints.glob("epoch_*_step_1"))
+    assert [path.name for path in checkpoints.glob("epoch_*_step_1")] == ["epoch_1_step_1"]
     config["recipe_args"]["num_epochs"] = 2
     config["checkpoint"]["restore_from"] = "LATEST"
     resumed = run()

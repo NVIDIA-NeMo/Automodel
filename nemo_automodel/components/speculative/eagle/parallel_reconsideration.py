@@ -241,7 +241,7 @@ class ParallelReconsiderationConfig:
 
 
 class ParallelReconsiderationTrainerModule(nn.Module):
-    """Train two independent continuations from a shared target-derived seed."""
+    """Train two feature rollouts over the same recorded token sequence."""
 
     def __init__(
         self,
@@ -291,28 +291,14 @@ class ParallelReconsiderationTrainerModule(nn.Module):
         """
         if target_logits is not None and target_probs is None and position_mask is None:
             top = target_logits.argmax(-1)
-            # Cached columns and sampling use selected_token_ids in frequency
-            # order. The eligibility mask alone cannot recover that order.
+            # Cached columns use selected_token_ids in frequency order. The
+            # eligibility mask alone cannot recover that order.
             reverse = self.selected_token_ids.new_zeros(self.selected_token_mask.shape)
             reverse[self.selected_token_ids] = torch.arange(self.selected_token_ids.numel(), device=top.device)
             return reverse[top], loss_mask.bool() & self.selected_token_mask[top]
         if target_logits is None and target_probs is not None and position_mask is not None:
             return target_probs.argmax(-1), position_mask.squeeze(-1).bool() & loss_mask.bool()
         raise ValueError("Provide live target_logits or cached target_probs and position_mask")
-
-    @torch.no_grad()
-    def _sample_tokens(self, hidden: Tensor) -> Tensor:
-        """Draw the branch's continuation tokens.
-
-        Args:
-            hidden: Draft features of shape [batch, origin, hidden].
-
-        Returns:
-            Target token IDs of shape [batch, origin].
-        """
-        probs = self.draft_model.compute_logits(hidden).float().softmax(-1)
-        indices = torch.multinomial(probs.flatten(0, 1), 1).reshape(hidden.shape[:2])
-        return self.selected_token_ids[indices]
 
     def forward(
         self,
@@ -331,7 +317,7 @@ class ParallelReconsiderationTrainerModule(nn.Module):
         """Compute the native trainer's loss and one-pass metrics.
 
         Args:
-            input_ids: EAGLE-shifted target token IDs [batch, origin].
+            input_ids: EAGLE-shifted recorded token IDs [batch, origin], shared by both rollouts.
             attention_mask: Original real-token mask [batch, origin].
             loss_mask: Aligned teacher supervision mask [batch, origin].
             aux_hidden_states: Target taps [batch, origin, concatenated_hidden].
@@ -367,7 +353,8 @@ class ParallelReconsiderationTrainerModule(nn.Module):
             minimum = torch.finfo(features.dtype).min
             base_mask = torch.zeros_like(base_visible, dtype=features.dtype).masked_fill(~base_visible, minimum)
             strict_mask = torch.zeros_like(base_mask).masked_fill(~strict_visible, minimum)
-            one = mixed = draft.draft_step(draft.embed_input_ids(input_ids), features, base_mask, position_ids)
+            tokens = input_ids
+            one = mixed = draft.draft_step(draft.embed_input_ids(tokens), features, base_mask, position_ids)
             one_prefix = mixed_prefix = (one.kv,)
             loss_sum, count, correct, halt_count = (features.new_zeros((), dtype=torch.float32) for _ in range(4))
             mass_sum = loss_sum.new_zeros(self.settings.max_reconsiderations + 1)
@@ -406,8 +393,12 @@ class ParallelReconsiderationTrainerModule(nn.Module):
                 depths = torch.multinomial(mass.detach().flatten(0, 1), 1).reshape_as(input_ids)
                 chosen = _select_halt(levels, depths)
                 mixed_prefix = (*mixed_prefix, chosen.kv)
+                # Follow EAGLE-3 TTT: carry each branch's own feature and cache,
+                # and advance on the recorded tokens that condition the teacher labels.
+                tokens = _shift_left_with_zero(tokens)
+                next_embeds = draft.embed_input_ids(tokens)
                 one = draft.draft_step(
-                    draft.embed_input_ids(self._sample_tokens(one.hidden)),
+                    next_embeds,
                     one.hidden,
                     base_mask,
                     position + 1,
@@ -415,7 +406,7 @@ class ParallelReconsiderationTrainerModule(nn.Module):
                 )
                 one_prefix = (*one_prefix, one.kv)
                 mixed = draft.draft_step(
-                    draft.embed_input_ids(self._sample_tokens(chosen.hidden)),
+                    next_embeds,
                     chosen.hidden,
                     strict_mask,
                     position + 1,

@@ -27,7 +27,6 @@ recipe_args:
   shuffle_seed: 0
   log_every_steps: 10
   max_grad_norm: 0.5
-  ckpt_every_steps: 250
   save_checkpoint_every_epoch: true
 
 optimizer:
