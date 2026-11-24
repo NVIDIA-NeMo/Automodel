@@ -1,13 +1,15 @@
 # GLM-5.3 (753B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
 # PP3 x EP16 on 12 nodes shards the experts 48 ways (256 experts rule out EP48), holding ~146 GiB of
-# bf16 weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU. The pipeline
-# settings follow the GB200 recipe (interleaved 1F1B, two layers per virtual stage) with 16K packs.
+# bf16 weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU, plus ~57 GiB of
+# NCCL/HybridEP buffers outside the PyTorch allocator. The pipeline settings follow the GB200 recipe
+# (interleaved 1F1B, two layers per virtual stage). Six 16K microbatches put ~104 GiB of activations
+# on the first stage and ran out of memory once optimizer state existed, so three 8K microbatches.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 96
-  local_batch_size: 6
+  global_batch_size: 48
+  local_batch_size: 3
   ckpt_every_steps: 1000
   val_every_steps: 1000
   gc_every_steps: 10
@@ -66,7 +68,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: train[:100000]
+  split: train[:30000]
   shuffle_seed: 42
   truncation: true
   seq_length: 4096
@@ -76,7 +78,7 @@ dataset:
     pretrained_model_name_or_path: zai-org/GLM-5.3
 
 packed_sequence:
-  packed_sequence_size: 16384
+  packed_sequence_size: 8192
   packing_strategy: thd
   num_proc: 8
 
@@ -108,7 +110,7 @@ ci:
   recipe_owner: akoumpa
   nodes: 12
   nproc_per_node: 4
-  time: "00:45:00"
+  time: "00:40:00"
   max_steps: 20
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
