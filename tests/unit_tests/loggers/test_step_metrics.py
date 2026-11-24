@@ -43,6 +43,29 @@ def test_token_counts_use_the_recipe_counters():
     assert (counts.labels.item(), counts.tokens.item(), counts.packs.item()) == (3, 4, 2)
 
 
+class _TeraflopPerBatch:
+    def get_flops(self, input_ids, /):
+        return 1e12
+
+
+def test_flops_count_context_parallel_ranks_once():
+    """CP ranks hold their DP replica's unsharded batch, so its FLOPs count once, like its tokens."""
+    dp_size, cp_size = 2, 2
+
+    def group_sum(tensor, /, *, include_cp=False, keep_device=False):
+        return tensor * (dp_size * cp_size if include_cp else dp_size)
+
+    reducer = StepMetricReducer(
+        device=torch.device("cpu"),
+        dp_reduce=group_sum,
+        count_label_tokens=_count_label_tokens,
+        count_tail_padding=count_tail_padding,
+    )
+    batch = {"labels": torch.zeros(1, 4, dtype=torch.long), "input_ids": torch.zeros(1, 4, dtype=torch.long)}
+
+    assert reducer.flops([batch], _TeraflopPerBatch()).item() == dp_size * 1e12
+
+
 def test_training_reporter_computes_mfu_with_the_recipe_formula():
     reporter = TrainingStepReporter(
         torch.device("cpu"),

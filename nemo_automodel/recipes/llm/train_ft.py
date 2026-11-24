@@ -1658,7 +1658,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
-        step_flops = reducer.flops(batches, getattr(self, "mfu_calculator", None))
+        step_flops = reducer.flops(batches, self.mfu_calculator)
         reporting_loss = reducer.loss(loss_buffer, normalize_by=counts.labels if self.pp_enabled else None)
         metrics = {
             "loss": reporting_loss,
@@ -1696,7 +1696,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             world_size=self.dist_env.world_size,
             pack_size=self.pack_size or 0,
             domain_names=getattr(getattr(self, "domain_mixture", None), "names", ()),
-            reference_mfu=getattr(getattr(self, "mfu_calculator", None), "reference_mfu", None),
+            reference_mfu=self.mfu_calculator.reference_mfu if self.mfu_calculator is not None else None,
             calculate_mfu=calculate_mfu,
         )
 

@@ -189,7 +189,7 @@ class StepMetricReducer:
             calculator: Model FLOPs estimator, if available.
 
         Returns:
-            Scalar total on the training device, or None for an unsupported input.
+            Scalar total over data-parallel ranks on the training device, or None for an unsupported input.
         """
         if not batches or calculator is None:
             return None
@@ -200,7 +200,10 @@ class StepMetricReducer:
             if flops is None:
                 return None
             total += float(flops)
-        return self.reduce(torch.tensor(total, dtype=torch.float64, device="cpu"), include_cp=True)
+        # Sum over DP ranks only, like the token count. Every CP rank of a DP replica holds
+        # the same unsharded batches (CP shards a copy inside the step), so including CP
+        # would count each sequence's FLOPs cp_size times.
+        return self.reduce(torch.tensor(total, dtype=torch.float64, device="cpu"))
 
     def loss(self, losses: Sequence[torch.Tensor], *, normalize_by: torch.Tensor | None) -> torch.Tensor:
         """Reduce reported loss and share the last pipeline stage's result.
