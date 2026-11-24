@@ -1,0 +1,251 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NVFP4 pretraining throughput of the language model of Nemotron 3.5 Super VL (120B-A12B) on text, from random
+# initialization, through Transformer Engine: 4 nodes x 4 GB300, tp1 / cp1 / pp1 / ep16, 128 sequences of 8192
+# tokens per optimizer step (16 ranks x one micro-batch of 8), the MTP head trained with two prediction depths
+# through its one block. The vision tower and projector are frozen and never run on text batches.
+# BF16 counterpart: nemotron_3_5_super_vl_te_bf16_8k_ep16_gb300.yaml. Each of the two files is the fastest
+# setting measured for its precision, so they differ in more than the precision (micro-batch, activation
+# checkpointing, optimizer). This file without the te_nvfp4 block is the BF16 run that differs in precision only.
+#
+# This file measures training speed. Three of its settings exist only for that; none belongs in a run whose
+# model is meant to be kept:
+#   - Mock data (dataset): random token ids in rows of fixed length. Nothing can be learned from them.
+#   - Balanced gate: `--benchmark` applies ci.perf_testing.fake_balanced_gate as
+#     model.backend.fake_balanced_gate: true, so every expert receives the same number of tokens. Run this file
+#     with `--benchmark`. Without it the gate is learned, which this file was not run with and is not set up
+#     for. The learned gate of a randomly initialized model sends some ranks several times the balanced rows:
+#     one micro-batch of 8 then peaked at 276.5 GiB of 276.6 GiB on 16 GB300 with less kept in memory than this
+#     file keeps. nemotron_3_5_super_vl_te_nvfp4_gb300.yaml in this directory is the file for the learned gate.
+#   - Equal token counts (model.backend.dispatcher_equal_token_counts: true): HybridEP skips the all-reduce that
+#     sizes its buffers. Valid only while every rank dispatches the same number of rows in every micro-batch,
+#     which fixed-length mock rows guarantee. With variable-length or packed data the dispatch hangs.
+#
+# Precision by module (te_nvfp4.precision_map), the layout published for this model family: Nemotron 3 Super
+# technical report, arXiv 2604.12374, section 2.2 "Precision by Layer Type"; the NVFP4 recipe itself is
+# described in arXiv 2509.25149. Counts are Transformer Engine GEMM modules on one rank.
+#   NVFP4, layers 0-73: Mamba input projection (34), routed experts (2 x 33), shared expert (2 x 33).
+#   MXFP8, layers 0-73: Mamba output projection (34).
+#   High precision (BF16): every GEMM of layers 74-87, the attention projections, the latent projections of the
+#     MoE layers and the MTP head. lm_head is a torch linear in BF16 and is not among the counts.
+# Rank 0 logs the counts once at startup ("te_nvfp4: Transformer Engine GEMM modules by precision": 166 NVFP4,
+# 34 MXFP8, 163 high precision). Parameters are BF16; FusedAdam keeps FP32 master weights, stored as the BF16
+# parameter plus its 16 low bits, and FP32 moments.
+# nemotron_3_5_super_vl_te_nvfp4_gb300.yaml in this directory is the training recipe with the same precision
+# map on FineWeb; its header describes the map and the NVFP4 size requirements in full.
+#
+# What makes the step fast, each measured on this workload:
+#   - One micro-batch of 8 sequences per rank under full-block activation checkpointing
+#     (distributed.moe.checkpoint_repeated_mtp_moe covers the shared MTP MoE block as well).
+#   - model.mamba_scan_ac_exempt_blocks: 13 keeps the scan state of the first 13 Mamba blocks, so their
+#     recompute in the backward pass skips the scan: about 1.5 GiB per block.
+#   - reshard_after_forward: false (FSDP and MoE) keeps the unsharded parameters between forward and backward.
+#   - te_grouped_tensor, dispatcher_num_sms: 64, dispatcher_recompute_cache: combine,
+#     mamba_norm_backward_grid_scale: 8 and FusedLinearCrossEntropy, as in the BF16 file.
+# shared_expert_overlap (the shared expert on a second CUDA stream) is off, as in the BF16 file: with cuBLASLt
+# before 13.8.1 a grouped GEMM can leave part of a weight gradient unwritten while GEMMs run on a second
+# stream, whatever the routing, so the experts refuse te_grouped_tensor together with it on such a library.
+# On one node with 128 of the 512 experts (ep4, 4 instead of 13 Mamba blocks keeping their scan state), two
+# runs each: this file 13,327 and 13,323 tokens/s/GPU; the side stream with one GEMM per expert 13,326 and
+# 13,323; both together, before they were refused, 13,399 and 13,421. This file takes the grouped GEMMs
+# because nvidia-smi then peaks 11 GiB lower (247 against 258 GiB).
+# Expert dispatch: the rows routed to the 32 experts of a rank hold 3.88e9 elements at this micro-batch, more
+# than one grouped NVFP4 quantization handles, so the NVFP4 expert projections run one GEMM per expert (rank 0
+# logs the first such dispatch and, at 256, 512, ... dispatches, how many there were). The routed experts in
+# high precision (layers 74-87 and the MTP block) keep the grouped GEMM.
+#
+# Reported figures. Every step logs `tps <tokens/s>(<tokens/s per GPU>/gpu)` and `mfu <percent>`. The model
+# FLOPs behind mfu are those of the language model for the tokens of the step: its 88 layers, lm_head and the
+# two MTP depths, 85.66 GFLOPs per token at this sequence length (75.87 without the MTP head); the vision tower
+# is not counted, and the count does not depend on the precision. mfu.peak_tflops is the dense BF16 peak of a
+# GB300, as in the BF16 file, although the GEMMs here mix NVFP4, MXFP8 and BF16: read mfu as a rate, not as a
+# utilization of the NVFP4 peak.
+#   model TFLOPs/s/GPU = mfu / 100 x 2500.
+# tps counts 8191 label positions per sequence, the FLOPs all 8192 tokens.
+#
+# Environment: GB300 (per GPU the step peaked at 250 GiB of 277 GiB in nvidia-smi and at 239 GiB allocated by
+# torch), Transformer Engine 2.19 or newer, PYTORCH_ALLOC_CONF=expandable_segments:True in every rank.
+# NEMO_HYBRIDEP_JIT_CACHE=<directory> keeps the compiled HybridEP kernels between launches: a shorter start,
+# the same step time.
+# NVTE_USE_FAST_MATH=1 in every rank selects faster arithmetic in Transformer Engine's quantization kernels.
+# It changes the quantized values (the loss of the first step differs in the fourth digit); its effect on
+# convergence was not studied.
+#
+# Measured with this file on 16 GB300 (Transformer Engine 2.19.0, cuBLASLt 13.7.0) with `--benchmark`, over 20
+# steps after 6 warm-up steps, the model config read from a local copy of the Hub config. Seconds per optimizer
+# step, tokens/s/GPU counting all 8192 tokens of a sequence, and model TFLOPs/s/GPU as logged:
+#   - default arithmetic, two runs: 4.944 and 4.943 s, 13,255 and 13,258 tokens/s/GPU, 1,135 and 1,136;
+#   - NVTE_USE_FAST_MATH=1, two runs: 4.696 and 4.693 s, 13,956 and 13,966 tokens/s/GPU, 1,195 and 1,196;
+#   - without the te_nvfp4 block (BF16 GEMMs), one run: 5.708 s, 11,482 tokens/s/GPU, 984.
+#
+# Launch on 4 nodes x 4 GPUs: on every node, from the repository root (26 steps, the first 6 are warm-up):
+#   torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=<first node>:<port> \
+#     -m nemo_automodel.cli.app \
+#     examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_8k_ep16_gb300.yaml \
+#     --benchmark --step_scheduler.max_steps 26
+# The measured runs also passed --numa-binding=node to torchrun and set OMP_NUM_THREADS=8 in every rank; the
+# effect of either was not measured.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 128
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  num_epochs: null
+  max_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: bfloat16
+  # Two prediction depths through the one MTP block of the checkpoint.
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  # The first 13 Mamba blocks keep their scan state through activation checkpointing.
+  mamba_scan_ac_exempt_blocks: 13
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+    trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    # The Mamba projections as Transformer Engine linears, so that the precision map can quantize them.
+    mamba_linear: te
+    rms_norm: te
+    experts: te
+    te_grouped_tensor: true
+    dispatcher: hybridep
+    dispatcher_num_sms: 64
+    dispatcher_recompute_cache: combine
+    # Benchmark only: valid for fixed-length rows, see the header.
+    dispatcher_equal_token_counts: true
+    # Not together with te_grouped_tensor before cuBLASLt 13.8.1, see the header.
+    shared_expert_overlap: false
+    mamba_norm_backward_grid_scale: 8
+    gate_precision: float32
+    # `--benchmark` sets this to true through ci.perf_testing.fake_balanced_gate.
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    te_nvfp4:
+      _target_: nemo_automodel.components.models.common.TENvfp4Config
+      row_scaled_activation: false
+      precision_map:
+        _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
+        high_precision_tail_layers: 14
+        mamba_in_proj: nvfp4
+        mamba_out_proj: mxfp8
+        routed_experts: nvfp4
+        shared_experts: nvfp4
+        attention: high_precision
+        latent_proj: high_precision
+        mtp: high_precision
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: false
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: false
+    checkpoint_repeated_mtp_moe: true
+  multimodal:
+    frozen_sharding: replicate
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+mtp:
+  scaling_factor: 0.3
+
+mfu:
+  # Dense BF16 peak of a GB300 in TFLOPs/s; see the header.
+  peak_tflops: 2500.0
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
+
+dataset:
+  # Benchmark only: random token ids.
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 131072
+  seq_len: 8192
+  include_position_ids: false
+  exclude_token_ids: [0]
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+  pin_memory: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: true
+  exp_avg_dtype: float32
+  exp_avg_sq_dtype: float32
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 2
+  min_lr: 3.0e-5
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: skipped
+  recipe_owner: HuiyingLi
+  time: "00:30:00"
+  nodes: 4
+  cluster_tag: gb300
+  nproc_per_node: 4
+  env_vars:
+    PYTORCH_ALLOC_CONF: expandable_segments:True
+  perf_testing:
+    schedule: disabled
+    fake_balanced_gate: true
