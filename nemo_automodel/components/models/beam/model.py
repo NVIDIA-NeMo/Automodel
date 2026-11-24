@@ -19,11 +19,12 @@ preserves HF names; BeamStateDictAdapter converts the grouped expert weights."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.beam import BeamConfig
 
 from nemo_automodel.components.models.beam.layers import (
     Block,
@@ -49,9 +50,6 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-
-if TYPE_CHECKING:
-    from transformers.models.beam import BeamConfig
 
 
 def beam_moe_config(config: BeamConfig, model_dtype: torch.dtype, overrides: dict[str, Any] | None = None) -> MoEConfig:
