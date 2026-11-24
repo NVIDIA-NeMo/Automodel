@@ -1,7 +1,8 @@
 # DeepSeek-V4.1-Flash (763B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
 # EP48 on 12 nodes, the fewest that fit, holds ~148 GiB of bf16 weights, gradients and TE FusedAdam
-# state (param remainders plus bf16 moments, 10 bytes per parameter) per GPU. 12K packs peaked at
-# 166 GiB; 32K packs (the T x T indexer logits stay below 2^31 elements) use more of the 280 GiB.
+# state (param remainders plus bf16 moments, 10 bytes per parameter) per GPU, and NCCL/HybridEP
+# buffers take ~61 GiB outside the PyTorch allocator. 12K packs peaked at 166 GiB; 32K packs ran out
+# of memory on the 16 GiB fp32 logits, so 16K.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
@@ -91,7 +92,7 @@ dataset:
     trust_remote_code: false
 
 packed_sequence:
-  packed_sequence_size: 32768
+  packed_sequence_size: 16384
   packing_strategy: thd
   num_proc: 8
 
