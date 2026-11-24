@@ -50,6 +50,7 @@ _Precision = Literal["fp32", "tf32", "fp16", "fp8", "fp4"]
 # https://www.nvidia.com/en-us/data-center/gb300-nvl72/
 # https://www.nvidia.com/en-us/data-center/hgx/
 # https://www.nvidia.com/en-us/data-center/l40s/ and the Ada architecture whitepaper (L40)
+# https://www.nvidia.com/en-us/products/workstations/rtx-5880/ and the Ada workstation whitepaper
 # Other 16-bit entries retain the existing lookup adapted from verl's flops_counter.py.
 _DEVICE_TFLOPS: dict[str, dict[_Precision, float]] = {
     "CPU": {"fp16": 0.448},
@@ -59,7 +60,6 @@ _DEVICE_TFLOPS: dict[str, dict[_Precision, float]] = {
     "GB300": {"fp32": 80, "tf32": 1250, "fp16": 2500, "fp8": 5000, "fp4": 15000},
     "B200": {"fp32": 75, "tf32": 1125, "fp16": 2250, "fp8": 4500, "fp4": 9000},
     "B300": {"fp32": 75, "tf32": 1125, "fp16": 2250, "fp8": 4500, "fp4": 13500},
-    "MI300X": {"fp16": 1336.0},
     "H100": {"fp32": 67, "tf32": 494.5, "fp16": 989, "fp8": 1979},
     "H800": {"fp16": 989.0},
     "H200": {"fp32": 67, "tf32": 494.5, "fp16": 989, "fp8": 1979},
@@ -70,9 +70,10 @@ _DEVICE_TFLOPS: dict[str, dict[_Precision, float]] = {
     "A40": {"fp16": 149.7},
     "L20": {"fp16": 119.5},
     "H20": {"fp16": 148.0},
-    "910B": {"fp16": 354.0},
-    "Ascend910": {"fp16": 354.0},
     "RTX 3070 Ti": {"fp16": 21.75},
+    # RTX 5880 datasheet: 1108.4 sparse FP8 TFLOPs/s. See the RTX 6000 Ada
+    # appendix of NVIDIA's Ada workstation whitepaper for the precision ratios.
+    "RTX 5880 Ada Generation": {"fp32": 69.3, "tf32": 138.6, "fp16": 277.1, "fp8": 554.2},
     "RTX PRO 6000 Blackwell Max-Q Workstation Edition": {"fp16": 438.9},
     "RTX PRO 6000 Blackwell Workstation Edition": {"fp16": 503.8},
     "H100 PCIe": {"fp32": 51, "tf32": 378, "fp16": 756, "fp8": 1513},

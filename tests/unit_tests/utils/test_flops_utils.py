@@ -407,6 +407,11 @@ def test_automfu_defaults_to_detected_device_peak(monkeypatch):
 @pytest.mark.parametrize(
     "name, dtype, expected",
     [
+        ("NVIDIA RTX 5880 Ada Generation", torch.bfloat16, 277.1),
+        ("NVIDIA RTX 5880 Ada Generation", torch.float8_e4m3fn, 554.2),
+        ("AMD Instinct MI300X", torch.bfloat16, float("inf")),
+        ("Ascend910", torch.bfloat16, float("inf")),
+        ("Ascend 910B", torch.bfloat16, float("inf")),
         ("NVIDIA H100 80GB HBM3", torch.float16, 989.0),
         ("NVIDIA H100 80GB HBM3", torch.float8_e4m3fn, 1979.0),
         ("NVIDIA H100 PCIe", torch.float8_e4m3fn, 1513.0),
