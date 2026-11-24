@@ -39,6 +39,7 @@ from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
 )
 from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -75,7 +76,7 @@ def test_recipe_config_defaults_mfu_settings():
         ({}, {}, 989.0),
         ({"enabled": True}, {}, 1979.0),
         ({"enabled": True, "emulate": True}, {}, 989.0),
-        ({"enabled": True}, {"compute_dtype": None}, 989.0),
+        ({"enabled": True}, {"compute_dtype": "auto", "infer_training_precision": False}, 989.0),
         ({"enabled": True}, {"compute_dtype": torch.float32}, 67.0),
     ],
 )
@@ -91,12 +92,19 @@ def test_recipe_mfu_uses_compute_precision(fp8_config, dtype_kwargs, expected, m
         distributed_config=FSDP2Config(),
         te_quantization=None,
         moe_parallel_config=None,
-        device_mesh=None,
+        mesh_context=MeshContext(),
     )
 
     TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, **dtype_kwargs)
 
     assert recipe.mfu_calculator.reference_mfu == expected
+
+
+def test_recipe_mfu_rejects_none_compute_dtype():
+    recipe = SimpleNamespace(distributed_config=None)
+
+    with pytest.raises(TypeError, match='compute_dtype must be "auto" or a torch.dtype'):
+        TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, nn.Linear(2, 2), compute_dtype=None)
 
 
 def _build_loader(
