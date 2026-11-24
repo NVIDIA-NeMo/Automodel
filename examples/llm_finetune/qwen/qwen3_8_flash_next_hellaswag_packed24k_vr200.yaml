@@ -28,7 +28,7 @@ model:
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: fa4  # packed batches need flex or fa4; FA4 runs on sm_107 with nvidia-cutlass-dsl 4.8
+    attn: flex  # packed batches need flex or fa4, and the FA4 QSA kernel supports only SM90
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
