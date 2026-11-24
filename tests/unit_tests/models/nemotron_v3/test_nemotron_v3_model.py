@@ -94,8 +94,13 @@ class MockNemotronV3Config:
         return vars(self)
 
 
-def _model_parallelizer_exemption_worker(rank: int, rendezvous: str) -> None:
-    """One gloo rank: apply the model's own parallelizer with activation checkpointing on a CPU mesh."""
+def _model_parallelizer_checkpointing_worker(rank: int, rendezvous: str) -> None:
+    """One gloo rank: apply the model's own parallelizer with activation checkpointing on a CPU mesh.
+
+    Without expert parallelism this parallelizer checkpoints every block of the native layout through the MoE
+    parallelizer's ``apply_ac``. What the model keeps out of block checkpointing has to stay out on this path
+    as it does with expert parallelism.
+    """
     import torch.distributed as dist
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
     from torch.distributed.device_mesh import init_device_mesh
@@ -109,12 +114,32 @@ def _model_parallelizer_exemption_worker(rank: int, rendezvous: str) -> None:
         backend = BackendConfig(
             linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
         )
-        config = MockNemotronV3Config(layers_block_type=["mamba", "attention", "mlp", "mamba"], num_hidden_layers=4)
-        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=1)
+        for activation_checkpointing in (True, "selective"):
+            config = MockNemotronV3Config(
+                layers_block_type=["mamba", "attention", "mlp", "mamba", "moe"], num_hidden_layers=5
+            )
+            model = NemotronHForCausalLM(
+                config, backend=backend, mamba_ac_exempt_blocks=1, mamba_scan_ac_exempt_blocks=1
+            )
+            PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=activation_checkpointing)
+            blocks = list(model.model.layers.values())
+            # Every block is checkpointed except the first Mamba block, which ``mamba_ac_exempt_blocks`` exempts.
+            wrapped = [isinstance(block, CheckpointWrapper) for block in blocks]
+            assert wrapped == [False, True, True, True, True], (activation_checkpointing, wrapped)
+            # ``mamba_scan_ac_exempt_blocks`` counts from the first checkpointed Mamba block: that block is
+            # wrapped and its mixer keeps the scan state.
+            assert blocks[0].mixer.scan_ac_exempt is False
+            assert blocks[3]._checkpoint_wrapped_module.mixer.scan_ac_exempt is True
+
+        # One physical ``[attention, moe]`` MTP depth that runs twice.
+        config = MockNemotronV3Config(
+            layers_block_type=["attention", "moe"], num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E"
+        )
+        model = NemotronHForCausalLM(config, backend=backend, num_nextn_predict_layers=2, mtp_use_repeated_layer=True)
         PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=True)
-        # This parallelizer checkpoints every block of the native layout: the exempt first Mamba block stays itself.
-        wrapped = [isinstance(block, CheckpointWrapper) for block in model.model.layers.values()]
-        assert wrapped == [False, True, True, True], wrapped
+        assert all(isinstance(block, CheckpointWrapper) for block in model.model.layers.values())
+        # As with expert parallelism, the MoE block of a weight-tied MTP depth keeps its activations.
+        assert [isinstance(block, CheckpointWrapper) for block in model.mtp.layers] == [True, False]
     finally:
         dist.destroy_process_group()
 
@@ -686,11 +711,20 @@ class TestNemotronHForCausalLM:
         model.gradient_checkpointing_disable()
         assert all(isinstance(block, NemotronV3Block) for block in model.model.layers.values())
 
-    def test_mamba_ac_exempt_blocks_are_left_unwrapped_by_the_model_parallelizer(self, tmp_path):
-        """FSDP2 without expert parallelism (``NemotronHModelParallelizer``) honors the exemption too."""
+    def test_model_parallelizer_keeps_exempt_blocks_out_of_checkpointing(self, tmp_path):
+        """FSDP2 without expert parallelism (``NemotronHModelParallelizer``) honors the exemptions too.
+
+        Full and selective checkpointing with ``mamba_ac_exempt_blocks`` and ``mamba_scan_ac_exempt_blocks``,
+        and the MoE block of a weight-tied MTP depth.
+        """
         import torch.multiprocessing as mp
 
-        mp.spawn(_model_parallelizer_exemption_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=1, join=True)
+        mp.spawn(
+            _model_parallelizer_checkpointing_worker,
+            args=((tmp_path / "rendezvous").as_uri(),),
+            nprocs=1,
+            join=True,
+        )
 
     @pytest.mark.parametrize("selective", [False, True])
     def test_mamba_ac_exempt_blocks_leaves_exempt_blocks_unwrapped(self, config, backend, selective):
