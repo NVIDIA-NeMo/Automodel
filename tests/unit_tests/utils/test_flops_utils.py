@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_automodel._transformers import mfu as mfu_module
 from nemo_automodel._transformers.mfu import AutoMFU, MFUConfig, get_device_flops
@@ -428,6 +429,67 @@ def test_mfu_config_builds_calculator(monkeypatch):
 
     assert calculator.config is model_config
     assert calculator.reference_mfu == 1979.0
+
+
+class _CountsItsOwnFlops:
+    """Model that counts seven FLOPs per token; its config selects no formula."""
+
+    def __init__(self) -> None:
+        self.config = SimpleNamespace()
+        self.calls: list[tuple[int, int]] = []
+
+    def model_flops(self, *, gbs: int, seq_len: int) -> float:
+        self.calls.append((gbs, seq_len))
+        return 7.0 * gbs * seq_len
+
+
+def test_automfu_takes_the_flops_of_a_model_that_counts_its_own(monkeypatch):
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    model = _CountsItsOwnFlops()
+
+    calculator = MFUConfig(peak_tflops=1979.0).build(model=model)
+
+    assert calculator.config is model.config
+    assert calculator.get_flops((2, 16)) == 224.0
+    assert calculator.get_flops(torch.zeros((3, 8), dtype=torch.long)) == 168.0
+    assert model.calls == [(2, 16), (3, 8)]
+    # 224 FLOPs in 1e-12 s on one device are 224 TFLOPs/s.
+    assert calculator((2, 16), time_delta=1e-12, world_size=1) == pytest.approx(100 * 224.0 / 1979.0)
+
+
+def test_automfu_prefers_the_model_count_over_the_config_formula(monkeypatch):
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: lambda config, gbs, seq_len: 1.0)
+
+    calculator = AutoMFU.from_config(_CountsItsOwnFlops(), peak_tflops=1979.0)
+
+    assert calculator.get_flops((1, 4)) == 28.0
+
+
+def test_automfu_keeps_the_config_formula_for_a_model_without_its_own_count(monkeypatch):
+    monkeypatch.setattr(
+        mfu_module,
+        "get_flops_formula_for_hf_config",
+        lambda config: lambda config, gbs, seq_len: 5.0 * gbs * seq_len,
+    )
+
+    calculator = AutoMFU.from_config(SimpleNamespace(config=SimpleNamespace()), peak_tflops=1979.0)
+
+    assert calculator.get_flops((2, 3)) == 30.0
+
+
+def test_automfu_reports_no_flops_when_the_model_count_fails(monkeypatch):
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+
+    class _CannotCount:
+        config = SimpleNamespace()
+
+        def model_flops(self, *, gbs: int, seq_len: int) -> float:
+            raise ValueError("unsupported layer")
+
+    calculator = AutoMFU.from_config(_CannotCount(), peak_tflops=1979.0)
+
+    assert calculator.get_flops((2, 16)) is None
+    assert calculator((2, 16), time_delta=1.0, world_size=1) is None
 
 
 def test_optional_field_set_to_none_uses_its_default():

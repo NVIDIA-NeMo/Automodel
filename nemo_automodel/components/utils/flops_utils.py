@@ -823,7 +823,7 @@ def _nemotronh_moe_layer_flops(config: _MoELayerConfig, gbs: int, seq_len: int) 
     return routed_expert_flops + shared_expert_flops + gate_flops + latent_proj_flops
 
 
-def _nemotronh_mtp_flops(
+def nemotronh_mtp_flops(
     config: _NemotronHConfig,
     gbs: int,
     seq_len: int,

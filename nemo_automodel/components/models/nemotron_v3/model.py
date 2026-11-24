@@ -52,6 +52,7 @@ from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLE
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.utils.flops_utils import nemotronh_flops, nemotronh_mtp_flops
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -587,6 +588,35 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def model_flops(self, *, gbs: int, seq_len: int) -> float:
+        """Count the model FLOPs of the forward and backward pass over one training batch.
+
+        Covers what a training step of this model runs: the backbone layers, ``lm_head`` and,
+        with an MTP head, every prediction depth (its blocks, its fusion projection and the
+        ``lm_head`` projection of its loss). The number of depths is ``mtp_config.num_layers``,
+        the value the model was built with: with one block shared by all depths it can exceed
+        the depth count of the checkpoint config.
+
+        Args:
+            gbs: Number of sequences in the batch.
+            seq_len: Tokens per sequence.
+
+        Returns:
+            Model FLOPs for ``gbs`` sequences of ``seq_len`` tokens.
+        """
+        flops = nemotronh_flops(self.config, gbs, seq_len)
+        depth_block_types = _resolve_block_types_per_sublayer(self.config)
+        if self.mtp_config.enabled and depth_block_types is not None:
+            flops += nemotronh_mtp_flops(
+                self.config,
+                gbs,
+                seq_len,
+                self.mtp_config.num_layers,
+                depth_block_types * self.mtp_config.num_physical_depths,
+                self.mtp_config.use_repeated_layer,
+            )
+        return flops
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable activation checkpointing on each transformer (and MTP) block.
