@@ -140,7 +140,7 @@ class HY4FlashBlock(nn.Module):
         self.post_mlp_layernorm = HY4FlashRMSNorm(hidden, eps, dtype)
         self.attn_hc = HY4FlashHyperConnection(config)
         self.ffn_hc = HY4FlashHyperConnection(config)
-        self.engram = (
+        self.engram_layer = (
             HY4FlashEngramLayer(config, layer_idx, process_group=engram_process_group, dtype=dtype)
             if layer_idx in config.engram_layer_indices
             else None
@@ -157,8 +157,8 @@ class HY4FlashBlock(nn.Module):
             Tensor of shape [batch, sequence, hc_mult, hidden].
         """
         rows, seq, _, hidden = streams.shape
-        if self.engram is not None:
-            streams = streams + self.engram(streams, batch.ngram_tokens, batch.engram_mask)
+        if self.engram_layer is not None:
+            streams = streams + self.engram_layer(streams, batch.ngram_tokens, batch.engram_mask)
         post, x = self.attn_hc(streams)
         x = self.input_layernorm(x)
         x = self.self_attn(x.reshape(1, rows * seq, hidden), layout=batch.layout, rope=batch.ropes[self.attention_type])
@@ -417,8 +417,8 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
                 nn.init.normal_(indexer.intra_group_ape, std=std)
                 nn.init.ones_(indexer.token_key_norm.weight)
                 nn.init.ones_(indexer.key_norm.weight)
-            if layer.engram is not None:
-                layer.engram.init_weights()
+            if layer.engram_layer is not None:
+                layer.engram_layer.init_weights()
         self.model.hc_head.init_weights(std)
         nn.init.ones_(self.model.norm.weight)
         if not _has_dtensor_params(self):

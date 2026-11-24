@@ -17,6 +17,8 @@
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
 
+from .tiny_kwargs import TINY_TEXT_KWARGS
+
 CPU_BACKEND = BackendConfig(
     attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch", rope_fusion=False
 )
@@ -24,48 +26,7 @@ CPU_BACKEND = BackendConfig(
 
 def tiny_text_config(**overrides: object) -> HY4FlashTextConfig:
     """Six layers: sparse, sparse, swa, swa, swa, sparse; dense MLP first; Engram on layers 1 and 3 (ids 2, 4)."""
-    sizes = {str(i): [[1009, 1013], [1019, 1021]] for i in (2, 4)}
-    kwargs = dict(
-        vocab_size=300,
-        hidden_size=64,
-        intermediate_size=96,
-        moe_intermediate_size=32,
-        routed_expert_hidden_size=32,
-        num_hidden_layers=6,
-        num_attention_heads=4,
-        swa_num_attention_heads=8,
-        n_routed_experts=8,
-        num_experts_per_tok=2,
-        q_lora_rank=32,
-        kv_lora_rank=32,
-        qk_nope_head_dim=16,
-        qk_rope_head_dim=8,
-        v_head_dim=16,
-        swa_qk_nope_head_dim=16,
-        swa_qk_rope_head_dim=8,
-        swa_v_head_dim=16,
-        sliding_window=8,
-        index_topk=8,
-        index_head_dim=16,
-        index_n_heads=4,
-        compressed_indexer_compress_ratio=2,
-        engram_layer_ids=[2, 4],
-        engram_max_ngram_size=3,
-        engram_n_head_per_ngram=2,
-        engram_n_embed_per_ngram=16,
-        engram_layer_head_vocab_sizes=sizes,
-        engram_pad_id=2,
-        engram_lookup_table_size=290,
-        rope_parameters={
-            "sliding_attention": {"rope_type": "default", "rope_theta": 1.0e4, "mrope_section": [2, 1, 1]},
-            "deepseek_sparse_attention": {"rope_type": "default", "rope_theta": 1.0e7, "mrope_section": [2, 1, 1]},
-        },
-        pad_token_id=2,
-        bos_token_id=0,
-        eos_token_id=1,
-    )
-    kwargs.update(overrides)
-    return HY4FlashTextConfig(**kwargs)
+    return HY4FlashTextConfig(**{**TINY_TEXT_KWARGS, **overrides})
 
 
 def tiny_config(**overrides: object) -> HY4FlashConfig:

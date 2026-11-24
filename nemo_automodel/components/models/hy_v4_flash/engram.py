@@ -74,6 +74,14 @@ def build_ngram_tokens(input_ids: torch.Tensor, document_positions: torch.Tensor
     return torch.stack(shifted, dim=-1)
 
 
+class HY4FlashWeightOnlyNorm(nn.Module):
+    """Holder of an RMSNorm weight whose epsilon is the dtype epsilon (``nn.RMSNorm(eps=None)`` semantics)."""
+
+    def __init__(self, size: int, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(size, dtype=dtype))
+
+
 class HY4FlashEngramLayer(nn.Module):
     """One Engram block (decoder layer ``layer_idx``, one-based id ``layer_idx + 1``).
 
@@ -114,7 +122,9 @@ class HY4FlashEngramLayer(nn.Module):
         self.head_dim = head_dim
         engram_size = (self.max_ngram_size - 1) * config.engram_n_embed_per_ngram
         owner = 1 if process_group is None else dist.get_world_size(process_group)
-        self.table = Qwen3_8_FlashNextEngramTableConfig(
+        # Named like the checkpoint: ``multi_head_embedding.embedding.weight`` is the flat table of all hash heads.
+        self.multi_head_embedding = nn.Module()
+        self.multi_head_embedding.embedding = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=-(-self.num_rows // owner) * owner,
             embedding_dim=head_dim,
             initializer_range=config.initializer_range,
@@ -128,29 +138,29 @@ class HY4FlashEngramLayer(nn.Module):
             persistent=False,
         )
         self._multipliers_ready = False
-        self.lookup_norm_weight = nn.Parameter(torch.ones(self.num_heads, head_dim, dtype=dtype))
+        self.lookup_per_head_norms = nn.ModuleList(HY4FlashWeightOnlyNorm(head_dim, dtype) for _ in range(self.num_heads))
         self.value_proj = nn.Linear(engram_size, self.hidden_size, dtype=dtype)
-        self.key_proj_weight = nn.Parameter(torch.empty(self.hc_mult, self.hidden_size, engram_size, dtype=dtype))
-        self.key_proj_bias = nn.Parameter(torch.empty(self.hc_mult, self.hidden_size, dtype=dtype))
-        self.norm_key_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
-        self.norm_query_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
+        self.key_projs = nn.ModuleList(nn.Linear(engram_size, self.hidden_size, dtype=dtype) for _ in range(self.hc_mult))
+        self.norm_key = nn.ModuleList(HY4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
+        self.norm_query = nn.ModuleList(HY4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
         self.unified_pre_gamma = nn.Parameter(torch.ones(self.hidden_size, dtype=dtype))
-        self.unified_per_hc_scales = nn.Parameter(torch.empty(self.hc_mult, self.hidden_size, dtype=dtype))
+        self.unified_per_hc_scales = nn.ParameterList(
+            nn.Parameter(torch.empty(self.hidden_size, dtype=dtype)) for _ in range(self.hc_mult)
+        )
 
     @torch.no_grad()
     def init_weights(self) -> None:
         """Initialise as the reference does (``unified_pre_gamma`` 1, per-stream scales N(0, 0.006)) and refresh hash state."""
-        self.table.reset_parameters()
+        self.multi_head_embedding.embedding.reset_parameters()
         std = self.initializer_range
-        nn.init.normal_(self.value_proj.weight, std=std)
-        nn.init.zeros_(self.value_proj.bias)
-        nn.init.normal_(self.key_proj_weight, std=std)
-        nn.init.zeros_(self.key_proj_bias)
-        nn.init.ones_(self.lookup_norm_weight)
-        nn.init.ones_(self.norm_key_weight)
-        nn.init.ones_(self.norm_query_weight)
+        for linear in (self.value_proj, *self.key_projs):
+            nn.init.normal_(linear.weight, std=std)
+            nn.init.zeros_(linear.bias)
+        for norm in (*self.lookup_per_head_norms, *self.norm_key, *self.norm_query):
+            nn.init.ones_(norm.weight)
         nn.init.ones_(self.unified_pre_gamma)
-        nn.init.normal_(self.unified_per_hc_scales, std=0.006)
+        for scale in self.unified_per_hc_scales:
+            nn.init.normal_(scale, std=0.006)
         self.head_vocab_sizes.copy_(torch.tensor(self._head_vocab_sizes, dtype=torch.int64))
         self.head_offsets.copy_(torch.tensor([0, *self._head_vocab_sizes[:-1]], dtype=torch.int64).cumsum(0))
         self.lookup_table.copy_(torch.arange(self.lookup_table.numel(), dtype=torch.int32))
@@ -204,15 +214,17 @@ class HY4FlashEngramLayer(nn.Module):
             self.refresh_hash_state()
         dtype = streams.dtype
         rows = self.hash_ngrams(ngram_tokens)
-        emb = self.table(rows).to(dtype)  # [B, S, heads, head_dim]
-        emb = F.rms_norm(emb, (self.head_dim,)) * self.lookup_norm_weight.to(dtype)
+        emb = self.multi_head_embedding.embedding(rows).to(dtype)  # [B, S, heads, head_dim]
+        emb = F.rms_norm(emb, (self.head_dim,)) * torch.stack([n.weight for n in self.lookup_per_head_norms]).to(dtype)
         emb = emb.flatten(-2)
         batch, seq = emb.shape[:2]
-        key = F.linear(emb, self.key_proj_weight.flatten(0, 1), self.key_proj_bias.flatten()).view(batch, seq, self.hc_mult, -1)
-        key = F.rms_norm(key, (self.hidden_size,)) * self.norm_key_weight.to(dtype)
-        query = F.rms_norm(streams, (self.hidden_size,)) * self.norm_query_weight.to(dtype)
+        key_weight = torch.cat([m.weight for m in self.key_projs]).to(dtype)
+        key_bias = torch.cat([m.bias for m in self.key_projs]).to(dtype)
+        key = F.linear(emb, key_weight, key_bias).view(batch, seq, self.hc_mult, -1)
+        key = F.rms_norm(key, (self.hidden_size,)) * torch.stack([n.weight for n in self.norm_key]).to(dtype)
+        query = F.rms_norm(streams, (self.hidden_size,)) * torch.stack([n.weight for n in self.norm_query]).to(dtype)
         logit = (key.float() * query.float()).sum(-1) * self.hidden_size**-0.5
         gate = torch.sigmoid(torch.copysign(logit.abs().clamp_min(1e-6).sqrt(), logit)).unsqueeze(-1)
         main = self.unified_pre_gamma.to(dtype) * F.rms_norm(self.value_proj(emb), (self.hidden_size,))
-        out = gate * main.float().unsqueeze(2) + main.unsqueeze(2).float() * self.unified_per_hc_scales.float()
+        out = gate * main.float().unsqueeze(2) + main.unsqueeze(2).float() * torch.stack(list(self.unified_per_hc_scales)).float()
         return out.masked_fill(~engram_mask[:, :, None, None], 0.0).to(dtype)

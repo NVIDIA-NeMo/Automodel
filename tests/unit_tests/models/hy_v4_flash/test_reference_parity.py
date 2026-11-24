@@ -1,0 +1,89 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Parity against the transformers reference (PR 50903) on a tiny random model.
+
+The reference needs a newer transformers than AutoModel pins, so it runs in a separate process
+(``ref_dump.py``) that writes released-format weights, inputs and logits to ``HY4_REF_DUMP``.
+"""
+
+import os
+
+import pytest
+import torch
+
+from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
+from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HY4FlashStateDictAdapter
+
+from .tiny import CPU_BACKEND, tiny_config
+
+DUMP = os.environ.get("HY4_REF_DUMP")
+pytestmark = pytest.mark.skipif(DUMP is None or not os.path.exists(DUMP), reason="HY4_REF_DUMP reference dump not provided")
+
+
+def _load():
+    dump = torch.load(DUMP, weights_only=False)
+    model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND).float().eval()
+    adapter = HY4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
+    native = adapter.from_hf({k: v.clone() for k, v in dump["state"].items()})
+    missing, unexpected = model.load_state_dict(native, strict=False)
+    return dump, model, missing, unexpected
+
+
+def test_released_state_loads_without_missing_or_unexpected_keys():
+    _, _, missing, unexpected = _load()
+    assert not unexpected, unexpected
+    assert not missing, missing
+
+
+def test_every_layer_matches_reference():
+    dump, model, _, _ = _load()
+    outputs = []
+    hooks = [layer.register_forward_hook(lambda mod, args, out: outputs.append(out.detach())) for layer in model.model.layers]
+    with torch.no_grad():
+        model(dump["ids"])
+    for hook in hooks:
+        hook.remove()
+    for index, (got, ref) in enumerate(zip(outputs, dump["layer_out"])):
+        torch.testing.assert_close(got, ref, rtol=2e-4, atol=2e-4, msg=lambda m, i=index: f"layer {i}: {m}")
+
+
+def test_submodules_match_reference():
+    dump, model, _, _ = _load()
+    got = {}
+    for index, layer in enumerate(model.model.layers):
+        for name, module in (("engram_layer", layer.engram_layer), ("mlp", layer.mlp), ("self_attn", layer.self_attn)):
+            if module is not None:
+                module.register_forward_hook(lambda m, a, o, key=f"{index}.{name}": got.__setitem__(key, o.detach()))
+    with torch.no_grad():
+        model(dump["ids"])
+    for key, ref in dump["sub_out"].items():
+        if key.rsplit(".", 1)[1] not in ("engram_layer", "mlp", "self_attn"):
+            continue
+        if key.endswith("mlp") and key.split(".")[0] != "0":
+            # the reference MoE block includes the combine norm; ours applies it in the block
+            continue
+        value = got[key]
+        if key.endswith("self_attn"):
+            value = value.view_as(ref) if value.numel() == ref.numel() else value
+        torch.testing.assert_close(value, ref, rtol=2e-4, atol=2e-4, msg=lambda m, key=key: f"{key}: {m}")
+
+
+def test_logits_match_reference():
+    dump, model, missing, _ = _load()
+    assert not missing, missing
+    with torch.no_grad():
+        out = model(dump["ids"], output_hidden_states=True)
+    torch.testing.assert_close(out.hidden_states, dump["hidden"], rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(out.logits, dump["logits"], rtol=2e-4, atol=2e-4)
