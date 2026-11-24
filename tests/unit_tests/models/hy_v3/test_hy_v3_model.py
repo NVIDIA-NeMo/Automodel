@@ -30,6 +30,7 @@ from nemo_automodel.components.models.hy_v3.model import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, FakeBalancedGate, MoE
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -333,14 +334,11 @@ class TestHYV3ForCausalLM:
         batch, seq = 1, 5
         input_ids = torch.randint(0, config.vocab_size, (batch, seq), device=device)
         position_ids = torch.arange(seq, device=device).unsqueeze(0)
-        hidden = torch.randn(seq, config.hidden_size, device=device, dtype=torch.bfloat16)
-        with patch.object(model.model, "forward", return_value=hidden):
-            out = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                output_hidden_states=True,
-            )
+        out, layer_inputs = run_with_passthrough_layers(
+            model, input_ids, position_ids=position_ids, qkv_format="thd", output_hidden_states=True
+        )
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq, config.hidden_size) for shape in layer_inputs)
         assert out.logits.shape == (batch, seq, config.vocab_size)
         assert out.hidden_states.shape == (batch, seq, config.hidden_size)
 

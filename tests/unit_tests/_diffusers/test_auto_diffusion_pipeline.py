@@ -214,6 +214,17 @@ def test_is_fp8_training_safe_linear_rejects_known_unsafe_cases(name, linear):
     assert not _is_fp8_training_safe_linear(name, linear)
 
 
+@pytest.mark.parametrize("name", ["blocks.0.attn.add_q_proj", "blocks.0.txt_mlp.net.2"])
+def test_is_fp8_training_safe_linear_honors_excluded_name_fragments(name):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _is_fp8_training_safe_linear
+
+    linear = torch.nn.Linear(32, 64)
+
+    assert _is_fp8_training_safe_linear(name, linear)
+    assert not _is_fp8_training_safe_linear(name, linear, fp8_exclude=("add_q_proj", "txt_mlp"))
+    assert _is_fp8_training_safe_linear("blocks.0.attn.to_q", linear, fp8_exclude=("add_q_proj", "txt_mlp"))
+
+
 def test_replace_linear_with_transformer_engine_copies_weights_and_skips_unsafe_modules():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
 
@@ -247,6 +258,25 @@ def test_replace_linear_with_transformer_engine_copies_weights_and_skips_unsafe_
     assert not module.safe.weight.requires_grad
     assert torch.allclose(module.safe.weight, safe_weight)
     assert torch.allclose(module.nested[0].weight, nested_weight)
+
+
+def test_replace_linear_with_transformer_engine_keeps_excluded_modules_in_high_precision():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
+
+    class FakeTransformerEngineLinear(torch.nn.Linear):
+        def __init__(self, in_features, out_features, bias=True, device=None, params_dtype=None):
+            super().__init__(in_features, out_features, bias=bias, device=device, dtype=params_dtype)
+
+    module = torch.nn.ModuleDict({"to_q": torch.nn.Linear(16, 16), "add_q_proj": torch.nn.Linear(16, 16)})
+    fake_transformer_engine = SimpleNamespace(pytorch=SimpleNamespace(Linear=FakeTransformerEngineLinear))
+    with patch(f"{MODULE_PATH}.safe_import_te", return_value=(True, fake_transformer_engine)):
+        converted = _replace_linear_with_transformer_engine(
+            module, "transformer", fp8_safe_only=True, fp8_exclude=("add_q_proj",)
+        )
+
+    assert converted == 1
+    assert isinstance(module["to_q"], FakeTransformerEngineLinear)
+    assert not isinstance(module["add_q_proj"], FakeTransformerEngineLinear)
 
 
 def test_replace_linear_with_transformer_engine_requires_optional_dependency():
@@ -757,10 +787,13 @@ def test_from_pretrained_applies_transformer_qkv_and_te_options():
             compact_fused_qkv_projections=True,
             transformer_engine_linear=True,
             transformer_engine_fp8_safe_only=True,
+            transformer_engine_fp8_exclude=("txt_mlp",),
         )
 
     mock_fuse.assert_called_once_with(transformer, "transformer", compact=True)
-    mock_replace_linear.assert_called_once_with(transformer, "transformer", fp8_safe_only=True)
+    mock_replace_linear.assert_called_once_with(
+        transformer, "transformer", fp8_safe_only=True, fp8_exclude=("txt_mlp",)
+    )
 
 
 def test_from_pretrained_rejects_compact_qkv_without_fusion():

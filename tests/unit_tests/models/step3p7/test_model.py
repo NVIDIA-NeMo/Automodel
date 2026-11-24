@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.step3p7 import model as step3p7_model
 from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
 from nemo_automodel.components.models.step3p7.model import Step3p7ForConditionalGeneration, Step3p7Model
@@ -322,6 +323,7 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
 
     wrapper, _ = _wrapper_with_fake_inner()
     hidden = wrapper.config.text_config.hidden_size
+    wrapper.lm_head = LMHead(hidden, wrapper.config.text_config.vocab_size)
     mtp_depth = int(getattr(wrapper.mtp_config, "num_layers", 0) or 0)
 
     # cp_size == 1: symmetric (regression against the pre-CP behavior).
@@ -335,6 +337,20 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
     assert outs[0].shape[1] == 4  # local sequence length on every output
     assert all(o.shape[1] == 4 for o in outs)
+
+
+def test_get_pipeline_stage_metas_declares_fp32_logits_for_the_primary_head_only():
+    """FP32 logits come from the LMHead; the MTP heads' logits stay in the compute dtype."""
+    from nemo_automodel.components.models.common.mtp.mtp import MTPConfig
+
+    wrapper, _ = _wrapper_with_fake_inner()
+    text_config = wrapper.config.text_config
+    wrapper.lm_head = LMHead(text_config.hidden_size, text_config.vocab_size, logits_dtype=torch.float32)
+    wrapper.mtp_config = MTPConfig(num_layers=2)
+
+    _, outs = wrapper.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.bfloat16)
+
+    assert [o.dtype for o in outs] == [torch.float32, torch.bfloat16, torch.bfloat16]
 
 
 def test_forward_consumes_pp_vlm_chunks_and_drops_mismatched_masks(monkeypatch):

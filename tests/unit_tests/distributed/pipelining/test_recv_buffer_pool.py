@@ -24,8 +24,7 @@ recv buffer object.
 """
 
 import faulthandler
-import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -85,10 +84,25 @@ def test_negative_slack_is_rejected():
 
 @pytest.fixture
 def fresh_install(monkeypatch):
-    """Reset the process-wide install flag around a test and restore it afterwards."""
+    """Reset the process-wide install flag around a test and restore it afterwards.
+
+    Also reports preallocated receive buffers, so the fake stage layouts exercise
+    the pool whatever the installed PyTorch does.
+    """
     monkeypatch.setattr(recv_buffer_pool, "_INSTALLED", False)
     monkeypatch.setattr(recv_buffer_pool, "_INSTALLED_LAYOUT", None)
+    monkeypatch.setattr(recv_buffer_pool, "_native_recv_buffers_are_just_in_time", lambda: False)
     yield
+
+
+def test_install_keeps_stock_buffers_when_receives_are_just_in_time(fresh_install, monkeypatch):
+    from torch.distributed.pipelining import stage as stage_mod
+
+    monkeypatch.setattr(recv_buffer_pool, "_native_recv_buffers_are_just_in_time", lambda: True)
+    before = dict(vars(stage_mod.PipelineStage))
+    assert install_recv_buffer_pool(slack=2) is False
+    assert recv_buffer_pool._INSTALLED is False and recv_buffer_pool._INSTALLED_LAYOUT is None
+    assert dict(vars(stage_mod.PipelineStage)) == before
 
 
 def _fake_stage_classes(layout: str):
@@ -219,14 +233,6 @@ class _Block(nn.Module):
         return self.l2(torch.relu(self.l1(x))) + x
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
 def _train_once(rank: int) -> tuple[list[float], float, object]:
     """Build a fresh pp4 stage for this rank and train 1F1B for a few steps.
 
@@ -269,14 +275,12 @@ def _train_once(rank: int) -> tuple[list[float], float, object]:
     return losses, param_sum, stage
 
 
-def _parity_worker(rank: int, world_size: int, port: int) -> None:
+def _parity_worker(rank: int, world_size: int, init_file: str) -> None:
     import torch.distributed as dist
 
     faulthandler.dump_traceback_later(240, exit=True)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     try:
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
         torch.set_num_threads(1)
 
         stock_losses, stock_sum, _ = _train_once(rank)
@@ -300,20 +304,25 @@ def _parity_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+_JIT_RECV_BUFFERS = pytest.mark.skipif(
+    recv_buffer_pool._native_recv_buffers_are_just_in_time(),
+    reason="PyTorch allocates receive buffers just in time, so the pool does not install",
+)
+
+
+@_JIT_RECV_BUFFERS
 @pytest.mark.run_only_on("GPU")
-def test_pooled_recv_buffers_match_stock_1f1b_exactly():
-    mp.spawn(_parity_worker, args=(_PP, _free_port()), nprocs=_PP, join=True)
+def test_pooled_recv_buffers_match_stock_1f1b_exactly(tmp_path: Path):
+    mp.spawn(_parity_worker, args=(_PP, str(tmp_path / "process-group")), nprocs=_PP, join=True)
 
 
-def _too_small_ring_worker(rank: int, world_size: int, port: int) -> None:
+def _too_small_ring_worker(rank: int, world_size: int, init_file: str) -> None:
     """Negative control: a ring below the 1F1B in-flight depth must NOT reproduce the stock run."""
     import torch.distributed as dist
 
     faulthandler.dump_traceback_later(240, exit=True)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     try:
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
         torch.set_num_threads(1)
 
         stock_losses, stock_sum, _ = _train_once(rank)
@@ -336,6 +345,7 @@ def _too_small_ring_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+@_JIT_RECV_BUFFERS
 @pytest.mark.run_only_on("GPU")
-def test_ring_below_inflight_depth_is_detected_by_the_harness():
-    mp.spawn(_too_small_ring_worker, args=(_PP, _free_port()), nprocs=_PP, join=True)
+def test_ring_below_inflight_depth_is_detected_by_the_harness(tmp_path: Path):
+    mp.spawn(_too_small_ring_worker, args=(_PP, str(tmp_path / "process-group")), nprocs=_PP, join=True)

@@ -21,6 +21,8 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
+from nemo_automodel.components.models.common.lm_head import LMHead
+
 _DSV4_CLASS_NAMES = {
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
@@ -175,7 +177,9 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
         mp_policy=(
             _fp32_mp_policy(
                 mp_policy,
-                preserve_activation_dtype=wrapped.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
+                # An LMHead casts its own input and returns its logits_dtype, so FSDP casts neither.
+                preserve_activation_dtype=isinstance(wrapped, LMHead)
+                or wrapped.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
             )
             if fp32_policy
             else mp_policy

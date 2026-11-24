@@ -26,6 +26,7 @@ from nemo_automodel.components.models.glm4_moe_lite.model import (
     ModelClass,
 )
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -300,20 +301,17 @@ class TestGlm4MoeLiteForCausalLM:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         padding_mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=device)
 
-        with patch.object(
-            model.model,
-            "forward",
-            return_value=torch.randn(seq_len, config.hidden_size, device=device).to(torch.bfloat16),
-        ):
-            output = model(
-                input_ids,
-                position_ids=position_ids,
-                padding_mask=padding_mask,
-                qkv_format="thd",
-                output_hidden_states=True,
-            )
+        output, layer_inputs = run_with_passthrough_layers(
+            model,
+            input_ids,
+            position_ids=position_ids,
+            padding_mask=padding_mask,
+            qkv_format="thd",
+            output_hidden_states=True,
+        )
 
-        # thd format should add batch dimension back
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq_len, config.hidden_size) for shape in layer_inputs)
         assert output.logits.shape == (1, seq_len, config.vocab_size)
         assert output.hidden_states.shape == (1, seq_len, config.hidden_size)
 

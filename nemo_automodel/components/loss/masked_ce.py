@@ -57,7 +57,9 @@ class MaskedCrossEntropy(nn.Module):
             labels (torch.Tensor): The ground truth class indices with shape [batch_size, seq_len].
             mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
                 1 will be used to calculate loss, otherwise ignored. Must be broadcastable to the shape
-                of the loss. Defaults to None.
+                of the loss. Defaults to None. ``labels`` is not modified in place:
+                masked positions are written to an internal copy, so the caller's
+                tensor is safe to reuse for another loss term or another mask.
             num_label_tokens: Optional global supervised-token count used to
                 normalize a sum-reduced loss.
             loss_weights: Optional per-token multipliers with the same shape as
@@ -87,7 +89,7 @@ class MaskedCrossEntropy(nn.Module):
             with torch.no_grad():
                 if mask.device != labels.device:
                     mask = mask.to(labels.device)  # pragma: no cover
-                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
+                labels = labels.masked_fill(mask.view(-1) == 0, self.ignore_index)
                 del mask
         if self.fp32_upcast:
             logits = logits.float()

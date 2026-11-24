@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -37,27 +37,18 @@ pytestmark = [
 _WORLD_SIZE = 2
 
 
-def _free_port() -> int:
-    """Return an unused localhost port for the process-group rendezvous."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _init(rank: int, port: int) -> torch.device:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+def _init(rank: int, init_file: str) -> torch.device:
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(_WORLD_SIZE)
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("nccl", init_method=f"file://{init_file}", rank=rank, world_size=_WORLD_SIZE)
     return torch.device("cuda", rank)
 
 
-def _gather_worker(rank: int, port: int) -> None:
+def _gather_worker(rank: int, init_file: str) -> None:
     try:
-        device = _init(rank, port)
+        device = _init(rank, init_file)
         local_k = (torch.arange(4, device=device, dtype=torch.float32).reshape(2, 2) + 10 * rank).requires_grad_()
         local_v = (torch.arange(2, device=device, dtype=torch.float32).reshape(2, 1) + 100 * rank).requires_grad_()
 
@@ -86,9 +77,9 @@ def _gather_worker(rank: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _head_tail_worker(rank: int, port: int) -> None:
+def _head_tail_worker(rank: int, init_file: str) -> None:
     try:
-        device = _init(rank, port)
+        device = _init(rank, init_file)
         total, width = 16, 3
         # Row i of the global tensor identifies global token i in every column.
         global_rows = torch.arange(total, device=device, dtype=torch.float32).view(total, 1).repeat(1, width)
@@ -140,13 +131,13 @@ def _head_tail_worker(rank: int, port: int) -> None:
     not dist.is_nccl_available() or torch.cuda.device_count() < _WORLD_SIZE,
     reason="requires NCCL and at least two CUDA devices",
 )
-def test_glm_dsa_cp_all_gather_preserves_rank_order_and_sums_kv_gradients() -> None:
-    mp.spawn(_gather_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
+def test_glm_dsa_cp_all_gather_preserves_rank_order_and_sums_kv_gradients(tmp_path: Path) -> None:
+    mp.spawn(_gather_worker, args=(str(tmp_path / "process-group"),), nprocs=_WORLD_SIZE, join=True)
 
 
 @pytest.mark.skipif(
     not dist.is_nccl_available() or torch.cuda.device_count() < _WORLD_SIZE,
     reason="requires NCCL and at least two CUDA devices",
 )
-def test_glm_dsa_cp_all_gather_reorders_head_tail_shards_into_global_order_with_owner_gradients() -> None:
-    mp.spawn(_head_tail_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
+def test_glm_dsa_cp_all_gather_reorders_head_tail_shards_into_global_order_with_owner_gradients(tmp_path: Path) -> None:
+    mp.spawn(_head_tail_worker, args=(str(tmp_path / "process-group"),), nprocs=_WORLD_SIZE, join=True)

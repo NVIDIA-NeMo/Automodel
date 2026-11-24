@@ -1,0 +1,116 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA post-training of a Nemotron 3.5 Decision checkpoint on a synthetic support-routing dataset
+# (fictional help-desk tickets with choice and yes/no decisions, some with soft labels) in one-decision JSONL:
+# {"state", "question", "type", "options", "label", optional "soft_labels" and "group"}. Bring your own file;
+# the prepare script converts it to single-question SystemOne records with group-disjoint splits.
+#
+#   uv run python examples/decision/prepare_nemotron_decision_data.py --input support_routing.jsonl \
+#       --split three-way --output data/support_routing
+#   # before: score the starting checkpoint
+#   automodel examples/decision/nemotron_decision_support_routing_lora.yaml --mode eval --output_dir runs/support/base
+#   # train (validation selects the stage; test is reported separately)
+#   automodel examples/decision/nemotron_decision_support_routing_lora.yaml --output_dir runs/support/lora
+#   # export a complete servable checkpoint
+#   uv run python examples/decision/export_nemotron_decision.py --base <checkpoint> \
+#       --stage runs/support/lora/LOWEST_VAL --output exports/support_lora
+#
+# Supported checkpoints: text Nemotron 3.5 Decision checkpoints (NemotronForDecision, a bidirectional Ministral 3
+# encoder) that ship decision.json and decision_template.jinja. Vision and quantized variants are rejected at setup.
+# For backbone fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
+# checkpoint.save_consolidated: every (decoder layers and final norm train; embeddings and head stay frozen).
+
+recipe: nemo_automodel.recipes.decision.train_nemotron_decision.TrainNemotronDecisionRecipe
+
+mode: train            # eval | train
+seed: 101
+output_dir: runs/support/lora
+init_from: null        # a published stage of the same base and method, e.g. runs/.../LOWEST_VAL
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /path/to/nemotron-3.5-decision-8b   # a local Nemotron 3.5 Decision checkpoint directory
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*.q_proj"
+    - "*.k_proj"
+    - "*.v_proj"
+    - "*.o_proj"
+    - "*.gate_proj"
+    - "*.up_proj"
+    - "*.down_proj"
+  dim: 32
+  alpha: 64
+  dropout: 0.0
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+lr_scheduler:
+  lr_decay_style: cosine   # warmup and decay steps are set from train.* below
+
+checkpoint:
+  enabled: true
+  save_consolidated: false  # LoRA stages save adapters; export_nemotron_decision.py merges them
+
+data:
+  train: data/support_routing/train.jsonl
+  validation: data/support_routing/validation.jsonl
+  test: data/support_routing/test.jsonl
+  max_tokens: 8192       # questions whose prompt + mask is longer are skipped and counted (no compaction)
+
+train:
+  global_batch_size: 16  # questions per optimizer step over all ranks (one question per forward)
+  epochs: 1.0
+  max_steps: 50          # 50 steps of 16 rows
+  warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
+  min_lr_ratio: 0.1
+  canonical_fraction: 0.5  # option shuffle (training only): this share of reads keeps the checkpoint's option
+                           # order, the rest are shuffled and re-coded by position; 1.0 disables it
+  max_grad_norm: 1.0
+  val_every_steps: 25
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft                    # the recipe trains SFT stages only
+  label_smoothing: 0.0         # plain cross-entropy over the options, as in the reference fine-tuning
+  brier_weight: 0.0
+  ordinal_weight: 0.0
+  soft_label_kl_weight: 0.0    # 0: soft labels replace the gold target; > 0: CE(gold) + weight * KL(soft || p)
+  soft_label_gold_mask: false  # true: ignore soft labels whose top option is not the gold answer
+
+ci:
+  nemo_ci_schedule: skipped  # needs a Nemotron 3.5 Decision checkpoint; covered by the functional test
+  cluster_tag: h100

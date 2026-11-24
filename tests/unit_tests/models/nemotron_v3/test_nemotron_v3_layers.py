@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import math
+
 import pytest
 import torch
 
@@ -20,6 +22,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3.layers import (
     NemotronV3Attention,
     NemotronV3Block,
+    NemotronV3Mamba2Mixer,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
@@ -640,6 +643,91 @@ class TestBackwardCompatibility:
         hidden = torch.randn(2, 8, config.hidden_size, dtype=torch.bfloat16)
         out = block(hidden)
         assert out.shape == (2, 8, config.hidden_size)
+
+
+def _mamba_init_config() -> MockNemotronV3Config:
+    """A small mixer: 8 heads of 16 channels in 2 groups."""
+    return MockNemotronV3Config(hidden_size=64, mamba_num_heads=8, mamba_head_dim=16, ssm_state_size=8, n_groups=2)
+
+
+def _zeroed_mamba_mixer() -> NemotronV3Mamba2Mixer:
+    """A mixer whose parameters hold what a fresh uninitialized allocation hands out: zeros."""
+    mixer = NemotronV3Mamba2Mixer(_mamba_init_config(), layer_idx=0)
+    with torch.no_grad():
+        for parameter in mixer.parameters():
+            parameter.zero_()
+    return mixer
+
+
+@pytest.mark.cpu_only
+def test_mamba_mixer_init_weights_initializes_every_parameter_of_an_uninitialized_mixer():
+    """init_weights must not rely on the constructors' default init: a mixer built without it starts at zero."""
+    num_hidden_layers = 4
+    mixer = _zeroed_mamba_mixer()
+
+    with torch.no_grad():
+        mixer.init_weights(num_hidden_layers=num_hidden_layers, buffer_device=torch.device("cpu"))
+
+    config = _mamba_init_config()
+    intermediate = config.mamba_num_heads * config.mamba_head_dim
+    in_bound = 1.0 / math.sqrt(config.hidden_size)
+    out_bound = 1.0 / math.sqrt(intermediate) / math.sqrt(num_hidden_layers)
+    conv_bound = 1.0 / math.sqrt(config.conv_kernel)
+    for name, weight, bound in (
+        ("in_proj.weight", mixer.in_proj.weight, in_bound),
+        ("out_proj.weight", mixer.out_proj.weight, out_bound),
+        ("conv1d.weight", mixer.conv1d.weight, conv_bound),
+        ("conv1d.bias", mixer.conv1d.bias, conv_bound),
+    ):
+        # A uniform(-bound, bound) sample: inside the bound, with standard deviation bound / sqrt(3).
+        assert float(weight.detach().abs().max()) <= bound, name
+        assert float(weight.detach().std()) == pytest.approx(bound / math.sqrt(3), rel=0.2), name
+    torch.testing.assert_close(mixer.norm.weight.detach(), torch.ones(intermediate))
+    torch.testing.assert_close(mixer.D.detach(), torch.ones(config.mamba_num_heads))
+    torch.testing.assert_close(mixer.A_log.detach(), torch.log(torch.arange(1, config.mamba_num_heads + 1).float()))
+    step_size = torch.nn.functional.softplus(mixer.dt_bias.detach())
+    assert float(step_size.min()) >= config.time_step_floor
+    assert float(step_size.max()) <= config.time_step_max * 1.001
+
+
+def _sharded_ssm_parameters_worker(rank: int, rendezvous: str) -> None:
+    """One of two Gloo ranks: initialize a mixer whose A_log and dt_bias are sharded over the ranks."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        mesh = init_device_mesh("cpu", (2,))
+        # What one process draws from this random state.
+        reference = _zeroed_mamba_mixer()
+        torch.manual_seed(20261123)
+        with torch.no_grad():
+            reference.init_weights(num_hidden_layers=4, buffer_device=torch.device("cpu"))
+
+        mixer = _zeroed_mamba_mixer()
+        holder = mixer._fp32_params
+        holder.A_log = torch.nn.Parameter(distribute_tensor(holder.A_log.detach(), mesh, [Shard(0)]))
+        holder.dt_bias = torch.nn.Parameter(distribute_tensor(holder.dt_bias.detach(), mesh, [Shard(0)]))
+        # Both ranks start from one random state, as they do in training once a sharded tensor has been drawn.
+        torch.manual_seed(20261123)
+        with torch.no_grad():
+            mixer.init_weights(num_hidden_layers=4, buffer_device=torch.device("cpu"))
+        expected = torch.log(torch.arange(1, _mamba_init_config().mamba_num_heads + 1).float())
+        torch.testing.assert_close(mixer.A_log.detach().full_tensor(), expected)
+        torch.testing.assert_close(mixer.A_log.detach().to_local(), expected.chunk(2)[rank])
+        # dt_bias is random per head: each rank holds its half of the single-process draw, not the same half.
+        torch.testing.assert_close(mixer.dt_bias.detach().to_local(), reference.dt_bias.detach().chunk(2)[rank])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.cpu_only
+def test_mamba_mixer_init_weights_gives_each_rank_its_slice_of_sharded_ssm_parameters(tmp_path):
+    """Per-head parameters follow the global head index: a sharded one must not restart at head 0 on every rank."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(_sharded_ssm_parameters_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
 
 
 class TestMambaMixerSeqIdxConstruction:

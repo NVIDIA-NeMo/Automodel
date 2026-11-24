@@ -114,7 +114,12 @@ def test_build_transformer_engine_fp8_recipe_dispatches_recipe_names(monkeypatch
             self.amax_compute_algo = amax_compute_algo
 
     class Float8CurrentScaling:
-        pass
+        def __init__(self, *, fp8_gemm_fprop):
+            self.fp8_gemm_fprop = fp8_gemm_fprop
+
+    class MMParams:
+        def __init__(self, *, use_split_accumulator):
+            self.use_split_accumulator = use_split_accumulator
 
     class MXFP8BlockScaling:
         pass
@@ -122,6 +127,7 @@ def test_build_transformer_engine_fp8_recipe_dispatches_recipe_names(monkeypatch
     recipe_classes = {
         "DelayedScaling": DelayedScaling,
         "Float8CurrentScaling": Float8CurrentScaling,
+        "MMParams": MMParams,
         "MXFP8BlockScaling": MXFP8BlockScaling,
     }
 
@@ -142,6 +148,12 @@ def test_build_transformer_engine_fp8_recipe_dispatches_recipe_names(monkeypatch
         amax_history_len=32,
         amax_compute_algo="max",
     )
+    current_split = diffusion_train._build_transformer_engine_fp8_recipe(
+        "current",
+        amax_history_len=32,
+        amax_compute_algo="max",
+        fprop_split_accumulator=True,
+    )
     mxfp8 = diffusion_train._build_transformer_engine_fp8_recipe(
         "mx",
         amax_history_len=32,
@@ -152,6 +164,8 @@ def test_build_transformer_engine_fp8_recipe_dispatches_recipe_names(monkeypatch
     assert delayed.amax_history_len == 32
     assert delayed.amax_compute_algo == "max"
     assert isinstance(current, Float8CurrentScaling)
+    assert current.fp8_gemm_fprop.use_split_accumulator is False
+    assert current_split.fp8_gemm_fprop.use_split_accumulator is True
     assert isinstance(mxfp8, MXFP8BlockScaling)
 
 
@@ -561,6 +575,7 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
         attention_backend="flash",
         transformer_engine_linear=True,
         transformer_engine_fp8_safe_only=True,
+        transformer_engine_fp8_exclude=("txt_mlp",),
         fuse_qkv_projections=True,
         compact_fused_qkv_projections=True,
         backend={"attn": "sdpa"},
@@ -580,6 +595,7 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     assert strategy_config.mp_policy.reduce_dtype is torch.bfloat16
     assert calls["transformer_engine_linear"] is True
     assert calls["transformer_engine_fp8_safe_only"] is True
+    assert calls["transformer_engine_fp8_exclude"] == ("txt_mlp",)
     assert calls["fuse_qkv_projections"] is True
     assert calls["compact_fused_qkv_projections"] is True
     # attention_backend is forwarded to from_pretrained, which applies it via

@@ -42,15 +42,15 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
-    compute_lm_head_logits,
     generation_config_from_model_config,
     restore_pretrained_generation_config,
 )
@@ -569,7 +569,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
         engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
-        **kwargs: Any,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict[str, Any] | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         if not config.language_model_only:
@@ -578,9 +579,6 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
                 "config.language_model_only=True. Vision and video training have not been validated."
             )
         super().__init__()
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        if kwargs:
-            raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
         self.config = config
         self.backend = _qwen3_8_flash_next_backend(backend)
         self.model = Qwen3_8_FlashNextModel(
@@ -592,12 +590,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             engram_table_config=engram_table_config,
         )
         dtype = _resolve_model_dtype(config.text_config)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.text_config.hidden_size,
-            config.text_config.vocab_size,
-            bias=False,
-            dtype=dtype,
+        self.lm_head = LMHead(
+            config.text_config.hidden_size, config.text_config.vocab_size, dtype=dtype, logits_dtype=logits_dtype
         )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.text_config.pad_token_id if config.text_config.pad_token_id is not None else -1
@@ -744,7 +738,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             inputs_meta = (torch.empty(microbatch_size, seq_len, hc_width, device="meta", dtype=dtype),)
 
         output_width = text_config.vocab_size if self.lm_head is not None else hc_width
-        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=dtype),)
+        output_dtype = (self.lm_head.logits_dtype or dtype) if self.lm_head is not None else dtype
+        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=output_dtype),)
         return inputs_meta, outputs_meta
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
@@ -846,17 +841,17 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             _qwen3_8_flash_next_cp_context=_qwen3_8_flash_next_cp_context,
             **kwargs,
         )
-        lm_output = compute_lm_head_logits(
-            self.lm_head,
-            outputs.last_hidden_state,
-            logits_to_keep,
-            output_hidden_states=return_hidden_states,
+        last_hidden_state = outputs.last_hidden_state
+        logits = (
+            last_hidden_state
+            if self.lm_head is None
+            else self.lm_head(slice_logits_to_keep(last_hidden_state, logits_to_keep))
         )
-        return Qwen3_8_FlashNextCausalLMOutput(
-            logits=lm_output.logits,
-            past_key_values=None,
-            hidden_states=outputs.hidden_states if capture_all_hidden_states else lm_output.hidden_states,
-        )
+        if capture_all_hidden_states:
+            hidden_states = outputs.hidden_states
+        else:
+            hidden_states = last_hidden_state if return_hidden_states else None
+        return Qwen3_8_FlashNextCausalLMOutput(logits=logits, past_key_values=None, hidden_states=hidden_states)
 
     @torch.no_grad()
     def initialize_weights(

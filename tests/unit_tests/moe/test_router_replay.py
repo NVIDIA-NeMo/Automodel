@@ -172,6 +172,39 @@ def test_record_replay_roundtrip(score_func):
     assert not torch.equal(i_replay, i_train_free)
 
 
+def test_layer_run_several_times_keeps_one_selection_per_visit():
+    torch.manual_seed(0)
+    gate = make_gate()
+    inputs = [torch.randn(6, 16) for _ in range(3)]  # the input of the layer in each of its three runs
+
+    recorded = []
+    with RouterReplay.record():
+        for visit, x in enumerate(inputs):
+            gate.router_replay.visit = visit
+            recorded.append(run(gate, x)[1])
+    (captured,) = RouterReplay.collect()
+    assert torch.equal(captured, torch.stack(recorded))
+
+    x_train = torch.randn(6, 16)
+    with RouterReplay.replay([captured]):
+        for visit in (2, 0, 1):  # any order, as in an activation-checkpoint recompute
+            gate.router_replay.visit = visit
+            assert torch.equal(run(gate, x_train)[1], recorded[visit])
+
+
+def test_recording_another_batch_length_starts_over():
+    torch.manual_seed(0)
+    gate = make_gate()
+    for tokens in (6, 9, 3):  # no record() block in between, so nothing empties the stored selections
+        RouterReplay.set_mode(RouterReplayMode.RECORD)
+        recorded = []
+        for visit in range(3):
+            gate.router_replay.visit = visit
+            recorded.append(run(gate, torch.randn(tokens, 16))[1])
+        RouterReplay.set_mode(None)
+        assert torch.equal(RouterReplay.collect()[0], torch.stack(recorded))
+
+
 def test_replay_recomputes_weights_from_live_scores():
     """Weights under replay come from the *current* scores at the replayed indices."""
     torch.manual_seed(1)

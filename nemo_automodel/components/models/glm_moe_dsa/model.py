@@ -25,10 +25,11 @@ from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaC
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    compute_lm_head_logits,
+    LMHead,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -429,7 +430,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: GlmMoeDsaConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.config = config
@@ -439,7 +442,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if resolved_backend.gate_precision is None:
             resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
         self.backend = resolved_backend
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GlmMoeDsaModel(
             config,
             backend=self.backend,
@@ -450,7 +452,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # Plain torch Linear on purpose: the GLM-5.3 checkpoint keeps lm_head in bf16
         # (``modules_to_not_convert``) and so do the RL trainer and SGLang, so it must stay out of
         # the TE FP8 autocast that ``backend.linear='te'`` + ``te_fp8`` would otherwise apply to it.
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GlmMoeDsaStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -549,7 +551,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             is_first: Whether this module is the first pipeline stage.
             microbatch_size: Number of sequences in the pipeline microbatch.
             seq_len: Sequence or packed-token length represented by the metadata.
-            dtype: Hidden-state and logits dtype.
+            dtype: Hidden-state dtype; also the logits dtype when the head's logits_dtype is unset.
 
         Returns:
             Pair of input and output metadata tuples. Optimized THD stages use hidden-state
@@ -595,8 +597,8 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             inputs_meta = (hidden_meta,)
 
         if self.lm_head is not None and not self._pp_return_hidden_states:
-            # The last stage emits logits; compute_lm_head_logits restores [1, T, V] under THD.
-            outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
+            # The last stage emits logits, restored to [1, T, V] under THD.
+            outputs_meta = (meta((microbatch_size, seq_len, vocab_size), self.lm_head.logits_dtype or dtype),)
         elif self.lm_head is not None:
             # Linear CE owns the projection: the last stage emits the final hidden states in the
             # same batch-restored layout as the logits ([1, T, H] under THD) and no top-k carry.
@@ -630,13 +632,13 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             ``unsqueeze`` view and does not mutate it; both branches match the output meta declared
             by ``get_pipeline_stage_metas``.
         """
-        if not self._pp_return_hidden_states:
-            return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
-        # The linear CE loss projects from the hidden states itself, so no full logits tensor is
-        # kept per in-flight microbatch. Restore the leading batch dim like compute_lm_head_logits.
-        if is_thd and hidden.dim() == 2:
-            return hidden.unsqueeze(0)
-        return hidden
+        if is_thd and hidden.dim() == 2:  # packed [tokens, hidden] -> [1, tokens, hidden], as the metas declare
+            hidden = hidden.unsqueeze(0)
+        if self._pp_return_hidden_states:
+            # The linear CE loss projects from the hidden states itself, so no full logits tensor is
+            # kept per in-flight microbatch.
+            return hidden
+        return self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
 
     def forward(
         self,
@@ -765,9 +767,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden = hidden + (carry_in.float() * 0.0).sum().to(hidden.dtype)  # dense zero grad(carry_in)
             return hidden, carry_out
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden = hidden.unsqueeze(0)
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

@@ -135,7 +135,10 @@ class Qwen3MoeAttention(nn.Module):
                 [batch, 1, sequence, sequence] dense mask accepted by the backend.
             **attn_kwargs: Backend metadata. Packed FA4 uses int32 cu_seqlens of
                 shape [documents + 1] and int64 packed_token_indices of shape
-                [tokens], indexing the flattened [batch * sequence] axis.
+                [tokens], indexing the flattened [batch * sequence] axis. FA4 THD
+                instead uses private compact offsets of shape [documents + 1] and
+                indices of shape [valid_tokens] into the physical [tokens] axis,
+                prepared once at model entry.
 
         Returns:
             Hidden states with the same shape and dtype as x.
@@ -162,7 +165,10 @@ class Qwen3MoeAttention(nn.Module):
                 [batch, 1, sequence, sequence] dense mask.
             **attn_kwargs: Backend metadata. Packed FA4 uses int32 cu_seqlens of
                 shape [documents + 1] and int64 packed_token_indices of shape
-                [tokens], indexing the flattened [batch * sequence] axis.
+                [tokens], indexing the flattened [batch * sequence] axis. FA4 THD
+                instead uses private compact offsets of shape [documents + 1] and
+                indices of shape [valid_tokens] into the physical [tokens] axis,
+                prepared once at model entry.
 
         Returns:
             Hidden states with the same shape and dtype as x.

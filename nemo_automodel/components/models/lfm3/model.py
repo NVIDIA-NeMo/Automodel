@@ -41,13 +41,23 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, eager_atten
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
-from nemo_automodel.components.models.common import compute_lm_head_logits
+from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
+from nemo_automodel.components.models.common import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.lfm3.config import Lfm3Config
+from nemo_automodel.components.models.lfm3.context_parallel import (
+    CPBatch,
+    DocumentHalo,
+    PackedDocuments,
+    convolve_documents,
+    document_attention_inputs,
+    prepare_cp_inputs,
+)
+from nemo_automodel.components.models.lfm3.parallelization import PARALLELIZER
 from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
@@ -97,6 +107,7 @@ class Lfm3Attention(Qwen3Attention):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
+        documents: PackedDocuments | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Attend over the sequence, then scale each head by its gate.
@@ -108,6 +119,8 @@ class Lfm3Attention(Qwen3Attention):
             attention_mask: Optional Tensor of shape [batch, 1, sequence, key_sequence],
                 additive or boolean as the attention backend expects.
             past_key_values: Optional generation cache, updated in place.
+            documents: Optional packed-document boundaries. They replace ``attention_mask``,
+                and under context parallelism add the keys held by earlier ranks.
             **kwargs: Arguments for the Hugging Face attention dispatcher.
 
         Returns:
@@ -122,6 +135,11 @@ class Lfm3Attention(Qwen3Attention):
         query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
         if past_key_values is not None:
             key, value = past_key_values.update(key, value, self.layer_idx)
+        if documents is not None:
+            key, value, attention_mask, varlen = document_attention_inputs(
+                documents, key, value, self.sliding_window, self.config._attn_implementation
+            )
+            kwargs = {**kwargs, **varlen}
 
         attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -153,6 +171,7 @@ class Lfm3ShortConv(Lfm2ShortConv):
         hidden_states: torch.Tensor,
         past_key_values: Cache | None = None,
         attention_mask: torch.Tensor | None = None,
+        documents: PackedDocuments | None = None,
     ) -> torch.Tensor:
         """Gate, convolve causally along the sequence, and gate again.
 
@@ -162,6 +181,8 @@ class Lfm3ShortConv(Lfm2ShortConv):
                 inputs is prepended as left context and updated in place.
             attention_mask: Optional Tensor of shape [batch, sequence], nonzero for
                 real tokens and zero for padding.
+            documents: Optional packed-document boundaries; the convolution then
+                restarts at every document.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -173,10 +194,13 @@ class Lfm3ShortConv(Lfm2ShortConv):
         if attention_mask is not None:
             # A biased `in_proj` makes padded positions nonzero again; keep them out of the convolution and the cache.
             gated = gated * attention_mask[:, None, :].to(gated.dtype)
-        if past_key_values is not None:
-            gated = past_key_values.update_conv_state(gated, self.layer_idx, conv_kernel_size=self.conv_kernel_size)
-        # `self.conv` pads both ends: the leading outputs are causal, the trailing ones look ahead.
-        mixed = self.conv(gated.to(self.conv.weight.dtype))[..., : gated.shape[-1]][..., -sequence:].to(gated.dtype)
+        if documents is not None:
+            mixed = convolve_documents(self.conv, gated, documents)
+        else:
+            if past_key_values is not None:
+                gated = past_key_values.update_conv_state(gated, self.layer_idx, conv_kernel_size=self.conv_kernel_size)
+            # `self.conv` pads both ends: the leading outputs are causal, the trailing ones look ahead.
+            mixed = self.conv(gated.to(self.conv.weight.dtype))[..., : gated.shape[-1]][..., -sequence:].to(gated.dtype)
         return self.out_proj((output_gate * mixed).transpose(-1, -2).contiguous())
 
 
@@ -203,6 +227,7 @@ class Lfm3DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
+        documents: PackedDocuments | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         """Run one decoder layer.
@@ -215,6 +240,7 @@ class Lfm3DecoderLayer(GradientCheckpointingLayer):
                 [batch, 1, sequence, key_sequence]; convolution layers take a padding
                 Tensor of shape [batch, sequence]. Either may be ``None``.
             past_key_values: Optional generation cache, updated in place.
+            documents: Optional packed-document boundaries, used in place of ``attention_mask``.
             **kwargs: Arguments for the Hugging Face attention dispatcher.
 
         Returns:
@@ -223,10 +249,10 @@ class Lfm3DecoderLayer(GradientCheckpointingLayer):
         operator_input = self.operator_norm(hidden_states)
         if self.is_attention_layer:
             operator_output, _ = self.self_attn(
-                operator_input, position_embeddings, attention_mask, past_key_values, **kwargs
+                operator_input, position_embeddings, attention_mask, past_key_values, documents, **kwargs
             )
         else:
-            operator_output = self.conv(operator_input, past_key_values, attention_mask)
+            operator_output = self.conv(operator_input, past_key_values, attention_mask, documents)
         hidden_states = hidden_states + self.post_operator_norm(operator_output)
         return hidden_states + self.post_ffn_norm(self.feed_forward(self.ffn_norm(hidden_states)))
 
@@ -312,6 +338,9 @@ class Lfm3Model(Lfm3PreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
+        max_length_q: int | None = None,
+        halo: DocumentHalo | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         """Run the decoder.
@@ -325,7 +354,15 @@ class Lfm3Model(Lfm3PreTrainedModel):
                 consecutive positions continuing from the cache.
             past_key_values: Optional generation cache, updated in place.
             inputs_embeds: Tensor of shape [batch, sequence, hidden].
-            use_cache: Whether to create and return a generation cache.
+            use_cache: Whether to create and return a generation cache. Training mode creates none.
+            cu_seq_lens_q: Optional int32 Tensor of shape [documents + 1] with the packed-document
+                boundaries of the flattened [batch * sequence] tokens. Attention and
+                convolution then stay inside each document, ``attention_mask`` is not used
+                and no generation cache is created; a supplied ``past_key_values`` and the
+                ``flex_attention`` backend are rejected.
+            max_length_q: Length of the longest packed document.
+            halo: Under context parallelism, how far the first local document reaches into
+                earlier ranks.
             **kwargs: Hugging Face output-capture and attention arguments.
 
         Returns:
@@ -333,16 +370,31 @@ class Lfm3Model(Lfm3PreTrainedModel):
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if kwargs.get("qkv_format") == "thd":
+            raise ValueError("LFM3 takes THD batches through the sharder of `prepare_model_inputs_for_cp`.")
+        if cu_seq_lens_q is not None and past_key_values is not None:
+            raise ValueError("LFM3 packed inputs do not support `past_key_values`.")
+        if cu_seq_lens_q is not None and self.config._attn_implementation == "flex_attention":
+            # Transformers adds a tensor mask to the FlexAttention scores, so the Boolean document mask hides no key.
+            raise ValueError(
+                "LFM3 does not support `flex_attention` with packed inputs or context parallelism; "
+                "use `sdpa` or a FlashAttention backend."
+            )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        if use_cache and past_key_values is None:
+        # Training builds no cache: whole-layer activation checkpointing replays each layer with the
+        # arguments of the forward, and a cache in them would be appended to a second time.
+        if use_cache and past_key_values is None and cu_seq_lens_q is None and not self.training:
             past_key_values = DynamicCache(config=self.config)
         if position_ids is None:
             seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             position_ids = (torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + seen).unsqueeze(0)
 
+        documents = None if cu_seq_lens_q is None else PackedDocuments(cu_seq_lens_q, max_length_q, halo)
         masks = attention_mask
-        if not isinstance(masks, dict):
+        if documents is not None:
+            masks = dict.fromkeys(self.config.layer_types)
+        elif not isinstance(masks, dict):
             masks = self._layer_masks(inputs_embeds, attention_mask, past_key_values, position_ids)
         position_embeddings = {
             layer_type: rotary_factors(position_ids, self.config.rope_parameters[layer_type], self.config.head_dim)
@@ -357,6 +409,7 @@ class Lfm3Model(Lfm3PreTrainedModel):
                 position_embeddings=position_embeddings.get(layer_type),
                 attention_mask=masks[layer_type],
                 past_key_values=past_key_values,
+                documents=documents,
                 **kwargs,
             )
         return BaseModelOutputWithPast(
@@ -370,20 +423,25 @@ class Lfm3ForCausalLM(HFCheckpointingMixin, Lfm3PreTrainedModel, GenerationMixin
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
+    _owns_cp_attention = True
+    supports_thd = True
+    parallelizer = PARALLELIZER
+
     @dataclass(frozen=True)
     class ModelCapabilities:
-        """Parallelism is undeclared until corresponding recipes are verified."""
+        """Context parallelism and THD packing use the model's own sharder; TP, PP and EP are undeclared."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = False
+        supports_thd: bool = True
 
-    def __init__(self, config: Lfm3Config) -> None:
+    def __init__(self, config: Lfm3Config, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = Lfm3Model(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         self.tie_weights()
 
@@ -404,6 +462,27 @@ class Lfm3ForCausalLM(HFCheckpointingMixin, Lfm3PreTrainedModel, GenerationMixin
     def get_output_embeddings(self) -> nn.Linear:
         """Return the vocabulary head."""
         return self.lm_head
+
+    def prepare_model_inputs_for_cp(self, batch: CPBatch, *, num_chunks: int = 1) -> dict[str, ContextParallelSharder]:
+        """Return the sharder that keeps packed documents apart and splits the sequence across CP ranks.
+
+        Args:
+            batch: The recipe batch with token Tensors of shape [batch, sequence]; it is not
+                read or changed here, the sharder reads it when it shards.
+            num_chunks: Unused; LFM3 shards whole rows.
+
+        Returns:
+            Mapping with the ``cp_sharder`` built on :func:`shard_documents`.
+        """
+        return prepare_cp_inputs(batch, num_chunks=num_chunks)
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject batched packing on backends that give the convolutions no document boundaries."""
+        if "flash_attention" not in attn_implementation:
+            raise ValueError(
+                f"LFM3 cannot keep batched packed documents apart with `{attn_implementation}` attention; "
+                "use a FlashAttention backend or `packing_strategy: thd`."
+            )
 
     @can_return_tuple
     def forward(
@@ -447,7 +526,10 @@ class Lfm3ForCausalLM(HFCheckpointingMixin, Lfm3PreTrainedModel, GenerationMixin
             use_cache=use_cache,
             **kwargs,
         )
-        logits = compute_lm_head_logits(self.lm_head, outputs.last_hidden_state, logits_to_keep).logits
+        hidden_states = outputs.last_hidden_state
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
