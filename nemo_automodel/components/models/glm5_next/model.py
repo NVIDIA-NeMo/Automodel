@@ -549,7 +549,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             pixel_values_videos: Unsupported; must be None. Empty PP chunks
                 are treated as None.
             logits_to_keep: 0 to project every local position, or the
-                positions to keep as in ``compute_lm_head_logits``.
+                positions to keep as in ``slice_logits_to_keep``.
             output_hidden_states: Whether to attach final hidden states.
             glm5_next_packed_context: Per-microbatch context or
                 ``Glm5NextPackedMetadata`` (doc_ids, seq_start, cp_size,
