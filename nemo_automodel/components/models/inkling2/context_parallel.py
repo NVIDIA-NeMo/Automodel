@@ -62,30 +62,47 @@ def gather_sequence(value: torch.Tensor, mesh: DeviceMesh | None, *, differentia
     return gathered.movedim(0, 1)
 
 
-def convolution_history(masked: torch.Tensor, mesh: DeviceMesh | None, width: int) -> torch.Tensor:
-    """Prepend causal history to masked [batch, local_sequence, channels].
+def gather_preceding(tail: torch.Tensor, mesh: DeviceMesh, length: int, *, differentiable: bool) -> torch.Tensor:
+    """Return the positions that directly precede this rank's shard.
 
     Args:
-        masked: This rank's shard [batch, local_sequence, channels] with invalid positions
-            already zeroed.
-        mesh: One-dimensional CP mesh; None or a single rank pads with zeros only.
-        width: Convolution taps; width - 1 history positions are prepended.
+        tail: This rank's final min(length, local_sequence) positions [batch, count, ...];
+            every rank supplies the same shape and dtype.
+        mesh: One-dimensional CP mesh with more than one rank.
+        length: Number of preceding positions to return.
+        differentiable: Route gradients back to each position's source rank.
 
     Returns:
-        New [batch, local_sequence + width - 1, channels] tensor. Rank zero and positions
-        before the sequence start receive zeros. Only each rank's final
-        min(width - 1, local_sequence) tokens are exchanged, which also handles a halo
-        wider than a shard and preserves backward participation on rank zero.
+        [batch, length, ...] in the tail's dtype, zeros where no rank precedes. Only the
+        tails are exchanged, which also handles a length larger than a shard and preserves
+        backward participation on rank zero.
+    """
+    count = tail.shape[1]
+    tails = gather_sequence(tail, mesh, differentiable=differentiable)
+    preceding = tails[:, : mesh.get_local_rank() * count]
+    prefix = preceding[:, -length:]
+    return F.pad(prefix, (0, 0) * (prefix.ndim - 2) + (length - prefix.shape[1], 0))
+
+
+def convolution_prefix(x: torch.Tensor, valid: torch.Tensor, mesh: DeviceMesh | None, width: int) -> torch.Tensor:
+    """Return the causal history that precedes x [batch, local_sequence, channels].
+
+    Args:
+        x: This rank's shard [batch, local_sequence, channels].
+        valid: Boolean [batch, local_sequence]; invalid positions count as zero.
+        mesh: One-dimensional CP mesh; None or a single rank gives zeros.
+        width: Convolution taps; the history has width - 1 positions.
+
+    Returns:
+        FP32 [batch, width - 1, channels]. Rank zero and positions before the sequence
+        start receive zeros.
     """
     halo = width - 1
     if mesh is None or mesh.size() == 1 or halo == 0:
-        return F.pad(masked, (0, 0, halo, 0))
-    count = min(halo, masked.shape[1])
-    tails = gather_sequence(masked[:, -count:], mesh, differentiable=True)
-    preceding = tails[:, : mesh.get_local_rank() * count]
-    prefix = preceding[:, -halo:]
-    prefix = F.pad(prefix, (0, 0, halo - prefix.shape[1], 0))
-    return torch.cat((prefix, masked), dim=1)
+        return x.new_zeros(x.shape[0], halo, x.shape[2], dtype=torch.float32)
+    count = min(halo, x.shape[1])
+    tail = (x[:, -count:] * valid[:, -count:, None]).float()
+    return gather_preceding(tail, mesh, halo, differentiable=True)
 
 
 def unpack_row_layout(batch: CPBatch) -> None:

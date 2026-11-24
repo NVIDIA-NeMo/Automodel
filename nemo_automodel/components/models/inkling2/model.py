@@ -14,6 +14,8 @@
 
 """Native FP32/BF16 Inkling2 text reference with explicit accumulation precision."""
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from typing import Literal, cast
 
@@ -53,10 +55,17 @@ from .layers import (
     ResidualQuery,
     ResidualState,
     ShortConvolution,
+    accumulate,
+    close_block,
+    compile_cores,
+    compile_variants,
+    normalize,
+    outside_dispatch_modes,
     residual_mix,
 )
 from .parallelization import FP32_MODULES, Inkling2Parallelizer
 from .state_dict_adapter import Inkling2StateDictAdapter
+from .triton_attention import attention_replay
 
 
 class Inkling2DecoderLayer(nn.Module):
@@ -99,9 +108,10 @@ class Inkling2DecoderLayer(nn.Module):
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.attn = Inkling2Attention(
-            config, layer_idx, dtype=dtype, backend=cast(Literal["eager", "flex"], backend.attn)
+            config, layer_idx, dtype=dtype, backend=cast(Literal["eager", "flex", "triton"], backend.attn)
         )
         self.mlp = Inkling2MoE(config, backend, dtype=dtype)
+        self.reuse_attention_on_recompute = config.reuse_attention_on_recompute and backend.attn == "triton"
         self.attn_sconv = ShortConvolution(config.hidden_size, config.sconv_kernel_size, dtype=dtype)
         self.mlp_sconv = ShortConvolution(config.hidden_size, config.sconv_kernel_size, dtype=dtype)
         self.controllers = (
@@ -119,6 +129,23 @@ class Inkling2DecoderLayer(nn.Module):
     def self_attn(self) -> Inkling2Attention:
         """Expose the shared MoE CP setup hook without another parameter owner."""
         return self.attn
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Extend this layer's activation-checkpoint contexts with the attention output replay.
+
+        Args:
+            context_fn: The parallelizer's ``torch.utils.checkpoint`` context factory, or ``None``.
+
+        Returns:
+            The context factory, wrapped when ``reuse_attention_on_recompute`` is set and the layer
+            runs the Triton attention; unchanged otherwise.
+        """
+        if not self.reuse_attention_on_recompute:
+            return context_fn
+        return attention_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,
@@ -145,38 +172,48 @@ class Inkling2DecoderLayer(nn.Module):
         Returns:
             New state with tensors of shape [batch, sequence, hidden]; previous state is unchanged.
         """
-        dtype = self.attn.qkvr.weight.dtype
-        streams = (
-            (state.partial,) * len(self.attn_norms) if self.attn_query is None else self.attn_query(state).unbind(0)
-        )
-        norms = tuple(self.attn_norms)
-        messages = None
-        if bank is not None:
-            assert self.controllers is not None and message_queries is not None
-            messages = residual_mix(bank, message_queries, normalize_values=True)
-            # In later passes a local layer also gets separate Q, K and V inputs, through its one norm.
-            streams, norms = (streams * 3, norms * 3) if self.is_local else (streams, norms)
-            streams = tuple(
-                self.controllers[name](stream.float(), message)
-                for name, stream, message in zip(("attn", "k", "v"), streams, messages)
+        with compile_variants():
+            norms = tuple(cast(nn.RMSNorm, norm) for norm in self.attn_norms)
+            messages = None
+            if bank is None and self.attn_query is not None:
+                normed = self.attn_query(state, norms)
+            else:
+                streams = (state.partial,) * len(norms) if self.attn_query is None else self.attn_query(state)
+                if bank is not None:
+                    assert self.controllers is not None and message_queries is not None
+                    messages = residual_mix(bank, message_queries, normalize_values=True)
+                    # In later passes a local layer also gets separate Q, K and V inputs, through its one norm.
+                    streams, norms = (streams * 3, norms * 3) if self.is_local else (streams, norms)
+                    streams = tuple(
+                        self.controllers[name](stream.float(), message)
+                        for name, stream, message in zip(("attn", "k", "v"), streams, messages)
+                    )
+                normed = tuple(normalize(stream, norm) for norm, stream in zip(norms, streams))
+            sources = (
+                AttentionSources(normed[0], normed[0], normed[0]) if len(normed) == 1 else AttentionSources(*normed)
             )
-        normed = tuple(norm(stream.float()).to(dtype) for norm, stream in zip(norms, streams))
-        sources = AttentionSources(normed[0], normed[0], normed[0]) if len(normed) == 1 else AttentionSources(*normed)
-        attention = self.attn_sconv(self.attn(sources, valid, positions), valid, positions=positions)
-        blocks = (*state.blocks, state.partial) if self.is_boundary else state.blocks
-        # Mixture arithmetic sees the FP32 sum before the residual storage cast.
-        partial = attention.float() if self.is_boundary else state.partial.float() + attention.float()
-        mlp_stream = self.mlp_query(ResidualState(blocks, partial))[0]
-        if messages is not None:
-            assert self.controllers is not None
-            mlp_stream = self.controllers["mlp"](mlp_stream, messages[3])
-        mlp_input = self.mlp_norm(mlp_stream).to(dtype)
-        gate = self.mlp.gate
-        if isinstance(gate, Gate) and gate.router_replay is not None:
-            # An argument, not loop state: the activation-checkpoint recompute repeats this call.
-            gate.router_replay.visit = visit
-        mlp = self.mlp_sconv(self.mlp(mlp_input, padding_mask=~valid), valid, positions=positions)
-        return ResidualState(blocks, (partial + mlp.float()).to(dtype))
+            with outside_dispatch_modes():
+                attention = self.attn_sconv(self.attn(sources, valid, positions), valid, positions=positions)
+            blocks = (*state.blocks, state.partial) if self.is_boundary else state.blocks
+            # Mixture arithmetic sees the FP32 sum before the residual storage cast.
+            partial = attention.float() if self.is_boundary else accumulate(state.partial, attention)
+            mlp_norm = cast(nn.RMSNorm, self.mlp_norm)
+            if messages is None:
+                mlp_input = self.mlp_query(ResidualState(blocks, partial), (mlp_norm,))[0]
+            else:
+                mlp_stream = self.mlp_query(ResidualState(blocks, partial))[0]
+                if messages is not None:
+                    assert self.controllers is not None
+                    mlp_stream = self.controllers["mlp"](mlp_stream, messages[3])
+                mlp_input = normalize(mlp_stream, mlp_norm)
+            gate = self.mlp.gate
+            if isinstance(gate, Gate) and gate.router_replay is not None:
+                # An argument, not loop state: the activation-checkpoint recompute repeats this call.
+                gate.router_replay.visit = visit
+            expert_output = self.mlp(mlp_input, padding_mask=~valid)
+            with outside_dispatch_modes():
+                mlp = self.mlp_sconv(expert_output, valid, positions=positions)
+            return ResidualState(blocks, close_block(partial, mlp))
 
     @torch.no_grad()
     def reset_parameters(self, init_std: float, buffer_device: torch.device) -> None:
@@ -213,7 +250,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     parallelizer = Inkling2Parallelizer()
     _owns_cp_attention = True
     supports_thd = True
-    _packed_cp_attn_backends = ("eager", "flex")
+    _packed_cp_attn_backends = ("eager", "flex", "triton")
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -265,19 +302,17 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 backend.rms_norm,
             )
             != ("torch", "torch")
-            or backend.attn not in ("eager", "flex")
+            or backend.attn not in ("eager", "flex", "triton")
             or (backend.experts, backend.dispatcher)
             not in (("torch", "torch"), ("torch_mm", "torch"), ("torch_mm", "hybridep"))
         ):
             raise ValueError(
-                "Inkling2 requires eager/flex attention, Torch linear/norm, and torch or torch_mm experts "
+                "Inkling2 requires eager, flex or triton attention, Torch linear/norm, and torch or torch_mm experts "
                 "with the torch dispatcher, or torch_mm experts with the hybridep dispatcher"
             )
-        if backend.fake_balanced_gate or backend.gate_precision not in (
-            None,
-            torch.float32,
-        ):
-            raise ValueError("Inkling2 requires the real FP32 sigmoid router")
+        # fake_balanced_gate replaces the router for throughput runs: random weights route unevenly.
+        if backend.gate_precision not in (None, torch.float32):
+            raise ValueError("Inkling2 requires the FP32 sigmoid router")
         self.cp_mesh: DeviceMesh | None = None
         self.backend = replace(backend, gate_precision=torch.float32)
         self.config = config
@@ -315,6 +350,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.lm_head: Inkling2LMHead | None = Inkling2LMHead(config, dtype=dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Inkling2StateDictAdapter(config)
+        if self.backend.compile_norm:
+            compile_cores()
         Inkling2ForCausalLM.initialize_weights(self)
 
     def prepare_model_inputs_for_cp(self, batch: CPBatch, *, num_chunks: int = 1) -> dict[str, ContextParallelSharder]:
@@ -644,7 +681,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 (positions.long(), valid.long()), dim=-1
             )
         assert self.norm is not None and self.output_query is not None
-        hidden = self.norm(self.output_query(state)[0]).to(state.partial.dtype)
+        with compile_variants():
+            hidden = self.output_query(state, (cast(nn.RMSNorm, self.norm),))[0]
         return hidden if return_hidden or self._pp_return_hidden_states else self._project_logits(hidden)
 
     def _run_layers(self, state: ResidualState, valid: torch.Tensor, positions: torch.Tensor) -> ResidualState:

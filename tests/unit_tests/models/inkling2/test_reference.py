@@ -41,7 +41,7 @@ from nemo_automodel.components.models.inkling2.layers import (
     residual_mix,
 )
 from nemo_automodel.components.models.inkling2.model import Inkling2ForCausalLM
-from nemo_automodel.components.moe.layers import Gate
+from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate
 
 from . import reference
 
@@ -255,7 +255,7 @@ def test_residual_mixture_is_token_local_and_immutable(normalize: bool) -> None:
     copies = [x.detach().clone() for x in sources]
     queries = torch.randn(3, 7, requires_grad=True)
     state = ResidualState(tuple(sources[:-1]), sources[-1])
-    actual = residual_mix(state, queries, normalize_values=normalize)
+    actual = torch.stack(residual_mix(state, queries, normalize_values=normalize))
     expected = torch.stack([reference.mix(sources, q, normalize) for q in queries])
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
     gradients = torch.autograd.grad(actual[:, 0, 2].square().sum(), sources)
@@ -378,6 +378,32 @@ def test_checkpoint_style_config_resolution_and_capabilities(tmp_path: Path) -> 
     assert caps.supports_cp and not caps.supports_tp
 
 
+def test_balanced_benchmark_gate_replaces_every_router() -> None:
+    """fake_balanced_gate puts the balanced gate, not a learned router, into every MoE layer."""
+    backend = BackendConfig(
+        attn="eager",
+        linear="torch",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=True,
+        fake_gate_noise=0.0,
+    )
+    config = tiny_config()
+    model = Inkling2ForCausalLM(config, backend=backend)
+    model.initialize_weights(torch.device("cpu"))
+    gates = [layer.mlp.gate for layer in model.layers.values()]
+    assert len(gates) == config.num_hidden_layers
+    assert all(type(gate) is FakeBalancedGate for gate in gates)
+    assert type(Inkling2ForCausalLM(config).layers["0"].mlp.gate) is Gate
+    tokens = 2 * config.n_routed_experts
+    _, experts, _ = gates[0](torch.zeros(tokens, config.hidden_size), torch.ones(tokens, dtype=torch.bool), None)
+    counts = torch.bincount(experts.flatten(), minlength=config.n_routed_experts)
+    assert counts.tolist() == [tokens * config.num_experts_per_tok // config.n_routed_experts] * config.n_routed_experts
+    logits = model(torch.arange(1, 9).unsqueeze(0))
+    assert torch.isfinite(logits[..., :37]).all()
+
+
 def test_materialization_and_rejected_contracts() -> None:
     cfg = tiny_config()
     with torch.device("meta"):
@@ -386,7 +412,7 @@ def test_materialization_and_rejected_contracts() -> None:
     model.initialize_weights(torch.device("cpu"))
     result = model(torch.ones(1, 3, dtype=torch.long))
     assert torch.isfinite(result[..., :37]).all()
-    with pytest.raises(ValueError, match="eager/flex attention"):
+    with pytest.raises(ValueError, match="eager, flex or triton attention"):
         Inkling2ForCausalLM(cfg, backend=BackendConfig(attn="sdpa"))
     with pytest.raises(ValueError, match="increase by one"):
         model(torch.ones(1, 3, dtype=torch.long), attention_mask=torch.tensor([[1, 0, 1]]))

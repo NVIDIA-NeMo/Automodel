@@ -21,6 +21,8 @@ from typing import Any, Literal, TypedDict
 
 from transformers import PretrainedConfig
 
+from nemo_automodel.components.models.inkling2.flops import model_flops
+
 
 class Inkling2QuantizationConfig(TypedDict):
     """Expert storage of a released checkpoint: NVFP4 for the first layers, MXFP8 after them."""
@@ -169,6 +171,7 @@ class Inkling2TextConfig(PretrainedConfig):
     """Text configuration; defaults follow the inspected checkpoint, not serving defaults."""
 
     model_type = "inkling2_model"
+    flops_formula = staticmethod(model_flops)
     base_config_key = "text_config"
     attribute_map = {
         "model_max_length": "max_position_embeddings",
@@ -221,6 +224,7 @@ class Inkling2TextConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         quantization_config: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None = None,
         loop_config: Inkling2LoopConfig | None = None,
+        reuse_attention_on_recompute: bool = False,
         **kwargs: Any,
     ) -> None:
         # Hugging Face owns the open-ended serialized metadata at this boundary.
@@ -289,6 +293,9 @@ class Inkling2TextConfig(PretrainedConfig):
         self.route_scale = route_scale
         self.use_gate_bias = use_gate_bias
         self.final_logit_softcapping = final_logit_softcapping
+        # Training-time switch, not part of a released checkpoint: under activation checkpointing keep
+        # each layer's attention output and reuse it in the recomputation (Triton attention only).
+        self.reuse_attention_on_recompute = bool(reuse_attention_on_recompute)
         self.initializer_range = initializer_range
         # Released checkpoints declare this in hf_quant_config.json; the model
         # fills it in from the checkpoint directory when it is built.
@@ -461,6 +468,15 @@ class Inkling2Config(PretrainedConfig):
             raise ValueError("A loop_config requires model_type inkling2_loop")
         kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)
+
+    @property
+    def reuse_attention_on_recompute(self) -> bool:
+        """Training-time switch of the text model, settable on either configuration level."""
+        return self.text_config.reuse_attention_on_recompute
+
+    @reuse_attention_on_recompute.setter
+    def reuse_attention_on_recompute(self, value: bool) -> None:
+        self.text_config.reuse_attention_on_recompute = bool(value)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize both levels; a stripped source declaration is stripped from the text config too.
