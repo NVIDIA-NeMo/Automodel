@@ -17,9 +17,12 @@
 import copy
 import dataclasses
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 from nemo_automodel.components.models.common import BackendConfig
+
+Glm5NextSinkhornBackend = Literal["torch", "tilelang"]
+Glm5NextIndexerBackend = Literal["torch", "cudnn"]
 
 
 @dataclass(kw_only=True)
@@ -34,8 +37,8 @@ class Glm5NextBackendConfig(BackendConfig):
             BF16 projections and PyTorch top-k, and requires CUDA and cuDNN DSA.
     """
 
-    sinkhorn: Literal["torch", "tilelang"] = "torch"
-    indexer: Literal["torch", "cudnn"] = "torch"
+    sinkhorn: Glm5NextSinkhornBackend = "torch"
+    indexer: Glm5NextIndexerBackend = "torch"
 
     @classmethod
     def from_backend(cls, backend: BackendConfig) -> "Glm5NextBackendConfig":
@@ -57,7 +60,9 @@ class Glm5NextBackendConfig(BackendConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.indexer not in ("torch", "cudnn"):
-            raise ValueError(f"Unsupported indexer={self.indexer!r}; expected 'torch' or 'cudnn'.")
-        if self.sinkhorn not in ("torch", "tilelang"):
-            raise ValueError(f"Unsupported sinkhorn={self.sinkhorn!r}; expected 'torch' or 'tilelang'.")
+        indexers = get_args(Glm5NextIndexerBackend)
+        if self.indexer not in indexers:
+            raise ValueError(f"Unsupported indexer={self.indexer!r}; expected {' or '.join(map(repr, indexers))}.")
+        sinkhorns = get_args(Glm5NextSinkhornBackend)
+        if self.sinkhorn not in sinkhorns:
+            raise ValueError(f"Unsupported sinkhorn={self.sinkhorn!r}; expected {' or '.join(map(repr, sinkhorns))}.")

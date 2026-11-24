@@ -12,7 +12,7 @@ kernel; small pure-Torch fallbacks keep CPU construction and unit tests useful.
 from __future__ import annotations
 
 import math
-from typing import Any, Literal
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +25,11 @@ from nemo_automodel.components.models.common.cudnn_sparse_attention import (
     is_cudnn_sparse_attention_available,
 )
 from nemo_automodel.components.models.common.sinkhorn import sinkhorn_normalize_tile_kernels, sinkhorn_normalize_torch
-from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
+from nemo_automodel.components.models.glm5_next.backend import (
+    Glm5NextBackendConfig,
+    Glm5NextIndexerBackend,
+    Glm5NextSinkhornBackend,
+)
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -92,7 +96,7 @@ class Glm5NextUnweightedRMSNorm(nn.Module):
 class Glm5NextHyperConnectionFp32Params(nn.Module):
     """Own mHC parameters that must remain fp32 under FSDP mixed precision."""
 
-    def __init__(self, mix_size: int, *, sinkhorn_backend: Literal["torch", "tilelang"] = "torch") -> None:
+    def __init__(self, mix_size: int, *, sinkhorn_backend: Glm5NextSinkhornBackend = "torch") -> None:
         super().__init__()
         self.sinkhorn_backend = sinkhorn_backend
         self.base = nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
@@ -157,7 +161,7 @@ class Glm5NextHyperConnection(nn.Module):
         self,
         config: Glm5NextTextConfig,
         *,
-        sinkhorn_backend: Literal["torch", "tilelang"] = "torch",
+        sinkhorn_backend: Glm5NextSinkhornBackend = "torch",
         compile_hc: bool = False,
     ) -> None:
         super().__init__()
@@ -593,7 +597,7 @@ class Glm5NextKPoolIndexer(nn.Module):
         layer_idx: int,
         dtype: torch.dtype,
         *,
-        backend: Literal["torch", "cudnn"] = "torch",
+        backend: Glm5NextIndexerBackend = "torch",
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
