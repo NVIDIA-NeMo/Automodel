@@ -143,7 +143,7 @@ freeze_config:
   freeze_language_model: false
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/glm5_3_flash_tulu3_128k_pp4_vpp2_cp32_ep32_100steps/
+  checkpoint_dir: checkpoints/glm5_3_flash_tulu3_128k_pp4_cp32_ep32_100steps/
   dequantize_base_checkpoint: true
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
@@ -190,9 +190,9 @@ wandb:
   enable: false
   entity: Nemo-automodel
   project: glm5_3_flash
-  name: glm5_3_flash_tulu3_128k_pp4_vpp2_cp32_ep32_100steps
-  dir: logs/glm5_3_flash_tulu3_128k_pp4_vpp2_cp32_ep32_100steps/wandb
-  tags: [glm5.3-flash, tulu3, packed128k, pp4, vpp2, cp32, ep32]
+  name: glm5_3_flash_tulu3_128k_pp4_cp32_ep32_100steps
+  dir: logs/glm5_3_flash_tulu3_128k_pp4_cp32_ep32_100steps/wandb
+  tags: [glm5.3-flash, tulu3, packed128k, pp4, cp32, ep32]
 moe_metrics:
   enabled: true
   mode: detailed
