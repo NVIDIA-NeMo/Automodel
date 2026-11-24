@@ -584,6 +584,9 @@ class Glm5NextLinearAttention(nn.Module):
 class Glm5NextKPoolIndexer(nn.Module):
     """KPool-compressed DSA indexer for training without a KV cache."""
 
+    # Validated query tile of the narrow BF16 weights projection.
+    weights_projection_tile = 512
+
     def __init__(
         self,
         config: Glm5NextTextConfig,
@@ -678,7 +681,11 @@ class Glm5NextKPoolIndexer(nn.Module):
             queries = torch.cat([self.wq_b(chunk) for chunk in query_resid.split(projection_chunk, dim=1)], dim=1)
             queries = queries.view(1, -1, self.n_heads, self.head_dim)
             weights = torch.cat(
-                [self.weights_proj(chunk) for chunk in query_hidden.split(min(512, projection_chunk), dim=1)], dim=1
+                [
+                    self.weights_proj(chunk)
+                    for chunk in query_hidden.split(min(self.weights_projection_tile, projection_chunk), dim=1)
+                ],
+                dim=1,
             )
             scores = cudnn_indexer_scores(
                 queries,
@@ -694,8 +701,11 @@ class Glm5NextKPoolIndexer(nn.Module):
                 scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
             scores = F.relu(scores * self.softmax_scale)
             # Keep the narrow BF16 projection at the validated query tile shape.
-            if query_hidden.shape[1] > 512:
-                weights = torch.cat([self.weights_proj(chunk) for chunk in query_hidden.split(512, dim=1)], dim=1)
+            if query_hidden.shape[1] > self.weights_projection_tile:
+                weights = torch.cat(
+                    [self.weights_proj(chunk) for chunk in query_hidden.split(self.weights_projection_tile, dim=1)],
+                    dim=1,
+                )
             else:
                 weights = self.weights_proj(query_hidden)
             weights = weights.float() * (self.n_heads**-0.5)
@@ -795,6 +805,10 @@ class Glm5NextSparseAttention(nn.Module):
 
     query_chunk_size = 32
     indexer_query_chunk_size = 2048
+    # FP32 score workspace bound of one indexer chunk.
+    indexer_score_workspace_bytes = 256 * 1024**2
+    # Indexer chunks above this size are rounded down to a power of two.
+    indexer_chunk_pow2_threshold = 512
 
     def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: Glm5NextBackendConfig) -> None:
         super().__init__()
@@ -1065,12 +1079,12 @@ class Glm5NextSparseAttention(nn.Module):
         """
         selected_indices = []
 
-        # Bound the FP32 [queries, index_heads, pools] score tensor to 256 MiB.
+        # Bound the FP32 [queries, index_heads, pools] score tensor to indexer_score_workspace_bytes.
         # At 256K/KPool4 this retains the original 32-query score workspace.
         def chunk_size(score_heads: int) -> int:
             bytes_per_query = max(1, pool_keys.shape[0]) * score_heads * 4
-            size = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
-            return 1 << (size.bit_length() - 1) if size > 512 else size
+            size = min(self.indexer_query_chunk_size, max(1, self.indexer_score_workspace_bytes // bytes_per_query))
+            return 1 << (size.bit_length() - 1) if size > self.indexer_chunk_pow2_threshold else size
 
         projection_chunk = chunk_size(self.indexer.n_heads)
         indexer_chunk = projection_chunk
