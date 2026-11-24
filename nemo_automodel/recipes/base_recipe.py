@@ -248,24 +248,28 @@ class BaseRecipe:
         directly, or pass None to fall back to the FSDP2 policy and model dtype.
         """
         strategy = self.distributed_config
-        if compute_dtype == "auto":
-            compute_dtype = None
+
+        def infer_compute_dtype() -> torch.dtype | None:
             fp8_config = self.cfg.get("fp8", None)
             if HAVE_TE and isinstance(self.te_quantization, TENvfp4Config):
-                compute_dtype = torch.float4_e2m1fn_x2
-            elif (HAVE_TE and isinstance(self.te_quantization, TEFp8Config)) or (
+                return torch.float4_e2m1fn_x2
+            if (HAVE_TE and isinstance(self.te_quantization, TEFp8Config)) or (
                 fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
             ):
-                compute_dtype = torch.float8_e4m3fn
-            elif (
+                return torch.float8_e4m3fn
+            if (
                 self.moe_parallel_config is not None
                 and self.moe_parallel_config.mp_policy is not None
                 and self.mesh_context.ep_size > 1
             ):
-                compute_dtype = self.moe_parallel_config.mp_policy.param_dtype
-            elif isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(self.device_mesh):
+                return self.moe_parallel_config.mp_policy.param_dtype
+            if isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(self.device_mesh):
                 # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
-                compute_dtype = strategy.autocast_dtype
+                return strategy.autocast_dtype
+            return None
+
+        if compute_dtype == "auto":
+            compute_dtype = infer_compute_dtype()
         if compute_dtype is None and isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
             compute_dtype = strategy.mp_policy.param_dtype
         mfu_settings = self.cfg.mfu
