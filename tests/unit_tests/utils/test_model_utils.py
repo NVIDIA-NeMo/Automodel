@@ -897,6 +897,20 @@ class TestSqueezeInputForThd:
         assert kw["max_seqlen"] == 3
         assert isinstance(kw["max_seqlen"], int)
 
+    @pytest.mark.parametrize("token_ids", [True, False], ids=["ids", "activations"])
+    def test_second_call_on_one_packed_token_is_a_noop(self, token_ids):
+        """A decoder squeezes what its wrapper already squeezed: one token keeps its token axis."""
+        tokens = torch.tensor([[7]]) if token_ids else torch.randn(1, 1, 4)
+        first = model_utils.squeeze_input_for_thd(
+            tokens, torch.tensor([[0]]), torch.tensor([[False]]), self._attn_kwargs(with_max_seqlen=False)
+        )
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(*first)
+
+        assert ids.shape == ((1,) if token_ids else (1, 4))
+        assert pos.shape == (1,)
+        assert mask.shape == (1,)
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+
     def test_accepts_input_ids_none_for_inputs_embeds_callers(self):
         """The bug: prior code did ``input_ids.squeeze(0)`` unconditionally and
         crashed when the caller used ``inputs_embeds`` only. The fix returns

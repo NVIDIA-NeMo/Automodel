@@ -18,8 +18,9 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -32,7 +33,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
-    compute_lm_head_logits,
     generation_config_from_model_config,
     restore_pretrained_generation_config,
 )
@@ -289,8 +289,10 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         config: Glm5NextConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict[str, Any] | None = None,
         mtp_loss_scaling_factor: float = 0.1,
-        **kwargs: Any,
     ) -> None:
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -301,7 +303,6 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         self.backend = copy.copy(backend) if backend is not None else BackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm5NextModel(
             config,
             self.backend,
@@ -313,13 +314,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             getattr(text_config, "torch_dtype", getattr(text_config, "dtype", None)),
             torch.bfloat16,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            text_config.hidden_size,
-            text_config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(text_config.hidden_size, text_config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.vocab_size = text_config.vocab_size
         num_mtp_layers = int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)
         self.mtp_config = MTPConfig(
@@ -417,7 +412,6 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             kwargs.pop(key, None)
         if pixel_values_videos is not None:
             raise NotImplementedError("GLM-5.3 AutoModel onboarding currently supports images, not video training")
-        is_thd = kwargs.get("qkv_format") == "thd"
         if input_ids is not None and input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
         if inputs_embeds is not None and inputs_embeds.ndim == 2:
@@ -479,16 +473,10 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             if output_hidden_states is not None
             else bool(getattr(self.config.text_config, "output_hidden_states", False))
         )
-        output = compute_lm_head_logits(
-            self.lm_head,
-            hidden,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         return Glm5NextCausalLMOutputWithPast(
-            logits=output.logits,
-            hidden_states=output.hidden_states,
+            logits=logits,
+            hidden_states=hidden if output_hidden_states else None,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None,
         )

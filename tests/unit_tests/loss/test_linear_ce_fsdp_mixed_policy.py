@@ -20,7 +20,7 @@ The reviewer's scenario on #4288: a native model with FP32 parameters under
 hidden states the model hands out must be projected in that weight's dtype; the ``torch_compile`` projection
 ``e @ c.T`` inside cut-cross-entropy aligns nothing itself. The CPU stand-in for the reviewer's Qwen3MoE is a
 tiny dense DeepSeek-V3 (Qwen3MoE builds its rotary cache on the current CUDA device): the same
-``compute_lm_head_logits`` head path, the same standalone FSDP ``lm_head`` unit under the policy.
+``LMHead`` projection path, the same standalone FSDP ``lm_head`` unit under the policy.
 """
 
 from __future__ import annotations

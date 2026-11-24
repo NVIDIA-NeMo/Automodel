@@ -154,6 +154,8 @@ class DFlash2TrainerModule(DFlashTrainerModule):
                 "teacher-forces the predecessor from the fixed-anchor block layout, which a variable "
                 "visible prefix breaks."
             )
+        if loss_type == "mmflash":
+            raise ValueError("DFlash 2 does not support loss_type='mmflash'. Use the DFlash trainer for MMFlash.")
         super().__init__(
             draft_model=draft_model,
             target_lm_head=target_lm_head,

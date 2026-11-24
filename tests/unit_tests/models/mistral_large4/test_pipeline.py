@@ -212,6 +212,15 @@ def test_final_fused_loss_input_is_uncapped_hidden_state():
     assert outputs[0].shape == hidden.shape
 
 
+def test_final_stage_logits_match_their_declared_dtype():
+    model = make_pipeline_model()
+    model.lm_head.logits_dtype = torch.bfloat16
+    parts = partition_model(model, (0, 2, 4))
+    logits = run_partition(parts, torch.tensor([[1, 2, 3, 4]]))
+    _, outputs = parts[-1].get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=4, dtype=torch.float32)
+    assert logits.dtype == outputs[0].dtype == torch.bfloat16
+
+
 def test_invalid_stage_ownership_missing_transport_and_packed_inputs_fail():
     model = make_pipeline_model()
     first, last = partition_model(model, (0, 2, 4))
