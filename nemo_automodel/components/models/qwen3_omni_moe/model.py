@@ -31,7 +31,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -394,9 +394,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 a single-position lm_head projection alongside the final hidden
                 states.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: When set, the returned output carries the final
                 hidden states (the input to ``lm_head``) so the recipe can run
                 fused linear cross-entropy.
@@ -576,8 +575,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # 5. Optionally compute loss/aux outputs
         if labels is not None or output_router_logits:
             output: dict[str, Any] = {"logits": logits}
-            if not compute_logits:
-                output["lm_head_weight"] = self.lm_head.weight
 
             aux_loss = None
             if labels is not None:
@@ -602,9 +599,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             return output
 
         if output_hidden_states:
-            return CausalLMOutputWithLMHeadWeight(
-                logits=logits, hidden_states=hidden, lm_head_weight=None if compute_logits else self.lm_head.weight
-            )
+            return CausalLMOutputWithPast(logits=logits, hidden_states=hidden)
 
         return logits
 

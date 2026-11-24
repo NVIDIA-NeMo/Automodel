@@ -2746,10 +2746,9 @@ class TestForwardBackwardStepNonPP:
 
         # Model output class that supports both attribute access and 'in' operator
         class ModelOutput:
-            def __init__(self, logits, hidden_states, lm_head_weight):
+            def __init__(self, logits, hidden_states):
                 self.logits = logits
                 self.hidden_states = hidden_states
-                self.lm_head_weight = lm_head_weight
 
             def __contains__(self, key):
                 return hasattr(self, key)
@@ -2764,11 +2763,10 @@ class TestForwardBackwardStepNonPP:
             def forward(self, logits_to_keep=None, *, compute_logits=True, **kwargs):
                 # FusedLinearCE requires bf16/fp16 hidden states
                 hidden = torch.randn(2, 5, 10, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-                # Like the repo's forwards, skip the head without logits and return its weight.
+                # Like the repo's forwards, skip the head without logits.
                 return ModelOutput(
                     logits=self.lm_head(hidden) if compute_logits else hidden[..., :0],
                     hidden_states=[hidden],
-                    lm_head_weight=None if compute_logits else self.lm_head.weight,
                 )
 
             def get_output_embeddings(self):

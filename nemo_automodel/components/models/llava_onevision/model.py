@@ -35,7 +35,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -418,11 +418,10 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
                 labels.view(-1).to(logits.device),
             )
 
-        return CausalLMOutputWithLMHeadWeight(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=getattr(outputs, "past_key_values", None),
             hidden_states=hidden_states if output_hidden_states else None,
             attentions=getattr(outputs, "attentions", None),
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )

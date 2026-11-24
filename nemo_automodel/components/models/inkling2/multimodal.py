@@ -153,9 +153,8 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
             position_ids: Optional integer [batch, sequence] consecutive positions.
             logits_to_keep: Tail length or sequence indices for the shared loss path.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Return final decoder features for external loss.
 
         Returns:

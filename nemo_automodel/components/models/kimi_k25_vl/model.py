@@ -48,18 +48,6 @@ LOGGER = logging.getLogger(__name__)
 # =============================================================================
 
 
-@dataclass
-class LlavaCausalLMOutputWithLMHeadWeight(LlavaCausalLMOutputWithPast):
-    """``LlavaCausalLMOutputWithPast`` that also carries the LM head's weight when the forward skipped the head.
-
-    Attributes:
-        lm_head_weight: Tensor of shape [vocab, hidden], as the module holds it, or None when the forward
-            computed logits.
-    """
-
-    lm_head_weight: torch.Tensor | None = None
-
-
 class MoonViT3dConfig(PretrainedConfig):
     """Configuration for MoonViT3d vision encoder with temporal support."""
 
@@ -1082,9 +1070,8 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
             logits_to_keep: Number of trailing positions to project, or indices
                 of shape [kept_sequence].
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Attention metadata forwarded to the language model.
 
         Returns:
@@ -1157,13 +1144,12 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         if not return_dict and not output_hidden_states:
             return logits
 
-        return LlavaCausalLMOutputWithLMHeadWeight(
+        return LlavaCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=None,
             hidden_states=hidden_states if output_hidden_states else None,
             attentions=None,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()

@@ -1248,9 +1248,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 positions (used by fused linear cross-entropy to avoid the full
                 logit matrix). Forwarded to the language-model lm_head gating.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Additional arguments
 
         Returns:

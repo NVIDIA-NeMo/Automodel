@@ -151,8 +151,6 @@ def test_compute_logits_false_skips_the_head(config_cls):
     assert head_calls == []
     assert output.logits.shape == (2, 6, 0)
     torch.testing.assert_close(output.hidden_states[-1], expected, rtol=0, atol=0)
-    # They project with the head's weight, which the forward returns as the module holds it.
-    assert output.lm_head_weight is model.lm_head.weight
 
 
 def test_logits_dtype_survives_the_build_retry():

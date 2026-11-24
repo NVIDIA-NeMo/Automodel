@@ -1114,7 +1114,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # The loss projects the final hidden states itself, with the head weight the model returns.
+                    # The loss projects the final hidden states itself, so the model skips its LM head.
                     out = model(**{**batch, "compute_logits": False, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
@@ -1129,7 +1129,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     prepare_lm_weight(
                         self.loss_fn,
                         model,
-                        lm_head_weight=out.lm_head_weight,
                         grad_reduce_group=grad_reduce_group,
                     )
                     if isinstance(self.loss_fn, LinearCrossEntropy)
@@ -1394,19 +1393,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, LinearCrossEntropy):
                         out = self.model_parts[0](**{**batch, "compute_logits": False, "output_hidden_states": True})
-                        lm_weight = prepare_lm_weight(
-                            self.loss_fn, self.model_parts[0], lm_head_weight=out.lm_head_weight
-                        )
                     else:
                         out = self.model_parts[0](**batch)
-                        lm_weight = None
                     local_loss = calculate_loss(
                         self.loss_fn,
                         logits=getattr(out, "logits", out),
                         labels=labels,
                         model=self.model_parts[0],
                         hidden_states=get_final_hidden_states(out),
-                        lm_weight=lm_weight,
                         num_label_tokens=num_label_tokens,
                     )
                     # Mirror training: include the drafter term so validation

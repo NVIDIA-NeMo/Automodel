@@ -245,7 +245,6 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         self,
         lm_head: nn.Module | None,
         *,
-        weight: torch.Tensor | None = None,
         model_config: PretrainedConfig | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor | ShardedLMHeadWeight:
@@ -254,8 +253,6 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         Args:
             lm_head: Plain linear head with weight of global shape [vocab, hidden].
                 Its FSDP policy, when present, owns the compute dtype.
-            weight: The head's weight of global shape [vocab, hidden], as the module holds it, that a forward
-                called with ``compute_logits=False`` returned; None uses ``lm_head.weight``.
             model_config: Owning model config, used to reject post-projection transforms.
             grad_reduce_group: Group contributing independent token losses.
 
@@ -269,9 +266,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         compute_dtype = lm_head.weight.dtype
         if isinstance(lm_head, FSDPModule):
             compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype or compute_dtype
-        weight = self.resolve_lm_weight(
-            lm_head.weight if weight is None else weight, grad_reduce_group=grad_reduce_group
-        )
+        weight = self.resolve_lm_weight(lm_head.weight, grad_reduce_group=grad_reduce_group)
         if isinstance(weight, ShardedLMHeadWeight):
             return weight.with_head_precision(lm_head)
         return weight.to(compute_dtype)

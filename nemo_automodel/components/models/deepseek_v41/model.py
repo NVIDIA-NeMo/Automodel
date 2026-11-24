@@ -60,7 +60,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -798,9 +798,8 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
             vision_token_types: Optional image/text markers [batch, sequence].
             logits_to_keep: Number of final positions, or integer position indices [kept].
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Attach the final normalized hidden states
                 [batch, sequence, hidden], in the backbone's activation dtype, as
                 every other model does; the recipes' linear losses project them
@@ -972,11 +971,10 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
             )
             if layout is not None:
                 loss = loss / (targets != -100).sum().clamp_min(1)
-        return CausalLMOutputWithLMHeadWeight(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             hidden_states=captured if output_residual_streams else (hidden if output_hidden_states else None),
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()

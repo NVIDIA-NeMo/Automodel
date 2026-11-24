@@ -22,6 +22,7 @@ from typing import Any, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -75,7 +76,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -104,7 +105,7 @@ from .state_dict_adapter import Qwen3_5MoeStateDictAdapter
 
 
 @dataclass
-class Qwen3_5MoeCausalLMOutputWithPast(CausalLMOutputWithLMHeadWeight):
+class Qwen3_5MoeCausalLMOutputWithPast(CausalLMOutputWithPast):
     """Qwen3.5-MoE output extended with MTP auxiliary hidden states."""
 
     mtp_per_depth_h: list[torch.Tensor] | None = None
@@ -1065,9 +1066,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 to keep the last positions, or indices of shape
                 ``[kept_sequence]``.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to include final decoder states in the
                 output for the fused loss path.
             cache_position: Optional token positions of shape ``[sequence]``.
@@ -1162,7 +1162,6 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             hidden_states=hidden_states if output_hidden_states else None,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()
@@ -1699,9 +1698,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             logits_to_keep: Number of trailing logits to retain, or indices of
                 shape ``[kept_sequence]``.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to expose final decoder states for the
                 fused loss path.
             **kwargs: Model inputs including image/video patch rows of shape
@@ -1917,14 +1915,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 hidden_states=hidden_states if output_hidden_states else None,
                 mtp_per_depth_h=mtp_per_depth_h,
                 mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
-                lm_head_weight=None if compute_logits else self.lm_head.weight,
             )
 
-        return CausalLMOutputWithLMHeadWeight(
-            logits=logits,
-            hidden_states=hidden_states if output_hidden_states else None,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
-        )
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

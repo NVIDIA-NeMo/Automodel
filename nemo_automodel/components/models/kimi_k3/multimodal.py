@@ -19,7 +19,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK31Config
 from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_vlm_cp
@@ -353,9 +352,8 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 at unsupervised positions. Native recipes compute loss externally.
             logits_to_keep: Trailing logit count or sequence indices [selected_tokens].
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to return final hidden states.
             kimi_vlm_full_input: Whether CP left the primary token stream intact
                 for image embedding before contiguous sequence sharding.
@@ -465,11 +463,10 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             shift_labels.view(-1).to(shift_logits.device),
             ignore_index=self.config.ignore_index,
         )
-        return CausalLMOutputWithLMHeadWeight(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=output.logits,
             hidden_states=output.hidden_states,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()

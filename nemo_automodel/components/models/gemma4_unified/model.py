@@ -30,7 +30,6 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import (
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_contiguous
 from nemo_automodel.components.models.common import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import drop_logits
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -44,18 +43,6 @@ from nemo_automodel.components.models.gemma4_moe.model import Gemma4ContextParal
 from nemo_automodel.components.models.gemma4_unified.state_dict_adapter import (
     Gemma4UnifiedStateDictAdapter,
 )
-
-
-@dataclass
-class Gemma4UnifiedCausalLMOutputWithLMHeadWeight(Gemma4UnifiedCausalLMOutputWithPast):
-    """``Gemma4UnifiedCausalLMOutputWithPast`` that also carries the LM head's weight when the forward skipped the head.
-
-    Attributes:
-        lm_head_weight: Tensor of shape [vocab, hidden], as the module holds it, or None when the forward
-            computed logits.
-    """
-
-    lm_head_weight: torch.Tensor | None = None
 
 
 class Gemma4UnifiedForConditionalGeneration(
@@ -173,9 +160,8 @@ class Gemma4UnifiedForConditionalGeneration(
             logits_to_keep: Integer suffix length, or an index tensor ``[kept_positions]`` selecting the
                 returned positions.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the logits are then empty, of shape [..., 0], and the output's
-                lm_head_weight is the head's weight of shape [vocab, hidden], as the module holds it. Without CP the
-                forward delegates to Hugging Face, which runs the head on the last position only.
+                the final hidden states directly; the logits are then empty, of shape [..., 0]. Without CP the forward
+                delegates to Hugging Face, which runs the head on the last position only.
             mm_encoder_outputs: Precomputed multimodal encoder outputs; not supported under CP.
             **kwargs: Remaining keyword arguments. Under CP, ``padding_mask`` (True = pad) and
                 ``_packed_seq_ids`` (0 = pad) carry this rank's slices to the ring.
@@ -224,7 +210,9 @@ class Gemma4UnifiedForConditionalGeneration(
                 mm_encoder_outputs=mm_encoder_outputs,
                 **kwargs,
             )
-            return output if compute_logits else drop_logits(output, self.lm_head)
+            if not compute_logits:
+                output.logits = output.logits[..., :0]
+            return output
         if input_ids is None or inputs_embeds is not None or mm_encoder_outputs is not None:
             raise ValueError(
                 "Gemma4 Unified context parallelism requires input_ids, without inputs_embeds or mm_encoder_outputs."
@@ -291,8 +279,4 @@ class Gemma4UnifiedForConditionalGeneration(
             logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         if (final_logit_softcapping := text_config.final_logit_softcapping) is not None:
             logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
-        return Gemma4UnifiedCausalLMOutputWithLMHeadWeight(
-            logits=logits,
-            hidden_states=text_outputs.hidden_states,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
-        )
+        return Gemma4UnifiedCausalLMOutputWithPast(logits=logits, hidden_states=text_outputs.hidden_states)

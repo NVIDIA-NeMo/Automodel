@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
@@ -33,7 +34,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -648,9 +649,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             logits_to_keep: Number of trailing logits, or token indices of shape
                 [selected_tokens], to retain.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Return hidden states for fused loss computation.
             **kwargs: Attention metadata, including ``cu_seqlens`` and
                 ``cu_seqlens_padded`` of shape [documents + 1] (optionally with
@@ -739,11 +739,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         else:
             logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
-        return CausalLMOutputWithLMHeadWeight(
-            logits=logits,
-            hidden_states=hidden_states if output_hidden_states else None,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
-        )
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

@@ -100,10 +100,7 @@ forward call. This skips auxiliary MTP computation while retaining all MTP
 parameters for checkpoint loading and saving. Response-only RL callers can
 combine it with `compute_logits=False, output_hidden_states=True` to consume
 the final hidden states without materializing full-vocabulary logits. The
-existing empty-vocabulary logits tensor remains the return contract. The output
-also carries the LM head's weight as `lm_head_weight`, as the module holds it
-(a sharded DTensor under FSDP2), so the caller can project the hidden states
-itself.
+existing empty-vocabulary logits tensor remains the return contract.
 
 ## Recommended fp32 Master Weight and Optimizer-State Patterns
 

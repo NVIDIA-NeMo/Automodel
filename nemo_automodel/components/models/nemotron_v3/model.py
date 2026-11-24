@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common import (
     HFCheckpointingMixin,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPContextParallelInputs,
     prepare_mtp_context_parallel_inputs,
@@ -57,7 +57,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 @dataclass
-class NemotronHCausalLMOutputWithPast(CausalLMOutputWithLMHeadWeight):
+class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
     """``CausalLMOutputWithPast`` plus declared MTP fields.
 
     The MTP per-depth hidden states and scaling factor must be regular
@@ -781,9 +781,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             output_hidden_states: Whether to return hidden states.
             return_dict: Accepted for API compatibility (always returns a
                 ``NemotronHCausalLMOutputWithPast`` off-PP).
-            compute_logits: Whether to materialize logits. Fused-linear loss callers may disable this off-PP when they
-                consume final hidden states directly; the output's lm_head_weight then carries the head's weight of
-                shape [vocab, hidden], as the module holds it.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers
+                may disable this off-PP when they consume final hidden states directly.
             compute_mtp: Whether to run the auxiliary MTP head. Disabling it
                 keeps its parameters and checkpoint topology intact for RL.
                 Only supported off-PP; defaults to True.
@@ -1108,7 +1107,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             attentions=None,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @staticmethod

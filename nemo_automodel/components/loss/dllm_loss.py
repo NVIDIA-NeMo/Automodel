@@ -486,6 +486,9 @@ class SCDDLoss(nn.Module):
 
         Returns:
             :class:`DLLMLossOutput` where ``total_loss == dllm_loss``.
+
+        Raises:
+            ValueError: If ``noisy_input_ids`` is None, or ``mask_token_id`` is outside the vocabulary.
         """
         del noise_mask, loss_mask_ar, num_ar_tokens, causal_logits
 
@@ -493,6 +496,9 @@ class SCDDLoss(nn.Module):
             raise ValueError("SCDDLoss requires noisy_input_ids (the corrupted tokens z_t seen by the model).")
 
         shard = vocab_parallel.vocab_shard(logits)
+        if not 0 <= self.mask_token_id < shard.vocab:
+            # Each shard fills only the [MASK] column it owns, so check the id against the whole vocabulary.
+            raise ValueError(f"mask_token_id={self.mask_token_id} is outside the vocabulary of {shard.vocab} ids.")
         z_t = noisy_input_ids.to(shard.local.device)
         x_0 = target_ids.to(shard.local.device)
 

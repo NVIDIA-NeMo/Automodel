@@ -33,7 +33,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -730,9 +730,8 @@ class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             logits_to_keep: Number of trailing token positions to retain, or
                 indices of shape [retained_sequence]. Zero retains all positions.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to include the decoder hidden states.
             **kwargs: Additional decoder arguments, including optional
                 cache_position of shape [sequence].
@@ -760,11 +759,7 @@ class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         else:
             logits = hidden.new_empty((*hidden.shape[:-1], 0))
-        return CausalLMOutputWithLMHeadWeight(
-            logits=logits,
-            hidden_states=hidden if output_hidden_states else None,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
-        )
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     def customize_pipeline_stage_modules(
         self,

@@ -15,8 +15,8 @@
 
 The reviewer's scenario on #4288: a native model with FP32 parameters under
 ``MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32, output_dtype=fp32, cast_forward_inputs=True)``,
-``reshard_after_forward=True`` and ``wrap_outer_model=False``. The recipes call the model with
-``compute_logits=False``, so the head never runs: the forward returns it sharded in its FP32 master dtype, and
+``reshard_after_forward=True`` and ``wrap_outer_model=False``, and the same with a wrapped root. The recipes call
+the model with ``compute_logits=False``, so the head never runs and stays sharded in its master dtype;
 ``prepare_lm_weight`` applies the head's policy instead, as FSDP would have. The loss streams the master in
 vocabulary chunks that it projects in BF16, with the hidden states the model hands out cast to match (the
 ``torch_compile`` projection ``e @ c.T`` aligns nothing itself), and averages the head's gradient in FP32. The
@@ -93,7 +93,7 @@ def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, lm_h
     return linear_ce_base._chunk_lse_and_target(hidden, weight, targets, softcap, logits_dtype, lm_head)
 
 
-def _worker(rank: int, port: int, master_dtype: torch.dtype) -> None:
+def _worker(rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: bool) -> None:
     torch.set_num_threads(1)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -125,9 +125,9 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype) -> None:
             ep_shard_enabled=False,
             mp_policy=policy,
             reshard_after_forward=True,
-            wrap_outer_model=False,
+            wrap_outer_model=wrap_outer_model,
         )
-        assert isinstance(model.lm_head, FSDPModule) and not isinstance(model, FSDPModule)
+        assert isinstance(model.lm_head, FSDPModule) and isinstance(model, FSDPModule) == wrap_outer_model
 
         loss_fn = FusedLinearCrossEntropy(impl="torch_compile")
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -156,12 +156,10 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype) -> None:
             out = model(input_ids, compute_logits=False, output_hidden_states=True)
             hidden = get_final_hidden_states(out)
             assert hidden.shape == (2, 8, 64)
-            # The forward skipped the head: it returns the weight sharded in its master dtype, and the loss streams
-            # it under the head's policy instead of gathering it.
-            assert isinstance(out.lm_head_weight, DTensor) and out.lm_head_weight.dtype == master_dtype
-            lm_weight = prepare_lm_weight(
-                loss_fn, model, lm_head_weight=out.lm_head_weight, grad_reduce_group=dist.group.WORLD
-            )
+            # The forward skipped the head, which stays sharded in its master dtype; the loss streams it under the
+            # head's policy instead of gathering it.
+            assert isinstance(model.lm_head.weight, DTensor) and model.lm_head.weight.dtype == master_dtype
+            lm_weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=dist.group.WORLD)
             assert isinstance(lm_weight, ShardedLMHeadWeight)
             assert lm_weight.dtype == torch.bfloat16 and lm_weight.shape == (_VOCAB, 64)
             reduced_dtypes.clear()
@@ -176,6 +174,9 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype) -> None:
             assert sum(parameter.grad is not None for parameter in model.parameters()) > 1  # the backbone too
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+        # A wrapped root hooks every gradient-requiring tensor of the forward's output for backward; a hook on a
+        # parameter is never removed, so the output must not carry the head's weight.
+        assert not model.lm_head.weight._backward_hooks
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -186,6 +187,10 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype) -> None:
     hard_timeout=60,
     reason="spawns two Gloo FSDP2 workers for a tiny Qwen3MoE forward/backward/step twice",
 )
-@pytest.mark.parametrize("master_dtype", [torch.float32, torch.bfloat16], ids=["fp32_master", "bf16_master"])
-def test_fused_loss_streams_the_head_under_its_fsdp_policy(master_dtype: torch.dtype) -> None:
-    mp.spawn(_worker, args=(_free_port(), master_dtype), nprocs=_WORLD_SIZE, join=True)
+@pytest.mark.parametrize(
+    ("master_dtype", "wrap_outer_model"),
+    [(torch.float32, False), (torch.bfloat16, False), (torch.float32, True)],
+    ids=["fp32_master", "bf16_master", "fp32_master_wrapped_root"],
+)
+def test_fused_loss_streams_the_head_under_its_fsdp_policy(master_dtype: torch.dtype, wrap_outer_model: bool) -> None:
+    mp.spawn(_worker, args=(_free_port(), master_dtype, wrap_outer_model), nprocs=_WORLD_SIZE, join=True)

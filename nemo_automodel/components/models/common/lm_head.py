@@ -18,7 +18,6 @@ import functools
 import inspect
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 import torch
@@ -27,7 +26,6 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from torch.utils.flop_counter import register_flop_formula
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils import ModelOutput
 
 from nemo_automodel.shared.tp_linear import tp_linear_forward
@@ -279,40 +277,6 @@ class LMHead(nn.Linear):
         return new_head.train(head.training)
 
 
-@dataclass
-class CausalLMOutputWithLMHeadWeight(CausalLMOutputWithPast):
-    """``CausalLMOutputWithPast`` that also carries the LM head's weight when the forward skipped the head.
-
-    A forward called with ``compute_logits=False`` returns empty logits of shape [..., 0] and the head's weight, as
-    the module holds it (a sharded DTensor under FSDP2), for a loss that projects the final hidden states itself.
-
-    Attributes:
-        lm_head_weight: Tensor of shape [vocab, hidden], or None when the forward computed logits.
-    """
-
-    lm_head_weight: torch.Tensor | None = None
-
-
-def drop_logits(output: ModelOutput, lm_head: nn.Module) -> ModelOutput:
-    """Empty the logits of a Hugging Face forward called without logits, and attach its head's weight.
-
-    Hugging Face's forwards always run the head, so a forward called with ``compute_logits=False`` projects the last
-    position only. A loss that projects the final hidden states itself takes the head's weight from the output.
-
-    Args:
-        output: Model output whose logits have shape [batch, kept_sequence, vocab].
-        lm_head: Output embedding whose weight has shape [vocab, hidden].
-
-    Returns:
-        The same output, with empty logits of shape [batch, kept_sequence, 0] and the head's weight, as the module
-        holds it, as ``lm_head_weight``.
-    """
-    output["logits"] = output["logits"][..., :0]
-    # Item assignment registers a key the output class may not declare, and sets the attribute too.
-    output["lm_head_weight"] = lm_head.weight
-    return output
-
-
 def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., ModelOutput]:
     """Give a Hugging Face forward the ``compute_logits`` option that the repo's forwards take.
 
@@ -321,9 +285,9 @@ def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., Mo
 
     Returns:
         ``forward`` with a keyword-only ``compute_logits``, True by default. False projects the last position only
-        and returns the output through :func:`drop_logits`. Its signature is ``forward``'s plus ``compute_logits``,
-        so signature-based checks see the parameters ``forward`` takes. A forward that already takes
-        ``compute_logits``, or takes no ``logits_to_keep`` to limit its head, is returned as is.
+        and returns the output with empty logits of shape [batch, 1, 0]. Its signature is ``forward``'s plus
+        ``compute_logits``, so signature-based checks see the parameters ``forward`` takes. A forward that already
+        takes ``compute_logits``, or takes no ``logits_to_keep`` to limit its head, is returned as is.
     """
     signature = inspect.signature(forward)
     if "compute_logits" in signature.parameters or "logits_to_keep" not in signature.parameters:
@@ -338,15 +302,18 @@ def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., Mo
         Args:
             self: Hugging Face model.
             *args: ``forward``'s positional inputs, such as input_ids of shape [batch, sequence].
-            compute_logits: Whether to return logits; False returns the head's weight instead.
+            compute_logits: Whether to return logits; False returns empty logits for a loss that projects the
+                final hidden states itself.
             **kwargs: ``forward``'s keyword inputs.
 
         Returns:
-            ``forward``'s output; without logits, through :func:`drop_logits`.
+            ``forward``'s output; without logits, its logits have shape [batch, 1, 0].
         """
         if compute_logits:
             return forward(self, *args, **kwargs)
-        return drop_logits(forward(self, *args, **{**kwargs, "logits_to_keep": 1}), self.get_output_embeddings())
+        output = forward(self, *args, **{**kwargs, "logits_to_keep": 1})
+        output["logits"] = output["logits"][..., :0]
+        return output
 
     parameters = list(signature.parameters.values())
     # A keyword-only parameter goes before **kwargs.

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A forward called with ``compute_logits=False`` returns the final hidden states and its head's weight.
+"""A forward called with ``compute_logits=False`` returns the final hidden states and empty logits.
 
-Fused-linear losses project the hidden states with that weight themselves. Forwards that delegate to Hugging Face,
-whose forward always runs the head, project a single position and return empty logits.
+Fused-linear losses project the hidden states with the head's weight themselves. Forwards that delegate to Hugging
+Face, whose forward always runs the head, project a single position and drop it.
 """
 
 import copy
@@ -89,7 +89,7 @@ def _qwen3_vl() -> tuple[nn.Module, int]:
 
 
 @pytest.mark.parametrize("build", [_gemma4, _gemma4_unified, _qwen3_vl], ids=["gemma4", "gemma4_unified", "qwen3_vl"])
-def test_hugging_face_forward_projects_one_position_and_returns_the_head_weight(
+def test_hugging_face_forward_projects_one_position_without_logits(
     build: Callable[[], tuple[nn.Module, int]],
 ):
     torch.manual_seed(0)
@@ -106,11 +106,9 @@ def test_hugging_face_forward_projects_one_position_and_returns_the_head_weight(
         output = model(input_ids=input_ids, output_hidden_states=True, compute_logits=False)
 
     assert with_logits.logits.shape == (2, 6, vocab_size)
-    assert "lm_head_weight" not in with_logits
     # Hugging Face's forward runs the head, so it projects only the last position, and the logits stay empty.
     assert projected == [torch.Size([2, 1])]
     assert output.logits.shape[-1] == 0
-    assert output["lm_head_weight"] is model.lm_head.weight
     torch.testing.assert_close(get_final_hidden_states(output), get_final_hidden_states(with_logits), rtol=0, atol=0)
 
 
@@ -126,7 +124,7 @@ def test_kimi_vl_without_logits_returns_its_output_without_return_dict():
     input_ids = torch.zeros(2, 5, dtype=torch.long)
 
     logits = KimiVLForConditionalGeneration.forward(model, input_ids=input_ids, output_hidden_states=True)
-    # The recipe passes no return_dict: empty logits alone would drop the hidden states and the head's weight.
+    # The recipe passes no return_dict: empty logits alone would drop the hidden states.
     output = KimiVLForConditionalGeneration.forward(
         model, input_ids=input_ids, output_hidden_states=True, compute_logits=False
     )
@@ -134,7 +132,6 @@ def test_kimi_vl_without_logits_returns_its_output_without_return_dict():
     assert logits.shape == (2, 5, 16)
     assert output.logits.shape == (2, 5, 0)
     assert output.hidden_states is hidden_states
-    assert output.lm_head_weight is head.weight
 
 
 def test_loaded_hugging_face_class_takes_compute_logits():
@@ -170,10 +167,8 @@ def test_loaded_hugging_face_class_takes_compute_logits():
     assert "logits_to_keep" in parameters and parameters["compute_logits"].default is True
     assert _supports_logits_to_keep(model)
     torch.testing.assert_close(with_logits.logits, expected.logits, rtol=0, atol=0)
-    assert "lm_head_weight" not in with_logits
     assert projected == [torch.Size([2, 1])]
     assert output.logits.shape == (2, 1, 0)
-    assert output.lm_head_weight is model.lm_head.weight
     torch.testing.assert_close(output.hidden_states[-1], expected.hidden_states[-1], rtol=0, atol=0)
 
 

@@ -31,7 +31,7 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_round_robin
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -476,14 +476,14 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             use_cache: True is unsupported by this full-sequence training baseline.
             past_key_values: Inference cache; only None is supported.
             output_hidden_states: Include all [batch, sequence, hidden] states,
-                except logits_to_keep=1 selects the final FP32 hidden tensor for
-                the shared linear-loss contract without retaining every layer.
+                except compute_logits=False or logits_to_keep=1 selects the final
+                FP32 hidden tensor for the shared linear-loss contract without
+                retaining every layer.
             logits_to_keep: Zero projects all positions; a positive value projects
                 that many final positions. Labels require all positions.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             skip_logits: Return only final FP32 hidden states for an external
                 already-shifted linear loss; do not run the vocabulary projection.
             padding_mask: Boolean [batch, sequence] or THD [tokens], True for
@@ -504,7 +504,9 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             raise ValueError("Flint labels require logits_to_keep=0")
         if labels is not None and skip_logits:
             raise ValueError("Flint skip_logits consumes already-shifted labels through a separate linear loss")
-        final_hidden_only = skip_logits or (output_hidden_states and logits_to_keep == 1)
+        # The shared linear-loss call asks for the final hidden states without logits (or, from older callers, with
+        # logits_to_keep=1).
+        final_hidden_only = skip_logits or (output_hidden_states and (not compute_logits or logits_to_keep == 1))
         received_residual = inputs_embeds is None and input_ids is not None and torch.is_floating_point(input_ids)
         if received_residual:
             inputs_embeds, input_ids = input_ids, None
@@ -599,11 +601,10 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
                 logits[:, :-1].reshape(-1, self.vocab_size), targets.reshape(-1), ignore_index=-100, reduction="sum"
             )
             loss = numerator / (targets != -100).sum().clamp_min(1)
-        return CausalLMOutputWithLMHeadWeight(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             hidden_states=hidden_states.float() if final_hidden_only else outputs.hidden_states,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
 

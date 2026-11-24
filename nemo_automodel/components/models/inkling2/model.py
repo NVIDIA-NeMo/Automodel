@@ -33,7 +33,7 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import (
     HFCheckpointingMixin,
 )
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -521,9 +521,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states: Include final hidden states for external loss; targets
                 are already aligned by the caller and are never shifted here.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
 
         Returns:
             Logits of shape [batch, kept_sequence, vocab] in the head's logits_dtype, softcapped
@@ -619,11 +618,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 # Automodel's loss contract consumes the final tensor here; HF
                 # annotates a tuple of per-layer states. Remove this boundary
                 # exception when that shared output annotation accepts the tensor.
-                return CausalLMOutputWithLMHeadWeight(
-                    logits=cast(torch.FloatTensor, logits),
-                    hidden_states=hidden,
-                    lm_head_weight=None if compute_logits else self.lm_head.weight,
-                )  # ty: ignore[invalid-argument-type]
+                return CausalLMOutputWithPast(logits=cast(torch.FloatTensor, logits), hidden_states=hidden)  # ty: ignore[invalid-argument-type]
             return logits
 
     def _run_decoder(

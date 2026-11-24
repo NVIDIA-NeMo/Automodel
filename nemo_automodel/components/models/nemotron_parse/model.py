@@ -638,8 +638,6 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # both ``"hidden_states" in out`` and ``out.hidden_states`` resolve to it.
         if return_final_hidden_states:
             out["hidden_states"] = final_hidden_states
-        if not compute_logits:
-            out["lm_head_weight"] = self.lm_head.weight
         return out
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):

@@ -22,10 +22,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.utils import ModelOutput
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -43,7 +44,7 @@ from .text import InklingDynamicCache
 
 
 @dataclass
-class InklingCausalLMOutputWithPast(CausalLMOutputWithLMHeadWeight):
+class InklingCausalLMOutputWithPast(ModelOutput):
     """Inkling logits, optional loss/cache, and multimodal hidden states."""
 
     loss: torch.FloatTensor | None = None
@@ -256,9 +257,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             use_cache: Whether to allocate and return a decoding cache.
             logits_to_keep: Number or indices of trailing logits to compute.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Additional text-attention arguments.
 
         Returns:
@@ -321,7 +321,6 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             logits=logits,
             past_key_values=outputs.past_key_values,
             image_hidden_states=outputs.image_hidden_states,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()

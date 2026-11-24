@@ -738,7 +738,6 @@ def test_patch_liger_kernel_gives_liger_forward_compute_logits(monkeypatch):
 
     assert kept == [1]
     assert output.logits.shape == (1, 1, 0)
-    assert output.lm_head_weight is model.lm_head.weight
 
 
 def test_patch_liger_kernel_keeps_compute_logits_when_liger_keeps_the_forward(monkeypatch):
@@ -762,7 +761,6 @@ def test_patch_liger_kernel_keeps_compute_logits_when_liger_keeps_the_forward(mo
     output = model(input_ids=torch.zeros(1, 4, dtype=torch.long), compute_logits=False)
 
     assert output.logits.shape == (1, 1, 0)
-    assert output.lm_head_weight is model.lm_head.weight
 
 
 def test_patch_liger_kernel_uses_model_owned_hook(monkeypatch):

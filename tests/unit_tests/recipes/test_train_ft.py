@@ -3281,6 +3281,36 @@ def test_forward_backward_step_eval_skips_metric_for_logits_to_keep_one_verifier
     assert recipe._mtp_accept_metrics == []
 
 
+def test_forward_backward_step_eval_skips_metric_for_empty_verifier_logits(monkeypatch):
+    """A LinearCrossEntropy forward called with ``compute_logits=False`` returns empty logits of shape
+    ``[B, S, 0]``: they carry no verifier to score, and an argmax over the empty vocabulary would raise."""
+    vocab = 6
+
+    class _NoLogitsVerifierModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compute_mtp_in_eval = True
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def forward(self, input_ids, **kwargs):
+            del kwargs
+            draft_logits = [torch.zeros(*input_ids.shape, vocab)]
+            return SimpleNamespace(
+                logits=torch.zeros(*input_ids.shape, 0),
+                mtp_per_depth_h=None,
+                mtp_per_depth_logits=draft_logits,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _NoLogitsVerifierModel()
+    recipe = _make_mtp_forward_backward_recipe(model, monkeypatch)
+
+    batch = {"input_ids": torch.tensor([[10, 11, 12]]), "labels": torch.tensor([[1, 1, 1]])}
+    recipe._forward_backward_step(idx=0, batch=batch, loss_buffer=[], num_label_tokens=3, num_batches=1, is_train=False)
+
+    assert recipe._mtp_accept_metrics == []
+
+
 def test_forward_backward_step_eval_excludes_mtp_loss_from_val_loss(monkeypatch):
     """Forcing MTP outputs on during eval (via compute_mtp_in_eval) must not change
     val_loss: calculate_mtp_loss is a training-loss term and must stay gated on

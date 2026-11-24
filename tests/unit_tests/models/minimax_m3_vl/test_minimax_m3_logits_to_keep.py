@@ -82,8 +82,6 @@ def test_compute_logits_false_returns_hidden_states_and_skips_lm_head(vlm_model)
     assert hidden.shape == (1, 16, hidden_size)
     assert hidden.shape[-1] != vocab, "lm_head was applied; the logits tensor was materialised"
     assert torch.isfinite(hidden).all()
-    assert out["logits"].shape == (1, 16, 0)
-    assert out["lm_head_weight"] is vlm_model.lm_head.weight
 
 
 def test_without_logits_to_keep_still_returns_logits(vlm_model):

@@ -1384,7 +1384,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             with train_ctx(), sync_ctx, te_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # The loss projects the final hidden states itself, with the head weight the model returns.
+                    # The loss projects the final hidden states itself, so the model skips its LM head.
                     out = model(**{**batch, "compute_logits": False, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
@@ -1403,7 +1403,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     shared_lm_weight = prepare_lm_weight(
                         self.loss_fn,
                         model,
-                        lm_head_weight=out.lm_head_weight,
                         grad_reduce_group=grad_reduce_group,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
@@ -1505,9 +1504,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     if (
                         mtp_per_depth_targets is None  # CP-sharded verifier targets not supported yet
                         and isinstance(verifier_logits, torch.Tensor)
-                        # Full-sequence logits, not a LinearCrossEntropy logits_to_keep=1 slice.
+                        # Full-sequence logits, not the empty logits of a LinearCrossEntropy forward.
                         and verifier_logits.dim() >= 2
                         and verifier_logits.shape[-2] == labels.shape[-1]
+                        and verifier_logits.shape[-1] > 0
                     ):
                         self._mtp_accept_metrics.append(
                             compute_mtp_prefix_hits(

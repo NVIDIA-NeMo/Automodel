@@ -56,18 +56,6 @@ from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forwar
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class Mistral3CausalLMOutputWithLMHeadWeight(Mistral3CausalLMOutputWithPast):
-    """``Mistral3CausalLMOutputWithPast`` that also carries the LM head's weight when the forward skipped the head.
-
-    Attributes:
-        lm_head_weight: Tensor of shape [vocab, hidden], as the module holds it, or None when the forward
-            computed logits.
-    """
-
-    lm_head_weight: torch.Tensor | None = None
-
-
 def _rotary_reinit_self_hook(module, args, kwargs):
     """One-shot forward pre-hook that recomputes *this rotary module's* own
     ``inv_freq`` on first call.
@@ -262,9 +250,8 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             use_cache: Whether to use KV caching.
             logits_to_keep: Number of final logits to compute (0=all, N=last N tokens).
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             image_sizes: Optional image sizes for the vision tower.
             output_hidden_states: Whether to surface the final hidden states on the
                 output (defaults to the text sub-config's ``output_hidden_states``).
@@ -310,14 +297,13 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=text_config.vocab_size, **kwargs)
 
-        return Mistral3CausalLMOutputWithLMHeadWeight(
+        return Mistral3CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=hidden_states if output_hidden_states else None,
             attentions=outputs.attentions,
             image_hidden_states=outputs.image_hidden_states,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @classmethod

@@ -24,7 +24,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
@@ -60,7 +60,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -101,7 +101,7 @@ from .state_dict_adapter import Qwen3_5DenseStateDictAdapter
 
 
 @dataclass
-class Qwen3_5CausalLMOutputWithPast(CausalLMOutputWithLMHeadWeight):
+class Qwen3_5CausalLMOutputWithPast(CausalLMOutputWithPast):
     """Qwen3.5 causal-LM output extended with MTP auxiliary hidden states."""
 
     rope_deltas: torch.Tensor | None = None
@@ -1259,9 +1259,8 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             logits_to_keep: Trailing token count (zero means all), or position
                 indices of shape [selected_tokens] indexing the sequence axis.
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Backbone arguments, including ``_packed_seq_ids`` of shape
                 [batch, sequence], ``packed_token_indices`` of shape [batch, sequence]
                 or [tokens], ``cu_seqlens`` of shape [batch, max_documents + 1] or
@@ -1349,7 +1348,6 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             attentions=getattr(outputs, "attentions", None),
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()
@@ -2130,7 +2128,6 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             rope_deltas=getattr(outputs, "rope_deltas", None),
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()

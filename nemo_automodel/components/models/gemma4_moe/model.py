@@ -94,7 +94,6 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, drop_logits
 from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -1353,10 +1352,9 @@ class Gemma4ForConditionalGeneration(
             mm_token_type_ids: Processor modality IDs [batch, sequence].
             logits_to_keep: Number of trailing logits or token indices [selected].
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the logits are then empty, of shape [..., 0], and the output's
-                lm_head_weight is the head's weight of shape [vocab, hidden], as the module holds it. The MoE path, and
-                the dense path under CP or E-series TP, skip the head; otherwise the dense path delegates to Hugging
-                Face, which runs it on the last position only.
+                the final hidden states directly; the logits are then empty, of shape [..., 0]. The MoE path, and the
+                dense path under CP or E-series TP, skip the head; otherwise the dense path delegates to Hugging Face,
+                which runs it on the last position only.
             output_hidden_states: Whether to retain decoder hidden states.
             **kwargs: Other native HF inputs, including original document IDs
                 ``_packed_seq_ids`` [batch, sequence] when packed.
@@ -1488,7 +1486,7 @@ class Gemma4ForConditionalGeneration(
                     logits = logits / final_logit_softcapping
                     logits = torch.tanh(logits)
                     logits = logits * final_logit_softcapping
-                output = Gemma4CausalLMOutputWithPast(
+                return Gemma4CausalLMOutputWithPast(
                     loss=None,
                     logits=logits,
                     past_key_values=text_outputs.past_key_values,
@@ -1497,7 +1495,6 @@ class Gemma4ForConditionalGeneration(
                     image_hidden_states=None,
                     audio_hidden_states=None,
                 )
-                return output if compute_logits else drop_logits(output, self.lm_head)
 
             if (
                 mm_token_type_ids is None
@@ -1553,7 +1550,9 @@ class Gemma4ForConditionalGeneration(
                 past_key_values=kv_share_holder,
                 **kwargs,
             )
-            return output if compute_logits else drop_logits(output, self.lm_head)
+            if not compute_logits:
+                output.logits = output.logits[..., :0]
+            return output
 
         # --- MoE forward path ---
         if cp_enabled:
@@ -1629,10 +1628,9 @@ class Gemma4ForConditionalGeneration(
             logits = torch.tanh(logits)
             logits = logits * final_logit_softcapping
 
-        return CausalLMOutputWithLMHeadWeight(
+        return CausalLMOutputWithPast(
             logits=logits,
             hidden_states=hidden_states if output_hidden_states else None,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     def _dense_parallel_lm_head(

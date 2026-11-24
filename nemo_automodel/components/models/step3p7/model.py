@@ -21,6 +21,7 @@ from typing import Any, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -31,7 +32,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import CausalLMOutputWithLMHeadWeight, LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import roll_tensor
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Step3p7CausalLMOutput(CausalLMOutputWithLMHeadWeight):
+class Step3p7CausalLMOutput(CausalLMOutputWithPast):
     """``CausalLMOutputWithPast`` plus optional per-depth MTP logits.
 
     Subclassing the HF ``ModelOutput`` gives this output the standard
@@ -575,9 +576,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             cache_position: Optional cache positions [sequence].
             logits_to_keep: Number of trailing logits, or indices [selected_tokens].
             compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
-                the final hidden states directly; the LM head then does not run, the logits are empty, of shape
-                [..., 0], and the output's lm_head_weight is the head's weight of shape [vocab, hidden], as the module
-                holds it.
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Include final hidden states in the model output.
             **kwargs: Media pixels [images, channels, height, width], patch pixels
                 [patches, channels, height, width], patch counts [images], newline
@@ -770,18 +770,13 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             # fused-CE path asks for hidden states via ``output_hidden_states``.
             if not output_hidden_states:
                 return logits
-            return Step3p7CausalLMOutput(
-                logits=logits,
-                hidden_states=hidden_states,
-                lm_head_weight=None if compute_logits else self.lm_head.weight,
-            )
+            return Step3p7CausalLMOutput(logits=logits, hidden_states=hidden_states)
 
         return Step3p7CausalLMOutput(
             logits=logits,
             hidden_states=(hidden_states if output_hidden_states else None),
             mtp_per_depth_logits=mtp_per_depth_logits,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
-            lm_head_weight=None if compute_logits else self.lm_head.weight,
         )
 
     @torch.no_grad()
