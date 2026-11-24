@@ -1,10 +1,10 @@
-# Inkling-2-Small (594B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP64 on 16 nodes keeps ~93 GiB of bf16 weights, gradients and FusedAdam state
-# (param remainders plus bf16 moments, 10 bytes per parameter) per GPU.
+# Inkling-2-Small (594B) LoRA on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
+# EP8 on 2 nodes, the fewest that fit, holds ~138 GiB of frozen bf16 weights per GPU;
+# 32K-token packs bring the estimated peak to ~175 GiB (~63%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 64
+  global_batch_size: 8
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -42,13 +42,27 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.attn.qkvr"
+    - "*.attn.wo_ud"
+    - "*.mlp.experts"
+  dim: 8
+  alpha: 32
+  dropout: 0.0
+  lora_dtype: bfloat16
+  use_memory_efficient_lora: true
+  use_triton: false
+  moe_rank_scaling: false
+
 distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 64
+  ep_size: 8
   sequence_parallel: false
   activation_checkpointing: true
   reshard_after_forward: true
@@ -83,7 +97,7 @@ dataset:
     eos_token: <|content_model_end_sampling|>
 
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 32768
   packing_strategy: thd
   pad_to_multiple_of: 64
   num_proc: 8
@@ -98,10 +112,10 @@ dataloader:
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.FusedAdam
-  lr: 5.0e-06
+  lr: 1.0e-04
   betas: [0.9, 0.95]
   eps: 1.0e-08
-  weight_decay: 0.1
+  weight_decay: 0.0
   adam_w_mode: true
   master_weights: true
   master_weight_dtype: float32
@@ -113,9 +127,9 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 16
+  nodes: 2
   nproc_per_node: 4
-  time: "01:30:00"
+  time: "01:00:00"
   max_steps: 20
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

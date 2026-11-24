@@ -1,10 +1,11 @@
-# DeepSeek-V4-Flash (291B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP16 on 4 nodes keeps ~146 GiB of bf16 weights, gradients and AdamW state per GPU.
+# DeepSeek-V4-Flash (291B) LoRA on one VR200 node (hecate: 4 GPUs per node, 280 GiB per GPU).
+# EP4 holds ~136 GiB of frozen bf16 weights per GPU; 16K-token packs bring the estimated peak
+# to ~195 GiB (~70%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 16
+  global_batch_size: 4
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -17,7 +18,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 16
+  ep_size: 4
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -38,6 +39,9 @@ model:
     num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: tilelang  # DeepSeek-V4 trains on packed THD batches only through the TileLang kernels
@@ -48,6 +52,18 @@ model:
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.self_attn.wq_a"
+    - "*.self_attn.wq_b"
+    - "*.self_attn.wkv"
+    - "*.self_attn.wo_b"
+    - "*.self_attn.compressor.wkv"
+  dim: 8
+  alpha: 32
+  use_triton: true
 
 checkpoint:
   enabled: false
@@ -66,7 +82,7 @@ dataset:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
 
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 16384
   packing_strategy: thd
 
 dataloader:
@@ -76,6 +92,7 @@ dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
+  fused: true
   betas: [0.9, 0.95]
   eps: 1e-8
   lr: 1e-5
@@ -85,9 +102,9 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 4
+  nodes: 1
   nproc_per_node: 4
-  time: "01:00:00"
+  time: "00:45:00"
   max_steps: 20
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

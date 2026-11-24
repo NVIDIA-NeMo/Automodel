@@ -1,11 +1,11 @@
 # GLM-5.3 (753B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP64 on 16 nodes keeps ~118 GiB of bf16 weights, gradients and FusedAdam state
-# (param remainders plus bf16 moments, 10 bytes per parameter) per GPU.
+# EP32 on 8 nodes, the fewest that fit, holds ~175 GiB of bf16 weights, gradients and AdamW
+# state (8 bytes per parameter) per GPU; 16K-token packs bring the estimated peak to ~210 GiB (~75%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 64
+  global_batch_size: 32
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -18,7 +18,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 64
+  ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -57,7 +57,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: train[:20000]
+  split: train[:40000]
   shuffle_seed: 42
   truncation: true
   seq_length: 4096
@@ -67,7 +67,7 @@ dataset:
     pretrained_model_name_or_path: zai-org/GLM-5.3
 
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 16384
   packing_strategy: thd
   num_proc: 8
 
@@ -77,17 +77,12 @@ dataloader:
   shuffle: true
 
 optimizer:
-  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
-  lr: 1e-5
+  _target_: torch.optim.AdamW
+  fused: true
   betas: [0.9, 0.95]
-  eps: 1e-8
+  eps: 1.0e-8
+  lr: 1e-5
   weight_decay: 0
-  adam_w_mode: true
-  bias_correction: true
-  master_weights: true
-  store_param_remainders: true
-  exp_avg_dtype: torch.bfloat16
-  exp_avg_sq_dtype: torch.bfloat16
 
 clip_grad_norm:
   max_norm: 1.0
@@ -96,7 +91,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 16
+  nodes: 8
   nproc_per_node: 4
   time: "01:30:00"
   max_steps: 20

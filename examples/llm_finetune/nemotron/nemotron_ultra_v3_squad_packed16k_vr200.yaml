@@ -1,9 +1,10 @@
 # NVIDIA-Nemotron-3-Ultra (560B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP32 on 8 nodes keeps ~140 GiB of bf16 weights, gradients and AdamW state per GPU.
+# EP32 on 8 nodes, the fewest that fit, holds ~130 GiB of bf16 weights, gradients and AdamW
+# state per GPU; 16K-token packs bring the estimated peak to ~205 GiB (~73%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  num_epochs: 1
+  num_epochs: 2
   max_steps: 20
   global_batch_size: 32
   local_batch_size: 1
@@ -61,7 +62,7 @@ dataset:
   padding: false
 
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 16384
   packing_strategy: thd
 
 dataloader:

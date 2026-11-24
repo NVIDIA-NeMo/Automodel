@@ -1,11 +1,12 @@
 # NVIDIA-Nemotron-3-Ultra (560B) LoRA on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP16 on 4 nodes keeps ~70 GiB of frozen bf16 weights per GPU.
+# EP8 on 2 nodes, the fewest that fit, holds ~130 GiB of frozen bf16 weights per GPU;
+# 16K-token packs bring the estimated peak to ~200 GiB (~71%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   num_epochs: 1
   max_steps: 20
-  global_batch_size: 16
+  global_batch_size: 8
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -49,7 +50,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 16
+  ep_size: 8
   activation_checkpointing: true
   defer_fsdp_grad_sync: true
   moe:
@@ -73,7 +74,7 @@ dataset:
   padding: false
 
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 16384
   packing_strategy: thd
 
 dataloader:
@@ -93,7 +94,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 4
+  nodes: 2
   nproc_per_node: 4
   time: "01:00:00"
   max_steps: 20

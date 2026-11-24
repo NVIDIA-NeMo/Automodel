@@ -1,11 +1,12 @@
-# Qwen3.8-Flash-Next (180B) LoRA on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP8 on 2 nodes keeps ~45 GiB of frozen bf16 weights per GPU. LoRA covers the
-# full-attention projections and the routed experts; the GatedDeltaNet layers stay frozen.
+# Qwen3.8-Flash-Next (180B) LoRA on one VR200 node (hecate: 4 GPUs per node, 280 GiB per GPU).
+# EP4 holds ~84 GiB of frozen bf16 weights per GPU; 24K-token packs bring the estimated peak
+# to ~185 GiB (~66%). LoRA covers the full-attention projections and the routed experts; the
+# GatedDeltaNet layers stay frozen.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 8
+  global_batch_size: 4
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -59,7 +60,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 8
+  ep_size: 4
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -80,7 +81,7 @@ dataset:
     trust_remote_code: false
 
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 24576
   packing_strategy: thd
 
 dataloader:
@@ -100,7 +101,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 2
+  nodes: 1
   nproc_per_node: 4
   time: "00:45:00"
   max_steps: 20
