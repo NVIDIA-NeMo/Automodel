@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Mapping, Sequence
-from typing import Any, NotRequired, TypedDict, cast
+from typing import Any, NotRequired, TypedDict
 
 import torch
 
@@ -22,13 +22,13 @@ class THDBatch(TypedDict):
     """Batch dictionary in THD (total, hidden, depth) format."""
 
     input_ids: torch.Tensor
-    position_ids: torch.Tensor
-    cu_seqlens: torch.Tensor
+    position_ids: torch.Tensor | None
+    cu_seqlens: torch.Tensor | None
     labels: torch.Tensor
     padding_mask: torch.Tensor
     cu_seqlens_padded: NotRequired[torch.Tensor]
     max_seqlen: NotRequired[torch.Tensor]
-    _packed_seq_ids: NotRequired[torch.Tensor]
+    _packed_seq_ids: NotRequired[torch.Tensor | None]
     document_ids: NotRequired[torch.Tensor]
     pad_between_seqs: NotRequired[bool]
 
@@ -190,11 +190,11 @@ def process_input_for_thd(
         >>> # result['max_seqlen']: tensor(6, dtype=torch.int32)  # max slot width in cu_seqlens
         >>> # result['padding_mask'].shape: [12]
     """
-    input_ids = batch["input_ids"]
-    labels = batch["labels"]
-    position_ids = batch["position_ids"]
-    seq_lens = batch["seq_lens"]
-    seq_lens_padded = batch["seq_lens_padded"]
+    input_ids: torch.Tensor = batch["input_ids"]
+    labels: torch.Tensor = batch["labels"]
+    position_ids: torch.Tensor | None = batch.get("position_ids")
+    seq_lens: torch.Tensor | None = batch.get("seq_lens")
+    seq_lens_padded: torch.Tensor | None = batch.get("seq_lens_padded")
 
     # Reshape to THD format: collapse batch dimension
     # Get total number of tokens from input_ids
@@ -280,21 +280,29 @@ def process_input_for_thd(
             device=input_ids_thd.device,
         )
 
-    result: dict[str, Any] = {
+    result: THDBatch = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
         "cu_seqlens": cu_seqlens,
         "labels": labels_thd,
         "padding_mask": padding_mask,
     }
-    for key in ("_packed_seq_ids", "document_ids"):
-        document_ids = batch.get(key)
-        if document_ids is not None:
-            if document_ids.shape != labels.shape:
-                raise ValueError(f"THD {key} must match labels [batch, sequence]")
-            # IDs are local to each batch document; make them unique before flattening.
-            offsets = torch.cat([document_ids.new_zeros(1), document_ids.amax(dim=1).cumsum(0)[:-1]])
-            result[key] = torch.where(document_ids > 0, document_ids + offsets[:, None], 0).reshape(-1)
+    if "_packed_seq_ids" in batch:
+        packed_ids = batch["_packed_seq_ids"]
+        if packed_ids is not None:
+            if packed_ids.shape != labels.shape:
+                raise ValueError("THD _packed_seq_ids must match labels [batch, sequence]")
+            offsets = torch.cat([packed_ids.new_zeros(1), packed_ids.amax(dim=1).cumsum(0)[:-1]])
+            result["_packed_seq_ids"] = torch.where(packed_ids > 0, packed_ids + offsets[:, None], 0).reshape(-1)
+        else:
+            result["_packed_seq_ids"] = None
+
+    if (doc_ids := batch.get("document_ids")) is not None:
+        if doc_ids.shape != labels.shape:
+            raise ValueError("THD document_ids must match labels [batch, sequence]")
+        offsets = torch.cat([doc_ids.new_zeros(1), doc_ids.amax(dim=1).cumsum(0)[:-1]])
+        result["document_ids"] = torch.where(doc_ids > 0, doc_ids + offsets[:, None], 0).reshape(-1)
+
     # Physical boundaries are data, not a backend switch. Decide padding once
     # for this stream, comparing the entire arrays (including the final offset).
     if cu_seqlens_padded is not None and cu_seqlens is not None:
@@ -307,11 +315,8 @@ def process_input_for_thd(
     # VLM media tensors like pixel_values / image_grid_thw), tensor or not, so
     # callers don't need to pop and restore them around the THD conversion.
     _consumed = {"seq_lens", "seq_lens_padded"}
-    for key, value in batch.items():
-        if key not in result and key not in _consumed:
-            result[key] = value
-
-    return cast(THDBatch, result)
+    passthrough = {key: value for key, value in batch.items() if key not in result and key not in _consumed}
+    return {**result, **passthrough}
 
 
 def split_batch_into_thd_chunks(
@@ -401,7 +406,8 @@ def split_batch_into_thd_chunks(
             padded.append(t)
         return torch.stack(padded)
 
-    chunk_size = batch["input_ids"].shape[0] // num_chunks
+    input_ids: torch.Tensor = batch["input_ids"]
+    chunk_size = input_ids.shape[0] // num_chunks
 
     # Process all chunks
     chunk_results: list[THDBatch] = [
@@ -416,24 +422,49 @@ def split_batch_into_thd_chunks(
         for i in range(num_chunks)
     ]
 
-    stacked: dict[str, Any] = {
+    position_ids_tensors: list[torch.Tensor] = []
+    cu_seqlens_tensors: list[torch.Tensor] = []
+    for c in chunk_results:
+        pos = c["position_ids"]
+        cu = c["cu_seqlens"]
+        if pos is None:
+            raise ValueError("split_batch_into_thd_chunks requires position_ids for all chunks")
+        if cu is None:
+            raise ValueError("split_batch_into_thd_chunks requires cu_seqlens for all chunks")
+        position_ids_tensors.append(pos)
+        cu_seqlens_tensors.append(cu)
+
+    stacked: THDBatch = {
         "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
         "labels": torch.stack([c["labels"] for c in chunk_results]),
-        "position_ids": torch.stack([c["position_ids"] for c in chunk_results]),
-        "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
+        "position_ids": torch.stack(position_ids_tensors),
+        "cu_seqlens": pad_and_stack(cu_seqlens_tensors, seq_lens_padding_value),
         "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
     }
     # Stack physical boundaries independently of the per-microbatch padding decision.
     if any("cu_seqlens_padded" in c for c in chunk_results):
-        padded_tensors = [c.get("cu_seqlens_padded", c["cu_seqlens"]) for c in chunk_results]
+        padded_tensors: list[torch.Tensor] = []
+        for c in chunk_results:
+            p = c.get("cu_seqlens_padded")
+            if p is not None:
+                padded_tensors.append(p)
+            else:
+                cu = c["cu_seqlens"]
+                if cu is None:
+                    raise ValueError("split_batch_into_thd_chunks requires cu_seqlens for all chunks")
+                padded_tensors.append(cu)
         stacked["cu_seqlens_padded"] = pad_and_stack(padded_tensors, seq_lens_padding_value)
     if all("max_seqlen" in c for c in chunk_results):
         stacked["max_seqlen"] = torch.stack([c["max_seqlen"] for c in chunk_results])
     if all("_packed_seq_ids" in c for c in chunk_results):
-        stacked["_packed_seq_ids"] = torch.stack([c["_packed_seq_ids"] for c in chunk_results])
+        if any(c["_packed_seq_ids"] is None for c in chunk_results):
+            stacked["_packed_seq_ids"] = None
+        else:
+            packed_tensors: list[torch.Tensor] = [t for c in chunk_results if (t := c["_packed_seq_ids"]) is not None]
+            stacked["_packed_seq_ids"] = torch.stack(packed_tensors)
     if all("document_ids" in c for c in chunk_results):
         stacked["document_ids"] = torch.stack([c["document_ids"] for c in chunk_results])
-    stacked.update(
-        {k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor) and k != "pad_between_seqs"}
-    )
-    return cast(THDBatch, stacked)
+    passthrough = {
+        k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor) and k != "pad_between_seqs"
+    }
+    return {**stacked, **passthrough}
