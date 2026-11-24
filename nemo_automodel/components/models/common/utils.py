@@ -609,7 +609,7 @@ class BackendConfig:
             For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
-            CUDA BF16, "fa4" selects FlashAttention 4 sparse GQA (SM90 BF16), and "cudnn"
+            CUDA BF16, "fa4" selects FlashAttention 4 sparse GQA (SM90 or SM100-family BF16), and "cudnn"
             selects cuDNN Frontend indexed QSA on SM100/SM103 with compression ratio four
             and CP=1, preserving the existing indexer. CPU execution retains the PyTorch
             numerical oracle. For Kimi K3, "fa4" runs MLA through FlashAttention 4 (varlen,

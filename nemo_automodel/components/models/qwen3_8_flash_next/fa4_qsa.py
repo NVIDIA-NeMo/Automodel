@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM90 QSA using PyTorch preprocessing and FlashAttention 4.
+"""SM90 and SM100-family QSA using PyTorch preprocessing and FlashAttention 4.
 
 Optional FA4/CuTe dependencies are loaded on the first CUDA call. The only
 CuTe code owned here is the mask callback compiled into FA4's kernels.
@@ -109,8 +109,34 @@ def _block_kinds(membership: torch.Tensor, block_keys: int) -> torch.Tensor:
     return present.to(torch.int32) + full.to(torch.int32)
 
 
+def _block_keys(device: torch.device) -> tuple[int, int]:
+    """Return the forward and backward key-block widths of FA4's head_dim=256 QSA kernels.
+
+    FA4 checks block-sparse lists against its KV tiles; query blocks are always 128 rows. SM90
+    runs 128x80 forward and 64x64 backward tiles. The SM100 family runs 128x128 forward tiles and
+    a 2CTA backward whose 64-key tiles must pair up, so both directions use 128 keys there.
+
+    Args:
+        device: CUDA device that runs the attention.
+
+    Returns:
+        Keys per forward block and keys per backward block.
+
+    Raises:
+        RuntimeError: When the device is neither SM90 nor compute capability 10.x/11.x.
+    """
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) == (9, 0):
+        return 80, 64
+    if major in (10, 11):
+        return 128, 128
+    raise RuntimeError(f"FA4 QSA supports SM90 and SM100-family (10.x/11.x) GPUs only; got SM{major}{minor}")
+
+
 @torch.compile(dynamic=False)
-def _preprocess(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...]:
+def _preprocess(
+    routes: torch.Tensor, kv_length: int, forward_block_keys: int, backward_block_keys: int
+) -> tuple[torch.Tensor, ...]:
     """Build a byte membership table and FA4 forward/reverse block lists.
 
     Args:
@@ -118,13 +144,16 @@ def _preprocess(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...
             Duplicate IDs collapse; invalid IDs, including large int64 values,
             are discarded before indexing.
         kv_length: Positive number of physical key/value positions.
+        forward_block_keys: Keys per forward block (see _block_keys).
+        backward_block_keys: Keys per backward block (see _block_keys).
 
     Returns:
         Uint8 membership [batch, queries, kv_length], with each row padded to
         a multiple of 32 bytes, followed by four forward and four reverse
         tensors in the layout documented by _compact_blocks. Forward rows are
-        ceil(queries/128) and columns ceil(kv_length/80); reverse rows are
-        ceil(kv_length/64) and columns ceil(queries/128).
+        ceil(queries/128) and columns ceil(kv_length/forward_block_keys);
+        reverse rows are ceil(kv_length/backward_block_keys) and columns
+        ceil(queries/128).
         No input is mutated, and no device scalar is read on the host.
     """
     batch, queries, _ = routes.shape
@@ -136,8 +165,8 @@ def _preprocess(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...
     # column, so they cannot overwrite a real token's membership.
     storage.scatter_(-1, indices, 1)
     membership = storage[..., :kv_length]
-    forward = _compact_blocks(_block_kinds(membership, 80))
-    backward = _compact_blocks(_block_kinds(membership, 64).transpose(1, 2))
+    forward = _compact_blocks(_block_kinds(membership, forward_block_keys))
+    backward = _compact_blocks(_block_kinds(membership, backward_block_keys).transpose(1, 2))
     return membership, *forward, *backward
 
 
@@ -149,7 +178,7 @@ def fa4_sparse_gqa_attention(
     *,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Evaluate exact route-set GQA using FA4 on SM90.
+    """Evaluate exact route-set GQA using FA4 on SM90 or SM100-family GPUs.
 
     Duplicate routes select a token once. Invalid IDs are ignored. Empty query
     rows have zero output and query gradients. Routes encode causality,
@@ -193,8 +222,7 @@ def fa4_sparse_gqa_attention(
         raise TypeError("FA4 QSA requires BF16 query, key, and value")
     if not query.is_cuda or any(t.device != query.device for t in (key, value, selected_token_ids)):
         raise ValueError("FA4 QSA requires Q/K/V/routes on the same CUDA device")
-    if torch.cuda.get_device_capability(query.device) != (9, 0):
-        raise RuntimeError("FA4 QSA currently supports SM90 GPUs only")
+    forward_keys, backward_keys = _block_keys(query.device)
     padded_keys = ((key.shape[1] + 32) // 32) * 32
     if query.shape[0] * query.shape[1] * padded_keys >= 2**31:
         raise ValueError("FA4 QSA byte mask exceeds int32 indexing limits")
@@ -205,9 +233,9 @@ def fa4_sparse_gqa_attention(
         raise RuntimeError("FA4 QSA backward uses atomic reductions and does not support deterministic algorithms")
     with torch.cuda.device(query.device):
         attention, block_lists, mask_mod = _load_fa4()
-        raw = _preprocess(selected_token_ids, key.shape[1])
-        forward_blocks = block_lists(*raw[1:5], block_size=(128, 80))
-        backward_blocks = block_lists(*raw[5:9], block_size=(128, 64))
+        raw = _preprocess(selected_token_ids, key.shape[1], forward_keys, backward_keys)
+        forward_blocks = block_lists(*raw[1:5], block_size=(128, forward_keys))
+        backward_blocks = block_lists(*raw[5:9], block_size=(128, backward_keys))
         # No tensor Python attributes: FA4 can also consume checkpoint-restored
         # auxiliary tensors, whose storage/layout survive without custom tags.
         output, _ = attention(

@@ -94,7 +94,7 @@ def test_byte_membership_preserves_route_set() -> None:
         [[[0, 0, -1, 1 << 40, 31, 32, 64], [-1] * 7], [[1, 2, 3, 65, -3, 2, 0], [64] * 7]], dtype=torch.int64
     )
     # Keep CPU unit tests focused on semantics, without compiler cold-start overhead.
-    raw = fa4_qsa._preprocess.__wrapped__(routes, 65)
+    raw = fa4_qsa._preprocess.__wrapped__(routes, 65, 80, 64)
     expected = torch.zeros(2, 2, 65, dtype=torch.uint8)
     expected[0, 0, [0, 31, 32, 64]] = 1
     expected[1, 0, [0, 1, 2, 3]] = 1
@@ -104,11 +104,14 @@ def test_byte_membership_preserves_route_set() -> None:
     assert all(t.is_contiguous() for t in raw[1:])
 
 
-def test_block_lists_distinguish_full_partial_and_empty() -> None:
-    routes = torch.arange(81).expand(1, 129, 81).clone()
+@pytest.mark.parametrize("forward_keys, backward_keys", [(80, 64), (128, 128)], ids=["sm90", "sm100"])
+def test_block_lists_distinguish_full_partial_and_empty(forward_keys: int, backward_keys: int) -> None:
+    # One key past the forward block: rows 0-127 fill the first forward and backward block and touch the next.
+    kv_length = forward_keys + 1
+    routes = torch.arange(kv_length).expand(1, 129, kv_length).clone()
     routes[:, 128] = -1
     # Keep CPU unit tests focused on semantics, without compiler cold-start overhead.
-    raw = fa4_qsa._preprocess.__wrapped__(routes, 81)
+    raw = fa4_qsa._preprocess.__wrapped__(routes, kv_length, forward_keys, backward_keys)
     mask, pc, pi, fc, fi, rpc, rpi, rfc, rfi = raw
     assert mask[:, 128].count_nonzero() == 0
     assert pc.tolist() == [[[1, 0]]]
@@ -119,3 +122,21 @@ def test_block_lists_distinguish_full_partial_and_empty() -> None:
     assert rfc.tolist() == [[[1, 0]]]
     assert rpi[0, 0, 1, 0] == 0
     assert rfi[0, 0, 0, 0] == 0
+
+
+@pytest.mark.parametrize(
+    "capability, expected",
+    [((9, 0), (80, 64)), ((10, 0), (128, 128)), ((10, 3), (128, 128)), ((10, 7), (128, 128)), ((11, 0), (128, 128))],
+)
+def test_block_keys_match_fa4_tiles_per_architecture(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], expected: tuple[int, int]
+) -> None:
+    monkeypatch.setattr(fa4_qsa.torch.cuda, "get_device_capability", lambda device: capability)
+    assert fa4_qsa._block_keys(torch.device("cuda", 0)) == expected
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (8, 9), (12, 0)])
+def test_block_keys_reject_gpus_without_fa4_qsa(monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]) -> None:
+    monkeypatch.setattr(fa4_qsa.torch.cuda, "get_device_capability", lambda device: capability)
+    with pytest.raises(RuntimeError, match=f"SM90 and SM100-family.*got SM{capability[0]}{capability[1]}"):
+        fa4_qsa._block_keys(torch.device("cuda", 0))
