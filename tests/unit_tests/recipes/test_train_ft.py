@@ -62,7 +62,6 @@ from nemo_automodel.recipes.llm.train_ft import (
         ({}, {}, 989.0),
         ({"fp8": {"enabled": True}}, {}, 1979.0),
         ({"fp8": {"enabled": True, "emulate": True}}, {}, 989.0),
-        ({"fp8": {"enabled": True}}, {"compute_dtype": "auto", "infer_training_precision": False}, 989.0),
         ({"fp8": {"enabled": True}}, {"compute_dtype": torch.float32}, 67.0),
         ({"mfu": {"device": "A100", "peak_tflops": 1}}, {}, 989.0),
     ],

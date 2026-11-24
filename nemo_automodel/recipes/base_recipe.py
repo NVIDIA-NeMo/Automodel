@@ -246,13 +246,10 @@ class BaseRecipe:
         model: torch.nn.Module,
         *,
         compute_dtype: torch.dtype | Literal["auto"] = "auto",
-        infer_training_precision: bool = True,
     ) -> AutoMFU:
         """Return the MFU calculator for the recipe's precision policy and model.
 
-        Pass the autocast dtype if the recipe applies autocast itself. With
-        infer_training_precision disabled, automatic selection uses the
-        FSDP2 policy or model dtype.
+        An explicit compute dtype bypasses automatic precision selection.
         """
 
         def infer_compute_dtype(
@@ -263,27 +260,25 @@ class BaseRecipe:
             moe_config: "MoEParallelizerConfig | None",
             mesh_context: "MeshContext",
             strategy: "DistributedStrategyConfig | None",
-            infer_training_precision: bool,
         ) -> torch.dtype | None:
             if isinstance(compute_dtype, torch.dtype):
                 return compute_dtype
             if compute_dtype != "auto":
                 raise TypeError('compute_dtype must be "auto" or a torch.dtype')
 
-            if infer_training_precision:
-                if HAVE_TE and isinstance(te_quantization, TENvfp4Config):
-                    return torch.float4_e2m1fn_x2
-                if (HAVE_TE and isinstance(te_quantization, TEFp8Config)) or (
-                    fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
-                ):
-                    return torch.float8_e4m3fn
-                if moe_config is not None and moe_config.mp_policy is not None and mesh_context.ep_size > 1:
-                    if moe_config.mp_policy.param_dtype is not None:
-                        return moe_config.mp_policy.param_dtype
-                elif isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(mesh_context.device_mesh):
-                    # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
-                    if strategy.autocast_dtype is not None:
-                        return strategy.autocast_dtype
+            if HAVE_TE and isinstance(te_quantization, TENvfp4Config):
+                return torch.float4_e2m1fn_x2
+            if (HAVE_TE and isinstance(te_quantization, TEFp8Config)) or (
+                fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
+            ):
+                return torch.float8_e4m3fn
+            if moe_config is not None and moe_config.mp_policy is not None and mesh_context.ep_size > 1:
+                if moe_config.mp_policy.param_dtype is not None:
+                    return moe_config.mp_policy.param_dtype
+            elif isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(mesh_context.device_mesh):
+                # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
+                if strategy.autocast_dtype is not None:
+                    return strategy.autocast_dtype
 
             if isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
                 return strategy.mp_policy.param_dtype
@@ -298,7 +293,6 @@ class BaseRecipe:
                 moe_config=self.moe_parallel_config,
                 mesh_context=self.mesh_context,
                 strategy=self.distributed_config,
-                infer_training_precision=infer_training_precision,
             ),
         )
 

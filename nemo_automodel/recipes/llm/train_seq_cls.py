@@ -27,8 +27,10 @@ _HAS_WANDB, wandb = safe_import(
     "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
 )
 
+from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
@@ -144,11 +146,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.model_parts = [model]
-        self.mfu_calculator = self._setup_mfu(
-            model,
-            compute_dtype=getattr(self.distributed_config, "autocast_dtype", None) or "auto",
-            infer_training_precision=False,
-        )
+        strategy = self.distributed_config
+        compute_dtype = getattr(strategy, "autocast_dtype", None)
+        if compute_dtype is None and isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
+            compute_dtype = strategy.mp_policy.param_dtype
+        self.mfu_calculator = AutoMFU.from_config(model, compute_dtype=compute_dtype)
 
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
 
