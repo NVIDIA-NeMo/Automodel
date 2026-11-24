@@ -246,6 +246,32 @@ Use the actual completed checkpoint directory. The example name uses the
 zero-based step index after 50 updates. W&B resume reconnects metrics,
 and `checkpoint.restore_from` restores training state.
 
+## Export for Serving
+
+Training saves the experts in floating point. Serving runtimes that read
+`hf_quant_config.json` expect the released expert layout instead: NVFP4 in
+layers 0-39 and MXFP8 in layers 40-47. To write a fine-tuned model in that
+layout, pass the released checkpoint and a consolidated save (written with
+`checkpoint.save_consolidated`, or by the `model/consolidate.sh` helper; see
+[Checkpointing](/development/checkpointing)):
+
+```bash
+uv run python -m nemo_automodel.components.models.inkling2.quantized_export \
+  --released "${INKLING2_MODEL}" \
+  --trained "${INKLING2_RUN_DIR}/checkpoints/epoch_0_step_99/model/consolidated" \
+  --out "${INKLING2_RUN_DIR}/Inkling-2-Small-finetuned"
+```
+
+The output has the released tensor names, dtypes, shapes, and shards. The
+`config.json`, `hf_quant_config.json`, `mtp.safetensors`, tokenizer, and other
+top-level files are copied from the release. Experts that training left
+unchanged keep their released bytes. Changed experts are quantized again with
+round-to-nearest, the rule the release declares, and the other tensors are cast
+to their released dtype. A text-only save takes the vision tower from the
+release. The export reads one tensor at a time and holds one output shard in
+memory. Use it for serving only, and resume training from the floating-point
+checkpoint.
+
 ## Packed Context Parallelism
 
 The recipe reads `allenai/tulu-3-sft-mixture` from the Hugging Face Hub and
