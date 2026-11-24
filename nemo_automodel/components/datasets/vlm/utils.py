@@ -164,10 +164,22 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
     ``_video_fps`` and ``_frame_indices``.  This allows downstream code
     (e.g. :func:`_build_video_metadata`) to construct ``VideoMetadata``
     for the processor so it inserts correct timestamps.
+
+    The input *example* is not modified: decoded media is written into a copy
+    of the conversation, and a new example dict is returned.  Datasets that
+    keep their records in memory (e.g. a list from :func:`make_meta_dataset`)
+    would otherwise keep every decoded image alive in each DataLoader worker.
     """
     conversation = example.get("conversation")
     if not conversation:
         return example
+    conversation = [
+        {**message, "content": [dict(item) for item in message["content"]]}
+        if isinstance(message.get("content"), list)
+        else message
+        for message in conversation
+    ]
+    example = {**example, "conversation": conversation}
     for message in conversation:
         content = message.get("content")
         if not isinstance(content, list):
