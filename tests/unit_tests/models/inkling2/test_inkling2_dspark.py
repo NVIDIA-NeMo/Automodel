@@ -38,6 +38,7 @@ from nemo_automodel.components.models.inkling2.dspark import (
     Inkling2DSparkReleasedConfig,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
+from nemo_automodel.recipes.speculative_decoding._dspark_warm_start import load_dspark_draft_weights
 
 pytestmark = pytest.mark.cpu_only
 
@@ -479,6 +480,28 @@ def test_released_tensors_round_trip_through_the_adapter(tmp_path):
     assert sorted(missing) == ["lm_head.weight"] and not unexpected
     for key, value in released.items():
         assert torch.equal(restored.state_dict()[key], value.to(torch.bfloat16).float()), key
+
+
+def test_warm_start_reads_the_released_mtp_safetensors(tmp_path):
+    released = _build(seed=3)
+    source = {
+        k: v.to(torch.bfloat16).contiguous()
+        for k, v in released.state_dict_adapter.to_hf(released.state_dict()).items()
+    }
+    path = tmp_path / "mtp.safetensors"
+    save_file(source, str(path))
+    model = _build()
+    head_before = model.lm_head.weight.detach().clone()
+
+    load_dspark_draft_weights(
+        model, str(path), keep_target_embeddings=True, target_layer_ids=_TARGET_LAYER_IDS, mask_token_id=0
+    )
+
+    state = model.state_dict()
+    assert source.keys() == set(state) - {"lm_head.weight"}
+    for key, value in source.items():
+        torch.testing.assert_close(state[key], value.to(state[key].dtype), rtol=0, atol=0)
+    torch.testing.assert_close(state["lm_head.weight"], head_before, rtol=0, atol=0)
 
 
 def test_adapter_rejects_tensors_outside_the_release():

@@ -86,6 +86,7 @@ for example to adapt a released draft to a fine-tuned target. It takes a local
 | An earlier run | `<checkpoint>/model/consolidated` |
 | MiniMax M3.1 Flash release | the checkpoint's `dspark/` folder |
 | DeepSeek V4.1 Flash release | the checkpoint folder, which embeds the draft under `mtp.*` |
+| Inkling 2 Small release | the checkpoint's `mtp.safetensors` file |
 
 Only the weights come from this path. The optimizer, LR schedule, RNG, and step
 counter start fresh. Use `checkpoint.restore_from` to continue a run instead. A
@@ -97,8 +98,8 @@ moments, so its first steps move every weight by about the full LR. Set
 The key set must match the draft exactly, and an earlier run's `target_layer_ids` and
 `mask_token_id` must match this run's. With `freeze_embeddings: true` the embedding and
 LM head stay the target's, and any copies in the checkpoint are ignored. With
-`freeze_embeddings: false` they come from the checkpoint. The MiniMax M3.1 Flash and
-DeepSeek V4.1 Flash drafts require `true`.
+`freeze_embeddings: false` they come from the checkpoint. The MiniMax M3.1 Flash,
+DeepSeek V4.1 Flash, and Inkling 2 Small drafts require `true`.
 
 Every rank decodes the whole draft in host memory before it is sharded. For DeepSeek
 V4.1 Flash that is about 31 GB per rank in BF16.
@@ -238,7 +239,8 @@ target's normalized embedding, the stream entering layer 0, which the draft read
 for the anchor slot. The consolidated checkpoint holds the 84 tensors of
 `mtp.safetensors` under their released names and shapes, without the shared LM
 head, next to a `config.json` holding the `mtp_config` they were trained for. The
-trainable weights start from a fresh initialization.
+trainable weights start from a fresh initialization, or from the released draft with
+[`draft_weights_path`](#warm-start) set to the checkpoint's `mtp.safetensors`.
 
 Supported targets include Qwen3 (dense and MoE), Gemma4, DeepSeek V4 and V4.1,
 GLM-5.2, Kimi K3, MiniMax M3, MiniMax M3.1 Flash, and Inkling 2 Small.
