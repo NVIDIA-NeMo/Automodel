@@ -933,7 +933,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
-        self._setup_mfu(self.model_parts[0])
+        self.mfu_calculator = self._setup_mfu(self.model_parts[0])
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)

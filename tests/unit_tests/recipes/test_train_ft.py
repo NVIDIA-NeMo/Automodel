@@ -89,9 +89,10 @@ def test_recipe_mfu_uses_compute_precision(raw_config, dtype_kwargs, expected, m
         mesh_context=MeshContext(),
     )
 
-    TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, **dtype_kwargs)
+    calculator = TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, **dtype_kwargs)
 
-    assert recipe.mfu_calculator.reference_mfu == expected
+    assert calculator.reference_mfu == expected
+    assert not hasattr(recipe, "mfu_calculator")
 
 
 def test_recipe_mfu_rejects_none_compute_dtype():

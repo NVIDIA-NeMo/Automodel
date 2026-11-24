@@ -247,8 +247,8 @@ class BaseRecipe:
         *,
         compute_dtype: torch.dtype | Literal["auto"] = "auto",
         infer_training_precision: bool = True,
-    ) -> None:
-        """Build MFU from the recipe's precision policy and initialized model.
+    ) -> AutoMFU:
+        """Return the MFU calculator for the recipe's precision policy and model.
 
         Pass the autocast dtype if the recipe applies autocast itself. With
         infer_training_precision disabled, automatic selection uses the
@@ -289,7 +289,7 @@ class BaseRecipe:
                 return strategy.mp_policy.param_dtype
             return None
 
-        self.mfu_calculator = AutoMFU.from_config(
+        return AutoMFU.from_config(
             model,
             compute_dtype=infer_compute_dtype(
                 compute_dtype=compute_dtype,
