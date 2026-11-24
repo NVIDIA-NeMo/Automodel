@@ -87,3 +87,23 @@ def test_logits_match_reference():
         out = model(dump["ids"], output_hidden_states=True)
     torch.testing.assert_close(out.hidden_states, dump["hidden"], rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(out.logits, dump["logits"], rtol=2e-4, atol=2e-4)
+
+
+VLM_DUMP = os.environ.get("HY4_REF_VLM_DUMP")
+
+
+@pytest.mark.skipif(VLM_DUMP is None or not os.path.exists(VLM_DUMP), reason="HY4_REF_VLM_DUMP reference dump not provided")
+def test_image_text_logits_and_positions_match_reference():
+    from nemo_automodel.components.models.hy_v4_flash.model import compute_mrope_position_ids
+
+    dump = torch.load(VLM_DUMP, weights_only=False)
+    config = tiny_config(vision=dump["vision_kwargs"], image_token_id=dump["image_token_id"])
+    model = HY4FlashForCausalLM(config, backend=CPU_BACKEND).float().eval()
+    adapter = HY4FlashStateDictAdapter(config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
+    missing, unexpected = model.load_state_dict(adapter.from_hf({k: v.clone() for k, v in dump["state"].items()}), strict=False)
+    assert not missing and not unexpected, (missing, unexpected)
+    positions = compute_mrope_position_ids(dump["types"], dump["grid"], None, 2)
+    assert torch.equal(positions, dump["position_ids"])
+    with torch.no_grad():
+        out = model(dump["ids"], pixel_values=dump["pixels"], image_grid_thw=dump["grid"], mm_token_type_ids=dump["types"])
+    torch.testing.assert_close(out.logits, dump["logits"], rtol=2e-4, atol=2e-4)

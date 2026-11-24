@@ -29,6 +29,20 @@ def tiny_text_config(**overrides: object) -> HY4FlashTextConfig:
     return HY4FlashTextConfig(**{**TINY_TEXT_KWARGS, **overrides})
 
 
-def tiny_config(**overrides: object) -> HY4FlashConfig:
-    """Composite config around :func:`tiny_text_config`."""
-    return HY4FlashConfig(text_config=tiny_text_config(**overrides).to_dict())
+def tiny_config(*, vision: dict[str, int] | None = None, image_token_id: int = 250, **overrides: object) -> HY4FlashConfig:
+    """Composite config around :func:`tiny_text_config`; ``vision`` overrides the tiny vision tower."""
+    vision_kwargs = dict(
+        hidden_size=32,
+        intermediate_size=48,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        patch_size=4,
+        spatial_merge_size=2,
+        out_hidden_size=TINY_TEXT_KWARGS["hidden_size"],
+        max_image_size=32,
+        rms_norm_eps=1e-5,
+    )
+    vision_kwargs.update(vision or {})
+    return HY4FlashConfig(
+        text_config=tiny_text_config(**overrides).to_dict(), vision_config=vision_kwargs, image_token_id=image_token_id
+    )

@@ -185,7 +185,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         converted: dict[str, torch.Tensor] = {}
         for key in list(hf_state_dict):
             value = hf_state_dict.pop(key)
-            if _SKIPPED.fullmatch(key) or key.startswith("vit."):
+            if _SKIPPED.fullmatch(key):
                 continue
             expert = _EXPERT.fullmatch(key)
             if expert:

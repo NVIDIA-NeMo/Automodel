@@ -28,6 +28,7 @@ other. Context parallelism, PP and vision are layered on this contract in siblin
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import torch
@@ -55,6 +56,7 @@ from nemo_automodel.components.models.hy_v4_flash.layers import (
     inverse_frequencies,
     mrope_cos_sin,
 )
+from nemo_automodel.components.models.hy_v4_flash.vision import HY4FlashVisionTower
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
@@ -103,6 +105,72 @@ class HY4FlashBatch:
     ngram_tokens: torch.Tensor | None
     engram_mask: torch.Tensor | None
     padding_mask: torch.Tensor | None
+
+
+def vision_position_ids(start: int, grid_thw: tuple[int, int, int], merge: int) -> torch.Tensor:
+    """3-D positions of one image/video: every merged row has ``w + 1`` tokens (the last is the newline).
+
+    All three axes of a frame start at the same offset and each frame starts a new block of ``max(h, w + 1)`` positions.
+
+    Returns:
+        Integer tensor of shape [3, t * h * (w + 1)] (time, height, width), offset by ``start``.
+    """
+    t, h, w = grid_thw[0], grid_thw[1] // merge, grid_thw[2] // merge
+    time = torch.arange(t) * max(h, w + 1)
+    rows = torch.arange(h)
+    cols = torch.arange(w + 1)
+    grid_t, grid_h, grid_w = torch.meshgrid(time, rows, cols, indexing="ij")
+    return torch.stack((grid_t, grid_h + grid_t, grid_w + grid_t)).reshape(3, -1) + start
+
+
+def compute_mrope_position_ids(
+    mm_token_type_ids: torch.Tensor,
+    image_grid_thw: torch.Tensor | None,
+    attention_mask: torch.Tensor | None,
+    merge: int,
+) -> torch.Tensor:
+    """M-RoPE positions of mixed text / image rows (the reference ``get_rope_index``).
+
+    Text advances all three axes by one per token; an image block takes :func:`vision_position_ids` and the next
+    text token continues at ``max + 1``. Padding positions get zero.
+
+    Args:
+        mm_token_type_ids: Integer tensor of shape [batch, sequence], 0 for text and 1 for image tokens.
+        image_grid_thw: Integer tensor of shape [images, 3] in row-major order of appearance, or ``None``.
+        attention_mask: Optional tensor of shape [batch, sequence], 1 for real tokens.
+        merge: Spatial merge size.
+
+    Returns:
+        Integer tensor of shape [3, batch, sequence].
+    """
+    rows, seq = mm_token_type_ids.shape
+    positions = torch.zeros(3, rows, seq, dtype=torch.long)
+    grids = iter([] if image_grid_thw is None else image_grid_thw.tolist())
+    types = mm_token_type_ids.cpu()
+    mask = None if attention_mask is None else attention_mask.bool().cpu()
+    for row in range(rows):
+        row_types = types[row] if mask is None else types[row][mask[row]]
+        pieces, current, index = [], 0, 0
+        for key, group in itertools.groupby(row_types.tolist()):
+            count = len(list(group))
+            if key == 0:
+                pieces.append(torch.arange(count).expand(3, -1) + current)
+                current += count
+            elif key == 1:
+                block = vision_position_ids(current, tuple(next(grids)), merge)
+                if block.shape[1] != count:
+                    raise ValueError(f"image block of {count} tokens does not match its grid ({block.shape[1]} expected)")
+                pieces.append(block)
+                current = int(block.max()) + 1
+            else:
+                raise ValueError(f"unsupported mm_token_type_id {key}; only text (0) and image (1) are supported")
+            index += count
+        flat = torch.cat(pieces, dim=1)
+        if mask is None:
+            positions[:, row] = flat
+        else:
+            positions[:, row, mask[row]] = flat
+    return positions.to(mm_token_type_ids.device)
 
 
 class HY4FlashBlock(nn.Module):
@@ -330,6 +398,43 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         self.moe_config = moe_config
         self.model = HY4FlashModel(text, self.backend, moe_config, engram_process_group=engram_process_group)
         self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
+        vision = config.vision_config
+        # ``vit`` is a top-level module, as in the released checkpoint (``vit.*`` keys).
+        self.vit = HY4FlashVisionTower(vision).to(torch.bfloat16) if vision.num_hidden_layers > 0 else None
+        self.image_token_id = config.image_token_id
+        self.spatial_merge_size = vision.spatial_merge_size
+
+    def _embed(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Token embeddings with image features scattered into the ``<|image_pad|>`` positions.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence].
+            pixel_values: Optional tensor of shape [patches, channels * patch_size * patch_size].
+            image_grid_thw: Optional integer tensor of shape [images, 3].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
+        embedded = self.model.embed_tokens(input_ids)
+        if self.vit is None:
+            return embedded
+        if pixel_values is None:
+            # Every data-parallel rank must run the sharded tower once; the dummy never reaches a token.
+            size = self.config.vision_config.patch_size
+            merge = self.spatial_merge_size
+            dummy = embedded.new_zeros(merge * merge, 3 * size * size)
+            grid = torch.tensor([[1, merge, merge]], device=embedded.device)
+            return embedded + 0 * self.vit(dummy, grid).sum()
+        features = self.vit(pixel_values.to(embedded.dtype), image_grid_thw.to(embedded.device)).to(embedded.dtype)
+        mask = input_ids == self.image_token_id
+        if int(mask.sum()) != features.shape[0]:
+            raise ValueError(f"{int(mask.sum())} image placeholder tokens but {features.shape[0]} image features")
+        return embedded.masked_scatter(mask.unsqueeze(-1), features)
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the token embedding."""
@@ -351,6 +456,9 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         loss_mask: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool = False,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
     ) -> CausalLMOutputWithPast:
         """Compute logits (and an optional mean token loss).
 
@@ -364,6 +472,10 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             loss_mask: Consumed by the recipe loss; accepted so the standard batch reaches the model.
             logits_to_keep: Number of final positions, or integer positions to keep.
             output_hidden_states: Attach the final hidden states [batch, sequence, hidden].
+            pixel_values: Optional tensor of shape [patches, channels * patch_size * patch_size].
+            image_grid_thw: Optional integer tensor of shape [images, 3] of (time, height, width) patch counts.
+            mm_token_type_ids: Optional integer tensor of shape [batch, sequence], 0 text / 1 image; derived from the
+                image placeholder id when omitted.
 
         Returns:
             ``CausalLMOutputWithPast`` with logits [batch, kept_sequence, vocab].
@@ -372,12 +484,25 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         if attention_mask is None and padding_mask is not None:
             attention_mask = ~padding_mask.bool()
         rows, seq = input_ids.shape
+        image_mask = input_ids == self.image_token_id
         if position_ids is None:
-            position_ids = torch.arange(seq, device=input_ids.device).expand(rows, seq)
+            if image_grid_thw is not None:
+                if mm_token_type_ids is None:
+                    mm_token_type_ids = image_mask.long()
+                position_ids = compute_mrope_position_ids(
+                    mm_token_type_ids, image_grid_thw, attention_mask, self.spatial_merge_size
+                )
+            else:
+                position_ids = torch.arange(seq, device=input_ids.device).expand(rows, seq)
         if position_ids.ndim == 2:
             position_ids = position_ids[None].expand(3, -1, -1)
         hidden = self.model(
-            input_ids, position_ids=position_ids, attention_mask=attention_mask, packed_seq_ids=packed_seq_ids
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            packed_seq_ids=packed_seq_ids,
+            inputs_embeds=self._embed(input_ids, pixel_values, image_grid_thw),
+            image_token_mask=image_mask,
         )
         logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         loss = None
@@ -421,8 +546,17 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
                 layer.engram_layer.init_weights()
         self.model.hc_head.init_weights(std)
         nn.init.ones_(self.model.norm.weight)
+        if self.vit is not None:
+            for name, parameter in self.vit.named_parameters():
+                if name.endswith("bias"):
+                    nn.init.zeros_(parameter)
+                elif parameter.ndim > 1:
+                    nn.init.normal_(parameter, std=std)
+                else:
+                    nn.init.ones_(parameter) if "norm" in name else nn.init.normal_(parameter, std=std)
         if not _has_dtensor_params(self):
             cast_model_to_dtype(self, dtype)
 
 
+HY4FlashForConditionalGeneration = HY4FlashForCausalLM
 ModelClass = HY4FlashForCausalLM
