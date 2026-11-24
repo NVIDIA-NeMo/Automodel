@@ -31,6 +31,32 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+# Elements of the projected states that the Triton kernels of the Mamba2 training scan (mamba_ssm) can address:
+# their offsets into that tensor are 32-bit.
+_MAMBA_SCAN_MAX_ELEMENTS = 2**31 - 1
+
+
+def _check_mamba_scan_size(projected_states: torch.Tensor) -> None:
+    """Reject projected states that are too large for the kernels of the Mamba2 training scan.
+
+    With 2**31 elements or more the scan reads and writes outside its tensors: an illegal memory access when
+    the mixer runs alone, a huge gradient norm followed by NaN losses in a training run.
+
+    Args:
+        projected_states: Output of the input projection as the scan receives it, of shape
+            [batch, seq_len, projection_size].
+
+    Raises:
+        ValueError: If the tensor holds more than ``_MAMBA_SCAN_MAX_ELEMENTS`` elements.
+    """
+    if projected_states.numel() > _MAMBA_SCAN_MAX_ELEMENTS:
+        batch_size, seq_len, projection_size = projected_states.shape
+        raise ValueError(
+            f"The Mamba scan received {batch_size} x {seq_len} x {projection_size} = {projected_states.numel()} "
+            f"projected elements, more than the {_MAMBA_SCAN_MAX_ELEMENTS} its kernels can address. Use fewer "
+            "tokens per micro-batch."
+        )
+
 
 def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(tensor, DTensor):
@@ -410,6 +436,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 projected_states = self.cp.pre_conv_ssm(projected_states, cu_seqlens=cu_seqlens_cp)
                 if squeezed and cu_seqlens_cp is not None:
                     projected_states = projected_states.unsqueeze(0).contiguous()
+                _check_mamba_scan_size(projected_states)
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(self.cp.get_A_log(A_log).float())
 
@@ -446,6 +473,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     out = out.squeeze(0)
                 return out
             else:
+                _check_mamba_scan_size(projected_states)
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(A_log.float())
                 # Adapters and sharded wrappers must execute their module forward/hooks.

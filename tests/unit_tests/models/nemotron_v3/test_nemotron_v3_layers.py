@@ -917,3 +917,39 @@ class TestMambaMixerSeqIdxConstruction:
 
         seq_idx = capture["seq_idx"]
         assert seq_idx is upstream, "upstream seq_idx must not be replaced by the construction path"
+
+    def test_projected_states_too_large_for_the_scan_kernels_are_rejected(self, monkeypatch, config):
+        """The scan kernels address the projected states with 32-bit offsets; a larger tensor must not reach them."""
+        from nemo_automodel.components.models.nemotron_v3 import layers
+
+        mixer = layers.NemotronV3Mamba2Mixer(config, layer_idx=0)
+        capture: dict[str, torch.Tensor | None] = {}
+        self._patch_mamba_kernel(monkeypatch, capture)
+        projection_size = mixer.in_proj.out_features
+        # 2 x 16 tokens of the projection are the limit here; a third sequence is one too many.
+        monkeypatch.setattr(layers, "_MAMBA_SCAN_MAX_ELEMENTS", 2 * 16 * projection_size)
+
+        mixer.forward(torch.randn(2, 16, config.hidden_size))
+        assert "seq_idx" in capture
+        capture.clear()
+        message = f"Mamba scan received 3 x 16 x {projection_size} = {3 * 16 * projection_size} projected elements"
+        with pytest.raises(ValueError, match=message):
+            mixer.forward(torch.randn(3, 16, config.hidden_size))
+        assert capture == {}
+
+
+def test_mamba_scan_size_limit_is_the_largest_32_bit_offset():
+    from nemo_automodel.components.models.nemotron_v3.layers import _check_mamba_scan_size
+
+    # A 4096 -> 18560 projection of 8192-token sequences: 14 sequences are 2,128,609,280 elements, 15 are
+    # 2,280,652,800. Meta tensors carry the shape without the memory.
+    assert 14 * 8192 * 18560 < 2**31 < 15 * 8192 * 18560
+    _check_mamba_scan_size(torch.empty(14, 8192, 18560, device="meta"))
+    with pytest.raises(
+        ValueError, match=r"15 x 8192 x 18560 = 2280652800 projected elements, more than the 2147483647"
+    ):
+        _check_mamba_scan_size(torch.empty(15, 8192, 18560, device="meta"))
+    # Exactly 2**31 - 1 elements pass, 2**31 do not.
+    _check_mamba_scan_size(torch.empty(1, 2**31 - 1, 1, device="meta"))
+    with pytest.raises(ValueError, match="2147483648 projected elements"):
+        _check_mamba_scan_size(torch.empty(1, 2**31, 1, device="meta"))
