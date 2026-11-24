@@ -266,11 +266,11 @@ def test_rejects_a_negative_selector_loss_weight():
         _build_trainer(selector_loss_weight=-1.0)
 
 
-def test_rejects_variable_prefix_loss_type():
-    """The selector teacher-forces the predecessor from the fixed-anchor block
-    layout (see ``_selector_scores``), which a variable visible prefix breaks."""
-    with pytest.raises(ValueError, match="variable_prefix"):
-        _build_trainer(loss_type="variable_prefix")
+@pytest.mark.parametrize("loss_type", ["variable_prefix", "mmflash"])
+def test_rejects_unsupported_loss_type(loss_type: str) -> None:
+    """The selector shares the backbone's DFlash or D-PACE weight schedule."""
+    with pytest.raises(ValueError, match=loss_type):
+        _build_trainer(loss_type=loss_type)
 
 
 def test_dpace_loss_type_runs_finite_and_trains_both_terms():
@@ -355,6 +355,8 @@ def test_selector_weighting_reuses_the_backbone_confidence_pass(loss_type):
         trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
 
     assert cross_entropy.call_count == 2
+
+
 def test_label_ids_supervise_labels_but_selector_predecessor_is_real_anchor(monkeypatch):
     trainer = _build_trainer(loss_decay_gamma=7.0, selector_top_k=VOCAB)
     input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=12)

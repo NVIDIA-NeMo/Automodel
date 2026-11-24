@@ -11,6 +11,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.minimax_m2.model import Block, MiniMaxM2ForCausalLM, MiniMaxM2Model
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 
 @dataclass
@@ -234,14 +235,11 @@ class TestMiniMaxM2ForCausalLM:
         batch, seq = 1, 5
         input_ids = torch.randint(0, config.vocab_size, (batch, seq))
         position_ids = torch.arange(seq).unsqueeze(0)
-        hidden = torch.randn(seq, config.hidden_size)
-        with patch.object(model.model, "forward", return_value=hidden):
-            out = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                output_hidden_states=True,
-            )
+        out, layer_inputs = run_with_passthrough_layers(
+            model, input_ids, position_ids=position_ids, qkv_format="thd", output_hidden_states=True
+        )
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq, config.hidden_size) for shape in layer_inputs)
         assert out.logits.shape == (batch, seq, config.vocab_size)
         assert out.hidden_states.shape == (batch, seq, config.hidden_size)
 

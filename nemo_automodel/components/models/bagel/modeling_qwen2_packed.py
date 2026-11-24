@@ -55,6 +55,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.shared.import_utils import safe_import_from
 
 __all__ = [
@@ -1557,17 +1558,14 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: Qwen2Config, backend: BagelBackendConfig | None = None) -> None:
+    def __init__(
+        self, config: Qwen2Config, backend: BagelBackendConfig | None = None, *, logits_dtype: torch.dtype | None = None
+    ) -> None:
         super().__init__(config)
         self.backend = backend or BagelBackendConfig()
         self.model = Qwen2Model(config, backend=self.backend)
         self.vocab_size = config.vocab_size
-        self.lm_head = _initialize_linear(
-            self.backend,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
 
     def init_moe(self) -> None:
@@ -1588,7 +1586,16 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
-        self.lm_head = new_embeddings
+        """Install the output head; a plain ``nn.Linear``, as a vocabulary resize builds, keeps the logits dtype.
+
+        Args:
+            new_embeddings: Output head with weight of shape [vocab, hidden].
+        """
+        self.lm_head = (
+            new_embeddings
+            if isinstance(new_embeddings, LMHead)
+            else LMHead.from_linear(new_embeddings, logits_dtype=self.lm_head.logits_dtype)
+        )
 
     def set_decoder(self, decoder: nn.Module) -> None:
         self.model = decoder
