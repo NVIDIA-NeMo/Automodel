@@ -111,7 +111,7 @@ ci:
   recipe_owner: akoumpa
   nodes: 1
   nproc_per_node: 4
-  time: "00:45:00"
+  time: "00:30:00"
   max_steps: 20
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
