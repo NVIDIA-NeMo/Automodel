@@ -107,6 +107,7 @@ class HY4FlashTextConfig(PretrainedConfig):
         hc_magnitude: float = 2.0,
         hc_eps: float = 1e-6,
         rope_parameters: dict[str, HY4FlashRopeParameters] | None = None,
+        layer_rope_parameters: dict[str, HY4FlashRopeParameters] | None = None,
         engram_layer_ids: list[int] | None = None,
         engram_max_ngram_size: int = 3,
         engram_n_head_per_ngram: int = 8,
@@ -131,6 +132,9 @@ class HY4FlashTextConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.swa_num_attention_heads = swa_num_attention_heads
+        # MLA expands one K/V per query head, so keys are never grouped.
+        kwargs.pop("num_key_value_heads", None)
+        self.num_key_value_heads = num_attention_heads
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
@@ -190,13 +194,18 @@ class HY4FlashTextConfig(PretrainedConfig):
         except KeyError as exc:
             raise ValueError(f"unsupported layer type {exc.args[0]!r}; expected one of {sorted(_LAYER_TYPE_ALIASES)}") from exc
 
-        rope = {} if rope_parameters is None else {_LAYER_TYPE_ALIASES[k]: dict(v) for k, v in rope_parameters.items()}
+        # The base class rewrites ``rope_parameters`` with a flat default alongside the per-type entries, so the
+        # per-type table is kept under its own name; a saved config carries both and the own name wins.
+        source = layer_rope_parameters if layer_rope_parameters is not None else rope_parameters
+        rope = {
+            _LAYER_TYPE_ALIASES[k]: dict(v) for k, v in (source or {}).items() if k in _LAYER_TYPE_ALIASES
+        }
         default_theta = {"deepseek_sparse_attention": 1.0e7, "sliding_attention": 1.0e4}
         for layer_type, theta in default_theta.items():
             params = rope.setdefault(layer_type, {"rope_type": "default"})
             params.setdefault("rope_theta", theta)
             params.setdefault("mrope_section", [12, 10, 10])
-        self.rope_parameters = rope
+        self.layer_rope_parameters = rope
 
         # Fields of the released config that the model does not consume are retained by the base class so a
         # saved config round-trips; they are listed so a future semantic change is a conscious decision.
@@ -211,11 +220,6 @@ class HY4FlashTextConfig(PretrainedConfig):
         )
 
     # ------------------------------------------------------------------ derived shapes
-    @property
-    def num_key_value_heads(self) -> int:
-        """MLA expands one K/V per query head, so keys are never grouped."""
-        return self.num_attention_heads
-
     def attention_heads(self, attention_type: AttentionType) -> int:
         """Number of query heads of a layer of the given attention type."""
         return self.num_attention_heads if attention_type == "deepseek_sparse_attention" else self.swa_num_attention_heads
@@ -274,7 +278,7 @@ class HY4FlashTextConfig(PretrainedConfig):
                 raise ValueError(f"{name} must be finite and positive, got {value!r}")
         for layer_type in set(self.layer_types):
             _, rope_dim, _ = self.attention_dims(layer_type)
-            section = self.rope_parameters[layer_type]["mrope_section"]
+            section = self.layer_rope_parameters[layer_type]["mrope_section"]
             if len(section) != 3 or sum(section) != rope_dim // 2:
                 raise ValueError(
                     f"mrope_section must have three entries summing to {rope_dim // 2} for {layer_type!r}, got {section}"
