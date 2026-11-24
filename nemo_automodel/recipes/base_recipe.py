@@ -43,6 +43,7 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
+from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_torch_ckpt,
     save_config,
@@ -64,7 +65,6 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 if TYPE_CHECKING:
-    from nemo_automodel._transformers.mfu import AutoMFU
     from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
@@ -174,7 +174,7 @@ class BaseRecipe:
     """
 
     dist_env: "DistInfo"
-    mfu_calculator: "AutoMFU | None" = None
+    mfu_calculator: AutoMFU = AutoMFU()
     timestamp: float
 
     @staticmethod
@@ -241,7 +241,13 @@ class BaseRecipe:
         strategy = self.distributed_config
         if compute_dtype is None and isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
             compute_dtype = strategy.mp_policy.param_dtype
-        self.mfu_calculator = self.cfg.mfu.build(model=model, compute_dtype=compute_dtype)
+        mfu_settings = self.cfg.mfu
+        self.mfu_calculator = AutoMFU.from_config(
+            model,
+            device=mfu_settings.device,
+            peak_tflops=mfu_settings.peak_tflops,
+            compute_dtype=compute_dtype,
+        )
 
     def _autocast_context(self):
         """Return the recipe-level autocast context configured by the strategy."""
@@ -868,17 +874,17 @@ class BaseRecipe:
     ) -> tuple[float, float | None]:
         """Advance the step timer and return the step's tokens/s and MFU.
 
-        MFU is ``None`` without an MFU calculator, without batches, or when any batch
-        lacks ``input_ids`` or has no FLOPs formula.
+        MFU is ``None`` when the model has no FLOPs formula, there are no batches,
+        or a batch lacks ``input_ids``.
         """
         t = time.perf_counter()
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
 
-        mfu_calculator = self.mfu_calculator
-        if not batches or mfu_calculator is None:
+        if not batches:
             return tps, None
+        mfu_calculator = self.mfu_calculator
         step_flops = 0.0
         for batch in batches:
             input_ids = batch.get("input_ids")

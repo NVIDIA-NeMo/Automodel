@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 from nemo_automodel.components.utils.flops_utils import (
     calculate_mfu,
     get_flops_formula_for_hf_config,
+    transformer_flops,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ _Precision = Literal["fp32", "tf32", "fp16", "fp8", "fp4"]
 # Other 16-bit entries retain the existing lookup adapted from verl's flops_counter.py.
 _DEVICE_TFLOPS: dict[str, dict[_Precision, float]] = {
     "CPU": {"fp16": 0.448},
+    # The preliminary Vera Rubin NVL72 spec lists 288 dense FP16/BF16 PFLOPs/s per rack.
+    "VR NVL72": {"fp16": 4000},
     "GB200": {"fp32": 80, "tf32": 1250, "fp16": 2500, "fp8": 5000, "fp4": 10000},
     "GB300": {"fp32": 80, "tf32": 1250, "fp16": 2500, "fp8": 5000, "fp4": 15000},
     "B200": {"fp32": 75, "tf32": 1125, "fp16": 2250, "fp8": 4500, "fp4": 9000},
@@ -148,12 +151,13 @@ class AutoMFU:
     """Auto MFU calculator - provides MFU calculation for various model architectures.
 
     This class provides a HuggingFace AutoModel-like interface for calculating
-    Model FLOPs Utilization (MFU) during training.
+    Model FLOPs Utilization (MFU) during training. Without a usable formula,
+    FLOPs and MFU calls return None.
     """
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PretrainedConfig | None = None,
         device: str | None = None,
         peak_tflops: float | None = None,
         *,
@@ -162,13 +166,23 @@ class AutoMFU:
         """Initialize AutoMFU with a model config.
 
         Args:
-            config: HuggingFace PretrainedConfig object
+            config: Hugging Face configuration. Omit it for a null calculator.
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
             compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
         """
         self.config = config
+        self.flops_formula = None
+        self.reference_mfu = math.inf
+        if config is None:
+            return
+
         self.flops_formula = get_flops_formula_for_hf_config(config)
+        if self.flops_formula is transformer_flops and not all(
+            hasattr(config, attr)
+            for attr in ("hidden_size", "num_hidden_layers", "num_attention_heads", "intermediate_size", "vocab_size")
+        ):
+            self.flops_formula = None
         dtype = compute_dtype or getattr(config, "dtype", None) or torch.bfloat16
         self.reference_mfu = (
             _validate_peak_tflops(peak_tflops)
@@ -206,7 +220,8 @@ class AutoMFU:
                 (the .config attribute will be extracted), or a model ID/local path.
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
-            compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
+            compute_dtype: Training compute dtype. When omitted for a model, infer its predominant
+                floating-point matrix parameter dtype. Fall back to the config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
                 when loading from model ID/path.
 
@@ -221,6 +236,12 @@ class AutoMFU:
         else:
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
+            if compute_dtype is None and peak_tflops is None and isinstance(config_or_path_or_model, torch.nn.Module):
+                elements_by_dtype: Counter[torch.dtype] = Counter()
+                for param in config_or_path_or_model.parameters():
+                    if param.ndim >= 2 and param.is_floating_point():
+                        elements_by_dtype[param.dtype] += param.numel()
+                compute_dtype = max(elements_by_dtype, key=elements_by_dtype.__getitem__, default=None)
         return cls(config, device=device, peak_tflops=peak_tflops, compute_dtype=compute_dtype)
 
     @classmethod
@@ -240,7 +261,8 @@ class AutoMFU:
                 local path, or model object (the .config attribute will be extracted)
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
-            compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
+            compute_dtype: Training compute dtype. When omitted for a model, infer its predominant
+                floating-point matrix parameter dtype. Fall back to the config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
 
         Returns:
@@ -299,17 +321,6 @@ class AutoMFU:
             batch_size, seq_len = input_ids_or_tensor
 
         try:
-            # Explicitly gate transformer fallback on required attributes.
-            if getattr(self.flops_formula, "__name__", None) == "transformer_flops":
-                required = (
-                    "hidden_size",
-                    "num_hidden_layers",
-                    "num_attention_heads",
-                    "intermediate_size",
-                    "vocab_size",
-                )
-                if not all(hasattr(self.config, attr) for attr in required):
-                    return None
             return self.flops_formula(self.config, gbs=batch_size, seq_len=seq_len)
         except Exception as e:
             logger.debug("Unable to compute FLOPs for config %s: %s", type(self.config).__name__, e)
@@ -373,27 +384,6 @@ class MFUConfig:
                 FutureWarning,
                 stacklevel=2,
             )
-
-    def build(self, *, model: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> AutoMFU:
-        """Build the calculator for an initialized model.
-
-        Args:
-            model: Model whose Hugging Face configuration supplies the FLOPs formula.
-            compute_dtype: Runtime compute dtype. Defaults to the dominant floating-point matrix
-                parameter dtype when no mixed-precision policy supplies one.
-
-        Returns:
-            The configured MFU calculator.
-        """
-        if compute_dtype is None and self.peak_tflops is None:
-            elements_by_dtype: Counter[torch.dtype] = Counter()
-            for param in model.parameters():
-                if param.ndim >= 2 and param.is_floating_point():
-                    elements_by_dtype[param.dtype] += param.numel()
-            if elements_by_dtype:
-                compute_dtype = max(elements_by_dtype, key=elements_by_dtype.__getitem__)
-
-        return AutoMFU.from_config(model, device=self.device, peak_tflops=self.peak_tflops, compute_dtype=compute_dtype)
 
 
 def _validate_peak_tflops(peak_tflops: float) -> float:

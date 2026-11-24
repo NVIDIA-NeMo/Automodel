@@ -363,6 +363,11 @@ def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expe
     assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
 
 
+def test_get_device_flops_recognizes_vr200():
+    """VR200 reports "NVIDIA VR NVL72"; an unknown name would make every step log MFU 0."""
+    assert get_device_flops(unit="T", device_name="NVIDIA VR NVL72") == 4000.0
+
+
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):
     monkeypatch.setattr(mfu_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(mfu_module.torch.cuda, "current_device", lambda: 3)
@@ -410,14 +415,12 @@ def test_get_device_flops_uses_cuda_fp32_matmul_policy(monkeypatch, precision, e
     assert get_device_flops(device_name="H100", dtype=torch.float32) == expected
 
 
-def test_mfu_config_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
+def test_automfu_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
     monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
     model = torch.nn.Sequential(torch.nn.LayerNorm(32), torch.nn.Linear(32, 32, dtype=torch.bfloat16))
     model.config = SimpleNamespace(dtype=torch.float32)
-    config = MFUConfig(device="H100")
-
-    assert config.build(model=model).reference_mfu == 989.0
-    assert config.build(model=model, compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
+    assert AutoMFU.from_config(model, device="H100").reference_mfu == 989.0
+    assert AutoMFU.from_config(model, device="H100", compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
 
 
 def test_automfu_accepts_precision_peak_override(monkeypatch):
@@ -456,17 +459,24 @@ def test_automfu_rejects_invalid_precision_peak(monkeypatch, peak_tflops):
         AutoMFU(SimpleNamespace(), peak_tflops=peak_tflops)
 
 
-def test_mfu_config_builds_calculator(monkeypatch):
-    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    model_config = SimpleNamespace()
-    model = SimpleNamespace(config=model_config)
-
+def test_mfu_config_warns_for_a_legacy_peak():
     with pytest.warns(FutureWarning, match=r"mfu\.peak_tflops is deprecated"):
-        config = MFUConfig(device="h100", peak_tflops=1979.0)
-    calculator = config.build(model=model)
+        settings = MFUConfig(device="h100", peak_tflops=1979.0)
 
-    assert calculator.config is model_config
-    assert calculator.reference_mfu == 1979.0
+    assert settings.peak_tflops == 1979.0
+
+
+def test_automfu_without_formula_preserves_the_calculator_interface():
+    # A config without the transformer fallback's dimensions has no usable formula.
+    config = SimpleNamespace()
+    model = torch.nn.Module()
+    model.config = config
+    calculator = AutoMFU.from_config(model, device="H100")
+
+    assert calculator.config is config
+    assert calculator.reference_mfu == 989.0
+    assert calculator.get_flops(torch.ones(1, 2, dtype=torch.long)) is None
+    assert calculator((1, 2), time_delta=1.0, world_size=1) is None
 
 
 def test_optional_field_set_to_none_uses_its_default():

@@ -189,7 +189,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             super().setup()
 
         if self._bench_peak_tflops is None:
-            assert self.mfu_calculator is not None
             self._bench_peak_tflops = self.mfu_calculator.reference_mfu
 
         # Store wandb run object if initialized by parent
