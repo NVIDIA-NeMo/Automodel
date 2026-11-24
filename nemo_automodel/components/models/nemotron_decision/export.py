@@ -27,6 +27,14 @@ from pathlib import Path
 
 import safetensors.torch as _st
 
+from nemo_automodel.components.models.nemotron_decision.packed import (
+    READ_LAYOUT,
+    READ_LAYOUT_ATTENTION,
+    READ_LAYOUT_POSITIONS,
+    READ_LAYOUT_SINGLE,
+    READ_LAYOUT_SLOT,
+    READ_LAYOUT_STATE_END,
+)
 from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
     DECISION_CONFIG_FILE,
     DECISION_TEMPLATE_FILE,
@@ -71,13 +79,72 @@ def checkpoint_fingerprint(checkpoint_dir: str | Path, *, chunk_size: int = 1 <<
     return digest.hexdigest()
 
 
-def merge_lora_checkpoint(base_dir: str | Path, adapter_dir: str | Path, output_dir: str | Path) -> dict:
+def read_layout_block(
+    *,
+    packed_read: bool,
+    prompt_format: str,
+    state_end_token: str,
+    state_end_token_id: int,
+    mask_token: str,
+    mask_token_id: int,
+) -> dict:
+    """The ``read_layout`` block an export writes into ``config.json`` (the keys of released packed checkpoints).
+
+    Args:
+        packed_read: The default read of the exported checkpoint (``True``: packed; ``False``: one question per read).
+        prompt_format: ``json`` or ``json-sep``.
+        state_end_token: The token that closes the state in ``json-sep`` prompts.
+        state_end_token_id: Its vocabulary id.
+        mask_token: The mask (read slot) token.
+        mask_token_id: Its vocabulary id.
+
+    Returns:
+        ``{"packed_read", "prompt_format", "state_end_token", "state_end_token_id", "state_end", "mask_token",
+        "mask_token_id", "layout", "attention", "positions", "read_slot", "single_read"}``.
+    """
+    return {
+        "packed_read": bool(packed_read),
+        "prompt_format": prompt_format,
+        "state_end_token": state_end_token,
+        "state_end_token_id": int(state_end_token_id),
+        "state_end": READ_LAYOUT_STATE_END,
+        "mask_token": mask_token,
+        "mask_token_id": int(mask_token_id),
+        "layout": READ_LAYOUT,
+        "attention": READ_LAYOUT_ATTENTION,
+        "positions": READ_LAYOUT_POSITIONS,
+        "read_slot": READ_LAYOUT_SLOT,
+        "single_read": READ_LAYOUT_SINGLE,
+    }
+
+
+def _write_read_layout(output_dir: Path, read_layout: dict | None) -> None:
+    """Record the read layout in the exported ``config.json``: ``prompt_format``, ``packed_read`` and ``read_layout``.
+
+    Keys of a ``read_layout`` the base already declares (for example a ``reference`` packer file it ships) are kept
+    unless the new block sets them. ``None`` leaves the copied configuration byte-identical.
+    """
+    if read_layout is None:
+        return
+    path = output_dir / "config.json"
+    config = json.loads(path.read_text())
+    config["prompt_format"] = read_layout["prompt_format"]
+    config["packed_read"] = read_layout["packed_read"]
+    config["read_layout"] = {**(config.get("read_layout") or {}), **read_layout}
+    path.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def merge_lora_checkpoint(
+    base_dir: str | Path, adapter_dir: str | Path, output_dir: str | Path, *, read_layout: dict | None = None
+) -> dict:
     """Merge a PEFT LoRA adapter into the base weights and write a complete checkpoint.
 
     Args:
         base_dir: Checkpoint the adapter was trained on.
         adapter_dir: Directory with ``adapter_config.json`` and ``adapter_model.safetensors``.
         output_dir: New directory (must not exist).
+        read_layout: Optional :func:`read_layout_block` written into the exported ``config.json``; ``None`` copies
+            the base configuration unchanged.
 
     Returns:
         Receipt ``{"base", "adapter", "lora_modules", "r", "alpha", "scale"}`` (also written as ``merge-receipt.json``).
@@ -133,16 +200,21 @@ def merge_lora_checkpoint(base_dir: str | Path, adapter_dir: str | Path, output_
         "scale": scale,
     }
     (output_dir / "merge-receipt.json").write_text(json.dumps(receipt))
+    _write_read_layout(output_dir, read_layout)
     return receipt
 
 
-def export_full_checkpoint(base_dir: str | Path, weights_dir: str | Path, output_dir: str | Path) -> dict:
+def export_full_checkpoint(
+    base_dir: str | Path, weights_dir: str | Path, output_dir: str | Path, *, read_layout: dict | None = None
+) -> dict:
     """Write a complete checkpoint from consolidated backbone fine-tuning weights, cast to the base dtypes.
 
     Args:
         base_dir: Checkpoint the run started from (configuration, tokenizer and model code are copied from it).
         weights_dir: Directory of consolidated ``*.safetensors`` weights of the trained model.
         output_dir: New directory (must not exist).
+        read_layout: Optional :func:`read_layout_block` written into the exported ``config.json``; ``None`` copies
+            the base configuration unchanged.
 
     Returns:
         Receipt ``{"base", "weights", "tensors"}`` (also written as ``export-receipt.json``).
@@ -178,4 +250,5 @@ def export_full_checkpoint(base_dir: str | Path, weights_dir: str | Path, output
     )
     receipt = {"base": str(base_dir), "weights": str(weights_dir), "tensors": len(trained)}
     (output_dir / "export-receipt.json").write_text(json.dumps(receipt))
+    _write_read_layout(output_dir, read_layout)
     return receipt

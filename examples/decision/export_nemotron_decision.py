@@ -18,8 +18,11 @@
       --stage runs/support/lora/LOWEST_VAL --output exports/support_lora
 
 LoRA stages are merged into the base weights (W += alpha / r * B @ A, in fp32); backbone fine-tuning stages are written
-from their consolidated weights in the base dtypes. The base configuration is copied unchanged. The stage must have
-been trained on this exact base.
+from their consolidated weights in the base dtypes. The stage must have been trained on this exact base. The base
+configuration is copied unchanged, except for a stage trained with ``data.prompt_format: json-sep`` or
+``data.packed_read: true``: its ``config.json`` then records ``prompt_format``, ``packed_read`` (the default read;
+``--packed-read on|off`` overrides it, since a state-blind stage also reads one question per sequence) and the
+``read_layout`` block (state-end and mask tokens, attention, positions and read-slot rules).
 """
 
 import argparse
@@ -40,6 +43,12 @@ def main() -> None:
     parser.add_argument("--base", required=True, help="the local checkpoint the stage was trained from")
     parser.add_argument("--stage", required=True, help="stage directory, or its LOWEST_VAL / LATEST pointer")
     parser.add_argument("--output", required=True, help="new directory for the complete checkpoint")
+    parser.add_argument(
+        "--packed-read",
+        choices=["stage", "on", "off"],
+        default="stage",
+        help="default read written to config.json: as trained (stage), packed (on) or one question per read (off)",
+    )
     args = parser.parse_args()
     stage = Path(args.stage)
     if stage.name in {"LOWEST_VAL", "LATEST"}:
@@ -51,10 +60,17 @@ def main() -> None:
     expected = manifest.get("base_fingerprint")
     if expected is None or checkpoint_fingerprint(args.base) != expected:
         raise SystemExit(f"{args.base} is not the base this stage was trained from (fingerprint mismatch)")
+    read_layout = manifest.get("read_layout")
+    if args.packed_read != "stage":
+        if read_layout is None or read_layout["prompt_format"] != "json-sep":
+            raise SystemExit("--packed-read needs a stage trained with data.prompt_format: json-sep")
+        read_layout = {**read_layout, "packed_read": args.packed_read == "on"}
     if manifest["method"] == "lora":
-        receipt = merge_lora_checkpoint(args.base, stage / "model", args.output)
+        receipt = merge_lora_checkpoint(args.base, stage / "model", args.output, read_layout=read_layout)
     else:
-        receipt = export_full_checkpoint(args.base, stage / "model" / "consolidated", args.output)
+        receipt = export_full_checkpoint(
+            args.base, stage / "model" / "consolidated", args.output, read_layout=read_layout
+        )
     print(json.dumps({"stage": str(stage), **receipt}, indent=2))
 
 

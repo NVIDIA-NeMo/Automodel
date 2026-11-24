@@ -106,6 +106,15 @@ For a step-by-step walkthrough with training logs and results, see the
   never truncated.
 * Only text decision checkpoints with `decision.json` and `decision_template.jinja` are accepted. Vision and quantized
   variants fail at setup instead of running with the wrong input or storage format.
+* Packed (state-blind) reads: `data.packed_read: true` with `data.prompt_format: json-sep`
+  (`nemotron_decision_soc_triage_packed_lora.yaml`) reads all questions of a record in one sequence: the state once,
+  closed by the state-end token, then each question with its own mask. The state attends only to the state, each
+  question to the state and itself (never to another question), question positions restart after the state, and each
+  question is read at its own mask. `train.global_batch_size` then counts records; a record's loss is the mean over
+  its questions. Evaluation reports per-question metrics and per-state all-correct (`exact_match`), and
+  `data.packed_read: false` evaluates the same stage one question per read. The export writes `prompt_format`,
+  `packed_read` and the `read_layout` block into `config.json`. `prepare_nemotron_decision_data.py --packed-read`
+  merges one-decision lines that share a state and group into multi-question records.
 
 ```bash
 # fictional SOC triage: the recipe reads the SystemOne records directly, one question per read

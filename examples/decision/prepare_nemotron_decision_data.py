@@ -18,6 +18,10 @@
   uv run python examples/decision/prepare_nemotron_decision_data.py --input support_routing.jsonl \
       --output data/support_routing --split three-way
 
+  # the same for packed (state-blind) training: lines that share a state and group become one multi-question record
+  uv run python examples/decision/prepare_nemotron_decision_data.py --input support_routing.jsonl \
+      --output data/support_routing_packed --split three-way --packed-read
+
 SystemOne records, such as the fictional SOC-triage tutorial data, need no conversion: point ``data.*`` at them.
 ``--split two-way`` writes a ``train``/``heldout`` split (held-out fraction 0.2, seed ``0``); its held-out file
 selects checkpoints, so it is validation, not an untouched test. ``--split three-way`` writes group-disjoint
@@ -34,6 +38,7 @@ from nemo_automodel.components.datasets.decision.records import validate_record
 from nemo_automodel.components.models.nemotron_decision.records import (
     convert_simple_line,
     in_heldout,
+    merge_by_state,
     read_jsonl,
     write_jsonl,
 )
@@ -61,6 +66,11 @@ def main() -> None:
     parser.add_argument("--seed", default="0")
     parser.add_argument("--heldout-fraction", type=float, default=0.2)
     parser.add_argument("--test-fraction", type=float, default=0.2, help="three-way: share of groups for test")
+    parser.add_argument(
+        "--packed-read",
+        action="store_true",
+        help="merge lines with the same state and group into one multi-question record (for data.packed_read)",
+    )
     args = parser.parse_args()
 
     records, errors = [], 0
@@ -75,6 +85,10 @@ def main() -> None:
         records.append(record)
     if len({r["id"] for r in records}) != len(records):
         raise SystemExit(f"{args.input}: record IDs must be unique")
+    if args.packed_read:
+        records = merge_by_state(records)
+        for record in records:
+            validate_record(record)
     if args.split == "two-way":
         splits = {
             "train": [r for r in records if not in_heldout(r, args.heldout_fraction, args.seed)],

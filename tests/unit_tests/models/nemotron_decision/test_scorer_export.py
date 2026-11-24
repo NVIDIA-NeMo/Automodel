@@ -259,3 +259,72 @@ def test_full_export_casts_to_base_dtypes_and_rejects_mismatched_tensors(tmp_pat
 )
 def test_full_finetuning_scope(name, trainable):
     assert full_finetune_trainable(name) is trainable
+
+
+# The read_layout block of a released always-packed checkpoint's config.json (its "reference" packer file aside).
+RELEASED_READ_LAYOUT = {
+    "packed_read": True,
+    "prompt_format": "json-sep",
+    "state_end_token": "<SPECIAL_101>",
+    "state_end_token_id": 101,
+    "state_end": "state = the prompt up to and including the state_end_token (right after the state value)",
+    "mask_token": "<SPECIAL_100>",
+    "mask_token_id": 100,
+    "layout": "[state][question 1 + mask][question 2 + mask] ... in request order",
+    "attention": "state->state; question->state+self; no question<->question",
+    "positions": "state 0..|S|-1; each question restarts at |S|",
+    "read_slot": "each question's mask token; softmax over its option-code tokens",
+    "single_read": "packed_read false: one bidirectional sequence per question (prompt + mask), read at its mask",
+}
+
+
+def _layout(packed_read=True):
+    from nemo_automodel.components.models.nemotron_decision.export import read_layout_block
+
+    return read_layout_block(
+        packed_read=packed_read,
+        prompt_format="json-sep",
+        state_end_token="<SPECIAL_101>",
+        state_end_token_id=101,
+        mask_token="<SPECIAL_100>",
+        mask_token_id=100,
+    )
+
+
+def test_read_layout_block_has_the_released_keys_and_values():
+    assert _layout() == RELEASED_READ_LAYOUT
+    assert list(_layout()) == list(RELEASED_READ_LAYOUT)
+    assert _layout(False) == {**RELEASED_READ_LAYOUT, "packed_read": False}
+
+
+@pytest.mark.parametrize("method", ["lora", "full"])
+def test_export_records_the_read_layout_in_config(tmp_path, method):
+    _write_base(tmp_path / "base")
+    base_config = json.loads((tmp_path / "base/config.json").read_text())
+    if method == "lora":
+        _write_adapter(tmp_path / "adapter")
+        merge_lora_checkpoint(tmp_path / "base", tmp_path / "adapter", tmp_path / "out", read_layout=_layout())
+    else:
+        (tmp_path / "trained").mkdir()
+        save_file(load_file(str(tmp_path / "base/model.safetensors")), str(tmp_path / "trained/model.safetensors"))
+        export_full_checkpoint(tmp_path / "base", tmp_path / "trained", tmp_path / "out", read_layout=_layout())
+    config = json.loads((tmp_path / "out/config.json").read_text())
+    assert config == {**base_config, "prompt_format": "json-sep", "packed_read": True, "read_layout": _layout()}
+    assert list(config)[-3:] == ["prompt_format", "packed_read", "read_layout"]
+
+
+def test_export_keeps_base_read_layout_keys_and_without_a_layout_copies_config_bytes(tmp_path):
+    _write_base(tmp_path / "base")
+    config = json.loads((tmp_path / "base/config.json").read_text())
+    config.update(
+        prompt_format="json-sep", packed_read=True, read_layout={**_layout(), "reference": "packed_layout.py"}
+    )
+    (tmp_path / "base/config.json").write_text(json.dumps(config))
+    _write_adapter(tmp_path / "adapter")
+    merge_lora_checkpoint(tmp_path / "base", tmp_path / "adapter", tmp_path / "plain")
+    assert (tmp_path / "plain/config.json").read_bytes() == (tmp_path / "base/config.json").read_bytes()
+    merge_lora_checkpoint(tmp_path / "base", tmp_path / "adapter", tmp_path / "single", read_layout=_layout(False))
+    exported = json.loads((tmp_path / "single/config.json").read_text())
+    assert exported["packed_read"] is False and exported["read_layout"]["packed_read"] is False
+    assert exported["read_layout"]["reference"] == "packed_layout.py"
+    assert list(exported) == list(config)  # existing keys keep their place

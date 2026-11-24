@@ -175,6 +175,8 @@ The checkpoint owns its prompt, and the recipe renders every question exactly as
 - the template ends with the mask token.
 
 The probability of each option is the decision head's distribution at that mask, restricted to the option codes.
+Always-packed checkpoints use the `json-sep` variant of this prompt, which closes the state with a state-end token;
+see [Always-Packed (State-Blind) Training](#always-packed-state-blind-training).
 
 ### Bring Your Own Decisions
 
@@ -599,3 +601,118 @@ split.
 | Test cross-entropy | 0.001 | 0.024 |
 | Stage size | ~170 MB (adapter only) | ~48 GB (sharded and consolidated) |
 | Export | merged into a ~17 GB bf16 checkpoint | cast to the base dtypes, ~17 GB |
+
+---
+
+## Always-Packed (State-Blind) Training
+
+Some decision checkpoints read **all questions about one state in a single sequence**: the state once, then each
+question with its own mask token. The recipe trains and evaluates in that layout with `data.packed_read: true`, and
+the default (`false`) keeps one question per read exactly as described above.
+
+### Packed Read Layout
+
+```text
+[state ... <SPECIAL_101>][question 1 ... <mask>][question 2 ... <mask>] ... [question n ... <mask>]
+```
+
+| Rule | Packed read |
+|---|---|
+| Prompt | `data.prompt_format: json-sep`: the same JSON user turn with the state-end token (`<SPECIAL_101>`) right after the state value, `{"state": ...<SPECIAL_101>, "question": ..., "options": [...]}`. The state is the prompt up to and including that token. |
+| Attention | The state attends only to the state. Each question attends to the state and to itself, never to another question. |
+| Positions | The state takes positions `0` to `S-1`, where `S` is the state length; every question restarts at `S`. |
+| Read slots | Each question is read at its own mask token, with the decision head restricted to its option codes. |
+
+A question therefore gets the same token IDs, positions, and attention whatever other questions share its read, so its
+answer never depends on them. The recipe builds the attention as a dense mask for SDPA (or eager) attention.
+Control-token text inside the state or a question is still encoded as plain text; only the inserted state-end token
+is a control token.
+
+### When to Use It
+
+Use packed reads for checkpoints trained for them (their `config.json` declares `"prompt_format": "json-sep"` and a
+`read_layout` block) and for tasks that ask several questions about the same state. One read scores every question of
+a state, so the state is encoded once instead of once per question. **Train state-blind (always packed), serve either
+way:** a LoRA trained on packed reads keeps its gain when served one question per read, while a LoRA trained one
+question per read loses most of its gain when served packed.
+
+Task test accuracy (%) with LoRA (rank 32, alpha 64, about 125 steps) on an 8B always-packed decision checkpoint,
+held-out multi-question task with 2 to 6 questions per state:
+
+| LoRA trained in ↓ / served in → | state-blind (always packed) | state-aware (single read) |
+|---|---:|---:|
+| no LoRA (base) | 79.4 | 80.4 |
+| state-blind (always packed) | 84.1 | 84.3 |
+| state-aware (single read) | 81.1 | 85.1 |
+
+General decision accuracy moved by −0.2 to −0.3 points.
+
+### Train and Evaluate Packed
+
+`examples/decision/nemotron_decision_soc_triage_packed_lora.yaml` is the SOC configuration with packed reads:
+
+```yaml
+data:
+  packed_read: true        # one read per alert: [state][question 1, mask][question 2, mask] ...
+  prompt_format: json-sep  # the state-end token closes the state
+
+train:
+  global_batch_size: 16    # packed rows (alerts) per optimizer step
+```
+
+- **Data**: every SystemOne record is one packed row with all of its supervised questions. For one-decision-per-line
+  JSONL, `prepare_nemotron_decision_data.py --packed-read` merges the lines that share a state and `group` into one
+  multi-question record (each question keyed by its line's `id`); every question stays in the split its line would
+  be in. Soft labels stay per question.
+- **Length**: a record whose packed read is longer than `data.max_tokens` is split into several reads of the same
+  state, which changes no answer. A question whose own prompt plus mask is longer is skipped and counted, as in single
+  reads.
+- **Loss**: a row's loss is the configured `DecisionLoss` over its questions (hard labels, soft labels, or gold
+  cross-entropy plus `soft_label_kl_weight` KL), which is the mean over the questions; each optimizer step averages
+  its rows. `train.canonical_fraction` decides the option shuffle per question.
+- **Evaluation**: one packed read per state and one prediction per question. `metrics_{split}.json` reports
+  per-question metrics (`accuracy`, `nll`, `brier`, `ece`, and `questions` by question ID) and per-state all-correct
+  (`exact_match`, over `records`); `run.packed_reads` counts the reads. `predictions_{split}.jsonl` has one line per
+  question.
+
+```bash
+# packed (state-blind) LoRA; validation selects the stage on packed reads
+automodel examples/decision/nemotron_decision_soc_triage_packed_lora.yaml --output_dir runs/soc/packed_lora
+# the same stage, read one question per sequence
+automodel examples/decision/nemotron_decision_soc_triage_packed_lora.yaml --mode eval --data.packed_read false \
+    --init_from runs/soc/packed_lora/LOWEST_VAL --output_dir runs/soc/packed_lora_single
+```
+
+The prompt format is part of a stage's identity, and the read is not: a stage trained packed loads for
+single-read evaluation (`data.packed_read: false`, same `data.prompt_format`), and a stage trained one question per read
+loads for packed evaluation.
+
+### Export
+
+The export records how the stage reads in `config.json`, with the same keys as released always-packed checkpoints:
+
+```json
+{
+  "prompt_format": "json-sep",
+  "packed_read": true,
+  "read_layout": {
+    "packed_read": true,
+    "prompt_format": "json-sep",
+    "state_end_token": "<SPECIAL_101>",
+    "state_end_token_id": 101,
+    "state_end": "state = the prompt up to and including the state_end_token (right after the state value)",
+    "mask_token": "<SPECIAL_100>",
+    "mask_token_id": 100,
+    "layout": "[state][question 1 + mask][question 2 + mask] ... in request order",
+    "attention": "state->state; question->state+self; no question<->question",
+    "positions": "state 0..|S|-1; each question restarts at |S|",
+    "read_slot": "each question's mask token; softmax over its option-code tokens",
+    "single_read": "packed_read false: one bidirectional sequence per question (prompt + mask), read at its mask"
+  }
+}
+```
+
+`packed_read` is the default read of the exported checkpoint; `--packed-read off` (or `on`) on
+`export_nemotron_decision.py` writes the other default without retraining. Keys the base `read_layout` already has
+(for example a reference packer file it ships) are kept. A stage trained with the default JSON prompt exports the
+base configuration unchanged.

@@ -15,9 +15,11 @@
 """SystemOne records for Nemotron Decision post-training: one-question encoding and one-decision JSONL conversion.
 
 The recipe reads SystemOne records (``{"id", "state", "questions", "answers"}`` plus optional ``rewards``,
-``soft_labels`` and ``meta``) and reads every question of a record through its own serving prompt. Simple
-one-decision-per-line JSONL (``state``, ``question``, ``type``, ``options``, ``label``, optional ``soft_labels`` and
-``group``) converts to single-question records, with ``group`` kept in ``meta`` for group-disjoint splits.
+``soft_labels`` and ``meta``) and reads every question of a record through its own serving prompt, or, with packed
+reads, all questions of a record in one read. Simple one-decision-per-line JSONL (``state``, ``question``, ``type``,
+``options``, ``label``, optional ``soft_labels`` and ``group``) converts to single-question records, with ``group`` kept
+in ``meta`` for group-disjoint splits; :func:`merge_by_state` then keeps the questions of one state together as one
+multi-question record.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
+    DEFAULT_STATE_END_TOKEN,
     DecisionContract,
     PreparedQuestion,
     prepare_question,
@@ -126,6 +129,48 @@ def convert_simple_line(line: dict[str, Any], number: int = 0) -> dict[str, Any]
     return record
 
 
+def merge_by_state(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge single-question records from :func:`convert_simple_line` that share a state and ``meta`` (group).
+
+    Records merge when their states serialize to the same JSON (key order included, so the merged record renders the
+    state exactly as each line did) and their ``meta`` is equal. The merged record keeps the first record's ``id``,
+    state and ``meta``; each question is keyed by its line's record ``id``, with that line's answer and soft labels.
+    Merged records keep the order of their first line. :func:`in_heldout` keys on ``meta.group`` or the state, so every
+    question lands in the same split as its line would.
+
+    Args:
+        records: Single-question records with unique IDs.
+
+    Returns:
+        Multi-question records (a state with one line stays a one-question record, keyed by the line's ID).
+
+    Raises:
+        ValueError: If a record does not have exactly one question, or record IDs repeat.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    for record in records:
+        if len(record["questions"]) != 1:
+            raise ValueError(f"record {record['id']!r}: merge_by_state takes single-question records")
+        record_id = str(record["id"])
+        if record_id in seen:
+            raise ValueError(f"duplicate record ID {record_id!r}")
+        seen.add(record_id)
+        key = json.dumps([record["state"], record.get("meta")], ensure_ascii=False)
+        if key not in merged:
+            merged[key] = {"id": record_id, "state": record["state"], "questions": {}}
+            if "meta" in record:
+                merged[key]["meta"] = record["meta"]
+        target = merged[key]
+        ((question_id, question),) = record["questions"].items()
+        target["questions"][record_id] = question
+        if question_id in (record.get("answers") or {}):
+            target.setdefault("answers", {})[record_id] = record["answers"][question_id]
+        if question_id in (record.get("soft_labels") or {}):
+            target.setdefault("soft_labels", {})[record_id] = record["soft_labels"][question_id]
+    return list(merged.values())
+
+
 def in_heldout(record: dict[str, Any], fraction: float, seed: str | int) -> bool:
     """Deterministic group-disjoint split: hash of ``seed|meta.group`` (or the state) below ``fraction``."""
     key = (record.get("meta") or {}).get("group") or json.dumps(record["state"], sort_keys=True, ensure_ascii=False)
@@ -153,6 +198,8 @@ def encode_question(
     mask_token_id: int,
     max_tokens: int,
     shuffle_seed: int | None = None,
+    prompt_format: str = "json",
+    state_end_token: str = DEFAULT_STATE_END_TOKEN,
 ) -> PreparedQuestion | None:
     """Encode one question of a record as its decision prompt, or ``None`` if this model cannot read it.
 
@@ -168,6 +215,8 @@ def encode_question(
         mask_token_id: The checkpoint's mask token.
         max_tokens: Longest allowed prompt including the mask slot.
         shuffle_seed: Option-shuffle seed (``None`` keeps the checkpoint's option order).
+        prompt_format: ``json`` or ``json-sep`` (see :func:`prepare_question`).
+        state_end_token: The token that closes the state in ``json-sep`` prompts.
     """
     if has_media(record):
         return None
@@ -180,6 +229,8 @@ def encode_question(
             record["questions"][question_id],
             mask_token_id=mask_token_id,
             shuffle_seed=shuffle_seed,
+            prompt_format=prompt_format,
+            state_end_token=state_end_token,
         )
     except ValueError:
         return None

@@ -139,3 +139,66 @@ def test_questions_this_model_cannot_read_are_not_encoded(tmp_path):
     assert (
         encode_question(tok, contract, record, "decision", mask_token_id=mask, max_tokens=length) is None
     )  # the mask slot must fit too
+
+
+def test_merge_by_state_keeps_a_states_questions_together_and_the_splits_unchanged():
+    from nemo_automodel.components.models.nemotron_decision.records import merge_by_state
+
+    lines = []
+    for i in range(60):
+        state = {"ticket": f"ticket {i // 3}"}
+        lines.append({**LINE, "id": f"t{i}", "state": state, "group": f"g{i // 6}"})
+    lines.append({**LINE, "id": "other-key-order", "state": {"b": 1, "a": 2}})
+    lines.append({**LINE, "id": "same-values", "state": {"a": 2, "b": 1}})  # key order differs: not merged
+    lines.append(
+        {
+            "id": "n1",
+            "state": {"ticket": "ticket 0"},
+            "question": "Urgent?",
+            "type": "noul",
+            "label": "yes",
+            "group": "g0",
+        }
+    )
+    records = [convert_simple_line(line) for line in lines]
+    merged = merge_by_state(records)
+    for record in merged:
+        validate_record(record)
+    first = merged[0]
+    assert first["id"] == "t0" and list(first["questions"]) == ["t0", "t1", "t2", "n1"]
+    assert first["answers"] == {"t0": "billing", "t1": "billing", "t2": "billing", "n1": "true"}
+    assert set(first["soft_labels"]) == {"t0", "t1", "t2"} and first["meta"] == {"group": "g0"}
+    assert len(merged) == 20 + 2 and sum(len(r["questions"]) for r in merged) == len(records)
+    # Every question lands in the split its line would.
+    by_line = {r["id"]: in_heldout(r, 0.3, "0") for r in records}
+    for record in merged:
+        assert {by_line[qid] for qid in record["questions"]} == {in_heldout(record, 0.3, "0")}
+    with pytest.raises(ValueError, match="single-question"):
+        merge_by_state(merged[:1] + [merged[0]])
+    with pytest.raises(ValueError, match="duplicate"):
+        merge_by_state([records[0], records[0]])
+
+
+def test_json_sep_questions_of_a_record_share_the_state_prefix(tmp_path):
+    from nemo_automodel.components.models.nemotron_decision.packed import shared_state_length
+    from tests.unit_tests.models.nemotron_decision.char_tokenizer import STATE_END
+
+    tok = char_tokenizer()
+    contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt"))
+    mask = tok.convert_tokens_to_ids(MASK)
+    record = {
+        "id": "r1",
+        "state": {"alert": "x"},
+        "questions": {
+            "a": {"type": "noul", "instructions": "?"},
+            "b": {"type": "score", "instructions": "How bad?", "criteria": ["low", "high"]},
+        },
+    }
+    prompts = [
+        encode_question(tok, contract, record, qid, mask_token_id=mask, max_tokens=4096, prompt_format="json-sep")
+        for qid in record["questions"]
+    ]
+    state_length = shared_state_length([p.input_ids for p in prompts], tok.convert_tokens_to_ids(STATE_END))
+    assert all(p.state_length == state_length for p in prompts)
+    plain = encode_question(tok, contract, record, "a", mask_token_id=mask, max_tokens=4096)
+    assert len(prompts[0].input_ids) == len(plain.input_ids) + 1  # json-sep adds exactly the state-end token

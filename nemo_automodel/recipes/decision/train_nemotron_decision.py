@@ -32,6 +32,15 @@ the starting checkpoint (step 0) is a saved, selectable stage; backbone fine-tun
 the test split separately; the validation split is not an untouched test. Export a selected stage as a complete
 servable checkpoint with ``examples/decision/export_nemotron_decision.py``.
 
+Packed (state-blind) reads, ``data.packed_read: true`` (needs ``data.prompt_format: json-sep``): all supervised
+questions of a record are read in one sequence, ``[state][question 1, mask][question 2, mask] ...``: the state attends
+only to the state, each question to the state and itself (never to another question), question positions restart after
+the state, and each question is read at its own mask (``packed.py``). A record whose packed read exceeds
+``data.max_tokens`` is split into several reads of the same state, which changes no answer. ``train.global_batch_size``
+then counts packed rows (states) per step; a row's loss is the mean over its questions and a step averages its rows.
+Evaluation reads each record once and reports per-question metrics and per-state all-correct (``exact_match``). The
+same stage reads one question per sequence with ``data.packed_read: false``, so either read can serve it.
+
 Run with::
 
     automodel examples/decision/nemotron_decision_support_routing_lora.yaml --nproc-per-node 1
@@ -47,6 +56,7 @@ import logging
 import math
 import random
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -69,15 +79,25 @@ from nemo_automodel.components.eval.decision.metrics import DecisionEvaluator, s
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
-from nemo_automodel.components.models.nemotron_decision.export import checkpoint_fingerprint
+from nemo_automodel.components.models.nemotron_decision.export import checkpoint_fingerprint, read_layout_block
+from nemo_automodel.components.models.nemotron_decision.packed import (
+    PackedRead,
+    pack_prompts,
+    packed_length,
+    shared_state_length,
+    split_into_reads,
+)
 from nemo_automodel.components.models.nemotron_decision.records import encode_question
 from nemo_automodel.components.models.nemotron_decision.scorer import (
     full_finetune_trainable,
     gather_head_rows,
     option_logits,
+    packed_option_logits,
     require_decision_config,
 )
 from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
+    DEFAULT_STATE_END_TOKEN,
+    PROMPT_FORMATS,
     DecisionContract,
     PreparedQuestion,
     readout_token_ids,
@@ -122,8 +142,31 @@ class _Decision:
     target: QuestionTarget
 
 
+@dataclasses.dataclass(frozen=True)
+class _PackedRow:
+    """Supervised questions of one record (one state) read together in one packed read.
+
+    Attributes:
+        record: The validated SystemOne record that holds the questions.
+        prompts: ``json-sep`` prompts of the questions, in record order; they share the state prefix.
+        targets: Supervision aligned with each prompt's ``labels``.
+    """
+
+    record: dict[str, Any]
+    prompts: tuple[PreparedQuestion, ...]
+    targets: tuple[QuestionTarget, ...]
+
+
 class TrainNemotronDecisionRecipe(BaseRecipe):
     """LoRA or full post-training of Nemotron 3.5 Decision checkpoints (see module docstring)."""
+
+    # Read settings (``data.packed_read``, ``data.prompt_format``, ``data.state_end_token``); setup() sets them from
+    # the config. The defaults are one question per read with the plain JSON prompt.
+    packed_read: bool = False
+    prompt_format: str = "json"
+    state_end_token: str = DEFAULT_STATE_END_TOKEN
+    state_end_token_id: int | None = None
+    read_layout: dict[str, Any] | None = None
 
     def __init__(self, cfg: RecipeConfig | ConfigNode) -> None:
         """Store the recipe configuration."""
@@ -160,6 +203,27 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         hf_config = AutoConfig.from_pretrained(model_path, revision=revision)
         require_decision_config(hf_config)
         self.contract = DecisionContract.from_pretrained(model_path, revision=revision)
+        self.packed_read = bool(self.cfg.get("data.packed_read", False))
+        self.prompt_format = str(self.cfg.get("data.prompt_format", "json"))
+        if self.prompt_format not in PROMPT_FORMATS:
+            raise ValueError(f"data.prompt_format must be one of {PROMPT_FORMATS}, got {self.prompt_format!r}")
+        if self.packed_read and self.prompt_format != "json-sep":
+            raise ValueError(
+                "data.packed_read needs data.prompt_format: json-sep (the state-end token closes the state)"
+            )
+        declared_layout = getattr(hf_config, "read_layout", None) or {}
+        self.state_end_token = str(
+            self.cfg.get("data.state_end_token", None)
+            or declared_layout.get("state_end_token")
+            or DEFAULT_STATE_END_TOKEN
+        )
+        declared_format = getattr(hf_config, "prompt_format", None)
+        if declared_format is not None and declared_format != self.prompt_format and self.dist_env.is_main:
+            logger.warning(
+                "the checkpoint declares prompt_format=%r but data.prompt_format=%r",
+                declared_format,
+                self.prompt_format,
+            )
 
         (
             self.distributed_setup,
@@ -189,15 +253,22 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
             raise ValueError("the decision head must exist and stay frozen; exclude it from peft target modules")
         if any(p.requires_grad for p in self.model.get_input_embeddings().parameters()):
             raise ValueError("the input embeddings must stay frozen")
+        if self.packed_read and self.model.config._attn_implementation not in ("sdpa", "eager"):
+            raise ValueError("data.packed_read needs model.attn_implementation sdpa or eager (a dense attention mask)")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision)
+        self.state_end_token_id = None
+        if self.prompt_format == "json-sep":
+            if self.state_end_token not in self.tokenizer.added_tokens_encoder:
+                raise ValueError(f"the tokenizer has no {self.state_end_token!r} token for json-sep prompts")
+            self.state_end_token_id = int(self.tokenizer.convert_tokens_to_ids(self.state_end_token))
         self.max_tokens = int(self.cfg.get("data.max_tokens", 8192))
         read_limit = min(self.contract.max_input_tokens, int(hf_config.max_position_embeddings))
         if not 0 < self.max_tokens <= read_limit:
             raise ValueError(f"data.max_tokens must be in [1, {read_limit}] (the checkpoint's read limit)")
         self.slice_keys = list(self.cfg.get("data.slice_keys", []) or [])
         self.records: dict[str, list[dict[str, Any]]] = {}
-        self.decisions: dict[str, list[_Decision]] = {}
+        self.decisions: dict[str, list[_Decision]] | dict[str, list[_PackedRow]] = {}
         self.skipped: dict[str, int] = {}
         for split in ("train", "validation", "test"):
             path = self.cfg.get(f"data.{split}", None)
@@ -209,7 +280,8 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
             for record in records:
                 validate_record(record)
             self.records[split] = records
-            self.decisions[split], self.skipped[split] = self._encode_split(records, train=split == "train")
+            encode = self._encode_packed_split if self.packed_read else self._encode_split
+            self.decisions[split], self.skipped[split] = encode(records, train=split == "train")
             if not self.decisions[split]:
                 raise ValueError(f"data.{split} has no supervised text decisions")
             if self.skipped[split] and self.dist_env.is_main:
@@ -221,8 +293,7 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
                 )
         if self.mode == "train" and "train" not in self.decisions:
             raise ValueError("data.train is required for mode=train")
-        validation = self.decisions.get("validation", [])
-        if self.mode == "train" and validation and not any(d.target.label >= 0 for d in validation):
+        if self.mode == "train" and "validation" in self.decisions and not self._labelled("validation"):
             raise ValueError("data.validation needs gold answers: stages are selected by validation accuracy")
         token_ids = list(readout_token_ids(self.tokenizer, self.contract))
         rows = gather_head_rows(self.model, token_ids).to(self.device)
@@ -248,6 +319,20 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
             "decision_contract_sha256": self.contract.sha256,
             "max_tokens": self.max_tokens,
         }
+        # The prompt format is part of a stage's identity; the read (packed or single) is not, so a state-blind
+        # stage also loads for single-read evaluation. Defaults (json prompts, single reads) add no keys.
+        self.read_layout = None
+        if self.prompt_format != "json":
+            self.identity["prompt_format"] = self.prompt_format
+            self.identity["state_end_token_id"] = self.state_end_token_id
+            self.read_layout = read_layout_block(
+                packed_read=self.packed_read,
+                prompt_format=self.prompt_format,
+                state_end_token=self.state_end_token,
+                state_end_token_id=self.state_end_token_id,
+                mask_token=self.tokenizer.convert_ids_to_tokens(self.mask_token_id),
+                mask_token_id=self.mask_token_id,
+            )
         init_from = self.cfg.get("init_from", None)
         if init_from:
             self._load_stage(Path(init_from))
@@ -274,14 +359,7 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         decisions, skipped = [], 0
         for record in records:
             for question_id in record["questions"]:
-                prompt = encode_question(
-                    self.tokenizer,
-                    self.contract,
-                    record,
-                    question_id,
-                    mask_token_id=self.mask_token_id,
-                    max_tokens=self.max_tokens,
-                )
+                prompt = self._encode(record, question_id)
                 if prompt is None:
                     skipped += 1
                     continue
@@ -293,6 +371,78 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
                 if keep:
                     decisions.append(_Decision(record, prompt, target))
         return decisions, skipped
+
+    def _encode_packed_split(self, records: list[dict[str, Any]], *, train: bool) -> tuple[list[_PackedRow], int]:
+        """Encode the supervised questions of each record as packed rows (``data.packed_read``).
+
+        Keeps the same questions as :meth:`_encode_split`. A record whose packed read is longer than
+        ``data.max_tokens`` is split into several rows of the same state (no answer depends on the other questions of
+        its read); a question whose own read is longer is skipped, as in single reads.
+
+        Args:
+            records: Validated SystemOne records of one split.
+            train: Whether the split trains the model.
+
+        Returns:
+            The packed rows, and the number of questions this model cannot read.
+        """
+        rows, skipped = [], 0
+        for record in records:
+            kept: list[tuple[PreparedQuestion, QuestionTarget]] = []
+            for question_id in record["questions"]:
+                prompt = self._encode(record, question_id)
+                if prompt is None:
+                    skipped += 1
+                    continue
+                target = self._target(record, prompt)
+                if train:
+                    keep = float(self.loss_fn.normalization_weight(self._row_targets(record, [target]))) > 0
+                else:
+                    keep = target.label >= 0 or target.rewards is not None
+                if keep:
+                    kept.append((prompt, target))
+            if not kept:
+                continue
+            state_length = shared_state_length([p.input_ids for p, _ in kept], self.state_end_token_id)
+            for read in split_into_reads(state_length, [len(p.input_ids) for p, _ in kept], self.max_tokens):
+                rows.append(_PackedRow(record, tuple(kept[i][0] for i in read), tuple(kept[i][1] for i in read)))
+        return rows, skipped
+
+    def _encode(self, record: dict[str, Any], question_id: str, shuffle_seed: int | None = None):
+        """``encode_question`` with this run's tokenizer, contract, mask, limit and prompt format."""
+        return encode_question(
+            self.tokenizer,
+            self.contract,
+            record,
+            question_id,
+            mask_token_id=self.mask_token_id,
+            max_tokens=self.max_tokens,
+            shuffle_seed=shuffle_seed,
+            prompt_format=self.prompt_format,
+            state_end_token=self.state_end_token,
+        )
+
+    def _labelled(self, split: str) -> int:
+        """Number of questions of ``split`` with a gold answer."""
+        if self.packed_read:
+            return sum(target.label >= 0 for row in self.decisions[split] for target in row.targets)
+        return sum(decision.target.label >= 0 for decision in self.decisions[split])
+
+    def _row_targets(
+        self, record: dict[str, Any], targets: list[QuestionTarget], device: torch.device | None = None
+    ) -> DecisionTargets:
+        """Loss targets of one record's questions with the configured question weights, on ``device`` (CPU default)."""
+        return DecisionTargets.from_questions(
+            record_ids=[str(record["id"])],
+            questions=[targets],
+            question_weights=self.loss_config.question_weights,
+            device=device,
+        )
+
+    def _pack(self, prompts: tuple[PreparedQuestion, ...]) -> PackedRead:
+        """The packed read of prompts that share a state."""
+        state_length = shared_state_length([p.input_ids for p in prompts], self.state_end_token_id)
+        return pack_prompts([p.input_ids for p in prompts], state_length=state_length, mask_token_id=self.mask_token_id)
 
     @staticmethod
     def _target(record: dict[str, Any], prompt: PreparedQuestion) -> QuestionTarget:
@@ -331,6 +481,8 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         Returns:
             The evaluator summary and its per-decision predictions, identical on every rank.
         """
+        if self.packed_read:
+            return self._evaluate_packed(split)
         self.model.eval()
         decisions = self.decisions[split]
         world = self._get_dp_group_size()
@@ -358,6 +510,52 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         self.model.train()
         return evaluator.summary(), evaluator.predictions()
 
+    def _packed_logits(
+        self, row: _PackedRow, prompts: tuple[PreparedQuestion, ...] | None = None
+    ) -> list[torch.Tensor]:
+        """Option logits of every question of a packed row (``prompts`` overrides the row's canonical prompts)."""
+        prompts = prompts or row.prompts
+        return packed_option_logits(
+            self.model,
+            self._pack(prompts),
+            [p.code_token_ids for p in prompts],
+            rows=self.head_rows,
+            device=self.device,
+        )
+
+    @torch.no_grad()
+    def _evaluate_packed(self, split: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """:meth:`evaluate` with one packed read per row: one prediction per question, metrics per question and state.
+
+        The evaluator's ``exact_match`` is the share of states (records) with every labelled question correct.
+        """
+        self.model.eval()
+        rows = self.decisions[split]
+        world = self._get_dp_group_size()
+        shard = pad_and_shard_records(range(len(rows)), rank=self._get_dp_rank(), world_size=world)
+        local = {index: [x.log_softmax(-1).tolist() for x in self._packed_logits(rows[index])] for index in shard}
+        gathered: list[dict[int, list[list[float]]]] = [local]
+        if dist.is_initialized() and world > 1:
+            gathered = [{} for _ in range(world)]
+            dist.all_gather_object(gathered, local, group=self._get_dp_group())
+        log_probs: dict[int, list[list[float]]] = {}
+        for part in gathered:
+            log_probs.update(part)
+        evaluator = DecisionEvaluator(slice_keys=self.slice_keys)
+        for index, row in enumerate(rows):
+            for target, values in zip(row.targets, log_probs[index], strict=True):
+                evaluator.add(
+                    str(row.record["id"]),
+                    target.question_id,
+                    target.option_ids,
+                    [math.exp(value) for value in values],
+                    target.label,
+                    target.rewards,
+                    row.record.get("meta"),
+                )
+        self.model.train()
+        return evaluator.summary(), evaluator.predictions()
+
     # ------------------------------------------------------------------ stage I/O
     def _save_stage(self, path: Path, validation: dict[str, Any] | None) -> None:
         """Publish the trainable weights (LoRA adapter or consolidated full weights) as an immutable stage."""
@@ -366,7 +564,10 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         value = selection_value(validation["correct"], validation["nll"]) if validation else None
 
         def write_metadata() -> None:
-            (path / "stage.json").write_text(json.dumps({**self.identity, "validation": validation}, indent=2))
+            manifest = {**self.identity, "validation": validation}
+            if self.read_layout is not None:
+                manifest["read_layout"] = self.read_layout
+            (path / "stage.json").write_text(json.dumps(manifest, indent=2))
             if value is not None:
                 (path / "losses.json").write_text(json.dumps({"selection": value}))
 
@@ -413,6 +614,9 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
             "init_from": str(self.cfg.get("init_from", None)),
             "skipped_questions": self.skipped[split],
         }
+        if self.packed_read:
+            summary["run"]["packed_read"] = True
+            summary["run"]["packed_reads"] = len(self.decisions[split])
         if self.dist_env.is_main:
             save_summary(summary, self.output_dir / f"metrics_{split}.json")
             with (self.output_dir / f"predictions_{split}.jsonl").open("w") as handle:
@@ -438,7 +642,7 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         if "validation" not in self.decisions:
             return None
         overall = self.evaluate("validation")[0]["overall"]
-        labelled = sum(decision.target.label >= 0 for decision in self.decisions["validation"])
+        labelled = self._labelled("validation")
         record = {
             "accuracy": overall["accuracy"],
             "correct": round(overall["accuracy"] * labelled),
@@ -447,6 +651,93 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         }
         self._log("validation.jsonl", {"step": step, **record})
         return record
+
+    def _single_window(
+        self,
+        decisions: list[_Decision],
+        window: list[int],
+        *,
+        rank: int,
+        world: int,
+        epoch: int,
+        canonical_fraction: float,
+    ) -> torch.Tensor:
+        """Forward and backward of one optimizer window of one-question reads; returns this rank's window-loss share."""
+        reads = []
+        for j in range(len(window) // world):
+            index = window[j * world + rank]
+            decision = decisions[index]
+            seed = index * 1000003 + self.seed + epoch
+            shuffle = None if random.Random(seed).random() < canonical_fraction else seed
+            prompt = self._encode(decision.record, decision.prompt.question_id, shuffle) or decision.prompt
+            targets = self._targets(decision.record, self._target(decision.record, prompt), self.device)
+            reads.append((decision, prompt, targets, self.loss_fn.normalization_weight(targets)))
+        # Normalize over the eligible question weights of the whole window on every DP rank.
+        window_weight = torch.stack([weight for *_, weight in reads]).sum()
+        if dist.is_initialized() and world > 1:
+            dist.all_reduce(window_weight, group=self._get_dp_group())
+        window_loss = torch.zeros((), device=self.device)
+        for decision, prompt, targets, weight in reads:
+            scores = QuestionLogits(str(decision.record["id"]), prompt.question_id, prompt.labels, self._logits(prompt))
+            assembled = assemble_decision_batch(logits=[[scores]], targets=targets)
+            loss, _ = self.loss_fn(assembled.logits, assembled.targets)
+            share = weight / window_weight
+            # FSDP averages gradients over the DP ranks; scaling by the DP size keeps each read's window share.
+            (loss * (world * share)).backward()
+            window_loss += loss.detach() * share
+        return window_loss
+
+    def _train_prompts(self, row: _PackedRow, seed: int, canonical_fraction: float) -> tuple[PreparedQuestion, ...]:
+        """Training prompts of a packed row: each question keeps or shuffles its options with its own coin.
+
+        Falls back to the canonical prompts if a shuffled question cannot be encoded or the shuffled read no longer
+        fits ``data.max_tokens``.
+        """
+        prompts = []
+        for k, prompt in enumerate(row.prompts):
+            question_seed = zlib.crc32(f"{seed}|{k}".encode())
+            shuffle = None if random.Random(question_seed).random() < canonical_fraction else question_seed
+            prompts.append(prompt if shuffle is None else self._encode(row.record, prompt.question_id, shuffle))
+        if any(p is None for p in prompts):
+            return row.prompts
+        lengths = [len(p.input_ids) for p in prompts]
+        if packed_length(row.prompts[0].state_length, lengths) > self.max_tokens:
+            return row.prompts
+        return tuple(prompts)
+
+    def _packed_window(
+        self, rows: list[_PackedRow], window: list[int], *, rank: int, world: int, epoch: int, canonical_fraction: float
+    ) -> torch.Tensor:
+        """Forward and backward of one optimizer window of packed rows; returns this rank's window-loss share.
+
+        Each row's loss is the objective's (weighted) mean over its questions; the window averages its rows over every
+        DP rank.
+        """
+        items = []
+        for j in range(len(window) // world):
+            index = window[j * world + rank]
+            row = rows[index]
+            prompts = self._train_prompts(row, index * 1000003 + self.seed + epoch, canonical_fraction)
+            targets = self._row_targets(row.record, [self._target(row.record, p) for p in prompts], self.device)
+            supervised = (self.loss_fn.normalization_weight(targets) > 0).float()
+            items.append((row, prompts, targets, supervised))
+        window_rows = torch.stack([supervised for *_, supervised in items]).sum()
+        if dist.is_initialized() and world > 1:
+            dist.all_reduce(window_rows, group=self._get_dp_group())
+        window_loss = torch.zeros((), device=self.device)
+        for row, prompts, targets, supervised in items:
+            logits = self._packed_logits(row, prompts)
+            scores = [
+                QuestionLogits(str(row.record["id"]), prompt.question_id, prompt.labels, values)
+                for prompt, values in zip(prompts, logits, strict=True)
+            ]
+            assembled = assemble_decision_batch(logits=[scores], targets=targets)
+            loss, _ = self.loss_fn(assembled.logits, assembled.targets)
+            share = supervised / window_rows
+            # FSDP averages gradients over the DP ranks; scaling by the DP size keeps each row's window share.
+            (loss * (world * share)).backward()
+            window_loss += loss.detach() * share
+        return window_loss
 
     def _train(self) -> Path:
         """Train; returns the validation-selected stage (the last stage when there is no validation split)."""
@@ -457,7 +748,8 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
             raise ValueError(f"train.global_batch_size={batch} must be a positive multiple of the DP size {world}")
         decisions = self.decisions["train"]
         if len(decisions) < batch:
-            raise ValueError(f"{len(decisions)} training decisions < train.global_batch_size {batch}")
+            noun = "packed rows" if self.packed_read else "decisions"
+            raise ValueError(f"{len(decisions)} training {noun} < train.global_batch_size {batch}")
         accum = batch // world
         steps_per_epoch = len(decisions) // batch
         total = int(self.cfg.get("train.max_steps", 0) or 0) or max(
@@ -494,6 +786,10 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
                 "trainable_parameters": sum(p.numel() for p in trainable),
                 **self.identity,
             }
+            if self.packed_read:
+                config["train_decisions"] = sum(len(row.prompts) for row in decisions)
+                config["train_packed_rows"] = len(decisions)
+                config["read_layout"] = self.read_layout
             (self.output_dir / "run_config.json").write_text(json.dumps(config, indent=2))
 
         start = self._validate(0)
@@ -515,41 +811,14 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
                 random.Random(self.seed + epoch).shuffle(order)
             window = order[cursor : cursor + batch]
             cursor += batch
-            reads = []
-            for j in range(accum):
-                index = window[j * world + rank]
-                decision = decisions[index]
-                seed = index * 1000003 + self.seed + epoch
-                shuffle = None if random.Random(seed).random() < canonical_fraction else seed
-                prompt = (
-                    encode_question(
-                        self.tokenizer,
-                        self.contract,
-                        decision.record,
-                        decision.prompt.question_id,
-                        mask_token_id=self.mask_token_id,
-                        max_tokens=self.max_tokens,
-                        shuffle_seed=shuffle,
-                    )
-                    or decision.prompt
+            if self.packed_read:
+                window_loss = self._packed_window(
+                    decisions, window, rank=rank, world=world, epoch=epoch, canonical_fraction=canonical_fraction
                 )
-                targets = self._targets(decision.record, self._target(decision.record, prompt), self.device)
-                reads.append((decision, prompt, targets, self.loss_fn.normalization_weight(targets)))
-            # Normalize over the eligible question weights of the whole window on every DP rank.
-            window_weight = torch.stack([weight for *_, weight in reads]).sum()
-            if dist.is_initialized() and world > 1:
-                dist.all_reduce(window_weight, group=self._get_dp_group())
-            window_loss = torch.zeros((), device=self.device)
-            for decision, prompt, targets, weight in reads:
-                scores = QuestionLogits(
-                    str(decision.record["id"]), prompt.question_id, prompt.labels, self._logits(prompt)
+            else:
+                window_loss = self._single_window(
+                    decisions, window, rank=rank, world=world, epoch=epoch, canonical_fraction=canonical_fraction
                 )
-                assembled = assemble_decision_batch(logits=[[scores]], targets=targets)
-                loss, _ = self.loss_fn(assembled.logits, assembled.targets)
-                share = weight / window_weight
-                # FSDP averages gradients over the DP ranks; scaling by the DP size keeps each read's window share.
-                (loss * (world * share)).backward()
-                window_loss += loss.detach() * share
             grad_norm = clip_grad_norm(max_grad_norm, [self.model], device_mesh=self.device_mesh)
             for scheduler in schedulers:
                 scheduler.step(1)  # lr for this update: warmup (step+1)/warmup, then cosine to min_lr
