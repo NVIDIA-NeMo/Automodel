@@ -38,6 +38,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PRECOMPUTE = "nemo_automodel.components.speculative.precompute_eagle3"
 
 
+def test_cli_configures_logging_when_handler_already_exists(tmp_path: Path) -> None:
+    script = """
+import logging
+logging.warning("handler initialized before CLI")
+from nemo_automodel.components.speculative import precompute_eagle3
+precompute_eagle3._run = lambda args: logging.getLogger("precompute_test").info("configured info log")
+precompute_eagle3.main(["--target-model", "unused", "--input-data", "unused", "--output-dir", "unused"])
+"""
+    output = _run_cpu([sys.executable, "-c", script], tmp_path)
+    assert "configured info log" in output
+
+
 @pytest.fixture(scope="module")
 def tiny_qwen(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     """Create a local dense Qwen3 checkpoint and seven deterministic chat rows."""
