@@ -19,7 +19,9 @@ The starter config uses Qwen3-0.6B, a 512-token cap, three rollout steps, and th
 paper's depth cap of two and entropy coefficient of 0.01. CUDA training uses
 BF16 autocast with FP32 draft parameters. Supply an
 [UltraChat](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) subset
-in JSONL format with a `messages` list for each row.
+in JSONL format with a `messages` list for each row. The example keeps the first
+assistant turn so the stock Qwen3 template has stable prefixes for the
+recipe's answer-only loss mask.
 
 ```bash
 mkdir -p data
@@ -30,7 +32,9 @@ from datasets import load_dataset
 rows = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
 with open("data/ultrachat_train.jsonl", "w", encoding="utf-8") as stream:
     for row in rows.take(2048):
-        stream.write(json.dumps({"messages": row["messages"]}) + "\n")
+        messages = row["messages"]
+        end = next(i for i, message in enumerate(messages) if message["role"] == "assistant")
+        stream.write(json.dumps({"messages": messages[: end + 1]}) + "\n")
 PY
 ```
 
