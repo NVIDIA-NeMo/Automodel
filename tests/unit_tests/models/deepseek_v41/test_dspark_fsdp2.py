@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import os
-import socket
 from pathlib import Path
 
 import pytest
@@ -41,12 +39,6 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 _WORLD_SIZE = 2
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _config(dtype: str = "bfloat16") -> DeepseekV41TextConfig:
@@ -92,12 +84,10 @@ def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: t
     fully_shard(model, mesh=mesh, mp_policy=policy)
 
 
-def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir: str) -> None:
+def _worker(rank: int, init_file: str, activation_checkpointing: bool, checkpoint_dir: str) -> None:
     # Each spawned rank runs tiny CPU tensors; avoid competing intra-op pools.
     torch.set_num_threads(1)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=_WORLD_SIZE)
     try:
         torch.manual_seed(17)
         mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("dp",))
@@ -175,14 +165,13 @@ def test_bf16_dspark_fsdp_forward_backward_checkpoint_roundtrip(
     # Other unit-test modules disable compilation during collection. Spawned workers
     # import the fullgraph MoE activation afresh, so explicitly enable its compiler.
     monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
-    mp.spawn(_worker, args=(_free_port(), activation_checkpointing, str(tmp_path)), nprocs=_WORLD_SIZE, join=True)
+    init_file = tmp_path / "process-group"
+    mp.spawn(_worker, args=(str(init_file), activation_checkpointing, str(tmp_path)), nprocs=_WORLD_SIZE, join=True)
 
 
-def _parity_worker(rank: int, port: int) -> None:
+def _parity_worker(rank: int, init_file: str) -> None:
     """Compare two-rank FSDP2 gradients and updates with an FP32 reference."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=_WORLD_SIZE)
     try:
         torch.manual_seed(17)
         backend = BackendConfig(
@@ -250,7 +239,7 @@ def _parity_worker(rank: int, port: int) -> None:
     hard_timeout=70,
     reason="Spawns two FSDP workers and compares compiled draft gradients, clipping, and updates with an FP32 reference.",
 )
-def test_fp32_dspark_fsdp_gradient_and_step_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fp32_dspark_fsdp_gradient_and_step_parity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Restore the caller's environment after spawning, without changing other tests.
     monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
-    mp.spawn(_parity_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
+    mp.spawn(_parity_worker, args=(str(tmp_path / "process-group"),), nprocs=_WORLD_SIZE, join=True)
