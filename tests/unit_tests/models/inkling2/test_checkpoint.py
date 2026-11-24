@@ -419,7 +419,8 @@ def test_released_fp8_config_label_loads_the_mxfp8_checkpoint(tmp_path: Path, pe
     """``Inkling-2-Small-MXFP8`` labels ``config.json`` with Transformers' fine-grained FP8 config.
 
     The label is the Hub file's ``quantization_config`` since 2026-11-17; the expert layout still
-    comes from ``hf_quant_config.json``. PEFT loading adds ``dequantize`` to an FP8 label.
+    comes from ``hf_quant_config.json``. PEFT loading adds ``dequantize`` to an FP8 label; the
+    marked config builds the model when ``from_pretrained`` is given it as ``config=``.
     """
     _, checkpoint, expected = mixed_fixture(nvfp4_layer_count=0)
     write_checkpoint(checkpoint, tmp_path)
@@ -436,7 +437,9 @@ def test_released_fp8_config_label_loads_the_mxfp8_checkpoint(tmp_path: Path, pe
     config = get_hf_config(str(tmp_path), "sdpa")
     assert type(config) is Inkling2Config and config.quantization_config == label
     if peft:
-        # The target modules of the released Inkling2 LoRA recipe.
+        # ``from_pretrained(path, config=config, peft_config=...)`` resolves this same object, marks it,
+        # and builds the model from it. The targets are those of the released Inkling2 LoRA recipe.
+        assert get_hf_config(str(tmp_path), "sdpa", config=config) is config
         lora = PeftConfig(target_modules=["*.attn.qkvr", "*.attn.wo_ud", "*.mlp.experts"])
         assert _maybe_dequantize_fp8_for_peft(config.quantization_config, lora, str(tmp_path))
         label["dequantize"] = True
@@ -452,10 +455,11 @@ def test_released_fp8_config_label_loads_the_mxfp8_checkpoint(tmp_path: Path, pe
         checkpointer.close()
     for key, value in model.state_dict().items():
         torch.testing.assert_close(value, expected[key].to(value.dtype), rtol=0, atol=0, msg=key)
-    # FP8 labels of other encodings, such as 128x128 blocks or float scales, are not MXFP8.
+    # Other FP8 labels, such as 128x128 blocks, float scales or static activation scales, are rejected.
     for declaration in (
         {**label, "weight_block_size": [128, 128]},
         {key: value for key, value in label.items() if key != "scale_fmt"},
+        {**label, "activation_scheme": "static"},
         {**label, "ignored_layers": []},
     ):
         with pytest.raises(ValueError, match="quant_method='inkling2'"):

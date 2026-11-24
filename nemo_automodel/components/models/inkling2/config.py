@@ -76,7 +76,7 @@ class _ParameterGroup(TypedDict):
 _EXPERT_WEIGHT = re.compile(r"model\.llm\.layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)")
 _EXPERT_PROJECTIONS = ("w13_weight", "w2_weight")
 _FP8_LABEL_FIELDS = frozenset(
-    ("quant_method", "activation_scheme", "weight_block_size", "scale_fmt", "modules_to_not_convert", "dequantize")
+    ("quant_method", "activation_scheme", "weight_block_size", "scale_fmt", "modules_to_not_convert")
 )
 
 
@@ -84,10 +84,12 @@ def _is_released_label(
     declaration: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None,
 ) -> bool:
     if declaration is not None and declaration.get("quant_method") == "fp8":
+        # Every released field, plus the optional ``dequantize`` the PEFT loader may add.
         return (
-            declaration.get("scale_fmt") == "ue8m0"
+            set(declaration) - {"dequantize"} == _FP8_LABEL_FIELDS
+            and declaration.get("activation_scheme") == "dynamic"
+            and declaration.get("scale_fmt") == "ue8m0"
             and declaration.get("weight_block_size") == [1, 32]
-            and set(declaration) <= _FP8_LABEL_FIELDS
         )
     return (
         declaration is not None
