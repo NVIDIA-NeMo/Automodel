@@ -445,6 +445,36 @@ checkpoint:
 | `eagle4.candidate_head.rank`, `eagle4.candidate_head.num_candidates` | EAGLE-4 stage 2: train the low-rank candidate head (requires `draft_weights_path`) |
 | `warmup_ratio` | Fraction of total steps for LR warmup |
 
+### Optimizer and Precision
+
+The draft is stored in BF16, so by default (no `_target_`) the optimizer is `torch.optim.AdamW` with
+BF16 parameters and BF16 Adam moments. Updates smaller than half a BF16 spacing are then rounded away,
+which can stall training late in a cosine schedule or at a small learning rate, and the recipe logs a
+warning. The `optimizer:` block is read like the LLM recipes read theirs: `_target_` and the
+optimizer-specific keys reach the optimizer. For example, Transformer Engine `FusedAdam` with FP32
+master weights and FP32 moments:
+
+```yaml
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+  warmup_ratio: 0.015          # schedule keys stay on the recipe
+  min_lr_ratio: 0.0
+```
+
+This costs more optimizer memory and a larger `optim/` checkpoint. See the
+[mixed-precision training guide](/development/mixed-precision-training).
+
 ### Launch Training
 
 **Multi-GPU (8x A100, production):**

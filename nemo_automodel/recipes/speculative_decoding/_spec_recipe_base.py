@@ -28,7 +28,7 @@ import logging
 import os
 import pathlib
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import ClassVar, TypeAlias
 
 import torch
 import torch.distributed as dist
@@ -42,7 +42,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     make_warmup_cosine_schedule,
@@ -52,6 +54,10 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Values an ``optimizer:`` block can carry into the optimizer constructor (floats such as ``lr`` / ``eps``,
+# ints, bools such as ``master_weights``, dtype strings, ``betas`` sequences, or an explicit null).
+OptimizerKwarg: TypeAlias = float | int | bool | str | list[float] | tuple[float, ...] | None
 
 
 def _step_cadence_hit(every: int | None, step: int) -> bool:
@@ -77,14 +83,62 @@ class SpecDecodeRecipeBase(BaseRecipe):
     # Floor on the ratio-derived LR warmup length (see ``resolve_warmup_steps``).
     min_warmup_steps: ClassVar[int] = 1
 
-    def _build_draft_optimizer(self, opt_cfg) -> torch.optim.Optimizer:
-        """Build the draft optimizer (AdamW over the trainable parameters)."""
-        return torch.optim.AdamW(
-            [p for p in self.trainer_module.parameters() if p.requires_grad],
-            lr=self.peak_lr,
-            betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
-            weight_decay=opt_cfg.get("weight_decay", 0.0),
-        )
+    @staticmethod
+    def _resolve_optimizer_spec(opt_cfg: ConfigNode) -> tuple[str, dict[str, OptimizerKwarg]]:
+        """Normalize the recipe's ``optimizer:`` config into a ``build_optimizer`` spec.
+
+        Reads an optional ``_target_`` (a registry short name such as ``"fused_adam"``
+        or a dotted import path, e.g. ``transformer_engine.pytorch.optimizers.FusedAdam``)
+        plus whatever other fields the config carries -- ``lr``/``betas``/``weight_decay``
+        and any optimizer-specific kwargs (``eps``, ``master_weights``,
+        ``master_weight_dtype``, ``exp_avg_dtype``, ``exp_avg_sq_dtype``,
+        ``store_param_remainders``, ...) -- and returns the ``(target, kwargs)`` tuple
+        that ``build_optimizer`` resolves via its registry / dotted-import-path /
+        ``OptimizerFromFactoryConfig`` escape hatch. ``warmup_ratio`` and ``min_lr_ratio``
+        belong to the LR schedule and are dropped.
+
+        Absent an explicit ``_target_``, this defaults to plain ``torch.optim.AdamW``
+        with ``betas=(0.9, 0.95)`` and ``weight_decay=0.0`` unless the config sets them
+        (the previous hard-coded behavior, so configs that do not select an optimizer
+        are unaffected). Those two AdamW-shaped defaults are only injected in that
+        no-``_target_`` case: forcing them onto an arbitrary explicit ``_target_`` would
+        break optimizers that do not accept a ``betas`` kwarg (e.g. plain SGD).
+
+        Args:
+            opt_cfg: The ``optimizer:`` config node.
+
+        Returns:
+            The ``(target, kwargs)`` pair for ``build_optimizer``.
+        """
+        kwargs = dict(opt_cfg.to_dict())
+        # ConfigNode resolves ``_target_`` to the callable in ``to_dict``; recover the original
+        # import-path string via ``get_as_string``. Only call it when the key is actually
+        # present: ``ConfigNode.get_as_string`` raises ``KeyError`` for an absent key even
+        # with an explicit ``None`` default.
+        target = kwargs.pop("_target_", None)
+        if target is not None and hasattr(opt_cfg, "get_as_string"):
+            target = opt_cfg.get_as_string("_target_")
+        kwargs.pop("warmup_ratio", None)
+        kwargs.pop("min_lr_ratio", None)
+        kwargs["lr"] = float(kwargs["lr"])
+        if target is None:
+            target = "torch.optim.AdamW"
+            kwargs.setdefault("betas", (0.9, 0.95))
+            kwargs.setdefault("weight_decay", 0.0)
+        return target, kwargs
+
+    def _build_draft_optimizer(self, opt_cfg: ConfigNode) -> torch.optim.Optimizer:
+        """Build the draft optimizer through ``build_optimizer`` from the ``optimizer:`` config.
+
+        ``_target_`` and the optimizer-specific keys take effect (see
+        :meth:`_resolve_optimizer_spec`), and ``build_optimizer`` warns when a torch
+        Adam is paired with BF16-stored trainable parameters.
+        """
+        return build_optimizer(
+            self.trainer_module,
+            self._resolve_optimizer_spec(opt_cfg),
+            device_mesh=getattr(self, "dp_mesh", None),
+        )[0]
 
     def _setup_training_state(self, recipe_cfg) -> None:
         """Build the optimizer and LR schedule, read the loop / checkpoint cadence knobs,

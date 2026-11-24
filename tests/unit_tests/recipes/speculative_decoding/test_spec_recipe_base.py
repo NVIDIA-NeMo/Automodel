@@ -100,7 +100,7 @@ def _make_recipe(cls, tmp_path, *, is_async=False, cp_mesh=None, cfg=None):
 # --------------------------------------------------------------------------- #
 def _optim_recipe(tmp_path, dataloader):
     obj = _Recipe.__new__(_Recipe)
-    obj.cfg = SimpleNamespace(optimizer=_Cfg(lr=1e-3, warmup_ratio=0.25, min_lr_ratio=0.2))
+    obj.cfg = SimpleNamespace(optimizer=ConfigNode({"lr": 1e-3, "warmup_ratio": 0.25, "min_lr_ratio": 0.2}))
     obj.trainer_module = torch.nn.Linear(2, 2)
     obj.train_dataloader = dataloader
     recipe_cfg = _Cfg(num_epochs=2, grad_accumulation_steps=3, output_dir=str(tmp_path / "out"))
@@ -146,6 +146,185 @@ def test_min_warmup_steps_floor_is_used(tmp_path):
     obj.__class__ = _FlooredWarmup
     obj._setup_training_state(recipe_cfg)
     assert obj.warmup_steps == 5
+
+
+# --------------------------------------------------------------------------- #
+# Optimizer construction (``optimizer:`` block -> ``build_optimizer``)
+# --------------------------------------------------------------------------- #
+def _recipe_with_optimizer(cls, opt_block, module, tmp_path):
+    obj = cls.__new__(cls)
+    obj.cfg = SimpleNamespace(optimizer=ConfigNode(opt_block))
+    obj.trainer_module = module
+    obj.train_dataloader = list(range(4))
+    recipe_cfg = _Cfg(num_epochs=1, output_dir=str(tmp_path / "out"))
+    return obj, recipe_cfg
+
+
+def _eagle3_cls():
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+
+    return TrainEagle3Recipe
+
+
+def test_eagle3_setup_honors_configured_optimizer_target_and_kwargs(tmp_path):
+    """Regression: ``optimizer._target_`` and its kwargs used to be ignored (torch AdamW was built)."""
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(),
+        {"_target_": "torch.optim.SGD", "lr": 3e-4, "momentum": 0.8, "nesterov": True},
+        torch.nn.Linear(2, 2),
+        tmp_path,
+    )
+    obj._setup_training_state(recipe_cfg)
+
+    assert type(obj.optimizer) is torch.optim.SGD
+    assert obj.optimizer.param_groups[0]["momentum"] == 0.8
+    assert obj.optimizer.param_groups[0]["nesterov"] is True
+    # The scheduler wraps the configured optimizer, at the configured peak LR.
+    assert obj.peak_lr == pytest.approx(3e-4)
+    assert obj.lr_scheduler.optimizer is obj.optimizer
+
+
+def test_eagle3_setup_honors_adamw_eps(tmp_path):
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 1e-4, "eps": 1e-6, "betas": [0.9, 0.999]}, torch.nn.Linear(2, 2), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+    assert isinstance(obj.optimizer, torch.optim.AdamW)
+    assert obj.optimizer.param_groups[0]["eps"] == 1e-6
+
+
+def test_unconfigured_optimizer_matches_a_hand_built_adamw_bitwise(tmp_path):
+    """A config without ``_target_`` must give exactly the previous hard-coded AdamW, step for step."""
+
+    def _make():
+        torch.manual_seed(7)
+        return torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 2))
+
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 2e-3, "betas": [0.9, 0.999], "weight_decay": 0.0}, _make(), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+
+    reference = _make()
+    ref_opt = torch.optim.AdamW(reference.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=0.0)
+
+    assert type(obj.optimizer) is torch.optim.AdamW
+    group, ref_group = obj.optimizer.param_groups[0], ref_opt.param_groups[0]
+    for key in ("lr", "betas", "eps", "weight_decay", "amsgrad", "foreach", "fused", "maximize"):
+        assert group[key] == ref_group[key], key
+
+    gen = torch.Generator().manual_seed(3)
+    for _ in range(5):
+        x, y = torch.randn(4, 8, generator=gen), torch.randn(4, 2, generator=gen)
+        for module, opt in ((obj.trainer_module, obj.optimizer), (reference, ref_opt)):
+            opt.zero_grad()
+            torch.nn.functional.mse_loss(module(x), y).backward()
+            opt.step()
+    for got, want in zip(obj.trainer_module.parameters(), reference.parameters()):
+        assert torch.equal(got, want)
+
+
+def test_unconfigured_optimizer_keeps_recipe_betas_default(tmp_path):
+    obj, recipe_cfg = _recipe_with_optimizer(_eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2), tmp_path)
+    obj._setup_training_state(recipe_cfg)
+    assert obj.optimizer.param_groups[0]["betas"] == (0.9, 0.95)
+    assert obj.optimizer.param_groups[0]["weight_decay"] == 0.0
+
+
+def test_only_trainable_parameters_are_optimized(tmp_path):
+    module = torch.nn.Linear(4, 4)
+    module.bias.requires_grad_(False)
+    obj, recipe_cfg = _recipe_with_optimizer(_eagle3_cls(), {"lr": 1e-4}, module, tmp_path)
+    obj._setup_training_state(recipe_cfg)
+    (params,) = (group["params"] for group in obj.optimizer.param_groups)
+    assert params == [module.weight]
+
+
+def _torch_adam_warnings(caplog):
+    return [r for r in caplog.records if "Detected torch.optim.Adam/AdamW" in r.getMessage()]
+
+
+def test_bf16_draft_with_torch_adam_warns(tmp_path, caplog):
+    """Regression: the BF16-parameter + torch-Adam warning never fired for the draft recipes."""
+    from nemo_automodel.components.optim import precision_warnings
+
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2).to(torch.bfloat16), tmp_path
+    )
+    with caplog.at_level(logging.WARNING):
+        obj._setup_training_state(recipe_cfg)
+    assert len(_torch_adam_warnings(caplog)) == 1
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+
+
+def test_fp32_draft_with_torch_adam_does_not_warn(tmp_path, caplog):
+    from nemo_automodel.components.optim import precision_warnings
+
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+    obj, recipe_cfg = _recipe_with_optimizer(_eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2), tmp_path)
+    with caplog.at_level(logging.WARNING):
+        obj._setup_training_state(recipe_cfg)
+    assert _torch_adam_warnings(caplog) == []
+
+
+def test_resolve_spec_defaults_to_adamw_when_no_target():
+    target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
+        ConfigNode({"lr": 6e-4, "warmup_ratio": 0.04, "min_lr_ratio": 0.1})
+    )
+    assert target == "torch.optim.AdamW"
+    assert kwargs == {"lr": 6e-4, "betas": (0.9, 0.95), "weight_decay": 0.0}
+
+
+def test_resolve_spec_respects_explicit_target_and_extra_kwargs():
+    target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
+        ConfigNode(
+            {
+                "_target_": "transformer_engine.pytorch.optimizers.FusedAdam",
+                "lr": 1e-5,
+                "master_weights": True,
+                "master_weight_dtype": "torch.float32",
+                "exp_avg_dtype": "torch.float32",
+                "exp_avg_sq_dtype": "torch.float32",
+                "store_param_remainders": True,
+                "warmup_ratio": 0.04,
+            }
+        )
+    )
+    assert target == "transformer_engine.pytorch.optimizers.FusedAdam"
+    assert kwargs == {
+        "lr": 1e-5,
+        "master_weights": True,
+        "master_weight_dtype": "torch.float32",
+        "exp_avg_dtype": "torch.float32",
+        "exp_avg_sq_dtype": "torch.float32",
+        "store_param_remainders": True,
+    }
+
+
+def test_resolve_spec_preserves_explicit_betas_and_weight_decay_and_coerces_lr():
+    _target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
+        ConfigNode({"lr": "6e-4", "betas": [0.9, 0.999], "weight_decay": 0.01})
+    )
+    assert kwargs["lr"] == pytest.approx(6e-4) and isinstance(kwargs["lr"], float)
+    assert list(kwargs["betas"]) == [0.9, 0.999]
+    assert kwargs["weight_decay"] == 0.01
+
+
+def test_resolve_spec_does_not_force_adamw_defaults_onto_explicit_target():
+    target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
+        ConfigNode({"_target_": "torch.optim.SGD", "lr": 0.1, "momentum": 0.9})
+    )
+    assert target == "torch.optim.SGD"
+    assert kwargs == {"lr": 0.1, "momentum": 0.9}
+
+
+def test_build_draft_optimizer_builds_sgd_for_an_explicit_target():
+    obj = _Recipe.__new__(_Recipe)
+    obj.trainer_module = torch.nn.Linear(4, 4)
+    optimizer = obj._build_draft_optimizer(ConfigNode({"_target_": "torch.optim.SGD", "lr": 0.1, "momentum": 0.9}))
+    assert isinstance(optimizer, torch.optim.SGD)
+    assert optimizer.param_groups[0]["momentum"] == 0.9
 
 
 # --------------------------------------------------------------------------- #
