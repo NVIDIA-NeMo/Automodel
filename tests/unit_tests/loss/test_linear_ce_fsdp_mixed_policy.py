@@ -27,8 +27,7 @@ tiny dense DeepSeek-V3 (Qwen3MoE builds its rotary cache on the current CUDA dev
 
 from __future__ import annotations
 
-import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -49,12 +48,6 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 
 _WORLD_SIZE = 2
 _VOCAB = 100
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _config() -> DeepseekV3Config:
@@ -94,12 +87,10 @@ def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, lm_h
 
 
 def _worker(
-    rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: bool, reduce_dtype: torch.dtype | None
+    rank: int, init_file: str, master_dtype: torch.dtype, wrap_outer_model: bool, reduce_dtype: torch.dtype | None
 ) -> None:
     torch.set_num_threads(1)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=_WORLD_SIZE)
     try:
         from nemo_automodel.components.loss import linear_ce as linear_ce_mod
         from nemo_automodel.components.loss import linear_ce_base
@@ -203,6 +194,9 @@ def _worker(
     ids=["fp32_master", "bf16_master", "fp32_master_wrapped_root", "fp32_master_unset_reduce_dtype"],
 )
 def test_fused_loss_streams_the_head_under_its_fsdp_policy(
-    master_dtype: torch.dtype, wrap_outer_model: bool, reduce_dtype: torch.dtype | None
+    tmp_path: Path, master_dtype: torch.dtype, wrap_outer_model: bool, reduce_dtype: torch.dtype | None
 ) -> None:
-    mp.spawn(_worker, args=(_free_port(), master_dtype, wrap_outer_model, reduce_dtype), nprocs=_WORLD_SIZE, join=True)
+    init_file = tmp_path / "process-group"
+    mp.spawn(
+        _worker, args=(str(init_file), master_dtype, wrap_outer_model, reduce_dtype), nprocs=_WORLD_SIZE, join=True
+    )

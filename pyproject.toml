@@ -140,11 +140,9 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-# ffpa-attn 0.2.3 first aligned on nvidia-cutlass-dsl==4.6.2 and quack-kernels==0.6.4, the
-# versions flash_attn.cute (FA4) used; both pins are overridden below (4.8.0, 0.6.5). 0.2.4 also
-# fixes the persistent CuTe cache callable ABI. 0.2.2 hard-pinned 4.6.0/0.6.1 and was
-# unsatisfiable alongside FA4, so do not relax this floor.
-ffpa = ["ffpa-attn>=0.2.4", "nvidia-cutlass-dsl==4.8.0"]
+# ffpa-attn 0.2.6 aligns with the nvidia-cutlass-dsl 4.8.0 and quack-kernels 0.6.5 pins
+# below, and fixes double padding of SM80 gradients in variable-length attention.
+ffpa = ["ffpa-attn>=0.2.6", "nvidia-cutlass-dsl==4.8.0"]
 fla = [
     # 0.5.2 is the first release without Triton block pointers, which Triton 3.9 removed.
     # docker/common/fla-autotune-keys.patch and the CP prewarm launches target 0.5.x.
