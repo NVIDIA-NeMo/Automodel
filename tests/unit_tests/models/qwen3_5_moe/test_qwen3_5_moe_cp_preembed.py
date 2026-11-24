@@ -20,6 +20,7 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.qwen3_5_moe.model import (
     Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeModel,
@@ -330,7 +331,7 @@ class TestPipelineStageMetas:
         model = Qwen3_5MoeForConditionalGeneration.__new__(Qwen3_5MoeForConditionalGeneration)
         nn.Module.__init__(model)
         model.config = types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=8, vocab_size=32))
-        model.lm_head = nn.Linear(8, 32, bias=False) if lm_head else None
+        model.lm_head = LMHead(8, 32) if lm_head else None
         model.cp_mesh = _FakeCPMesh(cp_size) if cp_size > 1 else None
         return model
 

@@ -1,0 +1,110 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA post-training of a Nemotron 3.5 Decision checkpoint on fictional SOC alert triage
+# (choice, yes/no and ordinal-score questions; each question of an alert is read on its own).
+#
+#   PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+#       --output-dir data/soc_triage --seed 7
+#   automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --mode eval --output_dir runs/soc/base
+#   automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --output_dir runs/soc/lora
+#
+# Supported checkpoints: text Nemotron 3.5 Decision checkpoints (NemotronForDecision, a bidirectional Ministral 3
+# encoder) that ship decision.json and decision_template.jinja. Vision and quantized variants are rejected at setup.
+# For backbone fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
+# checkpoint.save_consolidated: every (decoder layers and final norm train; embeddings and head stay frozen).
+
+recipe: nemo_automodel.recipes.decision.train_nemotron_decision.TrainNemotronDecisionRecipe
+
+mode: train            # eval | train
+seed: 101
+output_dir: runs/soc/lora
+init_from: null        # a published stage of the same base and method, e.g. runs/.../LOWEST_VAL
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /path/to/nemotron-3.5-decision-8b   # a local Nemotron 3.5 Decision checkpoint directory
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*.q_proj"
+    - "*.k_proj"
+    - "*.v_proj"
+    - "*.o_proj"
+    - "*.gate_proj"
+    - "*.up_proj"
+    - "*.down_proj"
+  dim: 32
+  alpha: 64
+  dropout: 0.0
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+lr_scheduler:
+  lr_decay_style: cosine   # warmup and decay steps are set from train.* below
+
+checkpoint:
+  enabled: true
+  save_consolidated: false  # LoRA stages save adapters; export_nemotron_decision.py merges them
+
+data:
+  train: data/soc_triage/train.jsonl
+  validation: data/soc_triage/validation.jsonl
+  test: data/soc_triage/test.jsonl
+  max_tokens: 8192       # questions whose prompt + mask is longer are skipped and counted (no compaction)
+  slice_keys: [evidence, verdict, family]
+
+train:
+  global_batch_size: 16  # questions per optimizer step over all ranks (one question per forward)
+  epochs: 1.0
+  max_steps: 0           # 0: train.epochs decide
+  warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
+  min_lr_ratio: 0.1
+  canonical_fraction: 0.5  # option shuffle (training only): this share of reads keeps the checkpoint's option
+                           # order, the rest are shuffled and re-coded by position; 1.0 disables it
+  max_grad_norm: 1.0
+  val_every_steps: 50
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft                    # the recipe trains SFT stages only
+  label_smoothing: 0.0         # plain cross-entropy over the options, as in the reference fine-tuning
+  brier_weight: 0.0
+  ordinal_weight: 0.0
+  soft_label_kl_weight: 0.0    # 0: soft labels replace the gold target; > 0: CE(gold) + weight * KL(soft || p)
+  soft_label_gold_mask: false  # true: ignore soft labels whose top option is not the gold answer
+
+ci:
+  nemo_ci_schedule: skipped  # needs a Nemotron 3.5 Decision checkpoint; covered by the functional test
+  cluster_tag: h100

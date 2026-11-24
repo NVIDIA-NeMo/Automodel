@@ -14,6 +14,7 @@
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Union
 
@@ -109,7 +110,7 @@ class KimiVLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -662,7 +663,14 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         config = KimiVLConfig.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
 
-    def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
+    def __init__(
+        self,
+        config: KimiVLConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ):
         warn_deprecated_model_class("KimiVLForConditionalGeneration")
         super().__init__()
         self.config = config
@@ -672,8 +680,11 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         self.model = KimiVLModel(config, moe_config=moe_config, backend=self.backend)
         self.moe_config = self.model.moe_config
 
-        self.model.language_model.lm_head = initialize_linear_module(
-            self.backend.linear, config.text_config.hidden_size, config.text_config.vocab_size, bias=False
+        self.model.language_model.lm_head = LMHead(
+            config.text_config.hidden_size,
+            config.text_config.vocab_size,
+            dtype=torch.bfloat16,
+            logits_dtype=logits_dtype,
         )
 
         self.vocab_size = config.text_config.vocab_size
@@ -791,7 +802,9 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             **kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         loss = None
         if labels is not None and self.lm_head is not None:
@@ -873,6 +886,44 @@ class KimiVLStateDictAdapter:
             for k, v in self.llm_adapter.to_hf(llm_keys, **kwargs).items():
                 hf_state_dict[k.replace("model.", "language_model.model.")] = v
         return hf_state_dict
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: torch.Tensor, **kwargs) -> list[tuple[str, torch.Tensor]]:
+        """Convert one native tensor to HuggingFace format, matching ``to_hf`` for that key.
+
+        Args:
+            fqn: Native key, for example ``model.language_model.model.layers.0.mlp.experts.gate_and_up_projs``.
+            tensor: Native tensor for ``fqn``. A grouped MoE expert tensor has shape
+                ``[n_routed_experts, in_dim, out_dim]``; every other tensor keeps its layout.
+            **kwargs: Conversion options forwarded to the language-model adapter. ``exclude_key_regex``
+                (``str | None``) drops any key that matches it.
+
+        Returns:
+            ``(hf_key, tensor)`` pairs. Empty when the key is excluded or is a ``model.model.*`` key. A grouped
+            expert tensor yields one pair per expert and projection; every other key yields one pair.
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+        if exclude_key_regex and re.match(exclude_key_regex, fqn):
+            return []
+
+        key = fqn
+        if key.startswith("model.model."):
+            return []
+        if key.startswith("model."):
+            key = key.replace("model.", "", 1)
+
+        if key.startswith("language_model.model."):
+            llm_key = key.replace("language_model.model.", "model.")
+        elif key.startswith(("language_model.embed_tokens.", "language_model.layers.", "language_model.norm.")):
+            llm_key = "model." + key.replace("language_model.", "", 1)
+        elif key.startswith("lm_head."):
+            return [("language_model." + key, tensor)]
+        else:
+            return [(key, tensor)]
+
+        return [
+            (k.replace("model.", "language_model.model."), v)
+            for k, v in self.llm_adapter.convert_single_tensor_to_hf(llm_key, tensor, **kwargs)
+        ]
 
     def from_hf(self, state_dict: dict, **kwargs) -> dict:
         native_state_dict = {}

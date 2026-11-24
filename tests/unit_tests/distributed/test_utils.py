@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import nemo_automodel.components.distributed.utils as du
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 
 
 class _FakeDist(SimpleNamespace):
@@ -146,3 +147,10 @@ def test_get_sync_ctx(monkeypatch, patch_dist):
     # entering/exiting the context must be a no-op
     with ctx:
         pass
+
+
+def test_dp_eval_sample_shard():
+    assert du.dp_eval_sample_shard(DDPConfig(), 1, 4) == (1, 4)
+    assert du.dp_eval_sample_shard(DDPConfig(), 0, 1) is None
+    assert du.dp_eval_sample_shard(FSDP2Config(), 1, 4) is None
+    assert du.dp_eval_sample_shard(None, 0, 2) is None

@@ -37,8 +37,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -278,7 +279,9 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         config: HunyuanImage3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs: Any,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -289,15 +292,12 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         if self.backend.dispatcher == "mok":
             raise NotImplementedError("dispatcher='mok' needs a split shared expert; HunyuanImage-3.0 fuses it.")
         dtype = _model_dtype(config)
-        moe_overrides = kwargs.pop("moe_overrides", None)
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides.")
         moe_config = moe_config or build_moe_config(config, moe_overrides)
 
         self.model = HunyuanImage3Model(config, self.backend, moe_config, dtype)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         hidden = config.hidden_size
         latent = config.latent_channels
         self.timestep_emb = TimestepEmbedder(hidden, dtype=dtype)
@@ -387,7 +387,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             input_ids: Long tensor of shape [batch, sequence].
 
         Returns:
-            fp32 tensor of shape [batch, sequence, vocab].
+            Tensor of shape [batch, sequence, vocab] in the head's ``logits_dtype``, FP32 by default.
         """
         _, seq_len = input_ids.shape
         cos, sin = rope_cos_sin(
@@ -396,7 +396,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             self.config.rope_theta,
         )
         hidden = self.model(self.model.embed_tokens(input_ids), cos, sin)
-        return self.lm_head(self.model.norm(hidden)).float()
+        return self.lm_head(self.model.norm(hidden)).to(self.lm_head.logits_dtype or torch.float32)
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():

@@ -56,6 +56,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -403,13 +404,21 @@ class Ernie5_5Block(nn.Module):
 class Ernie5_5Model(nn.Module):
     """ERNIE 5.5 decoder: embedding, hyper-connected blocks, hyper-head, final norm, output head and MultiMax."""
 
-    def __init__(self, config: Ernie5_5Config, backend: BackendConfig, moe_config: MoEConfig) -> None:
+    def __init__(
+        self,
+        config: Ernie5_5Config,
+        backend: BackendConfig,
+        moe_config: MoEConfig,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ) -> None:
         """Build the decoder from a decoder-only configuration.
 
         Args:
             config: Decoder-only model configuration, as ``decoder_only_config`` returns it.
             backend: Backend selection of the model.
             moe_config: Configuration of the latent MoE layers.
+            logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
         """
         super().__init__()
         self.config = config
@@ -425,7 +434,7 @@ class Ernie5_5Model(nn.Module):
         )
         self.hyper_head = Ernie5_5HyperHead(config.hc_mult, config.hidden_size, eps=config.rms_norm_eps)
         self.norm = Ernie5_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.multimax = Ernie5_5MultiMax(dtype=dtype)
         self.dsa_uses_cudnn = backend.attn == "cudnn" and any(layer.is_dsa for layer in self.layers)
 
@@ -527,7 +536,7 @@ class Ernie5_5Model(nn.Module):
             cp_group: Context-parallel group whose ranks hold consecutive shards of the row, or None.
 
         Returns:
-            Logits of shape [batch, sequence, vocab] in the model dtype.
+            Logits of shape [batch, sequence, vocab] in the head's ``logits_dtype``, or the model dtype if unset.
         """
         if document_ids is None:
             inputs = self.attention_inputs(input_ids)
@@ -645,13 +654,16 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         """
         return cls(config, backend)
 
-    def __init__(self, config: Ernie5_5Config, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self, config: Ernie5_5Config, backend: BackendConfig | None = None, *, logits_dtype: torch.dtype | None = None
+    ) -> None:
         """Validate the configuration and the backend, then build the decoder and the checkpoint adapter.
 
         Args:
             config: Model configuration with ``num_nextn_predict_layers == 0``. It is not modified.
             backend: Backend selection. None selects cuDNN DSA attention (the class docstring states what it
                 requires) with the torch expert, dispatcher and linear backends.
+            logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
 
         Raises:
             ValueError: If the configuration declares MTP layers or an unsupported architecture, or the backend
@@ -694,7 +706,7 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             gate_dtype=torch.float32,
             router_weights_fp32=True,
         )
-        self.model = Ernie5_5Model(self.config, self.backend, moe_config)
+        self.model = Ernie5_5Model(self.config, self.backend, moe_config, logits_dtype=logits_dtype)
         freeze_ernie5_5_indexer_params(self.model)
         # Fix the storage dtypes before sharding: everything in the model dtype except the strict FP32 names.
         cast_model_to_dtype(self, dtype)
@@ -970,8 +982,8 @@ class Ernie5_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             use_cache: Must be False: the model keeps no KV cache.
 
         Returns:
-            ``CausalLMOutputWithPast`` whose ``logits`` have shape [batch, sequence, vocab] in the model dtype. No
-            loss, hidden states or cache are returned.
+            ``CausalLMOutputWithPast`` whose ``logits`` have shape [batch, sequence, vocab] in the head's
+            ``logits_dtype``, or the model dtype if unset. No loss, hidden states or cache are returned.
 
         Raises:
             ValueError: If a row without packing metadata is not one unpadded document starting at position zero,

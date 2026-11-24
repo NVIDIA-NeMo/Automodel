@@ -58,6 +58,11 @@ class DecisionTargetProtocol(Protocol):
         """Loss question type: 0=noul, 1=choice, 2=score."""
         ...
 
+    @property
+    def soft_labels(self) -> tuple[float, ...] | None:
+        """Optional target distribution aligned with the option identities."""
+        ...
+
 
 @dataclass(frozen=True)
 class QuestionLogits:
@@ -95,6 +100,11 @@ class DecisionTargets:
         questions: Original targets grouped by record, retaining option order.
             Direct tensor-only construction is valid for isolated loss math;
             assembly requires identities prepared by ``from_questions``.
+        soft_labels: Optional float tensor of shape [questions, max_options];
+            each True row of soft_label_mask is a distribution over its real
+            options, and padding entries are zero.
+        soft_label_mask: Optional bool tensor of shape [questions]; True where
+            a question has soft labels. None with soft_labels means every row.
     """
 
     labels: torch.Tensor
@@ -106,6 +116,8 @@ class DecisionTargets:
     weights: torch.Tensor | None = None
     record_ids: tuple[str, ...] = ()
     questions: tuple[tuple[DecisionTargetProtocol, ...], ...] = ()
+    soft_labels: torch.Tensor | None = None
+    soft_label_mask: torch.Tensor | None = None
 
     @classmethod
     def from_questions(
@@ -133,7 +145,8 @@ class DecisionTargets:
 
         Returns:
             Supervision with layouts documented by ``DecisionTargets``. Padding
-            entries in rewards/reference tensors are zero; option_mask is False.
+            entries in rewards/soft-label/reference tensors are zero; option_mask
+            is False.
         """
         if not record_ids or len(record_ids) != len(questions):
             raise ValueError("record_ids and questions must contain the same nonzero number of records")
@@ -159,6 +172,15 @@ class DecisionTargets:
                     len(question.rewards) != len(options) or not all(math.isfinite(x) for x in question.rewards)
                 ):
                     raise ValueError(f"question {question.question_id!r} needs one finite reward per option")
+                soft = question.soft_labels
+                if soft is not None and (
+                    len(soft) != len(options)
+                    or not all(math.isfinite(x) and x >= 0 for x in soft)
+                    or not math.isclose(sum(soft), 1.0, abs_tol=1e-6)
+                ):
+                    raise ValueError(
+                        f"question {question.question_id!r} needs soft labels that form a distribution over its options"
+                    )
                 weight = float((question_weights or {}).get(question.question_id, 1.0))
                 if not math.isfinite(weight) or weight < 0:
                     raise ValueError(f"question {question.question_id!r} needs a finite nonnegative weight")
@@ -174,6 +196,12 @@ class DecisionTargets:
             for index, question in enumerate(flat):
                 if question.rewards is not None:
                     rewards[index, : len(question.option_ids)] = torch.tensor(question.rewards, device=device)
+        has_soft_labels = any(q.soft_labels is not None for q in flat)
+        soft_labels = torch.zeros((len(flat), width), device=device) if has_soft_labels else None
+        if soft_labels is not None:
+            for index, question in enumerate(flat):
+                if question.soft_labels is not None:
+                    soft_labels[index, : len(question.option_ids)] = torch.tensor(question.soft_labels, device=device)
         result = cls(
             labels=torch.tensor([q.label for q in flat], dtype=torch.long, device=device),
             option_mask=option_mask,
@@ -185,6 +213,10 @@ class DecisionTargets:
             weights=torch.tensor(weights, dtype=torch.float32, device=device),
             record_ids=tuple(record_ids),
             questions=nested,
+            soft_labels=soft_labels,
+            soft_label_mask=torch.tensor([q.soft_labels is not None for q in flat], dtype=torch.bool, device=device)
+            if has_soft_labels
+            else None,
         )
         if reference_logprobs is not None:
             references = _validated_rows(reference_logprobs, result)
@@ -219,6 +251,8 @@ class DecisionTargets:
             reward_mask=None if self.reward_mask is None else self.reward_mask.to(device),
             ref_logprobs=None if self.ref_logprobs is None else self.ref_logprobs.to(device),
             weights=None if self.weights is None else self.weights.to(device),
+            soft_labels=None if self.soft_labels is None else self.soft_labels.to(device),
+            soft_label_mask=None if self.soft_label_mask is None else self.soft_label_mask.to(device),
         )
 
 

@@ -23,7 +23,8 @@ The configured decision objective supports two stages:
 
 * **SFT** - label-smoothed cross-entropy on the gold option, plus a Brier term (calibration) and a ranked-probability
   score (squared EMD) for ordinal ``score`` questions. The optional ranked-probability term applies only to
-  ordinal questions.
+  ordinal questions. Soft labels (a target distribution per question) either replace the one-hot gold target in
+  all three terms, or, with ``soft_label_kl_weight > 0``, add ``KL(soft || pi)`` to the gold-target terms.
 
 * **RL** - the decision is a one-step contextual bandit, so the policy gradient can be computed two ways:
 
@@ -208,6 +209,11 @@ class DecisionLossConfig:
         kl_coef: Weight of ``KL(pi || pi_ref)`` (needs reference log-probabilities).
         anchor_weight: Weight of the supervised gold-option log-score anchor during RL.
         question_weights: Optional ``{question_id: weight}``.
+        soft_label_kl_weight: SFT use of soft labels. ``0`` replaces the one-hot gold target with the soft labels in
+            the cross-entropy, Brier and ranked-probability terms, so a question with soft labels needs no gold
+            answer. A positive weight keeps the gold target and adds ``soft_label_kl_weight * KL(soft || pi)`` to
+            labelled questions that have soft labels.
+        soft_label_gold_mask: Ignore soft labels whose most probable option is not the gold option.
     """
 
     mode: Literal["sft", "rl"] = "sft"
@@ -221,6 +227,8 @@ class DecisionLossConfig:
     kl_coef: float = 0.05
     anchor_weight: float = 0.1
     question_weights: dict[str, float] = field(default_factory=dict)
+    soft_label_kl_weight: float = 0.0
+    soft_label_gold_mask: bool = False
 
     def build(self) -> "DecisionLoss":
         """Return the loss module for this configuration."""
@@ -230,6 +238,8 @@ class DecisionLossConfig:
             raise ValueError(f"rl_objective must be 'expected_reward' or 'grpo', got {self.rl_objective!r}")
         if not 0 <= self.label_smoothing <= 1:
             raise ValueError("label_smoothing must be between zero and one")
+        if not (math.isfinite(self.soft_label_kl_weight) and self.soft_label_kl_weight >= 0):
+            raise ValueError("soft_label_kl_weight must be finite and nonnegative")
         if self.rl_objective == "grpo" and self.num_samples < 2:
             raise ValueError("GRPO requires at least two samples for its group baseline")
         if self.sample_temperature <= 0:
@@ -257,10 +267,35 @@ class DecisionLoss(nn.Module):
         if self.config.mode == "rl" and targets.rewards is not None:
             defined = targets.reward_mask if targets.reward_mask is not None else torch.ones_like(eligible)
             eligible = eligible | defined
+        soft = self._soft_targets(targets)
+        if self.config.mode == "sft" and self.config.soft_label_kl_weight == 0 and soft is not None:
+            eligible = eligible | soft[1]
         weights = (
             targets.weights.float() if targets.weights is not None else torch.ones_like(eligible, dtype=torch.float32)
         )
         return weights * eligible
+
+    def _soft_targets(self, targets: DecisionTargets) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the soft labels the SFT objective uses.
+
+        Args:
+            targets: Supervision tensors with layouts documented by DecisionTargets.
+
+        Returns:
+            None when the targets carry no soft labels. Otherwise a float32 tensor of shape [questions, options]
+            holding the soft labels, and a bool tensor of shape [questions] marking the questions that use them.
+        """
+        soft_labels = targets.soft_labels
+        if soft_labels is None:
+            return None
+        used = (
+            targets.soft_label_mask
+            if targets.soft_label_mask is not None
+            else torch.ones_like(targets.labels, dtype=torch.bool)
+        )
+        if self.config.soft_label_gold_mask:
+            used = used & (soft_labels.argmax(-1) == targets.labels)
+        return soft_labels.float(), used
 
     def normalization_weight(self, targets: DecisionTargets) -> torch.Tensor:
         """Return the denominator for composing microbatch or data-parallel losses.
@@ -298,6 +333,11 @@ class DecisionLoss(nn.Module):
             raise ValueError("every question must contain at least one valid option")
         if targets.labels.shape != (logits.shape[0],) or targets.question_types.shape != (logits.shape[0],):
             raise ValueError("labels and question_types must have shape [questions]")
+        if targets.soft_labels is not None and (
+            targets.soft_labels.shape != logits.shape
+            or (targets.soft_label_mask is not None and targets.soft_label_mask.shape != (logits.shape[0],))
+        ):
+            raise ValueError("soft_labels must have shape [questions, options] and soft_label_mask shape [questions]")
         logp = masked_log_softmax(logits, mask)
         probs = logp.exp() * mask
         width = logp.shape[-1]
@@ -311,11 +351,22 @@ class DecisionLoss(nn.Module):
         metrics: dict[str, torch.Tensor] = {}
 
         if cfg.mode == "sft":
+            soft = self._soft_targets(targets)
+            target = onehot
+            if soft is not None and cfg.soft_label_kl_weight == 0:
+                distribution, used = soft
+                target = torch.where(used[:, None], distribution * mask, onehot)
+            target_nll = -(logp * target).sum(-1)
             smooth = -(logp * mask).sum(-1) / n_valid
-            ce = (1 - cfg.label_smoothing) * nll + cfg.label_smoothing * smooth
-            rps = ((probs.cumsum(-1) - onehot.cumsum(-1)) ** 2 * mask).sum(-1) / (n_valid - 1).clamp_min(1)
+            ce = (1 - cfg.label_smoothing) * target_nll + cfg.label_smoothing * smooth
+            target_brier = ((probs - target) ** 2).sum(-1)
+            rps = ((probs.cumsum(-1) - target.cumsum(-1)) ** 2 * mask).sum(-1) / (n_valid - 1).clamp_min(1)
             rps = rps * (targets.question_types == SCORE_TYPE).float()
-            per_question = ce + cfg.brier_weight * brier + cfg.ordinal_weight * rps
+            per_question = ce + cfg.brier_weight * target_brier + cfg.ordinal_weight * rps
+            if soft is not None and cfg.soft_label_kl_weight > 0:
+                distribution, used = soft
+                kl = (distribution * (distribution.clamp_min(1e-12).log() - logp)).masked_fill(~mask, 0.0).sum(-1)
+                per_question = per_question + cfg.soft_label_kl_weight * kl * used.float()
             loss = _masked_mean(per_question, weights)
         else:
             rewards = self._rewards(targets, onehot) * mask

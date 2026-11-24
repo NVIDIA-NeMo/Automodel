@@ -145,6 +145,7 @@ def _validate_provider_sections(repo_root: Path) -> None:
         "embedding-models": "embedding",
         "reranking-models": "reranker",
         "wam": "wam",
+        "decision-models": "decision",
     }
     offenders: list[str] = []
     navigated_model_pages: list[Path] = []
@@ -341,7 +342,7 @@ def _validate_redirects(repo_root: Path) -> None:
         route
         for route in routes
         if re.fullmatch(
-            "/model-coverage/(?:large-language-models|vision-language-models|multimodal|omni|dllm|diffusion|embedding-models|reranking-models)/[^/]+",
+            "/model-coverage/(?:large-language-models|vision-language-models|multimodal|omni|dllm|diffusion|embedding-models|reranking-models|decision-models)/[^/]+",
             route,
         )
     }

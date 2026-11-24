@@ -741,13 +741,6 @@ navigation:
             contents:
               - page: "BAGEL-7B-MoT"
                 path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
-          - section: "LiquidAI"
-            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRjgCAABXRUJQVlA4TCwCAAAvE8AEEAfkppEkScrlD/a8+avSOg6M27aRpO2/2P3NbYtx2zaStP0Xu7+5bbmqbVtV5rm4BuAbQtC/gnsH93sSSCCBVAEJJJBAAi0ggAIEEEAf2AAVeAF/4AwkkMABWAB/4An8kgCa3/fNgRkwBbrABCgqoKqAokpS1QBC1TbPOdF2rF5UbSWx9041qlAqFZD33mhrjCGJJFR7b0m897SVhCqJtlSq9x5VEm2996jee9pSpbXmpNa2JQkVUNuGmmpRjTHceyWx1vL7f0kksdZy76VK4pxjrUWtqralrSTaakvVVlvvPfdeSaj+k4BEbdsLPXrbNG3e37aS2rbX7Nrs2qg10/lOvTqGiP4TCFCEA3ohImGJ5jJ1reuZXFTCIiKhsBSSJK9eIZksSDgkoYhkyUZH/8b/nvYGmZXImWnVyUfAE3YqfVopURtrR+8e+rvjgTWaRYkmjKLj5zdvgXU6KpOI5nm6S9i+seVj9bTMp4wKbN9vDw8ewv/VawNlUjEax2fwNgd6//l4SmcYa6ENJvc8rJE34e1OBJatJ/ADjr91Whd8OcY6T4jRXMEhLrPTcdk7wC3DWNqor/4Rpp21dgr4/lqZap7qOg5xja6Lc+/u3B9WzEdrRn2E92e2kyNr7/9+6ja1qBSpZ/aPgNtLG4A/plmUM9+/BF7d28MOHusLhAQ/n78Ampp/kJWTnbosJ12wsri4MD+ULJ+6PON8MJeJt7XFM7lBCYsI"/></svg>'
-            slug: liquidai
-            path: ../../model-coverage/multimodal/liquidai/index.mdx
-            contents:
-              - page: "d1-3B"
-                path: ../../model-coverage/multimodal/liquidai/d1-3b.mdx
       - section: "Omni"
         slug: omni
         contents:
@@ -794,6 +787,33 @@ navigation:
             contents:
               - page: "praxis-1-droid"
                 path: ../../model-coverage/wam/runwayml/praxis-1.mdx
+      - section: "Decision Models"
+        slug: decision-models
+        contents:
+          - page: "Overview"
+            path: ../../model-coverage/decision/index.mdx
+            slug: overview
+          - section: "Cloudflare"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRlICAABXRUJQVlA4TEUCAAAvE8AEEC/kOJJtVZlz//+4x8DO8k8EQmDlru+eNBxHkuQoOXNo7MNK7MEEzYvgdWrGbWzbqrLPe98ypCEKojSaIfPU3f29A8W2tmXV+V0a1pzIBJiFS2J0VLfEDMiWSO7u3Pv9f7iR4L/7vKDaHpTLFMXNVqnjKB7rnjh8lPt0+Z1HFML8/Si+lP5R+g/MP1+9zqa8V4e6PJvdvueo9vS36Zyk8KGQYpMoa064VPFENbff4eBgVWokEoQEUuBf+sPXcdrIqeS9a6n73+X76rv8zavkSBiYgYGBoSElzP8kEJZcABQY8GdoMIZD61+kCBINEGaJdpxItwzvQuxBRCOREQIs/4OAkik8o7hYdlHI7mxUu6AETTT4QdPPBsoogMIxC3fQCCE5ysDArWeknyotcyp+1fmfIoQCBERIpjAGMB94WlKwpRmKCaKvpY/nVIvtMHeCvIOwrvj+QRE792erNAfH+1xsv7hc4A/fWu+00He5DtjcBq4BwrZtx5N3tu0tL7u+zGXbrjmvL/v54xk/4H4j+j8B9PvFuxz7yisjAPxzjHA0vxAj9hF7OqP+3dX4/tYU3X8AILZ93NfF109m6VYkgNHh3PREslMAeprWHgkvYBc346fxpW7hbe+i1REgJtLmRmNrR1s7AOGqTB0q8hNmdppb6utqa6qrKirLFcpgSb5zMrXcMFBqMhsNep1WLpGqNIW+lcQBkM5kkcnGL22ygnAkr3hsiPPB4dERzvnetcV+7nF7XfStuYdPR5+jb+nfBQA="/></svg>'
+            slug: cloudflare
+            path: ../../model-coverage/decision/cloudflare/index.mdx
+            contents:
+              - page: "clef"
+                path: ../../model-coverage/decision/cloudflare/clef.mdx
+          - section: "Contrastive LM"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRgwCAABXRUJQVlA4TP8BAAAvE8AEAP/jIJIkReqeOWYd51/PKbhnhpm24Tq2bSfZ574Axi97sWFrsSMy3OM4kiRH6e45rfAC/50i+GvY3Zue/5AdBmEQAFImGIQJAAaDMBgkACYsbEzLM2Wm/9nIpgB1CBIFmSmcwidhmalZeoQoshCb4Hw9xHXKTM/l47sVnOzTKtme80f4pMsy03P+yEyyZSbZZIvrFMvpH41s37PSnP61+W7Fdy9kK1a5xcflWzSvCd6BAIOcUJTB1FaGFAQvoawdz45BrjDUVVF6fZm0dbK0C4rWdmUPoYQAIAj8EP4CFBCEmAABASK31f0wlhUBFwHy6LjJoldFAFJEKNUh4AhCCBhCUSmhqCmrvs72/932ufnXon0FQLRt23Sz3k1PT1zbts3UNtNX27Y/PvyEiP5PgMTTRKGqsagbIAYFb217MRqNktYc6Klvwi1qh3NTMthdUddaisfGCoa4HamBZiABG/L82EYUT3+vw+UBn7X+cXmxyI6y2dW3CywvkXxzcPh9u4ZZ+ft9fX95ezw5eno4+5rM/Z9CNkZ/RuZn56avr2YmTlez7vYWSISaoTIgvxCej8/373OMuPw0DGc6UiDJzh7/HCtgW0TctA+kU1Rl2YTaRkRUtS3Q2dFciye4FXRKWDWUN7a3VOOW6CGjEonRiBvEmBiMqIrEJiYKAA=="/></svg>'
+            slug: contrastive-lm
+            path: ../../model-coverage/decision/contrastive-lm/index.mdx
+            contents:
+              - page: "CLM-v0.1-8B"
+                path: ../../model-coverage/decision/contrastive-lm/clm-v0-1-8b.mdx
+          - section: "LiquidAI"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRjgCAABXRUJQVlA4TCwCAAAvE8AEEAfkppEkScrlD/a8+avSOg6M27aRpO2/2P3NbYtx2zaStP0Xu7+5bbmqbVtV5rm4BuAbQtC/gnsH93sSSCCBVAEJJJBAAi0ggAIEEEAf2AAVeAF/4AwkkMABWAB/4An8kgCa3/fNgRkwBbrABCgqoKqAokpS1QBC1TbPOdF2rF5UbSWx9041qlAqFZD33mhrjCGJJFR7b0m897SVhCqJtlSq9x5VEm2996jee9pSpbXmpNa2JQkVUNuGmmpRjTHceyWx1vL7f0kksdZy76VK4pxjrUWtqralrSTaakvVVlvvPfdeSaj+k4BEbdsLPXrbNG3e37aS2rbX7Nrs2qg10/lOvTqGiP4TCFCEA3ohImGJ5jJ1reuZXFTCIiKhsBSSJK9eIZksSDgkoYhkyUZH/8b/nvYGmZXImWnVyUfAE3YqfVopURtrR+8e+rvjgTWaRYkmjKLj5zdvgXU6KpOI5nm6S9i+seVj9bTMp4wKbN9vDw8ewv/VawNlUjEax2fwNgd6//l4SmcYa6ENJvc8rJE34e1OBJatJ/ADjr91Whd8OcY6T4jRXMEhLrPTcdk7wC3DWNqor/4Rpp21dgr4/lqZap7qOg5xja6Lc+/u3B9WzEdrRn2E92e2kyNr7/9+6ja1qBSpZ/aPgNtLG4A/plmUM9+/BF7d28MOHusLhAQ/n78Ampp/kJWTnbosJ12wsri4MD+ULJ+6PON8MJeJt7XFM7lBCYsI"/></svg>'
+            slug: liquidai
+            path: ../../model-coverage/decision/liquidai/index.mdx
+            contents:
+              - page: "d1-3B"
+                path: ../../model-coverage/decision/liquidai/d1-3b.mdx
       - section: "Diffusion Language Models"
         slug: dllm
         contents:
@@ -1035,6 +1055,12 @@ navigation:
           - page: "ASR with Qwen3-Omni"
             path: ../../guides/audio/qwen3-omni-asr.mdx
             slug: recipes-e2e-examples/qwen3-omni-asr
+      - section: "Decision Models"
+        skip-slug: true
+        contents:
+          - page: "NVIDIA Nemotron 3.5 Decision"
+            path: ../../guides/decision/nemotron-3-5-decision.mdx
+            slug: recipes-e2e-examples/nemotron-3-5-decision
   - section: "Training Recipes"
     slug: recipes-e2e-examples
     contents:

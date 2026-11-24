@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.moe.load_balance_metrics import (
+    ExpertLoadRecord,
     collect_expert_loads,
     compute_brief_metrics,
     compute_detailed_metrics,
@@ -398,6 +399,8 @@ class TestCollectExpertLoads:
 
         key = list(loads.keys())[0]
         assert "gate" in key
+        # The runtime record carries exactly the keys its declared TypedDict contract names.
+        assert set(loads[key]) == ExpertLoadRecord.__required_keys__ == {"expert_load", "aux_loss", "n_experts"}
         assert loads[key]["n_experts"] == 4
         assert torch.equal(loads[key]["expert_load"], torch.tensor([10.0, 20.0, 30.0, 40.0]))
         assert loads[key]["aux_loss"].item() == pytest.approx(0.5)

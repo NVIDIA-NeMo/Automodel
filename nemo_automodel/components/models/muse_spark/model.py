@@ -22,8 +22,9 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -199,8 +200,9 @@ class MuseSparkTextModel(nn.Module):
             **kwargs: Attention backend metadata, including packed sequence boundaries.
 
         Returns:
-            Decoder output with last_hidden_state [batch, sequence, hidden] or
-            [tokens, hidden], and optionally a tuple of residuals in the same layout.
+            Decoder output with last_hidden_state [batch, sequence, hidden], or
+            [1, tokens, hidden] for packed input, and optionally a tuple of residuals
+            in the layout the layers saw.
         """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -265,6 +267,8 @@ class MuseSparkTextModel(nn.Module):
             hidden_states = stream
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=None,
@@ -306,17 +310,21 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         config: MuseSpark1xOmniConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> "MuseSpark1xOmniForCausalLM":
         """Construct the native model from a resolved checkpoint config."""
         del kwargs
-        return cls(config, moe_config=moe_config, backend=backend)
+        return cls(config, moe_config=moe_config, backend=backend, logits_dtype=logits_dtype)
 
     def __init__(
         self,
         config: MuseSpark1xOmniConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -342,9 +350,8 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             if config.use_audio_perception
             else None
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype
-        )
+        logits_dtype = logits_dtype or (torch.float32 if config.use_fp32_for_output else None)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.cp_mesh = None
         if self.backend.enable_hf_state_dict_adapter:
             adapter_cls = (
@@ -451,9 +458,12 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             already-local activations. No per-batch mode is needed to size them.
         """
         residual_dtype = _residual_dtype(self.config)
-        output_dtype = (
-            residual_dtype if self.lm_head is None else (torch.float32 if self.config.use_fp32_for_output else dtype)
-        )
+        if self.lm_head is None:
+            output_dtype = residual_dtype
+        elif getattr(self, "_pp_return_hidden_states", False) is True:  # the final norm's output, not logits
+            output_dtype = residual_dtype if self.config.use_fp32_for_output else dtype
+        else:
+            output_dtype = self.lm_head.logits_dtype or dtype
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         local_seq_len = seq_len
         if cp_size > 1:
@@ -1015,24 +1025,14 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         )
         hidden_states = outputs.last_hidden_state
         if return_pipeline_hidden_states:
-            loss_hidden_states = hidden_states * self.config.output_multiplier
-            if is_thd and loss_hidden_states.ndim == 2:
-                loss_hidden_states = loss_hidden_states.unsqueeze(0)
-            return loss_hidden_states
+            return hidden_states * self.config.output_multiplier
 
-        projected = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            is_thd=is_thd,
-            fp32_lm_head=self.config.use_fp32_for_output,
-        )
         if self.lm_head is None:
             # No output scaling or soft cap may touch the residual stream
             # passed between non-final PP stages.
-            logits = projected.logits
+            logits = hidden_states
         else:
-            logits = projected.logits * self.config.output_multiplier
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep)) * self.config.output_multiplier
             if self.config.output_soft_cap_temp is not None:
                 cap = float(self.config.output_soft_cap_temp)
                 logits = torch.tanh(logits / cap) * cap
@@ -1050,8 +1050,6 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             )
 
         loss_hidden_states = hidden_states * self.config.output_multiplier
-        if is_thd and loss_hidden_states.ndim == 2:
-            loss_hidden_states = loss_hidden_states.unsqueeze(0)
         result = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,

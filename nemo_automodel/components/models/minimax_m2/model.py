@@ -22,15 +22,15 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.minimax_m2.layers import MiniMaxM2Attention
 from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
@@ -198,6 +198,33 @@ class MiniMaxM2Model(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run the decoder layers on padded or packed (THD) input.
+
+        Packed input arrives batched and is squeezed to [tokens, ...] for the layers, which TE's packed kernels
+        take; the hidden states come back batched.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or packed token IDs of shape [1, tokens]. Later
+                pipeline stages pass hidden states of shape [batch, sequence, hidden] or [1, tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence]; packed input requires them, as
+                [1, tokens].
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding, or,
+                with SDPA and an explicit padding_mask, a dense mask of shape [batch, 1, sequence, sequence];
+                packed input ignores it.
+            padding_mask: Optional bool mask of shape [batch, sequence] or [1, tokens], true at padding.
+            **attn_kwargs: Backend metadata. Packed input sets ``qkv_format="thd"`` and passes int32
+                ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
+        """
+        if attn_kwargs.get("qkv_format") == "thd":  # TE's packed kernels take [tokens, ...]
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         if position_ids is None:
             position_ids = (
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
@@ -223,7 +250,7 @@ class MiniMaxM2Model(nn.Module):
             )
 
         h = self.norm(h) if self.norm else h
-        return h
+        return h.unsqueeze(0) if h.dim() == 2 else h  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -289,13 +316,14 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: Any,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = MiniMaxM2Model(
             config,
             backend=self.backend,
@@ -303,9 +331,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MiniMaxM2StateDictAdapter(
                 self.config,
@@ -337,34 +363,39 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
-        """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.
+        """Run the decoder and project the kept positions to vocabulary logits.
 
         Args:
-            input_ids: Input token IDs. BSHD: ``[B, S]``; THD: ``[1, T]`` (squeezed internally).
-            position_ids: Optional position indices.
-            attention_mask: Optional attention mask.
-            padding_mask: Optional padding mask.
-            logits_to_keep: If 0, compute logits for all positions (training default);
-                otherwise only compute logits for the last ``logits_to_keep`` token positions.
-            output_hidden_states: Whether to return the final hidden states on the output.
-            **attn_kwargs: Additional arguments forwarded to the base model (e.g. qkv_format).
+            input_ids: Token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens], which the
+                decoder squeezes to [tokens]. Later pipeline stages pass hidden states of shape
+                [batch, sequence, hidden] or [1, tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence], or [1, tokens] for packed input, which
+                requires them.
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding, or,
+                with SDPA and an explicit padding_mask, a dense mask of shape [batch, 1, sequence, sequence];
+                packed input ignores it.
+            padding_mask: Optional bool Tensor of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; when None, the MoE layers derive it from attention_mask.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            output_hidden_states: Whether the output carries the final hidden states; None reads
+                ``config.output_hidden_states``.
+            **attn_kwargs: Backend metadata for the decoder. Packed input sets ``qkv_format="thd"`` and passes
+                int32 ``cu_seqlens`` and ``cu_seqlens_padded`` of shape [1, documents + 1], padded with -1000, and
+                ``max_seqlen``.
 
         Returns:
-            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with ``logits``
-            and, when ``output_hidden_states`` is set, the final ``hidden_states``.
+            CausalLMOutputWithPast whose ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] for packed
+            input, in the head's ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may
+            lower; on a pipeline stage without the head, ``logits`` holds the hidden states instead.
+            ``hidden_states``, when requested, are the final hidden states of shape [batch, sequence, hidden], or
+            [1, tokens, hidden] for packed input.
         """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
-
-        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        if is_thd:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
 
         hidden = self.model(
             input_ids,
@@ -374,9 +405,8 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
 
-        return compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
-        )
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(
