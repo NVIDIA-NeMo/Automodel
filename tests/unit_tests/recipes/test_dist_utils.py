@@ -537,6 +537,31 @@ class TestValidation:
         result = parse_distributed_section({"moe": {"ignore_router_for_ac": True}})
         assert result["moe_parallel_config"] is None
 
+    @pytest.mark.parametrize(
+        ("activation_checkpointing", "requested", "warns"),
+        [(True, True, True), ("selective", True, True), (False, True, False), (True, False, False)],
+    )
+    def test_dropped_moe_section_warns_about_checkpoint_repeated_mtp_moe(
+        self, caplog, activation_checkpointing, requested, warns
+    ):
+        """The option asks for a block to be checkpointed; dropping it with the section is not silent."""
+        cfg = {
+            "ep_size": 1,
+            "activation_checkpointing": activation_checkpointing,
+            "moe": {"checkpoint_repeated_mtp_moe": requested},
+        }
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        assert result["moe_parallel_config"] is None
+        assert ("checkpoint_repeated_mtp_moe` is set but ep_size=1" in caplog.text) is warns
+
+    def test_checkpoint_repeated_mtp_moe_is_kept_with_expert_parallelism(self, caplog):
+        cfg = {"ep_size": 2, "activation_checkpointing": True, "moe": {"checkpoint_repeated_mtp_moe": True}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        assert result["moe_parallel_config"].checkpoint_repeated_mtp_moe is True
+        assert "checkpoint_repeated_mtp_moe" not in caplog.text
+
     def test_unknown_field_for_strategy(self):
         with pytest.raises(ValueError, match="Unknown options"):
             parse_distributed_section({"strategy": "ddp", "sequence_parallel": True})

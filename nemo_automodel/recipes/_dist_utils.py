@@ -211,6 +211,14 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         )
         pipeline_dict = None
     if moe_dict is not None and ep_size <= 1:
+        if activation_checkpointing and moe_dict.get("checkpoint_repeated_mtp_moe"):
+            # The rest of the section only tunes the expert-parallel path. This option asks for a block to be
+            # checkpointed, and without expert parallelism the model's own path decides that.
+            logger.warning(
+                "`distributed.moe.checkpoint_repeated_mtp_moe` is set but ep_size=%d (<= 1): the "
+                "`distributed.moe` section is read only with expert parallelism, so the option is ignored.",
+                ep_size,
+            )
         moe_dict = None
 
     strategy_config = _resolve_strategy_config(strategy_name, **strategy_kwargs)
