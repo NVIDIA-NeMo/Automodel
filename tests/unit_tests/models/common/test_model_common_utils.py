@@ -26,7 +26,7 @@ from torch import nn
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
-    compute_lm_head_logits,
+    TENvfp4Config,
     generation_config_from_model_config,
     get_is_first_microbatch,
     get_is_optim_step,
@@ -170,6 +170,30 @@ def _fake_te_autocast():
         yield entered
 
 
+@contextmanager
+def _fake_te_nvfp4_recipe(available: bool = True):
+    """Stand in for ``transformer_engine.common.recipe``, with or without ``NVFP4BlockScaling``."""
+    recipe_module = types.ModuleType("transformer_engine.common.recipe")
+    if available:
+
+        class NVFP4BlockScaling:
+            def __init__(self, **kwargs: bool | str) -> None:
+                self.kwargs = kwargs
+
+        recipe_module.NVFP4BlockScaling = NVFP4BlockScaling
+    te_common = types.ModuleType("transformer_engine.common")
+    te_common.recipe = recipe_module
+    te_root = types.ModuleType("transformer_engine")
+    te_root.common = te_common
+    modules = {
+        "transformer_engine": te_root,
+        "transformer_engine.common": te_common,
+        "transformer_engine.common.recipe": recipe_module,
+    }
+    with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
+        yield
+
+
 class TestTEFp8Config:
     def test_default_recipe(self):
         cfg = TEFp8Config()
@@ -287,6 +311,103 @@ class TestBackendConfigTeFp8:
             BackendConfig(te_fp8=TEFp8Config(), linear="torch", experts="torch")
 
 
+class TestTENvfp4Config:
+    def test_default_options_keep_the_recipe_defaults(self):
+        cfg = TENvfp4Config()
+        assert cfg.recipe_kwargs() == {}
+        assert not cfg.resident_weights
+        with _fake_te_nvfp4_recipe():
+            assert cfg.build_recipe().kwargs == {}
+
+    def test_options_reach_the_te_recipe(self):
+        cfg = TENvfp4Config(
+            random_hadamard_transform=False,
+            stochastic_rounding=False,
+            weight_blocks_2d=False,
+            row_scaled_activation=True,
+            four_over_six="activations",
+            backward="high_precision",
+            resident_weights=True,
+        )
+        with _fake_te_nvfp4_recipe():
+            built = cfg.build_recipe()
+        assert built.kwargs == {
+            "disable_rht": True,
+            "disable_stochastic_rounding": True,
+            "disable_2d_quantization": True,
+            "row_scaled_activation": True,
+            "nvfp4_4over6": "activations",
+            "backward_override": "high_precision",
+        }
+
+    def test_build_recipe_without_te(self):
+        with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
+            assert TENvfp4Config().build_recipe() is None
+
+    def test_build_recipe_needs_te_with_nvfp4(self):
+        """A TE build without NVFP4BlockScaling is reported."""
+        with _fake_te_nvfp4_recipe(available=False):
+            with pytest.raises(ImportError, match="NVFP4BlockScaling"):
+                TENvfp4Config().build_recipe()
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"row_scaled_activation": True},
+            {"four_over_six": "activations"},
+            {"four_over_six": "all"},
+            {"four_over_six": "sometimes", "random_hadamard_transform": False},
+            {"backward": "float"},
+        ],
+    )
+    def test_unsupported_options_are_rejected(self, options):
+        with pytest.raises(ValueError, match="te_nvfp4"):
+            TENvfp4Config(**options)
+
+    def test_exclude_fqns_default_and_normalization(self):
+        assert TENvfp4Config().exclude_fqns == ("lm_head",)
+        assert TENvfp4Config(exclude_fqns=["lm_head", "model.score"]).exclude_fqns == ("lm_head", "model.score")
+        assert TENvfp4Config(exclude_fqns="score").module_excluded("model.score")
+        with pytest.raises(ValueError, match="te_nvfp4.exclude_fqns"):
+            TENvfp4Config(exclude_fqns=[""])
+
+
+class TestBackendConfigTeNvfp4:
+    def test_te_nvfp4_default_is_none(self):
+        cfg = BackendConfig()
+        assert cfg.te_nvfp4 is None
+        assert cfg.te_quantization is None
+
+    def test_te_nvfp4_dict_normalized(self):
+        cfg = BackendConfig(
+            te_nvfp4={"stochastic_rounding": False, "resident_weights": True}, experts="te", dispatcher="deepep"
+        )
+        assert cfg.te_nvfp4 == TENvfp4Config(stochastic_rounding=False, resident_weights=True)
+        assert cfg.te_fp8 is None
+        assert cfg.te_quantization is cfg.te_nvfp4
+
+    def test_empty_te_nvfp4_keeps_the_recipe_defaults(self):
+        cfg = BackendConfig(te_nvfp4={}, experts="te", dispatcher="deepep")
+        assert cfg.te_nvfp4 == TENvfp4Config()
+
+    def test_te_quantization_is_te_fp8_when_that_is_set(self):
+        cfg = BackendConfig(te_fp8={"recipe": "block"}, experts="te", dispatcher="deepep")
+        assert cfg.te_nvfp4 is None
+        assert cfg.te_quantization is cfg.te_fp8
+
+    def test_te_nvfp4_and_te_fp8_together_are_rejected(self):
+        with pytest.raises(ValueError, match="te_fp8 and te_nvfp4 are mutually exclusive"):
+            BackendConfig(te_nvfp4={}, te_fp8={"recipe": "mxfp8"}, experts="te", dispatcher="deepep")
+
+    def test_te_nvfp4_requires_te_backend(self):
+        with pytest.raises(ValueError, match="te_nvfp4 requires at least one TE backend"):
+            BackendConfig(te_nvfp4={}, linear="torch", experts="torch")
+
+    def test_te_nvfp4_rejects_unsupported_options(self):
+        with pytest.raises(ValueError, match="te_nvfp4.backward"):
+            BackendConfig(te_nvfp4={"backward": "float"}, experts="te", dispatcher="deepep")
+
+
 class TestGetRopeConfig:
     def test_extracts_rope_theta(self):
         config = SimpleNamespace(
@@ -332,181 +453,6 @@ class TestGetRopeConfig:
         assert rope_parameters["beta_slow"] == 1.0
         assert rope_parameters["beta_fast"] == 32.0
         assert rope_parameters["original_max_position_embeddings"] == 8192
-
-
-class TestComputeLmHeadLogits:
-    """Cover every branch of the shared lm_head projection helper."""
-
-    HIDDEN = 8
-    VOCAB = 16
-
-    def _lm_head(self):
-        torch.manual_seed(0)
-        return nn.Linear(self.HIDDEN, self.VOCAB, bias=False)
-
-    def test_none_lm_head_returns_hidden_states(self):
-        """A non-final PP stage (lm_head is None) passes hidden states through."""
-        hidden = torch.randn(2, 5, self.HIDDEN)
-        out = compute_lm_head_logits(None, hidden, logits_to_keep=0)
-        assert out.logits is hidden
-
-    def test_keep_zero_projects_all_positions_3d(self):
-        """logits_to_keep == 0 projects every position without slicing (BSHD)."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(2, 5, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0)
-        assert out.logits.shape == (2, 5, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden))
-
-    def test_keep_zero_projects_all_positions_2d(self):
-        """logits_to_keep == 0 with a 2D [T, H] (THD/packed) hidden state."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0)
-        assert out.logits.shape == (7, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden))
-
-    def test_keep_int_slices_last_n_3d(self):
-        """A positive int keeps only the last N positions (BSHD)."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(2, 5, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
-        assert out.logits.shape == (2, 2, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden[:, -2:, :]))
-
-    def test_keep_int_slices_last_n_2d(self):
-        """A positive int keeps only the last N positions (THD/packed)."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3)
-        assert out.logits.shape == (3, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden[-3:, :]))
-
-    def test_keep_tensor_indices_3d(self):
-        """A tensor of indices selects those positions (BSHD)."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(2, 5, self.HIDDEN)
-        idx = torch.tensor([0, 2, 4])
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=idx)
-        assert out.logits.shape == (2, 3, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden[:, idx, :]))
-
-    def test_keep_tensor_indices_2d(self):
-        """A tensor of indices selects those positions (THD/packed)."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        idx = torch.tensor([1, 3, 5])
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=idx)
-        assert out.logits.shape == (3, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden[idx, :]))
-
-    def test_is_thd_restores_batch_dim_on_2d_logits(self):
-        """THD/packed input -> 2D [T, V] logits get a leading batch dim restored."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, is_thd=True)
-        assert out.logits.shape == (1, 7, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden).unsqueeze(0))
-
-    def test_is_thd_with_logits_to_keep(self):
-        """is_thd composes with slicing: last-N 2D logits become [1, N, V]."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2, is_thd=True)
-        assert out.logits.shape == (1, 2, self.VOCAB)
-        torch.testing.assert_close(out.logits, lm_head(hidden[-2:, :]).unsqueeze(0))
-
-    def test_is_thd_noop_when_logits_already_3d(self):
-        """A 3D logits result (BSHD path) is left untouched, never made 4D."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(2, 5, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, is_thd=True)
-        assert out.logits.shape == (2, 5, self.VOCAB)
-
-    def test_is_thd_none_lm_head_unsqueezes_passthrough(self):
-        """With lm_head=None, the 2D passthrough hidden states also get the batch dim."""
-        hidden = torch.randn(7, self.HIDDEN)
-        out = compute_lm_head_logits(None, hidden, logits_to_keep=0, is_thd=True)
-        assert out.logits.shape == (1, 7, self.HIDDEN)
-        torch.testing.assert_close(out.logits, hidden.unsqueeze(0))
-
-    def test_fp32_lm_head_projects_in_fp32_and_restores_dtype(self):
-        """fp32_lm_head upcasts to fp32 for the matmul, then casts logits back to input dtype."""
-        lm_head = self._lm_head()  # nn.Linear with an fp32 weight
-        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, fp32_lm_head=True)
-        assert out.logits.dtype == torch.bfloat16
-        torch.testing.assert_close(out.logits, lm_head(hidden.float()).to(torch.bfloat16))
-
-    def test_fp32_lm_head_with_slicing(self):
-        """fp32_lm_head composes with logits_to_keep slicing (2D THD input)."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=3, fp32_lm_head=True)
-        assert out.logits.shape == (3, self.VOCAB)
-        assert out.logits.dtype == torch.bfloat16
-        torch.testing.assert_close(out.logits, lm_head(hidden[-3:, :].float()).to(torch.bfloat16))
-
-    def test_fp32_lm_head_ignored_when_lm_head_none(self):
-        """fp32_lm_head is a no-op on the lm_head=None passthrough."""
-        hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(None, hidden, fp32_lm_head=True)
-        assert out.logits is hidden
-
-    def test_lm_head_dtype_casts_after_slicing(self):
-        lm_head = self._lm_head().to(torch.bfloat16)
-        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
-
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
-
-        expected = lm_head(hidden[:, -2:, :].to(torch.bfloat16))
-        assert out.logits.shape == (2, 2, self.VOCAB)
-        assert out.logits.dtype == torch.bfloat16
-        torch.testing.assert_close(out.logits, expected)
-
-    def test_fsdp_lm_head_uses_policy_compute_dtype(self):
-        hidden_size = self.HIDDEN
-        vocab_size = self.VOCAB
-
-        class FakeFSDPHead(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight = nn.Parameter(torch.randn(vocab_size, hidden_size, dtype=torch.float32))
-
-            def _get_fsdp_state(self):
-                return SimpleNamespace(_mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
-
-            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-                """Project hidden states of shape [batch, sequence, hidden]."""
-                assert hidden_states.dtype == torch.bfloat16
-                return hidden_states @ self.weight.to(hidden_states.dtype).T
-
-        lm_head = FakeFSDPHead()
-        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
-
-        with patch("nemo_automodel.components.models.common.utils.FSDPModule", FakeFSDPHead):
-            out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
-
-        assert lm_head.weight.dtype == torch.float32
-        assert out.logits.shape == (2, 2, self.VOCAB)
-        assert out.logits.dtype == torch.bfloat16
-
-    def test_output_hidden_states_attaches_hidden(self):
-        """output_hidden_states attaches the final hidden states; default leaves them None."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(2, 5, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0)
-        assert out.hidden_states is None
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, output_hidden_states=True)
-        assert out.hidden_states is hidden
-
-    def test_output_hidden_states_thd_restores_batch_dim(self):
-        """With is_thd, a 2D hidden state gets a leading batch dim in the hidden_states field."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, is_thd=True, output_hidden_states=True)
-        assert out.hidden_states.shape == (1, 7, self.HIDDEN)
-        torch.testing.assert_close(out.hidden_states, hidden.unsqueeze(0))
 
 
 class TestGenerationConfigHelpers:

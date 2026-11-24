@@ -27,6 +27,7 @@ from transformers.models.lfm2_vl.modeling_lfm2_vl import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -72,9 +73,10 @@ class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, HFLfm2VlForConditiona
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: Lfm2VlConfig) -> None:
+    def __init__(self, config: Lfm2VlConfig, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         language = self.model.language_model
         for layer in language.layers:
             if layer.is_attention_layer:

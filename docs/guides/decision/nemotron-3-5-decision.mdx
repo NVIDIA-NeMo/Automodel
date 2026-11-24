@@ -1,0 +1,601 @@
+---
+title: "Nemotron 3.5 Decision"
+description: "Post-train Nemotron 3.5 Decision 8B on fictional SOC alert triage with LoRA or backbone fine-tuning, then export it and score typed decisions with Hugging Face Transformers."
+position: 16
+---
+**A step-by-step guide to post-training Nemotron 3.5 Decision 8B with
+[NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The model is an 8B decision model that uses a bidirectional Ministral 3 encoder to score
+the supplied options in one forward pass. The guide runs LoRA on a single GPU or backbone fine-tuning on
+one node on a fictional SOC alert-triage dataset, then exports the result and scores it with the checkpoint's own
+code on Hugging Face Transformers.**
+
+---
+
+## What is Nemotron 3.5 Decision?
+
+Nemotron 3.5 Decision 8B (architecture `NemotronForDecision`) answers **typed decision questions** about a
+structured or free-text *state*. Each question is one of three types:
+
+| Type | Answer | Example |
+|------|--------|---------|
+| `choice` | One of several named options | "Which team should handle the ticket?" → `billing` |
+| `noul` | Yes or no (`true` / `false`) | "Does this alert need analyst review?" → `false` |
+| `score` | A position on an ordered scale | "How severe is the event?" → `Low` |
+
+The model does not generate text. It reads the question once, bidirectionally, with a single mask token in the
+answer slot. Its decision head, restricted to the option codes, gives **a probability for every option** in one
+forward pass, with no sampling.
+
+Key architectural details:
+- **Backbone**: 34-layer Ministral 3 encoder read bidirectionally, hidden dim 4096, 32 attention heads (8 KV heads), head dim 128
+- **Vocabulary**: 131,072 tokens; mask token id `100`
+- **Context**: YaRN RoPE scaling to 262,144 positions
+- **Attention**: fully bidirectional (`is_causal: false`); text only
+- **Parameters**: 8.49B in total, of which 7.42B are decoder layers; ~17 GB in bf16
+
+## Post-Train for SOC Alert Triage
+
+This guide post-trains the model on a **fictional SOC (security operations center) alert-triage** dataset that ships
+with NeMo AutoModel. Every alert comes with five questions:
+
+| Question | Type | Options |
+|----------|------|---------|
+| `verdict` | `choice` | `malicious`, `benign_authorized`, `false_positive` |
+| `action` | `choice` | `close`, `monitor`, `escalate`, `contain` |
+| `attack_tactic` | `choice` | `credential_access`, `execution` |
+| `needs_human` | `noul` | `true`, `false` |
+| `severity` | `score` | `Informational`, `Low`, `Medium`, `High`, `Critical` |
+
+The labels follow a fictional tutorial policy. The base model answers from general knowledge: it gets 71% of the
+held-out questions right, and only 38% of the `severity` questions. After 40 LoRA steps it follows the policy on
+every held-out question. The same recipe runs on your own decisions (see
+[Bring Your Own Decisions](#bring-your-own-decisions)).
+
+<Warning>
+The tutorial data and labels are fictional. Accuracy on them shows that post-training works; it does not measure
+operational security performance.
+</Warning>
+
+## Guide Overview
+
+| Step | Description |
+|------|-------------|
+| **Step 0** | Environment setup |
+| **Step 1** | Prepare the SOC triage dataset |
+| **Step 2** | Training configuration (LoRA and backbone fine-tuning) |
+| **Step 3** | Score the base model, then launch post-training |
+| **Step 4** | Export the selected stage and run inference with the checkpoint's own code |
+| **Step 5** | Results |
+
+## Hardware Requirements
+
+- **LoRA**: one GPU. Peak memory was ~18 GiB with this dataset's short prompts (bf16 base, activation
+  checkpointing); longer states need more.
+- **Backbone fine-tuning**: one node of 8 GPUs (~26 GiB peak per GPU; fp32 weights and AdamW state for the decoder
+  layers, sharded with FSDP2).
+- **Training time** (measured on 8x B200): LoRA ~3.5 min on one GPU and backbone fine-tuning ~2.5 min on 8 GPUs. Both
+  include model loading, validation, and test scoring. Scoring the base model takes ~1 min.
+- **Disk**: ~17 GB for the base checkpoint, ~170 MB per LoRA stage (adapter only), ~48 GB per backbone fine-tuning stage
+  (sharded and consolidated weights), and ~17 GB per exported checkpoint.
+
+---
+
+## Step 0 — Set Up the Environment
+
+```bash
+# Inside the NeMo AutoModel container:
+cd /opt/Automodel
+
+# Or from a source checkout:
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
+```
+
+Place the Nemotron 3.5 Decision 8B bf16 checkpoint in a **local directory**. This guide uses
+`checkpoints/nemotron-3.5-decision-8b`.
+
+<Note>
+Use the local directory, not a Hugging Face id, in every command below. Each saved stage records a fingerprint of
+the base checkpoint's configuration and weights, and the export refuses to merge a stage into a base it was not
+trained on. The fingerprint is only recorded when the base is a local directory.
+</Note>
+
+The recipe accepts Nemotron 3.5 Decision checkpoints as they ship: `config.json` lists
+`"architectures": ["NemotronForDecision"]` (`model_type: ministral3`), and the directory holds the checkpoint's
+decision contract, `decision.json` and `decision_template.jinja`. NeMo AutoModel loads the model natively, so its
+remote code is not needed. Vision and quantized (for example, NVFP4) variants stop at setup with an explicit error.
+Post-train the bf16 checkpoint and quantize afterwards.
+
+---
+
+## Step 1 — Prepare the SOC Triage Dataset
+
+Generate the fictional alerts. The generator is deterministic for a given seed. It needs no model, API key, or GPU,
+and it refuses to overwrite an existing directory:
+
+```bash
+PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+    --output-dir data/soc_triage --seed 7
+```
+
+Expected output:
+```
+INFO:__main__:Wrote {'train': 128, 'validation': 32, 'test': 32}
+```
+
+Each record holds one alert (`state`), its five `questions`, and the policy's `answers`:
+
+```json
+{
+  "id": "fictional-7-00000",
+  "state": {
+    "asset": "host-00000.example",
+    "asset_impact": "critical",
+    "behavior": "credential read attempt",
+    "evidence": "A signed maintenance ticket and the approved schedule explain the activity.",
+    "evidence_quality": "clear",
+    "source_ip": "192.0.2.1"
+  },
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "What explains the observed security alert?",
+      "criteria": {
+        "malicious": "The evidence supports an unauthorized attack.",
+        "benign_authorized": "The activity is authorized and expected.",
+        "false_positive": "A sensor artifact explains the alert."
+      }
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is the event under the tutorial policy?",
+      "criteria": ["Informational", "Low", "Medium", "High", "Critical"]
+    }
+  },
+  "answers": {"verdict": "benign_authorized", "severity": "1"}
+}
+```
+
+(Two of the five questions and some `state` fields are shown.)
+
+The recipe reads these SystemOne records directly, as the [CLM and Clef recipes](/model-coverage/decision-models/overview)
+do, so no conversion step is needed.
+The model is trained the way the checkpoint reads decisions: **one question per read**. Each alert gives five reads, so the splits
+hold 640 training, 160 validation, and 160 test questions. All five questions about one alert stay in the same split,
+so the validation and test alerts are never seen in training.
+
+### Decision Prompt Format
+
+The checkpoint owns its prompt, and the recipe renders every question exactly as the checkpoint's own code does:
+- `decision_template.jinja` writes a fixed system message, then a JSON user turn `{"state", "question", "options"}`;
+- options keep the question's order (`choice`: criteria order; `noul`: `false`, `true`; `score`: level 0 upwards),
+  each with the code `decision.json` assigns to its position (`A`, `B`, ...);
+- control tokens inside the state or question are encoded as plain text, so they cannot act as control tokens;
+- the template ends with the mask token.
+
+The probability of each option is the decision head's distribution at that mask, restricted to the option codes.
+
+### Bring Your Own Decisions
+
+For your own data, write one decision per line:
+
+```json
+{"state": {"ticket": "I was charged twice for my March invoice."}, "question": "Which team should handle the ticket?", "type": "choice", "options": {"billing": "payments, invoices, refunds", "technical": "bugs, outages"}, "label": "billing", "group": "customer-0042"}
+```
+
+`soft_labels` (a probability per option) is optional. Rows that share a `group` stay in the same split, which keeps
+near-duplicates out of validation and test. Convert the lines to single-question SystemOne records with:
+
+```bash
+uv run python examples/decision/prepare_nemotron_decision_data.py \
+    --input my_decisions.jsonl --output data/my_records --split three-way
+```
+
+`--split three-way` writes group-disjoint `train` / `validation` / `test` files. Then point the `data.*` paths of
+`examples/decision/nemotron_decision_support_routing_lora.yaml` (or the SOC config) at them. If your data is already in
+SystemOne records, use them as they are. Soft labels there map each question to option weights:
+`"soft_labels": {"verdict": {"malicious": 0.8, "false_positive": 0.2}}`.
+
+---
+
+## Step 2 — Training Configuration
+
+**Config file**: `examples/decision/nemotron_decision_soc_triage_lora.yaml`
+
+```yaml
+recipe: nemo_automodel.recipes.decision.train_nemotron_decision.TrainNemotronDecisionRecipe
+
+mode: train            # eval | train
+seed: 101
+output_dir: runs/soc/lora
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /path/to/nemotron-3.5-decision-8b   # a local Nemotron 3.5 Decision checkpoint directory
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*.q_proj"
+    - "*.k_proj"
+    - "*.v_proj"
+    - "*.o_proj"
+    - "*.gate_proj"
+    - "*.up_proj"
+    - "*.down_proj"
+  dim: 32
+  alpha: 64
+  dropout: 0.0
+
+distributed:
+  strategy: fsdp2
+  activation_checkpointing: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  save_consolidated: false  # LoRA stages save adapters; export_nemotron_decision.py merges them
+
+data:
+  train: data/soc_triage/train.jsonl
+  validation: data/soc_triage/validation.jsonl
+  test: data/soc_triage/test.jsonl
+  max_tokens: 8192       # questions whose prompt + mask is longer are skipped and counted
+  slice_keys: [evidence, verdict, family]
+
+train:
+  global_batch_size: 16  # questions per optimizer step over all ranks
+  epochs: 1.0
+  warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
+  min_lr_ratio: 0.1
+  canonical_fraction: 0.5  # option shuffle (training only): this share of reads keeps the checkpoint's option
+                           # order, the rest are shuffled and re-coded by position; 1.0 disables it
+  max_grad_norm: 1.0
+  val_every_steps: 50
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft
+  label_smoothing: 0.0
+  brier_weight: 0.0
+  ordinal_weight: 0.0
+  soft_label_kl_weight: 0.0    # 0: soft labels replace the gold target; > 0: CE(gold) + weight * KL(soft || p)
+  soft_label_gold_mask: false
+```
+
+What the recipe trains:
+
+- **Loss**: the shared decision objective (`DecisionLoss`) with label smoothing, Brier, and ranked-probability terms
+  off, which is cross-entropy over the options: against the gold answer, or against a question's `soft_labels` when
+  the record has them. `loss.soft_label_kl_weight > 0` switches to gold cross-entropy plus a weighted KL term to the
+  soft labels.
+- **Option shuffle**: an explicit, training-only setting. With `canonical_fraction: 0.5`, half of the training reads
+  keep the checkpoint's option order and the other half shuffle the options and re-code them by position, so the model
+  learns what the options *mean*, not which letter they had. Evaluation always uses the checkpoint's order, and the
+  recipe's default (`1.0`) never shuffles.
+- **Frozen readout**: the embeddings and decision head never train, and no new parameters are added. The exported
+  checkpoint scores decisions exactly as the base checkpoint's own code does.
+- **Long questions**: questions longer than `data.max_tokens` are skipped and counted, never truncated.
+
+With rank 32 on the attention and MLP projections of all 34 layers, LoRA trains **89.1M parameters (1.04% of the
+model)**.
+
+### Backbone Fine-Tuning
+
+Backbone fine-tuning trains the encoder blocks and final norm instead of LoRA adapters. Override four keys on the
+command line:
+
+```bash
+--peft None --optimizer.lr 1.0e-6 --model.torch_dtype float32 --checkpoint.save_consolidated every
+```
+
+It trains **7.42B parameters**: all 34 encoder blocks and the final norm. The input embeddings and the output
+projection (the decision head) stay frozen. The head's rows for the option codes are the readout, so keeping them
+fixed keeps every code's meaning identical to the base checkpoint, so the exported model reads its decision contract
+exactly as the base does. It keeps fp32 weights and AdamW state for the trained parameters, so it uses one node of 8
+GPUs (see
+[Hardware Requirements](#hardware-requirements)).
+
+---
+
+## Step 3 — Launch Post-Training
+
+### Score the Base Model
+
+Run the same config in `eval` mode to get the *before* numbers on the validation and test splits:
+
+```bash
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --nproc-per-node 1 --mode eval \
+    --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
+    --output_dir runs/soc/base
+```
+
+```
+[eval] validation accuracy=0.7625 nll=0.6412
+[eval] test accuracy=0.7125 nll=0.7516
+```
+
+### LoRA
+
+```bash
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --nproc-per-node 1 \
+    --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
+    --output_dir runs/soc/lora
+```
+
+One epoch of the 640 training questions at 16 questions per step is **40 optimizer steps**. Validation runs on the starting
+checkpoint (step 0) and on the final step.
+
+### Backbone Fine-Tuning
+
+```bash
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --nproc-per-node 8 \
+    --model.pretrained_model_name_or_path checkpoints/nemotron-3.5-decision-8b \
+    --peft None --optimizer.lr 1.0e-6 --model.torch_dtype float32 --checkpoint.save_consolidated every \
+    --output_dir runs/soc/backbone
+```
+
+### Training Log for LoRA
+
+```
+Trainable parameters: 89,128,960
+Trainable parameters percentage: 1.04%
+
+validation {"step": 0, "accuracy": 0.7625, "correct": 122, "nll": 0.6412, "decisions": 160}
+training {"step": 1, "epoch": 1, "loss": 0.72928, "grad_norm": 34.7345, "lr": 5e-05, "seconds": 4.11}
+training {"step": 10, "epoch": 1, "loss": 0.12405, "grad_norm": 2.8301, "lr": 9.05e-05, "seconds": 3.65}
+training {"step": 20, "epoch": 1, "loss": 0.00494, "grad_norm": 0.0584, "lr": 5.87e-05, "seconds": 3.66}
+training {"step": 30, "epoch": 1, "loss": 0.00128, "grad_norm": 0.058, "lr": 2.45e-05, "seconds": 3.65}
+training {"step": 40, "epoch": 1, "loss": 0.00598, "grad_norm": 3.4131, "lr": 1e-05, "seconds": 3.53}
+validation {"step": 40, "accuracy": 1.0, "correct": 160, "nll": 0.001, "decisions": 160}  <-- LOWEST_VAL
+
+[train] validation accuracy=1.0000 nll=0.0010
+[train] test accuracy=1.0000 nll=0.0012
+```
+
+Each step takes ~3.6 s on one B200 (16 questions, activation checkpointing).
+
+### Training Log for Backbone Fine-Tuning
+
+```
+validation {"step": 0, "accuracy": 0.7625, "correct": 122, "nll": 0.6412, "decisions": 160}
+training {"step": 1, "epoch": 1, "loss": 0.72928, "grad_norm": 147.3218, "lr": 5e-07, "seconds": 3.17}
+training {"step": 10, "epoch": 1, "loss": 0.0571, "grad_norm": 12.4478, "lr": 9.05e-07, "seconds": 0.81}
+training {"step": 20, "epoch": 1, "loss": 0.11393, "grad_norm": 16.1489, "lr": 5.87e-07, "seconds": 0.45}
+training {"step": 30, "epoch": 1, "loss": 0.02959, "grad_norm": 1.8337, "lr": 2.45e-07, "seconds": 0.44}
+training {"step": 40, "epoch": 1, "loss": 0.02222, "grad_norm": 2.0611, "lr": 1e-07, "seconds": 0.44}
+validation {"step": 40, "accuracy": 1.0, "correct": 160, "nll": 0.0231, "decisions": 160}  <-- LOWEST_VAL
+
+[train] validation accuracy=1.0000 nll=0.0231
+[train] test accuracy=1.0000 nll=0.0244
+```
+
+The parameter summary printed when the model is built counts all 8.49B parameters. The recipe then freezes the
+embeddings and the decision head, so 7.42B parameters train.
+
+With a 100x lower learning rate, backbone fine-tuning reaches the same accuracy with less confident probabilities
+(cross-entropy 0.023 against 0.001 for LoRA).
+
+### How a Stage Is Selected
+
+Validation publishes the best stage as `LOWEST_VAL`: **most correct validation questions first, then lowest
+cross-entropy (NLL)**. For LoRA the starting checkpoint (step 0) is a saved, selectable stage, so a run that does not help
+publishes the base unchanged. Backbone fine-tuning selects among its trained stages. The test split is scored once, on
+the selected stage, and is never used for selection.
+
+### Checkpoints Saved
+
+```
+runs/soc/lora/
+  step_00000000/            # the starting checkpoint (LoRA only)
+  step_00000040/
+    model/
+      adapter_config.json
+      adapter_model.safetensors   # ~170 MB
+    stage.json              # base path and fingerprint, method, mask and readout ids, validation record
+    losses.json
+  LATEST -> step_00000040
+  LOWEST_VAL -> step_00000040
+  run_config.json
+  training.jsonl
+  validation.jsonl
+  selected.json             # the published step and its validation record
+  metrics_validation.json   # accuracy, exact match, NLL, Brier, ECE, reward; per question and per slice
+  metrics_test.json
+  predictions_validation.jsonl  # per-question option probabilities
+  predictions_test.jsonl
+```
+
+A backbone fine-tuning stage holds `model/consolidated/` (a Hugging Face export of the trained weights) instead of the
+adapter.
+
+---
+
+## Step 4 — Export and Run Inference
+
+### Export the Selected Stage
+
+Merge the selected LoRA stage into the base weights (`W += (alpha / r) * B @ A`, computed in fp32). The export writes
+a complete, standalone checkpoint:
+
+```bash
+uv run python examples/decision/export_nemotron_decision.py \
+    --base checkpoints/nemotron-3.5-decision-8b \
+    --stage runs/soc/lora/LOWEST_VAL \
+    --output exports/soc_lora
+```
+
+```json
+{
+  "stage": "runs/soc/lora/step_00000040",
+  "base": "checkpoints/nemotron-3.5-decision-8b",
+  "adapter": "runs/soc/lora/step_00000040/model",
+  "lora_modules": 238,
+  "r": 32,
+  "alpha": 64,
+  "scale": 2.0
+}
+```
+
+The same command exports a backbone fine-tuning stage (`--stage runs/soc/backbone/LOWEST_VAL`), cast to the base dtypes. The
+export first checks the stage's base fingerprint and refuses a base the stage was not trained on. It copies the base
+configuration, tokenizer, and model code unchanged, so the output loads anywhere the base loads. Each export takes
+~45 s.
+
+### Score Decisions with the Checkpoint's Own Code
+
+The export is a complete Nemotron 3.5 Decision checkpoint: it keeps the base's model code, decision contract, and
+tokenizer, so you serve it exactly like the base. Its own interface needs Transformers 5.23 or later. NeMo AutoModel
+pins an earlier version, so use a separate environment for inference:
+
+```bash
+uv venv decision-env --python 3.12 && source decision-env/bin/activate
+uv pip install "transformers>=5.23.0" torch
+```
+
+`system_one` answers named questions about a state. `prepare_decisions` and `decide` give the probability of every
+option. The example below is a held-out test alert:
+
+```python
+import torch
+from transformers import AutoModel, AutoTokenizer
+
+CKPT = "exports/soc_lora"  # or checkpoints/nemotron-3.5-decision-8b for the base model
+
+tokenizer = AutoTokenizer.from_pretrained(CKPT)
+model = AutoModel.from_pretrained(CKPT, trust_remote_code=True, dtype=torch.bfloat16).cuda().eval()
+
+alert = {
+    "asset": "host-00162.example",
+    "asset_impact": "critical",
+    "behavior": "credential read attempt",
+    "contact": "analyst-00162@example.com",
+    "event_id": "event-7-00162",
+    "evidence": "A replayed sensor event does not correspond to activity on this asset.",
+    "evidence_quality": "ambiguous",
+    "source_ip": "192.0.2.163",
+}
+action = {
+    "type": "choice",
+    "instructions": "Which response follows the tutorial policy?",
+    "criteria": {
+        "close": "Close the alert.",
+        "contain": "Contain the affected asset.",
+        "escalate": "Ask an analyst to investigate.",
+        "monitor": "Monitor the asset without containment.",
+    },
+}
+print(model.system_one(state=alert, questions={"action": action})["answers"]["action"]["choice"])
+
+(batch,) = model.prepare_decisions({"state": alert, "questions": {"action": action}}, tokenizer=tokenizer)
+probabilities = model.decide(**batch.model_inputs)[0].float().softmax(-1)
+print({option: round(p, 4) for option, p in zip(batch.questions[0]["options"], probabilities.tolist())})
+```
+
+Output of the post-trained export (`CKPT = "exports/soc_lora"`):
+```
+escalate
+{'close': 0.0001, 'contain': 0.0001, 'escalate': 0.9995, 'monitor': 0.0002}
+```
+
+The base model on the same alert (`CKPT = "checkpoints/nemotron-3.5-decision-8b"`):
+```
+close
+{'close': 0.8992, 'contain': 0.0165, 'escalate': 0.0693, 'monitor': 0.015}
+```
+
+The evidence is ambiguous and the asset is critical, so the tutorial policy escalates. The base model closes the
+alert with 90% probability; the post-trained model escalates. `system_one` returns each answer with its probabilities
+(`choice` and `score`) or the probability of `true` (`noul`); `score` options are their positions (`"0"` for
+`Informational` through `"4"` for `Critical`).
+
+### Evaluate the Test Split
+
+Score every question of the test records with the same interface:
+
+```python
+import json
+
+correct = total = 0
+for line in open("data/soc_triage/test.jsonl"):
+    record = json.loads(line)
+    for name, question in record["questions"].items():
+        (batch,) = model.prepare_decisions(
+            {"state": record["state"], "questions": {name: question}}, tokenizer=tokenizer
+        )
+        scores = model.decide(**batch.model_inputs)[0]
+        correct += batch.questions[0]["options"][int(scores.argmax())] == record["answers"][name]
+        total += 1
+print(f"test accuracy {correct / total:.4f} ({correct}/{total})")
+```
+
+```
+test accuracy 1.0000 (160/160)
+```
+
+The checkpoint's own code reproduces the recipe's test predictions (`predictions_test.jsonl`): the same decision on
+all 160 test questions, with a maximum absolute probability difference of 0.0008 for the LoRA export and 0.0024 for the
+backbone fine-tuning export. On the base checkpoint the same loop gives 0.7125 (114/160), also matching the recipe
+decision for decision.
+
+**Resources:** one GPU with ~16 GiB for the bf16 weights.
+**Runtime:** ~119 ms per question on 1x B200, one question at a time; the 160 test questions take ~19 s.
+
+---
+
+## Step 5 — Results
+
+### Evaluation on the 160 Test Questions (32 Held-Out Alerts)
+
+| Model | Accuracy | Cross-entropy | `choice` | `noul` | `score` |
+|---|---|---|---|---|---|
+| Base | 71.3% (114/160) | 0.752 | 78.1% | 84.4% | 37.5% |
+| LoRA, step 40 (`LOWEST_VAL`) | **100% (160/160)** | **0.001** | 100% | 100% | 100% |
+| Backbone fine-tuning, step 40 (`LOWEST_VAL`) | **100% (160/160)** | 0.024 | 100% | 100% | 100% |
+
+### Accuracy by Question
+
+| Question | Base | LoRA | Backbone fine-tuning |
+|---|---|---|---|
+| `verdict` | 20/32 | 32/32 | 32/32 |
+| `action` | 23/32 | 32/32 | 32/32 |
+| `attack_tactic` | 32/32 | 32/32 | 32/32 |
+| `needs_human` | 27/32 | 32/32 | 32/32 |
+| `severity` | 12/32 | 32/32 | 32/32 |
+
+The base model already identifies the behavior behind an alert (`attack_tactic`). Its mistakes are the policy's
+choices, which it has no way to know: what a controlled test artifact means, when an ambiguous alert on a critical
+asset is escalated, and where the severity thresholds sit. Post-training teaches those rules. Both methods reach
+100% here because the fictional policy is deterministic. On your own data, compare the two methods on your held-out
+split.
+
+### Sample Predictions (Test Split)
+
+| Alert evidence | Question | Gold | Base: top answer (p) | LoRA: top answer (p) |
+|---|---|---|---|---|
+| A replayed sensor event does not correspond to activity on this asset (ambiguous, critical asset) | `action` | `escalate` | `close` (0.90) | `escalate` (1.00) |
+| A replayed sensor event does not correspond to activity on this asset (ambiguous, ordinary asset) | `needs_human` | `true` | `false` (0.87) | `true` (1.00) |
+| A controlled test artifact matches the detection and no authorized change exists (clear) | `verdict` | `malicious` | `false_positive` (0.94) | `malicious` (1.00) |
+| A signed maintenance ticket and the approved schedule explain the activity (ambiguous) | `severity` | `Low` | `Informational` (0.54) | `Low` (1.00) |
+
+### Summary
+
+| | LoRA | Backbone fine-tuning |
+|---|---|---|
+| Trainable params | 89.1M (1.04%) | 7.42B (decoder layers and final norm) |
+| Learning rate | 1e-4 (AdamW, cosine) | 1e-6 (AdamW, cosine) |
+| GPU memory | ~18 GiB on 1 GPU | ~26 GiB / GPU on 8 GPUs |
+| Training time | ~3.5 min on 1x B200 | ~2.5 min on 8x B200 |
+| Test accuracy | 100% (base 71.3%) | 100% (base 71.3%) |
+| Test cross-entropy | 0.001 | 0.024 |
+| Stage size | ~170 MB (adapter only) | ~48 GB (sharded and consolidated) |
+| Export | merged into a ~17 GB bf16 checkpoint | cast to the base dtypes, ~17 GB |

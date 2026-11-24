@@ -73,11 +73,7 @@ class HyMT2Config(PretrainedConfig):
         qk_norm: bool = True,
         attention_bias: bool = False,
         hidden_act: str = "silu",
-        # FP32 upcast hints (mirroring HF config). NeMo AutoModel wires
-        # ``enable_lm_head_fp32`` either via the YAML ``lm_head_precision: float32``
-        # (preferred, handled by the MoE parallelizer) or via the in-model
-        # cast in ``HyMT2ForCausalLM.forward`` when ``lm_head_precision`` is
-        # unset.
+        # FP32 upcast hints mirroring the HF config; for FP32 logits set ``logits_dtype: float32``.
         enable_lm_head_fp32: bool = True,
         enable_attention_fp32_softmax: bool = False,
         enable_moe_fp32_combine: bool = False,

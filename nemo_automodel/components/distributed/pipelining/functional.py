@@ -383,8 +383,11 @@ def _precompute_stage_shapes(
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         emits_hidden_states = getattr(stage.submod, "_pp_return_hidden_states", False) is True
         if has_lm_head and not emits_hidden_states:
-            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype)
+            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size], in the head's logits_dtype
+            # when it sets one (an LMHead); any other head returns the model dtype.
+            head_dtype = getattr(stage.submod.lm_head, "logits_dtype", None)
+            logits_dtype = head_dtype if isinstance(head_dtype, torch.dtype) else model_dtype
+            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=logits_dtype)
         else:
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)
@@ -460,23 +463,23 @@ def _use_static_pipeline_stage_metadata(schedule: _PipelineSchedule, stages: lis
 
 
 def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
-    """Keep accumulated gradients alive when stage infrastructure is rebuilt.
+    """Keep stage re-initialization free of FSDP side effects in static metadata mode.
 
     ``_initialize_pp_stages`` ends by calling ``_post_metadata_inference_cleanup``
-    on every stage, which sets ``param.grad = None`` on FSDP modules. Upstream that
-    is safe: it assumes initialization happens once, before any real backward, and
-    only clears the throwaway gradients left behind by dynamic metadata inference.
+    on every stage, which reshards every FSDP module of the stage and sets
+    ``param.grad = None``. Upstream that is safe: it assumes initialization happens
+    once, before any real step, and only undoes the side effects of dynamic
+    metadata inference.
 
     ``reset_pp_stage_shapes`` breaks that assumption. It re-initializes the stages
-    whenever the sequence length changes, which for VLM batches is most steps -- and
-    with gradient accumulation that lands *between* micro-batches, so the cleanup
-    discards everything accumulated so far and only the final micro-batch's
-    gradients reach the optimizer.
+    whenever this rank's sequence length changes. Under gradient accumulation the
+    cleanup would discard the gradients accumulated so far, and in evaluation the
+    reshard makes only the re-initialized rank gather again, so its DP peers never
+    post the matching all-gathers and the ranks hang.
 
-    With static metadata no inference forward/backward runs, so there are no stale
-    gradients to clear and the whole wipe is collateral damage. Restore the
-    gradients in that case, and leave dynamic mode alone, where the cleanup is doing
-    real work.
+    With static metadata no inference forward/backward runs, so nothing is gathered,
+    no gradients are stale and nothing is stored. Skip the cleanup in that case, and
+    leave dynamic mode alone, where the cleanup is doing real work.
 
     Args:
         stages: The local pipeline stages to protect.
@@ -492,15 +495,37 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
             continue
 
         def _cleanup_preserving_grads(self, *, _cleanup=cleanup) -> None:
-            if getattr(self, "_inference_mode", None) is not InferenceMode.STATIC:
-                _cleanup()
+            # STATIC: no metadata forward ran, so nothing is gathered, no grads are stale,
+            # and nothing is stored. Skipping keeps rank-local re-inits FSDP-neutral.
+            if getattr(self, "_inference_mode", None) is InferenceMode.STATIC:
                 return
-            saved = [(param, param.grad) for param in self.submod.parameters() if param.grad is not None]
             _cleanup()
-            for param, grad in saved:
-                param.grad = grad
 
         stage._post_metadata_inference_cleanup = types.MethodType(_cleanup_preserving_grads, stage)
+
+
+def _check_stage_reinit_is_static(schedule: _PipelineSchedule, stages: list[PipelineStage]) -> None:
+    """Fail fast if a stage re-initialization would run dynamic metadata inference.
+
+    ``reset_pp_stage_shapes`` runs on each rank when its own sequence length changes.
+    Dynamic inference would run a real forward/backward and an FSDP reshard on that
+    rank only, so its DP peers would never post the matching collectives.
+    """
+    try:
+        from torch.distributed.pipelining._utils import InferenceMode, _StageMeta
+    except ImportError:
+        return
+
+    has_backward = getattr(schedule, "_has_backward", True)
+    for stage in stages:
+        user_meta = getattr(stage, "_user_meta", None)
+        if isinstance(user_meta, _StageMeta) and InferenceMode.needs_dynamic(user_meta, has_backward):
+            raise ValueError(
+                f"Pipeline stage {getattr(stage, 'stage_index', '?')} needs dynamic metadata inference after a "
+                "sequence-length reset, which is unsupported: a rank-local re-initialization in dynamic mode "
+                "desynchronizes FSDP collectives across data-parallel ranks. Provide complete static stage "
+                "metadata (plus input_grads/output_grads for DTensor stage inputs or outputs with backward)."
+            )
 
 
 def reset_pp_stage_shapes(
@@ -562,6 +587,7 @@ def reset_pp_stage_shapes(
     local_num_tokens = _precompute_stage_shapes(
         stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype
     )
+    _check_stage_reinit_is_static(schedule, stages)
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
@@ -579,7 +605,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
 
     Custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` models now return a
     ``CausalLMOutputWithPast`` from ``forward`` (fused-linear cross-entropy
-    support, ``compute_lm_head_logits``). ``torch.distributed.pipelining``
+    support). ``torch.distributed.pipelining``
     requires every stage to emit a tensor (or tuple/list of tensors):
     ``PipelineStage._validate_fwd_outputs`` and the inter-stage P2P send/recv
     treat the output as tensor leaves and read ``.shape`` on each, which raises
@@ -590,7 +616,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
     ``patch_causal_lm_model=False`` so only the inner model is patched. In both
     cases the kept outer ``forward`` returns a ``ModelOutput``. This wraps it so
     the return is unwrapped to its ``.logits`` tensor:
-    ``compute_lm_head_logits`` puts the projected logits there on the final stage
+    Those forwards put the projected logits there on the final stage
     and the pass-through ``hidden_states`` on non-final stages (``lm_head is
     None``) -- exactly the tensor each stage must forward, and the logits the
     last-stage loss (``PipelineCausalLMLoss`` / ``MaskedCrossEntropy``) consumes.

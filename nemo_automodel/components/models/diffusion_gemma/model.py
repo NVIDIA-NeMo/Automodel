@@ -54,6 +54,7 @@ from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -377,7 +378,8 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         canvas_length: int | None = None,
         self_conditioning: bool | None = None,
         freeze_router: bool | None = None,
-        **kwargs: Any,
+        *,
+        logits_dtype: torch.dtype | None = torch.float32,
     ):
         reject_unsupported_tie_word_embeddings(type(self), config)
         # ``canvas_length`` is a declared field on the reference config (and round-trips),
@@ -413,7 +415,13 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         self.vocab_size = text_config.vocab_size
 
         self.model = DiffusionGemmaBackbone(text_config, self.backend, moe_config=moe_config)
-        self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
+        # The head applies the final-logit softcap to its FP32 logits, which are FP32 by default.
+        self.lm_head = LMHead(
+            text_config.hidden_size,
+            text_config.vocab_size,
+            logits_dtype=logits_dtype,
+            logit_softcapping=self.final_logit_softcapping,
+        )
         self.tie_weights()
 
         # Expose moe_config for the MoE parallelizer assertion path.
@@ -497,14 +505,6 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
             for layer in self.model.layers.values():
                 layer.moe.init_weights(buffer_device)
         cast_model_to_dtype(self, dtype)
-
-    def _softcap_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.lm_head(hidden_states).to(torch.float32)
-        if self.final_logit_softcapping is not None:
-            logits = logits / self.final_logit_softcapping
-            logits = torch.tanh(logits)
-            logits = logits * self.final_logit_softcapping
-        return logits
 
     def forward(
         self,
@@ -599,7 +599,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
                 padding_mask=encoder_padding_mask,
                 return_hidden=True,
             )
-            encoder_logits = self._softcap_logits(encoder_hidden)
+            encoder_logits = self.lm_head(encoder_hidden)
         else:
             encoder_kv = self.model(
                 mode="encode",
@@ -641,7 +641,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
                     decoder_padding_mask=decoder_padding_mask,
                     self_conditioning_logits=None,
                 )
-                sc_logits = self._softcap_logits(pass1_hidden).detach()
+                sc_logits = self.lm_head(pass1_hidden).detach()
 
         hidden_states = self.model(
             mode="decode",
@@ -653,7 +653,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
             self_conditioning_logits=sc_logits,
             self_conditioning_mask=sc_mask,
         )
-        logits = self._softcap_logits(hidden_states)
+        logits = self.lm_head(hidden_states)
 
         return DiffusionGemmaOutput(logits=logits, encoder_logits=encoder_logits)
 

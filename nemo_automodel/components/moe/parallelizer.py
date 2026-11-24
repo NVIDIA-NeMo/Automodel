@@ -1163,11 +1163,8 @@ def apply_fsdp(
     if lm_head is not None and not tied_input_output_embeddings:
         # Use custom mixed precision policy for lm_head if lm_head_precision is specified
         if lm_head_precision == torch.float32:
-            lm_head_mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.float32,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
-            )
+            # No output_dtype: an LMHead returns logits in its own logits_dtype, FP32 when unset with FP32 weights.
+            lm_head_mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
             fully_shard(
                 lm_head,
                 mesh=fsdp_mesh,
