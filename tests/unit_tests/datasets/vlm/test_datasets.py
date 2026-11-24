@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import copy
 import io
 import json
 from types import SimpleNamespace
@@ -1359,6 +1360,29 @@ class TestPreloadMedia:
         assert isinstance(loaded, Image.Image)
         assert loaded.mode == "RGB"
 
+    def test_does_not_modify_input_example(self, tmp_path):
+        """Decoded media goes into a copy; the caller's record keeps its path."""
+        img_path = tmp_path / "img.png"
+        Image.new("RGB", (4, 4), color="red").save(str(img_path))
+        example = {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": str(img_path)},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                },
+                {"role": "assistant", "content": "A red square."},
+            ],
+        }
+        snapshot = copy.deepcopy(example)
+
+        result = vlm_utils._preload_media(example)
+
+        assert isinstance(result["conversation"][0]["content"][0]["image"], Image.Image)
+        assert example == snapshot
+
     @pytest.fixture
     def _mock_decord(self, monkeypatch):
         """Mock decord so video tests don't need real files."""
@@ -1826,6 +1850,22 @@ class TestRobustDatasetWrapperPreload:
         result = wrapper[0]
         assert result["conversation"][0]["content"][0]["image"] == str(img_path)
 
+    def test_preload_leaves_stored_records_unchanged(self, tmp_path):
+        """Decoded images and injected fake images must not be written back into the dataset."""
+        img_path = tmp_path / "img.png"
+        Image.new("RGB", (4, 4), color="green").save(str(img_path))
+        data = [
+            {"conversation": [{"role": "user", "content": [{"type": "image", "image": str(img_path)}]}]},
+            {"conversation": [{"role": "user", "content": [{"type": "text", "text": "no image"}]}]},
+        ]
+        snapshot = copy.deepcopy(data)
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        assert isinstance(wrapper[0]["conversation"][0]["content"][0]["image"], Image.Image)
+        assert wrapper[1]["_injected_fake"] is True
+        assert data == snapshot
+
     def test_preload_failure_retries(self):
         """When preload fails on one sample, retry picks a different sample."""
         good_img = Image.new("RGB", (4, 4), color="red")
@@ -2064,6 +2104,36 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
         encoded = wrapper[0]
         assert encoded["image_sizes"] is sizes
         assert encoded["pixel_values"] is pixels
+
+
+def test_pretokenized_getitem_leaves_stored_record_unchanged(tmp_path, monkeypatch):
+    """Decoded images must not be written back into the wrapped dataset's records.
+
+    A list-backed dataset is copied into every DataLoader worker; writing the decoded
+    image back would keep one image per visited sample alive in each worker.
+    """
+    import nemo_automodel.components.datasets.vlm.collate_fns as collate_fns
+
+    monkeypatch.setattr(
+        collate_fns,
+        "build_labels_from_template",
+        lambda input_ids, conversations, processor: input_ids.clone(),
+    )
+    img_path = tmp_path / "img.png"
+    Image.new("RGB", (4, 4), color="green").save(str(img_path))
+    records = [
+        {
+            "conversation": [
+                {"role": "user", "content": [{"type": "image", "image": str(img_path)}, {"type": "text", "text": "?"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "green"}]},
+            ]
+        }
+    ]
+    snapshot = copy.deepcopy(records)
+    wrapper = ds.PreTokenizedDatasetWrapper(records, _FakeProcessor(), max_retries=1)
+
+    assert wrapper[0]["input_ids"].tolist() == [1, 2, 3, 4]
+    assert records == snapshot
 
 
 def _shopify_hf_dataset(n=3):

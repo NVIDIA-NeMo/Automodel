@@ -38,6 +38,7 @@ from nemo_automodel.components.models.muse_glimmer.model import (
     apply_rotary_emb,
 )
 from nemo_automodel.components.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
+from tests.unit_tests.models.passthrough_layers import passthrough_layers
 
 
 def _tiny_config(*, has_vision: bool = False, **overrides) -> MuseGlimmerConfig:
@@ -72,6 +73,11 @@ def _tiny_config(*, has_vision: bool = False, **overrides) -> MuseGlimmerConfig:
     }
     values.update(overrides)
     return MuseGlimmerConfig(**values)
+
+
+def test_from_config_takes_logits_dtype():
+    model = MuseGlimmerForConditionalGeneration.from_config(_tiny_config(), logits_dtype=torch.float32)
+    assert model.lm_head.logits_dtype == torch.float32
 
 
 def test_registered_config_and_model_resolve_without_remote_code(tmp_path):
@@ -487,6 +493,30 @@ def test_cp_preparation_selects_aux_only_bshd_and_framework_thd_sharders():
         packed_vlm["_muse_glimmer_global_vision_mask"],
         torch.tensor([[False, True, True, False]]),
     )
+
+
+def test_packed_thd_forward_keeps_a_batch_axis():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    model = MuseGlimmerForConditionalGeneration(config, backend=BackendConfig(attn="sdpa"))
+    tokens = 5
+    input_ids = torch.randint(1, config.vocab_size - 8, (1, tokens))
+
+    # The collator's batch of one: [1, tokens] IDs, positions and labels, with boundaries padded by -1000.
+    with passthrough_layers(model.model.layers) as layer_inputs:
+        output = model(
+            input_ids=input_ids,
+            position_ids=torch.arange(tokens).unsqueeze(0),
+            labels=input_ids,
+            qkv_format="thd",
+            cu_seqlens=torch.tensor([[0, 3, 5, -1000]], dtype=torch.int32),
+            max_seqlen=torch.tensor([3]),
+        )
+
+    assert layer_inputs == [(tokens, config.hidden_size)] * config.num_hidden_layers
+    assert output.logits.shape == (1, tokens, config.vocab_size)
+    expected_loss = torch.nn.functional.cross_entropy(output.logits[0, :-1].float(), input_ids[0, 1:])
+    torch.testing.assert_close(output.loss, expected_loss)
 
 
 def test_packed_thd_requires_documents_within_muse_glimmer_sliding_window():

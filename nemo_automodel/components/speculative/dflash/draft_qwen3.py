@@ -29,6 +29,7 @@ mask that enforces this is built by the trainer wrapper in
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Callable, Tuple
 
 import torch
@@ -606,11 +607,22 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         temperature: float,
         top_p: float = 1.0,
         top_k: int = 0,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.LongTensor | None = None,
     ) -> torch.LongTensor:
         """Block-parallel speculative decoding: draft a block, verify with the target, accept the matching prefix.
 
         ``top_p`` / ``top_k`` truncate the *target's* distribution, which is what
         defines the emitted tokens; the draft proposes from plain temperature.
+
+        For an image prompt on a cache-capable Hugging Face Qwen3.5 target,
+        each greedy verification replays generated text from the image-prefill
+        cache. This preserves multimodal positions and avoids rewinding hybrid
+        recurrent state. The replay path is for correctness checks. Place the
+        processor tensors on the verifier's device before calling this method.
 
         Args:
             target: The frozen verifier.
@@ -620,13 +632,41 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             temperature: Sampling temperature; ``0`` decodes greedily.
             top_p: Nucleus mass to keep, in ``(0, 1]``.
             top_k: Candidates to keep, ``0`` for the whole vocabulary.
+            attention_mask: Optional processor mask of shape [1, prompt]. The prompt must be unpadded.
+            pixel_values: Processor image patches of shape [patches, patch_features].
+            image_grid_thw: Processor image grid sizes of shape [images, 3].
+            mm_token_type_ids: Processor modality IDs of shape [1, prompt].
 
         Returns:
             Long tensor of shape [1, prompt + generated].
         """
         self.eval()
         validate_sampling(temperature, top_p, top_k)
-        assert_target_supports_rollback(target)
+        if attention_mask is not None and (
+            attention_mask.shape != input_ids.shape or not bool((attention_mask == 1).all())
+        ):
+            raise ValueError("DFlash spec_generate requires an unpadded prompt.")
+        image_prompt = pixel_values is not None
+        if image_prompt != (image_grid_thw is not None):
+            raise ValueError("DFlash image prompts require both pixel_values and image_grid_thw.")
+        prefill_kwargs = {}
+        if image_prompt:
+            if temperature >= GREEDY_TEMPERATURE_EPS:
+                raise ValueError("DFlash image prompts require greedy decoding (temperature=0).")
+            if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+                raise ValueError("DFlash image prompts require input_ids of shape [1, prompt].")
+            if image_grid_thw is None or image_grid_thw.shape != (1, 3):
+                raise ValueError("DFlash image prompts require exactly one image grid of shape [1, 3].")
+            if mm_token_type_ids is None or mm_token_type_ids.shape != input_ids.shape:
+                raise ValueError("DFlash image prompts require mm_token_type_ids with the same shape as input_ids.")
+            prefill_kwargs = dict(
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+        else:
+            assert_target_supports_rollback(target)
         output_head = resolve_output_head(target)
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -645,11 +685,12 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         # Prefill the target on the prompt.
         output = target(
             input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
+            position_ids=None if image_prompt else position_ids[:, :num_input_tokens],
             past_key_values=past_key_values_target,
             use_cache=True,
             logits_to_keep=1,
             output_hidden_states=True,
+            **prefill_kwargs,
         )
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature, top_p, top_k)
@@ -661,7 +702,6 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         start = num_input_tokens
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
-            block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = self.embed_noise_block(target, block_output_ids)
             draft_logits = self.compute_logits(
                 self(
@@ -676,22 +716,36 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             _rewind_cache(past_key_values_draft, start)
             block_output_ids[:, 1:] = sample(draft_logits)
 
+            verification_ids = block_output_ids
+            verification_positions: torch.Tensor | None = position_ids[:, start : start + block_size]
+            verification_cache = past_key_values_target
+            verification_kwargs = {}
+            if image_prompt:
+                # The original cache stays at the image-prefill boundary. Each
+                # candidate block sees only the committed text and its own draft.
+                verification_ids = torch.cat((output_ids[:, num_input_tokens:start], block_output_ids), dim=1)
+                verification_positions = None  # The target applies its prefill's M-RoPE offset.
+                verification_cache = deepcopy(past_key_values_target)
+                verification_kwargs["logits_to_keep"] = block_size
             output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
+                verification_ids,
+                position_ids=verification_positions,
+                past_key_values=verification_cache,
                 use_cache=True,
                 output_hidden_states=True,
+                **verification_kwargs,
             )
             posterior = sample(output.logits, temperature, top_p, top_k)
             acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
             start += acceptance_length + 1
-            _rewind_cache(past_key_values_target, start)
-            target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
-                :, : acceptance_length + 1, :
-            ]
+            block_context = extract_context_feature(output.hidden_states, self.target_layer_ids)
+            if image_prompt:
+                block_context = block_context[:, -block_size:]
+            else:
+                _rewind_cache(past_key_values_target, start)
+            target_hidden = block_context[:, : acceptance_length + 1]
             if stop_tokens is not None and bool(
                 torch.isin(output_ids[0, start - acceptance_length - 1 : start + 1], stop_tokens).any()
             ):

@@ -7,6 +7,10 @@
 | `clef_soc_triage_lora.yaml` | `TrainClefDecisionRecipe` | Clef 27B: LoRA + joint schema head with FSDP2, eval / SFT / RL, stage chaining with `init_from` |
 | `d1_posttrain.py` | `D1PostTraining` | Experimental frozen-backbone D1-3B answer-token rows or Omni marker-head adaptation, with a publisher-baseline gate |
 | `export_clef_release.py` | — | Merge a Clef stage (LoRA + head) into a directory with the `Cloudflare/clef` release layout |
+| `nemotron_decision_soc_triage_lora.yaml` | `TrainNemotronDecisionRecipe` | Nemotron 3.5 Decision: LoRA (or backbone) post-training on fictional SOC triage, one question per read |
+| `nemotron_decision_support_routing_lora.yaml` | `TrainNemotronDecisionRecipe` | The same recipe on a synthetic support-routing dataset in one-decision JSONL (bring your own) |
+| `prepare_nemotron_decision_data.py` | — | Convert one-decision JSONL to single-question SystemOne records with group-disjoint splits |
+| `export_nemotron_decision.py` | — | Export a decision stage (merged LoRA or full weights) as a complete checkpoint |
 
 From the repository root, prepare fresh fictional data first (128 train, 32 validation, and 32 test records):
 
@@ -69,3 +73,61 @@ divisible by `local_batch_size * DP world size`, and small enough to fit at leas
 processes). An undersized split fails rather than producing a successful zero-step run. Losses normalize over
 eligible question weights across the complete accumulation window and DP group. A rank with no local supervision
 participates with zero local loss; a globally feedback-free window fails on every rank before backward.
+
+## Nemotron 3.5 Decision post-training
+
+`TrainNemotronDecisionRecipe` post-trains a Nemotron 3.5 Decision checkpoint (`NemotronForDecision`: a text
+Ministral 3 encoder read bidirectionally, plus the decision head). NeMo AutoModel loads it natively, without the
+checkpoint's remote code. It reads the same SystemOne records as the CLM and CLEF recipes, but scores each question
+of a record on its own, rendered with the checkpoint's own decision contract: `decision_template.jinja` around the
+JSON `{"state", "question", "options"}`, with the options in the question's order and the codes from
+`decision.json`. Control tokens inside the user content are encoded as plain text, and the template ends with the
+mask token. One bidirectional pass reads the prompt, and the frozen head's logits at the mask, restricted to the
+option codes, are the answer distribution. No readout parameters are added, so an exported checkpoint scores
+decisions exactly as the base checkpoint's own code does. Targets, the objective, and the metrics are the shared
+decision components (`question_targets`, `DecisionLoss`, `DecisionEvaluator`), so its
+`metrics_{validation,test}.json` report the same accuracy, exact match, NLL, Brier, ECE, reward, and slice metrics as
+the other decision recipes.
+
+For a step-by-step walkthrough with training logs and results, see the
+[Nemotron 3.5 Decision guide](../../docs/guides/decision/nemotron-3-5-decision.mdx).
+
+* Loss: `DecisionLoss` in `sft` mode with label smoothing, Brier, and ranked-probability terms off, so it is
+  cross-entropy over the options: against a question's `soft_labels` when the record has them, otherwise against its
+  gold answer. `loss.soft_label_kl_weight > 0` switches to gold cross-entropy plus a weighted KL to the soft labels,
+  and `loss.soft_label_gold_mask: true` ignores soft labels whose top option is not the gold answer.
+* Training and evaluation keep the checkpoint's option order. The option shuffle is an explicit training setting:
+  with `train.canonical_fraction` below 1 (the example configs use 0.5), that share of training reads keep the order
+  and the rest are shuffled and re-coded by position, so the model learns option meanings rather than codes.
+* LoRA (rank 32, alpha 64) adapts the attention and MLP projections. `peft: null` is backbone fine-tuning: it trains the
+  encoder blocks and final norm. Embeddings and the decision head (the output projection) stay frozen in both modes,
+  so every option code keeps the base checkpoint's meaning.
+* Questions longer than `data.max_tokens` (at most the checkpoint's `max_input_tokens`) are skipped and counted,
+  never truncated.
+* Only text decision checkpoints with `decision.json` and `decision_template.jinja` are accepted. Vision and quantized
+  variants fail at setup instead of running with the wrong input or storage format.
+
+```bash
+# fictional SOC triage: the recipe reads the SystemOne records directly, one question per read
+PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+    --output-dir data/soc_triage --seed 7
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --mode eval --output_dir runs/soc/base
+automodel examples/decision/nemotron_decision_soc_triage_lora.yaml --output_dir runs/soc/lora
+uv run python examples/decision/export_nemotron_decision.py --base /path/to/nemotron-3.5-decision-8b \
+    --stage runs/soc/lora/LOWEST_VAL --output exports/soc_lora
+```
+
+For one-decision-per-line JSONL (`state`, `question`, `type`, `options`, `label`, optional `soft_labels` and
+`group`), `prepare_nemotron_decision_data.py` writes single-question SystemOne records. `--split three-way` writes
+group-disjoint `train`/`validation`/`test` files. `--split two-way` writes a `train`/`heldout` split (fraction 0.2,
+seed `0`); because its held-out file selects checkpoints, treat it as validation, not as a final test. In a
+SystemOne record, soft labels are `"soft_labels": {question_id: {option: weight}}`; options left out weigh zero.
+
+Validation selects the published stage (`LOWEST_VAL`): most correct validation questions, then lowest NLL. For LoRA
+the starting checkpoint (step 0) is a saved, selectable stage; backbone fine-tuning selects among its trained stages
+(score the base with `--mode eval` for the before number). Each run writes `training.jsonl`, `validation.jsonl`,
+`selected.json`, `metrics_{validation,test}.json`, and `predictions_{validation,test}.jsonl` (per-question
+probabilities). Stages record a fingerprint of the base checkpoint (its configuration, decision contract files and
+every weight byte), and `init_from` and the export refuse a stage trained from a different base. The export copies
+the base configuration, decision files, tokenizer and model code unchanged, so the result loads and scores like the
+base checkpoint.

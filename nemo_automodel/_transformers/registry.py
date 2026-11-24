@@ -229,6 +229,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "NemotronForDecision",
+            ("nemo_automodel.components.models.nemotron_decision.model", "NemotronForDecision"),
+        ),
+        (
             "Mistral3BidirectionalModel",
             (
                 "nemo_automodel.components.models.ministral_bidirectional.model",
@@ -426,6 +430,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
             "Inkling2ForConditionalGeneration",
             ("nemo_automodel.components.models.inkling2.multimodal", "Inkling2ForConditionalGeneration"),
         ),
+        # Architecture name declared by the released looped Inkling2 checkpoints.
+        (
+            "Inkling2LoopForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling2.multimodal", "Inkling2ForConditionalGeneration"),
+        ),
         (
             "Inkling2ForCausalLM",
             ("nemo_automodel.components.models.inkling2.model", "Inkling2ForCausalLM"),
@@ -461,6 +470,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "inkling2": ("nemo_automodel.components.models.inkling2.config", "Inkling2Config"),
+    "inkling2_loop": ("nemo_automodel.components.models.inkling2.config", "Inkling2LoopConfiguration"),
     "inkling2_mm_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2LegacyConfig"),
     "inkling2_model": ("nemo_automodel.components.models.inkling2.config", "Inkling2TextConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),

@@ -27,7 +27,16 @@ from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
-FP32_MODULES = ("attn_query", "mlp_query", "output_query", "q_l2_clip", "rel_l2_clip", "mlp.gate")
+FP32_MODULES = (
+    "attn_query",
+    "mlp_query",
+    "output_query",
+    "message_queries",
+    "message_kv_queries",
+    "q_l2_clip",
+    "rel_l2_clip",
+    "mlp.gate",
+)
 
 
 def _is_fp32_module_name(name: str) -> bool:

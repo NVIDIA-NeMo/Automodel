@@ -62,3 +62,18 @@ def test_buffer_free_failure_does_not_block_pg_destroy(monkeypatch):
     init_utils.destroy_global_state()
 
     assert calls == ["destroy_pg"]
+
+
+def test_initialize_distributed_already_initialized(monkeypatch):
+    monkeypatch.setattr(init_utils.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(init_utils.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(init_utils.torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(init_utils.torch.cuda, "device_count", lambda: 0)
+
+    dist_info = init_utils.initialize_distributed(backend="gloo")
+    assert isinstance(dist_info, init_utils.DistInfo)
+    assert dist_info.backend == "gloo"
+    assert dist_info.rank == 0
+    assert dist_info.world_size == 1
+    assert dist_info.device == init_utils.torch.device("cpu")
+    assert dist_info.is_main is True

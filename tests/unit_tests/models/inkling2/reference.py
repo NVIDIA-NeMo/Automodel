@@ -70,6 +70,28 @@ def mix(sources: list[torch.Tensor], query: torch.Tensor, normalize: bool) -> to
     return sum(value * probabilities[..., i, None] for i, value in enumerate(values))
 
 
+def controller(
+    weights: Mapping[str, torch.Tensor], prefix: str, destination: torch.Tensor, message: torch.Tensor
+) -> torch.Tensor:
+    """Mix a loop message into a layer input through the low-rank gate.
+
+    Args:
+        weights: Named parameter tensors.
+        prefix: Controller module name.
+        destination: Tensor of shape [batch, sequence, hidden].
+        message: Tensor of shape [batch, sequence, hidden].
+
+    Returns:
+        FP32 tensor of shape [batch, sequence, hidden].
+    """
+    down = weights[prefix + ".down_weight"]
+    joined = torch.cat((rms(destination, None, 1e-6), rms(message, None, 1e-6)), -1)
+    hidden = (joined.to(down.dtype) @ down.T).float()
+    gain = torch.tanh(hidden @ weights[prefix + ".gain_weight"].float().T)
+    forget = torch.tanh(hidden @ weights[prefix + ".forget_weight"].float().T)
+    return destination.float() - forget * destination.float() + gain * message.float()
+
+
 def convolution(
     x: torch.Tensor,
     weights: Mapping[str, torch.Tensor],
@@ -181,17 +203,19 @@ def attention(
         heads * dim,
         heads,
     ]
+    # A local layer shares one input between Q, K and V, except in later loop passes.
+    shared = sources[1] is sources[0] and sources[2] is sources[0]
     # The checkpoint stores one fused projection. Keep that BF16 rounding
     # boundary: separate GEMMs would round each input-gradient contribution
     # before summing Q/R/gate/sink gradients back into the shared source.
     projected = [
         F.linear(source, weights[prefix + ".qkvr.weight"], weights.get(prefix + ".qkvr.bias"))
-        for source in (sources[:1] if local else sources)
+        for source in (sources[:1] if shared else sources)
     ]
     projections = []
     start = 0
     for index, size in enumerate(sizes):
-        source_index = index if not local and index in (1, 2) else 0
+        source_index = index if not shared and index in (1, 2) else 0
         projections.append(projected[source_index][..., start : start + size])
         start += size
     q, k, v, r, gate, sink = projections
@@ -352,7 +376,7 @@ def forward(
 
     Returns:
         ReferenceOutput containing [batch, sequence, vocab] logits and one
-        [batch, sequence, hidden] partial block per layer.
+        [batch, sequence, hidden] partial block per layer visit.
     """
     valid = torch.ones_like(input_ids, dtype=torch.bool) if valid is None else valid
     positions = (valid.long().cumsum(-1) - 1).clamp_min(0) if positions is None else positions
@@ -366,7 +390,8 @@ def forward(
     completed = []
     partials = []
     routing_ids, routing_scores = [], []
-    for i in range(cfg.num_hidden_layers):
+
+    def layer(i, completed, current, bank):
         prefix = f"layers.{i}"
         local = i in cfg.local_layer_ids
         count = 1 if local else 3
@@ -378,15 +403,26 @@ def forward(
                 for query in weights[prefix + ".attn_query.weight"]
             ]
         )
+        messages = {}
+        if bank is not None:
+            offset = i - cfg.loop_core_layers.start
+            for name, table, row in (("attn", "message_queries", 0), ("mlp", "message_queries", 1)):
+                messages[name] = mix(bank, weights[table + ".weight"][2 * offset + row], True)
+            for name, row in (("k", 0), ("v", 1)):
+                messages[name] = mix(bank, weights["message_kv_queries.weight"][2 * offset + row], True)
+            inputs = [
+                controller(weights, f"{prefix}.controllers.{name}", value, messages[name])
+                for name, value in zip(("attn", "k", "v"), inputs * 3 if local else inputs)
+            ]
         inputs = [
-            rms(value, weights[f"{prefix}.attn_norms.{j}.weight"], cfg.rms_norm_eps).to(dtype)
+            rms(value, weights[f"{prefix}.attn_norms.{0 if local else j}.weight"], cfg.rms_norm_eps).to(dtype)
             for j, value in enumerate(inputs)
         ]
         attn = attention(
             cfg,
             weights,
             prefix + ".attn",
-            inputs * 3 if local else inputs,
+            inputs * 3 if len(inputs) == 1 else inputs,
             local=local,
             valid=valid,
             positions=positions,
@@ -399,7 +435,7 @@ def forward(
             valid=valid,
         )
         if i % cfg.n_layers_per_attnres_block == 0:
-            completed.append(current)
+            completed = completed + [current]
             current = attn.float()
         else:
             current = current.float() + attn.float()
@@ -408,6 +444,8 @@ def forward(
             weights[prefix + ".mlp_query.weight"][0],
             cfg.attn_res_normalize_values,
         )
+        if bank is not None:
+            mlp_input = controller(weights, prefix + ".controllers.mlp", mlp_input, messages["mlp"])
         mlp_input = rms(mlp_input, weights[prefix + ".mlp_norm.weight"], cfg.rms_norm_eps).to(dtype)
         out = experts(cfg, weights, prefix + ".mlp", mlp_input, routing_ids, routing_scores)
         current = (
@@ -422,6 +460,26 @@ def forward(
         )
         current = current.to(dtype)
         partials.append(current)
+        return completed, current
+
+    loop = cfg.loop_config
+    if loop is None:
+        for i in range(cfg.num_hidden_layers):
+            completed, current = layer(i, completed, current, None)
+    else:
+        core = cfg.loop_core_layers
+        for i in range(core.start):
+            completed, current = layer(i, completed, current, None)
+        prelude_completed, prelude_current, bank = completed, current, None
+        for pass_index in range(loop["num_passes"]):
+            if pass_index:
+                # The blocks this pass wrote: everything after the prelude's blocks and its partial.
+                bank = completed[len(prelude_completed) + 1 :] + [current]
+                completed, current = prelude_completed, prelude_current
+            for i in core:
+                completed, current = layer(i, completed, current, bank)
+        for i in range(core.stop, cfg.num_hidden_layers):
+            completed, current = layer(i, completed, current, None)
     hidden = rms(
         mix(
             completed + [current],
