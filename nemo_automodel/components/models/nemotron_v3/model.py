@@ -18,7 +18,7 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig
+from transformers import AutoConfig, NemotronHConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -26,9 +26,9 @@ from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPContextParallelInputs,
     prepare_mtp_context_parallel_inputs,
@@ -39,7 +39,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
-    compute_lm_head_logits,
     generation_config_from_model_config,
     restore_pretrained_generation_config,
 )
@@ -395,19 +394,23 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def __init__(
         self,
-        config,
+        config: NemotronHConfig,
         backend: BackendConfig | None = None,
         *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
         mtp_use_repeated_layer: bool = False,
-        **kwargs,
+        logits_dtype: torch.dtype | None = None,
     ):
         """Initialize NemotronV3ForCausalLM.
 
         Args:
             config: NemotronH config.
             backend: Backend configuration.
+            moe_config: MoE configuration (optional, will create default if None).
+            moe_overrides: Optional dict of overrides to apply to the default MoE config.
             mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
                 (default ``0.1``). Programmatic override only — not exposed
                 as a YAML knob to keep recipe configs auto-detected.
@@ -420,8 +423,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             mtp_use_repeated_layer: When ``True``, build a single physical
                 MTP depth and reuse it across all iterations. Mirrors
                 Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
-            **kwargs: Additional arguments. Recognized keys:
-                ``moe_config``, ``moe_overrides``.
+            logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
         """
         super().__init__()
         self.config = config
@@ -429,8 +431,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self.backend = backend or BackendConfig()
 
         # Base model
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        moe_config = kwargs.pop("moe_config", None)
         self.model = NemotronV3Model(
             config,
             backend=self.backend,
@@ -441,13 +441,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # LM head
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
 
         self.mtp_config = build_mtp_config_from_hf(
             config,
@@ -705,7 +699,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             inputs_meta = append_mtp(meta(hidden_shape))
 
         if self.lm_head is not None:
-            primary_out = meta((microbatch_size, seq_len, self.config.vocab_size))
+            primary_out = meta((microbatch_size, seq_len, self.config.vocab_size), self.lm_head.logits_dtype or dtype)
         else:
             primary_out = meta(hidden_shape)
         outputs_meta = append_mtp(primary_out)
@@ -916,7 +910,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             past_key_values.has_previous_state = True
 
         if compute_logits:
-            logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
         else:
             if labels is not None or is_pp_stage:
                 raise ValueError("compute_logits=False is only supported off-PP without labels.")

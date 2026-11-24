@@ -207,7 +207,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
         )
         if self.impl == "cce" and hidden_states.is_cuda:
             # The cce backward kernel only accepts bf16/fp16 operands, so an fp32
-            # lm_head (``fp32_lm_head`` models, ``distributed.moe.lm_head_precision``)
+            # lm_head weight (FP32 heads such as DeepSeek V4, ``distributed.moe.lm_head_precision``)
             # cannot train through it; fail here with the alternatives instead of
             # inside the Triton kernel.
             for name, tensor in (("hidden_states", hidden_states), ("lm_weight", lm_weight)):
@@ -219,7 +219,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
                     )
         if hidden_states.dtype != lm_weight.dtype:
             # Project in the dtype of the weight the loss actually consumes, as the model's own lm_head
-            # (``compute_lm_head_logits``) and ChunkedCrossEntropy do: the backbone hands its activations
+            # (``LMHead.linear``) and ChunkedCrossEntropy do: the backbone hands its activations
             # out unchanged, so a bf16 backbone with an fp32 head (DeepSeek V4.1, ``lm_head_precision:
             # float32``) is promoted once here, and an FSDP head whose master weight is gathered after
             # resharding meets hidden states of the same dtype. The projection ``e @ c.T`` inside

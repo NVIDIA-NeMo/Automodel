@@ -105,6 +105,26 @@ def test_construct_and_forward_shape():
     assert torch.isfinite(out.logits).all()
 
 
+@pytest.mark.parametrize(
+    ("weight_dtype", "logits_dtype"),
+    [(torch.float32, torch.float32), (torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)],
+)
+def test_forward_returns_the_requested_logits_dtype(weight_dtype, logits_dtype):
+    """The head softcaps its FP32 logits and returns its logits_dtype (FP32 by default), whatever its weights."""
+    torch.manual_seed(0)
+    model, _ = _tiny_model()
+    model.train()
+    assert model.lm_head.logits_dtype == torch.float32  # the default
+    model.to(weight_dtype)
+    model.lm_head.logits_dtype = logits_dtype
+    clean = torch.randint(0, 64, (1, 8))
+    masks = _masks(model, 1, 8, 4, clean.device)
+
+    out = model(input_ids=clean, canvas_ids=clean.clone(), decoder_attention_mask=masks, do_self_conditioning=True)
+
+    assert out.logits.dtype == out.encoder_logits.dtype == logits_dtype
+
+
 def test_tie_weights_restores_lm_head_alias():
     model, _ = _tiny_model()
     model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
@@ -266,11 +286,11 @@ def test_no_leakage_on_composed_forward():
             h1 = model.model.decode(
                 canvas, encoder_kv=kv, decoder_position_ids=enc_pos, decoder_masks=masks, self_conditioning_logits=None
             )
-            sc = model._softcap_logits(h1).detach()
+            sc = model.lm_head(h1).detach()
             h2 = model.model.decode(
                 canvas, encoder_kv=kv, decoder_position_ids=enc_pos, decoder_masks=masks, self_conditioning_logits=sc
             )
-            return model._softcap_logits(h2)
+            return model.lm_head(h2)
 
     base = run(clean)
     block1 = slice(blk, 2 * blk)

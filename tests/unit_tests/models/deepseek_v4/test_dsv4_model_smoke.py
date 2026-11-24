@@ -649,6 +649,51 @@ class TestDeepseekV4ModelSmoke:
         torch.testing.assert_close(actual, expected)
         assert not torch.allclose(expected, wrong_orientation)
 
+    @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
+    def test_dsv4_fsdp_head_returns_its_logits_dtype(self, monkeypatch, logits_dtype):
+        """The FP32 head island keeps FP32 weights and returns the head's logits dtype, as its stage declares."""
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[4], torch_dtype="bfloat16")
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch",
+            rope_fusion=False,
+            enable_hf_state_dict_adapter=False,
+            dispatcher="torch",
+            experts="torch_mm",
+        )
+        model = DeepseekV4ForCausalLM(cfg, backend=backend, logits_dtype=logits_dtype)
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+
+        class FakeMesh:
+            mesh_dim_names = ("dp",)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return object()
+
+        bulk = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16)
+        dsv4_fsdp.fully_shard_deepseek_v4(model, mesh=FakeMesh(), mp_policy=bulk, offload_policy=object())
+
+        head_policy = next(kwargs["mp_policy"] for module, kwargs in calls if module is model.lm_head)
+        assert (head_policy.param_dtype, head_policy.output_dtype, head_policy.cast_forward_inputs) == (
+            torch.float32,
+            None,
+            False,
+        )
+        _, outputs = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=4, dtype=torch.bfloat16
+        )
+        assert outputs[0].dtype == logits_dtype
+
     def test_thd_pp_intermediate_hidden_state_keeps_shape(self):
         """Packed-sequence PP stages must not add a fake batch dim to hidden states."""
 

@@ -22,8 +22,12 @@ A *record* is the Jev / SystemOne ``POST /v1/systemone`` request body plus super
         "questions": {"verdict": {"type": "choice", "instructions": "...", "criteria": {...}}, ...},
         "answers": {"verdict": "malicious", ...},         # gold option id per question (SFT)
         "rewards": {"verdict": {"malicious": 1.0, ...}},  # optional per-option rewards (RL)
+        "soft_labels": {"verdict": {"malicious": 0.8, "false_positive": 0.2}},  # optional target weights (SFT)
         "meta": {...},                                     # optional slicing metadata
     }
+
+Soft labels give nonnegative weights to some or all of a question's options; options left out weigh zero, and the
+weights are normalized to a distribution when they are aligned with a model's option order.
 
 Question types follow the SystemOne API: ``noul`` (true/false), ``choice`` (named options) and ``score``
 (ordered levels ``"0".."K-1"``).  Each model family enumerates options in its own order, so every tensor
@@ -150,6 +154,25 @@ def validate_record(record: dict[str, Any]) -> None:
             raise ValueError(f"record {record.get('id')!r}, question {qid!r}: rewards must be finite numbers") from exc
         if not finite:
             raise ValueError(f"record {record.get('id')!r}, question {qid!r}: rewards must be finite numbers")
+    for qid, soft_labels in (record.get("soft_labels") or {}).items():
+        if qid not in questions:
+            raise ValueError(f"record {record.get('id')!r}: soft labels for unknown question {qid!r}")
+        options = set(canonical_option_ids(questions[qid]))
+        if not isinstance(soft_labels, dict) or not soft_labels or not set(soft_labels) <= options:
+            raise ValueError(
+                f"record {record.get('id')!r}, question {qid!r}: soft labels must weight options among {sorted(options)}"
+            )
+        try:
+            weights = [float(value) for value in soft_labels.values()]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"record {record.get('id')!r}, question {qid!r}: soft labels must be finite nonnegative numbers"
+            ) from exc
+        if not all(math.isfinite(weight) and weight >= 0 for weight in weights) or sum(weights) <= 0:
+            raise ValueError(
+                f"record {record.get('id')!r}, question {qid!r}: soft labels must be finite, nonnegative and "
+                "have a positive sum"
+            )
 
 
 def canonical_option_ids(question: dict[str, Any]) -> list[str]:
@@ -171,17 +194,19 @@ class QuestionTarget:
     option_ids: tuple[str, ...]
     label: int  # index into option_ids, or -100 when the record has no gold answer
     rewards: tuple[float, ...] | None  # aligned with option_ids
+    soft_labels: tuple[float, ...] | None = None  # distribution aligned with option_ids
 
 
 def question_targets(record: dict[str, Any], option_orders: dict[str, Iterable[str]]) -> list[QuestionTarget]:
-    """Align a record's answers and rewards with the option order a model uses.
+    """Align a record's answers, rewards and soft labels with the option order a model uses.
 
     Args:
-        record: SystemOne record.
+        record: Validated SystemOne record.
         option_orders: ``{question_id: option ids in model order}``, in the order the model returns questions.
     """
     answers = record.get("answers") or {}
     rewards = record.get("rewards") or {}
+    soft_labels = record.get("soft_labels") or {}
     targets = []
     for qid, option_ids in option_orders.items():
         option_ids = tuple(str(o) for o in option_ids)
@@ -190,6 +215,11 @@ def question_targets(record: dict[str, Any], option_orders: dict[str, Iterable[s
         label = option_ids.index(str(answer)) if answer is not None else -100
         reward_table = rewards.get(qid)
         aligned = tuple(float(reward_table[o]) for o in option_ids) if reward_table is not None else None
+        soft = None
+        if qid in soft_labels:
+            weights = [float(soft_labels[qid].get(o, 0.0)) for o in option_ids]
+            total = sum(weights)
+            soft = tuple(weight / total for weight in weights)
         targets.append(
             QuestionTarget(
                 question_id=qid,
@@ -197,6 +227,7 @@ def question_targets(record: dict[str, Any], option_orders: dict[str, Iterable[s
                 option_ids=option_ids,
                 label=label,
                 rewards=aligned,
+                soft_labels=soft,
             )
         )
     return targets
