@@ -116,7 +116,7 @@ class SpecDecodeRecipeBase(BaseRecipe):
         # present: ``ConfigNode.get_as_string`` raises ``KeyError`` for an absent key even
         # with an explicit ``None`` default.
         target = kwargs.pop("_target_", None)
-        if target is not None and hasattr(opt_cfg, "get_as_string"):
+        if target is not None:
             target = opt_cfg.get_as_string("_target_")
         kwargs.pop("warmup_ratio", None)
         kwargs.pop("min_lr_ratio", None)
@@ -137,7 +137,7 @@ class SpecDecodeRecipeBase(BaseRecipe):
         return build_optimizer(
             self.trainer_module,
             self._resolve_optimizer_spec(opt_cfg),
-            device_mesh=getattr(self, "dp_mesh", None),
+            device_mesh=self.dp_mesh,
         )[0]
 
     def _setup_training_state(self, recipe_cfg) -> None:

@@ -102,6 +102,7 @@ def _optim_recipe(tmp_path, dataloader):
     obj = _Recipe.__new__(_Recipe)
     obj.cfg = SimpleNamespace(optimizer=ConfigNode({"lr": 1e-3, "warmup_ratio": 0.25, "min_lr_ratio": 0.2}))
     obj.trainer_module = torch.nn.Linear(2, 2)
+    obj.dp_mesh = None
     obj.train_dataloader = dataloader
     recipe_cfg = _Cfg(num_epochs=2, grad_accumulation_steps=3, output_dir=str(tmp_path / "out"))
     return obj, recipe_cfg
@@ -155,6 +156,7 @@ def _recipe_with_optimizer(cls, opt_block, module, tmp_path):
     obj = cls.__new__(cls)
     obj.cfg = SimpleNamespace(optimizer=ConfigNode(opt_block))
     obj.trainer_module = module
+    obj.dp_mesh = None
     obj.train_dataloader = list(range(4))
     recipe_cfg = _Cfg(num_epochs=1, output_dir=str(tmp_path / "out"))
     return obj, recipe_cfg
@@ -322,6 +324,7 @@ def test_resolve_spec_does_not_force_adamw_defaults_onto_explicit_target():
 def test_build_draft_optimizer_builds_sgd_for_an_explicit_target():
     obj = _Recipe.__new__(_Recipe)
     obj.trainer_module = torch.nn.Linear(4, 4)
+    obj.dp_mesh = None
     optimizer = obj._build_draft_optimizer(ConfigNode({"_target_": "torch.optim.SGD", "lr": 0.1, "momentum": 0.9}))
     assert isinstance(optimizer, torch.optim.SGD)
     assert optimizer.param_groups[0]["momentum"] == 0.9
