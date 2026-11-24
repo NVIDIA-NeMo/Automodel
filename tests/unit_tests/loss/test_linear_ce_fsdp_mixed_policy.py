@@ -93,7 +93,9 @@ def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, lm_h
     return linear_ce_base._chunk_lse_and_target(hidden, weight, targets, softcap, logits_dtype, lm_head)
 
 
-def _worker(rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: bool) -> None:
+def _worker(
+    rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: bool, reduce_dtype: torch.dtype | None
+) -> None:
     torch.set_num_threads(1)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -114,7 +116,7 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: b
         mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("dp",))
         policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            reduce_dtype=reduce_dtype,
             output_dtype=torch.float32,
             cast_forward_inputs=True,
         )
@@ -137,7 +139,7 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: b
         reduced_dtypes = []
 
         def record_reduce_scatter(output: torch.Tensor, input: torch.Tensor, *args, **kwargs):
-            """Record the dtype of each gradient reduce-scatter, then run it.
+            """Record the dtype of each streamed head-gradient reduce-scatter, then run it.
 
             Args:
                 output: Tensor of shape [chunk_rows, hidden] receiving this rank's rows.
@@ -148,7 +150,9 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: b
             Returns:
                 The collective's work handle.
             """
-            reduced_dtypes.append(input.dtype)
+            # The streamed head sends [ranks * chunk_rows, hidden] chunks; FSDP's own reduce-scatters are flat.
+            if input.ndim == 2:
+                reduced_dtypes.append(input.dtype)
             return reduce_scatter(output, input, *args, **kwargs)
 
         dist.reduce_scatter_tensor = record_reduce_scatter
@@ -169,8 +173,9 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: b
             assert torch.isfinite(loss)
             loss.backward()
             assert model.lm_head.weight.grad is not None and model.lm_head.weight.grad.dtype == master_dtype
-            # The head's gradient is averaged in the policy's reduce_dtype, as FSDP reduces an unsharded head's.
-            assert reduced_dtypes and set(reduced_dtypes) == {torch.float32}
+            # The head's gradient is averaged in the policy's reduce_dtype, or its param_dtype when that is unset,
+            # as FSDP reduces an unsharded head's.
+            assert reduced_dtypes and set(reduced_dtypes) == {reduce_dtype or torch.bfloat16}
             assert sum(parameter.grad is not None for parameter in model.parameters()) > 1  # the backbone too
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -188,9 +193,16 @@ def _worker(rank: int, port: int, master_dtype: torch.dtype, wrap_outer_model: b
     reason="spawns two Gloo FSDP2 workers for a tiny Qwen3MoE forward/backward/step twice",
 )
 @pytest.mark.parametrize(
-    ("master_dtype", "wrap_outer_model"),
-    [(torch.float32, False), (torch.bfloat16, False), (torch.float32, True)],
-    ids=["fp32_master", "bf16_master", "fp32_master_wrapped_root"],
+    ("master_dtype", "wrap_outer_model", "reduce_dtype"),
+    [
+        (torch.float32, False, torch.float32),
+        (torch.bfloat16, False, torch.float32),
+        (torch.float32, True, torch.float32),
+        (torch.float32, False, None),
+    ],
+    ids=["fp32_master", "bf16_master", "fp32_master_wrapped_root", "fp32_master_unset_reduce_dtype"],
 )
-def test_fused_loss_streams_the_head_under_its_fsdp_policy(master_dtype: torch.dtype, wrap_outer_model: bool) -> None:
-    mp.spawn(_worker, args=(_free_port(), master_dtype, wrap_outer_model), nprocs=_WORLD_SIZE, join=True)
+def test_fused_loss_streams_the_head_under_its_fsdp_policy(
+    master_dtype: torch.dtype, wrap_outer_model: bool, reduce_dtype: torch.dtype | None
+) -> None:
+    mp.spawn(_worker, args=(_free_port(), master_dtype, wrap_outer_model, reduce_dtype), nprocs=_WORLD_SIZE, join=True)

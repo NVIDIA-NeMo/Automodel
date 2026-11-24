@@ -164,7 +164,9 @@ class KDLoss(nn.Module):
         tp_group: Explicit TP process group, in which case the logits must already be local
             vocabulary shards.  When ``None`` (default) the group is read from vocabulary-sharded
             ``DTensor`` logits; student and teacher logits must then share one vocabulary layout,
-            and plain tensors use the non-TP path.  No path gathers the full vocabulary.
+            and plain tensors use the non-TP path.  The only gather is of a vocabulary-sharded
+            teacher for a student that already holds the whole vocabulary, which then also holds
+            the teacher's ``[tokens, vocab]`` logits.
         chunk_size: When positive, valid tokens are processed in chunks of this size to avoid
             materializing the full ``[num_valid_tokens, vocab_size]`` probability matrix in fp32.
             With a Python scalar temperature, multi-chunk logits up to 32 bits use chunk-local

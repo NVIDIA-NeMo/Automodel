@@ -39,7 +39,8 @@ from nemo_automodel.components.models.common.lm_head import LMHead
 
 # Size budget for one gathered vocabulary chunk, in bytes. Backward holds about four
 # chunk-sized buffers at once: the current chunk, the prefetched next chunk, the
-# chunk gradient, and the previous gradient while it is reduce-scattered.
+# chunk gradient, and the previous gradient while it is reduce-scattered. A gradient
+# reduce dtype twice the projection's width, such as FP32 for a BF16 head, adds about two.
 _STREAM_CHUNK_BYTES = 128 * 1024**2
 
 
@@ -137,24 +138,30 @@ class ShardedLMHeadWeight:
         return torch.Size((self.vocab_size, self.weight.shape[1])) if self.vocab_size is not None else self.weight.shape
 
     def with_head_precision(self, lm_head: nn.Module | None) -> "ShardedLMHeadWeight":
-        """Adopt the mixed-precision policy of the FSDP unit that owns the head.
+        """Adopt the mixed-precision policy of the head's own FSDP unit.
 
         A head that ran in the forward computes in the policy's ``param_dtype`` and FSDP
-        reduces its gradient in ``reduce_dtype``; a head the forward skipped is still
-        sharded in its master dtype, so the streamed loss applies the same policy.
+        reduces its gradient in ``reduce_dtype``, or in ``param_dtype`` when that is unset;
+        a head the forward skipped is still sharded in its master dtype, so the streamed
+        loss applies the same policy. A head that shares a unit with other modules, such
+        as a tied head in the root unit, keeps its master dtype.
 
         Args:
-            lm_head: Module whose ``weight`` this operand streams; only an FSDP unit
-                carries a policy.
+            lm_head: Module whose ``weight`` this operand streams; only a head that is
+                its own FSDP unit carries a policy.
 
         Returns:
             A copy that projects in the policy's ``param_dtype`` and reduces the weight
-            gradient in its ``reduce_dtype``, or this operand for a head without a policy.
+            gradient as FSDP would, or this operand for a head without a policy.
         """
         if not isinstance(lm_head, FSDPModule):
             return self
         policy = lm_head._get_fsdp_state()._mp_policy
-        return replace(self, dtype=policy.param_dtype or self.dtype, reduce_dtype=policy.reduce_dtype)
+        return replace(
+            self,
+            dtype=policy.param_dtype or self.dtype,
+            reduce_dtype=policy.reduce_dtype or policy.param_dtype,
+        )
 
 
 class _PendingChunk:
