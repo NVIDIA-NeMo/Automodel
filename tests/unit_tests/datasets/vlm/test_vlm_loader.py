@@ -196,14 +196,14 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
 
 @pytest.mark.parametrize(
     "factory",
-    [*vlm_loader.COLLATE_FNS.values(), collate_fns.gemma4_prefix_collate_fn, collate_fns.phi4_mm_collate_fn],
+    [None, *vlm_loader.COLLATE_FNS.values(), collate_fns.gemma4_prefix_collate_fn, collate_fns.phi4_mm_collate_fn],
 )
 def test_vlm_dataloader_rejects_processor_dependent_collator_without_processor(factory):
     """Fail while building instead of deferring the processor error to first batch."""
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig([]),
         processor_config=VlmProcessorConfig(factory=lambda: None),
-        collator=VlmCollatorConfig(factory=factory),
+        collator=VlmCollatorConfig(factory=factory) if factory is not None else None,
     )
 
     with pytest.raises(ValueError, match="VLM dataloader for 'unused' requires a processor"):
