@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
+from collections import Counter
 from dataclasses import dataclass
 from os import PathLike
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -38,31 +40,52 @@ from nemo_automodel.components.utils.flops_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Device theoretical FLOPS (FLOPs/s) adapted from https://github.com/verl-project/verl/blob/main/verl/utils/flops_counter.py#L22-L85
-_DEVICE_FLOPS: dict[str, float] = {
-    "CPU": 448e9,
-    "GB200": 2.5e15,
-    # Blackwell Ultra keeps Blackwell's dense BF16 peak: NVIDIA lists 360 PFLOPS sparse per
-    # GB300 NVL72 rack and 36 PFLOPS sparse per HGX B300, the same as GB200 NVL72 and HGX B200.
-    "GB300": 2.5e15,
-    "B200": 2.25e15,
-    "B300": 2.25e15,
-    "MI300X": 1336e12,
-    "H100": 989e12,
-    "H800": 989e12,
-    "H200": 989e12,
-    "A100": 312e12,
-    "A800": 312e12,
-    "L40S": 362.05e12,
-    "L40": 181.05e12,
-    "A40": 149.7e12,
-    "L20": 119.5e12,
-    "H20": 148e12,
-    "910B": 354e12,
-    "Ascend910": 354e12,
-    "RTX 3070 Ti": 21.75e12,
-    "RTX PRO 6000 Blackwell Max-Q Workstation Edition": 438.9e12,
-    "RTX PRO 6000 Blackwell Workstation Edition": 503.8e12,
+_Precision = Literal["fp32", "tf32", "fp16", "fp8", "fp4"]
+
+# Dense, per-device TFLOPs/s. FP16 and BF16 share the same Tensor Core peak.
+# Additional precision entries are from NVIDIA's published specifications:
+# https://www.nvidia.com/en-us/data-center/h100/ and the Hopper architecture whitepaper (PCIe)
+# https://www.nvidia.com/en-us/data-center/h200/
+# https://www.nvidia.com/en-us/data-center/a100/
+# https://www.nvidia.com/en-us/data-center/gb200-nvl72/
+# https://www.nvidia.com/en-us/data-center/gb300-nvl72/
+# https://www.nvidia.com/en-us/data-center/hgx/
+# https://www.nvidia.com/en-us/data-center/l40s/ and the Ada architecture whitepaper (L40)
+# Other 16-bit entries retain the existing lookup adapted from verl's flops_counter.py.
+_DEVICE_TFLOPS: dict[str, dict[_Precision, float]] = {
+    "CPU": {"fp16": 0.448},
+    "GB200": {"fp32": 80, "tf32": 1250, "fp16": 2500, "fp8": 5000, "fp4": 10000},
+    "GB300": {"fp32": 80, "tf32": 1250, "fp16": 2500, "fp8": 5000, "fp4": 15000},
+    "B200": {"fp32": 75, "tf32": 1125, "fp16": 2250, "fp8": 4500, "fp4": 9000},
+    "B300": {"fp32": 75, "tf32": 1125, "fp16": 2250, "fp8": 4500, "fp4": 13500},
+    "MI300X": {"fp16": 1336.0},
+    "H100": {"fp32": 67, "tf32": 494.5, "fp16": 989, "fp8": 1979},
+    "H800": {"fp16": 989.0},
+    "H200": {"fp32": 67, "tf32": 494.5, "fp16": 989, "fp8": 1979},
+    "A100": {"fp32": 19.5, "tf32": 156, "fp16": 312},
+    "A800": {"fp16": 312.0},
+    "L40S": {"fp32": 91.6, "tf32": 183, "fp16": 362.05, "fp8": 733},
+    "L40": {"fp32": 90.5, "tf32": 90.5, "fp16": 181.05, "fp8": 362},
+    "A40": {"fp16": 149.7},
+    "L20": {"fp16": 119.5},
+    "H20": {"fp16": 148.0},
+    "910B": {"fp16": 354.0},
+    "Ascend910": {"fp16": 354.0},
+    "RTX 3070 Ti": {"fp16": 21.75},
+    "RTX PRO 6000 Blackwell Max-Q Workstation Edition": {"fp16": 438.9},
+    "RTX PRO 6000 Blackwell Workstation Edition": {"fp16": 503.8},
+    "H100 PCIe": {"fp32": 51, "tf32": 378, "fp16": 756, "fp8": 1513},
+    "H100 NVL": {"fp32": 60, "tf32": 417.5, "fp16": 835.5, "fp8": 1670.5},
+    "H200 NVL": {"fp32": 60, "tf32": 417.5, "fp16": 835.5, "fp8": 1670.5},
+}
+
+_DTYPE_PRECISIONS: dict[torch.dtype, _Precision] = {
+    torch.float32: "fp32",
+    torch.float16: "fp16",
+    torch.bfloat16: "fp16",
+    torch.float8_e4m3fn: "fp8",
+    torch.float8_e5m2: "fp8",
+    torch.float4_e2m1fn_x2: "fp4",
 }
 
 _UNIT_TO_SCALE = {
@@ -84,17 +107,18 @@ _CONFIG_ALIAS_ATTRS = (
 )
 
 
-def get_device_flops(unit: str = "T", device_name: str | None = None) -> float:
+def get_device_flops(unit: str = "T", device_name: str | None = None, *, dtype: torch.dtype = torch.bfloat16) -> float:
     """Get theoretical device FLOPS in a requested unit.
 
     Args:
         unit: One of ``B/K/M/G/T/P``. Default ``T`` (TFLOPs/s).
         device_name: Optional explicit device name for lookup. If ``None``,
             the current torch device name is inferred.
+        dtype: Training compute dtype. FP32 follows the CUDA matmul TF32 setting.
 
     Returns:
         Theoretical FLOPS in requested unit. Returns ``float("inf")`` for
-        unknown devices.
+        unknown device and precision combinations.
     """
     unit = unit.upper()
     if unit not in _UNIT_TO_SCALE:
@@ -107,14 +131,17 @@ def get_device_flops(unit: str = "T", device_name: str | None = None) -> float:
         else:
             device_name = "CPU"
 
-    flops = float("inf")
-    normalized_device = str(device_name).lower()
-    for key, value in sorted(_DEVICE_FLOPS.items(), key=lambda kv: len(kv[0]), reverse=True):
-        if key.lower() in normalized_device:
-            flops = value
-            break
+    precision = _DTYPE_PRECISIONS.get(dtype)
+    if dtype == torch.float32 and torch.backends.cuda.matmul.fp32_precision == "tf32":
+        precision = "tf32"
 
-    return flops / _UNIT_TO_SCALE[unit]
+    normalized_device = device_name.lower()
+    if " mig " in normalized_device or precision is None:
+        return math.inf
+    for key in sorted(_DEVICE_TFLOPS, key=len, reverse=True):
+        if key.lower() in normalized_device:
+            return _DEVICE_TFLOPS[key].get(precision, math.inf) * (1e12 / _UNIT_TO_SCALE[unit])
+    return math.inf
 
 
 class AutoMFU:
@@ -129,6 +156,8 @@ class AutoMFU:
         config: PretrainedConfig,
         device: str | None = None,
         peak_tflops: float | None = None,
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> None:
         """Initialize AutoMFU with a model config.
 
@@ -136,26 +165,29 @@ class AutoMFU:
             config: HuggingFace PretrainedConfig object
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
+            compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
         """
         self.config = config
         self.flops_formula = get_flops_formula_for_hf_config(config)
+        dtype = compute_dtype or getattr(config, "dtype", None) or torch.bfloat16
         self.reference_mfu = (
             _validate_peak_tflops(peak_tflops)
             if peak_tflops is not None
-            else get_device_flops(unit="T", device_name=device)
+            else get_device_flops(device_name=device, dtype=dtype)
         )
         if not math.isfinite(self.reference_mfu):
             device_description = repr(device) if device is not None else "the current device"
             logger.warning(
-                "Unable to determine the theoretical peak for %s; MFU will be reported as 0%%. "
+                "Unable to determine the theoretical peak for %s with %s; MFU will be reported as 0%%. "
                 "Pass a supported device or peak_tflops directly, or set mfu.device or mfu.peak_tflops in recipe YAML.",
                 device_description,
+                dtype,
             )
 
     @classmethod
     def register_device(cls, device: str, peak_tflops: float) -> None:
-        """Register or override a device peak TFLOPs entry used for MFU calculation."""
-        _DEVICE_FLOPS[str(device)] = float(peak_tflops) * 1e12
+        """Register or override the dense FP16/BF16 peak TFLOPs/s for a device."""
+        _DEVICE_TFLOPS.setdefault(str(device), {})["fp16"] = _validate_peak_tflops(peak_tflops)
 
     @classmethod
     def from_config(
@@ -163,6 +195,8 @@ class AutoMFU:
         config_or_path_or_model: PretrainedConfig | str | PathLike[str] | object,
         device: str | None = None,
         peak_tflops: float | None = None,
+        *,
+        compute_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> AutoMFU:
         """Create AutoMFU from a config object, model object, or model path/ID.
@@ -172,6 +206,7 @@ class AutoMFU:
                 (the .config attribute will be extracted), or a model ID/local path.
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
+            compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
                 when loading from model ID/path.
 
@@ -186,7 +221,7 @@ class AutoMFU:
         else:
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
-        return cls(config, device=device, peak_tflops=peak_tflops)
+        return cls(config, device=device, peak_tflops=peak_tflops, compute_dtype=compute_dtype)
 
     @classmethod
     def from_pretrained(
@@ -194,6 +229,8 @@ class AutoMFU:
         model_id_or_local_path_or_model: str | PathLike[str] | object,
         device: str | None = None,
         peak_tflops: float | None = None,
+        *,
+        compute_dtype: torch.dtype | None = None,
         **kwargs: Any,
     ) -> AutoMFU:
         """Create AutoMFU from model ID, local path, or a model object.
@@ -203,6 +240,7 @@ class AutoMFU:
                 local path, or model object (the .config attribute will be extracted)
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
+            compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
 
         Returns:
@@ -212,6 +250,7 @@ class AutoMFU:
             model_id_or_local_path_or_model,
             device=device,
             peak_tflops=peak_tflops,
+            compute_dtype=compute_dtype,
             **kwargs,
         )
 
@@ -319,7 +358,7 @@ class MFUConfig:
 
     Attributes:
         device: Optional device name used to look up the theoretical peak.
-        peak_tflops: Optional theoretical peak TFLOPs/s for the training precision.
+        peak_tflops: Deprecated theoretical peak TFLOPs/s override.
             When set, this takes precedence over ``device``.
     """
 
@@ -329,17 +368,32 @@ class MFUConfig:
     def __post_init__(self) -> None:
         if self.peak_tflops is not None:
             _validate_peak_tflops(self.peak_tflops)
+            warnings.warn(
+                "mfu.peak_tflops is deprecated. Remove it to use the detected device and training precision.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
-    def build(self, *, model: torch.nn.Module) -> AutoMFU:
+    def build(self, *, model: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> AutoMFU:
         """Build the calculator for an initialized model.
 
         Args:
             model: Model whose Hugging Face configuration supplies the FLOPs formula.
+            compute_dtype: Runtime compute dtype. Defaults to the dominant floating-point matrix
+                parameter dtype when no mixed-precision policy supplies one.
 
         Returns:
             The configured MFU calculator.
         """
-        return AutoMFU.from_config(model, device=self.device, peak_tflops=self.peak_tflops)
+        if compute_dtype is None and self.peak_tflops is None:
+            elements_by_dtype: Counter[torch.dtype] = Counter()
+            for param in model.parameters():
+                if param.ndim >= 2 and param.is_floating_point():
+                    elements_by_dtype[param.dtype] += param.numel()
+            if elements_by_dtype:
+                compute_dtype = max(elements_by_dtype, key=elements_by_dtype.__getitem__)
+
+        return AutoMFU.from_config(model, device=self.device, peak_tflops=self.peak_tflops, compute_dtype=compute_dtype)
 
 
 def _validate_peak_tflops(peak_tflops: float) -> float:

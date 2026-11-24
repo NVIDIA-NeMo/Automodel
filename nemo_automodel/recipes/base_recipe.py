@@ -53,6 +53,7 @@ from nemo_automodel.components.checkpoint.utils import (
     resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -234,6 +235,13 @@ class BaseRecipe:
             return
         for key in keys:
             tracked.discard(key)
+
+    def _setup_mfu(self, model: torch.nn.Module, *, compute_dtype: torch.dtype | None = None) -> None:
+        """Build MFU using the recipe's compute precision when it differs from weight storage."""
+        strategy = self.distributed_config
+        if compute_dtype is None and isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
+            compute_dtype = strategy.mp_policy.param_dtype
+        self.mfu_calculator = self.cfg.mfu.build(model=model, compute_dtype=compute_dtype)
 
     def _autocast_context(self):
         """Return the recipe-level autocast context configured by the strategy."""

@@ -38,6 +38,7 @@ from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
 )
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -58,11 +59,36 @@ from nemo_automodel.recipes.llm.train_ft import (
 def test_recipe_config_resolves_mfu_settings():
     config = RecipeConfig(ConfigNode({"mfu": {"device": "h100", "peak_tflops": 1979.0}}))
 
-    assert config.mfu == MFUConfig(device="h100", peak_tflops=1979.0)
+    with pytest.warns(FutureWarning, match=r"mfu\.peak_tflops is deprecated"):
+        mfu = config.mfu
+    assert mfu.device == "h100"
+    assert mfu.peak_tflops == 1979.0
 
 
 def test_recipe_config_defaults_mfu_settings():
     assert RecipeConfig(ConfigNode({})).mfu == MFUConfig()
+
+
+@pytest.mark.parametrize(
+    "strategy, compute_dtype, expected",
+    [
+        (FSDP2Config(), None, 989.0),
+        (FSDP2Config(), torch.float32, 67.0),
+        (FSDP2Config(), torch.float8_e4m3fn, 1979.0),
+    ],
+)
+def test_recipe_mfu_uses_compute_precision(strategy, compute_dtype, expected, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA H100 80GB HBM3")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+    model = nn.Linear(32, 32, dtype=torch.float32)
+    model.config = SimpleNamespace(dtype=torch.float32, model_type="llama")
+    recipe = SimpleNamespace(cfg=RecipeConfig(ConfigNode({})), distributed_config=strategy)
+
+    TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, compute_dtype=compute_dtype)
+
+    assert recipe.mfu_calculator.reference_mfu == expected
 
 
 def _build_loader(

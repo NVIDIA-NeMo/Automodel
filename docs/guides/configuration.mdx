@@ -280,25 +280,22 @@ increase steady-state training throughput.
 
 ## Configure the MFU Reference Peak
 
-Recipes that report model FLOP utilization automatically detect the current
-device and use its dense-BF16 peak from AutoMFU's device table. Ordinary BF16
-training does not need an `mfu:` section.
+Training recipes detect the current CUDA device and look up its dense peak for
+the training compute dtype. The recipe uses its Transformer Engine FP8 or
+NVFP4 setting or hardware-accelerated TorchAO FP8 setting when enabled.
+Otherwise, it uses the distributed autocast dtype, the FSDP2 compute dtype, or
+the model's predominant matrix parameter dtype. For example, an H100 SXM uses
+989 TFLOPs/s for BF16 or FP16 and 1,979 TFLOPs/s for FP8.
 
-Use an explicit override when the hardware is not in the table or when the
-training precision has a different theoretical peak, such as dense FP8:
+Remove `mfu.peak_tflops` from existing YAML to enable automatic selection. If
+that was the only key under `mfu:`, remove the entire section. During the
+deprecation period, an explicit `peak_tflops` still takes precedence and emits
+a warning. You can use `mfu.device` to override the detected device name.
 
-```yaml
-mfu:
-  device: h100
-  peak_tflops: 1979.0
-```
-
-`peak_tflops` takes precedence over `device`. A device name alone selects an
-entry from AutoMFU's table; omitting both fields uses the current CUDA device.
-Hardware detection cannot determine the effective training precision, so FP8
-and structured-sparse runs must provide the appropriate peak explicitly. An
-unknown device emits a warning and reports 0% MFU until you configure a
-supported `device` value or an explicit `peak_tflops` value.
+MFU uses one dense reference peak for the whole workload. Layers that run in a
+different dtype and custom kernels that mix precisions can affect the
+interpretation of the result. An unknown device or dtype combination emits a
+warning and reports 0% MFU.
 
 ## Profile VLM Training with NVTX
 

@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_automodel._transformers import mfu as mfu_module
 from nemo_automodel._transformers.mfu import AutoMFU, MFUConfig, get_device_flops
@@ -376,11 +377,47 @@ def test_get_device_flops_detects_current_cuda_device(monkeypatch):
 
 def test_automfu_defaults_to_detected_device_peak(monkeypatch):
     monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    monkeypatch.setattr(mfu_module, "get_device_flops", lambda *, unit, device_name: 989.0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA H100 80GB HBM3")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
     calculator = AutoMFU(SimpleNamespace())
 
     assert calculator.reference_mfu == 989.0
+
+
+@pytest.mark.parametrize(
+    "name, dtype, expected",
+    [
+        ("NVIDIA H100 80GB HBM3", torch.float16, 989.0),
+        ("NVIDIA H100 80GB HBM3", torch.float8_e4m3fn, 1979.0),
+        ("NVIDIA H100 PCIe", torch.float8_e4m3fn, 1513.0),
+        ("NVIDIA H100 NVL", torch.bfloat16, 835.5),
+        ("NVIDIA H100 80GB HBM3 MIG 1g.10gb", torch.bfloat16, float("inf")),
+        ("NVIDIA GB300", torch.float4_e2m1fn_x2, 15000.0),
+        ("NVIDIA B200", torch.float4_e2m1fn_x2, 9000.0),
+        ("NVIDIA A100", torch.float8_e4m3fn, float("inf")),
+    ],
+)
+def test_get_device_flops_selects_dense_peak_by_dtype(name, dtype, expected):
+    assert get_device_flops(device_name=name, dtype=dtype) == expected
+
+
+@pytest.mark.parametrize("precision, expected", [("ieee", 67.0), ("tf32", 494.5)])
+def test_get_device_flops_uses_cuda_fp32_matmul_policy(monkeypatch, precision, expected):
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", precision)
+
+    assert get_device_flops(device_name="H100", dtype=torch.float32) == expected
+
+
+def test_mfu_config_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    model = torch.nn.Sequential(torch.nn.LayerNorm(32), torch.nn.Linear(32, 32, dtype=torch.bfloat16))
+    model.config = SimpleNamespace(dtype=torch.float32)
+    config = MFUConfig(device="H100")
+
+    assert config.build(model=model).reference_mfu == 989.0
+    assert config.build(model=model, compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
 
 
 def test_automfu_accepts_precision_peak_override(monkeypatch):
@@ -424,7 +461,9 @@ def test_mfu_config_builds_calculator(monkeypatch):
     model_config = SimpleNamespace()
     model = SimpleNamespace(config=model_config)
 
-    calculator = MFUConfig(device="h100", peak_tflops=1979.0).build(model=model)
+    with pytest.warns(FutureWarning, match=r"mfu\.peak_tflops is deprecated"):
+        config = MFUConfig(device="h100", peak_tflops=1979.0)
+    calculator = config.build(model=model)
 
     assert calculator.config is model_config
     assert calculator.reference_mfu == 1979.0
