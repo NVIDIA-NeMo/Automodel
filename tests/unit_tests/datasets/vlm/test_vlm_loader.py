@@ -28,6 +28,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+from nemo_automodel.components.datasets.vlm import collate_fns
 from nemo_automodel.components.datasets.vlm import loader as vlm_loader
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
@@ -192,13 +193,16 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert padding_idx == processor.tokenizer.pad_token_id
 
 
-@pytest.mark.parametrize("explicit_collator", [False, True])
-def test_vlm_dataloader_rejects_default_collator_without_processor(explicit_collator):
+@pytest.mark.parametrize(
+    "factory",
+    [*vlm_loader.COLLATE_FNS.values(), collate_fns.gemma4_prefix_collate_fn, collate_fns.phi4_mm_collate_fn],
+)
+def test_vlm_dataloader_rejects_processor_dependent_collator_without_processor(factory):
     """Fail while building instead of deferring the processor error to first batch."""
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig([]),
         processor_config=VlmProcessorConfig(factory=lambda: None),
-        collator=VlmCollatorConfig(factory=vlm_loader.COLLATE_FNS["default"]) if explicit_collator else None,
+        collator=VlmCollatorConfig(factory=factory),
     )
 
     with pytest.raises(ValueError, match="VLM dataloader for 'unused' requires a processor"):

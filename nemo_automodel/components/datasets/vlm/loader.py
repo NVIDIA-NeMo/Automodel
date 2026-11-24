@@ -388,17 +388,6 @@ class VlmDataloaderConfig:
                 raise ValueError("VLM pretokenization requires a processor")
             dataset = self.pretokenization.build(dataset=dataset, processor=processor)
 
-        if (
-            processor is None
-            and self.pretokenization is None
-            and self.packing is None
-            and (self.collator is None or getattr(self.collator, "factory", None) is COLLATE_FNS["default"])
-        ):
-            raise ValueError(
-                f"VLM dataloader for {pretrained_model_name_or_path!r} requires a processor; "
-                "AutoProcessor.from_pretrained did not return one"
-            )
-
         if self.packing is not None:
             if self.pretokenization is None:
                 raise ValueError("VLM neat packing requires pretokenization")
@@ -441,11 +430,20 @@ class VlmDataloaderConfig:
         elif self.pretokenization is not None:
             collate_fn = partial(pad_collate_fn, processor=processor)
         else:
-            processor_type = type(processor).__name__
+            processor_type = "default" if processor is None else type(processor).__name__
             if processor_type not in COLLATE_FNS:
                 logger.warning("Using %s with the default VLM collator", processor_type)
                 processor_type = "default"
             collate_fn = partial(COLLATE_FNS[processor_type], processor=processor)
+
+        collator_factory = self.collator.factory if self.collator is not None else COLLATE_FNS["default"]
+        while isinstance(collator_factory, partial):
+            collator_factory = collator_factory.func
+        if processor is None and getattr(collator_factory, "__module__", None) == COLLATE_FNS["default"].__module__:
+            raise ValueError(
+                f"VLM dataloader for {pretrained_model_name_or_path!r} requires a processor; "
+                "the selected built-in collator cannot run without one"
+            )
 
         if hasattr(dataset, "robust_collate"):
             collate_fn = dataset.robust_collate(collate_fn)
