@@ -17,9 +17,19 @@
 import json
 import os
 import re
-from typing import Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from transformers import PretrainedConfig
+
+from .dspark_target import Inkling2DSparkTargetConfig
+
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+
+    from nemo_automodel.components.distributed.config import DistributedSetup
+
+    from .dspark import Inkling2DSparkModel, Inkling2DSparkOptions, Inkling2MtpConfig
 
 
 class Inkling2QuantizationConfig(TypedDict):
@@ -437,7 +447,7 @@ class Inkling2Config(PretrainedConfig):
         *,
         text_config: Inkling2TextConfig | dict[str, Any] | None = None,
         vision_config: Inkling2VisionConfig | dict[str, Any] | None = None,
-        mtp_config: dict[str, Any] | None = None,
+        mtp_config: "Inkling2MtpConfig | None" = None,
         quantization_config: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None = None,
         **kwargs: Any,
     ) -> None:
@@ -473,6 +483,67 @@ class Inkling2Config(PretrainedConfig):
         if "quantization_config" not in output:
             output["text_config"].pop("quantization_config", None)
         return output
+
+    def build_dspark_draft(self, options: "Inkling2DSparkOptions") -> "Inkling2DSparkModel":
+        """Build the DSpark draft in the released ``mtp.safetensors`` layout.
+
+        Args:
+            options: Declarative draft settings supplied by the DSpark recipe; they must agree
+                with ``mtp_config``.
+
+        Returns:
+            Newly initialized draft ready for device placement.
+
+        Raises:
+            ValueError: If the checkpoint has no ``mtp_config`` or an option disagrees with it.
+        """
+        # Imported here so loading the config does not import the speculative-decoding stack.
+        from .dspark import Inkling2DSparkConfig
+
+        if self.mtp_config is None:
+            raise ValueError("This Inkling2 config has no mtp_config, so it defines no DSpark draft")
+        return Inkling2DSparkConfig.from_options(self.text_config, self.mtp_config, options).build()
+
+    def build_dspark_target(
+        self,
+        *,
+        target_path: str,
+        trust_remote_code: bool,
+        device: "torch.device",
+        compute_dtype: "torch.dtype",
+        distributed_setup: "DistributedSetup",
+        load_metadata_with_gloo: bool,
+        attn_backend: str | None = None,
+        experts: str | None = None,
+        dispatcher: str | None = None,
+    ) -> "nn.Module":
+        """Load the frozen DSpark target on the recipe's expert-parallel / FSDP mesh.
+
+        Args:
+            target_path: Hub id or local directory of this checkpoint.
+            trust_remote_code: Forwarded to the checkpoint loaders.
+            device: Resolved execution device.
+            compute_dtype: Precision used to load and run the frozen target.
+            distributed_setup: Runtime parallelism configuration composed by the recipe.
+            load_metadata_with_gloo: Read checkpoint metadata over Gloo.
+            attn_backend: Target attention backend; ``None`` keeps ``Inkling2DSparkTargetConfig``'s default.
+            experts: Target expert backend; ``None`` keeps the default.
+            dispatcher: Target MoE dispatcher; ``None`` keeps the default.
+
+        Returns:
+            The pretrained target, frozen and in eval mode.
+        """
+        overrides = {"attn_backend": attn_backend, "experts": experts, "dispatcher": dispatcher}
+        return Inkling2DSparkTargetConfig(
+            target_path=target_path,
+            trust_remote_code=trust_remote_code,
+            **{name: value for name, value in overrides.items() if value is not None},
+        ).build(
+            device=device,
+            compute_dtype=compute_dtype,
+            distributed_setup=distributed_setup,
+            load_metadata_with_gloo=load_metadata_with_gloo,
+        )
 
 
 class Inkling2LegacyConfig(Inkling2Config):
