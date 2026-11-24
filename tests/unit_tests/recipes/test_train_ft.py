@@ -70,23 +70,31 @@ def test_recipe_config_defaults_mfu_settings():
 
 
 @pytest.mark.parametrize(
-    "strategy, compute_dtype, expected",
+    "fp8_config, dtype_kwargs, expected",
     [
-        (FSDP2Config(), None, 989.0),
-        (FSDP2Config(), torch.float32, 67.0),
-        (FSDP2Config(), torch.float8_e4m3fn, 1979.0),
+        ({}, {}, 989.0),
+        ({"enabled": True}, {}, 1979.0),
+        ({"enabled": True, "emulate": True}, {}, 989.0),
+        ({"enabled": True}, {"compute_dtype": None}, 989.0),
+        ({"enabled": True}, {"compute_dtype": torch.float32}, 67.0),
     ],
 )
-def test_recipe_mfu_uses_compute_precision(strategy, compute_dtype, expected, monkeypatch):
+def test_recipe_mfu_uses_compute_precision(fp8_config, dtype_kwargs, expected, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA H100 80GB HBM3")
     monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
     model = nn.Linear(32, 32, dtype=torch.float32)
     model.config = SimpleNamespace(dtype=torch.float32, model_type="llama")
-    recipe = SimpleNamespace(cfg=RecipeConfig(ConfigNode({})), distributed_config=strategy)
+    recipe = SimpleNamespace(
+        cfg=RecipeConfig(ConfigNode({"fp8": fp8_config})),
+        distributed_config=FSDP2Config(),
+        te_quantization=None,
+        moe_parallel_config=None,
+        device_mesh=None,
+    )
 
-    TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, compute_dtype=compute_dtype)
+    TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, **dtype_kwargs)
 
     assert recipe.mfu_calculator.reference_mfu == expected
 

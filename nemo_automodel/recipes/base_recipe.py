@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -55,7 +55,9 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config, TENvfp4Config
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
@@ -236,9 +238,34 @@ class BaseRecipe:
         for key in keys:
             tracked.discard(key)
 
-    def _setup_mfu(self, model: torch.nn.Module, *, compute_dtype: torch.dtype | None = None) -> None:
-        """Build MFU using the recipe's compute precision when it differs from weight storage."""
+    def _setup_mfu(
+        self, model: torch.nn.Module, *, compute_dtype: torch.dtype | Literal["auto"] | None = "auto"
+    ) -> None:
+        """Build MFU from the recipe's precision policy and initialized model.
+
+        Automatic selection accounts for quantization, expert parallelism, and
+        unsharded FSDP2 autocast. Callers that manage autocast pass their dtype
+        directly, or pass None to fall back to the FSDP2 policy and model dtype.
+        """
         strategy = self.distributed_config
+        if compute_dtype == "auto":
+            compute_dtype = None
+            fp8_config = self.cfg.get("fp8", None)
+            if HAVE_TE and isinstance(self.te_quantization, TENvfp4Config):
+                compute_dtype = torch.float4_e2m1fn_x2
+            elif (HAVE_TE and isinstance(self.te_quantization, TEFp8Config)) or (
+                fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
+            ):
+                compute_dtype = torch.float8_e4m3fn
+            elif (
+                self.moe_parallel_config is not None
+                and self.moe_parallel_config.mp_policy is not None
+                and self.mesh_context.ep_size > 1
+            ):
+                compute_dtype = self.moe_parallel_config.mp_policy.param_dtype
+            elif isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(self.device_mesh):
+                # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
+                compute_dtype = strategy.autocast_dtype
         if compute_dtype is None and isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
             compute_dtype = strategy.mp_policy.param_dtype
         mfu_settings = self.cfg.mfu

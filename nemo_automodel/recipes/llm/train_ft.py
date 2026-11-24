@@ -74,7 +74,6 @@ from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
-from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
@@ -104,7 +103,6 @@ from nemo_automodel.components.models.common.packing import (
     configure_packing_for_models,
     validate_thd_packing_support,
 )
-from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config, TENvfp4Config
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
@@ -935,24 +933,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
-        compute_dtype = None
-        fp8_config = self.cfg.get("fp8", None)
-        if HAVE_TE and isinstance(self.te_quantization, TENvfp4Config):
-            compute_dtype = torch.float4_e2m1fn_x2
-        elif (HAVE_TE and isinstance(self.te_quantization, TEFp8Config)) or (
-            fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
-        ):
-            compute_dtype = torch.float8_e4m3fn
-        elif (
-            self.moe_parallel_config is not None
-            and self.moe_parallel_config.mp_policy is not None
-            and self.mesh_context.ep_size > 1
-        ):
-            compute_dtype = self.moe_parallel_config.mp_policy.param_dtype
-        elif isinstance(self.distributed_config, FSDP2Config) and not fsdp2_sharding_enabled(self.device_mesh):
-            # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
-            compute_dtype = self.distributed_config.autocast_dtype
-        self._setup_mfu(self.model_parts[0], compute_dtype=compute_dtype)
+        self._setup_mfu(self.model_parts[0])
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
