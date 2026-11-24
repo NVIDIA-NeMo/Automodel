@@ -27,16 +27,36 @@ from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, Ro
 from torch.distributed.tensor.placement_types import Shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.activation_checkpointing import is_selective_activation_checkpointing
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.moe.parallelizer import apply_ac
 
 logger = logging.getLogger(__name__)
 
 
+def _is_hf_layout(model: nn.Module) -> bool:
+    """Return whether ``model`` is the HF NemotronH layout rather than native Nemotron-V3.
+
+    Both classes are named ``NemotronHForCausalLM`` and share this parallelizer: the HF
+    remote-code model keeps its decoder blocks in ``backbone.layers`` (``nn.ModuleList``),
+    while the native model keeps them in ``model.layers`` (``nn.ModuleDict``). The HF class
+    exposes no API that distinguishes the two, so this attribute probe is the single place
+    the layout is decided.
+
+    Args:
+        model: A Nemotron-H or native Nemotron-V3 causal LM.
+
+    Returns:
+        ``True`` for the HF layout, ``False`` for the native layout.
+    """
+    return hasattr(model, "backbone")
+
+
 def _decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
     """Return the mutable decoder container and its ordered blocks."""
-    inner = model.backbone if hasattr(model, "backbone") else model.model
+    inner = model.backbone if _is_hf_layout(model) else model.model
     container = inner.layers
     blocks = list(container.values()) if isinstance(container, nn.ModuleDict) else list(container)
     return container, blocks
@@ -62,6 +82,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
         **kwargs,
     ) -> nn.Module:
         """Apply every requested parallelism to a Nemotron-H model."""
+        activation_checkpointing_scope = kwargs.get("activation_checkpointing_scope", "all")
         del tp_shard_plan, kwargs
         if sequence_parallel:
             raise ValueError("Sequence parallelism is not supported for NemotronHForCausalLM")
@@ -121,17 +142,22 @@ class NemotronHModelParallelizer(ModelParallelizer):
                         )
 
         if activation_checkpointing:
-            block_items = (
-                block_container.items() if isinstance(block_container, nn.ModuleDict) else enumerate(block_container)
-            )
-            for key, layer in list(block_items):
-                if getattr(layer, "block_type", None) in ("mlp", "mamba"):
-                    # Only ``NemotronV3Block`` carries the flag (set through ``mamba_ac_exempt_blocks``); the
-                    # blocks of a Transformers Nemotron-H backbone, which this parallelizer also serves, do not.
-                    if getattr(layer, "_nemo_disable_activation_checkpointing", False):
-                        logger.info("Skipping activation checkpointing for exempt block %s", key)
-                        continue
-                    block_container[key] = checkpoint_wrapper(layer)
+            if _is_hf_layout(model):
+                # HF NemotronH layout: only mlp and mamba blocks are checkpointed.
+                for key, layer in list(enumerate(block_container)):
+                    if getattr(layer, "block_type", None) in ("mlp", "mamba"):
+                        block_container[key] = checkpoint_wrapper(layer)
+            else:
+                # Native Nemotron-V3 layout: checkpoint every decoder block (mamba, attention,
+                # mlp, moe) and the MTP blocks the same way the expert-parallel path does.
+                # For MoE models apply_ac pins the routing across the recompute and keeps the
+                # gate's expert-load accounting from counting it twice. Dense models
+                # (moe_config=None) have no routing to pin and recompute whole blocks.
+                apply_ac(
+                    model,
+                    selective=is_selective_activation_checkpointing(activation_checkpointing),
+                    activation_checkpointing_scope=activation_checkpointing_scope,
+                )
             _, layers = _decoder_blocks(model)
 
         if reapply_trainability is not None:

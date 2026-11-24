@@ -112,9 +112,9 @@ def _model_parallelizer_exemption_worker(rank: int, rendezvous: str) -> None:
         config = MockNemotronV3Config(layers_block_type=["mamba", "attention", "mlp", "mamba"], num_hidden_layers=4)
         model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=1)
         PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=True)
-        # This parallelizer checkpoints Mamba and dense MLP blocks: the exempt first Mamba block stays itself.
+        # This parallelizer checkpoints every block of the native layout: the exempt first Mamba block stays itself.
         wrapped = [isinstance(block, CheckpointWrapper) for block in model.model.layers.values()]
-        assert wrapped == [False, False, True, True], wrapped
+        assert wrapped == [False, True, True, True], wrapped
     finally:
         dist.destroy_process_group()
 
