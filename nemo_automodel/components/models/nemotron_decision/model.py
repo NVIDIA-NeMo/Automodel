@@ -32,6 +32,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput, MaskedLMOutput
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.ministral_bidirectional.model import Ministral3BidirectionalModel
 
@@ -56,17 +57,18 @@ class NemotronForDecision(PreTrainedModel):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: Ministral3Config, **kwargs: Any) -> None:
+    def __init__(self, config: Ministral3Config, *, logits_dtype: torch.dtype | None = None, **kwargs: Any) -> None:
         """Build the encoder and head.
 
         Args:
             config: Ministral 3 text config of the checkpoint; ``is_causal`` is forced to ``False``.
+            logits_dtype: Dtype of the head's logits; ``None`` keeps the head weight's dtype.
             **kwargs: Unused loader options.
         """
         config.is_causal = False
         super().__init__(config)
         self.encoder = Ministral3BidirectionalModel(config)
-        self.diffusion_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.diffusion_head = LMHead(config.hidden_size, config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
 
     @classmethod
@@ -86,7 +88,7 @@ class NemotronForDecision(PreTrainedModel):
         """Replace the encoder's token embeddings."""
         self.encoder.embed_tokens = value
 
-    def get_output_embeddings(self) -> nn.Linear:
+    def get_output_embeddings(self) -> LMHead:
         """The decision readout head."""
         return self.diffusion_head
 

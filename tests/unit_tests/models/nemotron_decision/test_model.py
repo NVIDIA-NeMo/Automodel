@@ -84,6 +84,36 @@ def test_parameter_names_match_the_checkpoint_layout(model):
     assert model.get_input_embeddings() is model.encoder.embed_tokens
 
 
+def _bf16_model(**kwargs):
+    torch.manual_seed(0)
+    return NemotronForDecision(_config(), **kwargs).to(torch.bfloat16).eval()
+
+
+def test_logits_dtype_sets_the_dtype_of_the_forward_logits():
+    ids = torch.tensor([[5, 6, 7, 8, 3]])
+    with torch.no_grad():
+        fp32_model = _bf16_model(logits_dtype=torch.float32)
+        hidden = fp32_model(input_ids=ids, output_last_hidden_states_only=True).last_hidden_state
+        logits = fp32_model(input_ids=ids).logits
+        default_logits = _bf16_model()(input_ids=ids).logits
+    # Float64 oracle over the same BF16 operands; the head weight stays BF16.
+    expected = hidden.double() @ fp32_model.diffusion_head.weight.double().T
+    assert fp32_model.diffusion_head.weight.dtype == torch.bfloat16
+    assert hidden.dtype == torch.bfloat16 and logits.dtype == torch.float32
+    torch.testing.assert_close(logits.double(), expected, rtol=1e-5, atol=1e-5)
+    assert default_logits.dtype == torch.bfloat16
+    torch.testing.assert_close(default_logits.double(), expected, rtol=2**-7, atol=2**-7)
+
+
+def test_logits_dtype_unset_matches_a_plain_linear_bit_for_bit(model):
+    ids = torch.tensor([[5, 6, 7, 8, 3]])
+    with torch.no_grad():
+        hidden = model(input_ids=ids, output_last_hidden_states_only=True).last_hidden_state
+        logits = model(input_ids=ids).logits
+    assert torch.equal(logits, torch.nn.functional.linear(hidden, model.diffusion_head.weight))
+    assert model.diffusion_head.bias is None
+
+
 def test_registry_routes_the_decision_architecture_to_the_native_class():
     from nemo_automodel._transformers.registry import ModelRegistry
 
