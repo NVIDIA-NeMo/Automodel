@@ -255,6 +255,26 @@ def test_resume_writes_missing_shards_with_a_different_world_size(
     _assert_equal_cache(reference, incomplete)
 
 
+def test_resume_balances_missing_shards(
+    compared_caches: tuple[Path, Path, int], tiny_qwen: tuple[Path, Path], tmp_path: Path
+) -> None:
+    reference, result, topk = compared_caches
+    incomplete = tmp_path / "completed_prefix"
+    shutil.copytree(result, incomplete)
+    # With two ranks, the original rank 0 owns both retained shards.
+    for index in (2, 3):
+        (incomplete / f"shard-{index:06d}.safetensors").unlink()
+    before = _snapshot(incomplete)
+
+    log = _precompute(*tiny_qwen, incomplete, world_size=2, topk=topk, extra=("--resume",))
+
+    assert "Rank 0/2: precomputing samples [4, 6) from shard 2" in log
+    assert "Rank 1/2: precomputing samples [6, 7) from shard 3" in log
+    after = _snapshot(incomplete)
+    assert all(after[name] == snapshot for name, snapshot in before.items())
+    _assert_equal_cache(reference, incomplete)
+
+
 def test_nonzero_rank_shard_validation_fails_before_any_write(
     compared_caches: tuple[Path, Path, int], tiny_qwen: tuple[Path, Path], tmp_path: Path
 ) -> None:

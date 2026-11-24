@@ -276,10 +276,12 @@ CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc-per-node=1 \
 Use one active job per cache directory and keep the target and dataset
 snapshots, device type, and precompute settings fixed across resumes.
 `--batch-size` is per rank and must divide `--shard-size`. Before writing,
-`--resume` checks the manifest and all committed shard headers. The smaller
-draft vocabulary is derived from the entire dataset, including completed
-shards. After precompute finishes, set `recipe_args.cached_target_path` to
-`CACHE` in the training recipe.
+`--resume` checks the manifest and all committed shard headers, then spreads
+the missing shards evenly across ranks. The smaller draft vocabulary is
+derived from the entire dataset, including completed shards. If a run stopped
+before committing any shards, start again without `--resume` to change settings
+in the same directory. After precompute finishes, set
+`recipe_args.cached_target_path` to `$CACHE` in the training recipe.
 
 DSpark supports the co-located and remote backends too. Its remote server,
 `serve_dspark_target`, reads the same YAML as the training run, so both sides

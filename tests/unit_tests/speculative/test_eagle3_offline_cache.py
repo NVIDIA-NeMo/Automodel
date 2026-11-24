@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -506,6 +508,7 @@ def test_cuda_replica_uses_single_rank_loading(monkeypatch, tmp_path, load_fails
     topology = {"WORLD_SIZE": "2", "LOCAL_WORLD_SIZE": "2", "RANK": "1", "LOCAL_RANK": "1"}
     for key, value in topology.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "eagle3-test")
     _patch_producer(monkeypatch, num_samples=2, batch_size=2)
     devices = []
     monkeypatch.setattr(torch.cuda, "set_device", devices.append)
@@ -534,6 +537,17 @@ def test_cuda_replica_uses_single_rank_loading(monkeypatch, tmp_path, load_fails
         assert pe.main(argv) == 0
     assert {key: os.environ[key] for key in topology} == topology
     assert devices == [torch.device("cuda:1")]
+
+
+def test_producer_python_entry_ignores_scheduler_ranks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "3")
+    monkeypatch.setenv("RANK", "1")
+    for key in ("LOCAL_WORLD_SIZE", "LOCAL_RANK", "TORCHELASTIC_RUN_ID"):
+        monkeypatch.delenv(key, raising=False)
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    assert existing_shard_indices(str(tmp_path)) == {0, 1, 2}
 
 
 def test_producer_main_writes_full_sharded_cache(monkeypatch, tmp_path):
@@ -590,6 +604,29 @@ def test_producer_main_resume_rejects_changed_config(monkeypatch, tmp_path):
 
     # Reject the configuration before replacing any cached artifacts.
     assert {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in tmp_path.iterdir()} == files_before
+
+
+def test_producer_can_restart_before_the_first_shard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    with monkeypatch.context() as patch:
+        patch.setattr(_FakeWrapper, "generate_batch", Mock(side_effect=RuntimeError("target forward failed")))
+        with pytest.raises(RuntimeError, match="target forward failed"):
+            pe.main(_producer_argv(tmp_path))
+
+    assert not existing_shard_indices(str(tmp_path))
+    assert read_manifest(str(tmp_path))["seq_length"] == 6
+    files_before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2, seq_len=4)
+    argv = _producer_argv(tmp_path, extra=["--seq-length", "4"])
+
+    with pytest.raises(ValueError, match="mismatched fields.*seq_length"):
+        pe.main([*argv, "--resume"])
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == files_before
+
+    assert pe.main(argv) == 0
+    assert read_manifest(str(tmp_path))["seq_length"] == 4
+    assert (tmp_path / "target_embeddings.safetensors").read_bytes() != files_before["target_embeddings.safetensors"]
+    assert CachedEagle3Dataset(str(tmp_path))[0]["input_ids"].shape == (4,)
 
 
 def test_manifest_records_dataset_identity_fields(monkeypatch, tmp_path):

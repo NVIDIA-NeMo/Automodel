@@ -182,17 +182,22 @@ def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing
         raise ValueError(f"{cache_dir} has shard indices outside the manifest's {num_shards} shards: {unexpected}.")
 
 
-def _missing_shard_runs(first_shard: int, num_shards: int, existing: set[int]) -> Iterator[tuple[int, int]]:
-    """Yield half-open runs of consecutive missing global shard indices."""
-    stop_shard = first_shard + num_shards
-    start = None
-    for index in range(first_shard, stop_shard + 1):
-        if index == stop_shard or index in existing:
-            if start is not None:
-                yield start, index
-                start = None
-        elif start is None:
+def _missing_shard_runs(
+    num_shards: int, existing: set[int], *, world_size: int, rank: int
+) -> Iterator[tuple[int, int]]:
+    """Partition the ordered missing shards and coalesce each rank's consecutive indices."""
+    missing = [index for index in range(num_shards) if index not in existing]
+    offset, _, count = partition_cache_shards(len(missing), shard_size=1, world_size=world_size, rank=rank)
+    if count == 0:
+        return
+
+    start = previous = missing[offset]
+    for index in missing[offset + 1 : offset + count]:
+        if index != previous + 1:
+            yield start, previous + 1
             start = index
+        previous = index
+    yield start, previous + 1
 
 
 def _precompute(
@@ -288,15 +293,11 @@ def _precompute(
 
     has_manifest = has_embeddings = False
     with sync_cache_phase("EAGLE-3 cache validation"):
-        if rank == 0:
+        if rank == 0 and args.resume:
             has_manifest = os.path.exists(manifest_path(args.output_dir))
             _ensure_resume_compatible(args.output_dir, manifest, existing)
-            has_embeddings = validate_target_embeddings(args.output_dir, shape=embeddings.shape)
-            if has_embeddings and not has_manifest:
-                raise ValueError(
-                    f"{args.output_dir}: manifest is missing, so the existing target embeddings cannot be verified. "
-                    "Use a fresh output directory."
-                )
+            if existing:
+                has_embeddings = validate_target_embeddings(args.output_dir, shape=embeddings.shape)
         for index in range(first_shard, first_shard + local_shards):
             if index in existing:
                 validate_eagle3_shard(args.output_dir, shard_index=index, manifest=manifest)
@@ -307,6 +308,8 @@ def _precompute(
         if rank == 0:
             if not has_manifest:
                 write_manifest(args.output_dir, manifest)
+            # With no committed shards, regenerate embeddings even if a prior
+            # run was interrupted between publishing the manifest and embeddings.
             if not has_embeddings:
                 write_target_embeddings(args.output_dir, embeddings)
 
@@ -314,16 +317,6 @@ def _precompute(
     # the group together so torchrun can supervise independent shard writes.
     if distributed:
         dist.destroy_process_group()
-
-    logger.info(
-        "Rank %d/%d: precomputing samples [%d, %d) from shard %d in %s",
-        rank,
-        world_size,
-        first_sample,
-        first_sample + local_samples,
-        first_shard,
-        args.output_dir,
-    )
 
     def _compute_from_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Capture the on-disk tensors for this batch.
@@ -345,12 +338,22 @@ def _precompute(
                 target_batch, selected_token_ids, selected_token_mask, cache_dtype, args.target_probs_topk
             )
 
-    for start, end in _missing_shard_runs(first_shard, local_shards, existing):
+    num_shards = (num_samples + args.shard_size - 1) // args.shard_size
+    for start, end in _missing_shard_runs(num_shards, existing, world_size=world_size, rank=rank):
+        start_sample = start * args.shard_size
+        end_sample = min(end * args.shard_size, num_samples)
+        logger.info(
+            "Rank %d/%d: precomputing samples [%d, %d) from shard %d in %s",
+            rank,
+            world_size,
+            start_sample,
+            end_sample,
+            start,
+            args.output_dir,
+        )
         loader = local_loader
         if start != first_shard or end != first_shard + local_shards:
-            loader = dataloader_for_sample_range(
-                dataloader, start=start * args.shard_size, end=min(end * args.shard_size, num_samples)
-            )
+            loader = dataloader_for_sample_range(dataloader, start=start_sample, end=end_sample)
         write_cache_shards(
             dataloader=loader,
             output_dir=args.output_dir,
@@ -368,7 +371,9 @@ def _precompute(
 def _run(args: argparse.Namespace) -> int:
     """Load a target replica and run the cache producer under Python or torchrun."""
     _validate_args(args)
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    # Some schedulers set rank variables for ordinary Python commands.
+    is_torchrun_worker = "LOCAL_RANK" in os.environ and "TORCHELASTIC_RUN_ID" in os.environ
+    world_size = int(os.environ.get("WORLD_SIZE", "1")) if is_torchrun_worker else 1
     rank = int(os.environ["RANK"]) if world_size > 1 else 0
     device = torch.device(args.device)
     if world_size > 1:
