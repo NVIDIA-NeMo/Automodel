@@ -1,16 +1,16 @@
-# GLM-5.3 (753B) LoRA on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP16 on 4 nodes holds ~88 GiB of frozen bf16 weights per GPU. Two nodes (EP8, ~175 GiB) run out
-# of memory while the FP8 checkpoint is dequantized during loading (268 GiB allocated on 280 GiB).
+# DeepSeek-V4-Flash (291B) LoRA on one VR200 node (hecate: 4 GPUs per node, 280 GiB per GPU).
+# EP4 holds ~136 GiB of frozen bf16 weights per GPU. Loading the FP4/FP8 checkpoint peaks at
+# ~266 GiB while it is dequantized; training with 16K packs peaked at 184 GiB, so 24K packs.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 16
+  global_batch_size: 4
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
   gc_every_steps: 10
-  num_epochs: 1
+  num_epochs: 10
   max_steps: 20
 
 distributed:
@@ -18,58 +18,52 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 16
+  ep_size: 4
   sequence_parallel: false
   activation_checkpointing: true
   moe:
+    ignore_router_for_ac: true
     reshard_after_forward: true
     wrap_outer_model: false
-    ignore_router_for_ac: true
 
 dist_env:
   backend: nccl
-  timeout_minutes: 60
+  timeout_minutes: 30
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: zai-org/GLM-5.3
-  dtype: bfloat16
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  load_base_model: true
   moe_overrides:
     gate_bias_update_factor: 0.0
     force_e_score_correction_bias: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: tilelang
+    attn: tilelang  # DeepSeek-V4 trains on packed THD batches only through the TileLang kernels
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: torch_mm
     dispatcher: hybridep
-    gate_precision: float32
-    fake_balanced_gate: false
+    experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules:
-    - "*.self_attn.q_a_proj"
-    - "*.self_attn.q_b_proj"
-    - "*.self_attn.kv_a_proj_with_mqa"
-    - "*.self_attn.kv_b_proj"
-    - "*.self_attn.o_proj"
-    - "*.mlp.gate_proj"
-    - "*.mlp.up_proj"
-    - "*.mlp.down_proj"
-    - "*.mlp.shared_experts.gate_proj"
-    - "*.mlp.shared_experts.up_proj"
-    - "*.mlp.shared_experts.down_proj"
-    - "*.mlp.experts"
+    - "*.self_attn.wq_a"
+    - "*.self_attn.wq_b"
+    - "*.self_attn.wkv"
+    - "*.self_attn.wo_b"
+    - "*.self_attn.compressor.wkv"
   dim: 8
   alpha: 32
-  dropout: 0.0
-  use_memory_efficient_lora: true
-  use_triton: false
+  use_triton: true
   lora_dtype: bfloat16
 
 checkpoint:
@@ -77,24 +71,20 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
-  path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: train[:20000]
-  shuffle_seed: 42
-  truncation: true
-  seq_length: 4096
-  padding: false
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: zai-org/GLM-5.3
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
 
 packed_sequence:
-  packed_sequence_size: 16384
+  packed_sequence_size: 24576
   packing_strategy: thd
-  num_proc: 8
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -115,16 +105,13 @@ optimizer:
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
 
-clip_grad_norm:
-  max_norm: 1.0
-
 ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 4
+  nodes: 1
   nproc_per_node: 4
-  time: "01:00:00"
+  time: "00:45:00"
   max_steps: 20
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

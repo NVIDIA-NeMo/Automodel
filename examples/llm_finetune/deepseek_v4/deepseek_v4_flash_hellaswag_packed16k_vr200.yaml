@@ -1,7 +1,7 @@
 # DeepSeek-V4-Flash (291B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
 # EP16 on 4 nodes, the fewest that fit, holds ~169 GiB of bf16 weights, gradients and TE FusedAdam
-# state (param remainders plus bf16 moments, 10 bytes per parameter) per GPU; 8K-token packs bring
-# the estimated peak to ~200 GiB (~72%).
+# state (param remainders plus bf16 moments, 10 bytes per parameter) per GPU. 8K packs peaked at
+# 176 GiB in training; 16K packs fill more of the 280 GiB.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
@@ -68,7 +68,7 @@ dataset:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
 
 packed_sequence:
-  packed_sequence_size: 8192
+  packed_sequence_size: 16384
   packing_strategy: thd
 
 dataloader:

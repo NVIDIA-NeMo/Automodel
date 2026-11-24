@@ -1,11 +1,12 @@
 # DeepSeek-V4.1-Flash (763B) LoRA on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP16 on 4 nodes holds ~89 GiB of frozen bf16 weights per GPU. Two nodes (EP8, ~178 GiB) run out
-# of memory while the FP8/FP4 checkpoint is dequantized during loading (269 GiB allocated on 280 GiB).
+# EP12 on 3 nodes holds ~118 GiB of frozen bf16 weights per GPU. Dequantizing the FP8/FP4
+# checkpoint adds ~88 GiB while loading (2 nodes ran out of memory there); training with 8K
+# packs on 4 nodes peaked at 115 GiB, so 24K packs.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 16
+  global_batch_size: 12
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -65,7 +66,7 @@ distributed:
   tp_size: 1
   pp_size: 1
   cp_size: 1
-  ep_size: 16
+  ep_size: 12
   defer_fsdp_grad_sync: false
   sequence_parallel: false
   activation_checkpointing: true
@@ -102,7 +103,7 @@ dataset:
     trust_remote_code: false
 
 packed_sequence:
-  packed_sequence_size: 8192
+  packed_sequence_size: 24576
   packing_strategy: thd
   num_proc: 8
 
@@ -134,7 +135,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 4
+  nodes: 3
   nproc_per_node: 4
   time: "01:00:00"
   max_steps: 20
