@@ -1,13 +1,13 @@
 # GLM-5.3 (753B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP64 on 16 nodes, the fewest that fit (256 experts rule out 12 nodes), holds ~110 GiB of bf16
-# weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU; 32K-token packs bring
-# the estimated peak to ~170 GiB (~61%) while the T x T indexer logits stay below 2^31 elements.
+# PP3 x EP16 on 12 nodes shards the experts 48 ways (256 experts rule out EP48), holding ~146 GiB of
+# bf16 weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU. The pipeline
+# settings follow the GB200 recipe (interleaved 1F1B, two layers per virtual stage) with 16K packs.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 1
+  global_batch_size: 96
+  local_batch_size: 6
   ckpt_every_steps: 1000
   val_every_steps: 1000
   gc_every_steps: 10
@@ -18,10 +18,18 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
-  ep_size: 64
+  pp_size: 3
+  ep_size: 16
   sequence_parallel: false
   activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
   moe:
     reshard_after_forward: true
     wrap_outer_model: false
@@ -68,7 +76,7 @@ dataset:
     pretrained_model_name_or_path: zai-org/GLM-5.3
 
 packed_sequence:
-  packed_sequence_size: 32768
+  packed_sequence_size: 16384
   packing_strategy: thd
   num_proc: 8
 
@@ -98,7 +106,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 16
+  nodes: 12
   nproc_per_node: 4
   time: "01:30:00"
   max_steps: 20
