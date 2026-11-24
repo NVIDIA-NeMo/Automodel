@@ -19,10 +19,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from transformers import LlamaConfig, PretrainedConfig
+from transformers import LlamaConfig, MiniMaxM2Config, PretrainedConfig
 
 from nemo_automodel.components.training.timers import Timers
-from nemo_automodel.components.utils.flops_utils import llama2_flops
+from nemo_automodel.components.utils.flops_utils import llama2_flops, minimax_m2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
 
@@ -424,6 +424,36 @@ class TestBenchmarkingRecipeSetup:
                 mock_recipe.setup()
                 expected = llama2_flops(text, gbs=256, seq_len=2048) / 1e12
                 assert mock_recipe.tflops == pytest.approx(expected)
+
+    def test_setup_skips_mtp_modules_the_model_does_not_build(
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction
+    ) -> None:
+        # Released MiniMax-M2 configs declare three MTP modules; the built model has no MTP head.
+        def make_config(use_mtp: bool) -> MiniMaxM2Config:
+            return MiniMaxM2Config(
+                hidden_size=256,
+                num_hidden_layers=4,
+                num_attention_heads=8,
+                num_key_value_heads=2,
+                head_dim=32,
+                intermediate_size=128,
+                num_local_experts=16,
+                num_experts_per_tok=4,
+                vocab_size=1024,
+                use_mtp=use_mtp,
+                num_mtp_modules=3,
+            )
+
+        mock_recipe.model_parts = [SimpleNamespace(config=make_config(use_mtp=True))]
+        mock_recipe._bench_flops_scope = "model"
+        with (
+            patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup"),
+            patch.object(mock_recipe, "_mtp_tflops", return_value=0.0),
+        ):
+            mock_recipe.setup()
+        expected = minimax_m2_flops(make_config(use_mtp=False), gbs=256, seq_len=2048) / 1e12
+        assert mock_recipe.tflops == pytest.approx(expected)
+        assert mock_recipe.model_parts[0].config.use_mtp is True
 
     @patch("nemo_automodel.recipes.llm.benchmark.get_flops_formula_for_hf_config")
     def test_setup_clears_val_dataloader(self, mock_get_flops, mock_recipe):

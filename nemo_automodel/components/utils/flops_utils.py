@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import warnings
 from collections.abc import Sequence
 from typing import Any, Callable, Protocol, TypeVar
@@ -2241,6 +2242,69 @@ def step3_5_flash_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None 
         mtp_total += loss_flops_calculator(seq_len, hs, vocab_size) * mtp_num_layers
 
     return gbs * (total_attn + total_mlp + total_vocab + mtp_total)
+
+
+# Config fields the FLOPs formulas read for the number of Multi-Token-Prediction (MTP) modules.
+_MTP_DEPTH_FIELDS = (
+    "num_nextn_predict_layers",
+    "mtp_num_hidden_layers",
+    "mtp_num_layers",
+    "num_mtp_layers",
+    "num_mtp_modules",
+)
+
+
+def _zero_mtp_depth_fields(config: Any) -> Any:
+    """Return ``config``, or a shallow copy whose MTP depth fields are zero."""
+    fields = [name for name in _MTP_DEPTH_FIELDS if getattr(config, name, None)]
+    use_mtp = getattr(config, "use_mtp", None) is True
+    if not fields and not use_mtp:
+        return config
+    config = copy.copy(config)
+    for name in fields:
+        setattr(config, name, 0)
+    if use_mtp:
+        config.use_mtp = False
+    return config
+
+
+def config_without_unbuilt_mtp(config: Any, model: object) -> Any:
+    """Drop MTP modules from ``config`` when the built ``model`` does not run an MTP head.
+
+    Released HF configs often declare MTP modules (``num_nextn_predict_layers``,
+    ``mtp_num_hidden_layers``, ``use_mtp`` + ``num_mtp_modules``) that the formulas count.
+    The model only runs them when it builds an MTP head: models without one ignore those
+    fields, and models with one can disable it (for example ``num_nextn_predict_layers: 0``
+    passed to the model). Counting the head in those cases overstates the FLOPs and MFU.
+
+    The model is taken to run an MTP head when it has an enabled ``mtp_config``. A model
+    with an ``mtp`` attribute but no ``mtp_config`` is left as is, since its head depth is
+    not known here. A model with neither has no MTP head.
+
+    Args:
+        config: HF config (or composite config with ``text_config``) passed to the formula.
+        model: The built model (or pipeline stage) the config belongs to.
+
+    Returns:
+        ``config`` unchanged, or a shallow copy (with a copied ``text_config``) whose MTP
+        depth fields are zero. The input config is never modified.
+    """
+    mtp_config = getattr(model, "mtp_config", None)
+    if mtp_config is not None:
+        if getattr(mtp_config, "enabled", False):
+            return config
+    elif hasattr(model, "mtp"):
+        return config
+
+    result = _zero_mtp_depth_fields(config)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None and text_config is not config:
+        new_text_config = _zero_mtp_depth_fields(text_config)
+        if new_text_config is not text_config:
+            if result is config:
+                result = copy.copy(config)
+            result.text_config = new_text_config
+    return result
 
 
 def get_flops_formula_for_hf_config(config: Any) -> Callable | None:

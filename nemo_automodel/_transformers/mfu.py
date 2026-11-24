@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 from nemo_automodel.components.utils.flops_utils import (
     calculate_mfu,
+    config_without_unbuilt_mtp,
     get_flops_formula_for_hf_config,
 )
 
@@ -184,7 +185,10 @@ class AutoMFU:
 
             config = AutoConfig.from_pretrained(str(config), **kwargs)
         else:
+            model = cls._unwrap_config_owner(config)
             config = cls._unwrap_config(config)
+            if model is not None:
+                config = config_without_unbuilt_mtp(config, model)
             cls._ensure_common_config_aliases(config)
         return cls(config, device=device, peak_tflops=peak_tflops)
 
@@ -300,6 +304,30 @@ class AutoMFU:
             if not moved:
                 break
         return cur
+
+    @staticmethod
+    def _unwrap_config_owner(config_or_model: object) -> object | None:
+        """Return the model that owns the config ``_unwrap_config`` finds, or None for a bare config.
+
+        Follows the same wrapper attributes as ``_unwrap_config`` and stops at the first
+        object that has a ``config``, which is where model-level settings such as
+        ``mtp_config`` live.
+        """
+        cur = config_or_model
+        visited = set()
+        while cur is not None and id(cur) not in visited:
+            visited.add(id(cur))
+            config = getattr(cur, "config", None)
+            if config is not None and config is not cur:
+                return cur
+            next_obj = None
+            for attr in _UNWRAP_ATTRS:
+                candidate = getattr(cur, attr, None)
+                if candidate is not None and candidate is not cur:
+                    next_obj = candidate
+                    break
+            cur = next_obj
+        return None
 
     @staticmethod
     def _ensure_common_config_aliases(config: object) -> None:

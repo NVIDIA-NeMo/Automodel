@@ -27,7 +27,11 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
-from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
+from nemo_automodel.components.utils.flops_utils import (
+    calculate_mfu,
+    config_without_unbuilt_mtp,
+    get_flops_formula_for_hf_config,
+)
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
@@ -198,6 +202,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             get_text_config = getattr(flops_config, "get_text_config", None)
             if callable(get_text_config):
                 flops_config = get_text_config()
+        # Do not count MTP modules the config declares but the built model does not run.
+        flops_config = config_without_unbuilt_mtp(flops_config, self.model_parts[0])
         flops_formula = get_flops_formula_for_hf_config(flops_config)
         if flops_formula is None:
             raise ValueError(
