@@ -17,6 +17,7 @@
 import logging
 from collections.abc import Callable, Collection
 from functools import cache
+from typing import NamedTuple
 
 import torch
 import torch._inductor.config
@@ -200,8 +201,16 @@ ExpandCore = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], 
 NormCore = Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]
 
 
+class HcCores(NamedTuple):
+    """The three mHC functions selected together for one model instance."""
+
+    project: ProjectionCore
+    collapse: CollapseCore
+    expand: ExpandCore
+
+
 @cache
-def hc_cores(compiled: bool) -> tuple[ProjectionCore, CollapseCore, ExpandCore]:
+def hc_cores(compiled: bool) -> HcCores:
     """Select per-instance mHC functions without changing eager model instances.
 
     Static shapes match the model-owned DeepSeek V4.1 compilation pattern.
@@ -211,11 +220,11 @@ def hc_cores(compiled: bool) -> tuple[ProjectionCore, CollapseCore, ExpandCore]:
     """
     options = _compile_options() if compiled else None
     if options is None:
-        return project_core, collapse_core, expand_core
-    return (
-        torch.compile(project_core, dynamic=False, options=options),
-        torch.compile(collapse_core, dynamic=False, options=options),
-        torch.compile(_expand_core_four_streams, dynamic=False, options=options),
+        return HcCores(project=project_core, collapse=collapse_core, expand=expand_core)
+    return HcCores(
+        project=torch.compile(project_core, dynamic=False, options=options),
+        collapse=torch.compile(collapse_core, dynamic=False, options=options),
+        expand=torch.compile(_expand_core_four_streams, dynamic=False, options=options),
     )
 
 

@@ -166,7 +166,9 @@ class Glm5NextHyperConnection(nn.Module):
         self.hc_eps = config.hc_eps
         self.input_norm = Glm5NextUnweightedRMSNorm(config.rms_norm_eps)
         self._compile_hc = compile_hc
-        self._project_core, self._collapse_core, _ = hc_cores(compile_hc)
+        cores = hc_cores(compile_hc)
+        self._project_core = cores.project
+        self._collapse_core = cores.collapse
         mix = (2 + self.hc_mult) * self.hc_mult
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size, dtype=dtype))
@@ -1150,7 +1152,7 @@ class Glm5NextDecoderLayer(nn.Module):
         )
         self.attn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=backend.sinkhorn, compile_hc=backend.compile_hc)
         self.ffn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=backend.sinkhorn, compile_hc=backend.compile_hc)
-        _, _, self._expand_core = hc_cores(backend.compile_hc)
+        self._expand_core = hc_cores(backend.compile_hc).expand
 
     def forward(
         self,
