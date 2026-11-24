@@ -22,9 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
-import warnings
 from collections import Counter
-from dataclasses import dataclass
 from os import PathLike
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -110,13 +108,11 @@ _CONFIG_ALIAS_ATTRS = (
 )
 
 
-def get_device_flops(unit: str = "T", device_name: str | None = None, *, dtype: torch.dtype = torch.bfloat16) -> float:
-    """Get theoretical device FLOPS in a requested unit.
+def get_device_flops(unit: str = "T", *, dtype: torch.dtype = torch.bfloat16) -> float:
+    """Get the current device's theoretical FLOPS in a requested unit.
 
     Args:
         unit: One of ``B/K/M/G/T/P``. Default ``T`` (TFLOPs/s).
-        device_name: Optional explicit device name for lookup. If ``None``,
-            the current torch device name is inferred.
         dtype: Training compute dtype. FP32 follows the CUDA matmul TF32 setting.
 
     Returns:
@@ -128,11 +124,7 @@ def get_device_flops(unit: str = "T", device_name: str | None = None, *, dtype: 
         supported = ", ".join(_UNIT_TO_SCALE.keys())
         raise ValueError(f"Unsupported unit '{unit}'. Supported units: {supported}")
 
-    if device_name is None:
-        if torch.cuda.is_available():
-            device_name = torch.cuda.get_device_name(torch.cuda.current_device())
-        else:
-            device_name = "CPU"
+    device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU"
 
     precision = _DTYPE_PRECISIONS.get(dtype)
     if dtype == torch.float32 and torch.backends.cuda.matmul.fp32_precision == "tf32":
@@ -158,8 +150,6 @@ class AutoMFU:
     def __init__(
         self,
         config: PretrainedConfig | None = None,
-        device: str | None = None,
-        peak_tflops: float | None = None,
         *,
         compute_dtype: torch.dtype | None = None,
     ) -> None:
@@ -167,8 +157,6 @@ class AutoMFU:
 
         Args:
             config: Hugging Face configuration. Omit it for a null calculator.
-            device: Optional device name override. By default, infer the current device.
-            peak_tflops: Optional peak TFLOPs/s override for the training precision.
             compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
         """
         self.config = config
@@ -184,31 +172,17 @@ class AutoMFU:
         ):
             self.flops_formula = None
         dtype = compute_dtype or getattr(config, "dtype", None) or torch.bfloat16
-        self.reference_mfu = (
-            _validate_peak_tflops(peak_tflops)
-            if peak_tflops is not None
-            else get_device_flops(device_name=device, dtype=dtype)
-        )
+        self.reference_mfu = get_device_flops(dtype=dtype)
         if not math.isfinite(self.reference_mfu):
-            device_description = repr(device) if device is not None else "the current device"
             logger.warning(
-                "Unable to determine the theoretical peak for %s with %s; MFU will be reported as 0%%. "
-                "Pass a supported device or peak_tflops directly, or set mfu.device or mfu.peak_tflops in recipe YAML.",
-                device_description,
+                "Unable to determine the theoretical peak for the current device with %s; MFU will be reported as 0%%.",
                 dtype,
             )
-
-    @classmethod
-    def register_device(cls, device: str, peak_tflops: float) -> None:
-        """Register or override the dense FP16/BF16 peak TFLOPs/s for a device."""
-        _DEVICE_TFLOPS.setdefault(str(device), {})["fp16"] = _validate_peak_tflops(peak_tflops)
 
     @classmethod
     def from_config(
         cls,
         config_or_path_or_model: PretrainedConfig | str | PathLike[str] | object,
-        device: str | None = None,
-        peak_tflops: float | None = None,
         *,
         compute_dtype: torch.dtype | None = None,
         **kwargs: Any,
@@ -218,8 +192,6 @@ class AutoMFU:
         Args:
             config_or_path_or_model: Either a PretrainedConfig object, a model object
                 (the .config attribute will be extracted), or a model ID/local path.
-            device: Optional device name override. By default, infer the current device.
-            peak_tflops: Optional peak TFLOPs/s override for the training precision.
             compute_dtype: Training compute dtype. When omitted for a model, infer its predominant
                 floating-point matrix parameter dtype. Fall back to the config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
@@ -228,6 +200,9 @@ class AutoMFU:
         Returns:
             AutoMFU instance
         """
+        if kwargs.keys() & {"device", "peak_tflops"}:
+            raise TypeError("AutoMFU uses the detected device and built-in peak FLOPS table")
+
         config = config_or_path_or_model
         if isinstance(config, (str, PathLike)):
             from transformers import AutoConfig
@@ -236,20 +211,18 @@ class AutoMFU:
         else:
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
-            if compute_dtype is None and peak_tflops is None and isinstance(config_or_path_or_model, torch.nn.Module):
+            if compute_dtype is None and isinstance(config_or_path_or_model, torch.nn.Module):
                 elements_by_dtype: Counter[torch.dtype] = Counter()
                 for param in config_or_path_or_model.parameters():
                     if param.ndim >= 2 and param.is_floating_point():
                         elements_by_dtype[param.dtype] += param.numel()
                 compute_dtype = max(elements_by_dtype, key=elements_by_dtype.__getitem__, default=None)
-        return cls(config, device=device, peak_tflops=peak_tflops, compute_dtype=compute_dtype)
+        return cls(config, compute_dtype=compute_dtype)
 
     @classmethod
     def from_pretrained(
         cls,
         model_id_or_local_path_or_model: str | PathLike[str] | object,
-        device: str | None = None,
-        peak_tflops: float | None = None,
         *,
         compute_dtype: torch.dtype | None = None,
         **kwargs: Any,
@@ -259,8 +232,6 @@ class AutoMFU:
         Args:
             model_id_or_local_path_or_model: Model ID (e.g., "meta-llama/llama-3-70b"),
                 local path, or model object (the .config attribute will be extracted)
-            device: Optional device name override. By default, infer the current device.
-            peak_tflops: Optional peak TFLOPs/s override for the training precision.
             compute_dtype: Training compute dtype. When omitted for a model, infer its predominant
                 floating-point matrix parameter dtype. Fall back to the config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
@@ -270,8 +241,6 @@ class AutoMFU:
         """
         return cls.from_config(
             model_id_or_local_path_or_model,
-            device=device,
-            peak_tflops=peak_tflops,
             compute_dtype=compute_dtype,
             **kwargs,
         )
@@ -361,33 +330,3 @@ class AutoMFU:
                     # Some config objects may block dynamic attrs; fallback
                     # behavior will return None if attrs remain unavailable.
                     pass
-
-
-@dataclass(frozen=True)
-class MFUConfig:
-    """Typed settings for constructing an :class:`AutoMFU` calculator.
-
-    Attributes:
-        device: Optional device name used to look up the theoretical peak.
-        peak_tflops: Deprecated theoretical peak TFLOPs/s override.
-            When set, this takes precedence over ``device``.
-    """
-
-    device: str | None = None
-    peak_tflops: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.peak_tflops is not None:
-            _validate_peak_tflops(self.peak_tflops)
-            warnings.warn(
-                "mfu.peak_tflops is deprecated. Remove it to use the detected device and training precision.",
-                FutureWarning,
-                stacklevel=2,
-            )
-
-
-def _validate_peak_tflops(peak_tflops: float) -> float:
-    peak = float(peak_tflops)
-    if not math.isfinite(peak) or peak <= 0:
-        raise ValueError("peak_tflops must be a finite value greater than zero")
-    return peak

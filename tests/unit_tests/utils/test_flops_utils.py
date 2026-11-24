@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from nemo_automodel._transformers import mfu as mfu_module
-from nemo_automodel._transformers.mfu import AutoMFU, MFUConfig, get_device_flops
+from nemo_automodel._transformers.mfu import AutoMFU, get_device_flops
 from nemo_automodel.components.utils import flops_utils
 
 
@@ -332,9 +332,15 @@ def test_calculate_mfu_warns_for_legacy_default_reference():
     assert actual_mfu == 100.0
 
 
-def test_automfu_h100_reference_uses_dense_bf16_peak():
+def _mock_cuda_device(monkeypatch, name):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: name)
+
+
+def test_automfu_h100_reference_uses_dense_bf16_peak(monkeypatch):
     """Test AutoMFU's H100 dense-BF16 training convention."""
-    h100_tflops = get_device_flops(unit="T", device_name="H100")
+    _mock_cuda_device(monkeypatch, "NVIDIA H100 80GB HBM3")
+    h100_tflops = get_device_flops(unit="T")
 
     assert h100_tflops == 989.0
 
@@ -346,8 +352,9 @@ def test_automfu_h100_reference_uses_dense_bf16_peak():
         ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 503.8),
     ],
 )
-def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expected_tflops):
-    assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
+def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expected_tflops, monkeypatch):
+    _mock_cuda_device(monkeypatch, device_name)
+    assert get_device_flops(unit="T") == expected_tflops
 
 
 @pytest.mark.parametrize(
@@ -359,13 +366,15 @@ def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expec
         ("NVIDIA GB300", 2500.0),
     ],
 )
-def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expected_tflops):
-    assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
+def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expected_tflops, monkeypatch):
+    _mock_cuda_device(monkeypatch, device_name)
+    assert get_device_flops(unit="T") == expected_tflops
 
 
-def test_get_device_flops_recognizes_vr200():
+def test_get_device_flops_recognizes_vr200(monkeypatch):
     """VR200 reports "NVIDIA VR NVL72"; an unknown name would make every step log MFU 0."""
-    assert get_device_flops(unit="T", device_name="NVIDIA VR NVL72") == 4000.0
+    _mock_cuda_device(monkeypatch, "NVIDIA VR NVL72")
+    assert get_device_flops(unit="T") == 4000.0
 
 
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):
@@ -374,7 +383,11 @@ def test_get_device_flops_detects_current_cuda_device(monkeypatch):
     monkeypatch.setattr(
         mfu_module.torch.cuda,
         "get_device_name",
-        lambda device: "NVIDIA H100 80GB HBM3" if device == 3 else "unexpected",
+        lambda device=None: (
+            "NVIDIA H100 80GB HBM3"
+            if (torch.cuda.current_device() if device is None else device) == 3
+            else "unexpected"
+        ),
     )
 
     assert get_device_flops(unit="T") == 989.0
@@ -404,36 +417,32 @@ def test_automfu_defaults_to_detected_device_peak(monkeypatch):
         ("NVIDIA A100", torch.float8_e4m3fn, float("inf")),
     ],
 )
-def test_get_device_flops_selects_dense_peak_by_dtype(name, dtype, expected):
-    assert get_device_flops(device_name=name, dtype=dtype) == expected
+def test_get_device_flops_selects_dense_peak_by_dtype(name, dtype, expected, monkeypatch):
+    _mock_cuda_device(monkeypatch, name)
+    assert get_device_flops(dtype=dtype) == expected
 
 
 @pytest.mark.parametrize("precision, expected", [("ieee", 67.0), ("tf32", 494.5)])
 def test_get_device_flops_uses_cuda_fp32_matmul_policy(monkeypatch, precision, expected):
     monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", precision)
 
-    assert get_device_flops(device_name="H100", dtype=torch.float32) == expected
+    _mock_cuda_device(monkeypatch, "H100")
+    assert get_device_flops(dtype=torch.float32) == expected
 
 
 def test_automfu_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
     monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
     model = torch.nn.Sequential(torch.nn.LayerNorm(32), torch.nn.Linear(32, 32, dtype=torch.bfloat16))
     model.config = SimpleNamespace(dtype=torch.float32)
-    assert AutoMFU.from_config(model, device="H100").reference_mfu == 989.0
-    assert AutoMFU.from_config(model, device="H100", compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
+    _mock_cuda_device(monkeypatch, "H100")
+    assert AutoMFU.from_config(model).reference_mfu == 989.0
+    assert AutoMFU.from_config(model, compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
 
 
-def test_automfu_accepts_precision_peak_override(monkeypatch):
-    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    monkeypatch.setattr(
-        mfu_module,
-        "get_device_flops",
-        lambda **kwargs: pytest.fail("explicit peak must bypass device lookup"),
-    )
-
-    calculator = AutoMFU(SimpleNamespace(), peak_tflops=1979.0)
-
-    assert calculator.reference_mfu == 1979.0
+@pytest.mark.parametrize("override", [{"device": "H100"}, {"peak_tflops": 1979.0}])
+def test_automfu_rejects_device_and_peak_overrides(override):
+    with pytest.raises(TypeError, match="detected device and built-in peak"):
+        AutoMFU.from_config(SimpleNamespace(), **override)
 
 
 def test_automfu_warns_and_reports_zero_for_unknown_device(monkeypatch, caplog):
@@ -443,35 +452,22 @@ def test_automfu_warns_and_reports_zero_for_unknown_device(monkeypatch, caplog):
         lambda config: lambda config, gbs, seq_len: 1e12,
     )
 
+    _mock_cuda_device(monkeypatch, "NVIDIA Example GPU")
     with caplog.at_level("WARNING", logger=mfu_module.__name__):
-        calculator = AutoMFU(SimpleNamespace(), device="NVIDIA Example GPU")
+        calculator = AutoMFU(SimpleNamespace())
 
     assert calculator.reference_mfu == float("inf")
     assert "MFU will be reported as 0%" in caplog.text
     assert calculator((1, 1), time_delta=1.0, world_size=1) == 0.0
 
 
-@pytest.mark.parametrize("peak_tflops", [0.0, -1.0, float("inf"), float("nan")])
-def test_automfu_rejects_invalid_precision_peak(monkeypatch, peak_tflops):
-    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-
-    with pytest.raises(ValueError, match="finite value greater than zero"):
-        AutoMFU(SimpleNamespace(), peak_tflops=peak_tflops)
-
-
-def test_mfu_config_warns_for_a_legacy_peak():
-    with pytest.warns(FutureWarning, match=r"mfu\.peak_tflops is deprecated"):
-        settings = MFUConfig(device="h100", peak_tflops=1979.0)
-
-    assert settings.peak_tflops == 1979.0
-
-
-def test_automfu_without_formula_preserves_the_calculator_interface():
+def test_automfu_without_formula_preserves_the_calculator_interface(monkeypatch):
     # A config without the transformer fallback's dimensions has no usable formula.
     config = SimpleNamespace()
     model = torch.nn.Module()
     model.config = config
-    calculator = AutoMFU.from_config(model, device="H100")
+    _mock_cuda_device(monkeypatch, "H100")
+    calculator = AutoMFU.from_config(model)
 
     assert calculator.config is config
     assert calculator.reference_mfu == 989.0

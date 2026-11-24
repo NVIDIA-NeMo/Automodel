@@ -254,10 +254,10 @@ class BaseRecipe:
         infer_training_precision disabled, automatic selection uses the
         FSDP2 policy or model dtype.
         """
-        strategy = self.distributed_config
 
         def infer_compute_dtype(
             *,
+            compute_dtype: torch.dtype | Literal["auto"],
             fp8_config: ConfigNode | None,
             te_quantization: "TEQuantizationConfig | None",
             moe_config: "MoEParallelizerConfig | None",
@@ -265,42 +265,41 @@ class BaseRecipe:
             strategy: "DistributedStrategyConfig | None",
             infer_training_precision: bool,
         ) -> torch.dtype | None:
-            if not infer_training_precision:
-                return None
-            if HAVE_TE and isinstance(te_quantization, TENvfp4Config):
-                return torch.float4_e2m1fn_x2
-            if (HAVE_TE and isinstance(te_quantization, TEFp8Config)) or (
-                fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
-            ):
-                return torch.float8_e4m3fn
-            if moe_config is not None and moe_config.mp_policy is not None and mesh_context.ep_size > 1:
-                return moe_config.mp_policy.param_dtype
-            if isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(mesh_context.device_mesh):
-                # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
-                return strategy.autocast_dtype
+            if isinstance(compute_dtype, torch.dtype):
+                return compute_dtype
+            if compute_dtype != "auto":
+                raise TypeError('compute_dtype must be "auto" or a torch.dtype')
+
+            if infer_training_precision:
+                if HAVE_TE and isinstance(te_quantization, TENvfp4Config):
+                    return torch.float4_e2m1fn_x2
+                if (HAVE_TE and isinstance(te_quantization, TEFp8Config)) or (
+                    fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
+                ):
+                    return torch.float8_e4m3fn
+                if moe_config is not None and moe_config.mp_policy is not None and mesh_context.ep_size > 1:
+                    if moe_config.mp_policy.param_dtype is not None:
+                        return moe_config.mp_policy.param_dtype
+                elif isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(mesh_context.device_mesh):
+                    # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
+                    if strategy.autocast_dtype is not None:
+                        return strategy.autocast_dtype
+
+            if isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
+                return strategy.mp_policy.param_dtype
             return None
 
-        if compute_dtype == "auto":
-            resolved_dtype = infer_compute_dtype(
+        self.mfu_calculator = AutoMFU.from_config(
+            model,
+            compute_dtype=infer_compute_dtype(
+                compute_dtype=compute_dtype,
                 fp8_config=self.cfg.get("fp8"),
                 te_quantization=getattr(self, "te_quantization", None),
                 moe_config=self.moe_parallel_config,
                 mesh_context=self.mesh_context,
-                strategy=strategy,
+                strategy=self.distributed_config,
                 infer_training_precision=infer_training_precision,
-            )
-        elif isinstance(compute_dtype, torch.dtype):
-            resolved_dtype = compute_dtype
-        else:
-            raise TypeError('compute_dtype must be "auto" or a torch.dtype')
-        if resolved_dtype is None and isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
-            resolved_dtype = strategy.mp_policy.param_dtype
-        mfu_settings = self.cfg.mfu
-        self.mfu_calculator = AutoMFU.from_config(
-            model,
-            device=mfu_settings.device,
-            peak_tflops=mfu_settings.peak_tflops,
-            compute_dtype=resolved_dtype,
+            ),
         )
 
     def _autocast_context(self):

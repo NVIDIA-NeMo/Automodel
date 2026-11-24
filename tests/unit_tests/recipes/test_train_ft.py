@@ -32,7 +32,6 @@ from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
-from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.datasets.loader import (
@@ -57,38 +56,33 @@ from nemo_automodel.recipes.llm.train_ft import (
 )
 
 
-def test_recipe_config_resolves_mfu_settings():
-    config = RecipeConfig(ConfigNode({"mfu": {"device": "h100", "peak_tflops": 1979.0}}))
-
-    with pytest.warns(FutureWarning, match=r"mfu\.peak_tflops is deprecated"):
-        mfu = config.mfu
-    assert mfu.device == "h100"
-    assert mfu.peak_tflops == 1979.0
-
-
-def test_recipe_config_defaults_mfu_settings():
-    assert RecipeConfig(ConfigNode({})).mfu == MFUConfig()
-
-
 @pytest.mark.parametrize(
-    "fp8_config, dtype_kwargs, expected",
+    "raw_config, dtype_kwargs, expected",
     [
         ({}, {}, 989.0),
-        ({"enabled": True}, {}, 1979.0),
-        ({"enabled": True, "emulate": True}, {}, 989.0),
-        ({"enabled": True}, {"compute_dtype": "auto", "infer_training_precision": False}, 989.0),
-        ({"enabled": True}, {"compute_dtype": torch.float32}, 67.0),
+        ({"fp8": {"enabled": True}}, {}, 1979.0),
+        ({"fp8": {"enabled": True, "emulate": True}}, {}, 989.0),
+        ({"fp8": {"enabled": True}}, {"compute_dtype": "auto", "infer_training_precision": False}, 989.0),
+        ({"fp8": {"enabled": True}}, {"compute_dtype": torch.float32}, 67.0),
+        ({"mfu": {"device": "A100", "peak_tflops": 1}}, {}, 989.0),
     ],
 )
-def test_recipe_mfu_uses_compute_precision(fp8_config, dtype_kwargs, expected, monkeypatch):
+def test_recipe_mfu_uses_compute_precision(raw_config, dtype_kwargs, expected, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA H100 80GB HBM3")
     monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
     model = nn.Linear(32, 32, dtype=torch.float32)
     model.config = SimpleNamespace(dtype=torch.float32, model_type="llama")
+    warning = (
+        pytest.warns(FutureWarning, match="YAML mfu section is deprecated and ignored")
+        if "mfu" in raw_config
+        else nullcontext()
+    )
+    with warning:
+        cfg = RecipeConfig(ConfigNode(raw_config))
     recipe = SimpleNamespace(
-        cfg=RecipeConfig(ConfigNode({"fp8": fp8_config})),
+        cfg=cfg,
         distributed_config=FSDP2Config(),
         te_quantization=None,
         moe_parallel_config=None,
@@ -101,7 +95,12 @@ def test_recipe_mfu_uses_compute_precision(fp8_config, dtype_kwargs, expected, m
 
 
 def test_recipe_mfu_rejects_none_compute_dtype():
-    recipe = SimpleNamespace(distributed_config=None)
+    recipe = SimpleNamespace(
+        cfg=RecipeConfig(ConfigNode({})),
+        distributed_config=None,
+        moe_parallel_config=None,
+        mesh_context=MeshContext(),
+    )
 
     with pytest.raises(TypeError, match='compute_dtype must be "auto" or a torch.dtype'):
         TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, nn.Linear(2, 2), compute_dtype=None)

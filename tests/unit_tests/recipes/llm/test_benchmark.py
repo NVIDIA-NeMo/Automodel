@@ -145,7 +145,7 @@ def mock_recipe(mock_config, monkeypatch):
         # Set benchmark-specific attributes
         recipe._bench_steps = 30
         recipe._bench_warmup_steps = 10
-        recipe._bench_peak_tflops = 989
+        recipe.mfu_calculator = SimpleNamespace(reference_mfu=989)
         recipe._bench_nsys_start = -1
         recipe._bench_nsys_end = -1
         recipe._bench_nsys_ranks = []
@@ -205,7 +205,6 @@ class TestBenchmarkingRecipeInitialization:
 
             assert recipe._bench_steps == 30  # from step_scheduler.max_steps
             assert recipe._bench_warmup_steps == 10  # from benchmark.warmup_steps
-            assert recipe._bench_peak_tflops == peak_tflops
             assert recipe._bench_nsys_start == -1  # from benchmark.nsys_start
             assert recipe._bench_nsys_end == -1  # from benchmark.nsys_end
             assert recipe._bench_nsys_ranks == []  # from benchmark.nsys_ranks
@@ -442,12 +441,9 @@ class TestBenchmarkingRecipeSetup:
 
             assert mock_recipe.val_dataloader is None
 
-    @pytest.mark.parametrize("override, expected_peak", [(None, 1979.0), (989, 989)])
     @patch("nemo_automodel.recipes.llm.benchmark.get_flops_formula_for_hf_config")
-    def test_setup_calculates_tflops(self, mock_get_flops, mock_recipe, override, expected_peak):
+    def test_setup_calculates_tflops(self, mock_get_flops, mock_recipe):
         """Test that setup calculates TFLOPs correctly."""
-        mock_recipe._bench_peak_tflops = override
-        mock_recipe.mfu_calculator = SimpleNamespace(reference_mfu=1979.0)
         expected_flops = 1e15
         mock_flops_formula = MagicMock(return_value=expected_flops)
         mock_get_flops.return_value = mock_flops_formula
@@ -457,7 +453,6 @@ class TestBenchmarkingRecipeSetup:
 
             expected_tflops = expected_flops / (10**12)
             assert mock_recipe.tflops == expected_tflops
-            assert mock_recipe._bench_peak_tflops == expected_peak
             mock_flops_formula.assert_called_once()
 
 
@@ -501,9 +496,14 @@ class TestBenchmarkingRecipeRunBenchmark:
             )
         )
 
-        with patch("torch.distributed.barrier"):
+        mock_recipe.cfg.benchmark.peak_tflops = 1
+        with (
+            patch("torch.distributed.barrier"),
+            patch.object(mock_recipe, "_log_benchmark_summary") as log_summary,
+        ):
             mock_recipe.run_benchmark()
 
+            log_summary.assert_called_once_with(30, 10, 989, 0)
             for model_part in mock_recipe.model_parts:
                 model_part.train.assert_called_once()
 

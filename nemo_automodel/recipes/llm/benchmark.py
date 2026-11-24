@@ -133,10 +133,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Store benchmarking-specific parameters from benchmark section
         bench_cfg = cfg.benchmark
         self._bench_warmup_steps = bench_cfg.warmup_steps
-        self._bench_peak_tflops = getattr(bench_cfg, "peak_tflops", None)
-        if self._bench_peak_tflops is not None:
+        if getattr(bench_cfg, "peak_tflops", None) is not None:
             warnings.warn(
-                "benchmark.peak_tflops is deprecated. Remove it to use the detected device and training precision.",
+                "benchmark.peak_tflops is deprecated and ignored. MFU uses the detected device and training precision.",
                 FutureWarning,
                 stacklevel=2,
             )
@@ -187,9 +186,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         with self.timers("setup", log_level=1):
             # Call parent setup
             super().setup()
-
-        if self._bench_peak_tflops is None:
-            self._bench_peak_tflops = self.mfu_calculator.reference_mfu
 
         # Store wandb run object if initialized by parent
         import wandb
@@ -371,7 +367,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         nsys_end = self._bench_nsys_end
         nsys_ranks = self._bench_nsys_ranks
 
-        peak_tflops = self._bench_peak_tflops
+        peak_tflops = self.mfu_calculator.reference_mfu
 
         # Set models to training mode
         for mp in self.model_parts:

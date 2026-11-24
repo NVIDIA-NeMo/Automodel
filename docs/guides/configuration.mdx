@@ -287,12 +287,9 @@ Otherwise, it uses the distributed autocast dtype, the FSDP2 compute dtype, or
 the model's predominant matrix parameter dtype. For example, an H100 SXM uses
 989 TFLOPs/s for BF16 or FP16 and 1,979 TFLOPs/s for FP8.
 
-Remove `mfu.peak_tflops` from existing YAML to enable automatic selection. If
-that was the only key under `mfu:`, remove the entire section. During the
-deprecation period, an explicit `peak_tflops` still takes precedence and emits
-a warning. You can use `mfu.device` to override the detected device name.
-Legacy benchmark recipes also detect the peak automatically when you remove
-`benchmark.peak_tflops`.
+Remove the `mfu` section from existing YAML. The section, including `device`
+and `peak_tflops`, is deprecated and ignored. Legacy benchmark recipes also
+ignore the deprecated `benchmark.peak_tflops` field.
 
 MFU uses one dense reference peak for the whole workload. Layers that run in a
 different dtype and custom kernels that mix precisions can affect the
