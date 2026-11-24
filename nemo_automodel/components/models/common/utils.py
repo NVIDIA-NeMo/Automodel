@@ -519,6 +519,50 @@ def _warn_about_row_scaled_nvfp4_gemm() -> None:
         )
 
 
+# Elements (rows x columns) that one Transformer Engine NVFP4 quantization of a dense GEMM operand may cover.
+# The quantization kernels address a tensor with 32-bit element offsets (Transformer Engine 2.19 to 2.21) and
+# wrap around past 2**32 elements; the limit stays 1/16 below that.
+NVFP4_QUANTIZE_MAX_ELEMENTS = 2**32 - 2**28
+
+
+def check_nvfp4_linear_size(
+    recipe: "Recipe",
+    *,
+    rows: int,
+    in_features: int,
+    out_features: int,
+    module: Literal["Linear", "LayerNormLinear", "LayerNormMLP"] = "Linear",
+) -> None:
+    """Reject a Transformer Engine dense GEMM call whose NVFP4 operands are too large to be quantized correctly.
+
+    The input of a GEMM holds ``rows * in_features`` elements and its output gradient ``rows * out_features``.
+    Beyond :data:`NVFP4_QUANTIZE_MAX_ELEMENTS` the NVFP4 quantization returns wrong values for part of the
+    rows without an error, in the forward GEMM for the input and in both backward GEMMs for the gradient. FP8
+    and MXFP8 quantization have no such limit. A custom recipe can hold NVFP4 quantizers and is checked like
+    the NVFP4 recipe.
+
+    Args:
+        recipe: Recipe of the active Transformer Engine autocast.
+        rows: Rows of the input, all leading dimensions flattened.
+        in_features: Input features of the module; the hidden size of a ``LayerNormMLP``.
+        out_features: Output features of the module; the intermediate size of a ``LayerNormMLP``, whose two
+            GEMMs quantize tensors of both widths.
+        module: Transformer Engine class of the module, for the error message.
+
+    Raises:
+        ValueError: If the larger of the two tensors exceeds the limit under an NVFP4 or custom recipe.
+    """
+    elements = rows * max(in_features, out_features)
+    if elements > NVFP4_QUANTIZE_MAX_ELEMENTS and (recipe.nvfp4() or recipe.custom()):
+        raise ValueError(
+            f"Transformer Engine {module}({in_features}, {out_features}) was called with {rows} rows under an "
+            f"NVFP4 recipe: its widest operand holds {elements} elements, more than the "
+            f"{NVFP4_QUANTIZE_MAX_ELEMENTS} elements one NVFP4 quantization handles correctly. Use a smaller "
+            "micro-batch, or run this module in MXFP8 or in high precision (te_nvfp4.precision_map or "
+            "te_nvfp4.exclude_fqns)."
+        )
+
+
 @dataclass(kw_only=True)
 class TENvfp4Config(TEQuantizationConfig):
     """Configuration for Transformer Engine NVFP4 quantization.
@@ -1557,6 +1601,9 @@ def _make_lazy_te_patcher():
        gradient accumulation (quantize on first microbatch, reuse cached on rest).
        The recompute forward of a marked activation checkpoint reuses the copy its
        forward cached (see ``weight_cache_flag_for_forward``).
+    3. NVFP4 size check: a TE Linear, LayerNormLinear or LayerNormMLP whose operands are too
+       large for a correct NVFP4 quantization raises instead of computing wrong values (see
+       ``check_nvfp4_linear_size``).
     """
     patched = False
 
@@ -1567,12 +1614,17 @@ def _make_lazy_te_patcher():
         patched = True
 
         from transformer_engine.pytorch.module.grouped_linear import GroupedLinear as TEGroupedLinear
+        from transformer_engine.pytorch.module.layernorm_linear import LayerNormLinear as TELayerNormLinear
+        from transformer_engine.pytorch.module.layernorm_mlp import LayerNormMLP as TELayerNormMLP
         from transformer_engine.pytorch.module.linear import Linear as TELinear
         from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TERMSNorm
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         _original_rmsnorm_forward = TERMSNorm.forward
         _original_linear_forward = TELinear.forward
         _original_grouped_linear_forward = TEGroupedLinear.forward
+        _original_layernorm_linear_forward = TELayerNormLinear.forward
+        _original_layernorm_mlp_forward = TELayerNormMLP.forward
 
         def _patched_rmsnorm_forward(self, x):
             # Skip the unallocated-tensor short-circuit during torch.compile tracing:
@@ -1586,6 +1638,13 @@ def _make_lazy_te_patcher():
             if is_tensor_unallocated(x):
                 out_shape = x.shape[:-1] + (self.weight.shape[0],)
                 return torch.empty(out_shape, dtype=x.dtype, device=x.device)
+            if FP8GlobalStateManager.is_fp8_enabled():
+                check_nvfp4_linear_size(
+                    FP8GlobalStateManager.get_fp8_recipe(),
+                    rows=x.numel() // x.shape[-1],
+                    in_features=self.in_features,
+                    out_features=self.out_features,
+                )
             if is_first_microbatch is None:
                 is_first_microbatch = weight_cache_flag_for_forward(
                     get_is_first_microbatch(), in_checkpoint_recompute()
@@ -1599,9 +1658,70 @@ def _make_lazy_te_patcher():
                 )
             return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
 
+        def _patched_layernorm_linear_forward(
+            self: TELayerNormLinear, inp: torch.Tensor, *args: bool | None, **kwargs: bool | None
+        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            """``LayerNormLinear.forward`` behind the NVFP4 size check.
+
+            Args:
+                self: The module.
+                inp: Input, ``[..., in_features]``.
+                *args: The flags of ``LayerNormLinear.forward`` (``is_first_microbatch``, ``fp8_output``,
+                    ``fp8_grad``), passed on unchanged.
+                **kwargs: The same flags by name.
+
+            Returns:
+                What ``LayerNormLinear.forward`` returns: the output, ``[..., out_features]``, and with
+                ``return_layernorm_output`` the normalized input as well.
+
+            Raises:
+                ValueError: From ``check_nvfp4_linear_size``.
+            """
+            if FP8GlobalStateManager.is_fp8_enabled():
+                check_nvfp4_linear_size(
+                    FP8GlobalStateManager.get_fp8_recipe(),
+                    rows=inp.numel() // inp.shape[-1],
+                    in_features=self.in_features,
+                    out_features=self.out_features,
+                    module="LayerNormLinear",
+                )
+            return _original_layernorm_linear_forward(self, inp, *args, **kwargs)
+
+        def _patched_layernorm_mlp_forward(
+            self: TELayerNormMLP, inp: torch.Tensor, *args: bool | None, **kwargs: bool | None
+        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            """``LayerNormMLP.forward`` behind the NVFP4 size check.
+
+            Args:
+                self: The module.
+                inp: Input, ``[..., hidden_size]``.
+                *args: The flag of ``LayerNormMLP.forward`` (``is_first_microbatch``), passed on unchanged.
+                **kwargs: The same flag by name.
+
+            Returns:
+                What ``LayerNormMLP.forward`` returns: the output, ``[..., hidden_size]``, and with
+                ``return_layernorm_output`` the normalized input as well.
+
+            Raises:
+                ValueError: From ``check_nvfp4_linear_size``.
+            """
+            if FP8GlobalStateManager.is_fp8_enabled():
+                # fc1 maps the hidden size to the intermediate size, fc2 back: [intermediate, hidden].
+                intermediate_size, hidden_size = self.fc1_weight.shape
+                check_nvfp4_linear_size(
+                    FP8GlobalStateManager.get_fp8_recipe(),
+                    rows=inp.numel() // inp.shape[-1],
+                    in_features=hidden_size,
+                    out_features=intermediate_size,
+                    module="LayerNormMLP",
+                )
+            return _original_layernorm_mlp_forward(self, inp, *args, **kwargs)
+
         TERMSNorm.forward = _patched_rmsnorm_forward
         TELinear.forward = _patched_linear_forward
         TEGroupedLinear.forward = _patched_grouped_linear_forward
+        TELayerNormLinear.forward = _patched_layernorm_linear_forward
+        TELayerNormMLP.forward = _patched_layernorm_mlp_forward
 
     return _patch
 
@@ -2163,6 +2283,7 @@ __all__ = [
     "TEQuantizationConfig",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
+    "check_nvfp4_linear_size",
     "get_is_first_microbatch",
     "get_is_optim_step",
     "get_rope_config",

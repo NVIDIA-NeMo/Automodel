@@ -146,3 +146,57 @@ def test_large_row_scaled_gemm_is_right_wherever_the_config_does_not_warn():
     cublaslt_version = get_te_cublaslt_version()
     if not row_scaled_nvfp4_gemm_is_unreliable(cublaslt_version, torch.cuda.get_device_capability()):
         assert wrong_rows == 0, f"{wrong_rows} wrong rows of 4096 with cuBLASLt {cublaslt_version}"
+
+
+def test_linear_with_operands_too_large_for_nvfp4_is_rejected(monkeypatch):
+    # The NVFP4 quantization kernels wrap around past 2**32 elements; the limit is lowered to make a small
+    # Linear exceed it.
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    from nemo_automodel.components.models.common import utils
+
+    utils._patch_te_modules()
+    monkeypatch.setattr(utils, "NVFP4_QUANTIZE_MAX_ELEMENTS", 64 * 256 - 1)
+    linear = te.Linear(128, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    values = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
+
+    with te.autocast(enabled=True, recipe=TENvfp4Config().build_recipe()):
+        with pytest.raises(ValueError, match=r"Linear\(128, 256\) was called with 64 rows .* holds 16384 elements"):
+            linear(values)
+        # 32 rows: the output gradient, the larger operand, holds 8192 elements.
+        assert linear(values[:2]).shape == (2, 16, 256)
+    # MXFP8 quantization and unquantized GEMMs have no limit.
+    with te.autocast(enabled=True, recipe=MXFP8BlockScaling()):
+        assert linear(values).shape == (4, 16, 256)
+    assert linear(values).shape == (4, 16, 256)
+
+
+@pytest.mark.parametrize("module_class", ["LayerNormLinear", "LayerNormMLP"])
+def test_layernorm_modules_with_operands_too_large_for_nvfp4_are_rejected(monkeypatch, module_class):
+    # Transformer Engine's fused norm + GEMM modules quantize the same operands as Linear. The limit is lowered
+    # to make small modules exceed it: 64 rows of the 256-wide tensor are 16384 elements.
+    import transformer_engine.pytorch as te
+
+    from nemo_automodel.components.models.common import utils
+
+    utils._patch_te_modules()
+    monkeypatch.setattr(utils, "NVFP4_QUANTIZE_MAX_ELEMENTS", 64 * 256 - 1)
+    if module_class == "LayerNormLinear":
+        module = te.LayerNormLinear(128, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        out_features = 256
+    else:
+        module = te.LayerNormMLP(128, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        out_features = 128
+    values = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
+
+    with te.autocast(enabled=True, recipe=TENvfp4Config().build_recipe()):
+        message = rf"{module_class}\(128, 256\) was called with 64 rows .* holds 16384 elements"
+        with pytest.raises(ValueError, match=message):
+            module(values)
+    # Unquantized GEMMs have no limit, and the module still runs through the check.
+    assert module(values).shape == (4, 16, out_features)
+    monkeypatch.setattr(utils, "NVFP4_QUANTIZE_MAX_ELEMENTS", 64 * 256)
+    with te.autocast(enabled=True, recipe=TENvfp4Config().build_recipe()):
+        output = module(values)
+    assert output.shape == (4, 16, out_features) and torch.isfinite(output).all()

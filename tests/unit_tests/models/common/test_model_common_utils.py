@@ -30,6 +30,7 @@ from nemo_automodel.components.models.common.utils import (
     TEFp8Config,
     TENvfp4Config,
     _warn_about_row_scaled_nvfp4_gemm,
+    check_nvfp4_linear_size,
     generation_config_from_model_config,
     get_is_first_microbatch,
     get_is_optim_step,
@@ -650,6 +651,55 @@ class TestRowScaledNvfp4Gemm:
         assert len(messages) == warnings
         if warnings:
             assert f"cuBLASLt {version}" in messages[0]
+
+
+class TestCheckNvfp4LinearSize:
+    """A TE Linear is rejected when its input or its output gradient is too large for one NVFP4 quantization."""
+
+    # 15/16 of the 2**32 elements at which the quantization kernels wrap around.
+    LIMIT = 4026531840
+
+    @staticmethod
+    def recipe(kind):
+        return SimpleNamespace(nvfp4=lambda: kind == "nvfp4", custom=lambda: kind == "custom")
+
+    @pytest.mark.parametrize(
+        ("kind", "rows", "in_features", "out_features", "elements"),
+        [
+            # A 4096 -> 18560 projection: 16 sequences of 8192 tokens fit, 32 do not; the output gradient is
+            # the larger operand.
+            ("nvfp4", 16 * 8192, 4096, 18560, None),
+            ("nvfp4", 32 * 8192, 4096, 18560, 32 * 8192 * 18560),
+            # The input is the larger operand.
+            ("nvfp4", 32 * 8192, 18560, 4096, 32 * 8192 * 18560),
+            # Exactly at the limit, and one row of 4096 above it.
+            ("nvfp4", LIMIT // 4096, 4096, 1024, None),
+            ("nvfp4", LIMIT // 4096 + 1, 4096, 1024, LIMIT + 4096),
+            # A custom recipe can hold NVFP4 quantizers.
+            ("custom", 32 * 8192, 4096, 18560, 32 * 8192 * 18560),
+            # MXFP8 and FP8 quantization have no limit.
+            ("mxfp8", 64 * 8192, 4096, 18560, None),
+        ],
+    )
+    def test_limit(self, kind, rows, in_features, out_features, elements):
+        if elements is None:
+            check_nvfp4_linear_size(self.recipe(kind), rows=rows, in_features=in_features, out_features=out_features)
+            return
+        message = (
+            rf"Linear\({in_features}, {out_features}\) was called with {rows} rows under an NVFP4 recipe: its "
+            rf"widest operand holds {elements} elements, more than the {self.LIMIT} elements"
+        )
+        with pytest.raises(ValueError, match=message):
+            check_nvfp4_linear_size(self.recipe(kind), rows=rows, in_features=in_features, out_features=out_features)
+
+    @pytest.mark.parametrize("module", ["LayerNormLinear", "LayerNormMLP"])
+    def test_the_error_names_the_module_class(self, module):
+        # One row of 4096 above the limit; within it the same call passes.
+        rows = self.LIMIT // 4096 + 1
+        check_nvfp4_linear_size(self.recipe("nvfp4"), rows=rows - 1, in_features=1024, out_features=4096, module=module)
+        message = rf"Transformer Engine {module}\(1024, 4096\) was called with {rows} rows under an NVFP4 recipe"
+        with pytest.raises(ValueError, match=message):
+            check_nvfp4_linear_size(self.recipe("nvfp4"), rows=rows, in_features=1024, out_features=4096, module=module)
 
 
 class TestBackendConfigTeNvfp4:
