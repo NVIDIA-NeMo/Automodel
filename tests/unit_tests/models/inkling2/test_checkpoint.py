@@ -28,6 +28,8 @@ import torch.distributed.checkpoint as dcp
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from nemo_automodel._transformers.auto_model import _maybe_dequantize_fp8_for_peft
+from nemo_automodel._transformers.model_init import get_hf_config
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.addons import _maybe_strip_quantization_config
@@ -40,6 +42,7 @@ from nemo_automodel.components.models.inkling2.config import (
 from nemo_automodel.components.models.inkling2.model import Inkling2ForCausalLM
 from nemo_automodel.components.models.inkling2.multimodal import Inkling2ForConditionalGeneration
 from nemo_automodel.components.models.inkling2.state_dict_adapter import Inkling2StateDictAdapter
+from nemo_automodel.shared.peft_config import PeftConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -52,7 +55,7 @@ def single_cpu_thread() -> Iterator[None]:
     torch.set_num_threads(previous)
 
 
-def checkpoint_config() -> Inkling2TextConfig:
+def checkpoint_config(nvfp4_layer_count: int = 1) -> Inkling2TextConfig:
     return Inkling2TextConfig(
         hidden_size=32,
         num_hidden_layers=2,
@@ -70,7 +73,7 @@ def checkpoint_config() -> Inkling2TextConfig:
         vocab_size=40,
         unpadded_vocab_size=37,
         dtype="float32",
-        quantization_config={"quant_method": "inkling2", "nvfp4_layer_count": 1},
+        quantization_config={"quant_method": "inkling2", "nvfp4_layer_count": nvfp4_layer_count},
         architectures=["Inkling2ForCausalLM"],
     )
 
@@ -106,9 +109,11 @@ def decode_oracle(
     return result
 
 
-def mixed_fixture() -> tuple[Inkling2ForCausalLM, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def mixed_fixture(
+    nvfp4_layer_count: int = 1,
+) -> tuple[Inkling2ForCausalLM, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     torch.manual_seed(905)
-    model = Inkling2ForCausalLM(checkpoint_config())
+    model = Inkling2ForCausalLM(checkpoint_config(nvfp4_layer_count))
     expected = {key: value.detach().clone() for key, value in model.state_dict().items()}
     checkpoint = {
         key: value.detach().contiguous().clone() for key, value in model.state_dict_adapter.to_hf(expected).items()
@@ -117,7 +122,7 @@ def mixed_fixture() -> tuple[Inkling2ForCausalLM, dict[str, torch.Tensor], dict[
         for kind, native in [("w13", "gate_and_up_projs"), ("w2", "down_projs")]:
             key = f"model.llm.layers.{layer}.mlp.experts.{kind}_weight"
             shape = checkpoint[key].shape
-            if layer == 0:
+            if layer < nvfp4_layer_count:
                 # All 16 E2M1 codes appear, with asymmetric adjacent columns.
                 packed = (
                     torch.arange(math.prod(shape) // 2)
@@ -405,6 +410,54 @@ def test_released_config_label_is_resolved_from_the_sidecar(tmp_path: Path, quan
         Inkling2ForCausalLM.from_config(Inkling2Config.from_dict(released))
     # Other declarations stay rejected.
     for declaration in ({"quant_method": "modelopt", "quant_algo": "FP8"}, {"quant_method": "modelopt"}):
+        with pytest.raises(ValueError, match="quant_method='inkling2'"):
+            Inkling2Config.from_dict({**released, "quantization_config": declaration})
+
+
+@pytest.mark.parametrize("peft", [False, True])
+def test_released_fp8_config_label_loads_the_mxfp8_checkpoint(tmp_path: Path, peft: bool) -> None:
+    """``Inkling-2-Small-MXFP8`` labels ``config.json`` with Transformers' fine-grained FP8 config.
+
+    The label is the Hub file's ``quantization_config`` since 2026-11-17; the expert layout still
+    comes from ``hf_quant_config.json``. PEFT loading adds ``dequantize`` to an FP8 label.
+    """
+    _, checkpoint, expected = mixed_fixture(nvfp4_layer_count=0)
+    write_checkpoint(checkpoint, tmp_path)
+    write_released_checkpoint_metadata(tmp_path, nvfp4_layers=[], mxfp8_layers=[0, 1])
+    label = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "scale_fmt": "ue8m0",
+        "modules_to_not_convert": ["model.llm.unembed", "model.visual", "model.llm.layers.*.attn.*"],
+    }
+    released = {**json.loads((tmp_path / "config.json").read_text()), "model_type": "inkling2"}
+    (tmp_path / "config.json").write_text(json.dumps({**released, "quantization_config": label}))
+    config = get_hf_config(str(tmp_path), "sdpa")
+    assert type(config) is Inkling2Config and config.quantization_config == label
+    if peft:
+        # The target modules of the released Inkling2 LoRA recipe.
+        lora = PeftConfig(target_modules=["*.attn.qkvr", "*.attn.wo_ud", "*.mlp.experts"])
+        assert _maybe_dequantize_fp8_for_peft(config.quantization_config, lora, str(tmp_path))
+        label["dequantize"] = True
+    assert config.to_dict()["quantization_config"] == label
+    model = Inkling2ForCausalLM(config)
+    assert model.config.quantization_config == {"quant_method": "inkling2", "nvfp4_layer_count": 0}
+    checkpointer = CheckpointingConfig(
+        model_repo_id=str(tmp_path), original_model_root_dir=str(tmp_path), model_cache_dir=str(tmp_path)
+    ).build(0, 0, 0)
+    try:
+        checkpointer.load_base_model(model, torch.device("cpu"), str(tmp_path), str(tmp_path))
+    finally:
+        checkpointer.close()
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, expected[key].to(value.dtype), rtol=0, atol=0, msg=key)
+    # FP8 labels of other encodings, such as 128x128 blocks or float scales, are not MXFP8.
+    for declaration in (
+        {**label, "weight_block_size": [128, 128]},
+        {key: value for key, value in label.items() if key != "scale_fmt"},
+        {**label, "ignored_layers": []},
+    ):
         with pytest.raises(ValueError, match="quant_method='inkling2'"):
             Inkling2Config.from_dict({**released, "quantization_config": declaration})
 

@@ -17,7 +17,7 @@
 import json
 import os
 import re
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypeAlias, TypedDict
 
 from transformers import PretrainedConfig
 
@@ -29,14 +29,31 @@ class Inkling2QuantizationConfig(TypedDict):
     nvfp4_layer_count: int
 
 
-class Inkling2ReleasedQuantizationLabel(TypedDict):
-    """``quantization_config`` of a released ``config.json``: the format name only.
-
-    The expert layout is in ``hf_quant_config.json``; building a model replaces this label with it.
-    """
+class Inkling2ModelOptQuantizationLabel(TypedDict):
+    """ModelOpt label of a released ``config.json``: the format name only."""
 
     quant_method: Literal["modelopt"]
     quant_algo: Literal["NVFP4", "MXFP8"]
+
+
+class Inkling2FP8QuantizationLabel(TypedDict):
+    """Transformers' fine-grained FP8 label, used by ``Inkling-2-Small-MXFP8``.
+
+    ``scale_fmt="ue8m0"`` with ``weight_block_size=[1, 32]`` is MXFP8: one power-of-two scale per 32 inputs.
+    """
+
+    quant_method: Literal["fp8"]
+    activation_scheme: Literal["dynamic"]
+    weight_block_size: list[int]
+    scale_fmt: Literal["ue8m0"]
+    modules_to_not_convert: list[str]
+    # Added by the PEFT loader (``_maybe_dequantize_fp8_for_peft``) to any FP8 label.
+    dequantize: NotRequired[bool]
+
+
+# ``quantization_config`` of a released ``config.json``. The expert layout is in ``hf_quant_config.json``;
+# building a model replaces the label with it.
+Inkling2ReleasedQuantizationLabel: TypeAlias = Inkling2ModelOptQuantizationLabel | Inkling2FP8QuantizationLabel
 
 
 class Inkling2LoopConfig(TypedDict):
@@ -58,11 +75,20 @@ class _ParameterGroup(TypedDict):
 
 _EXPERT_WEIGHT = re.compile(r"model\.llm\.layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)")
 _EXPERT_PROJECTIONS = ("w13_weight", "w2_weight")
+_FP8_LABEL_FIELDS = frozenset(
+    ("quant_method", "activation_scheme", "weight_block_size", "scale_fmt", "modules_to_not_convert", "dequantize")
+)
 
 
 def _is_released_label(
     declaration: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None,
 ) -> bool:
+    if declaration is not None and declaration.get("quant_method") == "fp8":
+        return (
+            declaration.get("scale_fmt") == "ue8m0"
+            and declaration.get("weight_block_size") == [1, 32]
+            and set(declaration) <= _FP8_LABEL_FIELDS
+        )
     return (
         declaration is not None
         and set(declaration) == {"quant_method", "quant_algo"}
