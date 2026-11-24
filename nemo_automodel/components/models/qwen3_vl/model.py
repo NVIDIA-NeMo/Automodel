@@ -37,6 +37,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -70,14 +71,16 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         supports_thd: bool = False
         supports_cp_vision_frame_sharding: bool = True
 
-    def __init__(self, config: Qwen3VLConfig) -> None:
+    def __init__(self, config: Qwen3VLConfig, *, logits_dtype: torch.dtype | None = None) -> None:
         """Construct the Hugging Face-compatible dense Qwen3-VL model.
 
         Args:
             config: Qwen3-VL configuration containing the text and vision sub-configs.
+            logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
         """
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
 
     def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie the language head to the active text embedding when configured."""
@@ -461,8 +464,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
             **kwargs,
         )
         hidden_states = text_outputs[0]
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)

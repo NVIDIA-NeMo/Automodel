@@ -331,6 +331,7 @@ def _eval_self(trainer, num_batches):
     # _run_eval routes the trainer call through the same _run_trainer_step seam as
     # training (so subclasses inject their extra inputs); bind the base seam, which
     # forwards (input_ids, hidden_states, loss_mask) to the trainer module.
+    obj._prepare_target_batch = TrainDFlashRecipe._prepare_target_batch.__get__(obj)
     obj._run_trainer_step = TrainDFlashRecipe._run_trainer_step.__get__(obj)
     obj._extra_eval_metric_sums = TrainDFlashRecipe._extra_eval_metric_sums.__get__(obj)
     obj._empty_extra_eval_metric_sums = TrainDFlashRecipe._empty_extra_eval_metric_sums.__get__(obj)

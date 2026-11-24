@@ -145,7 +145,9 @@ class TEParallelCrossEntropy:
         Args:
             logits: Input logits. Shape: [B, T, V]
             labels: Target labels. Shape: [B, T]
-            mask: Mask to apply to the loss. Shape: [B, T]
+            mask: Mask to apply to the loss. Shape: [B, T]. ``labels`` is not
+                modified in place -- for a DTensor this matters doubly, since the
+                local shard returned by ``to_local()`` aliases its storage.
             num_label_tokens: Non-padding token count as a Python integer or a scalar tensor on the loss device.
 
         Returns:
@@ -178,7 +180,7 @@ class TEParallelCrossEntropy:
             with torch.no_grad():
                 if mask.device != labels.device:
                     mask = mask.to(labels.device)
-                labels.masked_fill_(mask == 0, self.ignore_index)
+                labels = labels.masked_fill(mask == 0, self.ignore_index)
                 del mask
 
         reduce_loss = self.reduction == "mean"

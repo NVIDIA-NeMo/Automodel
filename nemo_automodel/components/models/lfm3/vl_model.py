@@ -37,7 +37,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.vision_utils import get_vision_position_ids
 
-from nemo_automodel.components.models.common import compute_lm_head_logits
+from nemo_automodel.components.models.common import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -438,11 +438,11 @@ class Lfm3VlForConditionalGeneration(HFCheckpointingMixin, Lfm3VlPreTrainedModel
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: Lfm3VlConfig) -> None:
+    def __init__(self, config: Lfm3VlConfig, *, logits_dtype: torch.dtype | None = None) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = Lfm3VlModel(config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.lm_head = LMHead(config.text_config.hidden_size, config.text_config.vocab_size, logits_dtype=logits_dtype)
         self.post_init()
         self.tie_weights()
 
@@ -522,7 +522,10 @@ class Lfm3VlForConditionalGeneration(HFCheckpointingMixin, Lfm3VlPreTrainedModel
             mm_encoder_outputs=mm_encoder_outputs,
             **kwargs,
         )
-        logits = compute_lm_head_logits(self.lm_head, outputs.last_hidden_state, logits_to_keep).logits
+        hidden_states = outputs.last_hidden_state
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
         loss = None
         if labels is not None:
             loss = self.loss_function(

@@ -24,6 +24,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
 from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
 from nemo_automodel.components.moe.config import MoEConfig
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required for forward smoke")
 
@@ -141,3 +142,26 @@ def test_tiny_variant_forward(variant):
     assert torch.isfinite(logits).all(), f"{variant}: non-finite logits"
     # The model should not collapse to a constant prediction.
     assert logits.argmax(dim=-1).unique().numel() > 1, f"{variant}: degenerate (constant) argmax"
+
+
+def test_packed_forward_keeps_a_batch_axis():
+    cfg = _tiny_cfg_for_variant("mini")
+    model = BailingMoeV2ForCausalLM(cfg, moe_config=_moe_cfg(cfg), backend=_backend())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    tokens = 5
+
+    # The collator's batch of one: [1, tokens] IDs and positions, with boundaries padded by -1000.
+    out, layer_inputs = run_with_passthrough_layers(
+        model,
+        torch.randint(0, cfg.vocab_size, (1, tokens)),
+        position_ids=torch.arange(tokens).unsqueeze(0),
+        qkv_format="thd",
+        cu_seqlens=torch.tensor([[0, 3, 5, -1000]], dtype=torch.int32),
+        max_seqlen=torch.tensor([3]),
+        output_hidden_states=True,
+    )
+
+    # The decoder squeezes the packed batch for its layers and restores it on the way out.
+    assert layer_inputs == [(tokens, cfg.hidden_size)] * cfg.num_hidden_layers
+    assert out.logits.shape == (1, tokens, cfg.vocab_size)
+    assert out.hidden_states.shape == (1, tokens, cfg.hidden_size)

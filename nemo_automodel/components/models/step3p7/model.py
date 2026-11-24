@@ -32,12 +32,13 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import roll_tensor
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 from nemo_automodel.components.models.step3p5.model import Step3p5Model
 from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
@@ -367,25 +368,26 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         config: Step3p7Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs: Any,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
+        mtp_loss_scaling_factor: float = 0.1,
     ) -> None:
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = Step3p7Model(
             config,
             backend=self.backend,
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
-            bias=False,
+            dtype=torch.bfloat16,
+            logits_dtype=logits_dtype,
         )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = getattr(config.text_config, "pad_token_id", None)
@@ -481,7 +483,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
         primary_shape = vocab_shape if self.lm_head is not None else hidden_shape
         mtp_shape = vocab_shape if self.lm_head is not None else hidden_shape
-        outputs_meta = (meta(primary_shape), *(meta(mtp_shape) for _ in range(mtp_depth)))
+        # Only the primary logits pass through the LMHead; the MTP heads' logits stay in the compute dtype.
+        out_dtype = (self.lm_head.logits_dtype or dtype) if self.lm_head is not None else dtype
+        outputs_meta = (meta(primary_shape).to(out_dtype), *(meta(mtp_shape) for _ in range(mtp_depth)))
         return inputs_meta, outputs_meta
 
     def _is_pipeline_parallel_stage(self) -> bool:
@@ -560,7 +564,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         """Run one microbatch with direct or explicitly staged patch-based media.
 
         Args:
-            input_ids: Token IDs [batch, sequence], or [tokens] for THD.
+            input_ids: Token IDs [batch, sequence], or packed THD IDs [1, tokens] or [tokens], which this method
+                squeezes to [tokens]. Later pipeline stages pass hidden states [batch, sequence, hidden].
             *mtp_embed_inputs: Optional MTP embeddings [batch, sequence, hidden]
                 propagated by a previous pipeline stage.
             position_ids: Scalar positions matching the token axes.
@@ -575,10 +580,16 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 flags [patches], and optional packed cumulative offsets [segments + 1].
 
         Returns:
-            Logits [batch, sequence, vocab] or a model output containing those
-            logits, optional hidden states [batch, sequence, hidden], and MTP
-            logits with the same token axes. Non-final PP stages return hidden
-            values and optional propagated MTP embeddings.
+            Without pipeline parallelism, the logits Tensor, or a Step3p7CausalLMOutput when hidden states are
+            requested or MTP runs (training with an MTP module). ``logits`` have shape [batch, kept, vocab], or
+            [1, kept, vocab] for THD input, in the head's ``logits_dtype`` when set and otherwise in its weight
+            dtype, which autocast may lower. ``hidden_states``, when requested, have shape [batch, sequence, hidden],
+            or [1, tokens, hidden] for THD input. ``mtp_per_depth_logits`` hold one Tensor per depth of shape
+            [batch, sequence, vocab], or [tokens, vocab] for THD input, in the compute dtype. A pipeline stage
+            returns the logits, or its hidden states [batch, sequence, hidden] when it has no head; with MTP
+            enabled it returns a tuple of those followed by one Tensor per depth: the MTP embeddings
+            [batch, sequence, hidden] from stages before the last, and the MTP logits from the last stage (empty
+            placeholders of the logits' shape outside MTP training).
         """
         output_hidden_states = (
             output_hidden_states
@@ -694,7 +705,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             **kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)
@@ -712,7 +725,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 cp_size=kwargs.get("cp_size", 1),
             )
             mtp_kwargs = {
-                "hidden_states": hidden_states,
+                # The MTP blocks embed the packed [tokens] ids, so they take packed [tokens, hidden] states.
+                "hidden_states": hidden_states.squeeze(0) if kwargs.get("qkv_format") == "thd" else hidden_states,
                 "freqs_cis": freqs_cis,
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
@@ -727,8 +741,10 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 mtp_kwargs["embed_fn"] = self.model.language_model.embed_tokens
             mtp_per_depth_logits = self.mtp(**mtp_kwargs)
         elif pp_mtp_enabled and self.lm_head is not None:
+            # Placeholders for the MTP heads' logits, in their compute dtype like the stage metadata.
             mtp_per_depth_logits = [
-                logits.new_empty(logits.shape) for _ in range(int(getattr(self.mtp_config, "num_layers", 0) or 0))
+                hidden_states.new_empty(logits.shape)
+                for _ in range(int(getattr(self.mtp_config, "num_layers", 0) or 0))
             ]
 
         if is_pp_stage:

@@ -95,6 +95,12 @@ def worker(case: str, output: Path) -> None:
         cfg.n_routed_experts = 16
         # Width exceeds a CP4 shard in the short case; includes static and dynamic taps.
         cfg.sconv_kernel_size = 5
+        if "loop" in case:
+            # Layers 6-11 form two residual blocks of three layers and run three times; later passes read
+            # the previous ones through messages. A single block would leave the message softmax constant
+            # and the message-query tables without gradient.
+            cfg.n_layers_per_attn_res_block = 3
+            cfg.loop_config = {"core_start": 6, "core_end": 12, "num_passes": 3, "gate_rank": 4, "is_varloop": False}
         text_cfg = cfg
         if image:
             text_cfg.vocab_size = text_cfg.unpadded_vocab_size = 200058
@@ -111,6 +117,10 @@ def worker(case: str, output: Path) -> None:
         reference_backend.attn = "eager"
         reference = cls(copy.deepcopy(cfg), backend=reference_backend).to(device)
         initialize_nonuniform_queries(reference)
+        if "loop" in case:
+            with torch.no_grad():
+                for queries in (reference.message_queries, reference.message_kv_queries):
+                    queries.weight.normal_(std=0.2)
         if lora:
             reference.requires_grad_(False)
             apply_lora_to_linear_modules(
@@ -359,6 +369,10 @@ def worker(case: str, output: Path) -> None:
             if compare:
                 expected_loss = F.cross_entropy(expected.flatten(0, 1), labels.flatten(), reduction="sum") / count
                 expected_loss.backward()
+                if "loop" in case:
+                    # The gradient comparison below covers the message queries only when they receive gradient.
+                    for queries in (reference.message_queries, reference.message_kv_queries):
+                        assert float(queries.weight.grad.norm()) > 0, "a message-query table received no gradient"
             if cpu:
                 for parameter in owners.values():
                     assert parameter.grad is not None
@@ -487,7 +501,7 @@ def worker(case: str, output: Path) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("case", ["cpu-ac", "cpu-lora", "cpu-image", "cpu-image-dp"])
+@pytest.mark.parametrize("case", ["cpu-ac", "cpu-lora", "cpu-image", "cpu-image-dp", "cpu-loop-ac"])
 def test_context_parallel_cpu(case: str, tmp_path: Path) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4]) + os.pathsep + env.get("PYTHONPATH", "")
@@ -528,6 +542,8 @@ def test_context_parallel_cpu(case: str, tmp_path: Path) -> None:
         "gpu-image-bf16-ac",
         "gpu-packed-bf16-ep2-ac",
         "gpu-packed-cp4-ac",
+        "gpu-loop-ep2-ac",
+        "gpu-loop-packed-cp4-ac",
     ],
 )
 def test_context_parallel_cuda(case: str, tmp_path: Path) -> None:

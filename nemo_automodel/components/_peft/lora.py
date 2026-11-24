@@ -42,6 +42,7 @@ from nemo_automodel.components._peft.lora_kernel import (
     lora_forward_wrapper,
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
@@ -583,6 +584,11 @@ def patch_linear_module(
         use_triton = False
     if not isinstance(orig_linear, tuple(linear_types)):
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
+    if isinstance(orig_linear, LMHead) and orig_linear.logits_dtype is not None:
+        raise ValueError(
+            "LoRA replaces a linear's projection, which would drop this LM head's logits_dtype; "
+            "leave the head out, e.g. with exclude_modules=['*.lm_head']."
+        )
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
 
     if use_dora:

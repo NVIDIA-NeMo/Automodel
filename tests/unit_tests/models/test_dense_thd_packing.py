@@ -173,9 +173,14 @@ def _build_model(
         return model_cls(config, backend=backend).to(torch.float32)
 
 
+@pytest.mark.parametrize("collated", [False, True], ids=["tokens", "collated"])
 @pytest.mark.parametrize("model_kind", MODEL_KINDS)
-def test_packed_thd_matches_per_document_logits_and_gradients(model_kind, monkeypatch):
-    """Packed THD must preserve document boundaries in forward and backward."""
+def test_packed_thd_matches_per_document_logits_and_gradients(model_kind, collated, monkeypatch):
+    """Packed THD must preserve document boundaries in forward and backward.
+
+    The decoder takes packed [tokens] input, or the collator's batch of one: [1, tokens] IDs and positions with
+    boundaries of shape [1, documents + 1] padded with -1000.
+    """
     torch.manual_seed(1234)
     reference_model = _build_model(model_kind, monkeypatch).train()
     packed_model = _build_model(model_kind, monkeypatch).train()
@@ -202,6 +207,9 @@ def test_packed_thd_matches_per_document_logits_and_gradients(model_kind, monkey
     )
     reference_logits.square().sum().backward()
 
+    if collated:
+        input_ids, position_ids = input_ids.unsqueeze(0), position_ids.unsqueeze(0)
+        cu_seqlens = torch.cat([cu_seqlens, torch.tensor([-1000], dtype=torch.int32)]).unsqueeze(0)
     packed_logits = packed_model(
         input_ids,
         position_ids=position_ids,

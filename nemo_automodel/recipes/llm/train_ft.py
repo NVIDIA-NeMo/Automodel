@@ -63,7 +63,13 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
-from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule, close_dataloader
+from nemo_automodel.components.datasets.loader import (
+    DataloaderConfig,
+    DatasetBuildSchedule,
+    NeatPackingConfig,
+    close_dataloader,
+)
+from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -162,6 +168,12 @@ def _should_pack_validation(
     if validation_dataloader.packing is None:
         return False
     if replace(validation_dataloader, packing=None).output_format == "thd":
+        return True
+    # The NEAT collater consumes packed rows only; unpacked examples lack their position IDs.
+    if (
+        isinstance(validation_dataloader.packing, NeatPackingConfig)
+        and validation_dataloader.collate_fn is neat_packed_collater
+    ):
         return True
     if training_dataloader is None or training_dataloader.output_format != "thd":
         return False
@@ -755,18 +767,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp = None
 
         from nemo_automodel.components.moe.mok_experts import enable_mok_mxfp8_optimizer_step_cache
+        from nemo_automodel.components.optim.nvfp4_resident_adam import enable_nvfp4_fused_adam_step
 
         enable_mok_mxfp8_optimizer_step_cache(self.model_parts, self.optimizer)
+        enable_nvfp4_fused_adam_step(self.model_parts, self.optimizer)
 
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
-        # Extract TE FP8 config from model backend (set after model construction)
-        self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
-        if self.te_fp8 is not None:
-            # Modules named in te_fp8.exclude_fqns (lm_head by default) run outside the FP8 autocast.
+        # Extract the TE quantization config (te_fp8 or te_nvfp4) from model backend (set after model construction)
+        self.te_quantization = (
+            self.model_parts[0].backend.te_quantization if hasattr(self.model_parts[0], "backend") else None
+        )
+        if self.te_quantization is not None:
+            # Modules named in its exclude_fqns (lm_head by default) run outside the TE autocast.
             for part in self.model_parts:
-                self.te_fp8.exclude_modules(part)
+                self.te_quantization.exclude_modules(part)
 
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
@@ -1310,10 +1326,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # forward is enqueued and would cancel the batch's non_blocking prefetch
             # once per microbatch.
             loss_weights = self.domain_mixture.loss_weights(dataset_ids, labels, validate_range=False)
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
 
         if self.pp_enabled:
-            with train_ctx(), fp8_ctx:
+            with train_ctx(), te_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1377,7 +1393,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx, fp8_ctx:
+            with train_ctx(), sync_ctx, te_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory

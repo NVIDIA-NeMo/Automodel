@@ -137,14 +137,15 @@ class Inkling2Attention(nn.Module):
         batch, sequence, _ = sources.q.shape
         projections = self.qkvr(sources.q)[..., : sum(self.split_sizes)].split(self.split_sizes, -1)
         q, k, v, r, gate, sink = projections
-        if not self.is_local:
-            # Only K/V rows use their independent depth-mixture inputs.
-            q_end = self.split_sizes[0]
-            k_end = q_end + self.split_sizes[1]
-            v_end = k_end + self.split_sizes[2]
-            # Invoke the module so LoRA updates and FSDP gather hooks also apply
-            # to K/V, whose residual mixtures differ from the query input.
+        q_end = self.split_sizes[0]
+        k_end = q_end + self.split_sizes[1]
+        v_end = k_end + self.split_sizes[2]
+        # Full-attention layers, and local layers in later loop passes, give K and V
+        # their own inputs. Invoke the module so LoRA updates and FSDP gather hooks
+        # also apply to those rows.
+        if sources.k is not sources.q:
             k = self.qkvr(sources.k)[..., q_end:k_end]
+        if sources.v is not sources.q:
             v = self.qkvr(sources.v)[..., k_end:v_end]
         k = self.k_sconv(k, valid, dynamic_input=None if self.is_local else sources.k, positions=positions)
         v = self.v_sconv(v, valid, dynamic_input=None if self.is_local else sources.v, positions=positions)

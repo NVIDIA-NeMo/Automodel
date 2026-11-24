@@ -50,7 +50,12 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
         supports_ep: bool = True
 
     def __init__(
-        self, config: Inkling2Config, *, backend: BackendConfig | None = None, revision: str | None = None
+        self,
+        config: Inkling2Config,
+        *,
+        backend: BackendConfig | None = None,
+        revision: str | None = None,
+        logits_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Build the decoder and vision encoder from the released configuration.
 
@@ -59,9 +64,11 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
                 on it before the text decoder is built from its text configuration.
             backend: Kernel selection shared with the text decoder.
             revision: Resolved Hub revision of the checkpoint, for the sidecar read.
+            logits_dtype: Dtype of the returned logits, FP32 by default; the projection, softcap and
+                padded-vocabulary mask run in FP32 before the cast.
         """
         resolve_quantization_config(config, revision=revision)
-        super().__init__(config.text_config, backend=backend)
+        super().__init__(config.text_config, backend=backend, logits_dtype=logits_dtype)
         self.config = config
         assert self.embed_tokens is not None
         self.visual = Inkling2VisionEncoder(
@@ -147,7 +154,8 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
             output_hidden_states: Return final decoder features for external loss.
 
         Returns:
-            The text decoder's FP32 logits or output object; inputs are not mutated.
+            The text decoder's logits, in its head's logits_dtype, or output object; inputs are not
+            mutated.
         """
         if self.embed_tokens is None:
             # Every stage receives row-chunked token kwargs from the shared

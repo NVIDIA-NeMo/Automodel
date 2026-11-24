@@ -529,6 +529,38 @@ def test_public_peft_targets_attention_and_experts_only_and_updates_adapters() -
             torch.testing.assert_close(parameter, frozen[name], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("frozen", [False, True])
+def test_head_shards_in_fp32_and_returns_its_logits_dtype(monkeypatch: pytest.MonkeyPatch, frozen: bool) -> None:
+    """A trainable or frozen head is an FP32 FSDP unit whose output FSDP does not cast, whatever its logits dtype."""
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from nemo_automodel.components.models.flint import parallelization
+
+    policies = {}
+
+    def record(module: torch.nn.Module, *, mp_policy: MixedPrecisionPolicy, **kwargs: object) -> torch.nn.Module:
+        """Record the policy each module is sharded with, in place of fully_shard."""
+        policies[module] = mp_policy
+        return module
+
+    monkeypatch.setattr(parallelization, "fully_shard", record)
+    model = FlintForCausalLM(_model_config(), logits_dtype=torch.bfloat16)
+    bulk = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16)
+    parallelizer = parallelization.FlintModelParallelizer()
+    if frozen:  # the shared embedding helper skips a frozen head, so the root shards it
+        model.lm_head.requires_grad_(False)
+        parallelizer._fully_shard_module(model, mesh=None, mp_policy=bulk)
+    else:
+        parallelizer._fully_shard_module(model.lm_head, mesh=None, mp_policy=bulk)
+
+    head_policy = policies[model.lm_head]
+    assert (head_policy.param_dtype, head_policy.reduce_dtype, head_policy.output_dtype) == (
+        torch.float32,
+        torch.float32,
+        None,
+    )
+
+
 def _model_config() -> FlintConfig:
     return FlintConfig(
         vocab_size=19,
