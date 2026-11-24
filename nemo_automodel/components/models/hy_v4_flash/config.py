@@ -327,8 +327,14 @@ class HY4FlashVisionConfig(PretrainedConfig):
         rms_norm_eps: float = 1e-5,
         rope_2d_theta: float = 10000.0,
         hidden_act: str = "gelu",
+        max_image_size: int = 2048,
+        interpolate_mode: str = "bilinear",
         **kwargs: object,
     ) -> None:
+        if hidden_act != "gelu":
+            raise ValueError(f"the vision tower implements the released gelu activation only, got {hidden_act!r}")
+        self.max_image_size = max_image_size
+        self.interpolate_mode = interpolate_mode
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
