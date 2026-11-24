@@ -14,7 +14,9 @@
 
 """Numerical coverage of the native TE grouped GEMM integration, on one GPU."""
 
+import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -24,9 +26,14 @@ from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import TENvfp4Config, set_is_first_microbatch
+from nemo_automodel.components.moe import experts as experts_module
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.shared.import_utils import is_te_min_version
+from nemo_automodel.shared.recompute_replay import mark_checkpoint_recompute
+
+if TYPE_CHECKING:
+    from transformer_engine.common.recipe import Recipe
 
 
 @dataclass
@@ -345,6 +352,7 @@ def test_native_te_grouped_tensor_matches_the_split_path_under_nvfp4(checkpointe
             parameter.copy_(reference_parameter)
     mask = torch.ones(sum(counts), device="cuda", dtype=torch.bool)
     indices = torch.cat([torch.full((count, 1), expert) for expert, count in enumerate(counts)]).cuda()
+    split_paths, grouped_paths = _record_gemm_paths(reference), _record_gemm_paths(candidate)
     try:
         for microbatch in range(2):
             set_is_first_microbatch(microbatch == 0)
@@ -404,6 +412,645 @@ def test_native_te_grouped_tensor_matches_the_split_path_under_nvfp4(checkpointe
                 assert abs(grouped_error - split_error) < 1e-3, name
     finally:
         set_is_first_microbatch(None)
+    # The dispatch with an empty expert ran on the path each module is built for, in every forward.
+    assert len(split_paths) == len(grouped_paths) == (4 if checkpointed else 2)
+    assert not any(split_paths) and all(grouped_paths)
+
+
+def _record_gemm_paths(module: GroupedExpertsTE) -> list[bool]:
+    """Keep, for every call of the module's gate/up projection, whether it ran grouped-tensor GEMMs.
+
+    Args:
+        module: Expert module whose ``gate_up_linear`` is observed.
+
+    Returns:
+        A list that receives ``use_grouped_tensor`` of the projection at each call, in call order.
+    """
+    grouped: list[bool] = []
+
+    def record(linear: torch.nn.Module, args: tuple[torch.Tensor, torch.Tensor | list[int]]) -> None:
+        """Store the GEMM path of one call.
+
+        Args:
+            linear: The projection being called.
+            args: Its positional arguments: rows of shape [rows, features] and the rows per expert, a tensor
+                of shape [experts] for grouped-tensor GEMMs or a list for one GEMM per expert.
+        """
+        assert isinstance(args[1], torch.Tensor) == linear.use_grouped_tensor
+        grouped.append(linear.use_grouped_tensor)
+
+    module.gate_up_linear.register_forward_pre_hook(record)
+    return grouped
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_nvfp4_dispatch_above_the_grouped_limit_runs_the_per_expert_path(
+    monkeypatch: pytest.MonkeyPatch, checkpointed: bool
+) -> None:
+    """A dispatch too large for one grouped NVFP4 quantization computes what ``te_grouped_tensor=False`` computes.
+
+    The element limit of the grouped quantization is lowered so that this small dispatch exceeds it. The module
+    built for grouped-tensor GEMMs then has to give the results of a module built without them bit for bit,
+    with the same number of weight quantizations, over optimizer steps with new weights and all three values
+    of the micro-batch flag, and has to return to grouped-tensor GEMMs once the limit allows it.
+
+    Args:
+        monkeypatch: Lowers the element limit of the grouped quantization.
+        checkpointed: Whether to recompute the expert forward during backward.
+    """
+    te = pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
+    if not is_te_min_version("2.19.0"):
+        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
+    import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
+
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("NVFP4 GEMMs require a Blackwell GPU")
+    recipe = TENvfp4Config(stochastic_rounding=False).build_recipe()
+    if not te_grouped_linear.is_module_grouped_tensor_path_supported(recipe, torch.bfloat16):
+        pytest.skip("The native grouped-tensor path does not support NVFP4 on this device")
+
+    torch.manual_seed(29)
+    # Padded to 384, 128, 128 and 128 rows of a 1024-wide gate/up output: 786,432 elements.
+    counts = [300, 17, 40, 63]
+    monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 768 * 1024 - 1)
+    reference = _experts(native=False, counts=counts, bias=False)
+    candidate = _experts(native=True, counts=counts, bias=False)
+    reference_paths, candidate_paths = _record_gemm_paths(reference), _record_gemm_paths(candidate)
+    quantize_weight = te_grouped_linear.quantize_weight
+    weight_quantized: list[bool] = []
+
+    def counting_quantize_weight(**kwargs: torch.Tensor | bool | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Record whether Transformer Engine quantizes a weight or reuses its stored copy.
+
+        Args:
+            **kwargs: Arguments of ``quantize_weight``; ``tensor`` is one expert weight of shape
+                [out_features, in_features], ``workspace`` its stored quantized copy or ``None``.
+
+        Returns:
+            The quantized weight of shape [out_features, in_features] and the copy to store.
+        """
+        weight_quantized.append(kwargs["workspace"] is None or bool(kwargs["update_workspace"]))
+        return quantize_weight(**kwargs)
+
+    monkeypatch.setattr(te_grouped_linear, "quantize_weight", counting_quantize_weight)
+    mask = torch.ones(sum(counts), device="cuda", dtype=torch.bool)
+    indices = torch.cat([torch.full((count, 1), expert) for expert, count in enumerate(counts)]).cuda()
+
+    def step(
+        module: GroupedExpertsTE, x: torch.Tensor, probs: torch.Tensor, upstream: torch.Tensor
+    ) -> dict[str, torch.Tensor | None]:
+        """Forward and backward of one module under the NVFP4 recipe.
+
+        Args:
+            module: Expert module to run.
+            x: Tensor of shape [tokens, hidden], grouped by expert.
+            probs: Tensor of shape [tokens, 1] with routing probabilities.
+            upstream: Output gradient of shape [tokens, hidden].
+
+        Returns:
+            Output [tokens, hidden], input gradient [tokens, hidden], probability gradient [tokens, 1] and
+            the gradient of every parameter, by name.
+        """
+        module.zero_grad(set_to_none=True)
+        hidden = x.detach().clone().requires_grad_()
+        probability = probs.detach().clone().requires_grad_()
+
+        def run(hidden: torch.Tensor, probability: torch.Tensor) -> torch.Tensor:
+            """Evaluate the experts under the NVFP4 recipe, also during checkpoint recomputation.
+
+            Args:
+                hidden: Tensor of shape [tokens, hidden], grouped by expert.
+                probability: Tensor of shape [tokens, 1] with routing probabilities.
+
+            Returns:
+                Tensor of shape [tokens, hidden].
+            """
+            with te.autocast(enabled=True, recipe=recipe):
+                return module(hidden, mask, probability, indices)
+
+        with te.autocast(enabled=True, recipe=recipe):
+            output = (
+                checkpoint(run, hidden, probability, use_reentrant=False) if checkpointed else run(hidden, probability)
+            )
+            output.backward(upstream)
+        values = {"output": output.detach(), "input_grad": hidden.grad, "probability_grad": probability.grad}
+        for name, parameter in module.named_parameters():
+            assert parameter.grad is not None, name
+            values[name] = parameter.grad
+        return values
+
+    forwards = 0
+    try:
+        for flags in ((True, False), (True, False), (None,)):
+            # New weights for every optimizer step, the same in both modules.
+            with torch.no_grad():
+                for reference_parameter, parameter in zip(reference.parameters(), candidate.parameters(), strict=True):
+                    reference_parameter.normal_(std=0.05)
+                    parameter.copy_(reference_parameter)
+            for flag in flags:
+                set_is_first_microbatch(flag)
+                x = torch.randn(sum(counts), 256, dtype=torch.bfloat16, device="cuda")
+                probs = torch.rand(sum(counts), 1, dtype=torch.bfloat16, device="cuda")
+                upstream = torch.randn_like(x)
+                results, quantizations = [], []
+                for module in (reference, candidate):
+                    weight_quantized.clear()
+                    results.append(step(module, x, probs, upstream))
+                    quantizations.append(sum(weight_quantized))
+                forwards += 2 if checkpointed else 1
+                # Two projections of four experts, quantized in the forward and again in its recompute.
+                assert quantizations == [{True: 8, False: 0, None: 8}[flag] * (2 if checkpointed else 1)] * 2
+                per_expert, fallback = results
+                assert per_expert.keys() == fallback.keys()
+                for name, expected in per_expert.items():
+                    assert torch.equal(fallback[name], expected), name
+        assert reference_paths == [False] * forwards
+        assert candidate_paths == [False] * forwards
+        assert candidate.gate_up_linear.use_grouped_tensor and candidate.down_linear.use_grouped_tensor
+
+        # Within the limit the same module runs grouped-tensor GEMMs again, with the same result.
+        monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 768 * 1024)
+        set_is_first_microbatch(None)
+        per_expert, grouped = (step(module, x, probs, upstream) for module in (reference, candidate))
+        assert candidate_paths[forwards:] == [True] * (2 if checkpointed else 1)
+        assert torch.equal(grouped["output"], per_expert["output"])
+        assert torch.equal(grouped["input_grad"], per_expert["input_grad"])
+        for name, expected in per_expert.items():
+            assert _relative_l2(grouped[name], expected) < 1e-4, name
+    finally:
+        set_is_first_microbatch(None)
+
+
+def _nvfp4_step(
+    module: GroupedExpertsTE,
+    recipe: "Recipe | None",
+    x: torch.Tensor,
+    probs: torch.Tensor,
+    upstream: torch.Tensor,
+    *,
+    checkpointed: bool,
+) -> dict[str, torch.Tensor]:
+    """Forward and backward of an expert module on rows grouped by expert, under a recipe.
+
+    Args:
+        module: Expert module with a ``_GroupedInputDispatcher``.
+        recipe: Transformer Engine recipe, ``None`` for unquantized GEMMs.
+        x: Tensor of shape [rows, hidden], grouped by expert.
+        probs: Tensor of shape [rows, 1] with routing probabilities.
+        upstream: Output gradient of shape [rows, hidden].
+        checkpointed: Whether to recompute the expert forward during backward.
+
+    Returns:
+        Output [rows, hidden], input gradient [rows, hidden], probability gradient [rows, 1] and the gradient
+        of every parameter, by name.
+    """
+    import transformer_engine.pytorch as te
+
+    module.zero_grad(set_to_none=True)
+    hidden = x.detach().clone().requires_grad_()
+    probability = probs.detach().clone().requires_grad_()
+    mask = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
+    indices = torch.zeros(x.shape[0], 1, device=x.device, dtype=torch.long)
+
+    def run(hidden: torch.Tensor, probability: torch.Tensor) -> torch.Tensor:
+        """Evaluate the experts under the recipe, also during checkpoint recomputation.
+
+        Args:
+            hidden: Tensor of shape [rows, hidden], grouped by expert.
+            probability: Tensor of shape [rows, 1] with routing probabilities.
+
+        Returns:
+            Tensor of shape [rows, hidden].
+        """
+        with te.autocast(enabled=recipe is not None, recipe=recipe):
+            return module(hidden, mask, probability, indices)
+
+    with te.autocast(enabled=recipe is not None, recipe=recipe):
+        if checkpointed:
+            output = checkpoint(
+                run, hidden, probability, use_reentrant=False, context_fn=mark_checkpoint_recompute(None)
+            )
+        else:
+            output = run(hidden, probability)
+        output.backward(upstream)
+    values = {"output": output.detach(), "input_grad": hidden.grad, "probability_grad": probability.grad}
+    for name, parameter in module.named_parameters():
+        assert parameter.grad is not None, name
+        values[name] = parameter.grad
+    return values
+
+
+def _record_gemm_calls(module: GroupedExpertsTE) -> list[tuple[int, bool]]:
+    """Keep the rows and the GEMM path of every call of the module's gate/up projection.
+
+    Args:
+        module: Expert module whose ``gate_up_linear`` is observed.
+
+    Returns:
+        A list that receives ``(rows, use_grouped_tensor)`` of the projection at each call, in call order.
+    """
+    calls: list[tuple[int, bool]] = []
+
+    def record(linear: torch.nn.Module, args: tuple[torch.Tensor, torch.Tensor | list[int]]) -> None:
+        """Store the rows and the GEMM path of one call.
+
+        Args:
+            linear: The projection being called.
+            args: Its positional arguments: rows of shape [rows, features] and the rows per expert.
+        """
+        assert isinstance(args[1], torch.Tensor) == linear.use_grouped_tensor
+        calls.append((args[0].shape[0], linear.use_grouped_tensor))
+
+    module.gate_up_linear.register_forward_pre_hook(record)
+    return calls
+
+
+def _nvfp4_recipe_or_skip(*, stochastic_rounding: bool) -> "Recipe":
+    """The NVFP4 recipe of ``TENvfp4Config``, or a skip where the grouped-tensor path cannot run it.
+
+    Args:
+        stochastic_rounding: Whether gradients are rounded stochastically (the recipe default).
+
+    Returns:
+        The Transformer Engine recipe.
+    """
+    pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
+    if not is_te_min_version("2.19.0"):
+        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
+    from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
+
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("NVFP4 GEMMs require a Blackwell GPU")
+    recipe = TENvfp4Config(stochastic_rounding=stochastic_rounding).build_recipe()
+    if not is_module_grouped_tensor_path_supported(recipe, torch.bfloat16):
+        pytest.skip("The native grouped-tensor path does not support NVFP4 on this device")
+    return recipe
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_nvfp4_dispatch_above_the_per_expert_limit_runs_in_chunks(
+    monkeypatch: pytest.MonkeyPatch, native: bool, checkpointed: bool
+) -> None:
+    """A dispatch too large for one NVFP4 quantization is quantized in chunks of rows and stays right.
+
+    The element limit of the per-expert quantization is lowered to 512 rows of the 1024-wide gate/up output.
+    A dispatch whose chunks end at expert boundaries then has to give the results of one call with one GEMM
+    per expert bit for bit (each expert's rows are quantized on their own either way), with the weights
+    quantized once per forward when Transformer Engine caches them. A dispatch with an expert larger than a
+    chunk quantizes that expert's rows in pieces; it is compared with FP32, and the experts that were not cut
+    with the single call.
+
+    Args:
+        monkeypatch: Lowers the element limit of the per-expert quantization.
+        native: Whether the module is built for grouped-tensor GEMMs.
+        checkpointed: Whether to recompute the expert forward during backward.
+    """
+    recipe = _nvfp4_recipe_or_skip(stochastic_rounding=False)
+    import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
+
+    torch.manual_seed(37)
+    limit = 512 * 1024
+    quantize_weight = te_grouped_linear.quantize_weight
+    weight_quantized: list[bool] = []
+
+    def counting_quantize_weight(**kwargs: torch.Tensor | bool | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Record whether Transformer Engine quantizes a weight or reuses its stored copy.
+
+        Args:
+            **kwargs: Arguments of ``quantize_weight``; ``tensor`` is one expert weight of shape
+                [out_features, in_features], ``workspace`` its stored quantized copy or ``None``.
+
+        Returns:
+            The quantized weight of shape [out_features, in_features] and the copy to store.
+        """
+        weight_quantized.append(kwargs["workspace"] is None or bool(kwargs["update_workspace"]))
+        return quantize_weight(**kwargs)
+
+    monkeypatch.setattr(te_grouped_linear, "quantize_weight", counting_quantize_weight)
+    forwards = 2 if checkpointed else 1
+    try:
+        # Padded to 384, 128, 0, 128 rows: chunks of 512 and 128 rows that end at expert boundaries. Then
+        # 1024, 128, 0, 128 rows: the first expert fills two chunks, the others share the third.
+        cases = [
+            (counts, chunk_rows, flags)
+            for counts, chunk_rows in (
+                ([300, 17, 0, 63], [512, 128]),
+                ([900, 17, 0, 63], [512, 512, 256]),
+            )
+            for flags in ((True, False), (None,))
+        ]
+        for counts, chunk_rows, flags in cases:
+            reference = _experts(native=False, counts=counts, bias=False)
+            candidate = _experts(native=native, counts=counts, bias=False)
+            calls = _record_gemm_calls(candidate)
+            # New weights for every optimizer step, the same in both modules.
+            with torch.no_grad():
+                for reference_parameter, parameter in zip(reference.parameters(), candidate.parameters(), strict=True):
+                    reference_parameter.normal_(std=0.05)
+                    parameter.copy_(reference_parameter)
+            for flag in flags:
+                set_is_first_microbatch(flag)
+                x = torch.randn(sum(counts), 256, dtype=torch.bfloat16, device="cuda")
+                probs = torch.rand(sum(counts), 1, dtype=torch.bfloat16, device="cuda")
+                upstream = torch.randn_like(x)
+
+                weight_quantized.clear()
+                single = _nvfp4_step(reference, recipe, x, probs, upstream, checkpointed=checkpointed)
+                single_quantizations = sum(weight_quantized)
+                calls.clear()
+                weight_quantized.clear()
+                with monkeypatch.context() as lowered:
+                    lowered.setattr(experts_module, "_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS", limit)
+                    chunked = _nvfp4_step(candidate, recipe, x, probs, upstream, checkpointed=checkpointed)
+                chunked_quantizations = sum(weight_quantized)
+
+                # Every call ran one GEMM per expert on at most 512 rows; the chunks cover the padded rows.
+                assert calls == [(rows, False) for rows in chunk_rows] * forwards
+                assert candidate.gate_up_linear.use_grouped_tensor is native
+                # Two projections of four experts. Cached weights are quantized by the first call of a first
+                # micro-batch only; without the cache every call quantizes them.
+                assert single_quantizations == {True: 8, False: 0, None: 8 * forwards}[flag]
+                assert chunked_quantizations == {True: 8, False: 0, None: 8 * forwards * len(chunk_rows)}[flag]
+                assert single.keys() == chunked.keys()
+                if len(chunk_rows) == 2:
+                    for name, expected in single.items():
+                        assert torch.equal(chunked[name], expected), name
+                    continue
+                # The first expert was quantized in two pieces: its values differ from the single call by
+                # NVFP4 rounding, the other experts' values do not differ.
+                first = slice(0, counts[0])
+                rest = slice(counts[0], sum(counts))
+                oracle = _fp32_reference(candidate, x, probs, upstream, counts)
+                for name in ("output", "input_grad"):
+                    assert torch.equal(chunked[name][rest], single[name][rest]), name
+                    assert _relative_l2(chunked[name][first], oracle[name][first]) < NVFP4_ORACLE_TOLERANCE, name
+                for linear in ("gate_up_linear", "down_linear"):
+                    for expert in (1, 2, 3):
+                        name = f"{linear}.weight{expert}"
+                        assert torch.equal(chunked[name], single[name]), name
+                    name = f"{linear}.weight0"
+                    assert _relative_l2(chunked[name], oracle[name]) < NVFP4_ORACLE_TOLERANCE, name
+    finally:
+        set_is_first_microbatch(None)
+
+
+class _NanFilledEmpty:
+    """``torch`` as Transformer Engine's ``grouped_linear`` module sees it, with ``empty`` returning NaN.
+
+    Transformer Engine allocates the outputs of its GEMMs with ``torch.empty``. With this in its place an
+    element that a GEMM does not write is NaN instead of whatever the allocator's block held.
+    """
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(torch, name)
+
+    def empty(self, *args: int, **kwargs: torch.dtype | torch.device | str) -> torch.Tensor:
+        """Allocate like ``torch.empty`` and fill floating-point tensors with NaN.
+
+        Args:
+            *args: Sizes of the tensor.
+            **kwargs: ``dtype`` and ``device`` of the tensor.
+
+        Returns:
+            Tensor of the requested shape.
+        """
+        tensor = torch.empty(*args, **kwargs)
+        return tensor.fill_(float("nan")) if tensor.is_floating_point() else tensor
+
+
+class _SharedExpert(torch.nn.Module):
+    """The shared expert of the model, 4096 -> 5376 -> 4096 with ``relu(x)**2``, on Transformer Engine linears."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        import transformer_engine.pytorch as te
+
+        self.up = te.Linear(4096, 5376, bias=False, params_dtype=torch.bfloat16, device="cuda")
+        self.down = te.Linear(5376, 4096, bias=False, params_dtype=torch.bfloat16, device="cuda")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape [tokens, 4096].
+
+        Returns:
+            Tensor of shape [tokens, 4096].
+        """
+        return self.down(torch.relu(self.up(x)).square())
+
+
+# Rows per expert of one rank of 32 experts of 1024 -> 2688 -> 1024, multiples of the 128 rows NVFP4 pads to.
+REAL_LAYOUTS: dict[str, list[int]] = {
+    # 22 routes for each of 8 x 8192 tokens on one of 16 ranks of 512 experts: 3.9e9 elements in the
+    # intermediate tensor, above the limit of the grouped quantization.
+    "balanced_3.9e9": [45056] * 32,
+    # Half of that, 22 routes for each of 4 x 8192 tokens: 1.9e9 elements, within both limits.
+    "balanced_1.9e9": [22528] * 32,
+    # 6.5% more rows: 4.13e9 elements, above the limit of the per-expert quantization as well.
+    "balanced_4.1e9": [48000] * 32,
+    # About the same total spread unevenly, with two experts without rows.
+    "uneven_4.1e9": [96000] * 8 + [24064] * 16 + [0] * 2 + [64000] * 6,
+    # One expert holds 1,600,000 rows, 4.3e9 elements by itself; two experts have no rows.
+    "one_expert_4.3e9": [1280] * 3 + [1600000] + [1280] * 3 + [0] + [1280] * 12 + [0] + [1280] * 11,
+    # Half the experts without rows; the others stay within the limit of the grouped quantization (1.9e9).
+    "half_empty_1.9e9": [0] * 16 + [45056] * 16,
+}
+REAL_WIDTH = 2688
+# 15/16 of the 2**31 and 2**32 elements at which the two NVFP4 quantizations start to fail.
+REAL_GROUPED_LIMIT = 2013265920
+REAL_PER_EXPERT_LIMIT = 4026531840
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
+@pytest.mark.parametrize(
+    ("native", "side_stream"), [(True, False), (False, False), (False, True)], ids=["grouped", "split", "split-side"]
+)
+@pytest.mark.parametrize("layout", list(REAL_LAYOUTS))
+def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
+    monkeypatch: pytest.MonkeyPatch, layout: str, native: bool, side_stream: bool
+) -> None:
+    """NVFP4 experts are right in every row and every expert at the sizes one rank of the model receives.
+
+    One rank of 32 experts of 1024 -> 2688 -> 1024 gets the rows of ``REAL_LAYOUTS``, inside an activation
+    checkpoint as in training. Transformer Engine's NVFP4 quantization is wrong past 2**31 elements on the
+    grouped-tensor path (the rows from that offset on get the last expert's tensor scale) and past 2**32 with
+    one GEMM per expert (it wraps around). The inputs of the experts differ in scale by factors of 3 and 9, so
+    a row with another expert's scale is off by more than 0.5 of its norm, while NVFP4 rounding leaves 0.2 to
+    0.35; Transformer Engine's output buffers are pre-filled with NaN, so an unwritten element shows. Output,
+    input gradient and both weight gradients are compared with FP32 values computed here, expert by expert,
+    without Transformer Engine or autograd.
+
+    Args:
+        monkeypatch: Pre-fills Transformer Engine's output buffers with NaN.
+        layout: Key of ``REAL_LAYOUTS``.
+        native: Whether the module is built for grouped-tensor GEMMs (else for one GEMM per expert).
+        side_stream: Whether the model's shared expert runs on a second CUDA stream during the routed
+            experts (``shared_expert_overlap``), with the stream calls of ``MoE``.
+    """
+    recipe = _nvfp4_recipe_or_skip(stochastic_rounding=True)
+    import transformer_engine.pytorch as te
+    import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
+
+    if torch.cuda.mem_get_info()[0] < 160 * 2**30:
+        pytest.skip("Needs 160 GiB of free GPU memory")
+    monkeypatch.setattr(te_grouped_linear, "torch", _NanFilledEmpty())
+
+    counts = REAL_LAYOUTS[layout]
+    num_experts, dim, inter = len(counts), 1024, REAL_WIDTH
+    total = sum(counts)
+    elements = total * inter
+    config = MoEConfig(
+        n_routed_experts=num_experts,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=dim,
+        inter_dim=inter,
+        moe_inter_dim=inter,
+        norm_topk_prob=False,
+        expert_bias=False,
+        expert_activation="relu2",
+        dtype=torch.bfloat16,
+    )
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
+    module = GroupedExpertsTE(config, backend=backend)
+    module.gate_up_linear.reset_parameters()
+    module.down_linear.reset_parameters()
+    module.ep_size = 1
+    module.token_dispatcher = _GroupedInputDispatcher(counts)
+    calls = _record_gemm_calls(module)
+    shared = _SharedExpert() if side_stream else None
+    stream = torch.cuda.Stream() if side_stream else None
+
+    generator = torch.Generator(device="cuda").manual_seed(77)
+    scale = torch.tensor([3.0 if expert % 2 == 0 else 1 / 3 for expert in range(num_experts - 1)] + [1.0])
+    x = torch.randn(total, dim, generator=generator, device="cuda")
+    x = (x * scale.cuda().repeat_interleave(torch.tensor(counts).cuda()).unsqueeze(1)).to(torch.bfloat16)
+    probs = 0.05 + 0.4 * torch.rand(total, 1, generator=generator, device="cuda")
+    upstream = (torch.randn(total, dim, generator=generator, device="cuda") * 1e-3).to(torch.bfloat16)
+    shared_input = torch.randn(65536, 4096, generator=generator, device="cuda").to(torch.bfloat16)
+    mask = torch.ones(total, device="cuda", dtype=torch.bool)
+    indices = torch.zeros(total, 1, device="cuda", dtype=torch.long)
+
+    def block(hidden: torch.Tensor, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The routed experts, with the shared expert on the side stream when the case asks for it.
+
+        Args:
+            hidden: Tensor of shape [rows, 1024], grouped by expert.
+            tokens: Tensor of shape [65536, 4096], the input of the shared expert.
+
+        Returns:
+            Routed output of shape [rows, 1024] and the shared output of shape [65536, 4096] (``tokens``
+            itself without a side stream).
+        """
+        with te.autocast(enabled=True, recipe=recipe):
+            if stream is None:
+                return module(hidden, mask, probs, indices), tokens
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                side = shared(tokens)
+            tokens.record_stream(stream)
+            routed = module(hidden, mask, probs, indices)
+            current = torch.cuda.current_stream()
+            current.wait_stream(stream)
+            side.record_stream(current)
+            return routed, side
+
+    def row_errors(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+        """Relative L2 error of every row.
+
+        Args:
+            actual: Tensor of shape [rows, features].
+            expected: FP32 reference of the same shape.
+
+        Returns:
+            Tensor of shape [rows].
+        """
+        assert torch.isfinite(actual).all()
+        return (actual.float() - expected).norm(dim=1) / expected.norm(dim=1)
+
+    # A dispatch with empty experts within the grouped limit is repeated: its exact zeros hold in every round.
+    rounds = 24 if 0 in counts and elements <= REAL_GROUPED_LIMIT else 1
+    set_is_first_microbatch(True)
+    try:
+        for _ in range(rounds):
+            module.zero_grad(set_to_none=True)
+            hidden = x.clone().requires_grad_()
+            tokens = shared_input.clone().requires_grad_()
+            with te.autocast(enabled=True, recipe=recipe):
+                output, side = checkpoint(
+                    block, hidden, tokens, use_reentrant=False, context_fn=mark_checkpoint_recompute(None)
+                )
+                torch.autograd.backward([output, side], [upstream, torch.ones_like(side) * 1e-3])
+            assert hidden.grad is not None
+
+            # The expert MLP and its gradients in FP32, expert by expert in blocks of rows, written out
+            # without autograd.
+            worst = {"output": 0.0, "input_grad": 0.0, "gate_up_weight_grad": 0.0, "down_weight_grad": 0.0}
+            offset = 0
+            with torch.no_grad():
+                for expert, rows in enumerate(counts):
+                    gate_up = getattr(module.gate_up_linear, f"weight{expert}")
+                    down = getattr(module.down_linear, f"weight{expert}")
+                    if rows == 0:
+                        # No rows, no gradient: exact zeros, not what the output buffer held.
+                        assert torch.count_nonzero(gate_up.grad) == 0, expert
+                        assert torch.count_nonzero(down.grad) == 0, expert
+                        continue
+                    gate_up_grad = torch.zeros_like(gate_up, dtype=torch.float32)
+                    down_grad = torch.zeros_like(down, dtype=torch.float32)
+                    for start in range(offset, offset + rows, 131072):
+                        span = slice(start, min(start + 131072, offset + rows))
+                        inputs, probability, output_grad = x[span].float(), probs[span], upstream[span].float()
+                        pre_activation = inputs @ gate_up.float().T
+                        activated = pre_activation.relu().square() * probability
+                        activated_grad = output_grad @ down.float()
+                        pre_activation_grad = activated_grad * 2 * pre_activation.relu() * probability
+                        worst["output"] = max(
+                            worst["output"], row_errors(output[span], activated @ down.float().T).max().item()
+                        )
+                        worst["input_grad"] = max(
+                            worst["input_grad"],
+                            row_errors(hidden.grad[span], pre_activation_grad @ gate_up.float()).max().item(),
+                        )
+                        gate_up_grad += pre_activation_grad.T @ inputs
+                        down_grad += output_grad.T @ activated
+                    worst["gate_up_weight_grad"] = max(
+                        worst["gate_up_weight_grad"], _relative_l2(gate_up.grad, gate_up_grad)
+                    )
+                    worst["down_weight_grad"] = max(worst["down_weight_grad"], _relative_l2(down.grad, down_grad))
+                    offset += rows
+            # On GB300: 0.26 to 0.28 and 0.34 to 0.36 for the worst row, 0.29 and 0.25 for the worst expert.
+            assert worst["output"] < 0.45, worst
+            assert worst["input_grad"] < 0.45, worst
+            assert worst["gate_up_weight_grad"] < NVFP4_ORACLE_TOLERANCE, worst
+            assert worst["down_weight_grad"] < NVFP4_ORACLE_TOLERANCE, worst
+
+    finally:
+        set_is_first_microbatch(None)
+
+    # No quantization covered more than its path handles: every forward and every recompute ran the same
+    # calls, each within the per-expert limit, on grouped-tensor GEMMs only for a module built for them and a
+    # dispatch within their limit.
+    per_pass = len(calls) // (2 * rounds)
+    forward_calls = calls[:per_pass]
+    assert calls == forward_calls * (2 * rounds)
+    assert sum(rows for rows, _ in forward_calls) == total
+    assert all(rows * inter <= REAL_PER_EXPERT_LIMIT for rows, _ in forward_calls)
+    # The layouts above need no extra call for ending their chunks at expert boundaries.
+    assert len(forward_calls) == math.ceil(elements / REAL_PER_EXPERT_LIMIT)
+    grouped = native and elements <= REAL_GROUPED_LIMIT
+    assert all(path is grouped for _, path in forward_calls)
+    assert module.gate_up_linear.use_grouped_tensor is native
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 recipe switching requires CUDA")

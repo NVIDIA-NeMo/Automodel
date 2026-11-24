@@ -1601,9 +1601,10 @@ def _make_lazy_te_patcher():
        gradient accumulation (quantize on first microbatch, reuse cached on rest).
        The recompute forward of a marked activation checkpoint reuses the copy its
        forward cached (see ``weight_cache_flag_for_forward``).
+       ``out`` is GroupedLinear's output buffer.
     3. NVFP4 size check: a TE Linear, LayerNormLinear or LayerNormMLP whose operands are too
        large for a correct NVFP4 quantization raises instead of computing wrong values (see
-       ``check_nvfp4_linear_size``).
+       ``check_nvfp4_linear_size``). The routed experts check their own dispatches.
     """
     patched = False
 
@@ -1651,12 +1652,34 @@ def _make_lazy_te_patcher():
                 )
             return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
 
-        def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None):
+        def _patched_grouped_linear_forward(
+            self: TEGroupedLinear,
+            inp: torch.Tensor,
+            m_splits: torch.Tensor | list[int],
+            is_first_microbatch: bool | None = None,
+            out: torch.Tensor | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            """``GroupedLinear.forward`` with the weight-cache flag of the current micro-batch.
+
+            Args:
+                self: The grouped linear.
+                inp: Rows of all groups, ``[rows, in_features]``, the rows of a group consecutive.
+                m_splits: Rows per group, ``[num_gemms]``: a list, or an int64 tensor on the device of
+                    ``inp`` for the grouped-tensor path.
+                is_first_microbatch: Weight-cache flag; None takes it from the process-wide flag and the
+                    recompute state (``weight_cache_flag_for_forward``).
+                out: Buffer that receives the output, ``[rows, out_features]``, or None to allocate one.
+
+            Returns:
+                What ``GroupedLinear.forward`` returns: the output, ``[rows, out_features]``.
+            """
             if is_first_microbatch is None:
                 is_first_microbatch = weight_cache_flag_for_forward(
                     get_is_first_microbatch(), in_checkpoint_recompute()
                 )
-            return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
+            return _original_grouped_linear_forward(
+                self, inp, m_splits, is_first_microbatch=is_first_microbatch, out=out
+            )
 
         def _patched_layernorm_linear_forward(
             self: TELayerNormLinear, inp: torch.Tensor, *args: bool | None, **kwargs: bool | None

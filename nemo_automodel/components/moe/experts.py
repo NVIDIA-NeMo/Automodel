@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import re
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -25,6 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as torch_checkpoint
 from torch.autograd import Function
+from torch.autograd.function import FunctionCtx
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
@@ -50,6 +53,7 @@ _HAVE_TE, transformer_engine = safe_import_te()
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
+logger = logging.getLogger(__name__)
 # Bound each GPT-OSS-sized FP32 temporary to about 45 MiB while leaving small
 # dispatches on the faster single-operation path.
 _BIAS_CHUNK_ROWS = 4096
@@ -303,6 +307,154 @@ def _resolve_m_splits(
     if isinstance(tokens_per_expert, torch.Tensor):
         return tokens_per_expert.tolist()
     return list(tokens_per_expert)
+
+
+# Elements (rows x columns) that one Transformer Engine NVFP4 quantization of routed-expert rows may cover.
+# The quantization kernels address a tensor with 32-bit element offsets (Transformer Engine 2.19 to 2.21): the
+# grouped quantization of ``te_grouped_tensor`` scales the rows from element offset 2**31 of the grouped tensor
+# up to its last expert with the last expert's tensor scale, and the quantization of the per-expert path wraps
+# around once the rows of all experts together pass 2**32 elements. Both limits stay 1/16 below those offsets.
+_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS = 2**31 - 2**27
+_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS = 2**32 - 2**28
+
+
+def _plan_dispatch_chunks(rows_per_expert: list[int], *, max_rows: int, align: int) -> list[list[int]]:
+    """Cut the rows of a rank's experts into consecutive chunks of at most ``max_rows`` rows.
+
+    The dispatched rows are grouped by expert, so a chunk is a row range of that tensor. A chunk ends before
+    the first expert whose rows no longer fit into it, as long as that expert fits a chunk of its own; only an
+    expert with more rows than one chunk holds is cut, and then at a multiple of ``align`` rows from its start.
+
+    Args:
+        rows_per_expert: Rows of each local expert, in expert order; multiples of ``align``.
+        max_rows: Most rows one chunk may hold.
+        align: Row multiple that the quantization of one expert's rows needs.
+
+    Returns:
+        For every chunk the rows it holds of each expert, zero for the experts outside it. The chunks cover
+        the rows of all experts in order; a dispatch without rows is one empty chunk.
+
+    Raises:
+        ValueError: If ``max_rows`` is smaller than ``align``.
+    """
+    capacity = max_rows // align * align
+    if capacity <= 0:
+        raise ValueError(f"A chunk of at most {max_rows} rows cannot hold a block of {align} rows.")
+    chunks: list[list[int]] = [[0] * len(rows_per_expert)]
+    used = 0
+    for expert, rows in enumerate(rows_per_expert):
+        if 0 < used and capacity - used < rows <= capacity:
+            chunks.append([0] * len(rows_per_expert))
+            used = 0
+        while rows > 0:
+            if used == capacity:
+                chunks.append([0] * len(rows_per_expert))
+                used = 0
+            taken = min(rows, capacity - used)
+            chunks[-1][expert] = taken
+            used += taken
+            rows -= taken
+    return chunks
+
+
+@dataclass
+class _QuantizedDispatchCounts:
+    """How the quantized expert dispatches of this process ran, for the log lines of :func:`_count_dispatch`."""
+
+    dispatches: int = 0
+    """Dispatches with rows under a quantization recipe."""
+    chunked: int = 0
+    """Dispatches that ran in more than one chunk of rows."""
+    chunks: int = 0
+    """Chunks of all chunked dispatches."""
+    largest_rows: int = 0
+    """Rows of the largest chunked dispatch."""
+    left_grouped_for_size: int = 0
+    """Dispatches of a module built for grouped-tensor GEMMs that ran one GEMM per expert because of their size."""
+
+
+_DISPATCH_COUNTS = _QuantizedDispatchCounts()
+
+
+def _count_dispatch(*, rows: int, width: int, chunks: int, left_grouped: bool) -> None:
+    """Count one quantized expert dispatch and report on rank 0 how the dispatches of this rank ran.
+
+    The first dispatch that runs in chunks and the first one that leaves the grouped-tensor GEMMs for its
+    size are reported when they happen. After that the counts are reported whenever the number of dispatches
+    reaches a power of two from 256 on, as long as any dispatch left the path the module is built for.
+
+    Args:
+        rows: Rows of the dispatch (padded).
+        width: Columns of the widest tensor Transformer Engine quantizes for these rows.
+        chunks: Calls of each projection that the dispatch needs; more than one above the per-expert limit.
+        left_grouped: Whether a single-call dispatch of a module built for grouped-tensor GEMMs runs one GEMM
+            per expert because it is too large for the grouped quantization.
+    """
+    counts = _DISPATCH_COUNTS
+    counts.dispatches += 1
+    first: Literal["chunked", "size"] | None = None
+    if chunks > 1:
+        first = "chunked" if counts.chunked == 0 else None
+        counts.chunked += 1
+        counts.chunks += chunks
+        counts.largest_rows = max(counts.largest_rows, rows)
+    elif left_grouped:
+        first = "size" if counts.left_grouped_for_size == 0 else None
+        counts.left_grouped_for_size += 1
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    if first == "chunked":
+        logger.warning(
+            "TE experts: a dispatch of %d rows holds %d elements, more than the %d that one Transformer Engine "
+            "NVFP4 quantization handles correctly; such dispatches are quantized and multiplied in consecutive "
+            "chunks of rows (%d here), with one GEMM per expert.",
+            rows,
+            rows * width,
+            _NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS,
+            chunks,
+        )
+    elif first == "size":
+        logger.warning(
+            "TE experts: a dispatch of %d rows holds %d elements, more than the %d that Transformer Engine's "
+            "grouped NVFP4 quantization (te_grouped_tensor) handles correctly; such dispatches run one GEMM per "
+            "expert instead.",
+            rows,
+            rows * width,
+            _NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS,
+        )
+    total = counts.dispatches
+    left = counts.chunked + counts.left_grouped_for_size
+    if total >= 256 and total & (total - 1) == 0 and left > 0:
+        logger.warning(
+            "TE experts: of the %d quantized expert dispatches of this rank so far, %d ran in chunks (%d chunks in "
+            "all, the largest dispatch %d rows), and %d left the grouped-tensor GEMMs for one GEMM per expert "
+            "because of their size.",
+            total,
+            counts.chunked,
+            counts.chunks,
+            counts.largest_rows,
+            counts.left_grouped_for_size,
+        )
+
+
+@contextmanager
+def _per_expert_gemms(*linears: "GroupedLinear") -> Iterator[None]:
+    """Run ``GroupedLinear`` modules built for grouped-tensor GEMMs with one GEMM per expert inside the context.
+
+    Transformer Engine reads ``use_grouped_tensor`` in every forward and records the path it took for the
+    backward, so a call inside the context is the call of a module built without grouped-tensor GEMMs. Both
+    paths use the same parameters and the same cached quantized weights.
+
+    Args:
+        *linears: Modules built with ``use_grouped_tensor=True``.
+    """
+    for linear in linears:
+        linear.use_grouped_tensor = False
+    try:
+        yield
+    finally:
+        for linear in linears:
+            linear.use_grouped_tensor = True
 
 
 def _permute_tokens_for_grouped_mm(
@@ -1924,6 +2076,73 @@ def _torch_mm_experts_fwd(
     return output2
 
 
+class _SplitRows(Function):
+    """Consecutive row ranges of a tensor as views whose gradients are joined by one concatenation.
+
+    Slicing the tensor instead would give every range a backward that writes a zero tensor of the full size,
+    and autograd would add those tensors up.
+    """
+
+    @staticmethod
+    def forward(ctx: FunctionCtx, tensor: torch.Tensor, row_counts: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        """
+        Args:
+            ctx: Autograd context; nothing is saved.
+            tensor: Tensor of shape [rows, features].
+            row_counts: Rows of each range; they sum to ``rows``.
+
+        Returns:
+            One view of shape [row_counts[i], features] per range, in order.
+        """
+        return tensor.split(row_counts)
+
+    @staticmethod
+    def backward(ctx: FunctionCtx, *grads: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """
+        Args:
+            ctx: Autograd context.
+            *grads: Gradient of each range, of shape [row_counts[i], features]; zeros for an unused range.
+
+        Returns:
+            Gradient of shape [rows, features] for ``tensor`` and ``None`` for ``row_counts``.
+        """
+        return torch.cat(grads), None
+
+
+class _JoinRows(Function):
+    """One tensor for consecutive row ranges that their producers wrote into a shared buffer.
+
+    Concatenating the ranges would copy them; here the buffer is the result, and its gradient is handed to
+    the producers range by range.
+    """
+
+    @staticmethod
+    def forward(ctx: FunctionCtx, buffer: torch.Tensor, *parts: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            ctx: Autograd context; keeps the row count of every part.
+            buffer: Tensor of shape [rows, features] that holds the values of all parts.
+            *parts: The autograd outputs whose values are consecutive row ranges of ``buffer``, in order.
+
+        Returns:
+            ``buffer`` as a tensor of shape [rows, features] whose gradient flows to ``parts``.
+        """
+        ctx.row_counts = [part.shape[0] for part in parts]
+        return buffer.view_as(buffer)
+
+    @staticmethod
+    def backward(ctx: FunctionCtx, grad: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        """
+        Args:
+            ctx: Autograd context with the row counts.
+            grad: Gradient of the result, of shape [rows, features].
+
+        Returns:
+            ``None`` for ``buffer`` and the rows of ``grad`` that belong to each part.
+        """
+        return (None, *grad.split(ctx.row_counts))
+
+
 _TE_EXPERT_PARAMETER = re.compile(r"(weight|bias)(\d+)")
 
 
@@ -2432,6 +2651,95 @@ class GroupedExpertsTE(nn.Module):
             dtype=self.config.dtype,
         )
 
+    def _per_expert_chunks(self, recipe: "Recipe | None", m_splits: list[int], align: int) -> list[list[int]] | None:
+        """Rows per expert of the calls a quantized dispatch needs when it cannot run as the module is built.
+
+        Transformer Engine quantizes the rows of all experts of a ``GroupedLinear`` call together. Its NVFP4
+        kernels return wrong values, without an error, beyond ``_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS``
+        elements on the grouped-tensor path and beyond ``_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS`` with one GEMM
+        per expert. A dispatch between the two limits therefore leaves the grouped-tensor path, and one above
+        both runs in consecutive chunks of rows, each within the per-expert limit. FP8 and MXFP8 quantization
+        and unquantized GEMMs have no such limit. A custom recipe can hold NVFP4 quantizers and is limited
+        like the NVFP4 recipe.
+
+        Args:
+            recipe: Active Transformer Engine recipe, ``None`` outside a quantized autocast.
+            m_splits: Rows per local expert as passed to the GEMMs (padded under a recipe).
+            align: Row multiple the recipe pads every expert to.
+
+        Returns:
+            ``None`` when the dispatch runs as the module is built. Otherwise the rows per expert of every
+            call, each with one GEMM per expert: a single entry, ``m_splits``, for a dispatch that only
+            leaves the grouped-tensor path, several for one above the per-expert limit.
+        """
+        if recipe is None:
+            return None
+        # The widest tensor Transformer Engine quantizes for these rows: an input or an output of a projection.
+        width = max(self.config.expert_dim, self.config.moe_inter_dim * (2 if self.is_gated else 1))
+        rows = sum(m_splits)
+        size_limited = recipe.nvfp4() or recipe.custom()
+        chunks: list[list[int]] | None = None
+        if size_limited and rows * width > _NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS:
+            chunks = _plan_dispatch_chunks(m_splits, max_rows=_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS // width, align=align)
+        elif self.use_grouped_tensor and size_limited and rows * width > _NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS:
+            chunks = [m_splits]
+        _count_dispatch(
+            rows=rows,
+            width=width,
+            chunks=len(chunks) if chunks is not None else 1,
+            left_grouped=chunks is not None and len(chunks) == 1,
+        )
+        return chunks
+
+    def _expert_mlp_in_chunks(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        chunks: list[list[int]],
+        cast_weights: AbstractContextManager[None],
+    ) -> torch.Tensor:
+        """Run the expert MLP once per chunk of rows, so that every quantization covers one chunk.
+
+        Every call goes to the same two ``GroupedLinear`` modules, with one GEMM per expert, the rows of its
+        chunk and the rows per expert inside that chunk (zero for the other experts), so the parameters and
+        their cached quantized weights are the ones a single call uses, and an expert without rows in a call
+        gets a zero gradient from it. The calls after the first reuse the weights the first one quantized. The
+        down projections write into one output buffer and the input rows are handed out as views, so no
+        activation is copied; the input gradient is concatenated once.
+
+        Args:
+            hidden_states: Dispatched rows of shape [rows, expert_dim], grouped by expert.
+            probs: Routing weight of every row, shape [rows, 1].
+            chunks: Rows per expert of every chunk, from :meth:`_per_expert_chunks`.
+            cast_weights: Context under which the GEMMs run (casts FP32 parameters to the compute dtype).
+
+        Returns:
+            Expert outputs of shape [rows, expert_dim].
+        """
+        from nemo_automodel.components.models.common.utils import get_is_first_microbatch, weight_cache_flag_for_forward
+
+        row_counts = tuple(sum(chunk) for chunk in chunks)
+        # The dtype Transformer Engine computes in: the autocast dtype, else the dtype of the rows.
+        dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else hidden_states.dtype
+        output = torch.empty((hidden_states.shape[0], self.config.expert_dim), dtype=dtype, device=hidden_states.device)
+        # A later call replays the weights of the first one, as the recompute of a checkpoint does.
+        later_call = weight_cache_flag_for_forward(get_is_first_microbatch(), True)
+        parts: list[torch.Tensor] = []
+        row = 0
+        for index, (chunk, rows, hidden) in enumerate(
+            zip(chunks, row_counts, _SplitRows.apply(hidden_states, row_counts), strict=True)
+        ):
+            weight_cache = None if index == 0 else later_call
+            with cast_weights:
+                hidden = self.gate_up_linear(hidden, chunk, is_first_microbatch=weight_cache)
+            hidden = self.expert_activation(hidden, probs[row : row + rows])
+            with cast_weights:
+                parts.append(
+                    self.down_linear(hidden, chunk, is_first_microbatch=weight_cache, out=output[row : row + rows])
+                )
+            row += rows
+        return _JoinRows.apply(output, *parts)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2519,6 +2827,7 @@ class GroupedExpertsTE(nn.Module):
                 self._grouped_tensor_signature = signature
         actual_m_splits = None
         unpadding = self.fp8_unpadding
+        row_align = 1
         if recipe is not None:
             actual_m_splits = m_splits
             padding = self.fp8_padding
@@ -2532,13 +2841,16 @@ class GroupedExpertsTE(nn.Module):
                 unpadding = self.native_fp8_unpadding
             permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
             permuted_probs, _ = padding(permuted_probs, actual_m_splits)
+            row_align = padding.align_size
 
         if has_dispatched_rows:
+            # The calls of a dispatch that has to run one GEMM per expert, possibly in chunks of rows.
+            chunks = self._per_expert_chunks(recipe, m_splits, row_align)
             # The native grouped-tensor API consumes device-side int64 split sizes.
             # Keep the host list for padding, unpadding, and the legacy TE path.
             if device_m_splits is not None:
                 grouped_m_splits = device_m_splits
-            elif self.use_grouped_tensor:
+            elif self.use_grouped_tensor and chunks is None:
                 grouped_m_splits = torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
             else:
                 grouped_m_splits = m_splits
@@ -2552,11 +2864,22 @@ class GroupedExpertsTE(nn.Module):
                 and not torch.is_autocast_enabled("cuda")
                 else nullcontext()
             )
-            with cast_weights:
-                output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
-            output1 = self.expert_activation(output1, permuted_probs)
-            with cast_weights:
-                output2 = self.down_linear(output1, grouped_m_splits)
+            gemm_path = (
+                _per_expert_gemms(self.gate_up_linear, self.down_linear)
+                if chunks is not None and self.use_grouped_tensor
+                else nullcontext()
+            )
+            with gemm_path:
+                if chunks is not None and len(chunks) > 1:
+                    output2 = self._expert_mlp_in_chunks(
+                        permuted_local_hidden_states, permuted_probs, chunks, cast_weights
+                    )
+                else:
+                    with cast_weights:
+                        output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
+                    output1 = self.expert_activation(output1, permuted_probs)
+                    with cast_weights:
+                        output2 = self.down_linear(output1, grouped_m_splits)
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
