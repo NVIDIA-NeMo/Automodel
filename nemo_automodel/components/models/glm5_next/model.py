@@ -39,6 +39,7 @@ from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendCo
 from nemo_automodel.components.models.glm5_next.config import Glm5NextConfig, Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
+    Glm5NextPackedMetadata,
     _global_doc_ids_from_batch,
     _normalize_batch_axis,
     doc_ids_from_cu_seqlens,
@@ -510,7 +511,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         pixel_values_videos: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
-        glm5_next_packed_context: Glm5NextPackedContext | tuple[torch.Tensor, int, int, int] | None = None,
+        glm5_next_packed_context: Glm5NextPackedContext | Glm5NextPackedMetadata | None = None,
         **kwargs: Any,
     ) -> Glm5NextCausalLMOutputWithPast | torch.Tensor:
         """Decode ids ``[B,S]`` or a PP activation ``[B,Slocal,hc_mult,H]``.
@@ -551,7 +552,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                 positions to keep as in ``compute_lm_head_logits``.
             output_hidden_states: Whether to attach final hidden states.
             glm5_next_packed_context: Per-microbatch context or
-                (doc_ids, seq_start, cp_size, original_seq_len). doc_ids is an
+                ``Glm5NextPackedMetadata`` (doc_ids, seq_start, cp_size,
+                original_seq_len). doc_ids is an
                 integer tensor of shape [microbatch, padded_global_sequence],
                 replicated across CP ranks; nonpositive values mark padding.
                 seq_start is the global offset of this rank's contiguous
@@ -613,8 +615,13 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             raise ValueError("input_ids or inputs_embeds is required")
 
         context = glm5_next_packed_context
-        if isinstance(context, tuple):
-            context = Glm5NextPackedContext(*context)
+        if isinstance(context, Glm5NextPackedMetadata):
+            context = Glm5NextPackedContext(
+                doc_ids=context.doc_ids,
+                seq_start=context.seq_start,
+                cp_size=context.cp_size,
+                original_seq_len=context.original_seq_len,
+            )
         context_ids = input_ids
         if context_ids is None:
             context_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)

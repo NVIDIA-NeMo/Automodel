@@ -15,7 +15,7 @@ import contextlib
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -30,6 +30,25 @@ _FLA_CP_AVAILABLE, _build_cp_context = safe_import_from(
     "build_cp_context",
     msg="GLM-5.3 context parallelism requires the `fla` optional dependency.",
 )
+
+
+class Glm5NextPackedMetadata(NamedTuple):
+    """Packed-document layout in the form the PP kwargs splitter can chunk.
+
+    The splitter splits ``doc_ids`` along the batch axis and replicates the integers, and returns
+    the same ``NamedTuple`` type per microbatch; it treats a dataclass as one replicated value.
+
+    Attributes:
+        doc_ids: Integer document ids ``[batch, global_sequence]``.
+        seq_start: Global offset of this rank's contiguous local token interval.
+        cp_size: Number of context-parallel ranks.
+        original_seq_len: Sequence length before CP divisibility padding.
+    """
+
+    doc_ids: torch.Tensor
+    seq_start: int
+    cp_size: int
+    original_seq_len: int
 
 
 @dataclass
@@ -381,7 +400,7 @@ def shard_batch_for_glm5_next_cp(
         ``glm5_next_packed_context`` holds int32 ``doc_ids`` of shape [batch,
         padded_global_sequence], replicated on every CP rank, plus
         ``seq_start``, ``cp_size`` and the unpadded length: a
-        ``Glm5NextPackedContext``, or the equivalent tuple when
+        ``Glm5NextPackedContext``, or the equivalent ``Glm5NextPackedMetadata`` when
         ``num_chunks > 1``.
     """
     del tp_mesh
@@ -422,12 +441,12 @@ def shard_batch_for_glm5_next_cp(
     batch.setdefault("padding_mask", doc_ids <= _PAD_DOC_ID)
     seq_start = 0 if cp_mesh is None else cp_mesh.get_local_rank() * (padded_seq_len // cp_size)
     # The PP kwargs splitter treats dataclasses as opaque (replicated) values.
-    # A tuple lets it split doc_ids alongside input_ids and labels, while the
+    # A NamedTuple lets it split doc_ids alongside input_ids and labels, while the
     # Python scalar offsets remain shared. Forward creates each chunk's cache.
     batch["glm5_next_packed_context"] = (
-        (doc_ids, seq_start, cp_size, seq_len)
+        Glm5NextPackedMetadata(doc_ids=doc_ids, seq_start=seq_start, cp_size=cp_size, original_seq_len=seq_len)
         if num_chunks > 1
-        else Glm5NextPackedContext(doc_ids, seq_start, cp_size, seq_len)
+        else Glm5NextPackedContext(doc_ids=doc_ids, seq_start=seq_start, cp_size=cp_size, original_seq_len=seq_len)
     )
 
     local_seq_len = padded_seq_len // cp_size

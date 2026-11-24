@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
 
-from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
+from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext, Glm5NextPackedMetadata
 from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
 from nemo_automodel.components.moe.parallelizer import apply_ac
 from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
@@ -112,6 +112,19 @@ def test_packed_metadata_follows_microbatch_rows():
         actual = model(**chunk).logits
         expected = model(ids[index : index + 1], attention_mask=docs[index : index + 1]).logits
         torch.testing.assert_close(actual, expected)
+
+
+def test_packed_metadata_chunks_keep_their_named_fields():
+    """The kwargs splitter returns the NamedTuple per microbatch, splitting doc_ids and replicating the integers."""
+    ids = torch.arange(1, 25).reshape(2, 12)
+    docs = torch.tensor([[1] * 6 + [2] * 6, [1] * 3 + [2] * 9], dtype=torch.int32)
+    metadata = Glm5NextPackedMetadata(doc_ids=docs, seq_start=4, cp_size=2, original_seq_len=12)
+    _, chunks = split_args_kwargs_into_chunks((), {"input_ids": ids, "glm5_next_packed_context": metadata}, 2)
+    for index, chunk in enumerate(chunks):
+        context = chunk["glm5_next_packed_context"]
+        assert isinstance(context, Glm5NextPackedMetadata)
+        torch.testing.assert_close(context.doc_ids, docs[index : index + 1])
+        assert (context.seq_start, context.cp_size, context.original_seq_len) == (4, 2, 12)
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
