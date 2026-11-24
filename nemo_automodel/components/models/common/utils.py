@@ -927,6 +927,8 @@ class BackendConfig:
             Requires ``dispatcher="deepep"``, ``"hybridep"``, or ``"uccl_ep"``.
             Device and precision support follows TE's ``GroupedLinear`` contract.
             Parameters and checkpoints retain their existing layouts.
+            Not together with ``shared_expert_overlap`` on cuBLASLt before 13.8.1, where a grouped GEMM can
+            lose output while GEMMs run on a second CUDA stream: the TE experts raise at construction.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             "nccl_ep" uses Transformer Engine NCCL-EP,
@@ -1021,7 +1023,8 @@ class BackendConfig:
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
         shared_expert_overlap: run the shared experts of MoE models (the shared ``MoE`` class, e.g. DeepSeek V4 / V4.1, and Kimi K3)
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
-            communication of the routed path; numerics unchanged. Default False.
+            communication of the routed path; numerics unchanged. Default False. Not together with
+            ``te_grouped_tensor`` on cuBLASLt before 13.8.1, see there.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
             expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP`` / ``GroupedExpertsTE``, all MoE models),
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/

@@ -46,7 +46,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-from nemo_automodel.shared.import_utils import is_te_min_version, safe_import, safe_import_te
+from nemo_automodel.shared.import_utils import get_te_cublaslt_version, is_te_min_version, safe_import, safe_import_te
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 _HAVE_TE, transformer_engine = safe_import_te()
@@ -316,6 +316,32 @@ def _resolve_m_splits(
 # around once the rows of all experts together pass 2**32 elements. Both limits stay 1/16 below those offsets.
 _NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS = 2**31 - 2**27
 _NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS = 2**32 - 2**28
+
+# First cuBLASLt release, as ``cublasLtGetVersion()`` reports it, in which a grouped GEMM was not seen to lose
+# output while a GEMM runs on another CUDA stream: 13.8.1.
+_CONCURRENT_GROUPED_GEMM_MIN_CUBLASLT = 130801
+
+
+def concurrent_grouped_gemm_is_unreliable(cublaslt_version: int) -> bool:
+    """Whether a cuBLASLt grouped GEMM can leave output elements unwritten while another GEMM runs.
+
+    Transformer Engine's grouped-tensor path (``te_grouped_tensor``) runs the experts of a rank as one
+    cuBLASLt grouped GEMM per projection. With cuBLASLt 13.7.0 on GB300 that GEMM sometimes does not write
+    rectangular tiles of its output (16 to 32 rows by 32 to 256 columns of one expert's matrix) when a GEMM
+    of Transformer Engine or of torch starts on a second CUDA stream while it runs. The tiles keep what the
+    output buffer held, so in training a weight gradient silently contains part of an older tensor. Seen in
+    the weight gradients of experts without rows (BF16 and NVFP4) and of experts with rows (NVFP4 and MXFP8),
+    in up to 1% of the backward passes of one layer; not seen without a second stream, with elementwise
+    kernels on the second stream, or with one GEMM per expert. cuBLASLt 13.8.1 did not show it in the same
+    runs.
+
+    Args:
+        cublaslt_version: ``cublasLtGetVersion()`` of the library that runs the GEMMs, e.g. 130700 for 13.7.0.
+
+    Returns:
+        ``True`` for releases before 13.8.1.
+    """
+    return cublaslt_version < _CONCURRENT_GROUPED_GEMM_MIN_CUBLASLT
 
 
 def _plan_dispatch_chunks(rows_per_expert: list[int], *, max_rows: int, align: int) -> list[list[int]]:
@@ -2231,8 +2257,11 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
 
         Raises:
-            ValueError: If ``te_grouped_tensor`` is requested with Transformer Engine older than 2.19.0, or if
-                ``dispatcher_capacity_factor`` is set, which these experts cannot use.
+            ValueError: If ``te_grouped_tensor`` is requested with Transformer Engine older than 2.19.0, or
+                together with ``shared_expert_overlap`` on a cuBLASLt whose grouped GEMM loses output while
+                the shared expert's GEMMs run on the side stream
+                (:func:`concurrent_grouped_gemm_is_unreliable`), or if ``dispatcher_capacity_factor`` is set,
+                which these experts cannot use.
         """
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
@@ -2263,6 +2292,22 @@ class GroupedExpertsTE(nn.Module):
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
+        if (
+            backend is not None
+            and backend.te_grouped_tensor
+            and backend.shared_expert_overlap
+            and config.n_shared_experts > 0
+        ):
+            # The shared expert's GEMMs would run on a side stream during the grouped GEMMs of these experts.
+            # A layer without a shared expert opens no side stream.
+            cublaslt_version = get_te_cublaslt_version()
+            if concurrent_grouped_gemm_is_unreliable(cublaslt_version):
+                raise ValueError(
+                    "te_grouped_tensor=True cannot be combined with shared_expert_overlap=True on cuBLASLt "
+                    f"{cublaslt_version}: before 13.8.1 a grouped GEMM can leave part of its output unwritten "
+                    "while the GEMMs of the shared expert run on the side stream, which corrupts weight "
+                    "gradients without an error. Set one of the two to False, or use cuBLAS 13.8.1 or newer."
+                )
         # Set when NVFP4 is enabled; caps the experts per rank.
         self.te_nvfp4 = backend.te_nvfp4 if backend is not None else None
         self.dispatcher_backend = dispatcher_backend

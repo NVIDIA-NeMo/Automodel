@@ -2617,6 +2617,74 @@ def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
             experts(*args)
 
 
+@pytest.mark.parametrize(
+    ("cublaslt_version", "unreliable"),
+    [
+        (130300, True),
+        (130700, True),
+        (130800, True),
+        (130801, False),
+        (130802, False),
+        (131000, False),
+        (140000, False),
+    ],
+)
+def test_concurrent_grouped_gemm_is_unreliable_before_cublaslt_13_8_1(cublaslt_version: int, unreliable: bool) -> None:
+    """cuBLASLt 13.7.0 lost grouped-GEMM output beside a second stream on GB300; 13.8.1 did not."""
+    from nemo_automodel.components.moe.experts import concurrent_grouped_gemm_is_unreliable
+
+    assert concurrent_grouped_gemm_is_unreliable(cublaslt_version) is unreliable
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("cublaslt_version", [130700, 130801])
+def test_te_grouped_tensor_refuses_the_shared_expert_side_stream_before_cublaslt_13_8_1(
+    moe_config, fake_native_te, monkeypatch, native: bool, overlap: bool, cublaslt_version: int
+) -> None:
+    """Grouped-tensor GEMMs next to the shared expert's side stream are refused where they can lose output.
+
+    The refusal needs both keys and a cuBLASLt before 13.8.1 (130801); every other combination builds the
+    experts on the path it asks for, and the library is asked for its version only when both keys are set.
+    """
+    from nemo_automodel.components.moe import experts as experts_module
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    asked: list[int] = []
+
+    def reported_version() -> int:
+        asked.append(cublaslt_version)
+        return cublaslt_version
+
+    monkeypatch.setattr(experts_module, "get_te_cublaslt_version", reported_version)
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native, shared_expert_overlap=overlap)
+    if native and overlap and cublaslt_version == 130700:
+        with pytest.raises(ValueError, match="cannot be combined with shared_expert_overlap=True on cuBLASLt 130700"):
+            GroupedExpertsTE(moe_config, backend=backend)
+    else:
+        experts = GroupedExpertsTE(moe_config, backend=backend)
+        assert experts.use_grouped_tensor is native
+        assert experts.gate_up_linear.use_grouped_tensor is native
+        assert experts.down_linear.use_grouped_tensor is native
+    assert asked == ([cublaslt_version] if native and overlap else [])
+
+
+def test_te_grouped_tensor_with_shared_expert_overlap_builds_for_a_layer_without_a_shared_expert(
+    moe_config, fake_native_te, monkeypatch
+) -> None:
+    """Without a shared expert no side stream runs, so both keys build on any cuBLASLt and it is not asked."""
+    from nemo_automodel.components.moe import experts as experts_module
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    def unexpected_version() -> int:
+        raise AssertionError("the cuBLASLt version must not be read for a layer without a shared expert")
+
+    monkeypatch.setattr(experts_module, "get_te_cublaslt_version", unexpected_version)
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=True, shared_expert_overlap=True)
+    experts = GroupedExpertsTE(replace(moe_config, n_shared_experts=0), backend=backend)
+    assert experts.use_grouped_tensor is True
+
+
 class _CountingDispatcher:
     """Dispatcher stand-in returning per-expert counts as an int32 tensor, as the flex dispatchers do."""
 
