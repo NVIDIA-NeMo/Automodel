@@ -56,6 +56,7 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 
 class _FakeMesh:
@@ -738,6 +739,7 @@ def test_patch_liger_kernel_gives_liger_forward_compute_logits(monkeypatch):
 
     assert kept == [1]
     assert output.logits.shape == (1, 1, 0)
+    assert not leaf_tensors_requiring_grad(output)
 
 
 def test_patch_liger_kernel_keeps_compute_logits_when_liger_keeps_the_forward(monkeypatch):
@@ -761,6 +763,7 @@ def test_patch_liger_kernel_keeps_compute_logits_when_liger_keeps_the_forward(mo
     output = model(input_ids=torch.zeros(1, 4, dtype=torch.long), compute_logits=False)
 
     assert output.logits.shape == (1, 1, 0)
+    assert not leaf_tensors_requiring_grad(output)
 
 
 def test_patch_liger_kernel_uses_model_owned_hook(monkeypatch):

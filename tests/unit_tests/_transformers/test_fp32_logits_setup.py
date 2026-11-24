@@ -26,6 +26,7 @@ from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common.lm_head import LMHead
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 _VOCAB = 128
 
@@ -150,6 +151,7 @@ def test_compute_logits_false_skips_the_head(config_cls):
     # Fused-linear losses project the final hidden states themselves, so the forward neither runs nor gathers the head.
     assert head_calls == []
     assert output.logits.shape == (2, 6, 0)
+    assert not leaf_tensors_requiring_grad(output)
     torch.testing.assert_close(output.hidden_states[-1], expected, rtol=0, atol=0)
 
 

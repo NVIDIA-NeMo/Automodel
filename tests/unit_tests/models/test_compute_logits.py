@@ -15,7 +15,8 @@
 """A forward called with ``compute_logits=False`` returns the final hidden states and empty logits.
 
 Fused-linear losses project the hidden states with the head's weight themselves. Forwards that delegate to Hugging
-Face, whose forward always runs the head, project a single position and drop it.
+Face, whose forward always runs the head, project a single position and drop it. No output carries the head's weight:
+FSDP2 would leave a backward hook on it after every forward.
 """
 
 import copy
@@ -32,6 +33,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 pytestmark = pytest.mark.cpu_only
 
@@ -109,6 +111,7 @@ def test_hugging_face_forward_projects_one_position_without_logits(
     # Hugging Face's forward runs the head, so it projects only the last position, and the logits stay empty.
     assert projected == [torch.Size([2, 1])]
     assert output.logits.shape[-1] == 0
+    assert not leaf_tensors_requiring_grad(output)
     torch.testing.assert_close(get_final_hidden_states(output), get_final_hidden_states(with_logits), rtol=0, atol=0)
 
 
@@ -132,6 +135,7 @@ def test_kimi_vl_without_logits_returns_its_output_without_return_dict():
     assert logits.shape == (2, 5, 16)
     assert output.logits.shape == (2, 5, 0)
     assert output.hidden_states is hidden_states
+    assert not leaf_tensors_requiring_grad(output)
 
 
 def test_loaded_hugging_face_class_takes_compute_logits():
@@ -169,6 +173,7 @@ def test_loaded_hugging_face_class_takes_compute_logits():
     torch.testing.assert_close(with_logits.logits, expected.logits, rtol=0, atol=0)
     assert projected == [torch.Size([2, 1])]
     assert output.logits.shape == (2, 1, 0)
+    assert not leaf_tensors_requiring_grad(output)
     torch.testing.assert_close(output.hidden_states[-1], expected.hidden_states[-1], rtol=0, atol=0)
 
 

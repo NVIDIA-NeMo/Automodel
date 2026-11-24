@@ -31,6 +31,7 @@ from nemo_automodel.components.models.flint.config import FlintConfig
 from nemo_automodel.components.models.flint.packing import _prepare_inputs_for_cp
 from tests.functional_tests.models.flint import run_packed_cp_logits as harness
 from tests.unit_tests.models.flint.conftest import tiny_backend, tiny_config
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 
 def _model():
@@ -84,6 +85,7 @@ def test_chunked_linear_loss_uses_final_hidden_only_and_shifts_targets_once() ->
     # The recipes' call skips the head and returns only the final FP32 hidden states.
     recipe_output = chunked(inputs, output_hidden_states=True, compute_logits=False)
     assert recipe_output.logits.shape == (1, 5, 0)
+    assert not leaf_tensors_requiring_grad(recipe_output)
     torch.testing.assert_close(recipe_output.hidden_states, hidden, atol=0, rtol=0)
     handle.remove()
     recipe_output = chunked(inputs, output_hidden_states=True, logits_to_keep=1)

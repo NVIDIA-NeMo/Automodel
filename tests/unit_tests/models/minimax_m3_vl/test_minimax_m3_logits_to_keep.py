@@ -28,6 +28,7 @@ import torch
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 from .conftest import (
     IMAGE_TOKEN_INDEX,
@@ -82,6 +83,7 @@ def test_compute_logits_false_returns_hidden_states_and_skips_lm_head(vlm_model)
     assert hidden.shape == (1, 16, hidden_size)
     assert hidden.shape[-1] != vocab, "lm_head was applied; the logits tensor was materialised"
     assert torch.isfinite(hidden).all()
+    assert not leaf_tensors_requiring_grad(out)
 
 
 def test_without_logits_to_keep_still_returns_logits(vlm_model):
