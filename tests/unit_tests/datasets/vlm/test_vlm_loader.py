@@ -71,10 +71,11 @@ def _collate_prefixed_examples(examples, *, processor, prefix):
 @dataclass
 class StaticDatasetConfig:
     events: list[str]
+    examples: list[dict[str, torch.Tensor]] | None = None
 
     def build(self):
         self.events.append("dataset")
-        return ["one", "two"]
+        return self.examples if self.examples is not None else ["one", "two"]
 
 
 class BuildContext:
@@ -207,6 +208,30 @@ def test_vlm_dataloader_rejects_processor_dependent_collator_without_processor(f
 
     with pytest.raises(ValueError, match="VLM dataloader for 'unused' requires a processor"):
         config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2)
+
+
+def test_vlm_dataloader_allows_processorless_pad_collator():
+    """A pad collator can consume pre-tokenized samples without a processor."""
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig(
+            [],
+            examples=[
+                {
+                    "input_ids": torch.tensor([3, 5, 8]),
+                    "attention_mask": torch.ones(3, dtype=torch.long),
+                    "labels": torch.tensor([3, 5, 8]),
+                }
+            ],
+        ),
+        processor_config=VlmProcessorConfig(factory=lambda: None),
+        collator=VlmCollatorConfig(factory=collate_fns.pad_collate_fn),
+        shuffle=False,
+        num_workers=1,
+    )
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+
+    assert next(iter(result.dataloader))["labels"].tolist() == [[5, 8]]
 
 
 def test_vlm_dataloader_allows_processorless_custom_collator():

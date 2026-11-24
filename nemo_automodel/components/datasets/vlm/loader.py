@@ -42,6 +42,7 @@ from nemo_automodel.components.datasets.packing import (
 )
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     COLLATE_FNS,
+    PROCESSOR_REQUIRED_COLLATE_FNS,
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
     pad_collate_fn,
@@ -439,7 +440,7 @@ class VlmDataloaderConfig:
         collator_factory = self.collator.factory if self.collator is not None else COLLATE_FNS["default"]
         while isinstance(collator_factory, partial):
             collator_factory = collator_factory.func
-        if processor is None and getattr(collator_factory, "__module__", None) == COLLATE_FNS["default"].__module__:
+        if processor is None and collator_factory in PROCESSOR_REQUIRED_COLLATE_FNS:
             raise ValueError(
                 f"VLM dataloader for {pretrained_model_name_or_path!r} requires a processor; "
                 "the selected built-in collator cannot run without one"

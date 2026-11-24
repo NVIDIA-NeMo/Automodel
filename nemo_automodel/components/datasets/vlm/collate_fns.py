@@ -2471,3 +2471,10 @@ COLLATE_FNS = {
     "LlavaOneVisionProcessor": llava_onevision_collate_fn,
     "default": default_collate_fn,
 }
+
+# Built-in VLM collators that consume the runtime processor.
+PROCESSOR_REQUIRED_COLLATE_FNS = (
+    *COLLATE_FNS.values(),
+    gemma4_prefix_collate_fn,
+    phi4_mm_collate_fn,
+)
