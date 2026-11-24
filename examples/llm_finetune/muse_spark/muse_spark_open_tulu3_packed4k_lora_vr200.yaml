@@ -1,0 +1,136 @@
+# Muse-Spark-open (822B) LoRA on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
+# EP32 on 8 nodes keeps ~51 GiB of frozen bf16 weights per GPU.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 20
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-models/Muse-Spark-open-816B-A42B
+  dtype: bfloat16
+  config:
+    residual_dtype: fp32
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te  # packed THD batches need te or magi; te avoids the MagiAttention build
+    linear: torch
+    rms_norm: torch_fp32
+    compile_norm: true
+    experts: torch_mm
+    dispatcher: hybridep
+    compile_router_weight: true
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.self_attn.q_proj"
+    - "*.self_attn.k_proj"
+    - "*.self_attn.v_proj"
+    - "*.self_attn.o_proj"
+    - "*.feed_forward.experts"
+  dim: 8
+  alpha: 32
+  dropout: 0.0
+  lora_dtype: bfloat16
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  multimodal:
+    frozen_sharding: per_layer
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  impl: cce
+  logit_softcapping: 20.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:20000]
+  shuffle_seed: 1234
+  seq_length: 4096
+  truncation: true
+  padding: false
+
+packed_sequence:
+  packed_sequence_size: 4096
+  packing_strategy: thd
+  pad_to_multiple_of: 64
+  num_proc: 8
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+  shuffle: true
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 1.0e-04
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  weight_decay: 0.0
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: true
+  exp_avg_dtype: bfloat16
+  exp_avg_sq_dtype: bfloat16
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: vrnvl72
+  recipe_owner: akoumpa
+  nodes: 8
+  nproc_per_node: 4
+  time: "01:00:00"
+  max_steps: 20
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
