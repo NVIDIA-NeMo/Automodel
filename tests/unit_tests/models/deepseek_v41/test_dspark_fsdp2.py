@@ -154,7 +154,7 @@ def _worker(rank: int, init_file: str, activation_checkpointing: bool, checkpoin
 
 
 @pytest.mark.runtime_budget(
-    45,
+    30,
     hard_timeout=70,
     reason="Spawns two FSDP workers, compiles draft forward/backward, and saves and restores a sharded checkpoint.",
 )
@@ -235,7 +235,7 @@ def _parity_worker(rank: int, init_file: str) -> None:
 
 
 @pytest.mark.runtime_budget(
-    45,
+    30,
     hard_timeout=70,
     reason="Spawns two FSDP workers and compares compiled draft gradients, clipping, and updates with an FP32 reference.",
 )
