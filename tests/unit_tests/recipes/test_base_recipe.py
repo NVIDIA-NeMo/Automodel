@@ -2276,7 +2276,7 @@ def test_finite_recipe_publishes_periodic_and_terminal_checkpoints_with_validati
     recipe._enable_qat_if_delayed = lambda step: None
     recipe._collect_moe_load_balance = lambda: None
     recipe._make_progress_bar = lambda: None
-    recipe.log_train_metrics = lambda sample: None
+    recipe.log_train_metrics = lambda sample, remote_log=None: None
     recipe._update_progress_bar = lambda *args: None
     recipe._maybe_collect_garbage = lambda: None
     recipe.metric_logger_train = SimpleNamespace(close=lambda: None)
@@ -2291,7 +2291,9 @@ def test_finite_recipe_publishes_periodic_and_terminal_checkpoints_with_validati
         loss.backward()
         recipe.optimizer.step()
         return MetricsSample(
-            step=recipe.step_scheduler.step, epoch=recipe.step_scheduler.epoch, metrics={"loss": loss.item()}
+            step=recipe.step_scheduler.step,
+            epoch=recipe.step_scheduler.epoch,
+            metrics={"loss": loss.item(), "num_tokens_per_step": sum(batch.numel() for batch in batches)},
         )
 
     def validate(loader):
@@ -2309,6 +2311,13 @@ def test_finite_recipe_publishes_periodic_and_terminal_checkpoints_with_validati
     recipe._run_train_optim_step = train_step
     recipe._run_validation_epoch = validate
     if recipe_kind == "llm":
+        # The LLM loop reports step metrics through train_ft's deferred reporter.
+        recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
+        recipe.pack_size = None
+        recipe._moe_layer_loads = None
+        recipe._training_step_reporter = MethodType(recipe_type._training_step_reporter, recipe)
+        recipe._emit_train_metrics = MethodType(recipe_type._emit_train_metrics, recipe)
+        recipe._snapshot_moe_metrics = MethodType(recipe_type._snapshot_moe_metrics, recipe)
         recipe.val_dataloaders = {"default": validation_loader}
         recipe.metric_logger_valid = {"default": logger}
         recipe.log_val_metrics = lambda name, sample, logger: validation_logs.append(sample)

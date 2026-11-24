@@ -23,6 +23,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers.modeling_outputs import CausalLMOutput
 
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.token_normalization import normalize_token_loss
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
@@ -107,18 +108,20 @@ def test_recipe_releases_unused_outputs_before_backward(output_kind, dtype, reco
             input_ids = torch.randint(19, (2, 7))
             labels = torch.randint(19, (2, 7))
             labels[:, :2] = -100
+            # The recipe passes the count as a device scalar and normalizes with
+            # normalize_token_loss, whose numerics test_token_normalization pins.
             count = (labels != -100).sum()
             output = reference(input_ids)
             logits = output if output_kind == "tensor" else output.logits
-            expected = F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum") / count
+            expected = normalize_token_loss(
+                F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum"), count
+            )
             if output_kind == "mtp":
                 shifted = labels.roll(-1, -1)
                 shifted[:, -1] = -100
-                expected = (
-                    expected
-                    + 0.3
-                    * F.cross_entropy(output.mtp_per_depth_logits[0].flatten(0, 1), shifted.flatten(), reduction="sum")
-                    / count
+                expected = expected + 0.3 * normalize_token_loss(
+                    F.cross_entropy(output.mtp_per_depth_logits[0].flatten(0, 1), shifted.flatten(), reduction="sum"),
+                    count,
                 )
             expected.backward()
             losses = []
