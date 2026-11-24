@@ -1,7 +1,7 @@
 # Muse-Spark-open (822B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
 # EP64 on 16 nodes, the fewest that fit (256 experts rule out 12 nodes), holds ~120 GiB of bf16
 # weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU; 16K-token packs bring
-# the estimated peak to ~170 GiB (~60%).
+# the measured peak to 168 GiB (60%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
@@ -80,7 +80,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: train[:20000]
+  split: train[:30000]  # 20000 samples fill only 16 of the 20 steps of 64 x 16K packs
   shuffle_seed: 1234
   seq_length: 4096
   truncation: true
@@ -120,7 +120,7 @@ ci:
   recipe_owner: akoumpa
   nodes: 16
   nproc_per_node: 4
-  time: "00:45:00"
+  time: "00:30:00"
   max_steps: 20
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

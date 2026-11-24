@@ -80,7 +80,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: train[:20000]
+  split: train[:30000]  # 20000 samples fill only 17 of the 20 steps of 48 x 16K packs
   shuffle_seed: 42
   seq_length: 4096
   padding: false
