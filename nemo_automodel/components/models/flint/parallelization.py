@@ -28,9 +28,16 @@ from transformers.modeling_utils import PreTrainedModel
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.flint.config import FlintConfig
 from nemo_automodel.components.models.flint.layers import FlintDecoderLayer
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+
+# The vocabulary head computes in FP32 whatever its logits_dtype. LMHead casts its own logits to that dtype,
+# so FSDP leaves the output alone.
+_FP32_HEAD_POLICY = MixedPrecisionPolicy(
+    param_dtype=torch.float32, reduce_dtype=torch.float32, cast_forward_inputs=False
+)
 
 
 class FlintModelParallelizer(ModelParallelizer):
@@ -159,16 +166,11 @@ class FlintModelParallelizer(ModelParallelizer):
                 ignored_params=ignored_params,
             )
             return module
-        if isinstance(inner, nn.Linear) and getattr(inner, "_flint_fp32_output_head", False):
+        if isinstance(inner, LMHead):
             # Only the model-owned vocabulary head has this strict boundary.
             # Mixed-storage LoRA can also make projection/adapter linears
             # standalone FSDP units; they retain the caller's shared policy.
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.float32,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
-                cast_forward_inputs=False,
-            )
+            mp_policy = _FP32_HEAD_POLICY
         elif isinstance(inner, PreTrainedModel) and inner.config_class is FlintConfig and mp_policy is not None:
             head = inner.get_output_embeddings()
             if head is not None and not isinstance(head, FSDPModule):
@@ -178,16 +180,11 @@ class FlintModelParallelizer(ModelParallelizer):
                 fully_shard(
                     head,
                     mesh=mesh,
-                    mp_policy=MixedPrecisionPolicy(
-                        param_dtype=torch.float32,
-                        reduce_dtype=torch.float32,
-                        output_dtype=torch.float32,
-                        cast_forward_inputs=False,
-                    ),
+                    mp_policy=_FP32_HEAD_POLICY,
                     offload_policy=offload_policy,
                     reshard_after_forward=False,
                 )
-            # The outer root must preserve the head's FP32 logits in the
+            # The outer root must preserve the head's logits dtype in the
             # structured model output, even if bulk block outputs use BF16.
             # Its own bulk parameter/reduction precision is left unchanged.
             mp_policy = replace(mp_policy, output_dtype=None)

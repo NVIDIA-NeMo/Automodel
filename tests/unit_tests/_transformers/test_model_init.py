@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import types
-from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -44,6 +43,7 @@ from nemo_automodel._transformers.model_init import (
     get_hf_config,
 )
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.utils import BackendConfig, generation_config_from_model_config
 
 
@@ -214,7 +214,9 @@ class TestBackendModuleOverrides:
             )
 
         assert is_custom is True
-        assert sum(isinstance(module, FakeQuackLinear) for module in model.modules()) == 8
+        # The LM head owns its projection (logits_dtype) and does not take the linear backend.
+        assert type(model.lm_head) is LMHead
+        assert sum(isinstance(module, FakeQuackLinear) for module in model.modules()) == 7
         assert sum(type(module) is nn.Linear for module in model.modules()) == 0
         assert sum(isinstance(module, FakeQuackRMSNorm) for module in model.modules()) == 3
         assert sum(type(module) is nn.RMSNorm for module in model.modules()) == 0
@@ -316,7 +318,9 @@ class TestBackendModuleOverrides:
             )
 
         assert is_custom is True
-        assert sum(isinstance(module, FakeQuackLinear) for module in model.modules()) == 8
+        # The LM head owns its projection (logits_dtype) and does not take the linear backend.
+        assert type(model.lm_head) is LMHead
+        assert sum(isinstance(module, FakeQuackLinear) for module in model.modules()) == 7
         assert sum(type(module) is nn.Linear for module in model.modules()) == 0
         assert sum(isinstance(module, FakeQuackRMSNorm) for module in model.modules()) == 3
 

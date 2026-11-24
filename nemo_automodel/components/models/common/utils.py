@@ -26,12 +26,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
 
 import torch
 from torch import nn
-from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
@@ -1655,103 +1653,6 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
             module._buffers[buffer_name] = buf.to(torch.float32)
 
 
-def compute_lm_head_logits(
-    lm_head: nn.Module | None,
-    hidden_states: torch.Tensor,
-    logits_to_keep: int | torch.Tensor = 0,
-    is_thd: bool = False,
-    fp32_lm_head: bool = False,
-    output_hidden_states: bool = False,
-) -> CausalLMOutputWithPast:
-    """Project hidden states through ``lm_head`` and wrap the result.
-
-    Centralizes the lm_head projection and output packaging shared by every
-    custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` ``forward()``. The
-    returned ``CausalLMOutputWithPast`` carries the projected ``logits`` and,
-    when requested, the final ``hidden_states``; callers that also need ``loss``,
-    ``past_key_values``, etc. read ``.logits`` and build their own output.
-
-    - ``lm_head is None`` (e.g. a non-final pipeline-parallel stage that does not
-      own the head): ``hidden_states`` is passed through as ``logits`` so the
-      next stage receives it.
-    - ``logits_to_keep == 0`` (training default): every position is projected.
-      The full range is deliberately *not* sliced, because ``slice(0, None)`` on
-      a DTensor is unsupported (it raises on the ``aten.alias`` op under tensor
-      parallel with sequence parallelism).
-    - ``logits_to_keep`` as a positive int or a tensor of indices: only the
-      requested positions are projected. Both 2D ``[T, H]`` (THD/packed) and 3D
-      ``[B, S, H]`` (BSHD) hidden states are handled.
-    - ``is_thd``: THD/packed inputs yield 2D ``[T, V]`` logits; the leading batch
-      dim is restored (``unsqueeze(0)`` -> ``[1, T, V]``) so downstream code sees
-      a uniform ``[B, S, V]`` layout. The same restoration is applied to the
-      ``hidden_states`` field. Only applied while the tensor is still 2D, so an
-      ``inputs_embeds`` path that already produced ``[1, T, *]`` is left
-      untouched.
-    - ``fp32_lm_head``: run the projection in fp32 and cast the logits back to
-      the input dtype. Used by models whose ``lm_head.weight`` has been promoted
-      to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
-      through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
-      ``F.linear`` so DTensor redistribution is preserved.
-    - Otherwise, cast the sliced input to the head's effective compute dtype.
-      For a standalone FSDP2 head this comes from its mixed-precision policy,
-      since its sharded weight may still expose the master-copy dtype before the
-      forward pre-hook runs. Other heads use their materialized weight dtype.
-    - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
-      ``hidden_states`` are attached to the output so the fused cross-entropy
-      path can recompute logits over every position; otherwise the field is
-      ``None``.
-
-    Args:
-        lm_head: The language-model head module, or ``None`` on a pipeline stage
-            that does not own it.
-        hidden_states: Final hidden states, shaped ``[T, H]`` or ``[B, S, H]``.
-        logits_to_keep: ``0`` to project every position; a positive int to keep
-            the last ``N`` positions; or a tensor of position indices.
-        is_thd: Whether the inputs were THD/packed; if so, a 2D logits (and
-            hidden-states) result is unsqueezed back to a leading batch dim of 1.
-        fp32_lm_head: Project in fp32 and cast the result back to the input
-            dtype. Ignored when ``lm_head`` is ``None``.
-        output_hidden_states: Attach the final hidden states to the output.
-
-    Returns:
-        A ``CausalLMOutputWithPast`` whose ``logits`` are the projected logits
-        (or ``hidden_states`` unchanged when ``lm_head`` is ``None``) and whose
-        ``hidden_states`` are the final hidden states when ``output_hidden_states``
-        is set, else ``None``.
-    """
-    if lm_head is None:
-        logits = hidden_states
-    else:
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            sliced = hidden_states
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                sliced = hidden_states[slice_indices, :]
-            else:
-                sliced = hidden_states[:, slice_indices, :]
-        if fp32_lm_head:
-            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-                logits = lm_head(sliced.float()).to(hidden_states.dtype)
-        else:
-            compute_dtype = None
-            if isinstance(lm_head, FSDPModule):
-                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
-            lm_head_weight = getattr(lm_head, "weight", None)
-            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
-                compute_dtype = lm_head_weight.dtype
-            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
-            logits = lm_head(projection_input)
-    if is_thd and logits.dim() == 2:
-        logits = logits.unsqueeze(0)
-
-    hidden_out = None
-    if output_hidden_states:
-        hidden_out = hidden_states.unsqueeze(0) if is_thd and hidden_states.dim() == 2 else hidden_states
-
-    return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
-
-
 def prepare_frozen_parameters_for_sharding(
     model: nn.Module,
     compute_dtype: torch.dtype | None,
@@ -1957,7 +1858,6 @@ __all__ = [
     "TEQuantizationConfig",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
-    "compute_lm_head_logits",
     "get_is_first_microbatch",
     "get_is_optim_step",
     "get_rope_config",

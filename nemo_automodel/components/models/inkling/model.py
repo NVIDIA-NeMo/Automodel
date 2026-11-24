@@ -26,6 +26,7 @@ from transformers.utils import ModelOutput
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -118,10 +119,10 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         config: InklingConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs: Any,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        del kwargs
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
         self.backend = backend or BackendConfig()
@@ -139,7 +140,9 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         self.model.moe_config = self.moe_config
 
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype)
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype
+        )
         self.vocab_size = text_config.vocab_size
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = InklingStateDictAdapter(
@@ -210,7 +213,13 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             outputs_meta = (torch.empty(*hidden_shape, device="meta", dtype=dtype),)
         else:
             outputs_meta = (
-                torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=self.lm_head.weight.dtype),
+                torch.empty(
+                    microbatch_size,
+                    seq_len,
+                    vocab_size,
+                    device="meta",
+                    dtype=self.lm_head.logits_dtype or self.lm_head.weight.dtype,
+                ),
             )
         return inputs_meta, outputs_meta
 
@@ -283,8 +292,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             return hidden_states
 
         hidden_states = hidden_states / self.config.text_config.logits_mup_width_multiplier
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         unpadded_vocab_size = self.config.text_config.unpadded_vocab_size
         if unpadded_vocab_size is not None and unpadded_vocab_size < logits.shape[-1]:
             logits = logits[..., :unpadded_vocab_size].contiguous()
