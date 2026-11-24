@@ -362,6 +362,11 @@ def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expe
     assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
 
 
+def test_get_device_flops_recognizes_vr200():
+    """VR200 reports "NVIDIA VR NVL72"; an unknown name would make every step log MFU 0."""
+    assert get_device_flops(unit="T", device_name="NVIDIA VR NVL72") == 4000.0
+
+
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):
     monkeypatch.setattr(mfu_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(mfu_module.torch.cuda, "current_device", lambda: 3)
