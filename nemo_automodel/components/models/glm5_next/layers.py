@@ -696,8 +696,8 @@ class Glm5NextKPoolIndexer(nn.Module):
                 pool_keys,
                 weights,
                 query_positions,
-                self.index_kpool,
-                self.softmax_scale * (self.n_heads**-0.5),
+                pool_size=self.index_kpool,
+                scale=self.softmax_scale * (self.n_heads**-0.5),
             )
         else:
             queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)

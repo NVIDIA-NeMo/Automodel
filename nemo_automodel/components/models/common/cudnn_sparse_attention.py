@@ -372,6 +372,7 @@ def cudnn_indexer_scores(
     pool_keys: torch.Tensor,
     weights: torch.Tensor,
     query_positions: torch.Tensor,
+    *,
     pool_size: int,
     scale: float,
 ) -> torch.Tensor:

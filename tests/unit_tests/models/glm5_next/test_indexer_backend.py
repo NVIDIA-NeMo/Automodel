@@ -43,7 +43,7 @@ def test_empty_index_scores_need_no_kernel(queries: int, pools: int) -> None:
     k = torch.empty((pools, 128), device="cuda", dtype=torch.bfloat16)
     w = torch.empty((1, queries, 32), device="cuda", dtype=torch.bfloat16)
     positions = torch.arange(queries, device="cuda")
-    scores = cudnn_indexer_scores(q, k, w, positions, 4, 1 / 64)
+    scores = cudnn_indexer_scores(q, k, w, positions, pool_size=4, scale=1 / 64)
     assert scores.shape == (1, queries, pools)
     assert scores.dtype == torch.float32
     assert scores.device == q.device
@@ -95,7 +95,7 @@ def test_cudnn_indexer_scores_and_selection_match_fp32_oracle(query_start: int) 
         * scale
     )
     visible = pool_indices[:, -1][None, :] <= positions[:, None]
-    actual = cudnn_indexer_scores(queries, pool_keys, weights, positions, pool, scale)[0]
+    actual = cudnn_indexer_scores(queries, pool_keys, weights, positions, pool_size=pool, scale=scale)[0]
     assert actual.dtype == torch.float32 and actual.shape == oracle.shape
     assert torch.isneginf(actual[~visible]).all(), "future pools must be unselectable"
     observed, reference = actual[visible].double(), oracle[visible].double()
