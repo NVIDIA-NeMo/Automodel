@@ -321,6 +321,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.hy_v3.model", "HYV3ForCausalLM"),
         ),
         (
+            "HYV4FlashForConditionalGeneration",
+            ("nemo_automodel.components.models.hy_v4_flash.model", "HY4FlashForConditionalGeneration"),
+        ),
+        (
             "HyMT2ForCausalLM",
             ("nemo_automodel.components.models.hy_mt2.model", "HyMT2ForCausalLM"),
         ),
@@ -537,6 +541,7 @@ _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
     "kimi_k31": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
     "lfm3_vl": ("nemo_automodel.components.models.lfm3.processing", "Lfm3VlProcessor"),
+    "hy_v4_flash": ("nemo_automodel.components.models.hy_v4_flash.processing", "HY4FlashProcessor"),
 }
 
 # model_types whose custom model implementation should win over a transformers
