@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import (
     cudnn_indexer_scores,
     cudnn_sparse_attention,
@@ -795,7 +794,7 @@ class Glm5NextSparseAttention(nn.Module):
     query_chunk_size = 32
     indexer_query_chunk_size = 2048
 
-    def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
+    def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: Glm5NextBackendConfig) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -828,8 +827,7 @@ class Glm5NextSparseAttention(nn.Module):
             dtype=dtype,
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False, dtype=dtype)
-        indexer_backend = backend.indexer if isinstance(backend, Glm5NextBackendConfig) else "torch"
-        self.indexer = Glm5NextKPoolIndexer(config, layer_idx, dtype, backend=indexer_backend)
+        self.indexer = Glm5NextKPoolIndexer(config, layer_idx, dtype, backend=backend.indexer)
         self._cp_mesh = None
 
     def setup_cp_attention(self, cp_mesh) -> None:
@@ -1120,7 +1118,7 @@ class Glm5NextDecoderLayer(nn.Module):
         config: Glm5NextTextConfig,
         layer_idx: int,
         moe_config: MoEConfig,
-        backend: BackendConfig,
+        backend: Glm5NextBackendConfig,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -1150,9 +1148,8 @@ class Glm5NextDecoderLayer(nn.Module):
         self.post_attention_layernorm = Glm5NextRMSNorm(
             config.hidden_size, config.rms_norm_eps, dtype, compile_norm=backend.compile_norm
         )
-        sinkhorn_backend = backend.sinkhorn if isinstance(backend, Glm5NextBackendConfig) else "torch"
-        self.attn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=sinkhorn_backend, compile_hc=backend.compile_hc)
-        self.ffn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=sinkhorn_backend, compile_hc=backend.compile_hc)
+        self.attn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=backend.sinkhorn, compile_hc=backend.compile_hc)
+        self.ffn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=backend.sinkhorn, compile_hc=backend.compile_hc)
         _, _, self._expand_core = hc_cores(backend.compile_hc)
 
     def forward(

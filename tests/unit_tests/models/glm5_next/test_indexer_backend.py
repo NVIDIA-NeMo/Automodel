@@ -15,7 +15,8 @@ from nemo_automodel.components.models.common.cudnn_sparse_attention import (
 from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.layers import Glm5NextKPoolIndexer, Glm5NextSparseAttention
-from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
+from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
+from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_shared_backend
 
 
 @pytest.mark.parametrize("indexer", ["torch", "cudnn"])
@@ -26,8 +27,8 @@ def test_indexer_backend_is_independent_of_attention(indexer: str) -> None:
 
 
 def test_shared_backend_preserves_torch_indexer() -> None:
-    module = Glm5NextSparseAttention(tiny_glm5_next_config().text_config, 3, tiny_backend())
-    assert module.indexer.backend == "torch"
+    model = Glm5NextForConditionalGeneration(tiny_glm5_next_config(), backend=tiny_shared_backend())
+    assert model.language_model.layers["3"].self_attn.indexer.backend == "torch"
 
 
 def test_unknown_indexer_is_rejected() -> None:

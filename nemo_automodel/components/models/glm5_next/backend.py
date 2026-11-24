@@ -14,6 +14,8 @@
 
 """Runtime backend configuration owned by GLM-5.3-Flash."""
 
+import copy
+import dataclasses
 from dataclasses import dataclass
 from typing import Literal
 
@@ -34,6 +36,24 @@ class Glm5NextBackendConfig(BackendConfig):
 
     sinkhorn: Literal["torch", "tilelang"] = "torch"
     indexer: Literal["torch", "cudnn"] = "torch"
+
+    @classmethod
+    def from_backend(cls, backend: BackendConfig) -> "Glm5NextBackendConfig":
+        """Return a private GLM config carrying ``backend``'s values.
+
+        The model accepts the shared ``BackendConfig``, which has no ``sinkhorn`` or ``indexer``
+        field; those take their ``"torch"`` defaults here, once, so layers read them directly.
+        Every shared field is copied by value, and ``__post_init__`` re-validates it.
+
+        Args:
+            backend: A shared ``BackendConfig`` or a ``Glm5NextBackendConfig``.
+
+        Returns:
+            A new ``Glm5NextBackendConfig``; a ``Glm5NextBackendConfig`` input is shallow-copied.
+        """
+        if isinstance(backend, cls):
+            return copy.copy(backend)
+        return cls(**{f.name: getattr(backend, f.name) for f in dataclasses.fields(BackendConfig) if f.init})
 
     def __post_init__(self) -> None:
         super().__post_init__()

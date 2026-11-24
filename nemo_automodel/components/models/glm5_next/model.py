@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -167,7 +166,7 @@ class Glm5NextTextModel(nn.Module):
     def __init__(
         self,
         config: Glm5NextTextConfig,
-        backend: BackendConfig,
+        backend: Glm5NextBackendConfig,
         *,
         moe_config: MoEConfig | None = None,
         moe_overrides: dict[str, Any] | None = None,
@@ -273,7 +272,7 @@ class Glm5NextModel(nn.Module):
     def __init__(
         self,
         config: Glm5NextConfig,
-        backend: BackendConfig,
+        backend: Glm5NextBackendConfig,
         *,
         moe_config: MoEConfig | None = None,
         moe_overrides: dict[str, Any] | None = None,
@@ -364,7 +363,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         # Match PreTrainedModel behavior so consolidated HF exports preserve
         # generation defaults even for this native nn.Module implementation.
         self.generation_config = generation_config_from_model_config(config)
-        self.backend = copy.copy(backend) if backend is not None else Glm5NextBackendConfig()
+        self.backend = Glm5NextBackendConfig.from_backend(backend) if backend is not None else Glm5NextBackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
         self.model = Glm5NextModel(

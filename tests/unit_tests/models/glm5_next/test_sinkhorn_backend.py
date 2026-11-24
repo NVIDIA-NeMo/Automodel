@@ -14,13 +14,14 @@
 
 """CPU contracts for the optional GLM Sinkhorn backend and mHC precision."""
 
-from dataclasses import asdict
+from dataclasses import asdict, fields, replace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
 from nemo_automodel.components.models.glm5_next.layers import Glm5NextDecoderLayer, Glm5NextHyperConnection
@@ -28,7 +29,7 @@ from nemo_automodel.components.models.glm5_next.model import (
     Glm5NextForConditionalGeneration,
     build_glm5_next_moe_config,
 )
-from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
+from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_shared_backend
 
 
 class _IdentityUpdate(nn.Module):
@@ -97,9 +98,30 @@ def test_model_threads_independent_sinkhorn_backend(sinkhorn: str) -> None:
 
 
 def test_existing_shared_backend_preserves_torch_sinkhorn() -> None:
-    model = Glm5NextForConditionalGeneration(tiny_glm5_next_config(), backend=tiny_backend())
+    model = Glm5NextForConditionalGeneration(tiny_glm5_next_config(), backend=tiny_shared_backend())
     assert all(layer.attn_hc._fp32_params.sinkhorn_backend == "torch" for layer in model.language_model.layers.values())
-    assert Glm5NextBackendConfig(**asdict(tiny_backend())).sinkhorn == "torch"
+    assert model.backend.sinkhorn == "torch"
+
+
+def test_shared_backend_upgrade_keeps_every_shared_value() -> None:
+    shared = replace(
+        tiny_shared_backend(adapter=False),
+        compile_hc=True,
+        compile_norm=True,
+        dispatcher_num_sms=7,
+        fake_balanced_gate=True,
+        enable_fsdp_optimizations=True,
+        shared_expert_overlap=True,
+        gate_precision=torch.float16,
+    )
+    for upgraded in (
+        Glm5NextBackendConfig.from_backend(shared),
+        Glm5NextForConditionalGeneration(tiny_glm5_next_config(), backend=shared).backend,
+    ):
+        assert isinstance(upgraded, Glm5NextBackendConfig)
+        assert (upgraded.sinkhorn, upgraded.indexer) == ("torch", "torch")
+        for field in fields(BackendConfig):
+            assert getattr(upgraded, field.name) == getattr(shared, field.name), field.name
 
 
 def test_invalid_sinkhorn_backend_is_rejected() -> None:
