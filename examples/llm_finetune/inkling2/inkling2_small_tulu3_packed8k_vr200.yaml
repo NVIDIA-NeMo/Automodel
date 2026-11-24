@@ -1,7 +1,8 @@
 # Inkling-2-Small (594B) full SFT on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP32 on 8 nodes, the fewest that fit, holds ~173 GiB of bf16 weights, gradients and FusedAdam
-# state (param remainders plus bf16 moments, 10 bytes per parameter) per GPU; 32K-token packs
-# bring the estimated peak to ~210 GiB (~75%).
+# EP32 on 8 nodes, the fewest that fit, holds ~69 GiB of bf16 weights and gradients plus ~104 GiB
+# of TE FusedAdam state (param remainders plus bf16 moments) per GPU. Measured activations are
+# ~3.2 GiB per 1K tokens, so 32K packs run out of memory at the first step that holds optimizer
+# state; 8K packs keep the estimated peak near 200 GiB allocated.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
@@ -72,7 +73,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
-  split: train[:60000]
+  split: train[:20000]
   shuffle_seed: 1234
   seq_length: 4096
   truncation: true
@@ -84,7 +85,7 @@ dataset:
     eos_token: <|content_model_end_sampling|>
 
 packed_sequence:
-  packed_sequence_size: 32768
+  packed_sequence_size: 8192
   packing_strategy: thd
   pad_to_multiple_of: 64
   num_proc: 8
