@@ -88,7 +88,6 @@ def mock_config(monkeypatch):
     config = ConfigNamespace(
         benchmark=SimpleNamespace(
             warmup_steps=10,
-            peak_tflops=989,
             nsys_start=-1,
             nsys_end=-1,
             nsys_ranks=[],
@@ -192,14 +191,21 @@ class TestBenchmarkingRecipeInitialization:
         ):
             assert instruction in notices[0]
 
-    def test_init_extracts_benchmark_params(self, mock_config):
+    @pytest.mark.parametrize("peak_tflops", [None, 989])
+    def test_init_extracts_benchmark_params(self, mock_config, peak_tflops):
         """Test that __init__ correctly extracts benchmarking parameters from benchmark section."""
+        if peak_tflops is not None:
+            mock_config.benchmark.peak_tflops = peak_tflops
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
-            recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+            if peak_tflops is None:
+                recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+            else:
+                with pytest.warns(FutureWarning, match=r"benchmark\.peak_tflops is deprecated"):
+                    recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
 
             assert recipe._bench_steps == 30  # from step_scheduler.max_steps
             assert recipe._bench_warmup_steps == 10  # from benchmark.warmup_steps
-            assert recipe._bench_peak_tflops == 989  # from benchmark.peak_tflops
+            assert recipe._bench_peak_tflops == peak_tflops
             assert recipe._bench_nsys_start == -1  # from benchmark.nsys_start
             assert recipe._bench_nsys_end == -1  # from benchmark.nsys_end
             assert recipe._bench_nsys_ranks == []  # from benchmark.nsys_ranks
@@ -436,9 +442,12 @@ class TestBenchmarkingRecipeSetup:
 
             assert mock_recipe.val_dataloader is None
 
+    @pytest.mark.parametrize("override, expected_peak", [(None, 1979.0), (989, 989)])
     @patch("nemo_automodel.recipes.llm.benchmark.get_flops_formula_for_hf_config")
-    def test_setup_calculates_tflops(self, mock_get_flops, mock_recipe):
+    def test_setup_calculates_tflops(self, mock_get_flops, mock_recipe, override, expected_peak):
         """Test that setup calculates TFLOPs correctly."""
+        mock_recipe._bench_peak_tflops = override
+        mock_recipe.mfu_calculator = SimpleNamespace(reference_mfu=1979.0)
         expected_flops = 1e15
         mock_flops_formula = MagicMock(return_value=expected_flops)
         mock_get_flops.return_value = mock_flops_formula
@@ -448,6 +457,7 @@ class TestBenchmarkingRecipeSetup:
 
             expected_tflops = expected_flops / (10**12)
             assert mock_recipe.tflops == expected_tflops
+            assert mock_recipe._bench_peak_tflops == expected_peak
             mock_flops_formula.assert_called_once()
 
 
@@ -846,9 +856,9 @@ class TestBenchmarkingRecipeJSONOutput:
 
             assert recipe._bench_json_output_path is None
 
-    @pytest.mark.parametrize("scope", ["model", "text"])
+    @pytest.mark.parametrize("scope, peak_tflops", [("model", 989), ("text", 989), ("model", float("inf"))])
     def test_log_benchmark_summary_creates_json_file(
-        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, tmp_path: Path, scope: str
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, tmp_path: Path, scope: str, peak_tflops: float
     ) -> None:
         """Test that benchmark summary is written to JSON file."""
         json_file = tmp_path / "benchmark_summary.json"
@@ -865,7 +875,7 @@ class TestBenchmarkingRecipeJSONOutput:
         }
 
         with patch("torch.distributed.barrier"):
-            mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=989, rank=0)
+            mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=peak_tflops, rank=0)
 
         # Verify JSON file was created
         assert json_file.exists()
@@ -880,7 +890,7 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["total_steps"] == 30
         assert summary_data["warmup_steps"] == 10
         assert summary_data["training_steps"] == 20
-        assert summary_data["peak_tflops"] == 989
+        assert summary_data["peak_tflops"] == (989 if peak_tflops == 989 else None)
         assert summary_data["world_size"] == 8
         assert summary_data["tflops_total"] == mock_recipe.tflops
         assert summary_data["tflops_per_gpu"] == mock_recipe.tflops / 8
@@ -888,7 +898,9 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["local_batch_size"] == 4
         assert summary_data["seq_len"] == 2048
         assert summary_data["avg_iter_time_seconds"] == pytest.approx(10.0 / 20)
-        assert summary_data["avg_mfu_percent"] == pytest.approx(mock_recipe.tflops / (8 * (10.0 / 20) * 989) * 100)
+        assert summary_data["avg_mfu_percent"] == pytest.approx(
+            mock_recipe.tflops / (8 * (10.0 / 20) * peak_tflops) * 100
+        )
 
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""

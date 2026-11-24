@@ -291,6 +291,8 @@ Remove `mfu.peak_tflops` from existing YAML to enable automatic selection. If
 that was the only key under `mfu:`, remove the entire section. During the
 deprecation period, an explicit `peak_tflops` still takes precedence and emits
 a warning. You can use `mfu.device` to override the detected device name.
+Legacy benchmark recipes also detect the peak automatically when you remove
+`benchmark.peak_tflops`.
 
 MFU uses one dense reference peak for the whole workload. Layers that run in a
 different dtype and custom kernels that mix precisions can affect the
