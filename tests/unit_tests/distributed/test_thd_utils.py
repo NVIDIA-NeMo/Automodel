@@ -790,4 +790,4 @@ def test_process_input_for_thd_pad_between_seqs_and_passthrough():
     result = process_input_for_thd(batch)
     assert isinstance(result["pad_between_seqs"], bool)
     assert result["pad_between_seqs"] is True
-    assert result["custom_metadata_tag"] == "non_tensor_passthrough"
+    assert result.get("custom_metadata_tag") == "non_tensor_passthrough"
