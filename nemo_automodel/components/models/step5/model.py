@@ -520,8 +520,10 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
         pixel_values: torch.Tensor | None = None,
         patch_pixel_values: torch.Tensor | None = None,
         num_patches: torch.Tensor | list[int] | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        output_hidden_states: bool = False,
         **kwargs: ConfigValue | torch.Tensor,
-    ) -> CausalLMOutputWithPast:
+    ) -> CausalLMOutputWithPast | torch.Tensor:
         """Inject projected crop/overview tokens and run the text backbone.
 
         Args:
@@ -530,10 +532,15 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
             pixel_values: Optional tensor of shape [images, channels, height, width].
             patch_pixel_values: Optional tensor of shape [crops, channels, height, width].
             num_patches: Crop counts of shape [images], or equivalent list.
-            **kwargs: Tensor and scalar arguments from Step5ForCausalLM.forward.
+            logits_to_keep: Last-token count, or a tensor of shape
+                [selected_sequence] with sequence indices to project. Zero keeps all positions.
+            output_hidden_states: Attach final hidden states for native fused CE.
+            **kwargs: Tensor and scalar arguments with the layouts documented by Step5ForCausalLM.forward.
 
         Returns:
-            Language output with logits of shape [batch, local_sequence, vocab].
+            Language output with logits of shape [batch, selected_sequence, vocab]
+            and optional hidden states of shape [batch, local_sequence, hidden].
+            Native fused-loss pipeline stages return the hidden-state tensor directly.
         """
         if pixel_values is not None:
             if input_ids is None or inputs_embeds is not None:
@@ -577,7 +584,13 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
             inputs_embeds[mask] = visual[local_numbers].to(inputs_embeds.dtype)
         elif patch_pixel_values is not None:
             raise ValueError("Crop inputs require overview pixel_values")
-        return super().forward(input_ids, inputs_embeds=inputs_embeds, **kwargs)
+        return super().forward(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            logits_to_keep=logits_to_keep,
+            output_hidden_states=output_hidden_states,
+            **kwargs,
+        )
 
 
 ModelClass = Step5ForCausalLM

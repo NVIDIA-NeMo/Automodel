@@ -14,9 +14,9 @@
 
 import collections
 import copy
-import os
 import sys
 import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -957,17 +957,15 @@ class TestFusedAdamCachedListsPatch:
         assert optimizer.__dict__["_nemo_fused_adam_plans"][0] is te_patches_module._FUSED_ADAM_NO_PLAN
         assert optimizer.original_calls == 4
 
-    def test_dtensor_parameters_hand_their_local_shards_to_the_kernel(self, monkeypatch):
+    def test_dtensor_parameters_hand_their_local_shards_to_the_kernel(self, monkeypatch, tmp_path: Path):
         dist = pytest.importorskip("torch.distributed")
         if not dist.is_available():
             pytest.skip("torch.distributed unavailable")
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
-        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
-        monkeypatch.setenv("MASTER_PORT", str(29500 + os.getpid() % 1000))
         if not dist.is_initialized():
-            dist.init_process_group("gloo", rank=0, world_size=1)
+            dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'process-group'}", rank=0, world_size=1)
         try:
             mesh = init_device_mesh("cpu", (1,))
             _, FusedAdam, calls = self._patched_module(monkeypatch)
