@@ -69,12 +69,19 @@ include = [
     "nemo_automodel/components/flow_matching/**",
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
+    "nemo_automodel/components/moe/load_balance_metrics.py",
     "nemo_automodel/components/optim/**",
     "nemo_automodel/components/utils/**",
     "nemo_automodel/components/quantization/**",
     "nemo_automodel/components/training/**",
     "nemo_automodel/components/distributed/config.py",
+    "nemo_automodel/components/distributed/grad_utils.py",
+    "nemo_automodel/components/distributed/init_utils.py",
+    "nemo_automodel/components/distributed/tensor_utils.py",
+    "nemo_automodel/components/distributed/utils.py",
     "nemo_automodel/components/eval/tool_call_evaluator.py",
+    "nemo_automodel/components/loss/kd_loss.py",
+    "nemo_automodel/components/datasets/reservoir_sampler.py",
 ]
 
 [overrides.rules]

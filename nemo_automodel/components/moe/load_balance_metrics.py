@@ -41,9 +41,62 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections.abc import Mapping
+from typing import TypedDict
 
 import torch
 import torch.nn as nn
+
+
+class ExpertLoadRecord(TypedDict):
+    """Most recent routing statistics of one MoE ``Gate``.
+
+    Attributes:
+        expert_load: Tensor of shape [n_experts], indexed by routed-expert ID,
+            holding the number of tokens routed to each expert in the Gate's
+            last forward. The Gate produces int64 counts on the routing device;
+            float counts are also accepted because consumers convert with
+            ``.float()``. Detached from autograd. When collected with a
+            ``dp_group`` it is a new tensor summed over that group (global
+            counts); otherwise it is the rank-local tensor stored on the Gate
+            (aliased, not copied).
+        aux_loss: Tensor of shape [] (a detached scalar) holding the
+            load-balancing loss most recently computed by the Gate, or ``None``
+            if it has never computed one (``aux_loss_coeff == 0`` or no
+            training-mode forward yet). It is not reset by forwards that skip
+            the aux loss, so it can be older than ``expert_load``.
+        n_experts: Number of routed experts of the Gate (``n_routed_experts``).
+    """
+
+    expert_load: torch.Tensor
+    aux_loss: torch.Tensor | None
+    n_experts: int
+
+
+class _LayerStats(TypedDict):
+    """Per-layer load-balance scalars.
+
+    Attributes:
+        cv: Coefficient of variation (std / mean) of the expert load; 0.0 when
+            the mean load is 0.
+        aux_loss: Python value of the layer's aux loss, or ``None`` when absent.
+    """
+
+    cv: float
+    aux_loss: float | None
+
+
+class _DiversityStats(TypedDict):
+    """Per-layer expert diversity metrics.
+
+    Attributes:
+        dead_expert_frac: Fraction of experts with zero load, in ``[0, 1]``.
+        expert_diversity: ``exp(H) / n_experts`` of the routing distribution,
+            in ``[0, 1]``.
+    """
+
+    dead_expert_frac: float
+    expert_diversity: float
 
 
 def enable_load_balance_tracking(model: nn.Module) -> None:
@@ -67,7 +120,7 @@ def enable_load_balance_tracking(model: nn.Module) -> None:
 def collect_expert_loads(
     model: nn.Module,
     dp_group: torch.distributed.ProcessGroup | None = None,
-) -> dict[str, dict]:
+) -> dict[str, ExpertLoadRecord]:
     """Collect the most recent expert load data from all Gate modules.
 
     When ``dp_group`` is provided, expert loads are all-reduced across the
@@ -82,14 +135,13 @@ def collect_expert_loads(
             expert loads.  Pass ``None`` to skip reduction (rank-local view).
 
     Returns:
-        Dictionary mapping layer names to dicts with keys:
-        - ``"expert_load"``: ``Tensor[n_experts]`` with token counts per expert.
-        - ``"aux_loss"``: ``Optional[Tensor]`` scalar aux loss (if computed).
-        - ``"n_experts"``: ``int`` number of routed experts.
+        Dictionary mapping the Gate's qualified module name to its
+        :class:`ExpertLoadRecord`. Gates that have not stored a load since
+        tracking was enabled are omitted.
     """
     from nemo_automodel.components.moe.layers import Gate
 
-    loads: dict[str, dict] = {}
+    loads: dict[str, ExpertLoadRecord] = {}
     for name, module in model.named_modules():
         if isinstance(module, Gate) and module._last_expert_load is not None:
             expert_load = module._last_expert_load
@@ -104,17 +156,27 @@ def collect_expert_loads(
     return loads
 
 
-def _compute_per_layer_stats(layer_loads: dict[str, dict]):
+def _compute_per_layer_stats(
+    layer_loads: Mapping[str, ExpertLoadRecord],
+) -> tuple[list[_LayerStats], list[torch.Tensor]]:
     """Compute per-layer CV, aux_loss and per-layer utilization ratios.
+
+    Args:
+        layer_loads: Mapping from layer name to :class:`ExpertLoadRecord`;
+            each ``expert_load`` is a Tensor of shape [n_experts] and each
+            ``aux_loss`` a Tensor of shape [] or ``None``. Not mutated.
 
     Returns:
         (per_layer_metrics, per_layer_utilizations) where:
-        - per_layer_metrics: list of dicts with keys cv, aux_loss
-        - per_layer_utilizations: list of Tensor[n_experts] with utilization ratio per layer
-          (1.0 = ideal, >1 = overloaded, <1 = underloaded)
+        - per_layer_metrics: list of :class:`_LayerStats`, one per layer in
+          sorted layer-name order.
+        - per_layer_utilizations: list, in the same order, of float32 Tensors
+          of shape [n_experts] on the load's device, holding each expert's
+          utilization ratio (1.0 = ideal, >1 = overloaded, <1 = underloaded).
+          New tensors; the input loads are not aliased.
     """
-    per_layer_metrics = []
-    per_layer_utilizations = []
+    per_layer_metrics: list[_LayerStats] = []
+    per_layer_utilizations: list[torch.Tensor] = []
 
     for _name, data in sorted(layer_loads.items()):
         load = data["expert_load"].float()
@@ -125,12 +187,7 @@ def _compute_per_layer_stats(layer_loads: dict[str, dict]):
         cv = (std / mean).item() if mean > 0 else 0.0
         aux_loss = data["aux_loss"].item() if data["aux_loss"] is not None else None
 
-        per_layer_metrics.append(
-            {
-                "cv": cv,
-                "aux_loss": aux_loss,
-            }
-        )
+        per_layer_metrics.append(_LayerStats(cv=cv, aux_loss=aux_loss))
 
         # Utilization ratio: current / ideal (1.0 = perfect balance)
         n_experts = load.shape[0]
@@ -243,7 +300,7 @@ def _compute_utilization_aggregates(
 
 def _compute_diversity_per_layer(
     per_layer_utilizations: list[torch.Tensor],
-) -> list[dict[str, float]]:
+) -> list[_DiversityStats]:
     """Compute per-layer expert diversity metrics from utilization ratios.
 
     For each layer, computes:
@@ -257,15 +314,15 @@ def _compute_diversity_per_layer(
             ratios (1.0 = ideal load).
 
     Returns:
-        List of dicts (one per layer) with the metrics above.
+        List of :class:`_DiversityStats`, one per layer.
     """
-    results: list[dict[str, float]] = []
+    results: list[_DiversityStats] = []
     for util in per_layer_utilizations:
         n_experts = util.shape[0]
         total = util.sum()
 
         if total == 0:
-            results.append({"dead_expert_frac": 1.0, "expert_diversity": 0.0})
+            results.append(_DiversityStats(dead_expert_frac=1.0, expert_diversity=0.0))
             continue
 
         dead_expert_frac = (util == 0).float().mean().item()
@@ -276,12 +333,12 @@ def _compute_diversity_per_layer(
         H = -(p_nonzero * p_nonzero.log()).sum().item()
         effective_frac = math.exp(H) / n_experts if n_experts > 0 else 0.0
 
-        results.append({"dead_expert_frac": dead_expert_frac, "expert_diversity": effective_frac})
+        results.append(_DiversityStats(dead_expert_frac=dead_expert_frac, expert_diversity=effective_frac))
     return results
 
 
 def _aggregate_diversity_metrics(
-    per_layer_diversity: list[dict[str, float]],
+    per_layer_diversity: list[_DiversityStats],
     per_layer: bool = False,
 ) -> dict[str, float]:
     """Aggregate per-layer diversity metrics into model-level summaries.
@@ -315,7 +372,7 @@ def _aggregate_diversity_metrics(
 
 
 def compute_brief_metrics(
-    layer_loads: dict[str, dict],
+    layer_loads: Mapping[str, ExpertLoadRecord],
     top_k: int = 5,
 ) -> dict[str, float]:
     """Compute brief load-balance metrics: aggregated scalars + top-K/bottom-K utilization.
@@ -329,7 +386,10 @@ def compute_brief_metrics(
       lowest utilization experts globally.
 
     Args:
-        layer_loads: Output of :func:`collect_expert_loads`.
+        layer_loads: Output of :func:`collect_expert_loads`: a mapping from
+            layer name to :class:`ExpertLoadRecord`, whose ``expert_load`` is a
+            Tensor of shape [n_experts] and ``aux_loss`` a Tensor of shape []
+            or ``None``. Layers are ordered by name. Not mutated.
         top_k: Number of top/bottom experts to emit globally.
 
     Returns:
@@ -355,7 +415,7 @@ def compute_brief_metrics(
 
 
 def compute_detailed_metrics(
-    layer_loads: dict[str, dict],
+    layer_loads: Mapping[str, ExpertLoadRecord],
     top_k: int = 5,
 ) -> dict[str, float]:
     """Compute detailed load-balance metrics: per-layer scalars + aggregates + utilization.
@@ -366,7 +426,10 @@ def compute_detailed_metrics(
     - ``moe/layer_{i}/utilization_mean`` — per-layer mean utilization.
 
     Args:
-        layer_loads: Output of :func:`collect_expert_loads`.
+        layer_loads: Output of :func:`collect_expert_loads`: a mapping from
+            layer name to :class:`ExpertLoadRecord`, whose ``expert_load`` is a
+            Tensor of shape [n_experts] and ``aux_loss`` a Tensor of shape []
+            or ``None``. Layers are ordered by name. Not mutated.
         top_k: Number of top/bottom experts to emit globally.
 
     Returns:
@@ -378,7 +441,8 @@ def compute_detailed_metrics(
 
     metrics: dict[str, float] = {}
 
-    cvs, aux_losses = [], []
+    cvs: list[float] = []
+    aux_losses: list[float] = []
     for i, m in enumerate(per_layer):
         metrics[f"moe/layer_{i}/cv"] = m["cv"]
         cvs.append(m["cv"])

@@ -33,3 +33,13 @@ uv run automodel --nproc-per-node=8 examples/dllm_sft/nemotron_labs_diffusion_sf
 | [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_lora.yaml) |
 
 See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+
+## Nemotron 3.5 Decision
+
+Nemotron 3.5 Decision 8B, derived from this model, answers typed decision questions with one bidirectional read per
+question. NeMo AutoModel loads its `NemotronForDecision` checkpoints natively and post-trains them with the
+[`nemotron_decision_soc_triage_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/nemotron_decision_soc_triage_lora.yaml)
+and
+[`nemotron_decision_support_routing_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/nemotron_decision_support_routing_lora.yaml)
+recipes. See the [Nemotron 3.5 Decision guide](/recipes-e2e-examples/nemotron-3-5-decision). For the other decision
+models that NeMo AutoModel post-trains, see [Decision Models](/model-coverage/decision-models/overview).

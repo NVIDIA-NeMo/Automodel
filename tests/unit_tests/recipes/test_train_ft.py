@@ -1577,7 +1577,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
         ),
     )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
 
     return recipe
 
@@ -2365,7 +2365,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "device_mesh", None)
         object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
-        object.__setattr__(recipe, "te_fp8", None)
+        object.__setattr__(recipe, "te_quantization", None)
         object.__setattr__(recipe, "model_parts", [nn.Linear(4, 4)])
         object.__setattr__(
             recipe,
@@ -3030,7 +3030,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "magi", SimpleNamespace(enabled=False))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())  # not FusedLinearCrossEntropy
@@ -3180,7 +3180,7 @@ def _make_mtp_forward_backward_recipe(model, monkeypatch, *, calculate_mtp_loss=
     object.__setattr__(recipe, "device_mesh", object())
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())
@@ -3401,7 +3401,7 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     object.__setattr__(recipe, "device_mesh", object())
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())
@@ -3789,7 +3789,7 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -3899,7 +3899,7 @@ def test_qwen35_hidden_state_request_in_recipe(monkeypatch, loss_kind):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -3970,9 +3970,9 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
     reference = deepcopy(model)
     loss_fn = ChunkedCrossEntropy(2, compile=False)
     if softcap is not None:
-        # A plain head is not sufficient: both setup and shared weight preparation
+        # The head does not apply the softcap itself: both setup and shared weight preparation
         # must inspect the owning model's nested text config before training.
-        assert type(model.lm_head) is torch.nn.Linear
+        assert getattr(model.lm_head, "logit_softcapping", None) is None
         with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
             _maybe_downgrade_loss_fn(loss_fn, model, False)
         with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
@@ -3990,7 +3990,7 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -4118,7 +4118,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     recipe.mesh_context = SimpleNamespace(cp_size=1)
     recipe.pp_enabled = False
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.distributed_config = None
     recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
@@ -4351,7 +4351,7 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
     )
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.model_parts = [model]
     recipe.loss_fn = base_loss
@@ -4477,6 +4477,125 @@ def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
     recipe._finalize_and_close_checkpointer.assert_called_once()
 
 
+@pytest.mark.parametrize("attention_backend", ["sdpa", "eager"])
+def test_zephon_setup_preserves_requested_attention_backend(monkeypatch, tmp_path, attention_backend):
+    """Zephon setup preserves the configured SDPA or eager attention backend."""
+    from nemo_automodel._transformers.kernel_patches import _apply_preload_overrides
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonDataloaderConfig,
+        ZephonOptions,
+        ZephonSource,
+        ZephonTextDatasetConfig,
+    )
+
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    config = ZephonDataloaderConfig(
+        dataset_config=ZephonTextDatasetConfig(
+            zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),))
+        )
+    )
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
+    module = "nemo_automodel.recipes.llm.train_ft"
+    recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+    raw = _minimal_cfg_with_nvtx(False)
+
+    class ModelBuildReached(Exception):
+        pass
+
+    def build(*args, **kwargs):
+        attention, _ = _apply_preload_overrides(
+            tp_size=1,
+            cp_size=1,
+            has_packed_sequence=kwargs.get("has_packed_sequence", False),
+            attn_implementation=attention_backend,
+            use_liger_kernel=False,
+        )
+        assert attention == attention_backend
+        raise ModelBuildReached
+
+    monkeypatch.setattr(f"{module}.build_model", build)
+    original = getattr(recipe_type, "_create_distributed_setup")
+
+    def setup(self):
+        result = original(self)
+        result.mesh_context.tp_size = 1
+        return result
+
+    monkeypatch.setattr(recipe_type, "_create_distributed_setup", setup)
+    with pytest.raises(ModelBuildReached):
+        recipe_type(raw).setup()
+
+
+@pytest.mark.parametrize("backend", ["native", "zephon"])
+def test_common_loader_build_keeps_rng_owned_by_loader_and_rank_order(monkeypatch, tmp_path, backend):
+    from contextlib import contextmanager
+
+    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonDataloaderConfig,
+        ZephonOptions,
+        ZephonSource,
+        ZephonTextDatasetConfig,
+    )
+
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    if backend == "native":
+        config = DataloaderConfig(dataset_config=SimpleNamespace(build=lambda: []), seed=123)
+    else:
+        config = ZephonDataloaderConfig(
+            dataset_config=ZephonTextDatasetConfig(
+                zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),))
+            )
+        )
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
+    recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+    monkeypatch.setattr(recipe_type, "_packing_contract", property(lambda self: DEFAULT_PACKED_SEQUENCE_CONTRACT))
+    original_setup = recipe_type._create_distributed_setup
+
+    def setup(self):
+        result = original_setup(self)
+        result.mesh_context.tp_size = 1
+        return result
+
+    monkeypatch.setattr(recipe_type, "_create_distributed_setup", setup)
+    events = []
+
+    @contextmanager
+    def rng_context(*, seed, ranked):
+        events.append(("rng-enter", seed, ranked))
+        try:
+            yield
+        finally:
+            events.append(("rng-exit", seed, ranked))
+
+    @contextmanager
+    def rank_context(*, group):
+        events.append("rank-enter")
+        yield
+        events.append("rank-exit")
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.loader.ScopedRNG", rng_context)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.FirstRankPerNode", rank_context)
+
+    class BuildReached(Exception):
+        pass
+
+    def build(self, **kwargs):
+        with kwargs["dataset_build_context"]:
+            events.append("build")
+        assert kwargs["cp_size"] == 1
+        assert kwargs["pp_enabled"] is False
+        assert kwargs["ignore_index"] == -100
+        raise BuildReached
+
+    monkeypatch.setattr(type(config), "build", build)
+    with pytest.raises(BuildReached):
+        recipe_type(_minimal_cfg_with_nvtx(False)).setup()
+    # build() is mocked above: its owned RNG context must not be duplicated by the recipe.
+    assert events == (["rank-enter", "build", "rank-exit"] if backend == "native" else ["build"])
+
+
 @pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
 @pytest.mark.parametrize("is_packed,output_format", [(False, "batched"), (True, "batched"), (True, "thd")])
 def test_setup_always_passes_return_contract_and_only_configures_packed_batched_inputs(
@@ -4599,7 +4718,7 @@ def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[l
         info=SimpleNamespace(has_first_stage=True, has_last_stage=False, schedule=SimpleNamespace(step=run_schedule)),
     )
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.model_parts = [model]
     recipe.loss_fn = MaskedCrossEntropy()

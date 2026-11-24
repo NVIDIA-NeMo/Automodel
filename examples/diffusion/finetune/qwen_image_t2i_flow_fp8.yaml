@@ -1,0 +1,136 @@
+# Qwen-Image full fine-tuning with FP8 matrix multiplies (Transformer Engine). It needs a GPU with FP8 tensor
+# cores (Hopper or newer) and was tested on 8x H100. qwen_image_t2i_flow.yaml is the bf16 recipe.
+#
+# FP8 is only faster than bf16 together with the settings marked "FP8-tuned" below.
+#
+# Comparing with bf16:
+#   Same settings, FP8 off, which isolates the effect of FP8 (override from the command line, or edit the key):
+#     --model.transformer_engine_fp8 false
+#   The stock bf16 recipe is qwen_image_t2i_flow.yaml. It differs from this file only in the keys marked
+#   "bf16 recipe" below. Two of them are unset there, and a key cannot be unset from the command line, so run
+#   that file instead of overriding this one.
+# On 8x H100 this recipe trains at 77.2 samples/s (micro-batch 32 per GPU); the same settings in bf16 reach
+# 63.3 (1.22x). The batch-size table at step_scheduler below shows how the speedup changes with batch size.
+
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen-Image"
+  mode: "finetune"
+  cache_dir: null
+  attention_backend: "flash"
+  transformer_engine_fp8: true  # bf16: false
+  transformer_engine_fp8_recipe: "current"
+  # Accumulate the forward FP8 GEMM with periodic fp32 promotion. Without it the SFT loss does not match bf16.
+  transformer_engine_fp8_fprop_split_accumulator: true
+  # Linears kept in bf16:
+  #   img_mod / txt_mod - AdaLN modulation; their weight-gradient GEMM reduces over the per-GPU batch, which
+  #                       Transformer Engine requires to be a multiple of 16 for FP8.
+  #   text stream       - only ~15 text tokens per sample against full-size weights: a memory-bound GEMM where FP8
+  #                       adds weight-quantization cost without a matmul speedup. Revisit for long captions.
+  transformer_engine_fp8_exclude: [img_mod, txt_mod, add_q_proj, add_k_proj, add_v_proj, to_add_out, txt_mlp, txt_in]
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
+
+#adjust dp_size to the total number of GPUs
+fsdp:
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  # FP8-tuned (bf16 recipe: false). Needed for FP8 to beat bf16; Transformer Engine's checkpoint is selected
+  # automatically when the model holds Transformer Engine linears.
+  activation_checkpointing: true
+  cpu_offload: false
+  enable_compile: true
+  # FP8-tuned (bf16 recipe: unset). Keep each block's weights gathered between forward and backward
+  # (about +35 GB per GPU, ~5% faster).
+  reshard_after_forward: false
+  # FP8-tuned (bf16 recipe: unset, i.e. float32). bf16 gradient reduce-scatter, ~5% faster.
+  reduce_dtype: bfloat16
+
+flow_matching:
+  adapter_type: "qwen_image"
+  adapter_kwargs:
+    guidance_scale: 3.5
+    use_guidance_embeds: false
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 2.23
+  mix_uniform_ratio: 0.0
+  sigma_min: 0.02
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  use_loss_weighting: true
+  loss_weighting_scheme: "bsmntw"
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 10
+  # FP8-tuned (bf16 recipe: 5 and 40). A throughput configuration, see the caveat below.
+  # local_batch_size is the micro-batch (samples per GPU per forward/backward pass); global_batch_size is the samples
+  # per optimizer step. global = local * GPUs * gradient-accumulation steps, and here there is no accumulation.
+  # FP8 gains more as the micro-batch grows, because the GEMMs get larger. Measured on 8x H100, samples/s:
+  #   local  global    FP8   bf16 (same settings)   FP8/bf16   memory per GPU
+  #       8      64   57.9   53.3                   1.09x      58.6 GB
+  #      16     128   70.2   59.1                   1.19x      60.9 GB
+  #      32     256   77.2   63.3                   1.22x      69.2 GB   <- fastest
+  #      40     320   70.3   56.8                   1.24x      73.6 GB   (slower: memory pressure near 80 GB)
+  # Caveat: a larger global batch also changes the optimization. With about 1,100 images, global 256 is only 4
+  # optimizer steps per epoch, and at a fixed learning rate a larger global batch needs more samples to reach the
+  # same validation loss (global 128 vs 64: +0.002 at 1,500 to 2,000 samples). A 512-step run of this recipe
+  # (128 epochs) ended with validation loss +0.28% and average training loss +2.6% above bf16 (0.08505 vs 0.08482
+  # and 0.0901 vs 0.0878), with the validation gap flat after step 128. Other batch sizes were checked only for
+  # throughput and finite training loss. For real training, consider scaling optimizer.lr
+  # (for example by the square root of the batch ratio) and the number of epochs, and validate. Use
+  # local_batch_size 8 and global_batch_size 64 for the smaller, validated batch.
+  local_batch_size: 32
+  global_batch_size: 256
+  ckpt_every_steps: 500
+  save_checkpoint_every_epoch: false
+  log_remote_every_steps: 1
+  # max_steps: null  # Set to limit training to a specific number of steps
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    train_text_encoder: false
+    num_workers: 2
+    # Supported resolutions include [256x256], [512x512], and [1024x1024].
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: safetensors
+  save_consolidated: final
+  diffusers_compatible: true
+  restore_from: null
+
+wandb:
+  enable: false
+  project: qwen-image-finetuning
+  mode: online
+  name: qwen_image_finetune_fp8_run_1
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+  timeout_minutes: 30
+
+seed: 42
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

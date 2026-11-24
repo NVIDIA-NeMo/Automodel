@@ -49,6 +49,14 @@ class TestStructure:
         assert [is_moe_layer(beam_config, i) for i in range(4)] == [False, True, True, True]
         assert set(model.model.rotary_emb) == {"sliding_attention"}
 
+    @pytest.mark.parametrize("logits_dtype", [None, torch.bfloat16])
+    def test_softcapped_logits_leave_in_the_requested_dtype(self, beam_config, backend_config, logits_dtype):
+        """The softcap runs in fp32; the logits leave in the head's logits_dtype, fp32 by default."""
+        model = BeamForCausalLM(beam_config, backend=backend_config, logits_dtype=logits_dtype)
+        model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+        ids = torch.randint(0, beam_config.vocab_size, (1, 6), generator=torch.Generator().manual_seed(3))
+        assert model(ids).logits.dtype == (logits_dtype or torch.float32)
+
     def test_ssmax_scale_matches_hf(self):
         from transformers.models.beam.modeling_beam import compute_attention_scaling
 

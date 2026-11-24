@@ -78,7 +78,7 @@ def test_bf16_cast_keeps_rope_freqs_cis_fp32():
     config = KimiK25VLConfig(vision_config=_tiny_vision_config(), text_config=_tiny_text_config())
     config.torch_dtype = torch.bfloat16
 
-    model = KimiK25VLForConditionalGeneration.from_config(config, torch_dtype=torch.bfloat16)
+    model = KimiK25VLForConditionalGeneration.from_config(config)
     # Mirror the fixed from_pretrained cast (which routes through cast_model_to_dtype).
     cast_model_to_dtype(model, torch.bfloat16)
 
