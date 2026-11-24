@@ -1,11 +1,11 @@
 # GLM-5.3 (753B) LoRA on VR200 (hecate: 4 GPUs per node, 280 GiB per GPU).
-# EP8 on 2 nodes, the fewest that fit, holds ~175 GiB of frozen bf16 weights per GPU;
-# 16K-token packs bring the estimated peak to ~215 GiB (~77%).
+# EP16 on 4 nodes holds ~88 GiB of frozen bf16 weights per GPU. Two nodes (EP8, ~175 GiB) run out
+# of memory while the FP8 checkpoint is dequantized during loading (268 GiB allocated on 280 GiB).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 8
+  global_batch_size: 16
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -18,7 +18,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 8
+  ep_size: 16
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -122,7 +122,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
   recipe_owner: akoumpa
-  nodes: 2
+  nodes: 4
   nproc_per_node: 4
   time: "01:00:00"
   max_steps: 20
