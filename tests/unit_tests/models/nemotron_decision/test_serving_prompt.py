@@ -313,3 +313,61 @@ def test_parity_with_the_checkpoint_preparation(public_tokenizer, tmp_path, case
     assert (target.soft_labels is None and case["soft"] is None) or list(target.soft_labels) == pytest.approx(
         case["soft"]
     )
+
+
+# A four-question request packed by the reference packer of a released always-packed checkpoint (json-sep prompts, its
+# serving option reordering off so options keep the question's order), with the public tokenizer above (the release
+# ships the same tokenizer.json): total length, state length, read slots and sha256 of the packed ids and positions.
+SEP_REQUEST = {
+    "state": {
+        "ticket": "I was charged twice for my March invoice and support has not answered in three days.",
+        "customer": {"plan": "business", "tenure_months": 26},
+    },
+    "questions": {
+        "urgent": {"type": "noul", "instructions": "Does this ticket need a reply today?"},
+        "team": {
+            "type": "choice",
+            "instructions": "Which team should handle the ticket?",
+            "criteria": {
+                "billing": "payments, invoices, refunds",
+                "technical": "bugs, outages",
+                "sales": "new plans, upgrades",
+            },
+        },
+        "mood": {
+            "type": "score",
+            "instructions": "How upset is the customer?",
+            "criteria": ["calm", "annoyed", "angry"],
+        },
+        "refund": {"type": "noul", "instructions": "Should a refund be offered?"},
+    },
+}
+SEP_PACKED = {
+    "length": 420,
+    "state_len": 93,
+    "slots": [167, 263, 346, 419],
+    "ids_sha256": "ecf8a2ae8185272fc3fc5ae81675e836a95efe3611f1b31b491834d96215b8e6",
+    "positions_sha256": "a76e506ea8d991c924dbebd4b4e011fa73a59d9933a1e63ab9e5aae785bfe56e",
+    "labels": [["false", "true"], ["billing", "technical", "sales"], ["0", "1", "2"], ["false", "true"]],
+    "codes": [[1065, 1066], [1065, 1066, 1067], [1065, 1066, 1067], [1065, 1066]],
+}
+
+
+def test_json_sep_packed_read_matches_the_reference_packer(public_tokenizer, tmp_path):
+    from nemo_automodel.components.models.nemotron_decision.packed import pack_prompts, shared_state_length
+
+    contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt", codes=("A", "B", "C", "D")))
+    prompts = [
+        prepare_question(
+            public_tokenizer, contract, SEP_REQUEST["state"], key, q, mask_token_id=100, prompt_format="json-sep"
+        )
+        for key, q in SEP_REQUEST["questions"].items()
+    ]
+    state_length = shared_state_length([p.input_ids for p in prompts], 101)
+    read = pack_prompts([p.input_ids for p in prompts], state_length=state_length, mask_token_id=100)
+    assert state_length == SEP_PACKED["state_len"] and len(read.input_ids) == SEP_PACKED["length"]
+    assert list(read.slots) == SEP_PACKED["slots"]
+    assert hashlib.sha256(json.dumps(list(read.input_ids)).encode()).hexdigest() == SEP_PACKED["ids_sha256"]
+    assert hashlib.sha256(json.dumps(list(read.position_ids)).encode()).hexdigest() == SEP_PACKED["positions_sha256"]
+    assert [list(p.labels) for p in prompts] == SEP_PACKED["labels"]
+    assert [list(p.code_token_ids) for p in prompts] == SEP_PACKED["codes"]
