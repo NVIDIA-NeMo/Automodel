@@ -89,7 +89,8 @@ _POST_MLP_NORM_NATIVE = re.compile(r"(model\.layers\.(\d+))\.post_mlp_layernorm\
 _EXPERT = re.compile(_LAYER + r"mlp\.experts\.(gate_up_proj|down_proj)$")
 _NATIVE_EXPERT = re.compile(_LAYER + r"mlp\.experts\.(gate_and_up_projs|down_projs)$")
 _ENGRAM_TABLE = re.compile(_LAYER + r"engram_layer\.multi_head_embedding\.embedding\.weight$")
-_SKIPPED = re.compile(r"(model\.dfly_layers\.|.*_extra_state)")
+# Whole keys are matched: the speculative drafter (``model.dfly_layers.*``, serving only) and TE ``_extra_state`` buffers.
+_SKIPPED = re.compile(r"(model\.dfly_layers\..*|.*_extra_state)")
 
 
 class HY4FlashStateDictAdapter(StateDictAdapter):
