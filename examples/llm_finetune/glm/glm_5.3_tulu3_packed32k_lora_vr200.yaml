@@ -1,0 +1,131 @@
+# GLM-5.3 (753B) LoRA on VR200 (4 GPUs per node, 280 GiB per GPU).
+# EP16 on 4 nodes holds ~88 GiB of frozen bf16 weights per GPU (2 nodes run out of memory while
+# the FP8 checkpoint is dequantized, and 256 experts rule out 3). Training with 16K packs peaked
+# at 133 GiB and loading at 174 GiB, so 32K packs.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 20
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+    ignore_router_for_ac: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: zai-org/GLM-5.3
+  dtype: bfloat16
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.self_attn.q_a_proj"
+    - "*.self_attn.q_b_proj"
+    - "*.self_attn.kv_a_proj_with_mqa"
+    - "*.self_attn.kv_b_proj"
+    - "*.self_attn.o_proj"
+    - "*.mlp.gate_proj"
+    - "*.mlp.up_proj"
+    - "*.mlp.down_proj"
+    - "*.mlp.shared_experts.gate_proj"
+    - "*.mlp.shared_experts.up_proj"
+    - "*.mlp.shared_experts.down_proj"
+    - "*.mlp.experts"
+  dim: 8
+  alpha: 32
+  dropout: 0.0
+  use_memory_efficient_lora: true
+  use_triton: false
+  lora_dtype: bfloat16
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:20000]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 4096
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.3
+
+packed_sequence:
+  packed_sequence_size: 32768
+  packing_strategy: thd
+  num_proc: 8
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-4
+  weight_decay: 0.0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: vrnvl72
+  recipe_owner: akoumpa
+  nodes: 4
+  nproc_per_node: 4
+  time: "00:30:00"
+  max_steps: 20
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
