@@ -18,6 +18,13 @@ import pytest
 os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
 os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
 
+# Under pytest-xdist, test files run in several worker processes at the same time. Give each
+# worker its own default torchrun rendezvous port (torchrun reads PET_MASTER_PORT), so two
+# workers that launch torchrun at the same time do not both bind port 29500.
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
+if _XDIST_WORKER is not None:
+    os.environ["PET_MASTER_PORT"] = str(29501 + int(_XDIST_WORKER.removeprefix("gw")))
+
 # Ensure the repository root is importable so functional tests can do
 # `from tests.utils.test_utils import run_test_script` reliably across
 # different pytest import modes / runners.
