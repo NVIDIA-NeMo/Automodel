@@ -428,8 +428,17 @@ def test_automfu_defaults_to_detected_device_peak(monkeypatch):
         ("NVIDIA H100 PCIe", torch.float8_e4m3fn, 1513.0),
         ("NVIDIA H100 NVL", torch.bfloat16, 835.5),
         ("NVIDIA H100 80GB HBM3 MIG 1g.10gb", torch.bfloat16, float("inf")),
+        ("NVIDIA H100 80GB HBM3", torch.float8_e5m2, 1979.0),
+        ("NVIDIA H200", torch.float8_e4m3fn, 1979.0),
+        ("NVIDIA H200 NVL", torch.float8_e4m3fn, 1670.5),
+        ("NVIDIA GB200", torch.float8_e4m3fn, 5000.0),
+        ("NVIDIA GB200", torch.float4_e2m1fn_x2, 10000.0),
+        ("NVIDIA GB300", torch.float8_e4m3fn, 5000.0),
         ("NVIDIA GB300", torch.float4_e2m1fn_x2, 15000.0),
+        ("NVIDIA B200", torch.float8_e4m3fn, 4500.0),
         ("NVIDIA B200", torch.float4_e2m1fn_x2, 9000.0),
+        ("NVIDIA B300 SXM6 AC", torch.float4_e2m1fn_x2, 13500.0),
+        ("NVIDIA L40S", torch.float8_e4m3fn, 733.0),
         ("NVIDIA A100", torch.float8_e4m3fn, float("inf")),
     ],
 )
@@ -438,17 +447,40 @@ def test_get_device_flops_selects_dense_peak_by_dtype(name, dtype, expected, mon
     assert get_device_flops(dtype=dtype) == expected
 
 
-@pytest.mark.parametrize("precision, expected", [("ieee", 67.0), ("tf32", 494.5)])
-def test_get_device_flops_uses_cuda_fp32_matmul_policy(monkeypatch, precision, expected):
+@pytest.mark.parametrize(
+    "name, precision, expected",
+    [
+        ("H100", "ieee", 67.0),
+        ("H100", "tf32", 494.5),
+        ("NVIDIA A100-SXM4-80GB", "ieee", 19.5),
+        ("NVIDIA A100-SXM4-80GB", "tf32", 156.0),
+    ],
+)
+def test_get_device_flops_uses_cuda_fp32_matmul_policy(monkeypatch, name, precision, expected):
     monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", precision)
 
-    _mock_cuda_device(monkeypatch, "H100")
+    _mock_cuda_device(monkeypatch, name)
     assert get_device_flops(dtype=torch.float32) == expected
+
+
+@pytest.mark.parametrize("unit, expected", [("P", 0.989), ("t", 989.0), ("G", 989_000.0)])
+def test_get_device_flops_converts_units(monkeypatch, unit, expected):
+    _mock_cuda_device(monkeypatch, "NVIDIA H100 80GB HBM3")
+    assert get_device_flops(unit) == pytest.approx(expected)
+    with pytest.raises(ValueError, match="Unsupported unit"):
+        get_device_flops("X")
 
 
 def test_automfu_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
     monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    model = torch.nn.Sequential(torch.nn.LayerNorm(32), torch.nn.Linear(32, 32, dtype=torch.bfloat16))
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+    # The BF16 matrix holds the most matrix elements (4096). FP32 has more matrix tensors (3, 48 elements)
+    # and more elements overall once the 1-D LayerNorm parameters (10000) count.
+    model = torch.nn.Sequential(
+        torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16),
+        *(torch.nn.Linear(4, 4, bias=False) for _ in range(3)),
+        torch.nn.LayerNorm(5000),
+    )
     model.config = SimpleNamespace(dtype=torch.float32)
     _mock_cuda_device(monkeypatch, "H100")
     assert AutoMFU.from_config(model).reference_mfu == 989.0
