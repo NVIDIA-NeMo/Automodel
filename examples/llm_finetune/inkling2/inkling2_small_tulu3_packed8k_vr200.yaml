@@ -4,6 +4,7 @@
 # ~3.2 GiB per 1K tokens, so 32K packs run out of memory at the first step that holds optimizer
 # state; 8K packs keep the estimated peak near 200 GiB allocated.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
 
 step_scheduler:
   global_batch_size: 32
@@ -17,11 +18,6 @@ step_scheduler:
 dist_env:
   backend: nccl
   timeout_minutes: 60
-
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1234
-  ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained

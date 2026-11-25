@@ -2,6 +2,7 @@
 # EP8 on 2 nodes, the fewest that fit, holds ~130 GiB of frozen bf16 weights per GPU. 16K packs
 # peaked at 245 GiB, too close to the 280 GiB once NCCL and HybridEP buffers are counted, so 12K.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1111
 
 step_scheduler:
   num_epochs: 1
@@ -18,11 +19,6 @@ dist_env:
 
 prewarm:
   mamba_ssd_autotune: true
-
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1111
-  ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
@@ -62,7 +58,7 @@ loss_fn:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  exclude_modules: ["*.out_proj"]  # Mamba kernels read out_proj.weight directly, so LoRA cannot wrap it.
+  exclude_modules: ["*.out_proj"]
   dim: 32
   alpha: 32
   use_triton: true

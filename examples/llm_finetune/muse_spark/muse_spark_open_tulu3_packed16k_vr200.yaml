@@ -3,6 +3,7 @@
 # weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU; 16K-token packs bring
 # the measured peak to 168 GiB (60%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
 
 step_scheduler:
   global_batch_size: 64
@@ -16,11 +17,6 @@ step_scheduler:
 dist_env:
   backend: nccl
   timeout_minutes: 60
-
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1234
-  ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained

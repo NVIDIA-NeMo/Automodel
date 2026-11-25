@@ -2,6 +2,7 @@
 # EP8 on 2 nodes, the fewest that fit, holds ~138 GiB of frozen bf16 weights per GPU;
 # 32K-token packs bring the estimated peak to ~175 GiB (~63%).
 recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
 
 step_scheduler:
   global_batch_size: 8
@@ -15,11 +16,6 @@ step_scheduler:
 dist_env:
   backend: nccl
   timeout_minutes: 60
-
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1234
-  ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained

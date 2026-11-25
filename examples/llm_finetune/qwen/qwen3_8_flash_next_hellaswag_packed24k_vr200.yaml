@@ -95,6 +95,11 @@ optimizer:
       lr_mult: 5.0
       wd_mult: 0.0
 
+# Apply the embedding group multipliers while keeping the base learning rate constant.
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 0
+
 ci:
   nemo_ci_schedule: release
   cluster_tag: vrnvl72
