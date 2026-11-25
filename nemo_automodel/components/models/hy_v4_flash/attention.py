@@ -98,6 +98,8 @@ class HY4FlashDocLayout:
         all_rows_nonempty: Whether this rank holds no padding token (every query has at least its own key).
         valid_rows: Int64 tensor of shape [valid_local_tokens] of the non-padding local queries, or ``None`` when
             ``all_rows_nonempty``.
+        cp_group: Context-parallel group whose ranks hold the consecutive shards of the global sequence, or ``None``
+            when this rank holds all of it. Every layer gathers its keys over this group.
     """
 
     doc_ranges: tuple[tuple[int, int], ...]
@@ -107,6 +109,7 @@ class HY4FlashDocLayout:
     dense_plan: HY4FlashSparsePlan
     all_rows_nonempty: bool
     valid_rows: torch.Tensor | None
+    cp_group: dist.ProcessGroup | None = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +190,24 @@ class HY4FlashCompressedIndexer(nn.Module):
             Tensor of shape [tokens, index_head_dim].
         """
         return self.token_key_norm(self.token_key_projection(hidden_states))
+
+    @torch.no_grad()
+    def enter_pooling_units(self, reference: torch.Tensor) -> None:
+        """Enter the fp32 pooling modules once with an empty input.
+
+        Pooling runs only for documents longer than ``index_topk``, so how often (and whether) a rank calls these
+        modules depends on its data. Under FSDP each call of a sharded unit is a collective (all-gather), and ranks
+        that issue different collective sequences deadlock. Entering the units here, unconditionally and in the same
+        order on every rank, makes that sequence data independent; later calls find the parameters unsharded.
+
+        Args:
+            reference: Any tensor on the compute device (its values are unused).
+        """
+        empty = reference.new_zeros((0, self.kpool, self.head_dim), dtype=self.key_value_projection.weight.dtype)
+        self.key_value_projection(empty)
+        self.key_gate_projection(empty)
+        self.intra_group_ape(empty)
+        self.key_norm(empty[:, 0])
 
     @torch.no_grad()
     def pool_groups(self, token_keys: torch.Tensor) -> torch.Tensor:
@@ -371,11 +392,15 @@ class HY4FlashAttention(nn.Module):
         self.compressed_indexer = (
             HY4FlashCompressedIndexer(config) if self.attention_type == "indexed_attention" else None
         )
-        self._cp_group: dist.ProcessGroup | None = None
 
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
-        """Attach the context-parallel group (called by the shared parallelizer): keys are gathered, queries stay local."""
-        self._cp_group = cp_mesh.get_group()
+        """Accept the context-parallel mesh from the shared parallelizer without storing it.
+
+        The parallelizer offers the mesh to sliding-window blocks only, so a group stored here would be missing on
+        the sparse layers. Every layer instead reads the group from the forward's ``HY4FlashDocLayout.cp_group``
+        (keys are gathered over it, queries stay local).
+        """
+        del cp_mesh
 
     def _absorbed_weights(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-head key / value up-projections of ``kv_b_proj`` as ``[heads, dim, latent]`` tensors.
@@ -425,7 +450,7 @@ class HY4FlashAttention(nn.Module):
         query = torch.cat((q_abs, q_rot), dim=-1)
         kv_local = torch.cat((latent, k_rot), dim=-1)
         token_keys = self.compressed_indexer.token_keys(x) if self.compressed_indexer is not None else None
-        kv, keys = self._gather_keys(kv_local, token_keys)
+        kv, keys = self._gather_keys(kv_local, token_keys, layout.cp_group)
 
         if self.compressed_indexer is None:
             plan = layout.window_plan
@@ -457,6 +482,7 @@ class HY4FlashAttention(nn.Module):
             Plan over this rank's queries with global key rows.
         """
         indexer = self.compressed_indexer
+        indexer.enter_pooling_units(hidden_states)
         lo, hi = layout.local_start, layout.local_end
         plan = layout.dense_plan
         indices = lengths = None
@@ -484,7 +510,7 @@ class HY4FlashAttention(nn.Module):
         return plan if indices is None else HY4FlashSparsePlan(indices, lengths)
 
     def _gather_keys(
-        self, kv_local: torch.Tensor, token_keys: torch.Tensor | None
+        self, kv_local: torch.Tensor, token_keys: torch.Tensor | None, cp_group: dist.ProcessGroup | None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the latent keys (and index token keys) over the global sequence.
 
@@ -495,17 +521,18 @@ class HY4FlashAttention(nn.Module):
         Args:
             kv_local: Tensor of shape [local_tokens, kv_lora_rank + rope_dim].
             token_keys: Optional tensor of shape [local_tokens, index_head_dim].
+            cp_group: Context-parallel group of the forward, or ``None``.
 
         Returns:
             The same tensors over the global sequence.
         """
-        if self._cp_group is None or dist.get_world_size(self._cp_group) == 1:
+        if cp_group is None or dist.get_world_size(cp_group) == 1:
             return kv_local, token_keys
-        kv = gather_sequence(kv_local[None], self._cp_group)[0]
+        kv = gather_sequence(kv_local[None], cp_group)[0]
         if token_keys is None:
             return kv, None
         with torch.no_grad():
-            keys = gather_sequence(token_keys[None], self._cp_group)[0]
+            keys = gather_sequence(token_keys[None], cp_group)[0]
         return kv, keys
 
     def _attend(

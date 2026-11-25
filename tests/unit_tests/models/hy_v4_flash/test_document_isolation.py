@@ -245,3 +245,32 @@ def test_positions_that_do_not_restart_per_document_are_detected():
     running = torch.arange(sum(map(len, documents)))[None]
     with pytest.raises(AssertionError):
         assert_documents_match_alone(model, documents, position_ids=running)
+
+
+@pytest.mark.parametrize("lengths", [(5, 9, 3), (5, 41, 3)])
+def test_pooling_modules_are_entered_whether_or_not_a_document_needs_selection(lengths):
+    """FSDP turns the first call of a sharded unit into a collective, so every rank must issue the same calls.
+
+    The fp32 group-pooling modules only do work for documents longer than ``index_topk``. A rank whose pack holds no
+    such document must still enter them, at the same place, or its collective sequence differs from a rank that does
+    (a deadlock under FSDP). Both packs must therefore enter each module in every sparse layer.
+    """
+    model = build_model()
+    assert (max(lengths) > TOPK) == (lengths == (5, 41, 3))
+    sparse_layers = [layer for layer in model.model.layers if layer.self_attn.compressed_indexer is not None]
+    assert sparse_layers
+    entered = []
+    for index, layer in enumerate(sparse_layers):
+        indexer = layer.self_attn.compressed_indexer
+        for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm"):
+            getattr(indexer, name).register_forward_pre_hook(
+                lambda module, args, index=index, name=name: entered.append((index, name))
+            )
+    with torch.no_grad():
+        model(**pack(random_documents(lengths)))
+    first_entries = list(dict.fromkeys(entered))
+    assert first_entries == [
+        (index, name)
+        for index in range(len(sparse_layers))
+        for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm")
+    ]

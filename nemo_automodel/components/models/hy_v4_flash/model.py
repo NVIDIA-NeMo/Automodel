@@ -359,6 +359,7 @@ class HY4FlashModel(nn.Module):
             causal_prefix_plan(position, doc_start, cfg.index_topk),
             all_rows_nonempty,
             None if all_rows_nonempty else torch.nonzero(window_plan.lengths > 0).flatten(),
+            cp_group if cp_size > 1 else None,
         )
         ropes = {}
         for attention_type, theta in self._inv_freq_theta.items():
@@ -433,9 +434,17 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         "intra_group_ape",
         "lm_head",
     ]
-    # Tiny fp32 holders whose forward ignores its input: one FSDP unit across all blocks (see
-    # ``parallelizer_utils.fully_shard_across_blocks``).
-    _fsdp_shard_across_blocks = ["self_attn.sinks_param"]
+    # Small fp32 modules that get one FSDP unit across all blocks (see ``parallelizer_utils.fully_shard_across_blocks``):
+    # the sinks, whose forward ignores its input, and the indexer's group-pooling modules, which only run for documents
+    # longer than ``index_topk``. A cross-block unit stays unsharded for the step, so each costs one all-gather per
+    # step (issued on every rank by ``HY4FlashCompressedIndexer.enter_pooling_units``) instead of one per call.
+    _fsdp_shard_across_blocks = [
+        "self_attn.sinks_param",
+        "self_attn.compressed_indexer.key_value_projection",
+        "self_attn.compressed_indexer.key_gate_projection",
+        "self_attn.compressed_indexer.key_norm",
+        "self_attn.compressed_indexer.intra_group_ape",
+    ]
 
     @dataclass(frozen=True)
     class ModelCapabilities:

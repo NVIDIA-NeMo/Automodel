@@ -59,8 +59,8 @@ def _drop_remote_keys(rank: int, local_tokens: int) -> None:
     """Test-only broken variant: the cross-rank key gather returns zeros for every token of another rank."""
     original = HY4FlashAttention._gather_keys
 
-    def gather(self, kv_local, token_keys):
-        kv, keys = original(self, kv_local, token_keys)
+    def gather(self, kv_local, token_keys, cp_group):
+        kv, keys = original(self, kv_local, token_keys, cp_group)
         own = torch.zeros(kv.shape[0], 1, dtype=torch.bool)
         own[rank * local_tokens : (rank + 1) * local_tokens] = True
         return kv * own, None if keys is None else keys * own
@@ -75,15 +75,20 @@ def _worker(rank, rendezvous, result_path, broken):
         "gloo", rank=rank, world_size=WORLD, init_method=f"file://{rendezvous}", timeout=timedelta(seconds=240)
     )
     try:
+        # Wired the way the shared parallelizer's ``apply_cp`` does it: the mesh goes on the model, and only blocks
+        # whose attention type is ``sliding_attention`` are offered ``setup_cp_attention``. Sparse blocks are never
+        # called, so a layer that kept its own copy of the group would not gather keys there.
         mesh = init_device_mesh("cpu", (WORLD,), mesh_dim_names=("cp",))
+        model.cp_mesh = mesh
         for layer in model.model.layers:
-            layer.self_attn.setup_cp_attention(mesh)
+            if layer.attention_type == "sliding_attention":
+                layer.self_attn.setup_cp_attention(mesh)
         batch = pack(random_documents(DOC_LENGTHS), PADDING)
         local_tokens = batch["input_ids"].shape[1] // WORLD
         if broken:
             _drop_remote_keys(rank, local_tokens)
         shard = {k: v[:, rank * local_tokens : (rank + 1) * local_tokens] for k, v in batch.items()}
-        out = model(**shard, cp_group=mesh.get_group())
+        out = model(**shard)
         # the per-rank objectives sum to the single-rank objective
         _objective(out.logits, shard["attention_mask"]).backward()
         grads = {}
