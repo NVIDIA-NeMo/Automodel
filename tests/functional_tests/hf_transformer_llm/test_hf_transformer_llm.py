@@ -25,7 +25,6 @@ HF_TRANSFORMER_LLM_DDP_FILENAME = "L2_HF_Transformer_LLM_DDP.sh"
 HF_TRANSFORMER_LLM_META_FSDP2_TP2_FILENAME = "L2_HF_Transformer_LLM_Meta_FSDP2_TP2.sh"
 
 
-
 class TestHFTransformerLLM:
     def test_hf_transformer_llm_ddp(self):
         try:

@@ -23,6 +23,7 @@ import sys
 # spec.loader.exec_module(mod)
 # main = mod.main
 
+
 def test_preprocess_megatron_dataset():
     jsonl_files_path = f"{os.environ['TEST_DATA_DIR']}/mcore_dataset_fineweb/fineweb_sample.val.part_0*.jsonl"
     files_to_exist = [
@@ -45,7 +46,8 @@ def test_preprocess_megatron_dataset():
             "preprocessed_data",
             "--output-path",
             output_path,
-            "--workers", "2",
+            "--workers",
+            "2",
             "--pretrained-model-name-or-path",
             f"{os.environ['TEST_DATA_DIR']}/hf_mixtral_2l/",
             "--append-eod",

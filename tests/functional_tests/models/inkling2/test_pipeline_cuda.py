@@ -227,9 +227,7 @@ def _worker(name: str, output: Path, case: Case | None = None) -> None:
             last = next(part for part in parts if part.lm_head is not None)
             last._pp_return_hidden_states = case.fused
             loss_module = (
-                PipelineCausalLMLoss(
-                    fused, last, grad_reduce_group=setup.mesh_context.device_mesh["dp_cp"].get_group()
-                )
+                PipelineCausalLMLoss(fused, last, grad_reduce_group=setup.mesh_context.device_mesh["dp_cp"].get_group())
                 if case.fused
                 else None
             )

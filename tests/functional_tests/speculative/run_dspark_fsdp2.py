@@ -83,9 +83,7 @@ def main() -> None:
         num_key_value_heads=2,
         max_position_embeddings=256,
     )
-    draft = Qwen3DSparkModel(build_draft_config(target_config, _model_args())).to(
-        device=device, dtype=dtype
-    )
+    draft = Qwen3DSparkModel(build_draft_config(target_config, _model_args())).to(device=device, dtype=dtype)
     draft.initialize_embeddings_and_head(
         embed_tokens=nn.Embedding(VOCAB, HIDDEN),
         lm_head=nn.Linear(HIDDEN, VOCAB, bias=False),
@@ -106,12 +104,10 @@ def main() -> None:
     seq = 48
     input_ids = torch.randint(0, VOCAB, (1, seq), generator=gen).to(device)
     loss_mask = torch.ones(1, seq, dtype=torch.uint8, device=device)
-    target_hidden_states = torch.randn(
-        1, seq, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen
-    ).to(device=device, dtype=dtype)
-    target_last_hidden_states = torch.randn(1, seq, HIDDEN, generator=gen).to(
+    target_hidden_states = torch.randn(1, seq, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen).to(
         device=device, dtype=dtype
     )
+    target_last_hidden_states = torch.randn(1, seq, HIDDEN, generator=gen).to(device=device, dtype=dtype)
 
     optim = torch.optim.AdamW([p for p in draft.parameters() if p.requires_grad], lr=5e-3)
     draft.train()

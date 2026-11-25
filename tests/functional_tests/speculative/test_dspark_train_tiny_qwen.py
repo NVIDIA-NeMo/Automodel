@@ -31,9 +31,7 @@ from nemo_automodel.components.speculative.dspark import (
     compute_dspark_loss,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FlexAttention backward requires a GPU"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention backward requires a GPU")
 
 VOCAB = 1024
 HIDDEN = 128
@@ -74,9 +72,7 @@ def test_dspark_draft_trains_against_tiny_qwen_target():
     target = AutoModelForCausalLM.from_config(target_config).to(device=device, dtype=dtype).eval()
     target.requires_grad_(False)
 
-    draft = Qwen3DSparkModel(build_draft_config(target_config, _model_args())).to(
-        device=device, dtype=dtype
-    )
+    draft = Qwen3DSparkModel(build_draft_config(target_config, _model_args())).to(device=device, dtype=dtype)
     draft.initialize_embeddings_and_head(
         embed_tokens=target.get_input_embeddings(),
         lm_head=target.get_output_embeddings(),

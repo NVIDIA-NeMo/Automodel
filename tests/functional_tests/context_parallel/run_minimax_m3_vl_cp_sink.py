@@ -57,25 +57,65 @@ def main():
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
     tiny = dict(
-        hidden_size=64, intermediate_size=32, dense_intermediate_size=48, shared_intermediate_size=32,
-        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=16, rotary_dim=8,
-        partial_rotary_factor=0.5, vocab_size=128, max_position_embeddings=512, rms_norm_eps=1e-6,
-        rope_theta=10000.0, num_local_experts=4, num_experts_per_tok=2, n_shared_experts=1,
-        moe_layer_freq=[0, 1, 1], use_gemma_norm=True, use_qk_norm=True, qk_norm_type="per_head",
-        scoring_func="sigmoid", use_routing_bias=True, routed_scaling_factor=2.0, swiglu_alpha=1.702,
-        swiglu_limit=7.0, num_mtp_modules=0, sparse_attention_config=dict(use_sparse_attention=False),
+        hidden_size=64,
+        intermediate_size=32,
+        dense_intermediate_size=48,
+        shared_intermediate_size=32,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        partial_rotary_factor=0.5,
+        vocab_size=128,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        moe_layer_freq=[0, 1, 1],
+        use_gemma_norm=True,
+        use_qk_norm=True,
+        qk_norm_type="per_head",
+        scoring_func="sigmoid",
+        use_routing_bias=True,
+        routed_scaling_factor=2.0,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        num_mtp_modules=0,
+        sparse_attention_config=dict(use_sparse_attention=False),
     )
     vision = dict(
-        hidden_size=32, num_attention_heads=4, num_hidden_layers=2, intermediate_size=64, patch_size=2,
-        num_channels=3, rope_theta=10000.0, hidden_act="gelu", layer_norm_eps=1e-5,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        patch_size=2,
+        num_channels=3,
+        rope_theta=10000.0,
+        hidden_act="gelu",
+        layer_norm_eps=1e-5,
         img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2},
     )
-    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False,
-                            dispatcher="torch", fake_balanced_gate=False, enable_hf_state_dict_adapter=False)
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        rope_fusion=False,
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
 
     torch.manual_seed(0)
-    cfg = MiniMaxM3VLConfig(vision_config=dict(vision), text_config={**tiny, "torch_dtype": "bfloat16"},
-                            image_token_index=100, video_token_index=101, projector_hidden_size=tiny["hidden_size"])
+    cfg = MiniMaxM3VLConfig(
+        vision_config=dict(vision),
+        text_config={**tiny, "torch_dtype": "bfloat16"},
+        image_token_index=100,
+        video_token_index=101,
+        projector_hidden_size=tiny["hidden_size"],
+    )
     model = MiniMaxM3SparseForConditionalGeneration(cfg, backend=backend).eval().to(device)
     model.initialize_weights(dtype=torch.bfloat16)
     model.to(torch.bfloat16)
