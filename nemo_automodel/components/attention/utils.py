@@ -27,6 +27,9 @@ from nemo_automodel.shared.import_utils import safe_import
 
 # Public source checksums, not credentials. Remove this compatibility gate once
 # upstream FA4 advertises initialized unused seqused output/gradient rows.
+_FA4_PREVIOUS_INTERFACE_SHA256 = (
+    "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"  # pragma: allowlist secret
+)
 _FA4_ORIGINAL_INTERFACE_SHA256 = (
     "c3895b66051bf09ca3e98f63e0f4c84e608d2300e2024eb315db9d4ee77c8cd0"  # pragma: allowlist secret
 )
@@ -604,6 +607,7 @@ def preprocess_args_and_kwargs_for_attn(
         if is_thd and isinstance(max_seqlen, int) and fa4_physical_layout:
             interface_sha = _fa4_interface_sha256()
             if interface_sha in (
+                _FA4_PREVIOUS_INTERFACE_SHA256,
                 _FA4_ORIGINAL_INTERFACE_SHA256,
                 _FA4_PHYSICAL_INTERFACE_SHA256,
             ):

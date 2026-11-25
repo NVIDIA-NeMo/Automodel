@@ -1089,7 +1089,7 @@ def test_fa4_original_interface_hash_tracks_the_container_pin() -> None:
     )
 
 
-@pytest.mark.parametrize("dependency", ["patched", "original", "unknown"])
+@pytest.mark.parametrize("dependency", ["patched", "original", "previous", "unknown"])
 @pytest.mark.parametrize("window", [(-1, 0), (128, 0)])
 def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency: str, window: tuple[int, int]) -> None:
     from torch.utils.checkpoint import checkpoint
@@ -1136,6 +1136,7 @@ def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency:
     sha = {
         "patched": utils._FA4_PHYSICAL_INTERFACE_SHA256,
         "original": utils._FA4_ORIGINAL_INTERFACE_SHA256,
+        "previous": "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646",  # pragma: allowlist secret
         "unknown": None,
     }[dependency]
     with (
