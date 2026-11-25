@@ -65,6 +65,7 @@ from nemo_automodel.components.models.hy_v4_flash.layers import (
     inverse_frequencies,
     mrope_cos_sin,
 )
+from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HY4FlashStateDictAdapter
 from nemo_automodel.components.models.hy_v4_flash.vision import HY4FlashVisionTower
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -470,6 +471,8 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         vision = config.vision_config
         # ``vit`` is a top-level module, as in the released checkpoint (``vit.*`` keys).
         self.vit = HY4FlashVisionTower(vision).to(torch.bfloat16) if vision.num_hidden_layers > 0 else None
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = HY4FlashStateDictAdapter(config, moe_config, self.backend, dtype=torch.bfloat16)
         self.image_token_id = config.image_token_id
         self.spatial_merge_size = vision.spatial_merge_size
 
