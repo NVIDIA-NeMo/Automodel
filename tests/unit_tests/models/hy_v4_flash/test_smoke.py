@@ -91,9 +91,13 @@ def test_selective_activation_checkpointing_trains_like_the_plain_model():
         out = model(ids, labels=ids)
         out.loss.backward()
         assert chunked_calls and all(chunked_calls)
-        results.append(
-            (out.loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None})
-        )
+        # The wrapper inserts its own level into parameter names; compare under the plain names.
+        grads = {
+            name.replace("_checkpoint_wrapped_module.", ""): p.grad.clone()
+            for name, p in model.named_parameters()
+            if p.grad is not None
+        }
+        results.append((out.loss.detach(), grads))
     (plain_loss, plain_grads), (wrapped_loss, wrapped_grads) = results
     assert torch.equal(plain_loss, wrapped_loss)
     assert plain_grads.keys() == wrapped_grads.keys() and len(plain_grads) > 0
