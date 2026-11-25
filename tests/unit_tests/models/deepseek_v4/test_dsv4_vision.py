@@ -35,6 +35,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
 )
 from nemo_automodel.components.models.deepseek_v4.model import (
     DeepseekV4ForCausalLM,
+    DeepseekV4HashGate,
     DeepseekV4VisionGate,
     apply_deepseek_v4_image_visibility,
 )
@@ -455,6 +456,45 @@ def _moe_config() -> MoEConfig:
         norm_topk_prob=True,
         dtype=torch.float32,
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("gate_kind", ["hash", "vision"])
+@pytest.mark.parametrize("base_logit", [-100.0, -120.0])
+def test_dsv4_gates_extreme_negative_gradients(gate_kind: str, base_logit: float) -> None:
+    config = _vision_config()
+    moe_config = _moe_config()
+    moe_config.gate_bias_update_factor = 0.0
+    if gate_kind == "hash":
+        gate = DeepseekV4HashGate(config, moe_config)
+        gate.tid2eid[3] = torch.tensor([0, 1])
+        gate.set_input_ids(torch.tensor([[3]]))
+    else:
+        gate = DeepseekV4VisionGate(config, moe_config, gate_precision=torch.float32, hash_routing=False)
+    with torch.no_grad():
+        gate.weight.zero_()
+        gate.weight[:, 0] = base_logit - torch.arange(moe_config.n_routed_experts)
+    x = torch.zeros(1, config.hidden_size)
+    x[:, 0] = 1.0
+    x.requires_grad_()
+    weights, indices, _ = gate(x, torch.ones(1, dtype=torch.bool), None)
+    upstream = torch.tensor([[-1.0, 1.0]])
+    (weights * upstream).sum().backward()
+
+    reference_x = x.detach().double().requires_grad_()
+    reference_weight = gate.weight.detach().double().requires_grad_()
+    reference_scores = torch.nn.functional.softplus(torch.nn.functional.linear(reference_x, reference_weight)).sqrt()
+    reference_weights = reference_scores.gather(1, indices)
+    reference_weights = reference_weights / (reference_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    (reference_weights * upstream.double()).sum().backward()
+
+    assert indices.tolist() == [[0, 1]]
+    assert torch.isfinite(weights).all()
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(gate.weight.grad).all()
+    torch.testing.assert_close(weights.double(), reference_weights, rtol=2e-6, atol=1e-40)
+    torch.testing.assert_close(x.grad.double(), reference_x.grad, rtol=2e-6, atol=1e-40)
+    torch.testing.assert_close(gate.weight.grad.double(), reference_weight.grad, rtol=2e-6, atol=1e-40)
 
 
 def test_vision_gate_uses_hash_for_text_and_visual_bias_for_image_tokens():

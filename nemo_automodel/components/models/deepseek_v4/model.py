@@ -103,7 +103,7 @@ from nemo_automodel.components.models.deepseek_v4.vision import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import Gate, MoE
+from nemo_automodel.components.moe.layers import Gate, MoE, sqrt_softplus_stable
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -478,7 +478,7 @@ class DeepseekV4HashGate(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             scores = F.linear(x.float(), self.weight.float())
         if self.score_func == "sqrtsoftplus":
-            scores = F.softplus(scores).sqrt()
+            scores = sqrt_softplus_stable(scores)
         elif self.score_func == "sigmoid":
             scores = scores.sigmoid()
         else:
@@ -569,7 +569,7 @@ class DeepseekV4VisionGate(Gate):
         self._pending_input_ids = None
         self._pending_vision_token_types = None
 
-        original_scores = torch.sqrt(torch.nn.functional.softplus(scores.float()))
+        original_scores = sqrt_softplus_stable(scores)
         num_tokens = original_scores.shape[0]
         if vision_token_types is not None:
             vision_mask = vision_token_types.flatten() >= 0
