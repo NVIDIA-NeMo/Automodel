@@ -29,7 +29,8 @@ selection sized the mask by the local shard instead of the gathered K/V
 (``mask=(8, 8)`` versus ``tensors=(8, 16)``); the CPU unit tests cannot reach
 it because the flex mask is only built on CUDA. The FA4 backend builds its
 membership table and block lists from local queries against global keys. It
-has SM90 and SM100-family (10.x/11.x) kernels only, so other GPUs skip it.
+uses a longer row so each rank's queries and the global keys span multiple blocks.
+It runs on SM90 and SM100-family (10.x/11.x) GPUs.
 
 Run::
 
@@ -55,8 +56,6 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
 
 WORLD_SIZE = 2
-BOUNDARIES = (0, 3, 10)  # two documents; the row is CP-padded to 16 tokens
-PADDED_LENGTH = 16
 DTYPE = torch.bfloat16
 # bf16 attention versus the same bf16 layer and backend on the full row.
 OUTPUT_TOL = dict(rtol=2e-2, atol=2e-2)
@@ -136,9 +135,12 @@ def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    total_tokens = BOUNDARIES[-1]
+    # The second FA4 document crosses the shard boundary. Each rank has two
+    # 128-query tiles and attends to keys in multiple global KV tiles.
+    boundaries, padded_length = ((0, 67, 266), 272) if attn == "fa4" else ((0, 3, 10), 16)
+    total_tokens = boundaries[-1]
     input_ids = torch.arange(1, total_tokens + 1, dtype=torch.long).view(1, -1)
-    document_positions = torch.cat([torch.arange(end - start) for start, end in zip(BOUNDARIES, BOUNDARIES[1:])]).view(
+    document_positions = torch.cat([torch.arange(end - start) for start, end in zip(boundaries, boundaries[1:])]).view(
         1, -1
     )
     _, local_batch, layout = shard_batch_for_qwen3_8_flash_next_cp(
@@ -148,17 +150,17 @@ def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device
             "input_ids": input_ids.clone(),
             "labels": input_ids.clone(),
             "position_ids": document_positions.clone(),
-            "cu_seqlens": torch.tensor(BOUNDARIES, dtype=torch.int32),
+            "cu_seqlens": torch.tensor(boundaries, dtype=torch.int32),
             "qkv_format": "thd",
         },
         padding_token_id=0,
         pad_multiple=4,
     )
-    assert layout.padded_seq_len == PADDED_LENGTH, layout.padded_seq_len
+    assert layout.padded_seq_len == padded_length, layout.padded_seq_len
     batch_context = local_batch["_qwen3_8_flash_next_cp_context"]
     assert isinstance(batch_context, Qwen3_8_FlashNextCPContext)
     assert batch_context.global_cu_seqlens is not None
-    local_length = PADDED_LENGTH // world_size
+    local_length = padded_length // world_size
     local_start = rank * local_length
 
     torch.manual_seed(321)
@@ -170,12 +172,12 @@ def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device
     reference = reference.to(device=device, dtype=DTYPE)
     cp_attention = cp_attention.to(device=device, dtype=DTYPE)
 
-    full_freqs = _document_relative_freqs((*BOUNDARIES, PADDED_LENGTH), rotary_width=config.head_dim).to(
+    full_freqs = _document_relative_freqs((*boundaries, padded_length), rotary_width=config.head_dim).to(
         device=device, dtype=DTYPE
     )
     torch.manual_seed(99)
-    full_hidden_values = torch.randn(1, PADDED_LENGTH, config.hidden_size).to(device=device, dtype=DTYPE)
-    grad_output = torch.randn(1, PADDED_LENGTH, config.hidden_size).to(device=device, dtype=DTYPE)
+    full_hidden_values = torch.randn(1, padded_length, config.hidden_size).to(device=device, dtype=DTYPE)
+    grad_output = torch.randn(1, padded_length, config.hidden_size).to(device=device, dtype=DTYPE)
 
     # Reference: the whole packed row in one process (packed CP1).
     reference_hidden = full_hidden_values[:, :total_tokens].clone().requires_grad_(True)
@@ -184,7 +186,7 @@ def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device
     reference_output = reference(
         reference_hidden,
         freqs_cis=full_freqs[:, :total_tokens],
-        cu_seqlens=torch.tensor(BOUNDARIES, dtype=torch.int32, device=device),
+        cu_seqlens=torch.tensor(boundaries, dtype=torch.int32, device=device),
     )
     handle.remove()
     reference_output.backward(grad_output[:, :total_tokens])
@@ -194,11 +196,11 @@ def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device
         group=dist.group.WORLD,
         rank=rank,
         size=world_size,
-        global_input_ids=torch.nn.functional.pad(input_ids, (0, PADDED_LENGTH - total_tokens)).to(device),
-        global_padding_mask=(torch.arange(PADDED_LENGTH).view(1, -1) >= total_tokens).to(device),
+        global_input_ids=torch.nn.functional.pad(input_ids, (0, padded_length - total_tokens)).to(device),
+        global_padding_mask=(torch.arange(padded_length).view(1, -1) >= total_tokens).to(device),
         local_sequence_start=local_start,
         local_sequence_length=local_length,
-        global_cu_seqlens=torch.tensor(BOUNDARIES, dtype=torch.long, device=device),
+        global_cu_seqlens=torch.tensor(boundaries, dtype=torch.long, device=device),
     )
     local_hidden = full_hidden_values[:, local_start : local_start + local_length].clone().requires_grad_(True)
     cp_routes: list[torch.Tensor] = []
@@ -242,7 +244,15 @@ def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device
         summed_gradient = parameter.grad.float()
         dist.all_reduce(summed_gradient, group=dist.group.WORLD)
         assert reference_gradient is not None, name
-        torch.testing.assert_close(summed_gradient, reference_gradient.float(), **PARAM_TOL)
+        reference_gradient = reference_gradient.float()
+        if attn == "fa4":
+            # The longer row accumulates more BF16 terms. Bound both the total
+            # error and the largest coordinate error relative to this parameter.
+            error = summed_gradient - reference_gradient
+            assert error.norm() <= 0.02 * reference_gradient.norm(), name
+            assert error.abs().max() <= 0.02 * reference_gradient.abs().max(), name
+        else:
+            torch.testing.assert_close(summed_gradient, reference_gradient, **PARAM_TOL)
 
 
 def main() -> None:
