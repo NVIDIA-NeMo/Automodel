@@ -14,6 +14,9 @@
 
 import os
 
+import pytest
+import yaml
+
 from nemo_automodel.components.launcher.nemo_run.config import (
     NemoRunConfig,
 )
@@ -135,3 +138,97 @@ def test_overrides_default_not_shared():
     b = NemoRunConfig()
     a.overrides["x"] = 1
     assert "x" not in b.overrides
+
+
+# ---------------------------------------------------------------------------
+# from_dict — validates the YAML section at the launcher boundary
+# ---------------------------------------------------------------------------
+
+
+def test_from_dict_parsed_yaml_section():
+    section = yaml.safe_load(
+        "executor: my_slurm\n"
+        "job_name: sft\n"
+        "detach: false\n"
+        "tail_logs: true\n"
+        "job_dir: /tmp/jobs\n"
+        "executors_file: /tmp/executors.py\n"
+        "nodes: 2\n"
+        "env_vars:\n"
+        "  A: b\n"
+        "overrides:\n"
+        "  mem: 64G\n"
+    )
+    cfg = NemoRunConfig.from_dict(section)
+    assert cfg == NemoRunConfig(
+        executor="my_slurm",
+        job_name="sft",
+        detach=False,
+        tail_logs=True,
+        executors_file="/tmp/executors.py",
+        job_dir="/tmp/jobs",
+        overrides={"mem": "64G", "nodes": 2, "env_vars": {"A": "b"}},
+    )
+
+
+def test_from_dict_null_launcher_keys_take_defaults():
+    section = yaml.safe_load("executor:\njob_name:\njob_dir: null\nexecutors_file:\ntail_logs:\noverrides:\nnodes: 2\n")
+    cfg = NemoRunConfig.from_dict(section)
+    default = NemoRunConfig()
+    assert cfg.executor == "local"
+    assert cfg.job_name == ""
+    assert cfg.job_dir == ""
+    assert cfg.executors_file == default.executors_file
+    assert cfg.tail_logs is False
+    assert cfg.overrides == {"nodes": 2}
+
+
+def test_from_dict_null_detach_keeps_meaning_false():
+    assert NemoRunConfig.from_dict({"detach": None}).detach is False
+    assert NemoRunConfig.from_dict({}).detach is True
+
+
+def test_from_dict_local_executor_with_null_executors_file():
+    cfg = NemoRunConfig.from_dict(yaml.safe_load("executor: local\nexecutors_file:\n"))
+    assert cfg.executor == "local"
+    assert cfg.executors_file == NemoRunConfig().executors_file
+
+
+def test_from_dict_top_level_key_wins_over_explicit_override():
+    cfg = NemoRunConfig.from_dict({"overrides": {"nodes": 1, "mem": "64G"}, "nodes": 2})
+    assert cfg.overrides == {"nodes": 2, "mem": "64G"}
+
+
+def test_from_dict_does_not_mutate_input():
+    explicit = {"mem": "64G"}
+    section = {"overrides": explicit, "nodes": 2}
+    NemoRunConfig.from_dict(section)
+    assert explicit == {"mem": "64G"}
+    assert section == {"overrides": {"mem": "64G"}, "nodes": 2}
+
+
+@pytest.mark.parametrize(
+    ("section", "message"),
+    [
+        ({"executor": 3}, "nemo_run.executor must be a string, got int"),
+        ({"executor": False}, "nemo_run.executor must be a string, got bool"),
+        ({"executors_file": 1}, "nemo_run.executors_file must be a string, got int"),
+        ({"job_name": 7}, "nemo_run.job_name must be a string, got int"),
+        ({"job_name": 0}, "nemo_run.job_name must be a string, got int"),
+        ({"job_name": False}, "nemo_run.job_name must be a string, got bool"),
+        ({"job_name": {}}, "nemo_run.job_name must be a string, got dict"),
+        ({"job_dir": []}, "nemo_run.job_dir must be a string, got list"),
+        ({"job_dir": ["a"]}, "nemo_run.job_dir must be a string, got list"),
+        ({"detach": "false"}, "nemo_run.detach must be true or false, got str"),
+        ({"detach": 0}, "nemo_run.detach must be true or false, got int"),
+        ({"tail_logs": "yes"}, "nemo_run.tail_logs must be true or false, got str"),
+        ({"tail_logs": 1}, "nemo_run.tail_logs must be true or false, got int"),
+        ({"overrides": ["mem=64G"]}, "nemo_run.overrides must be a mapping, got list"),
+        ({"overrides": "mem=64G"}, "nemo_run.overrides must be a mapping, got str"),
+        ({"overrides": {1: "x"}}, "nemo_run executor override keys must be strings, got int"),
+        ({1: "x"}, "nemo_run executor override keys must be strings, got int"),
+    ],
+)
+def test_from_dict_rejects_wrong_types(section, message):
+    with pytest.raises(TypeError, match=message):
+        NemoRunConfig.from_dict(section)

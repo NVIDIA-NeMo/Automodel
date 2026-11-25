@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ def load_executor_from_file(name: str, executors_file: str) -> Any:
     return executor
 
 
-def apply_overrides(executor: Any, overrides: dict) -> None:
+def apply_overrides(executor: Any, overrides: Mapping[str, object]) -> None:
     """Apply YAML overrides to an executor via ``setattr``.
 
     Dict and list values are *merged* with existing executor attributes
