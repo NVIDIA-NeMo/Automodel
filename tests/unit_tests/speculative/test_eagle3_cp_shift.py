@@ -28,7 +28,7 @@ cross-rank logic without a GPU.
 from __future__ import annotations
 
 import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -53,20 +53,10 @@ pytestmark = [
 B, S, STEPS = 2, 8, 3
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _init_gloo(rank: int, world_size: int, port: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+def _init_gloo(rank: int, world_size: int, init_file: str) -> None:
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
 
 
 def _zigzag_idx(rank: int, world_size: int, seq: int) -> list[int]:
@@ -82,9 +72,9 @@ def _full_sequence() -> torch.Tensor:
     return torch.arange(1, B * S + 1, dtype=torch.float32).view(B, S)
 
 
-def _contiguous_worker(rank: int, world_size: int, port: int) -> None:
+def _contiguous_worker(rank: int, world_size: int, init_file: str) -> None:
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_file)
         full = _full_sequence()
         lo, hi = rank * S // world_size, (rank + 1) * S // world_size
         ref, local = full, full[:, lo:hi].contiguous()
@@ -97,9 +87,9 @@ def _contiguous_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _zigzag_worker(rank: int, world_size: int, port: int) -> None:
+def _zigzag_worker(rank: int, world_size: int, init_file: str) -> None:
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_file)
         full = _full_sequence()
         idx = _zigzag_idx(rank, world_size, S)
         local = full[:, idx].contiguous()
@@ -121,10 +111,10 @@ def _zigzag_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _zigzag_extra_dim_worker(rank: int, world_size: int, port: int) -> None:
+def _zigzag_extra_dim_worker(rank: int, world_size: int, init_file: str) -> None:
     """``position_mask`` is ``[B, S, 1]``; the shift must handle a trailing dim."""
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_file)
         full = _full_sequence().unsqueeze(-1)
         idx = _zigzag_idx(rank, world_size, S)
         ref, local = full, full[:, idx].contiguous()
@@ -137,10 +127,10 @@ def _zigzag_extra_dim_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _zigzag_single_rank_worker(rank: int, world_size: int, port: int) -> None:
+def _zigzag_single_rank_worker(rank: int, world_size: int, init_file: str) -> None:
     """At cp_size=1 rank 0 owns both chunks in order, so the shift is the local one."""
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_file)
         full = _full_sequence()
         shifted = _cp_shift_left_zigzag(full.clone(), dist.group.WORLD)
         torch.testing.assert_close(shifted, _shift_left_with_zero(full))
@@ -149,17 +139,17 @@ def _zigzag_single_rank_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def test_cp_shift_left_matches_full_shift_on_contiguous_shards():
-    mp.spawn(_contiguous_worker, args=(2, _free_port()), nprocs=2, join=True)
+def test_cp_shift_left_matches_full_shift_on_contiguous_shards(tmp_path: Path):
+    mp.spawn(_contiguous_worker, args=(2, str(tmp_path / "process-group")), nprocs=2, join=True)
 
 
-def test_cp_shift_left_zigzag_matches_full_shift_on_zigzag_shards():
-    mp.spawn(_zigzag_worker, args=(2, _free_port()), nprocs=2, join=True)
+def test_cp_shift_left_zigzag_matches_full_shift_on_zigzag_shards(tmp_path: Path):
+    mp.spawn(_zigzag_worker, args=(2, str(tmp_path / "process-group")), nprocs=2, join=True)
 
 
-def test_cp_shift_left_zigzag_handles_trailing_dim():
-    mp.spawn(_zigzag_extra_dim_worker, args=(2, _free_port()), nprocs=2, join=True)
+def test_cp_shift_left_zigzag_handles_trailing_dim(tmp_path: Path):
+    mp.spawn(_zigzag_extra_dim_worker, args=(2, str(tmp_path / "process-group")), nprocs=2, join=True)
 
 
-def test_cp_shift_left_zigzag_single_rank_matches_local_shift():
-    mp.spawn(_zigzag_single_rank_worker, args=(1, _free_port()), nprocs=1, join=True)
+def test_cp_shift_left_zigzag_single_rank_matches_local_shift(tmp_path: Path):
+    mp.spawn(_zigzag_single_rank_worker, args=(1, str(tmp_path / "process-group")), nprocs=1, join=True)
