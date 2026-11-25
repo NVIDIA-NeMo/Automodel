@@ -331,11 +331,9 @@ stably and needs no filtering.
 from pathlib import Path
 from datasets import load_dataset
 
-
 def single_turn(row):
     roles = [m["role"] for m in row["messages"]]
     return roles.count("assistant") == 1 and roles[-1] == "assistant"
-
 
 out = Path("./cache/dataset/perfectblend-qwen3-8b-regen-single-turn")
 out.mkdir(parents=True, exist_ok=True)
