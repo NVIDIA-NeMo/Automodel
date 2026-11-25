@@ -337,6 +337,10 @@ class HYV4FlashModel(nn.Module):
             flat_positions = position_ids.reshape(3, -1)
             global_ids, global_time = input_ids, position_ids[0]
         change = torch.nonzero(flat[1:] != flat[:-1]).flatten().add(1).tolist()
+        if cp_size == 1:
+            # A batch row never continues the previous one, even when their document ids are equal (packed rows
+            # number their documents from 1 each). Under CP the single row is one global sequence.
+            change = sorted({*change, *range(seq, rows * seq, seq)})
         bounds = [0, *change, flat.numel()]
         host_ids = flat[bounds[:-1]].tolist()
         doc_ranges = tuple((s, e) for s, e, d in zip(bounds[:-1], bounds[1:], host_ids) if d > 0)
@@ -615,7 +619,8 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
             attention_mask: Optional tensor of shape [batch, sequence], 1 for real tokens.
             padding_mask: Optional bool tensor of shape [batch, sequence], True at padding (used if no attention_mask).
             packed_seq_ids: Optional integer tensor of shape [batch, sequence] with packed-document ids.
-            labels: Optional integer tensor of shape [batch, sequence], -100 ignored.
+            labels: Optional integer tensor of shape [batch, sequence], -100 ignored. With ``seq_lens`` the first
+                token of every document is not supervised.
             loss_mask: Consumed by the recipe loss; accepted so the standard batch reaches the model.
             logits_to_keep: Number of final positions, or integer positions to keep.
             output_hidden_states: Attach the final hidden states [batch, sequence, hidden].
@@ -683,9 +688,18 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
         logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         loss = None
         if labels is not None:
+            targets = labels[:, 1:]
+            if layout is not None:
+                # The first token of a packed document is not a target of the previous document's last token.
+                documents = layout.restore(layout.sequence_ids)
+                same_document = (documents[:, 1:] > 0) & (documents[:, 1:] == documents[:, :-1])
+                targets = targets.masked_fill(~same_document, -100)
             loss = F.cross_entropy(
-                logits[:, :-1].float().reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1), ignore_index=-100
-            )
+                logits[:, :-1].float().reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            ) / (targets != -100).sum().clamp_min(1)
         return CausalLMOutputWithPast(loss=loss, logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()

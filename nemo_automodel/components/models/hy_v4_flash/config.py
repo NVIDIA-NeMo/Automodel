@@ -311,8 +311,11 @@ class HYV4FlashTextConfig(PretrainedConfig):
             raise ValueError("Hy4-flash selects experts globally; only n_group=1, topk_group=1 is supported")
         if self.n_shared_experts != 1:
             raise ValueError("Hy4-flash has exactly one shared expert")
-        if self.index_topk % self.index_kpool:
-            raise ValueError(f"index_topk ({self.index_topk}) must be divisible by index_kpool ({self.index_kpool})")
+        if self.index_topk % self.index_kpool or self.index_topk < 2 * self.index_kpool:
+            raise ValueError(
+                f"index_topk ({self.index_topk}) must be a multiple of index_kpool ({self.index_kpool}) and hold "
+                "at least two groups (the query's own group and one recalled group)"
+            )
         for name in ("rms_norm_eps", "hc_eps", "routed_scaling_factor"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:

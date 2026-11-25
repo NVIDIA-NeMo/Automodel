@@ -115,3 +115,10 @@ def test_fp32_lm_head_flag_cannot_be_silently_disabled() -> None:
     assert tiny_text_config().enable_lm_head_fp32 is True
     with pytest.raises(ValueError, match="enable_lm_head_fp32"):
         tiny_text_config(enable_lm_head_fp32=False)
+
+
+def test_top_k_of_a_single_group_is_rejected() -> None:
+    # One group leaves no recalled group next to the query's own, which the selection does not implement.
+    with pytest.raises(ValueError, match="at least two groups"):
+        tiny_text_config(index_topk=2, compressed_indexer_compress_ratio=2)
+    assert tiny_text_config(index_topk=4, compressed_indexer_compress_ratio=2).index_topk == 4

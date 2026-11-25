@@ -80,7 +80,7 @@ peft:
     - "model.layers.*.self_attn.o_proj"
   dim: 64
   alpha: 128
-  dropout: 0.05
+  dropout: 0.0  # kv_b_proj is absorbed into the attention kernel, which cannot apply per-token LoRA dropout
   use_triton: false
 
 distributed:
@@ -104,7 +104,8 @@ distributed:
       cast_forward_inputs: false
 
 freeze_config:
-  freeze_vision_tower: true
+  freeze_modules:
+    - path: vit
   freeze_language_model: false
 
 checkpoint:

@@ -20,8 +20,8 @@ the next rank, a document spanning three ranks (longer than ``index_topk`` and t
 window both drop keys while the keys live on other ranks), short documents and trailing padding.
 """
 
+from dataclasses import dataclass
 from datetime import timedelta
-from pathlib import Path
 
 import pytest
 import torch
@@ -79,7 +79,8 @@ def _drop_remote_keys(rank: int, local_tokens: int) -> None:
     HYV4FlashAttention._gather_keys = gather
 
 
-def _worker(rank: int, rendezvous: str, result_path: str, broken: bool) -> None:
+def _worker(rank: int, rendezvous: str, result_path: str) -> None:
+    torch.set_num_threads(1)  # four workers share the runner's cores
     # Built before the process group exists so the Engram tables stay complete and local (no owner sharding).
     model = build_model()
     dist.init_process_group(
@@ -96,30 +97,48 @@ def _worker(rank: int, rendezvous: str, result_path: str, broken: bool) -> None:
                 layer.self_attn.setup_cp_attention(mesh)
         batch = pack(random_documents(DOC_LENGTHS), PADDING)
         local_tokens = batch["input_ids"].shape[1] // WORLD
-        if broken:
-            _drop_remote_keys(rank, local_tokens)
         shard = {k: v[:, rank * local_tokens : (rank + 1) * local_tokens] for k, v in batch.items()}
         out = model(**shard)
         grads = {}
-        if not broken:  # the negative control only compares logits
-            # the per-rank objectives sum to the single-rank objective
-            _objective(out.logits, shard["attention_mask"]).backward()
-            for name, parameter in model.named_parameters():
-                if parameter.grad is not None:
-                    grad = parameter.grad.clone()
-                    dist.all_reduce(grad)
-                    grads[name] = grad
-        torch.save({"logits": out.logits.detach(), "grads": grads}, result_path)
+        # the per-rank objectives sum to the single-rank objective
+        _objective(out.logits, shard["attention_mask"]).backward()
+        for name, parameter in model.named_parameters():
+            if parameter.grad is not None:
+                grad = parameter.grad.clone()
+                dist.all_reduce(grad)
+                grads[name] = grad
+        # Negative control in the same processes: the same forward without the cross-rank key gather.
+        _drop_remote_keys(rank, local_tokens)
+        with torch.no_grad():
+            broken = model(**shard).logits
+        torch.save({"logits": out.logits.detach(), "grads": grads, "broken": broken}, result_path)
     finally:
         dist.destroy_process_group()
 
 
-def _run_ranks(tmp_path: Path, broken: bool) -> list[dict[str, torch.Tensor | dict[str, torch.Tensor]]]:
+@dataclass(frozen=True)
+class _RankResults:
+    """Outputs of one four-rank run.
+
+    Attributes:
+        logits: Tensor of shape [1, tokens, vocab], the ranks' logits concatenated.
+        grads: Parameter gradients summed over the ranks, by parameter name.
+        broken_logits: Tensor of shape [1, tokens, vocab] of the forward without the cross-rank key gather.
+    """
+
+    logits: torch.Tensor
+    grads: dict[str, torch.Tensor]
+    broken_logits: torch.Tensor
+
+
+@pytest.fixture(scope="module")
+def four_ranks(tmp_path_factory: pytest.TempPathFactory) -> _RankResults:
+    """Run the pack once over four Gloo ranks (real cross-rank forward and backward) for both tests."""
+    tmp_path = tmp_path_factory.mktemp("cp4")
     context = mp.get_context("spawn")
     paths = [str(tmp_path / f"rank{rank}.pt") for rank in range(WORLD)]
     processes = [
-        context.Process(target=_worker, args=(rank, str(tmp_path / "init"), paths[rank], broken))
-        for rank in range(WORLD)
+        context.Process(target=_worker, args=(rank, str(tmp_path / "init"), paths[rank])) for rank in range(WORLD)
     ]
     for process in processes:
         process.start()
@@ -127,7 +146,11 @@ def _run_ranks(tmp_path: Path, broken: bool) -> list[dict[str, torch.Tensor | di
         process.join(timeout=400)
         assert process.exitcode == 0
     results = [torch.load(path) for path in paths]
-    return torch.cat([r["logits"] for r in results], dim=1), results[0]["grads"]
+    return _RankResults(
+        torch.cat([r["logits"] for r in results], dim=1),
+        results[0]["grads"],
+        torch.cat([r["broken"] for r in results], dim=1),
+    )
 
 
 def _assert_documents_match_alone(logits: torch.Tensor) -> None:
@@ -138,23 +161,19 @@ def _assert_documents_match_alone(logits: torch.Tensor) -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.runtime_budget(120, reason="spawns four Gloo workers that each build the tiny model")
-def test_cp4_matches_unpacked_documents_and_single_rank_gradients(tmp_path: Path) -> None:
-    logits, grads = _run_ranks(tmp_path, broken=False)
-    _assert_documents_match_alone(logits)
+def test_cp4_matches_unpacked_documents_and_single_rank_gradients(four_ranks: _RankResults) -> None:
+    _assert_documents_match_alone(four_ranks.logits)
     reference_logits, reference_grads = _single_rank()
     real = sum(DOC_LENGTHS)
-    torch.testing.assert_close(logits[:, :real], reference_logits[:, :real], **TOLERANCE)
-    assert grads.keys() == reference_grads.keys()
+    torch.testing.assert_close(four_ranks.logits[:, :real], reference_logits[:, :real], **TOLERANCE)
+    assert four_ranks.grads.keys() == reference_grads.keys()
     for name, grad in reference_grads.items():
         torch.testing.assert_close(
-            grads[name], grad, rtol=2e-3, atol=2e-4, msg=lambda m, name=name: f"grad {name}: {m}"
+            four_ranks.grads[name], grad, rtol=2e-3, atol=2e-4, msg=lambda m, name=name: f"grad {name}: {m}"
         )
 
 
 @pytest.mark.cpu_only
-@pytest.mark.runtime_budget(120, reason="spawns four Gloo workers that each build the tiny model")
-def test_cp4_without_the_cross_rank_key_gather_is_detected(tmp_path: Path) -> None:
-    logits, _ = _run_ranks(tmp_path, broken=True)
+def test_cp4_without_the_cross_rank_key_gather_is_detected(four_ranks: _RankResults) -> None:
     with pytest.raises(AssertionError):
-        _assert_documents_match_alone(logits)
+        _assert_documents_match_alone(four_ranks.broken_logits)

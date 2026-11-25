@@ -78,7 +78,8 @@ distributed:
     lm_head_precision: float32
     ignore_router_for_ac: true
 freeze_config:
-  freeze_vision_tower: true
+  freeze_modules:
+    - path: vit
   freeze_language_model: false
 checkpoint:
   enabled: false

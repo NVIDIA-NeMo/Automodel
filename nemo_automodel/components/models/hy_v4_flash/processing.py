@@ -107,6 +107,14 @@ class ImageProcessorConfig(TypedDict):
     image_std: list[float]
 
 
+class ProcessorConfig(TypedDict):
+    """``processor_config.json`` as this processor writes it."""
+
+    processor_class: str
+    image_token_id: int
+    image_processor: ImageProcessorConfig
+
+
 def image_settings_from_processor_config(block: ImageProcessorConfig) -> HYV4FlashImageSettings:
     """Preprocessing constants of a checkpoint's ``processor_config.json`` ``image_processor`` block."""
     mean, std = block["image_mean"], block["image_std"]
@@ -261,6 +269,22 @@ class HYV4FlashProcessor(ProcessorMixin):
         with open(cached_file(pretrained_model_name_or_path, "processor_config.json", **hub)) as handle:
             settings = image_settings_from_processor_config(json.load(handle)["image_processor"])
         return cls(tokenizer=tokenizer, image_token_id=config.image_token_id, settings=settings)
+
+    def to_dict(self) -> ProcessorConfig:
+        """``processor_config.json`` content: the ``image_processor`` block that :meth:`from_pretrained` reads."""
+        settings = self.settings
+        return ProcessorConfig(
+            processor_class=type(self).__name__,
+            image_token_id=self.image_token_id,
+            image_processor=ImageProcessorConfig(
+                patch_size=settings.patch_size,
+                merge_size=settings.merge_size,
+                min_pixels=settings.min_pixels,
+                max_pixels=settings.max_pixels,
+                image_mean=list(settings.mean),
+                image_std=list(settings.std),
+            ),
+        )
 
     # ------------------------------------------------------------------ tokenization
     def __call__(

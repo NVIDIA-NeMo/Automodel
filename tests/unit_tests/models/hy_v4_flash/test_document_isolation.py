@@ -244,3 +244,77 @@ def test_padded_batch_rows_equal_separate_forwards() -> None:
         out = model(batch, attention_mask=mask).logits
         torch.testing.assert_close(out[0], model(a).logits[0], **TOLERANCE)
         torch.testing.assert_close(out[1, :13], model(b).logits[0], **TOLERANCE)
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        pytest.param([[30], [30]], id="one_full_document_per_row"),
+        pytest.param([[30, 0], [12, 18]], id="full_row_then_two_documents"),
+        pytest.param([[18, 12], [30, 0]], id="two_documents_then_full_row"),
+        pytest.param([[25], [30]], id="padded_row_then_full_row"),
+    ],
+)
+def test_packed_batch_rows_do_not_see_each_other(lengths: list[list[int]]) -> None:
+    """Packed rows number their documents from 1 each: equal ids in adjacent rows are still different documents."""
+    model = build_model()
+    rows = torch.randint(*TOKEN_RANGE, (2, 30), generator=torch.Generator().manual_seed(11))
+    captured = {}
+
+    def keep_embedding_gradient(module: torch.nn.Module, args: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
+        output.retain_grad()
+        captured["embeddings"] = output
+
+    hook = model.model.embed_tokens.register_forward_hook(keep_embedding_gradient)
+    logits = model(rows, seq_lens=torch.tensor(lengths), qkv_format="thd").logits
+    hook.remove()
+    logits[1].square().sum().backward()
+    assert torch.count_nonzero(captured["embeddings"].grad[0]) == 0  # exactly zero: no path from row 1 to row 0
+    assert captured["embeddings"].grad[1].abs().sum() > 0
+    with torch.no_grad():
+        for row, row_lengths in enumerate(lengths):
+            start = 0
+            for length in filter(None, row_lengths):
+                alone = run_alone(model, rows[row, start : start + length])
+                torch.testing.assert_close(logits[row, start : start + length], alone, **TOLERANCE)
+                start += length
+
+
+def test_equal_document_ids_in_adjacent_rows_are_separate_documents() -> None:
+    model = build_model()
+    rows = torch.randint(*TOKEN_RANGE, (2, 30), generator=torch.Generator().manual_seed(12))
+    positions = torch.arange(30).expand(2, 30)
+    with torch.no_grad():
+        logits = model(rows, packed_seq_ids=torch.ones(2, 30, dtype=torch.long), position_ids=positions).logits
+        for row in range(2):
+            torch.testing.assert_close(logits[row], run_alone(model, rows[row]), **TOLERANCE)
+
+
+def test_packed_loss_is_the_token_weighted_mean_over_independent_documents() -> None:
+    """With ``seq_lens`` the last token of a document does not predict the first token of the next one."""
+    model = build_model()
+    ids = torch.randint(*TOKEN_RANGE, (1, 30), generator=torch.Generator().manual_seed(13))
+    documents = (ids[:, :13], ids[:, 13:])
+
+    def loss_and_gradients(run: Callable[[], torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        model.zero_grad(set_to_none=True)
+        loss = run()
+        loss.backward()
+        return loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    packed, packed_grads = loss_and_gradients(
+        lambda: model(ids, labels=ids, seq_lens=torch.tensor([[13, 17]]), qkv_format="thd").loss
+    )
+    # 12 and 16 supervised transitions inside the documents; the transition between them is not a target.
+    alone, alone_grads = loss_and_gradients(
+        lambda: sum((d.shape[1] - 1) * model(d, labels=d).loss for d in documents) / 28
+    )
+    torch.testing.assert_close(packed, alone, rtol=1e-5, atol=1e-6)
+    assert packed_grads.keys() == alone_grads.keys()
+    for name, value in alone_grads.items():
+        torch.testing.assert_close(
+            packed_grads[name], value, rtol=2e-3, atol=2e-4, msg=lambda m, name=name: f"{name}: {m}"
+        )
+    with torch.no_grad():
+        ignored = model(ids, labels=torch.full_like(ids, -100), seq_lens=torch.tensor([[13, 17]]), qkv_format="thd")
+    assert ignored.loss == 0  # nothing supervised: a finite zero, not a division by zero

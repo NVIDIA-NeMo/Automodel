@@ -450,7 +450,16 @@ class HYV4FlashAttention(nn.Module):
 
         Evaluating the module on an identity keeps the result differentiable through LoRA adapters and valid
         when FSDP shards ``kv_b_proj`` (a direct ``.weight`` read would see the sharded DTensor).
+
+        Raises:
+            RuntimeError: If ``kv_b_proj`` carries a LoRA adapter with active training dropout. One absorbed weight
+                cannot represent per-token dropout.
         """
+        if self.kv_b_proj.training and getattr(self.kv_b_proj, "dropout_p", 0.0) > 0.0:
+            raise RuntimeError(
+                "Hy4-flash absorbs kv_b_proj into the attention kernel and cannot apply LoRA dropout on it: "
+                "set the LoRA dropout to 0 or do not target kv_b_proj"
+            )
         eye = torch.eye(self.kv_lora_rank, dtype=dtype, device=device)
         weight = self.kv_b_proj(eye).T.reshape(self.num_heads, self.nope_dim + self.v_dim, self.kv_lora_rank)
         return weight[:, : self.nope_dim], weight[:, self.nope_dim :]
