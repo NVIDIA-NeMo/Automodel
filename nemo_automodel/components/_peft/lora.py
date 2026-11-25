@@ -42,6 +42,7 @@ from nemo_automodel.components._peft.lora_kernel import (
     lora_forward_wrapper,
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
@@ -231,10 +232,30 @@ class LinearLoRA(nn.Linear):
         obj.dropout_position = dropout_position
 
         if obj.use_dora:
-            # initialize DoRA magnitude vector to ||W|| (row-wise L2 norm).
-            with torch.no_grad():
-                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype=dtype, device=device)
-            obj.lora_magnitude = nn.Parameter(weight_norm, requires_grad=True)
+            obj.lora_magnitude = nn.Parameter(
+                torch.empty(out_features, dtype=dtype, device=device),
+                requires_grad=True,
+            )
+            LinearLoRA.init_dora_magnitude(obj)
+
+    @torch.no_grad
+    def init_dora_magnitude(self) -> None:
+        """Set the DoRA magnitude vector to the row-wise L2 norm of the current base weight.
+
+        ``self.weight`` is a Tensor of shape [out_features, in_features] and may be a DTensor
+        (for example ``Shard(0)`` under FSDP2, or ``Shard(0)``/``Shard(1)`` under TP).
+        ``self.lora_magnitude`` is a Tensor of shape [out_features], updated in place so the
+        parameter object is kept; when it is a DTensor, the norm is redistributed to its placements
+        first. The norm is computed in the weight's dtype and cast to the magnitude's dtype.
+
+        Called at adapter creation and again after the base checkpoint is loaded, because on
+        the meta-device path the weight only gets its real values after the adapter exists.
+        """
+        weight_norm = torch.linalg.norm(self.weight, dim=1)
+        magnitude = self.lora_magnitude
+        if isinstance(magnitude, DTensor):
+            weight_norm = weight_norm.redistribute(magnitude.device_mesh, magnitude.placements)
+        magnitude.copy_(weight_norm)
 
     def _dora_weight_norm(self) -> torch.Tensor:
         """
@@ -563,6 +584,11 @@ def patch_linear_module(
         use_triton = False
     if not isinstance(orig_linear, tuple(linear_types)):
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
+    if isinstance(orig_linear, LMHead) and orig_linear.logits_dtype is not None:
+        raise ValueError(
+            "LoRA replaces a linear's projection, which would drop this LM head's logits_dtype; "
+            "leave the head out, e.g. with exclude_modules=['*.lm_head']."
+        )
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
 
     if use_dora:

@@ -31,13 +31,14 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_batch_contiguous,
 )
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.configuration import (
     ConfigValue,
@@ -190,6 +191,8 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         config: Step5Config | Step5VLConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
@@ -234,9 +237,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         if not moe_config.swiglu_clamp_after_activation:
             raise ValueError("Step5 requires post-SiLU clamping in its MoEConfig")
         self.model = Step5TextModel(text, self.backend, moe_config, dtype=dtype)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text.hidden_size, text.vocab_size, bias=False, dtype=dtype
-        )
+        self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.state_dict_adapter = Step5StateDictAdapter(text, moe_config, self.backend, dtype)
         self.init_weights()
         # Establish FP32 norm storage even under Transformers' BF16 default dtype,
@@ -328,7 +329,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             width, output_dtype = hidden, torch.float32
         else:
             width = hidden if self._pp_return_hidden_states else self.config.vocab_size
-            output_dtype = dtype
+            output_dtype = dtype if self._pp_return_hidden_states else (self.lm_head.logits_dtype or dtype)
         outputs = (torch.empty(microbatch_size, seq_len, width, device="meta", dtype=output_dtype),)
         return inputs, outputs
 
@@ -437,9 +438,8 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             return hidden
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden)
-        out = compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, is_thd=False, output_hidden_states=output_hidden_states
-        )
+        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        out = CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
         if labels is not None:
             if self.cp_mesh is not None and self.cp_mesh.size() > 1:
                 raise ValueError("Use the native recipe's globally shifted loss with CP")
@@ -465,9 +465,14 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
         supports_pp: bool = False
 
     def __init__(
-        self, config: Step5VLConfig, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None
+        self,
+        config: Step5VLConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__(config, moe_config, backend)
+        super().__init__(config, moe_config, backend, logits_dtype=logits_dtype)
         self.vision_model = Step5VisionEncoder(config.vision_config)
         self.vit_large_projector = nn.Linear(
             config.vision_config.width * 4, config.hidden_size, bias=config.projector_bias
@@ -508,8 +513,10 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
         pixel_values: torch.Tensor | None = None,
         patch_pixel_values: torch.Tensor | None = None,
         num_patches: torch.Tensor | list[int] | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        output_hidden_states: bool = False,
         **kwargs: ConfigValue | torch.Tensor,
-    ) -> CausalLMOutputWithPast:
+    ) -> CausalLMOutputWithPast | torch.Tensor:
         """Inject projected crop/overview tokens and run the text backbone.
 
         Args:
@@ -518,10 +525,15 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
             pixel_values: Optional tensor of shape [images, channels, height, width].
             patch_pixel_values: Optional tensor of shape [crops, channels, height, width].
             num_patches: Crop counts of shape [images], or equivalent list.
-            **kwargs: Tensor and scalar arguments from Step5ForCausalLM.forward.
+            logits_to_keep: Last-token count, or a tensor of shape
+                [selected_sequence] with sequence indices to project. Zero keeps all positions.
+            output_hidden_states: Attach final hidden states for native fused CE.
+            **kwargs: Tensor and scalar arguments with the layouts documented by Step5ForCausalLM.forward.
 
         Returns:
-            Language output with logits of shape [batch, local_sequence, vocab].
+            Language output with logits of shape [batch, selected_sequence, vocab]
+            and optional hidden states of shape [batch, local_sequence, hidden].
+            Native fused-loss pipeline stages return the hidden-state tensor directly.
         """
         if pixel_values is not None:
             if input_ids is None or inputs_embeds is not None:
@@ -565,7 +577,13 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
             inputs_embeds[mask] = visual[local_numbers].to(inputs_embeds.dtype)
         elif patch_pixel_values is not None:
             raise ValueError("Crop inputs require overview pixel_values")
-        return super().forward(input_ids, inputs_embeds=inputs_embeds, **kwargs)
+        return super().forward(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            logits_to_keep=logits_to_keep,
+            output_hidden_states=output_hidden_states,
+            **kwargs,
+        )
 
 
 ModelClass = Step5ForCausalLM

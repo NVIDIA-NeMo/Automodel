@@ -118,4 +118,5 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

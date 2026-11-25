@@ -18,23 +18,26 @@ import math
 import os
 import types
 import warnings
+from abc import ABC, abstractmethod
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
 
 import torch
 from torch import nn
-from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from transformer_engine.common.recipe import Recipe
 
 logger = logging.getLogger(__name__)
 
@@ -249,22 +252,13 @@ def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
 
 
 @dataclass(kw_only=True)
-class TEFp8Config:
-    """Configuration for Transformer Engine FP8 quantization.
+class TEQuantizationConfig(ABC):
+    """Base class of :class:`TEFp8Config` and :class:`TENvfp4Config`."""
 
-    When present (not None) in BackendConfig, FP8 is enabled.
-    The ``recipe`` field accepts either a string shorthand (``"current"``, ``"block"``,
-    or ``"mxfp8"``) or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
-
-    ``"mxfp8"`` selects TE's :class:`MXFP8BlockScaling` recipe (e4m3 data + e8m0 block
-    scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
-    e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
-    ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
-    """
-
-    recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    name: ClassVar[str]
+    """``"te_fp8"`` or ``"te_nvfp4"``; used in log and error messages."""
     exclude_fqns: tuple[str, ...] = ("lm_head",)
-    """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
+    """Module names kept out of the Transformer Engine autocast (their GEMMs run in the model dtype).
 
     Same matching as the torchao ``fp8.filter_fqns`` block: a module is excluded when any entry is a
     substring of its qualified name, so ``"lm_head"`` covers ``lm_head`` and
@@ -279,14 +273,16 @@ class TEFp8Config:
             self.exclude_fqns = (self.exclude_fqns,)
         self.exclude_fqns = tuple(self.exclude_fqns)
         if any(not isinstance(fqn, str) or not fqn for fqn in self.exclude_fqns):
-            raise ValueError(f"te_fp8.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}")
+            raise ValueError(
+                f"{self.name}.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}"
+            )
 
     def module_excluded(self, name: str) -> bool:
-        """Whether the module with qualified name ``name`` stays out of the FP8 autocast."""
+        """Whether the module with qualified name ``name`` stays out of the Transformer Engine autocast."""
         return any(fqn in name for fqn in self.exclude_fqns)
 
     def exclude_modules(self, model: nn.Module) -> list[str]:
-        """Keep the modules matching :attr:`exclude_fqns` out of the FP8 autocast.
+        """Keep the modules matching :attr:`exclude_fqns` out of the Transformer Engine autocast.
 
         Each matching module gets an instance ``forward`` that runs the forward it had so far (an
         instance-level forward installed earlier, e.g. by a tensor-parallel style, else the class
@@ -298,7 +294,7 @@ class TEFp8Config:
             model: Model (or pipeline stage) whose modules are inspected by qualified name.
 
         Returns:
-            Qualified names of the modules now kept out of FP8, in ``named_modules`` order; empty
+            Qualified names of the modules now kept out of the autocast, in ``named_modules`` order; empty
             without Transformer Engine or without exclusions.
         """
         if not HAVE_TE or not self.exclude_fqns:
@@ -314,8 +310,43 @@ class TEFp8Config:
                 module.forward = types.MethodType(_forward_outside_fp8, module)
             excluded.append(name)
         if excluded:
-            logger.info("te_fp8: %d module(s) kept out of the FP8 autocast: %s", len(excluded), ", ".join(excluded))
+            logger.info(
+                "%s: %d module(s) kept out of the Transformer Engine autocast: %s",
+                self.name,
+                len(excluded),
+                ", ".join(excluded),
+            )
         return excluded
+
+    @abstractmethod
+    def build_recipe(self) -> "Recipe | None":
+        """Return the Transformer Engine recipe; ``None`` when Transformer Engine is not installed."""
+
+    def maybe_te_autocast(self):
+        """Return te_autocast context manager for the recipe."""
+        if not HAVE_TE:
+            return nullcontext()
+        from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+        return te_autocast(enabled=True, recipe=self.build_recipe())
+
+
+@dataclass(kw_only=True)
+class TEFp8Config(TEQuantizationConfig):
+    """Configuration for Transformer Engine FP8 quantization.
+
+    When present (not None) in BackendConfig, FP8 is enabled.
+    The ``recipe`` field accepts either a string shorthand (``"current"``, ``"block"``,
+    or ``"mxfp8"``) or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
+
+    ``"mxfp8"`` selects TE's :class:`MXFP8BlockScaling` recipe (e4m3 data + e8m0 block
+    scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
+    e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
+    ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
+    """
+
+    name: ClassVar[str] = "te_fp8"
+    recipe: Literal["current", "block", "mxfp8"] | Any = "current"
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -347,13 +378,86 @@ class TEFp8Config:
             return Float8BlockScaling()
         return Float8CurrentScaling()
 
-    def maybe_te_autocast(self):
-        """Return te_autocast context manager for FP8."""
-        if not HAVE_TE:
-            return nullcontext()
-        from transformer_engine.pytorch.quantization import autocast as te_autocast
 
-        return te_autocast(enabled=True, recipe=self.build_recipe())
+@dataclass(kw_only=True)
+class TENvfp4Config(TEQuantizationConfig):
+    """Configuration for Transformer Engine NVFP4 quantization.
+
+    When present (not None) in BackendConfig, NVFP4 is enabled with TE's ``NVFP4BlockScaling`` recipe
+    (Blackwell GPUs only). Weights stay in the model dtype and are quantized for each GEMM unless
+    ``resident_weights`` is set. The defaults are the recipe's defaults.
+    """
+
+    name: ClassVar[str] = "te_nvfp4"
+    max_grouped_tensors: ClassVar[int] = 64
+    """``kMaxTensorsPerKernel`` of TE's NVFP4 grouped quantization kernels; caps the experts per rank."""
+    random_hadamard_transform: bool = True
+    """Rotate the operands of the weight-gradient GEMM with a 16x16 Hadamard matrix before quantizing."""
+    stochastic_rounding: bool = True
+    """Round gradients stochastically instead of to nearest."""
+    weight_blocks_2d: bool = True
+    """Share one block scale per 16x16 weight block instead of per 16 values of a row."""
+    row_scaled_activation: bool = False
+    """Scale forward activations per row (one FP32 scale per token) instead of per tensor."""
+    four_over_six: Literal["none", "weights", "activations", "all"] = "none"
+    """Tensors whose blocks map their maximum to 4 or to 6, whichever quantizes the block with less error."""
+    backward: Literal["quantized", "high_precision", "dequantized"] = "quantized"
+    """Operands of the backward GEMMs: quantized to NVFP4, the original floating-point operands, or the
+    dequantized forward operands. With ``"quantized"``, ``row_scaled_activation`` and ``four_over_six`` on
+    activations only work with frozen weights."""
+    resident_weights: bool = False
+    """Hold the expert weights as NVFP4 tensors: an NVFP4 checkpoint fills them unchanged and they are saved
+    in the same form. Training them needs Transformer Engine ``FusedAdam`` with ``master_weights=True``."""
+
+    def __post_init__(self) -> None:
+        """Normalize ``exclude_fqns`` and reject options that Transformer Engine does not implement."""
+        super().__post_init__()
+        if self.four_over_six not in ("none", "weights", "activations", "all"):
+            raise ValueError(
+                "te_nvfp4.four_over_six must be one of 'none', 'weights', 'activations' or 'all', "
+                f"got {self.four_over_six!r}"
+            )
+        if self.backward not in ("quantized", "high_precision", "dequantized"):
+            raise ValueError(
+                f"te_nvfp4.backward must be one of quantized, high_precision or dequantized, got {self.backward!r}"
+            )
+        if self.random_hadamard_transform and (
+            self.row_scaled_activation or self.four_over_six in ("activations", "all")
+        ):
+            raise ValueError(
+                "te_nvfp4.row_scaled_activation and te_nvfp4.four_over_six on activations require "
+                "te_nvfp4.random_hadamard_transform=False"
+            )
+
+    def recipe_kwargs(self) -> dict[str, bool | str]:
+        """Keyword arguments of ``NVFP4BlockScaling`` for the options that differ from its defaults."""
+        kwargs: dict[str, bool | str] = {}
+        if not self.random_hadamard_transform:
+            kwargs["disable_rht"] = True
+        if not self.stochastic_rounding:
+            kwargs["disable_stochastic_rounding"] = True
+        if not self.weight_blocks_2d:
+            kwargs["disable_2d_quantization"] = True
+        if self.row_scaled_activation:
+            kwargs["row_scaled_activation"] = True
+        if self.four_over_six != "none":
+            kwargs["nvfp4_4over6"] = self.four_over_six
+        if self.backward != "quantized":
+            kwargs["backward_override"] = self.backward
+        return kwargs
+
+    def build_recipe(self) -> "Recipe | None":
+        """Build the TE ``NVFP4BlockScaling`` recipe with these options; ``None`` without Transformer Engine."""
+        if not HAVE_TE:
+            return None
+        # Transformer Engine has NVFP4 since v2.7.
+        available, recipe_cls = safe_import_from("transformer_engine.common.recipe", "NVFP4BlockScaling")
+        if not available:
+            raise ImportError(
+                "te_nvfp4 requires transformer_engine.common.recipe.NVFP4BlockScaling "
+                "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
+            )
+        return recipe_cls(**self.recipe_kwargs())
 
 
 @dataclass(kw_only=True)
@@ -532,10 +636,13 @@ class BackendConfig:
             Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            "nccl_ep" uses Transformer Engine NCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        nccl_ep: NCCL-EP settings; ``max_tokens_per_rank`` is required when selecting
+            "nccl_ep". NCCL-EP sizes its own kernels and ignores ``dispatcher_num_sms``.
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
-            manager instance across MoE layers.
+            manager instance across MoE layers. NCCL-EP always keeps routing state layer-local.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
         dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
@@ -565,7 +672,9 @@ class BackendConfig:
             run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
             taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
             that covers the largest routing skew expected across layers and batches. Not supported
-            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination) or by
+            ``GroupedExpertsTE``, which HybridEP uses for every ``experts`` value other than
+            ``torch_mm``, ``gmm`` and ``torch_mm_mxfp8``.
         dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
@@ -596,6 +705,9 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+            Qwen3-MoE also supports attn="fa4": only the padded projections, Q/K
+            normalization and RoPE are compiled; packed varlen attention runs between
+            those fixed-shape graphs with its document metadata preserved.
         compile_situ: torch.compile the SiTU expert activation of models that opt in
             (currently Kimi K3): the weighted-SiTU forward and backward run as one fused
             whole-tensor kernel each (low-precision in/out, fp32 math inside, no chunk loop),
@@ -603,12 +715,13 @@ class BackendConfig:
             mixing chain is compiled as well. Compiled numerics are allclose to eager but
             not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
-            (currently Kimi K3 and DeepSeek V4.1), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            (currently Kimi K3, DeepSeek V4.1 and GLM-5.3-Flash decoder/final norms),
+            fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
         compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in
-            (currently DeepSeek V4 / V4.1): coefficient projection, stream collapse and stream expand,
-            one fused kernel each, static shapes (a new sequence length compiles them again; past
+            (currently DeepSeek V4 / V4.1 and GLM-5.3-Flash): coefficient projection, stream collapse and stream
+            expand, fusing their elementwise chains with static shapes (a new sequence length compiles them again; past
             dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
         shared_expert_overlap: run the shared experts of MoE models (the shared ``MoE`` class, e.g. DeepSeek V4 / V4.1, and Kimi K3)
@@ -639,13 +752,14 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
     te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
@@ -683,6 +797,7 @@ class BackendConfig:
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
+    te_nvfp4: TENvfp4Config | None = None
     gate_precision: str | torch.dtype | None = None
     # When True, torch.compile(fullgraph=True) the attention module's forward to fuse its many
     # small ops (projections, RoPE, reshapes, SDPA). Applies to both the DeepSeek-V3 MLA and
@@ -695,12 +810,12 @@ class BackendConfig:
     # Kimi K3): fused whole-tensor weighted-SiTU forward/backward, the dense SituAndMul core
     # and the attn-res chain. Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
-    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3 and
-    # DeepSeek V4.1), same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
-    # not bitwise-identical. Default False.
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3,
+    # DeepSeek V4.1 and GLM-5.3-Flash decoder/final norms), same lazy once-per-process pattern as compile_situ.
+    # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_norm: bool = False
     # When True, torch.compile the mHC projection / collapse / expand cores of opted-in models
-    # (currently DeepSeek V4 / V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
+    # (currently DeepSeek V4 / V4.1 and GLM-5.3-Flash), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
     # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index
@@ -754,11 +869,26 @@ class BackendConfig:
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
+        # Normalize te_nvfp4: dict -> TENvfp4Config, None stays None
+        if isinstance(self.te_nvfp4, dict):
+            self.te_nvfp4 = TENvfp4Config(**self.te_nvfp4)
+        if self.te_fp8 is not None and self.te_nvfp4 is not None:
+            raise ValueError("te_fp8 and te_nvfp4 are mutually exclusive: Transformer Engine runs one recipe")
 
         if isinstance(self.cuda_graph, dict):
             self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
+
+        if isinstance(self.nccl_ep, dict):
+            self.nccl_ep = NcclEpConfig(**self.nccl_ep)
+        elif not isinstance(self.nccl_ep, NcclEpConfig):
+            raise TypeError("nccl_ep must be an NcclEpConfig or mapping")
+        if self.dispatcher == "nccl_ep":
+            if self.nccl_ep.max_tokens_per_rank is None:
+                raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
+            if self.dispatcher_async_dispatch:
+                raise ValueError("dispatcher_async_dispatch is not supported by NCCL-EP")
 
         if isinstance(self.mok, dict):
             self.mok = MoKBackendConfig(**self.mok)
@@ -799,7 +929,7 @@ class BackendConfig:
 
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -832,10 +962,11 @@ class BackendConfig:
             raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
         if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
-        # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
-        if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
+        # FP8 and NVFP4 require at least one TE backend (they apply to all TE modules: Linear, GroupedLinear, RMSNorm)
+        te_quantization = self.te_quantization
+        if te_quantization is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
-                "te_fp8 requires at least one TE backend "
+                f"{te_quantization.name} requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
             )
         # The sync-free knobs only mean something to the HybridEP dispatcher; elsewhere the capacity factor
@@ -873,6 +1004,11 @@ class BackendConfig:
                 "dispatcher_capacity_factor has no effect under benchmark_static_routing (the pinned count already "
                 "keeps the dispatch non-blocking); unset one of them"
             )
+
+    @property
+    def te_quantization(self) -> TEQuantizationConfig | None:
+        """The ``te_fp8`` or ``te_nvfp4`` config, whichever is set."""
+        return self.te_fp8 if self.te_fp8 is not None else self.te_nvfp4
 
 
 # Keep the forward opaque so grad/no_grad compilation uses the same computation.
@@ -1518,103 +1654,6 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
             module._buffers[buffer_name] = buf.to(torch.float32)
 
 
-def compute_lm_head_logits(
-    lm_head: nn.Module | None,
-    hidden_states: torch.Tensor,
-    logits_to_keep: int | torch.Tensor = 0,
-    is_thd: bool = False,
-    fp32_lm_head: bool = False,
-    output_hidden_states: bool = False,
-) -> CausalLMOutputWithPast:
-    """Project hidden states through ``lm_head`` and wrap the result.
-
-    Centralizes the lm_head projection and output packaging shared by every
-    custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` ``forward()``. The
-    returned ``CausalLMOutputWithPast`` carries the projected ``logits`` and,
-    when requested, the final ``hidden_states``; callers that also need ``loss``,
-    ``past_key_values``, etc. read ``.logits`` and build their own output.
-
-    - ``lm_head is None`` (e.g. a non-final pipeline-parallel stage that does not
-      own the head): ``hidden_states`` is passed through as ``logits`` so the
-      next stage receives it.
-    - ``logits_to_keep == 0`` (training default): every position is projected.
-      The full range is deliberately *not* sliced, because ``slice(0, None)`` on
-      a DTensor is unsupported (it raises on the ``aten.alias`` op under tensor
-      parallel with sequence parallelism).
-    - ``logits_to_keep`` as a positive int or a tensor of indices: only the
-      requested positions are projected. Both 2D ``[T, H]`` (THD/packed) and 3D
-      ``[B, S, H]`` (BSHD) hidden states are handled.
-    - ``is_thd``: THD/packed inputs yield 2D ``[T, V]`` logits; the leading batch
-      dim is restored (``unsqueeze(0)`` -> ``[1, T, V]``) so downstream code sees
-      a uniform ``[B, S, V]`` layout. The same restoration is applied to the
-      ``hidden_states`` field. Only applied while the tensor is still 2D, so an
-      ``inputs_embeds`` path that already produced ``[1, T, *]`` is left
-      untouched.
-    - ``fp32_lm_head``: run the projection in fp32 and cast the logits back to
-      the input dtype. Used by models whose ``lm_head.weight`` has been promoted
-      to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
-      through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
-      ``F.linear`` so DTensor redistribution is preserved.
-    - Otherwise, cast the sliced input to the head's effective compute dtype.
-      For a standalone FSDP2 head this comes from its mixed-precision policy,
-      since its sharded weight may still expose the master-copy dtype before the
-      forward pre-hook runs. Other heads use their materialized weight dtype.
-    - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
-      ``hidden_states`` are attached to the output so the fused cross-entropy
-      path can recompute logits over every position; otherwise the field is
-      ``None``.
-
-    Args:
-        lm_head: The language-model head module, or ``None`` on a pipeline stage
-            that does not own it.
-        hidden_states: Final hidden states, shaped ``[T, H]`` or ``[B, S, H]``.
-        logits_to_keep: ``0`` to project every position; a positive int to keep
-            the last ``N`` positions; or a tensor of position indices.
-        is_thd: Whether the inputs were THD/packed; if so, a 2D logits (and
-            hidden-states) result is unsqueezed back to a leading batch dim of 1.
-        fp32_lm_head: Project in fp32 and cast the result back to the input
-            dtype. Ignored when ``lm_head`` is ``None``.
-        output_hidden_states: Attach the final hidden states to the output.
-
-    Returns:
-        A ``CausalLMOutputWithPast`` whose ``logits`` are the projected logits
-        (or ``hidden_states`` unchanged when ``lm_head`` is ``None``) and whose
-        ``hidden_states`` are the final hidden states when ``output_hidden_states``
-        is set, else ``None``.
-    """
-    if lm_head is None:
-        logits = hidden_states
-    else:
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            sliced = hidden_states
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                sliced = hidden_states[slice_indices, :]
-            else:
-                sliced = hidden_states[:, slice_indices, :]
-        if fp32_lm_head:
-            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-                logits = lm_head(sliced.float()).to(hidden_states.dtype)
-        else:
-            compute_dtype = None
-            if isinstance(lm_head, FSDPModule):
-                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
-            lm_head_weight = getattr(lm_head, "weight", None)
-            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
-                compute_dtype = lm_head_weight.dtype
-            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
-            logits = lm_head(projection_input)
-    if is_thd and logits.dim() == 2:
-        logits = logits.unsqueeze(0)
-
-    hidden_out = None
-    if output_hidden_states:
-        hidden_out = hidden_states.unsqueeze(0) if is_thd and hidden_states.dim() == 2 else hidden_states
-
-    return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
-
-
 def prepare_frozen_parameters_for_sharding(
     model: nn.Module,
     compute_dtype: torch.dtype | None,
@@ -1816,9 +1855,10 @@ __all__ = [
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",
+    "TENvfp4Config",
+    "TEQuantizationConfig",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
-    "compute_lm_head_logits",
     "get_is_first_microbatch",
     "get_is_optim_step",
     "get_rope_config",

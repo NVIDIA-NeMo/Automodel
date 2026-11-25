@@ -122,6 +122,8 @@ MODEL_TYPE_OVERVIEW_PATHS = (
     ("Diffusion", "diffusion/index.mdx"),
     ("Embedding", "embedding/index.mdx"),
     ("Reranking", "reranker/index.mdx"),
+    ("WAM", "wam/index.mdx"),
+    ("Decision", "decision/index.mdx"),
 )
 
 
@@ -135,6 +137,8 @@ MODEL_TYPE_ROUTE_CATEGORIES = {
     "Diffusion": "diffusion",
     "Embedding": "embedding-models",
     "Reranking": "reranking-models",
+    "WAM": "wam",
+    "Decision": "decision-models",
 }
 
 
@@ -153,8 +157,10 @@ PROVIDER_ORGS = {
     "bigcode": "bigcode",
     "black-forest-labs": "black-forest-labs",
     "bytedance-seed": "ByteDance-Seed",
+    "cloudflare": "Cloudflare",
     "cohere": "CohereForAI",
     "coherelabs": "CohereLabs",
+    "contrastive-lm": "Contrastive-LM",
     "deepseek-ai": "deepseek-ai",
     "diffusers": "diffusers",
     "eleutherai": "EleutherAI",
@@ -174,12 +180,12 @@ PROVIDER_ORGS = {
     "llava-hf": "llava-hf",
     "lmms-lab": "lmms-lab",
     "meta": "meta-llama",
+    "meta-models": "meta-models",
     "microsoft": "microsoft",
     "MiniMaxAI": "MiniMaxAI",
     "mistralai": "mistralai",
     "moonshotai": "moonshotai",
     "nanbeige": "Nanbeige",
-    "meta-models": "meta-models",
     "nvidia": "nvidia",
     "openai": "openai",
     "openai-community": "openai-community",
@@ -191,6 +197,7 @@ PROVIDER_ORGS = {
     "qwen": "Qwen",
     "recursivesi": "RecursiveSI",
     "reflection": "reflection",
+    "runwayml": "runwayml",
     "stabilityai": "stabilityai",
     "stepfun-ai": "stepfun-ai",
     "tencent": "tencent",

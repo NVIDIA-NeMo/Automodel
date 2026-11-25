@@ -313,6 +313,12 @@ def test_peft_merges_the_same_delta_as_the_native_lora_math(family, tmp_path):
     rank = 4
     alpha = 8
     adapter, moe_config, native_state_dict = _make_adapter_and_state(family, rank)
+    # PEFT may fuse W + B @ A for the unmerged forward. Keep the rank-four
+    # products and their sums exactly representable in float32 so this test
+    # detects layout and scaling errors independently of GEMM rounding order.
+    factor_grid = 16
+    for factor in native_state_dict.values():
+        factor.mul_(factor_grid).round_().div_(factor_grid)
     hf_state_dict = adapter.to_hf(dict(native_state_dict), quantization=family == "minimax_m2")
 
     expert_path, input_projection = _FAMILIES[family]
@@ -338,6 +344,9 @@ def test_peft_merges_the_same_delta_as_the_native_lora_math(family, tmp_path):
     save_file(hf_state_dict, str(tmp_path / "adapter_model.safetensors"))
 
     hf_model = _make_transformers_model(family, moe_config.n_routed_experts, moe_config.dim, moe_config.moe_inter_dim)
+    with torch.no_grad():
+        for parameter in hf_model.get_submodule(model_parent).parameters():
+            parameter.mul_(factor_grid**2).round_().div_(factor_grid**2)
     base_weights = {
         name: parameter.detach().clone()
         for name, parameter in hf_model.named_parameters()

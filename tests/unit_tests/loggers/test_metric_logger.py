@@ -155,17 +155,12 @@ def test_metric_logger_dist_nonzero_noop(tmp_path, monkeypatch):
     monkeypatch.setattr(metric_logger_mod.dist, "get_world_size", lambda: 2)
 
     logger = MetricLoggerDist(str(logfile), flush=True, append=False)
-    # After __init__, .log is replaced with no-op on nonzero ranks
     logger.log(metric_logger_mod.MetricsSample(step=0, epoch=0, metrics={"should_not_write": True}))
+    logger.flush()
     logger.close()
 
-    # File may exist due to opener in base __init__, but it should be empty
-    if logfile.exists():
-        rows = _read_jsonl(logfile)
-        assert rows == []
-    else:
-        # If file was not created, that's also acceptable
-        assert True
+    # Non-zero ranks must not create the log file.
+    assert not logfile.exists()
 
 
 def test_flush_method_is_callable_and_not_shadowed_by_the_flag(tmp_path):

@@ -193,7 +193,37 @@ class ModelParallelizer:
         """Apply every requested parallelism and return the parallelized model."""
         from nemo_automodel.components.distributed.model_parallelizer import _apply_model_parallelizer
 
+        self._prepare_model(model, mesh_context)
         return _apply_model_parallelizer(self, model, mesh_context)
+
+    def _prepare_model(self, model: nn.Module, mesh_context: "MeshContext") -> None:
+        """Validate model constraints and install runtime mesh state before strategy dispatch.
+
+        A sidecar can reject unsupported topologies or set model-owned context-parallel
+        state here, before any executor changes parameter ownership. The default needs
+        no preparation; all sidecars retain the inherited public entry point.
+        """
+
+    def _apply_moe(self, model: nn.Module, mesh_context: "MeshContext") -> nn.Module:
+        """Apply the expert-parallel flow selected by ``mesh_context.ep_size > 1``.
+
+        The shared flow walks one decoder ``layers`` stack. A model whose MoE blocks live
+        in several towers overrides this hook and shards them itself.
+        """
+        from nemo_automodel.components.distributed import model_parallelizer
+
+        return model_parallelizer._parallelize_moe(model, mesh_context, parallelizer=self)
+
+    def _apply_unsharded(self, model: nn.Module, mesh_context: "MeshContext") -> nn.Module:
+        """Prepare ``model`` for FSDP2 when the mesh has no sharding dimension (one data-parallel rank).
+
+        The shared flow skips ``fully_shard``, installs activation checkpointing on one decoder
+        ``layers`` stack and wraps the forward in autocast. A model whose blocks live in several
+        towers overrides this hook.
+        """
+        from nemo_automodel.components.distributed import model_parallelizer
+
+        return model_parallelizer._parallelize_unsharded_fsdp2(model, mesh_context, parallelizer=self)
 
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
         """Apply the FSDP2 primitive used by this model sidecar."""

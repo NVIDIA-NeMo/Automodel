@@ -24,14 +24,16 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoi
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
 from nemo_automodel.components.optim.optimizer import (
+    OPTIMIZER_CONFIG_REGISTRY,
     AdamConfig,
     AdamWConfig,
+    GradientSketchConfig,
     LRSchedulerConfig,
     OptimizerConfig,
     OptimizerFromFactoryConfig,
     ParamGroupOverride,
-    _drop_empty_local_shards,
     build_optimizer,
     build_optimizer_config,
 )
@@ -746,58 +748,68 @@ class TestParamGroupOverrides:
         assert _groups_by_role(opt)["router"]["lr_mult"] == 0.1
 
 
-def _real_param():
-    return nn.Parameter(torch.zeros(4, 4))
+class TestGradientSketchConfig:
+    def _model(self):
+        return nn.Sequential(nn.Linear(7, 5), nn.Tanh(), nn.Linear(5, 3))
 
+    def test_registered(self):
+        assert OPTIMIZER_CONFIG_REGISTRY["gradient_sketch"] is GradientSketchConfig
+        assert GradientSketchConfig.supports_megatron_fsdp_sharding is False
 
-def _empty_param():
-    # numel() == 0 stands in for a DTensor whose rank-local shard is empty:
-    # _local_numel returns .numel() for a plain tensor, so a zero-element tensor
-    # exercises the same "locally empty on this rank" path without a real mesh.
-    return nn.Parameter(torch.zeros(0, 4))
+    def test_build_wraps_native_adamw(self):
+        cfg = GradientSketchConfig(native=AdamWConfig(lr=5e-6, weight_decay=0.01), rank=3, target_modules=["0", "2"])
+        (opt,) = cfg.build(self._model())
+        assert isinstance(opt, GradientSketchOptimizer)
+        assert isinstance(opt.native, torch.optim.AdamW)
+        assert opt.param_groups[0]["lr"] == 5e-6 and opt.settings.rank == 3
 
+    def test_native_accepts_yaml_dict(self):
+        cfg = build_optimizer_config(
+            "gradient_sketch", {"native": {"_target_": "adamw", "lr": 1e-5}, "rank": 2, "target_modules": ["0"]}
+        )
+        (opt,) = cfg.build(self._model())
+        assert opt.param_groups[0]["lr"] == 1e-5
 
-class TestDropEmptyLocalShards:
-    """CPU coverage for the TE-FusedAdam zero-numel-shard guard, both input shapes.
+    def test_rejects_pipeline_parts(self):
+        class Parts(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.parts = [nn.Linear(2, 2), nn.Linear(2, 2)]
 
-    ``_drop_empty_local_shards`` guards TransformerEngine ``FusedAdam`` (whose
-    ``multi_tensor_apply`` faults on empty tensors) against FSDP2 params whose
-    rank-local shard is empty. It accepts either a flat param list or the
-    per-group dicts produced by ``param_group_overrides``; the grouped shape is
-    what per-parameter-group LR adds on top of the pre-existing flat guard.
-    """
+        with pytest.raises(NotImplementedError, match="pipeline"):
+            GradientSketchConfig(native=AdamWConfig(), target_modules=["0"]).build(Parts())
 
-    def test_flat_list_drops_empty_keeps_real(self):
-        p_real, p_empty = _real_param(), _empty_param()
-        out = _drop_empty_local_shards([p_real, p_empty])
-        assert len(out) == 1 and out[0] is p_real
+    def test_invalid_settings_raise_at_construction(self):
+        with pytest.raises(ValueError, match="rank"):
+            GradientSketchConfig(native=AdamWConfig(), rank=0)
 
-    def test_flat_list_all_empty_raises(self):
-        with pytest.raises(ValueError, match="zero-numel local shard"):
-            _drop_empty_local_shards([_empty_param(), _empty_param()])
+    def test_rejects_param_group_overrides(self):
+        with pytest.raises(ValueError, match="param_group_overrides"):
+            GradientSketchConfig(native=AdamWConfig(), param_group_overrides=[{"pattern": "bias", "lr_mult": 0.5}])
 
-    def test_param_groups_drop_empty_and_preserve_options(self):
-        p0, p1, p_empty = _real_param(), _real_param(), _empty_param()
-        groups = [
-            {"params": [p0, p_empty], "lr_mult": 1.0, "wd_mult": 1.0},
-            {"params": [p1], "lr_mult": 0.1, "wd_mult": 0.0},
-        ]
-        out = _drop_empty_local_shards(groups)
+    class _FakeMesh:
+        def __init__(self, sizes):
+            self.sizes = sizes
+            self.mesh_dim_names = tuple(sizes)
 
-        # Empty shard dropped from group 0; both groups survive with real params.
-        assert len(out) == 2
-        assert len(out[0]["params"]) == 1 and out[0]["params"][0] is p0
-        assert len(out[1]["params"]) == 1 and out[1]["params"][0] is p1
-        # Per-group LR/WD options carried through unchanged.
-        assert out[0]["lr_mult"] == 1.0 and out[0]["wd_mult"] == 1.0
-        assert out[1]["lr_mult"] == 0.1 and out[1]["wd_mult"] == 0.0
-        # Fresh dicts are returned; the input group dicts are not mutated in place.
-        assert groups[0]["params"][0] is p0 and groups[0]["params"][1] is p_empty
+        def __getitem__(self, name):
+            size = self.sizes[name]
+            return type("_Dim", (), {"size": lambda self: size})()
 
-    def test_param_group_fully_empty_raises(self):
-        groups = [
-            {"params": [_real_param()], "lr_mult": 1.0},
-            {"params": [_empty_param()], "lr_mult": 0.1},
-        ]
-        with pytest.raises(ValueError, match="param group 1"):
-            _drop_empty_local_shards(groups)
+    @pytest.mark.parametrize(
+        "sizes, message",
+        [
+            ({"dp_replicate": 2, "dp_shard": 2, "cp": 1, "tp": 1}, "HSDP"),
+            ({"dp_replicate": 1, "dp_shard": 2, "cp": 1, "tp": 2}, "tensor parallelism"),
+        ],
+    )
+    def test_build_rejects_unsupported_mesh(self, sizes, message):
+        cfg = GradientSketchConfig(native=AdamWConfig(), rank=2, target_modules=["0"])
+        with pytest.raises(ValueError, match=f"gradient sketch does not support {message}"):
+            cfg.build(self._model(), device_mesh=self._FakeMesh(sizes))
+
+    def test_build_accepts_fsdp_with_context_parallelism(self):
+        cfg = GradientSketchConfig(native=AdamWConfig(), rank=2, target_modules=["0"])
+        mesh = self._FakeMesh({"pp": 1, "dp_replicate": 1, "dp_shard": 2, "cp": 2, "tp": 1})
+        (opt,) = cfg.build(self._model(), device_mesh=mesh)
+        assert isinstance(opt, GradientSketchOptimizer)

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import numpy as np
 import torch
@@ -23,7 +24,7 @@ import torch
 def time_shift(
     t: torch.Tensor,
     image_seq_len: int,
-    shift_type: str = "constant",
+    shift_type: Literal["linear", "sqrt", "constant"] | str = "constant",
     base_shift: float = 0.5,
     max_shift: float = 1.15,
     constant: float = 3.0,
@@ -63,7 +64,7 @@ def time_shift(
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str,
+    weighting_scheme: Literal["logit_normal", "mode", "uniform"] | str,
     batch_size: int,
     logit_mean: float = 0.0,
     logit_std: float = 1.0,

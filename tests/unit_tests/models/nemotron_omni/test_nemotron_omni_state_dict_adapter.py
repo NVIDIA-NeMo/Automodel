@@ -672,17 +672,13 @@ def test_native_radio_vision_lora_complete_qkv():
         assert torch.equal(hf_sd[k], peft_sd[k])
 
 
-def test_production_save_and_hf_peft_reload(tmp_path, monkeypatch):
+def test_production_save_and_hf_peft_reload(tmp_path):
     """Production Checkpointer.save_model with recipe defaults and PeftModel.from_pretrained reload."""
     from types import SimpleNamespace
 
-    import peft.import_utils
     from peft import PeftModel, get_peft_model_state_dict
     from safetensors.torch import load_file
     from torch import nn
-    monkeypatch.setattr(peft.import_utils, "is_torchao_available", lambda: False, raising=False)
-    import peft.tuners.lora.torchao
-    monkeypatch.setattr(peft.tuners.lora.torchao, "is_torchao_available", lambda: False, raising=False)
 
     from nemo_automodel.components._peft.lora import PeftConfig
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer

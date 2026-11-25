@@ -21,6 +21,7 @@ V4.1 omits the short convolution used by earlier Engram architectures.
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import TYPE_CHECKING
 
@@ -356,6 +357,39 @@ class DeepseekV41Engram(nn.Module):
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size, dtype=dtype))
         self.init_weights()
 
+    def __deepcopy__(self, memo: dict[int, object]) -> DeepseekV41Engram:
+        """Copy a stage shell while retaining the existing communicator by reference."""
+        if self.embed.process_group is not None:
+            memo[id(self.embed.process_group)] = self.embed.process_group
+        result = type(self).__new__(type(self))
+        memo[id(self)] = result
+        result.__dict__.update(copy.deepcopy(self.__dict__, memo))
+        return result
+
+    def set_owner_group(self, process_group: dist.ProcessGroup | None) -> None:
+        """Bind an unmaterialized table to its stage-local owner group, or to one local owner for ``None``.
+
+        This runs after pipeline trimming, before FSDP and checkpoint loading.
+        A populated table cannot be rebound: silently discarding its old owner
+        shard would corrupt checkpoint loading and optimizer parameter identities.
+        """
+        old = self.embed
+        ranks = () if process_group is None else tuple(dist.get_process_group_ranks(process_group))
+        old_ranks = () if old.process_group is None else tuple(dist.get_process_group_ranks(old.process_group))
+        if old_ranks == ranks:
+            return
+        if not old.weight.is_meta:
+            raise ValueError("Changing the Engram owner group requires an unmaterialized meta table")
+        owner_size = max(len(ranks), 1)
+        self.embed = Qwen3_8_FlashNextEngramTableConfig(
+            num_embeddings=-(-self.num_embeddings // owner_size) * owner_size,
+            embedding_dim=old.embedding_dim,
+            initializer_range=old.initializer_range,
+            strict_validation=old.strict_validation,
+            capacity_mode=old.capacity_mode,
+        ).build(process_group=process_group, device="meta", dtype=old.weight.dtype)
+        self.embed.weight.requires_grad_(old.weight.requires_grad)
+
     @torch.no_grad()
     def init_weights(self) -> None:
         """Initialize the table, projection, and learned branch normalization weights."""
@@ -368,7 +402,6 @@ class DeepseekV41Engram(nn.Module):
         nn.init.normal_(self.wkv.weight, mean=0.0, std=self.initializer_range)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
-        self.embed.mark_sharding_contract()
 
     def _validates_on_device(self, hash_ids: torch.Tensor) -> bool:
         """Whether hash IDs are checked with device-side asserts (CUDA, strict validation off).

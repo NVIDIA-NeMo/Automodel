@@ -21,9 +21,12 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Callable
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -31,6 +34,34 @@ from nemo_automodel.shared.import_utils import safe_import_from
 
 MANIFEST_NAME = "manifest.json"
 SHARD_RE = re.compile(r"^shard-(\d{6})\.safetensors$")
+
+
+@contextmanager
+def sync_cache_phase(phase: str) -> Iterator[None]:
+    """Propagate rank-local errors before entering the next cache phase.
+
+    Every participating rank must enter the phase, and its body performs only
+    local work. Single-process callers receive the original exception.
+
+    Args:
+        phase: Label identifying the preparation or I/O operation.
+    """
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        yield
+        return
+
+    local_error = None
+    try:
+        yield
+    except Exception as exc:
+        local_error = exc
+
+    errors: list[str | None] = [None] * dist.get_world_size()
+    message = f"{type(local_error).__name__}: {local_error}" if local_error is not None else None
+    dist.all_gather_object(errors, message)
+    for rank, error in enumerate(errors):
+        if error is not None:
+            raise RuntimeError(f"{phase} failed on rank {rank}: {error}") from local_error
 
 
 def load_safetensors(cache_name: str):
@@ -261,17 +292,26 @@ def resume_start_sample(existing_shards: set[int], shard_size: int) -> int:
     return len(existing_shards) * shard_size
 
 
-def _sequential_subset_loader(dataloader: DataLoader, start: int, end: int) -> DataLoader:
+def dataloader_for_sample_range(dataloader: DataLoader, *, start: int, end: int) -> DataLoader:
     """Return a sequential loader over ``dataset[start:end)`` mirroring ``dataloader``.
 
     Preserves the source loader's worker settings: in particular
     ``multiprocessing_context`` -- the precompute paths load the target onto CUDA
     before iterating, so fork-started workers would inherit a live CUDA context and
     abort (see ``build_eagle3_dataloader``'s forkserver note).
+
+    Args:
+        dataloader: Source of the dataset, batch size, collator and worker settings.
+        start: First sample index in the slice.
+        end: Exclusive sample index at the end of the slice.
+
+    Returns:
+        A sequential loader that emits the selected samples without padding
+        the number of rows to a multiple of the batch size.
     """
     dataset = dataloader.dataset
     worker_kwargs: dict[str, Any] = {}
-    num_workers = int(getattr(dataloader, "num_workers", 0))
+    num_workers = int(getattr(dataloader, "num_workers", 0)) if start < end else 0
     if num_workers > 0:
         worker_kwargs["persistent_workers"] = getattr(dataloader, "persistent_workers", False)
         multiprocessing_context = getattr(dataloader, "multiprocessing_context", None)
@@ -303,7 +343,7 @@ def dataloader_from_sample(dataloader: DataLoader, start_sample: int) -> DataLoa
             collate_fn=getattr(dataloader, "collate_fn", None),
             drop_last=False,
         )
-    return _sequential_subset_loader(dataloader, start_sample, len(dataset))
+    return dataloader_for_sample_range(dataloader, start=start_sample, end=len(dataset))
 
 
 class _ShardAccumulator:
@@ -457,7 +497,7 @@ def write_cache_shards_distributed(
 
     local_loader = None
     if num_local_samples > 0:
-        local_loader = _sequential_subset_loader(dataloader, start_sample, start_sample + num_local_samples)
+        local_loader = dataloader_for_sample_range(dataloader, start=start_sample, end=start_sample + num_local_samples)
 
     accumulator = _ShardAccumulator(
         output_dir=output_dir,

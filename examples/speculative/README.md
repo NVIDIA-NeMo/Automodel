@@ -219,7 +219,7 @@ no external merge step is needed. Not supported with `parallel_drafting`
 lock), with `freeze_embeddings: false` (same freeze conflict), with `fp8:`,
 or in the DFlash-family, DSpark, and EAGLE-1/2 recipes (rejected explicitly.
 Their drafts carry trainable non-LoRA heads that the freeze would silently
-lock, and only EAGLE-3 implements the warm start). See
+lock). See
 `eagle3/qwen3_eagle3_lora.yaml`.
 
 ## Target Backends
@@ -251,6 +251,39 @@ Offline cache is produced by `precompute_eagle3.py`
 (`python -m nemo_automodel.components.speculative.precompute_eagle3 --target-model ... --input-data ... --output-dir ...`),
 then consumed through `cached_target_path`. DSpark also supports a text-only offline cache through `precompute_dspark.py`
 for HF-loadable single-process text targets.
+
+For a dense EAGLE-3 target that fits on one GPU, run offline precompute across
+several GPUs on the same node. Each rank loads a target replica and writes its
+own global shard indices directly into the cache directory.
+
+```bash
+TARGET=/models/Qwen3-4B
+DATA=/data/target-responses.jsonl
+CACHE=/data/eagle3-qwen3-4b
+PRECOMPUTE_ARGS=(
+  --target-model "$TARGET" --input-data "$DATA" --output-dir "$CACHE"
+  --seq-length 256 --batch-size 4 --shard-size 64
+  --draft-vocab-size 8192 --target-probs-topk 64 --dtype bf16
+)
+
+# Start on two GPUs.
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+  -m nemo_automodel.components.speculative.precompute_eagle3 "${PRECOMPUTE_ARGS[@]}"
+
+# After an interruption, fill the missing shards on one GPU.
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc-per-node=1 \
+  -m nemo_automodel.components.speculative.precompute_eagle3 "${PRECOMPUTE_ARGS[@]}" --resume
+```
+
+Use one active job per cache directory and keep the target and dataset
+snapshots, device type, and precompute settings fixed across resumes.
+`--batch-size` is per rank and must divide `--shard-size`. Before writing,
+`--resume` checks the manifest and all committed shard headers, then spreads
+the missing shards evenly across ranks. The smaller draft vocabulary is
+derived from the entire dataset, including completed shards. If a run stopped
+before committing any shards, start again without `--resume` to change settings
+in the same directory. After precompute finishes, set
+`recipe_args.cached_target_path` to `$CACHE` in the training recipe.
 
 DSpark supports the co-located and remote backends too. Its remote server,
 `serve_dspark_target`, reads the same YAML as the training run, so both sides
@@ -665,7 +698,7 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `draft_attn_implementation` | EAGLE-3 | `eager` (default) or `flash_attention_2`. |
 | `fc_norm`, `norm_output` | EAGLE-3.1 | Both default false; either alone is a valid intermediate config. |
 | `eagle4.sliding_window`, `eagle4.candidate_head.{rank,num_candidates}` | EAGLE-4 | `candidate_head` selects stage 2 and needs `draft_weights_path`; leave `draft_vocab_size` unset. |
-| `draft_weights_path` | EAGLE-3 | Warm-start the draft from a consolidated safetensors export (file or directory); required for meaningful LoRA adaptation. |
+| `draft_weights_path` | EAGLE-3 / DSpark | Warm-start the draft from a consolidated safetensors export (file or directory); required for meaningful LoRA adaptation. DSpark also reads released drafts; see the [DSpark guide](../../docs/guides/speculative/dspark.mdx). |
 | `target_model_backend`, `remote_urls`, `remote_timeout`, `remote_max_retries` | EAGLE-3 / DSpark remote | See [Target Backends](#target-backends). `target_prefetch_depth` is EAGLE-3 only. |
 | `cached_target_path` | EAGLE-3 / DSpark offline | Path to a cache produced by `precompute_eagle3.py`, `precompute_dspark.py`, or (large sharded targets) `precompute_dspark_dist.py`. |
 | `parallel_drafting`, `num_depths`, `num_draft_layers`, `down_sample_ratio`, `down_sample_ratio_min`, `mask_token_id`, `sequence_partitions` | P-EAGLE | `mask_token_id` is required (no default). `sequence_partitions > 1` splits each sequence by dependency lineage to bound long-context memory. |

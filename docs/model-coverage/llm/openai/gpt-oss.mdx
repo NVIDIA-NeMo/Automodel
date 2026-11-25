@@ -15,15 +15,15 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 From the repository root, run:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
+uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml
 ```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Full-parameter fine-tuning | Use the [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml). |
-| LoRA fine-tuning | Use the [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml). |
+| Full-parameter fine-tuning | Use the [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml). |
+| LoRA fine-tuning | Use the [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/customizer_gpt_oss_peft_packing.yaml). |
 | Fine-tuning with 1,024-token packed sequences | Use the [packed-sequence recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml). |
 | LoRA fine-tuning on DGX Spark | Use the [DGX Spark recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml). |
 

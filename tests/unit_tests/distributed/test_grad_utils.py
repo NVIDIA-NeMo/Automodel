@@ -67,8 +67,7 @@ def spawn_threads_and_init_comms(func=None, *, timeout=5, world_size=1):
         return partial(spawn_threads_and_init_comms, timeout=timeout, world_size=world_size)
 
     def _run_test_method_with_multi_threads(world_size: int, callback):
-
-        world = _install_threaded_pg()
+        _ = _install_threaded_pg()
         global_store = c10d.HashStore()
 
         def worker(rank):
@@ -93,7 +92,7 @@ def spawn_threads_and_init_comms(func=None, *, timeout=5, world_size=1):
     def wrapper(*args, **kwargs):  # noqa: D401
         torch._C._distributed_c10d._set_thread_isolation_mode(True)
         try:
-            threads = _run_test_method_with_multi_threads(world_size, lambda: func(self, *args, **kwargs))
+            threads = _run_test_method_with_multi_threads(world_size, lambda: func(*args, **kwargs))
             # join and error handling
             MultiThreadedTestCase._join_threads(threads, func)
         finally:
@@ -197,6 +196,19 @@ def test_clip_grad_by_total_norm_single_tensor_input():
     assert torch.allclose(param.grad, original_grad * scaling)
 
 
+def test_clip_grad_by_total_norm_generator_input():
+    """Function accepts an arbitrary iterable (generator) of parameters."""
+
+    p1 = _make_param([3.0, 4.0])
+    p2 = _make_param([1.0, 2.0])
+    g1_before, g2_before = p1.grad.clone(), p2.grad.clone()
+
+    grad_utils.clip_grad_by_total_norm_((p for p in [p1, p2]), max_grad_norm=1.0, total_norm=5.0)
+
+    assert torch.allclose(p1.grad, g1_before * 0.2)
+    assert torch.allclose(p2.grad, g2_before * 0.2)
+
+
 # The threaded PG wrapper ensures *DeviceMesh* can operate without a real backend.
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")
 @spawn_threads_and_init_comms(world_size=2)
@@ -249,6 +261,21 @@ def test_get_grad_norm_l2(norm_type: int | float):
     tp_group = Mock(name="tp_group")
 
     out = grad_utils.get_grad_norm([p1, p2], dp_group, tp_group, norm_type=norm_type)
+
+    assert math.isclose(out, expected, rel_tol=1e-6)
+
+
+def test_get_grad_norm_generator_input():
+    """get_grad_norm accepts a generator of parameters."""
+
+    p1 = _make_param([3.0, 4.0])
+    p2 = _make_param([1.0, 2.0])
+    expected = _expected_l2_norm(p1.grad, p2.grad)  # type: ignore[arg-type]
+
+    dp_group = Mock(name="dp_group")
+    tp_group = Mock(name="tp_group")
+
+    out = grad_utils.get_grad_norm((p for p in [p1, p2]), dp_group, tp_group, norm_type=2)
 
     assert math.isclose(out, expected, rel_tol=1e-6)
 

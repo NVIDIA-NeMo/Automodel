@@ -94,9 +94,8 @@ distributed:
     reshard_after_forward: false
     wrap_outer_model: false
     # HF reference upcasts the lm_head to fp32 (``enable_lm_head_fp32: true``).
-    # The MoE parallelizer handles this via MixedPrecisionPolicy when set
-    # here; HyMT2ForCausalLM also has an in-model fp32 fallback if this is
-    # left unset.
+    # This keeps the head weight in fp32; HyMT2ForCausalLM returns fp32 logits
+    # either way, since that flag makes ``model.logits_dtype`` default to float32.
     lm_head_precision: float32
 
 loss_fn:
@@ -125,7 +124,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: tencent/Hy-MT2-30B-A3B
@@ -152,4 +151,5 @@ optimizer:
 #   name: hy_mt2_30b_a3b_sft
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100

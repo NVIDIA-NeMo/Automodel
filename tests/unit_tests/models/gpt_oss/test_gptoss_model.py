@@ -23,6 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 
 @pytest.fixture
@@ -402,13 +403,7 @@ class TestGptOssForCausalLM:
             assert output.device == device
 
     def test_forward_thd_unsqueeze(self, gpt_config, backend_config, device):
-        """Test that THD format produces 3D logits with unsqueezed batch dimension.
-
-        When qkv_format='thd' is used (sequence packing with TE attention),
-        the model squeezes [1, T] inputs to [T] via squeeze_input_for_thd,
-        producing 2D [T, V] logits. The forward method must unsqueeze to
-        [1, T, V] to match the expected 3D batch format.
-        """
+        """THD input [1, T]: the decoder's layers see [T, H], and logits and hidden states keep the [1, T] batch."""
         model = GptOssForCausalLM(gpt_config, backend=backend_config)
         model = model.to(device)
 
@@ -418,30 +413,18 @@ class TestGptOssForCausalLM:
         position_ids = torch.arange(total_tokens, device=device).unsqueeze(0)
         cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32, device=device)
 
-        with patch.object(model.model, "forward") as mock_model:
-            # After squeeze_input_for_thd, input is 1D [T], so backbone returns [T, H]
-            mock_model.return_value = torch.randn(
-                total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
-            )
+        output, layer_inputs = run_with_passthrough_layers(
+            model,
+            input_ids,
+            position_ids=position_ids,
+            qkv_format="thd",
+            cu_seqlens=cu_seqlens,
+            output_hidden_states=True,
+        )
 
-            output = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                cu_seqlens=cu_seqlens,
-                output_hidden_states=True,
-            )
-
-            # Logits must be 3D [1, T, V] after unsqueeze
-            assert output.logits.ndim == 3
-            assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
-            assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
-
-            # Verify backbone received squeezed 1D input_ids
-            call_args = mock_model.call_args
-            actual_input_ids = call_args[0][0]
-            assert actual_input_ids.ndim == 1
-            assert actual_input_ids.shape[0] == total_tokens
+        assert layer_inputs and all(shape == (total_tokens, gpt_config.hidden_size) for shape in layer_inputs)
+        assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
+        assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
 
     def test_forward_non_thd_no_unsqueeze(self, gpt_config, backend_config, device):
         """Test that non-THD forward does not add extra dimensions."""
@@ -473,11 +456,11 @@ class TestGptOssForCausalLM:
         attention_mask = torch.ones(1, total_tokens, dtype=torch.bool, device=device)
         cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32, device=device)
 
-        with patch.object(model.model, "forward") as mock_model:
-            mock_model.return_value = torch.randn(
-                total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
-            )
-
+        with ExitStack() as stack:
+            layer_forwards = [
+                stack.enter_context(patch.object(layer, "forward", side_effect=lambda hidden, **kwargs: hidden))
+                for layer in model.model.layers.values()
+            ]
             output = model(
                 input_ids,
                 position_ids=position_ids,
@@ -486,13 +469,12 @@ class TestGptOssForCausalLM:
                 output_hidden_states=True,
             )
 
-        actual_input_ids = mock_model.call_args.args[0]
-        actual_kwargs = mock_model.call_args.kwargs
-        assert actual_input_ids.shape == (total_tokens,)
-        assert actual_kwargs["position_ids"].shape == (total_tokens,)
-        assert actual_kwargs["attention_mask"] is None
-        assert actual_kwargs["qkv_format"] == "thd"
-        assert torch.equal(actual_kwargs["cu_seqlens"], torch.tensor([0, 8, 16], dtype=torch.int32, device=device))
+        # The decoder selects THD from the offsets: its layers see packed [T, H] states and THD kwargs.
+        layer_args, layer_kwargs = layer_forwards[0].call_args
+        assert layer_args[0].shape == (total_tokens, gpt_config.hidden_size)
+        assert layer_kwargs["attention_mask"] is None
+        assert layer_kwargs["qkv_format"] == "thd"
+        assert torch.equal(layer_kwargs["cu_seqlens"], torch.tensor([0, 8, 16], dtype=torch.int32, device=device))
         assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
         assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
 
@@ -794,8 +776,8 @@ class TestGptOssModelTHD:
                     )
 
                 output = model(input_ids, qkv_format="thd")
-                # Should not crash — 1D input_ids handled correctly
-                assert output.shape == (total_tokens, gpt_config.hidden_size)
+                # Should not crash — 1D input_ids handled correctly; packed output keeps the [1, T] batch layout
+                assert output.shape == (1, total_tokens, gpt_config.hidden_size)
 
     def test_2d_input_ids_generates_2d_position_ids(self, gpt_config, backend_config, device):
         """Standard 2D [B, S] input should still generate 2D position_ids."""
@@ -823,3 +805,219 @@ class TestGptOssModelTHD:
 
 
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend,accepted", [("fa4", True), ("te", True), ("flex", False)])
+def test_fa4_thd_capability_is_model_owned_and_does_not_enable_parallelism(backend: str, accepted: bool) -> None:
+    """The canonical validator checks the actual GPT contract without installing NEAT hooks."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.common.packing import validate_thd_packing_support
+
+    model = GptOssForCausalLM.__new__(GptOssForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.backend = SimpleNamespace(attn=backend)
+    model.config = SimpleNamespace()
+    if accepted:
+        validate_thd_packing_support([model])
+    else:
+        with pytest.raises(ValueError, match="cannot consume THD"):
+            validate_thd_packing_support([model])
+    assert model._owns_packed_attention is (backend == "fa4")
+    caps = model.ModelCapabilities()
+    assert not caps.supports_tp and not caps.supports_cp and not caps.supports_pp
+    assert not model._forward_pre_hooks
+
+
+@pytest.mark.cpu_only
+def test_fa4_thd_decoder_normalizes_implicit_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offsets plus singleton token IDs select THD: layers see [tokens] inputs, the output stays batched."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import nemo_automodel.components.models.gpt_oss.model as model_module
+
+    inner = GptOssModel.__new__(GptOssModel)
+    torch.nn.Module.__init__(inner)
+    inner.backend = SimpleNamespace(attn="fa4", rope_fusion=False)
+    inner.rotary_emb = None
+    inner.embed_tokens = torch.nn.Embedding(2, 4)
+    inner.norm = torch.nn.Identity()
+    inner.layers = torch.nn.ModuleDict({"0": torch.nn.Identity()})
+    capture = Mock(side_effect=lambda hidden, **kwargs: hidden)
+    monkeypatch.setattr(inner.layers["0"], "forward", capture)
+    monkeypatch.setattr(model_module, "position_ids_to_freqs_cis", lambda *args, **kwargs: torch.ones(2, 4))
+    out = inner(
+        torch.zeros(1, 2, dtype=torch.long),
+        position_ids=torch.arange(2)[None],
+        padding_mask=torch.zeros(1, 2, dtype=torch.bool),
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    assert capture.call_args.args[0].shape == (2, 4)
+    assert capture.call_args.kwargs["qkv_format"] == "thd"
+    assert capture.call_args.kwargs["padding_mask"].shape == (2,)
+    assert out.shape == (1, 2, 4)
+
+
+@pytest.mark.cpu_only
+def test_fa4_thd_inner_prepares_once_and_rejects_short_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One shared preparation feeds every layer and validates the actual physical input."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import nemo_automodel.components.models.gpt_oss.model as model_module
+
+    inner = GptOssModel.__new__(GptOssModel)
+    torch.nn.Module.__init__(inner)
+    inner.backend = SimpleNamespace(attn="fa4", rope_fusion=False)
+    inner.rotary_emb = None
+    inner.embed_tokens = torch.nn.Embedding(2, 4)
+    inner.norm = torch.nn.Identity()
+    inner.layers = torch.nn.ModuleDict({"0": torch.nn.Identity(), "1": torch.nn.Identity()})
+    captures = []
+    for layer in inner.layers.values():
+        capture = Mock(side_effect=lambda h, **kwargs: h)
+        monkeypatch.setattr(layer, "forward", capture)
+        captures.append(capture)
+    monkeypatch.setattr(model_module, "position_ids_to_freqs_cis", lambda *args, **kwargs: torch.ones(2, 4))
+    prepare = Mock(wraps=model_module.prepare_packed_metadata)
+    monkeypatch.setattr(model_module, "prepare_packed_metadata", prepare)
+    padding = torch.zeros(2, dtype=torch.bool)
+    kwargs = {"qkv_format": "thd", "padding_mask": padding, "cu_seqlens": torch.tensor([0, 2], dtype=torch.int32)}
+    inner(torch.zeros(2, dtype=torch.long), position_ids=torch.arange(2), **kwargs)
+    assert prepare.call_count == 1
+    first, second = [capture.call_args.kwargs for capture in captures]
+    assert first["_fa4_cu_seqlens"] is second["_fa4_cu_seqlens"]
+    assert torch.equal(first["padding_mask"], padding)
+    with pytest.raises(ValueError, match="padding_mask length"):
+        inner(torch.zeros(3, dtype=torch.long), position_ids=torch.arange(3), **kwargs)
+
+
+@pytest.mark.cpu_only
+def test_fa4_canonical_raw_thd_sharder_to_model_matches_te(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raw [8,4096] loader fields follow TE's shared conversion before GPT forward."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import nemo_automodel.components.models.gpt_oss.model as model_module
+    from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
+    from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
+
+    ids = (torch.arange(8 * 4096) % 2).reshape(8, 4096)
+    raw = {
+        "input_ids": ids,
+        "labels": ids.clone(),
+        "position_ids": torch.arange(4096).expand(8, -1).clone(),
+        "seq_lens": torch.tensor([[2, 4090]] * 8),
+        "seq_lens_padded": torch.tensor([[4, 4092]] * 8),
+        "qkv_format": "thd",
+    }
+    before = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
+    converted = {}
+    outputs = {}
+    monkeypatch.setattr(model_module, "position_ids_to_freqs_cis", lambda *args, **kwargs: torch.ones(32768, 4))
+    for backend in ("te", "fa4"):
+        model = GptOssForCausalLM.__new__(GptOssForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.backend = SimpleNamespace(attn=backend, rope_fusion=False)
+        model.config = SimpleNamespace(output_hidden_states=False)
+        inner = GptOssModel.__new__(GptOssModel)
+        torch.nn.Module.__init__(inner)
+        inner.backend = model.backend
+        inner.rotary_emb = None
+        inner.embed_tokens = torch.nn.Embedding.from_pretrained(torch.arange(8).reshape(2, 4).float())
+        inner.norm = torch.nn.Identity()
+        inner.layers = torch.nn.ModuleDict({"0": torch.nn.Identity(), "1": torch.nn.Identity()})
+        calls = []
+        for layer in inner.layers.values():
+            call = Mock(side_effect=lambda hidden, **kwargs: hidden)
+            monkeypatch.setattr(layer, "forward", call)
+            calls.append(call)
+        model.model = inner
+        model.lm_head = torch.nn.Identity()
+        attach_capabilities_and_validate(model, None)
+        assert not model.ModelCapabilities().supports_cp and not model.ModelCapabilities().supports_pp
+        if backend == "fa4":
+            assert not model.supports_cp
+        batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
+        sharder = ContextParallelSharder(model, None, batch, padding_token_id=0, num_chunks=1)
+        _, prepared = sharder.shard(batch)
+        converted[backend] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in prepared.items()}
+        prepared.pop("labels")
+        # The Identity head returns the hidden states, restored to the batched [1, tokens, hidden] layout.
+        outputs[backend] = model(**prepared).logits
+        if backend == "fa4":
+            assert model.supports_thd
+        assert outputs[backend].shape == (1, 32768, 4)
+        assert torch.equal(outputs[backend], inner.embed_tokens(ids.reshape(-1)).unsqueeze(0))
+        first, second = [call.call_args.kwargs for call in calls]
+        assert first["padding_mask"].shape == (32768,)
+        assert first["cu_seqlens_padded"][-1] == 32768
+        if backend == "fa4":
+            assert first["_fa4_cu_seqlens"] is second["_fa4_cu_seqlens"]
+            assert torch.equal(first["packed_token_indices"], (~first["padding_mask"]).nonzero().flatten())
+            assert first["_fa4_cu_seqlens"][-1] == 8 * 4092
+            with pytest.raises(ValueError, match="single non-pipeline chunk"):
+                ContextParallelSharder(model, None, raw, num_chunks=2)
+    assert converted["te"].keys() == converted["fa4"].keys()
+    for key, value in converted["te"].items():
+        actual = converted["fa4"][key]
+        if isinstance(value, torch.Tensor):
+            assert value.shape == actual.shape and value.dtype == actual.dtype
+            assert torch.equal(value, actual), key
+        else:
+            assert value == actual, key
+    assert torch.equal(outputs["te"], outputs["fa4"])
+    for key, value in before.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(raw[key], value), key
+        else:
+            assert raw[key] == value
+
+
+@pytest.mark.cpu_only
+def test_fa4_raw_thd_capability_does_not_enable_flex_or_parallelism() -> None:
+    """Backend validation remains authoritative after declaring shared THD preparation."""
+    from types import SimpleNamespace
+
+    from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate, validate_for_mesh
+    from nemo_automodel.components.models.common.packing import validate_thd_packing_support
+
+    for backend in ("flex", "fa4"):
+        model = GptOssForCausalLM.__new__(GptOssForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.backend = SimpleNamespace(attn=backend)
+        model.config = SimpleNamespace()
+        attach_capabilities_and_validate(model, None)
+        if backend == "flex":
+            assert not model.supports.supports_sequence_packing
+            with pytest.raises(ValueError, match="cannot consume THD"):
+                validate_thd_packing_support([model])
+            assert not model.requires_thd_batch_preparation
+        else:
+            validate_thd_packing_support([model])
+            assert model.requires_thd_batch_preparation
+            with pytest.raises(ValueError, match="cp_size=2"):
+                validate_for_mesh(model, SimpleNamespace(cp_size=2, tp_size=1, pp_size=1, ep_size=1))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend,expected", [("te", True), ("fa4", False), ("flex", False)])
+def test_fa4_shared_thd_keeps_existing_te_packed_cp_capability(backend: str, expected: bool) -> None:
+    """Native THD metadata support must preserve TE packed CP without enabling FA4 CP."""
+    from types import SimpleNamespace
+
+    from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
+
+    model = GptOssForCausalLM.__new__(GptOssForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.backend = SimpleNamespace(attn=backend)
+    model.config = SimpleNamespace()
+    model._mesh = SimpleNamespace(cp_size=2, tp_size=1, pp_size=1, ep_size=1)
+    attach_capabilities_and_validate(model, None)
+    assert model.supports.cp_size == 2
+    assert model.supports.supports_cp_with_sequence_packing is expected
+    assert model.supports_cp_with_sequence_packing is expected
+    assert model.supports_cp is expected
+    assert not model.ModelCapabilities().supports_cp

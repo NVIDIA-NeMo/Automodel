@@ -47,7 +47,6 @@ from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    _build_pp_collate_wrapper,
     _get_domain_mixture_blend,
     _should_pack_validation,
     _supports_loss_weights,
@@ -106,7 +105,6 @@ def _build_loader(
         pp_enabled=pp_enabled,
         supports_seq_lens=model is None or "seq_lens" in inspect.signature(model.forward).parameters,
         cp_size=cp_size,
-        collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
     )
     return loader, None
 
@@ -421,6 +419,33 @@ def test_should_pack_validation_for_explicit_thd_collater(attn):
     )
 
     assert _should_pack_validation(cfg.dataloader, cfg.validation_dataloaders["default"], nn.Module()) is True
+
+
+@pytest.mark.parametrize(
+    "validation_collate_fn,expected",
+    [
+        ("nemo_automodel.components.datasets.utils.neat_packed_collater", True),
+        ("nemo_automodel.components.datasets.utils.default_collater", False),
+    ],
+)
+@pytest.mark.parametrize("attn", ["fa4", "sdpa", "te"])
+def test_should_pack_validation_for_explicit_neat_collater(attn, validation_collate_fn, expected):
+    """A NEAT-collated validation loader is packed; ordinary collation stays unpacked."""
+    dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"}
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "model": {"backend": {"attn": attn}},
+                "dataset": dataset,
+                "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.neat_packed_collater"},
+                "validation_dataset": dataset,
+                "validation_dataloader": {"collate_fn": validation_collate_fn},
+                "packed_sequence": {"packed_sequence_size": 1024, "packing_strategy": "neat"},
+            }
+        )
+    )
+
+    assert _should_pack_validation(cfg.dataloader, cfg.validation_dataloaders["default"], nn.Module()) is expected
 
 
 def test_should_not_pack_validation_without_pack_size():
@@ -1069,6 +1094,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
                 is_packed=False,
                 output_format="batched",
                 seed=42,
+                packing=None,
                 packed_sequence_length=0,
             )
         ),
@@ -1551,7 +1577,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
         ),
     )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
 
     return recipe
 
@@ -2027,99 +2053,40 @@ def test_build_model_and_optimizer_return_values():
 # Tests for _get_model_name helper
 # =============================================================================
 
-# =============================================================================
-# Tests for PP mask precomputation guard in the loader build
-# =============================================================================
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_workers", [0, 1])
+def test_pp_spawn_dataloader_only_collates_data(num_workers: int) -> None:
+    """Spawned PP loaders preserve data without loading configs or building model masks."""
+    from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDatasetConfig
+    from nemo_automodel.components.datasets.utils import default_collater
 
-def _pp_loader(cfg_model, cfg_dl, **patches):
-    """Build a PP-enabled iterable loader and return its resolved ``collate_fn``."""
-    cfg_ds = ConfigNode(
-        {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
-            "tokenizer": None,
-            "num_shards": 4,
-        }
+    config = DataloaderConfig(
+        dataset_config=MockIterableDatasetConfig(vocab_size=16, seq_len=4, num_samples=2),
+        batch_size=2,
+        num_workers=num_workers,
+        collate_fn=default_collater,
     )
-    loader, _ = _build_loader(
-        cfg_ds=cfg_ds,
-        cfg_dl=cfg_dl,
-        cfg_model=cfg_model,
-        cfg_ps=ConfigNode({}),
-        seed=123,
-        local_batch_size=2,
-        global_batch_size=4,
-        max_steps=None,
-        val_check_interval=None,
-        dp_rank=0,
-        dp_world_size=1,
-        pp_enabled=True,
-    )
-    return loader.collate_fn
-
-
-def test_pp_autoconfig_failure_skips_masks(caplog):
-    """When AutoConfig.from_pretrained raises, the collate is left unwrapped (warning logged)."""
-    calls = []
-    cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
-    with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
-        caplog.at_level(logging.WARNING),
-    ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
-
-    assert "Failed to load model config for causal mask precomputation" in caplog.text
-    collate_fn(["dummy"])
-    assert calls == ["base"]
-    add_masks.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "model_type",
-    ["deepseek_v4", "glm_moe_dsa"],
-)
-def test_pp_custom_sparse_model_skips_masks(caplog, model_type):
-    """Custom sparse models compute masks internally, so PP precomputation is skipped."""
-    calls = []
-    cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    model_name = "zai-org/GLM-5.2" if model_type == "glm_moe_dsa" else "deepseek-ai/DeepSeek-V4-Pro"
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": model_name})
-    with (
-        patch(
-            "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
-            return_value=MagicMock(model_type=model_type),
-        ),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
-        caplog.at_level(logging.INFO),
-    ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
-
-    collate_fn(["dummy"])
-    assert calls == ["base"]
-    add_masks.assert_not_called()
-    assert f"Skipping pipeline parallel causal mask precomputation for model_type={model_type}" in caplog.text
-
-
-def test_pp_autoconfig_success_chains_masks():
-    """When AutoConfig succeeds, the resolved collate is wrapped with mask precomputation (base -> masks)."""
-    call_order = []
-    cfg_dl = ConfigNode({"collate_fn": lambda b: call_order.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
-
-    def mock_add_masks(batch, model_config=None):
-        call_order.append("masks")
-        return batch
-
-    with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=MagicMock()),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
-    ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
-
-    collate_fn(["dummy_batch"])
-    assert call_order == ["base", "masks"]
+    loader = config.build(dp_rank=0, dp_world_size=1, pp_enabled=True)
+    assert loader.collate_fn is default_collater
+    iterator = iter(loader)
+    try:
+        batches = list(iterator)
+    finally:
+        if num_workers:
+            # torchdata's bounded shutdown can terminate before reaping a worker.
+            # Reap it before the test's child-process leak check runs.
+            iterator._shutdown_workers()
+            for worker in iterator._workers:
+                worker.join(timeout=10)
+                assert not worker.is_alive()
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["input_ids"].shape == (2, 4)
+    torch.testing.assert_close(batch["labels"][:, :-1], batch["input_ids"][:, 1:])
+    assert (batch["labels"][:, -1] == -100).all()
+    torch.testing.assert_close(batch["padding_mask"], batch["input_ids"] == 0)
+    assert "causal_mask_mapping" not in batch
 
 
 @pytest.mark.parametrize(
@@ -2198,19 +2165,47 @@ def _make_trainer_for_trackio(monkeypatch):
     return trainer
 
 
-def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(monkeypatch):
+def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     from nemo_automodel.components.loggers.metric_logger import MetricsSample
 
     trainer = _make_trainer_for_trackio(monkeypatch)
     metrics = {"loss": 1.5, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
-    log_data = MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8})
+    log_data = MetricsSample(
+        step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8, "num_tokens_per_step": 10, "mfu": 0.25}
+    )
 
-    trainer.log_train_metrics(log_data)
+    with caplog.at_level(logging.INFO):
+        trainer.log_train_metrics(log_data)
+    assert "num_tokens_per_step 10 | mfu 0.25" in caplog.text
 
     first, second = trainer.trackio_logger.log_metrics.call_args_list
     assert first.args[0] == log_data.to_dict() and first.kwargs == {"step": 7}
     assert any(key.startswith("moe/") for key in second.args[0]) and second.kwargs == {"step": 7}
     trainer.metric_logger_train.log.assert_called_once_with(log_data)
+
+
+@pytest.mark.parametrize(
+    ("pack_fill", "expected"),
+    [(0.75, "loss 1.5000 | pack_fill 0.750 | grad_norm 0.5000"), (None, "loss 1.5000 | grad_norm 0.5000")],
+)
+def test_log_train_metrics_shows_pack_fill_next_to_loss(monkeypatch, caplog, pack_fill, expected):
+    from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+    trainer = _make_trainer_for_trackio(monkeypatch)
+    metrics = {"loss": 1.5, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
+    if pack_fill is not None:
+        metrics["pack_fill"] = pack_fill
+
+    with caplog.at_level(logging.INFO):
+        trainer.log_train_metrics(
+            MetricsSample(
+                step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8, "num_tokens_per_step": 10, "mfu": 0.25}
+            )
+        )
+
+    assert expected in caplog.text
 
 
 @pytest.mark.parametrize(("val_name", "key"), [("default", "val_loss"), ("squad", "val_squad/val_loss")])
@@ -2370,7 +2365,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "device_mesh", None)
         object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
-        object.__setattr__(recipe, "te_fp8", None)
+        object.__setattr__(recipe, "te_quantization", None)
         object.__setattr__(recipe, "model_parts", [nn.Linear(4, 4)])
         object.__setattr__(
             recipe,
@@ -2414,7 +2409,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
         monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            "nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm",
             lambda *a, **k: torch.tensor(1.0),
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.prepare_for_grad_accumulation", lambda *a, **k: None)
@@ -2430,13 +2425,44 @@ class TestRunTrainOptimStepSetsMoEScale:
         options = {} if backend is None else {"backend": backend}
         recipe = self._make_recipe(monkeypatch, pp_enabled=False, clip_grad_norm=options)
         clip = MagicMock(return_value=torch.tensor(1.0))
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", clip)
+        monkeypatch.setattr("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm", clip)
         batches = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
 
         sample = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
 
         assert clip.call_args.kwargs["grad_norm_backend"] == (backend or "triton")
         assert sample.metrics["grad_norm"] == 1.0
+
+    @pytest.mark.parametrize("has_last_stage", [False, True])
+    def test_pp_bf16_loss_reporting_matches_broadcast_dtype(self, monkeypatch, has_last_stage):
+        """BF16 CE and FP32 placeholder ranks use identical reporting buffers."""
+        recipe = self._make_recipe(monkeypatch, pp_enabled=True, dp_group_size=1)
+        labels = torch.tensor([[0, 1, -100, 2]])
+        logits = torch.tensor([[[2, 0, -1], [0, 2, -1], [1, 1, 1], [-1, 0, 2]]], dtype=torch.bfloat16)
+        ce = MaskedCrossEntropy(fp32_upcast=False)(logits, labels)
+        assert ce.dtype == torch.bfloat16
+        expected_loss = ce.float() / 3
+        broadcast_inputs = []
+
+        def forward_backward_step(idx, batch, *, loss_buffer, **kwargs):
+            loss_buffer.append(ce.detach() if has_last_stage else torch.tensor(0.0))
+
+        def broadcast(tensor):
+            # NCCL requires matching element types on source and destination;
+            # broadcasting bf16 into an fp32 placeholder corrupts the metric.
+            assert tensor.dtype == torch.float32
+            broadcast_inputs.append(tensor.clone())
+            tensor.copy_(expected_loss)
+            return tensor
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", broadcast)
+        sample = recipe._run_train_optim_step([{"input_ids": labels.clamp_min(0), "labels": labels}])
+
+        assert len(broadcast_inputs) == 1
+        torch.testing.assert_close(broadcast_inputs[0], expected_loss if has_last_stage else torch.tensor(0.0))
+        assert sample.metrics["loss"] == pytest.approx(expected_loss.item())
+        assert ce.dtype == torch.bfloat16
 
     @pytest.mark.parametrize("pp_enabled", [False, True])
     @pytest.mark.parametrize("accumulation_steps", [1, 3])
@@ -2495,7 +2521,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.synchronize_tp_replica_gradients", synchronize)
         monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            "nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm",
             scale_grads_and_clip_grad_norm,
         )
         batches = [{"labels": torch.tensor([[1, 2, 3, -100]])} for _ in range(accumulation_steps)]
@@ -2610,6 +2636,27 @@ class TestRunTrainOptimStepSetsMoEScale:
         tps = metrics.metrics["tps"]
         assert tps > 0
         assert metrics.metrics["tps_per_gpu"] == pytest.approx(tps / 16)
+
+    def test_pack_fill_divides_tokens_by_pack_capacity(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=1)
+        object.__setattr__(recipe, "pack_size", 4)
+        # Three 4-token packs over two microbatches. Trailing -100 labels are padding; the
+        # interior -100 is a masked prompt token, which still fills its pack.
+        batches = [
+            {"labels": torch.tensor([[1, -100, 3, -100], [4, 5, -100, -100]])},
+            {"labels": torch.tensor([[6, 7, 8, 9]])},
+        ]
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        assert metrics.metrics["pack_fill"] == pytest.approx((3 + 2 + 4) / (3 * 4))
+
+    def test_pack_fill_is_absent_without_packing(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=1)
+
+        metrics = recipe._run_train_optim_step([{"labels": torch.tensor([[1, 2, 3, -100]])}])
+
+        assert "pack_fill" not in metrics.metrics
 
 
 # -----------------------------------------------------------------------------
@@ -2983,7 +3030,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "magi", SimpleNamespace(enabled=False))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())  # not FusedLinearCrossEntropy
@@ -3133,7 +3180,7 @@ def _make_mtp_forward_backward_recipe(model, monkeypatch, *, calculate_mtp_loss=
     object.__setattr__(recipe, "device_mesh", object())
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())
@@ -3354,7 +3401,7 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     object.__setattr__(recipe, "device_mesh", object())
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "te_quantization", None)
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())
@@ -3742,7 +3789,7 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -3852,7 +3899,7 @@ def test_qwen35_hidden_state_request_in_recipe(monkeypatch, loss_kind):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -3923,9 +3970,9 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
     reference = deepcopy(model)
     loss_fn = ChunkedCrossEntropy(2, compile=False)
     if softcap is not None:
-        # A plain head is not sufficient: both setup and shared weight preparation
+        # The head does not apply the softcap itself: both setup and shared weight preparation
         # must inspect the owning model's nested text config before training.
-        assert type(model.lm_head) is torch.nn.Linear
+        assert getattr(model.lm_head, "logit_softcapping", None) is None
         with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
             _maybe_downgrade_loss_fn(loss_fn, model, False)
         with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
@@ -3943,7 +3990,7 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
@@ -4071,7 +4118,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     recipe.mesh_context = SimpleNamespace(cp_size=1)
     recipe.pp_enabled = False
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.distributed_config = None
     recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
@@ -4304,7 +4351,7 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
     )
     recipe.tokenizer = None
-    recipe.te_fp8 = None
+    recipe.te_quantization = None
     recipe.domain_mixture = None
     recipe.model_parts = [model]
     recipe.loss_fn = base_loss
@@ -4430,6 +4477,125 @@ def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
     recipe._finalize_and_close_checkpointer.assert_called_once()
 
 
+@pytest.mark.parametrize("attention_backend", ["sdpa", "eager"])
+def test_zephon_setup_preserves_requested_attention_backend(monkeypatch, tmp_path, attention_backend):
+    """Zephon setup preserves the configured SDPA or eager attention backend."""
+    from nemo_automodel._transformers.kernel_patches import _apply_preload_overrides
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonDataloaderConfig,
+        ZephonOptions,
+        ZephonSource,
+        ZephonTextDatasetConfig,
+    )
+
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    config = ZephonDataloaderConfig(
+        dataset_config=ZephonTextDatasetConfig(
+            zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),))
+        )
+    )
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
+    module = "nemo_automodel.recipes.llm.train_ft"
+    recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+    raw = _minimal_cfg_with_nvtx(False)
+
+    class ModelBuildReached(Exception):
+        pass
+
+    def build(*args, **kwargs):
+        attention, _ = _apply_preload_overrides(
+            tp_size=1,
+            cp_size=1,
+            has_packed_sequence=kwargs.get("has_packed_sequence", False),
+            attn_implementation=attention_backend,
+            use_liger_kernel=False,
+        )
+        assert attention == attention_backend
+        raise ModelBuildReached
+
+    monkeypatch.setattr(f"{module}.build_model", build)
+    original = getattr(recipe_type, "_create_distributed_setup")
+
+    def setup(self):
+        result = original(self)
+        result.mesh_context.tp_size = 1
+        return result
+
+    monkeypatch.setattr(recipe_type, "_create_distributed_setup", setup)
+    with pytest.raises(ModelBuildReached):
+        recipe_type(raw).setup()
+
+
+@pytest.mark.parametrize("backend", ["native", "zephon"])
+def test_common_loader_build_keeps_rng_owned_by_loader_and_rank_order(monkeypatch, tmp_path, backend):
+    from contextlib import contextmanager
+
+    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonDataloaderConfig,
+        ZephonOptions,
+        ZephonSource,
+        ZephonTextDatasetConfig,
+    )
+
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    if backend == "native":
+        config = DataloaderConfig(dataset_config=SimpleNamespace(build=lambda: []), seed=123)
+    else:
+        config = ZephonDataloaderConfig(
+            dataset_config=ZephonTextDatasetConfig(
+                zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),))
+            )
+        )
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
+    recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+    monkeypatch.setattr(recipe_type, "_packing_contract", property(lambda self: DEFAULT_PACKED_SEQUENCE_CONTRACT))
+    original_setup = recipe_type._create_distributed_setup
+
+    def setup(self):
+        result = original_setup(self)
+        result.mesh_context.tp_size = 1
+        return result
+
+    monkeypatch.setattr(recipe_type, "_create_distributed_setup", setup)
+    events = []
+
+    @contextmanager
+    def rng_context(*, seed, ranked):
+        events.append(("rng-enter", seed, ranked))
+        try:
+            yield
+        finally:
+            events.append(("rng-exit", seed, ranked))
+
+    @contextmanager
+    def rank_context(*, group):
+        events.append("rank-enter")
+        yield
+        events.append("rank-exit")
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.loader.ScopedRNG", rng_context)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.FirstRankPerNode", rank_context)
+
+    class BuildReached(Exception):
+        pass
+
+    def build(self, **kwargs):
+        with kwargs["dataset_build_context"]:
+            events.append("build")
+        assert kwargs["cp_size"] == 1
+        assert kwargs["pp_enabled"] is False
+        assert kwargs["ignore_index"] == -100
+        raise BuildReached
+
+    monkeypatch.setattr(type(config), "build", build)
+    with pytest.raises(BuildReached):
+        recipe_type(_minimal_cfg_with_nvtx(False)).setup()
+    # build() is mocked above: its owned RNG context must not be duplicated by the recipe.
+    assert events == (["rank-enter", "build", "rank-exit"] if backend == "native" else ["build"])
+
+
 @pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
 @pytest.mark.parametrize("is_packed,output_format", [(False, "batched"), (True, "batched"), (True, "thd")])
 def test_setup_always_passes_return_contract_and_only_configures_packed_batched_inputs(
@@ -4485,3 +4651,78 @@ def test_setup_always_passes_return_contract_and_only_configures_packed_batched_
     assert queries == [True]
     assert configured == ([True] if is_packed and output_format == "batched" else [])
     assert thd_validated == ([True] if output_format == "thd" else [])
+
+
+@pytest.mark.parametrize("document_ids", [[[1, 1, 2, 2, 0], [1, 2, 2, 2, 0]], [[1, 1, 1, 1, 0], [1, 1, 1, 0, 0]]])
+def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[list[int]]) -> None:
+    """Real PP splitting must deliver rebased offsets covering each microbatch."""
+    from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
+
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common.packing import PackingCapabilities, configure_packing
+
+    class Capture(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor, **kwargs):
+            return input_ids, kwargs
+
+    packing = PackingCapabilities(packed_mask_type="flash_varlen")
+    samples = [
+        {"input_ids": [1] * 5, "labels": [1] * 5, "position_ids": [0] * 5, "attention_mask": ids}
+        for ids in document_ids
+    ]
+    batch = neat_packed_collater(samples, packing=packing)
+    model = Capture()
+    configure_packing("flash_attention_2", model=model)
+    seen = []
+
+    def run_schedule(
+        input_ids: torch.Tensor,
+        *,
+        target: torch.Tensor | None,
+        losses: list[torch.Tensor] | None,
+        **kwargs: torch.Tensor | int | str | None,
+    ) -> None:
+        """Validate PP chunks from token IDs [batch, sequence] and batch-major metadata.
+
+        Args:
+            input_ids: Token IDs [batch, sequence].
+            target: Optional label IDs [batch, sequence]; unused on this non-final stage.
+            losses: Optional scalar loss tensors; unused on this non-final stage.
+            **kwargs: Packing metadata with document IDs [batch, sequence].
+
+        Returns:
+            None; validates both model-prepared microbatches.
+        """
+        assert not {"cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"} & kwargs.keys()
+        _, chunks = split_args_kwargs_into_chunks((), {"input_ids": input_ids, **kwargs}, chunks=2)
+        for sample, chunk in zip(samples, chunks):
+            tokens, prepared = model(**chunk)
+            expected = neat_packed_collater([sample], packing=packing)
+            offsets = prepared["cu_seq_lens_q"]
+            assert tokens.shape == (1, 5)
+            assert offsets[0].item() == 0
+            assert offsets[-1].item() == tokens.numel()
+            torch.testing.assert_close(offsets, expected["cu_seq_lens_q"])
+            torch.testing.assert_close(prepared["cu_seq_lens_k"], expected["cu_seq_lens_k"])
+            assert prepared["max_length_q"] == expected["max_length_q"]
+            seen.append(True)
+
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.device_mesh = None
+    recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(
+        pp_batch_size=2,
+        pp_microbatch_size=1,
+        update_seq_len=lambda length: None,
+        info=SimpleNamespace(has_first_stage=True, has_last_stage=False, schedule=SimpleNamespace(step=run_schedule)),
+    )
+    recipe.tokenizer = None
+    recipe.te_quantization = None
+    recipe.domain_mixture = None
+    recipe.model_parts = [model]
+    recipe.loss_fn = MaskedCrossEntropy()
+    original_keys = set(batch)
+    recipe._forward_backward_step(0, batch, loss_buffer=[], num_label_tokens=8, num_batches=1)
+    assert len(seen) == 2
+    assert set(batch) == original_keys

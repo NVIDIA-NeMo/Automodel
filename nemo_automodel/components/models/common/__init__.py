@@ -15,6 +15,7 @@
 """Common/shared components for model implementations."""
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.utils import (
     HAVE_DEEP_EP,
     HAVE_TE,
@@ -22,7 +23,7 @@ from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     CudaGraphConfig,
     MoKBackendConfig,
-    compute_lm_head_logits,
+    NcclEpConfig,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -38,9 +39,11 @@ __all__ = [
     "BackendConfig",
     "CudaGraphConfig",
     "MoKBackendConfig",
+    "NcclEpConfig",
     "get_rope_config",
     "initialize_rms_norm_module",
     "initialize_linear_module",
-    # lm_head projection
-    "compute_lm_head_logits",
+    # LM head
+    "LMHead",
+    "slice_logits_to_keep",
 ]

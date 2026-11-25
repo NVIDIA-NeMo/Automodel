@@ -37,7 +37,7 @@ from torch.nn.attention import SDPBackend
 from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
-from huggingface_hub import ResolvedRevision, snapshot_download
+from huggingface_hub import ResolvedRevision
 from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
@@ -98,6 +98,7 @@ from nemo_automodel._transformers.kernel_patches import (
 from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
     _init_model,
+    _resolve_model_dir,
     get_hf_config,
     get_is_hf_model,
     no_hf_meta_device,
@@ -631,13 +632,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         ):
             # Give the checkpointer the selected snapshot, not a repo id whose
             # cache may also contain an unrelated (or newer) weight index.
-            pretrained_path = snapshot_download(
+            pretrained_path = _resolve_model_dir(
                 pretrained_path,
                 revision=revision,
                 cache_dir=cache_dir,
-                local_files_only=True,
+                subfolder=kwargs.get("subfolder", ""),
             )
-            pretrained_path = os.path.join(pretrained_path, kwargs.get("subfolder", ""))
 
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
@@ -749,6 +749,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 - cache_dir (str): Cache directory for model weights.
                 - load_metadata_with_gloo (bool): Use a CPU process group for checkpoint
                   load planning while retaining the training group. Default: False.
+                - logits_dtype (str | torch.dtype): Dtype of the LM head's logits, e.g. ``float32``;
+                  a constructor argument of repo models, ignored with a warning for Hugging Face ones.
 
         Returns:
             transformers.PreTrainedModel: The loaded (and possibly patched)

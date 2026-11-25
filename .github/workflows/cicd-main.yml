@@ -63,6 +63,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check out the PR merged into its target branch
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/checkout-pr-merge.sh
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -119,6 +124,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check out the PR merged into its target branch
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/checkout-pr-merge.sh
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -163,6 +173,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check out the PR merged into its target branch
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/checkout-pr-merge.sh
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -585,10 +600,10 @@ jobs:
             timeout: 60
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          # Leave room for cold compilation in the packed Qwen3.5 CP test.
+          # Main takes 34 minutes; allow headroom for cold compilation and slower runners.
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 40
+            timeout: 60
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval

@@ -1,0 +1,96 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Synthetic pretraining counterpart of examples/llm_benchmark/moonlight/moonlight_16b_te_fp8.yaml
+# Fixed-length mock tokens; runtime tuning is canonical. GPU validation is pending.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 256
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  num_epochs: null
+  max_steps: 1000
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 8
+  sequence_parallel: false
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 2
+  round_virtual_stages_to_pp_multiple: up
+  scale_grads_in_schedule: false
+  patch_inner_model: false
+  patch_causal_lm_model: false
+  layers_per_stage: 2
+  pp_seq_len: 2048
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: te
+    te_grouped_tensor: true
+    dispatcher: deepep
+    te_fp8:
+      _target_: nemo_automodel.components.models.common.utils.TEFp8Config
+      recipe: current
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+checkpoint:
+  enabled: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 163840
+  seq_len: 2048
+  include_position_ids: false
+  exclude_token_ids: [0]
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+  pin_memory: true
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+  foreach: false
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100
+  time: 00:15:00
+  nodes: 1
+  recipe_owner: akoumpa
+  nproc_per_node: 8
+  perf_testing:
+    schedule: nightly
+    fake_balanced_gate: true
