@@ -29,6 +29,7 @@ other. Context parallelism, PP and vision are layered on this contract in siblin
 from __future__ import annotations
 
 import itertools
+from functools import partial
 from dataclasses import dataclass
 
 import torch
@@ -39,6 +40,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder, contiguous_local_indices
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
@@ -47,6 +49,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
+from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
+from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashAttention, HY4FlashDocLayout, HY4FlashRope
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLayer, build_ngram_tokens
@@ -271,6 +275,7 @@ class HY4FlashModel(nn.Module):
         attention_mask: torch.Tensor | None,
         packed_seq_ids: torch.Tensor | None,
         image_token_mask: torch.Tensor | None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> HY4FlashBatch:
         """Build the flattened-token metadata shared by every layer.
 
@@ -280,6 +285,8 @@ class HY4FlashModel(nn.Module):
             attention_mask: Optional bool/int tensor of shape [batch, sequence], 1 for real tokens.
             packed_seq_ids: Optional integer tensor of shape [batch, sequence] with document ids (0 = padding).
             image_token_mask: Optional bool tensor of shape [batch, sequence], True at image placeholder tokens.
+            cp_group: Context-parallel group; all token tensors above then hold this rank's contiguous shard
+                (batch must be 1) and the returned document layout / rotary tables cover the global sequence.
 
         Returns:
             The shared batch view.
@@ -287,17 +294,29 @@ class HY4FlashModel(nn.Module):
         cfg = self.config
         rows, seq = input_ids.shape
         valid = torch.ones_like(input_ids, dtype=torch.bool) if attention_mask is None else attention_mask.bool()
+        cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
         if packed_seq_ids is not None:
             doc_ids = packed_seq_ids.to(torch.long) * valid
         else:
             doc_ids = torch.arange(1, rows + 1, device=input_ids.device)[:, None].expand(rows, seq) * valid
-        flat = doc_ids.reshape(-1)
+        if cp_size > 1:
+            if rows != 1:
+                raise ValueError("context parallelism requires one packed row per rank")
+            local_start = dist.get_rank(cp_group) * seq
+            flat = gather_sequence(doc_ids, cp_group).reshape(-1)
+            flat_positions = gather_sequence(position_ids.permute(1, 2, 0), cp_group).reshape(-1, 3).T
+            global_ids = gather_sequence(input_ids, cp_group)
+            global_time = flat_positions[0][None]
+        else:
+            local_start = 0
+            flat = doc_ids.reshape(-1)
+            flat_positions = position_ids.reshape(3, -1)
+            global_ids, global_time = input_ids, position_ids[0]
         change = torch.nonzero(flat[1:] != flat[:-1]).flatten().add(1).tolist()
         bounds = [0, *change, flat.numel()]
         host_ids = flat[bounds[:-1]].tolist()
         doc_ranges = tuple((s, e) for s, e, d in zip(bounds[:-1], bounds[1:], host_ids) if d > 0)
-        layout = HY4FlashDocLayout(doc_ranges, 0, rows * seq)
-        flat_positions = position_ids.reshape(3, -1)
+        layout = HY4FlashDocLayout(doc_ranges, local_start, local_start + rows * seq)
         ropes = {}
         for attention_type, theta in self._inv_freq_theta.items():
             _, rope_dim, _ = cfg.attention_dims(attention_type)
@@ -307,7 +326,8 @@ class HY4FlashModel(nn.Module):
             ropes[attention_type] = HY4FlashRope(cos[0], sin[0])
         ngram = engram_mask = None
         if cfg.engram_layer_ids:
-            ngram = build_ngram_tokens(input_ids, position_ids[0], cfg.engram_max_ngram_size, cfg.engram_pad_id)
+            ngram = build_ngram_tokens(global_ids, global_time, cfg.engram_max_ngram_size, cfg.engram_pad_id)
+            ngram = ngram[:, local_start : local_start + seq]
             engram_mask = valid & (input_ids != cfg.engram_pad_id)
             if image_token_mask is not None:
                 engram_mask = engram_mask & ~image_token_mask
@@ -322,6 +342,7 @@ class HY4FlashModel(nn.Module):
         packed_seq_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         image_token_mask: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
         """Compute the final hidden states.
 
@@ -332,11 +353,12 @@ class HY4FlashModel(nn.Module):
             packed_seq_ids: Optional integer tensor of shape [batch, sequence] with document ids.
             inputs_embeds: Optional tensor of shape [batch, sequence, hidden] replacing the token embeddings.
             image_token_mask: Optional bool tensor of shape [batch, sequence] of image placeholder tokens.
+            cp_group: Optional context-parallel group; tensors then hold the local contiguous shard.
 
         Returns:
             Tensor of shape [batch, sequence, hidden] after the final norm.
         """
-        batch = self.prepare_batch(input_ids, position_ids, attention_mask, packed_seq_ids, image_token_mask)
+        batch = self.prepare_batch(input_ids, position_ids, attention_mask, packed_seq_ids, image_token_mask, cp_group)
         embedded = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         streams = embedded.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         for layer in self.layers:
@@ -347,6 +369,7 @@ class HY4FlashModel(nn.Module):
 class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """Hy4-flash with an fp32 ``lm_head`` (text path)."""
 
+    _owns_cp_attention: bool = True
     config_class = HY4FlashConfig
     base_model_prefix = "model"
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -370,7 +393,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
         supports_thd: bool = True
@@ -391,6 +414,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        self.cp_mesh: DeviceMesh | None = None
         text = config.text_config
         self.backend = backend or BackendConfig(
             attn="cudnn", linear="torch", rms_norm="torch", experts="torch_mm", dispatcher="hybridep"
@@ -439,6 +463,28 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             raise ValueError(f"{int(mask.sum())} image placeholder tokens but {features.shape[0]} image features")
         return embedded.masked_scatter(mask.unsqueeze(-1), features)
 
+    def prepare_model_inputs_for_cp(self, batch: dict[str, torch.Tensor], *, num_chunks: int = 1) -> dict[str, object]:
+        """Select contiguous packed sharding (documents are never aligned or reordered).
+
+        Args:
+            batch: Full tensors of shape [batch, global_sequence] (the hook leaves them intact).
+            num_chunks: Framework chunk count; this model uses one chunk.
+
+        Returns:
+            The model-owned CP sharder; its local token tensors have shape [1, padded_global_sequence / cp_size].
+        """
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=partial(
+                    shard_cp_batch,
+                    pad_multiple=1,
+                    packed_alignment=1,
+                    sync_packed_length=self.backend.dispatcher == "hybridep",
+                ),
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
     def _nemo_prepare_model_owned_dtensors(self, fsdp_mesh: DeviceMesh) -> set[nn.Parameter]:
         """Register the row-owner-sharded Engram tables as DTensors before FSDP records its ignored parameters.
 
@@ -477,6 +523,10 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
+        seq_lens: torch.Tensor | None = None,
+        seq_lens_padded: torch.Tensor | None = None,
+        qkv_format: str | None = None,
     ) -> CausalLMOutputWithPast:
         """Compute logits (and an optional mean token loss).
 
@@ -494,13 +544,37 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             image_grid_thw: Optional integer tensor of shape [images, 3] of (time, height, width) patch counts.
             mm_token_type_ids: Optional integer tensor of shape [batch, sequence], 0 text / 1 image; derived from the
                 image placeholder id when omitted.
+            cp_group: Context-parallel group; ``input_ids`` etc. are then the local contiguous shard prepared by the
+                model-owned sharder (``packed_seq_ids`` and document-local ``position_ids`` included).
+            seq_lens: Optional integer tensor of shape [batch, documents] of real document lengths of a packed row
+                (direct, non-CP packed forward). ``seq_lens_padded`` gives the physical spans and ``qkv_format`` must be
+                ``"thd"`` or omitted.
 
         Returns:
             ``CausalLMOutputWithPast`` with logits [batch, kept_sequence, vocab].
         """
         del loss_mask
+        if cp_group is None and self.cp_mesh is not None:
+            cp_group = self.cp_mesh.get_group()
         if attention_mask is None and padding_mask is not None:
             attention_mask = ~padding_mask.bool()
+        if qkv_format not in (None, "thd"):
+            raise ValueError("Hy4-flash qkv_format must be omitted or 'thd'")
+        layout = None
+        if seq_lens is not None:
+            if packed_seq_ids is not None or (cp_group is not None and dist.get_world_size(cp_group) > 1):
+                raise ValueError("seq_lens is for direct packed forwards; CP input must come from the model-owned sharder")
+            layout = packed_layout(
+                seq_lens,
+                seq_lens_padded=seq_lens_padded,
+                input_shape=tuple(input_ids.shape),
+                alignment=1,
+                minimum_length=input_ids.shape[1],
+            )
+            input_ids = layout.pack(input_ids, fill=self.config.text_config.pad_token_id or 0)
+            position_ids = layout.position_ids
+            packed_seq_ids = layout.sequence_ids
+            attention_mask = packed_seq_ids > 0
         rows, seq = input_ids.shape
         image_mask = input_ids == self.image_token_id
         if position_ids is None:
@@ -521,7 +595,10 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             packed_seq_ids=packed_seq_ids,
             inputs_embeds=self._embed(input_ids, pixel_values, image_grid_thw),
             image_token_mask=image_mask,
+            cp_group=cp_group,
         )
+        if layout is not None:
+            hidden = layout.restore(hidden)
         logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
         loss = None
         if labels is not None:

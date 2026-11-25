@@ -38,9 +38,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.hy_v4_flash.config import AttentionType, HY4FlashTextConfig
+from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
 from nemo_automodel.components.models.hy_v4_flash.layers import HY4FlashRMSNorm, apply_interleaved_rope
 
 
@@ -308,6 +312,11 @@ class HY4FlashAttention(nn.Module):
         self.compressed_indexer = (
             HY4FlashCompressedIndexer(config) if self.attention_type == "deepseek_sparse_attention" else None
         )
+        self._cp_group: dist.ProcessGroup | None = None
+
+    def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
+        """Attach the context-parallel group (called by the shared parallelizer): keys are gathered, queries stay local."""
+        self._cp_group = cp_mesh.get_group()
 
     def _absorbed_weights(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-head key / value up-projections of ``kv_b_proj`` as ``[heads, dim, latent]`` tensors.
@@ -398,7 +407,9 @@ class HY4FlashAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the latent keys (and index token keys) over the global sequence.
 
-        Without context parallelism the local tensors already are the global ones.
+        Without context parallelism the local tensors already are the global ones. With it, only the 576-wide latent
+        keys (differentiable: backward reduce-scatters their gradients to the owning rank) and the 128-wide index token
+        keys (no gradient) travel, instead of the 3072-wide hidden states.
 
         Args:
             kv_local: Tensor of shape [local_tokens, kv_lora_rank + rope_dim].
@@ -407,7 +418,14 @@ class HY4FlashAttention(nn.Module):
         Returns:
             The same tensors over the global sequence.
         """
-        return kv_local, token_keys
+        if self._cp_group is None or dist.get_world_size(self._cp_group) == 1:
+            return kv_local, token_keys
+        kv = gather_sequence(kv_local[None], self._cp_group)[0]
+        if token_keys is None:
+            return kv, None
+        with torch.no_grad():
+            keys = gather_sequence(token_keys[None], self._cp_group)[0]
+        return kv, keys
 
     def _attend(self, query: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor) -> torch.Tensor:
         """Run the sparse latent attention kernel (or its PyTorch twin).
