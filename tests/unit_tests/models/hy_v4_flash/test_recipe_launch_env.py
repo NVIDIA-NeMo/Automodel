@@ -25,15 +25,17 @@ import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[4]
-RECIPES = (
-    "examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep64.yaml",
-    "examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep64_lora.yaml",
-    "examples/llm_finetune/hy_v4_flash/hy4_flash_tulu3_128k_cp16_ep64_100steps.yaml",
-)
+RECIPES = sorted(str(path.relative_to(REPO)) for path in (REPO / "examples").glob("*/hy_v4_flash/*.yaml"))
+
+
+def test_every_recipe_directory_is_covered() -> None:
+    assert {recipe.split("/")[1] for recipe in RECIPES} == {"llm_benchmark", "llm_finetune", "vlm_finetune"}
+    assert len(RECIPES) == 5
 
 
 @pytest.mark.parametrize("recipe", RECIPES)
-def test_multi_node_h100_recipe_disables_pxn(recipe):
-    ci = yaml.safe_load((REPO / recipe).read_text())["ci"]
+def test_multi_node_h100_recipe_disables_pxn(recipe: str) -> None:
+    with (REPO / recipe).open() as handle:
+        ci = yaml.safe_load(handle)["ci"]
     assert ci["cluster_tag"] == "h100" and ci["nodes"] > 1
     assert ci["env_vars"]["NCCL_PXN_DISABLE"] == "1"

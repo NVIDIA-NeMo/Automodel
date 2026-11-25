@@ -23,7 +23,7 @@ import nemo_automodel._transformers.registry  # noqa: F401  (registers the custo
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLayer
 
-from .tiny import tiny_config, tiny_text_config
+from .tiny import CPU_BACKEND, tiny_config, tiny_text_config
 
 RELEASED = os.environ.get("HY4_CONFIG_JSON")
 needs_released = pytest.mark.skipif(
@@ -79,6 +79,15 @@ def test_engram_fp8_lookup_is_rejected_instead_of_ignored():
         HY4FlashEngramLayer(tiny_text_config(engram_fp8_embedding=True), 1, dtype=torch.float32)
 
 
+def _rope_parameters(**sliding_overrides: str | bool) -> dict[str, dict[str, str | float | bool | list[int]]]:
+    """The tiny per-type rotary table with fields of the sliding-window entry replaced."""
+    entry = {"rope_type": "default", "mrope_section": [2, 1, 1]}
+    return {
+        "sliding_attention": {**entry, "rope_theta": 1.0e4, **sliding_overrides},
+        "deepseek_sparse_attention": {**entry, "rope_theta": 1.0e7},
+    }
+
+
 def test_unsupported_layer_type_is_rejected():
     with pytest.raises(ValueError, match="unsupported layer type"):
         tiny_text_config(layer_types=["full_attention"] * 6)
@@ -88,8 +97,33 @@ def test_wrong_engram_layer_offset_is_detected_by_the_layer_id_check():
     # a zero-based reading of the ids [2, 4] would put Engram on layers 2 and 4, which the config lookup rejects
     cfg = tiny_text_config()
     assert cfg.engram_layer_indices == [1, 3]
-    with pytest.raises(KeyError):
-        HY4FlashEngramLayer(cfg, 2, dtype=torch.float32)  # layer_id 3 has no head-vocab table in the config
+    with pytest.raises(ValueError, match="has no Engram block"):
+        HY4FlashEngramLayer(cfg, 2, dtype=torch.float32)  # one-based id 3 is not an Engram layer
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"attention_bias": True}, "attention_bias=True is not supported"),
+        ({"attention_dropout": 0.1}, "attention_dropout must be 0"),
+        ({"dtype": "float32"}, "built in bfloat16"),
+        ({"rope_parameters": _rope_parameters(rope_type="yarn")}, "rope_type must be 'default'"),
+        ({"rope_parameters": _rope_parameters(mrope_interleaved=False)}, "only interleaved M-RoPE"),
+    ],
+)
+def test_settings_the_model_does_not_implement_are_rejected(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        tiny_text_config(**overrides)
+
+
+@pytest.mark.parametrize(("field", "value"), [("attn", "flex"), ("rms_norm", "te")])
+def test_unsupported_backend_choices_are_rejected(field: str, value: str) -> None:
+    import dataclasses
+
+    from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashAttention
+
+    with pytest.raises(ValueError, match=f"backend.{field}"):
+        HY4FlashAttention(tiny_text_config(), 0, dataclasses.replace(CPU_BACKEND, **{field: value}))
 
 
 def test_reduced_depth_keeps_the_released_schedule_prefix():

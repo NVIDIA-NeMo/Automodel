@@ -30,7 +30,7 @@ from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausal
 from .tiny import CPU_BACKEND, tiny_config
 
 # index_topk 16 with 4-token groups (the released ratio): three recalled groups plus the query's own group.
-KPOOL, TOPK, WINDOW = 4, 16, 8
+KPOOL, TOPK, WINDOW = 4, 16, 6
 # Starts at every offset mod 4, documents of 1, 2 and 3 tokens, documents shorter and longer than window and top-k.
 DOC_LENGTHS = (1, 2, 3, 21, 22, 23, 37, 5, 41)
 TOLERANCE = dict(rtol=1e-4, atol=2e-5)  # fp32: same arithmetic, only the GEMM batch shapes (summation order) differ
@@ -38,7 +38,12 @@ TOLERANCE = dict(rtol=1e-4, atol=2e-5)  # fp32: same arithmetic, only the GEMM b
 
 def build_model() -> HY4FlashForCausalLM:
     torch.manual_seed(0)
-    config = tiny_config(vision={"num_hidden_layers": 0}, index_topk=TOPK, compressed_indexer_compress_ratio=KPOOL)
+    config = tiny_config(
+        vision={"num_hidden_layers": 0},
+        index_topk=TOPK,
+        compressed_indexer_compress_ratio=KPOOL,
+        sliding_window=WINDOW,
+    )
     model = HY4FlashForCausalLM(config, backend=CPU_BACKEND).float()
     model.initialize_weights(dtype=torch.float32)
     return model
