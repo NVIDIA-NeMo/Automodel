@@ -2515,7 +2515,7 @@ class TestRunTrainOptimStepSetsMoEScale:
             assert device_mesh is recipe.device_mesh
             sync_inputs.append(model.weight.grad.clone())
             # Model a second TP rank's equal partial contribution. Real
-            # collectives are covered by distributed/test_tp_replicas.py.
+            # collectives are covered by parallelism/test_tp_replicas.py.
             model.weight.grad.mul_(2.0)
 
         monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
