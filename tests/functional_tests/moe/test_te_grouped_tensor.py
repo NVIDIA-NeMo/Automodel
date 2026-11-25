@@ -884,7 +884,7 @@ class _WaitInBackward(torch.autograd.Function):
 # Rows per expert of one rank of 32 experts, as REAL_LAYOUTS: half of the experts without rows, and the
 # balanced rows of 4 x 8192 tokens.
 OVERLAP_LAYOUTS: dict[str, list[int]] = {"half_empty": [0] * 16 + [45056] * 16, "balanced": [22528] * 32}
-OVERLAP_ROUNDS = 100
+OVERLAP_ROUNDS = 500
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
