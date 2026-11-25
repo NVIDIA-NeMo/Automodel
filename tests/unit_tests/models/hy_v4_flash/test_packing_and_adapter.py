@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
 
 from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
@@ -65,7 +64,10 @@ def test_adapter_round_trip_restores_released_names_and_values():
     released = adapter.to_hf(native)
     assert not [k for k in released if "sinks_param" in k or "fc1_latent" in k or "attn_hc" in k], "native names leaked"
     assert "model.layers.0.self_attn.learnable_sink_param" in released
-    assert "model.layers.0.mlp.post_fc2_norm.weight" in released and "model.layers.1.mlp.combine_output_norm.weight" in released
+    assert (
+        "model.layers.0.mlp.post_fc2_norm.weight" in released
+        and "model.layers.1.mlp.combine_output_norm.weight" in released
+    )
     assert released["model.layers.1.mlp.experts.gate_up_proj"].shape == (8, 64, 32)  # [experts, 2 * inter, latent]
     again = adapter.from_hf({k: v.clone() for k, v in released.items()})
     assert set(again) == set(native)

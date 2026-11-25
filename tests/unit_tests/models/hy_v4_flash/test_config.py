@@ -26,7 +26,9 @@ from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLa
 from .tiny import tiny_config, tiny_text_config
 
 RELEASED = os.environ.get("HY4_CONFIG_JSON")
-needs_released = pytest.mark.skipif(RELEASED is None or not os.path.exists(RELEASED), reason="HY4_CONFIG_JSON not provided")
+needs_released = pytest.mark.skipif(
+    RELEASED is None or not os.path.exists(RELEASED), reason="HY4_CONFIG_JSON not provided"
+)
 
 
 def test_autoconfig_resolves_the_local_class_from_a_checkpoint_style_config(tmp_path):
@@ -50,7 +52,9 @@ def test_released_config_semantics():
     # config ids are one-based: zero-based layers 1, 11, 21, 31 (confirmed against the weight names)
     assert text.engram_layer_ids == [2, 12, 22, 32] and text.engram_layer_indices == [1, 11, 21, 31]
     assert text.engram_fp8_embedding is False
-    assert text.layer_types.count("deepseek_sparse_attention") == 12 and text.layer_types.count("sliding_attention") == 30
+    assert (
+        text.layer_types.count("deepseek_sparse_attention") == 12 and text.layer_types.count("sliding_attention") == 30
+    )
     assert [i for i, t in enumerate(text.layer_types) if t == "deepseek_sparse_attention"][:4] == [0, 1, 5, 9]
     assert text.index_kpool == 4 and text.index_topk // text.index_kpool == 512
     assert text.attention_heads("sliding_attention") == 64 and text.attention_heads("deepseek_sparse_attention") == 32

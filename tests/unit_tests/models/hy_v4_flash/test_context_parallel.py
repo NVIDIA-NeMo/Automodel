@@ -56,7 +56,9 @@ def _reference():
 def _worker(rank, rendezvous, result_path):
     # Built before the process group exists so the Engram tables stay complete and local (no owner sharding).
     model = _model()
-    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=f"file://{rendezvous}", timeout=timedelta(seconds=120))
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=f"file://{rendezvous}", timeout=timedelta(seconds=120)
+    )
     try:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("cp",))
         for layer in model.model.layers:
@@ -99,4 +101,6 @@ def test_cp2_matches_single_rank_forward_and_gradients(tmp_path):
     logits = torch.cat([results[0]["logits"], results[1]["logits"]], dim=1)
     torch.testing.assert_close(logits, reference_logits, rtol=2e-4, atol=2e-4)
     for name, grad in reference_grads.items():
-        torch.testing.assert_close(results[0]["grads"][name], grad, rtol=2e-3, atol=2e-4, msg=lambda m, name=name: f"grad {name}: {m}")
+        torch.testing.assert_close(
+            results[0]["grads"][name], grad, rtol=2e-3, atol=2e-4, msg=lambda m, name=name: f"grad {name}: {m}"
+        )

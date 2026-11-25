@@ -29,8 +29,9 @@ other. Context parallelism, PP and vision are layered on this contract in siblin
 from __future__ import annotations
 
 import itertools
-from functools import partial
 from dataclasses import dataclass
+from functools import partial
+from typing import TypedDict
 
 import torch
 import torch.distributed as dist
@@ -40,7 +41,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder, contiguous_local_indices
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
@@ -91,6 +95,12 @@ def build_moe_config(text: HY4FlashTextConfig, dtype: torch.dtype) -> MoEConfig:
         moe_latent_size=text.routed_expert_hidden_size,
         dtype=dtype,
     )
+
+
+class HY4FlashCPInputs(TypedDict):
+    """Model-owned context-parallel inputs handed to the training recipe."""
+
+    cp_sharder: ContextParallelSharder
 
 
 @dataclass(frozen=True)
@@ -164,7 +174,9 @@ def compute_mrope_position_ids(
             elif key == 1:
                 block = vision_position_ids(current, tuple(next(grids)), merge)
                 if block.shape[1] != count:
-                    raise ValueError(f"image block of {count} tokens does not match its grid ({block.shape[1]} expected)")
+                    raise ValueError(
+                        f"image block of {count} tokens does not match its grid ({block.shape[1]} expected)"
+                    )
                 pieces.append(block)
                 current = int(block.max()) + 1
             else:
@@ -321,7 +333,10 @@ class HY4FlashModel(nn.Module):
         for attention_type, theta in self._inv_freq_theta.items():
             _, rope_dim, _ = cfg.attention_dims(attention_type)
             cos, sin = mrope_cos_sin(
-                flat_positions[:, None], inverse_frequencies(rope_dim, theta), cfg.layer_rope_parameters[attention_type]["mrope_section"], torch.float32
+                flat_positions[:, None],
+                inverse_frequencies(rope_dim, theta),
+                cfg.layer_rope_parameters[attention_type]["mrope_section"],
+                torch.float32,
             )
             ropes[attention_type] = HY4FlashRope(cos[0], sin[0])
         ngram = engram_mask = None
@@ -463,7 +478,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             raise ValueError(f"{int(mask.sum())} image placeholder tokens but {features.shape[0]} image features")
         return embedded.masked_scatter(mask.unsqueeze(-1), features)
 
-    def prepare_model_inputs_for_cp(self, batch: dict[str, torch.Tensor], *, num_chunks: int = 1) -> dict[str, object]:
+    def prepare_model_inputs_for_cp(self, batch: dict[str, torch.Tensor], *, num_chunks: int = 1) -> HY4FlashCPInputs:
         """Select contiguous packed sharding (documents are never aligned or reordered).
 
         Args:
@@ -563,7 +578,9 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         layout = None
         if seq_lens is not None:
             if packed_seq_ids is not None or (cp_group is not None and dist.get_world_size(cp_group) > 1):
-                raise ValueError("seq_lens is for direct packed forwards; CP input must come from the model-owned sharder")
+                raise ValueError(
+                    "seq_lens is for direct packed forwards; CP input must come from the model-owned sharder"
+                )
             layout = packed_layout(
                 seq_lens,
                 seq_lens_padded=seq_lens_padded,
@@ -608,7 +625,9 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         return CausalLMOutputWithPast(loss=loss, logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()
-    def initialize_weights(self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16) -> None:
+    def initialize_weights(
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         """Initialise every weight (checkpoint-free path) as the reference does."""
         if buffer_device is None:
             buffer_device = next(self.parameters()).device
@@ -625,14 +644,34 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             layer.attn_hc.init_weights(std)
             layer.ffn_hc.init_weights(std)
             attn = layer.self_attn
-            for module in (attn.q_a_proj, attn.q_b_proj, attn.kv_a_proj_with_mqa, attn.kv_b_proj, attn.o_proj, attn.gate_proj):
+            for module in (
+                attn.q_a_proj,
+                attn.q_b_proj,
+                attn.kv_a_proj_with_mqa,
+                attn.kv_b_proj,
+                attn.o_proj,
+                attn.gate_proj,
+            ):
                 nn.init.normal_(module.weight, std=std)
             nn.init.constant_(attn.sinks_param.weight, text.learnable_sink_init)
-            for norm in (layer.input_layernorm, layer.post_self_attn_layernorm, layer.post_attention_layernorm, layer.post_mlp_layernorm, attn.q_a_layernorm, attn.kv_a_layernorm):
+            for norm in (
+                layer.input_layernorm,
+                layer.post_self_attn_layernorm,
+                layer.post_attention_layernorm,
+                layer.post_mlp_layernorm,
+                attn.q_a_layernorm,
+                attn.kv_a_layernorm,
+            ):
                 nn.init.ones_(norm.weight)
             if attn.compressed_indexer is not None:
                 indexer = attn.compressed_indexer
-                for module in (indexer.query_projection, indexer.head_weight_projection, indexer.token_key_projection, indexer.key_value_projection, indexer.key_gate_projection):
+                for module in (
+                    indexer.query_projection,
+                    indexer.head_weight_projection,
+                    indexer.token_key_projection,
+                    indexer.key_value_projection,
+                    indexer.key_gate_projection,
+                ):
                     nn.init.normal_(module.weight, std=std)
                 nn.init.normal_(indexer.intra_group_ape.weight, std=std)
                 nn.init.ones_(indexer.token_key_norm.weight)

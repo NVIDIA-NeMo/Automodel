@@ -28,6 +28,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, Required, TypeAlias, TypedDict
 
 import numpy as np
 import torch
@@ -38,6 +39,33 @@ from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_TV, _tv_functional = safe_import("torchvision.transforms.v2.functional")
 _HAS_TV_T, _tv_transforms = safe_import("torchvision.transforms.v2")
+
+ImageSource: TypeAlias = "Image.Image | str | Path | bytes"
+TokenizerOption: TypeAlias = "bool | int | str | list[str] | None"
+
+
+class ImageUrl(TypedDict):
+    """``{"url": ...}`` form of an image reference."""
+
+    url: str
+
+
+class ChatContentBlock(TypedDict, total=False):
+    """One text or image block of a chat message (the Hugging Face multimodal chat format)."""
+
+    type: Required[str]
+    text: str
+    image: ImageSource
+    path: str
+    image_url: str | ImageUrl
+
+
+class ChatMessage(TypedDict):
+    """One chat message with string content or an ordered list of content blocks."""
+
+    role: Literal["system", "user", "assistant"]
+    content: str | list[ChatContentBlock]
+
 
 IMAGE_PAD_TOKEN = "<｜hy_image▁pad:opensource｜>"
 TEXT, IMAGE = 0, 1
@@ -67,7 +95,9 @@ class HY4FlashImageSettings:
 def smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixels: int) -> tuple[int, int]:
     """Round both sides to multiples of ``factor`` while keeping the area inside ``[min_pixels, max_pixels]``."""
     if max(height, width) / min(height, width) > 200:
-        raise ValueError(f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}")
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}"
+        )
     h_bar = round(height / factor) * factor
     w_bar = round(width / factor) * factor
     if h_bar * w_bar > max_pixels:
@@ -109,7 +139,9 @@ def preprocess_image(image: Image.Image, settings: HY4FlashImageSettings) -> tup
     tensor = torch.from_numpy(rgb.copy()).permute(2, 0, 1)
     grid_h, grid_w = image_grid(tensor.shape[1], tensor.shape[2], settings)
     size = [grid_h * settings.patch_size, grid_w * settings.patch_size]
-    resized = _tv_functional.resize(tensor, size, interpolation=_tv_transforms.InterpolationMode.BICUBIC, antialias=True)
+    resized = _tv_functional.resize(
+        tensor, size, interpolation=_tv_transforms.InterpolationMode.BICUBIC, antialias=True
+    )
     scaled = resized.float() * (1.0 / 255.0)
     mean = torch.tensor(settings.mean).view(3, 1, 1)
     std = torch.tensor(settings.std).view(3, 1, 1)
@@ -128,6 +160,14 @@ def _open_image(value: Image.Image | str | Path | bytes) -> Image.Image:
 
         return Image.open(io.BytesIO(value))
     return Image.open(value)
+
+
+class ProcessorOptions(TypedDict, total=False):
+    """Tokenisation options forwarded by the collator through ``processor_kwargs``."""
+
+    padding: bool | str
+    truncation: bool
+    max_length: int
 
 
 class HY4FlashProcessor(ProcessorMixin):
@@ -157,7 +197,7 @@ class HY4FlashProcessor(ProcessorMixin):
         super().__init__(tokenizer=tokenizer, chat_template=tokenizer.chat_template)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs: object) -> HY4FlashProcessor:
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs: TokenizerOption) -> HY4FlashProcessor:
         """Load the checkpoint tokenizer; image constants come from ``processor_config.json`` (defaults match it)."""
         loading = {
             key: kwargs[key]
@@ -177,7 +217,7 @@ class HY4FlashProcessor(ProcessorMixin):
         padding: bool | str = False,
         truncation: bool = False,
         max_length: int | None = None,
-        **kwargs: object,
+        **kwargs: TokenizerOption,
     ) -> BatchFeature:
         """Tokenise rendered prompts, expanding every image pad.
 
@@ -257,7 +297,7 @@ class HY4FlashProcessor(ProcessorMixin):
         return BatchFeature(data=data, tensor_type=return_tensors)
 
     # ------------------------------------------------------------------ chat rendering
-    def _split_images(self, messages: Sequence[dict[str, object]]) -> tuple[list[dict[str, object]], list[object]]:
+    def _split_images(self, messages: Sequence[ChatMessage]) -> tuple[list[ChatMessage], list[ImageSource]]:
         """Replace image payloads with bare ``{"type": "image"}`` blocks and collect the sources in order."""
         sources, rendered = [], []
         for message in messages:
@@ -281,14 +321,14 @@ class HY4FlashProcessor(ProcessorMixin):
 
     def apply_chat_template(
         self,
-        conversation: Sequence[dict[str, object]] | Sequence[Sequence[dict[str, object]]],
+        conversation: Sequence[ChatMessage] | Sequence[Sequence[ChatMessage]],
         *,
         tokenize: bool = False,
         return_dict: bool = False,
         return_tensors: str | None = None,
         add_generation_prompt: bool = False,
-        processor_kwargs: dict[str, object] | None = None,
-        **kwargs: object,
+        processor_kwargs: ProcessorOptions | None = None,
+        **kwargs: TokenizerOption,
     ) -> str | list[str] | torch.Tensor | BatchFeature:
         """Render conversations with the checkpoint's jinja template and, optionally, tokenise them.
 
@@ -317,5 +357,5 @@ class HY4FlashProcessor(ProcessorMixin):
             images.append(sources)
         if not tokenize:
             return texts if batched else texts[0]
-        result = self(text=texts, images=images, return_tensors=return_tensors, **dict(processor_kwargs or {}))
+        result = self(text=texts, images=images, return_tensors=return_tensors, **(processor_kwargs or {}))
         return result if return_dict else result["input_ids"]

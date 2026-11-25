@@ -48,7 +48,11 @@ def _brute_force(cfg: HY4FlashConfig, seq_len: int) -> float:
                 n, d = t.index_n_heads, t.index_head_dim
                 total += 2 * (t.q_lora_rank * n * d + hs * n + hs * d + 2 * d * d)
                 total += 2 * n * d * ((i + 1) // t.index_kpool)
-    total += 6 * seq_len * (hc * hc * hs + len(t.engram_layer_ids) * (hc + 1) * 2 * t.engram_n_embed_per_ngram * hs + hs * t.vocab_size)
+    total += (
+        6
+        * seq_len
+        * (hc * hc * hs + len(t.engram_layer_ids) * (hc + 1) * 2 * t.engram_n_embed_per_ngram * hs + hs * t.vocab_size)
+    )
     return total
 
 
@@ -61,7 +65,9 @@ def test_formula_matches_per_query_counting(seq_len):
 
 def test_text_config_resolves_the_same_formula():
     cfg = tiny_config()
-    assert get_flops_formula_for_hf_config(cfg.text_config)(cfg.text_config, 1, 16) == get_flops_formula_for_hf_config(cfg)(cfg, 1, 16)
+    assert get_flops_formula_for_hf_config(cfg.text_config)(cfg.text_config, 1, 16) == get_flops_formula_for_hf_config(
+        cfg
+    )(cfg, 1, 16)
 
 
 def test_released_config_has_roughly_the_model_card_active_parameters():

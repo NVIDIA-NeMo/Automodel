@@ -188,7 +188,9 @@ def mrope_cos_sin(
     freqs = position_ids[..., None].float() * inv_freq.to(position_ids.device)
     merged = freqs[0].clone()
     for plane, offset in ((1, 1), (2, 2)):
-        merged[..., slice(offset, mrope_section[plane] * 3, 3)] = freqs[plane][..., slice(offset, mrope_section[plane] * 3, 3)]
+        merged[..., slice(offset, mrope_section[plane] * 3, 3)] = freqs[plane][
+            ..., slice(offset, mrope_section[plane] * 3, 3)
+        ]
     return merged.cos().to(dtype), merged.sin().to(dtype)
 
 

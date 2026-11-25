@@ -52,7 +52,9 @@ def draw_hash_multipliers(seed: int, layer_id: int, max_ngram_size: int, compres
     return torch.tensor((drawn * 2 + 1).tolist(), dtype=torch.int64)
 
 
-def build_ngram_tokens(input_ids: torch.Tensor, document_positions: torch.Tensor, max_ngram_size: int, pad_id: int) -> torch.Tensor:
+def build_ngram_tokens(
+    input_ids: torch.Tensor, document_positions: torch.Tensor, max_ngram_size: int, pad_id: int
+) -> torch.Tensor:
     """Stack each token with the ``max_ngram_size - 1`` tokens before it.
 
     Positions that reach before the start of their document read ``pad_id``; the document start is where the
@@ -138,9 +140,13 @@ class HY4FlashEngramLayer(nn.Module):
             persistent=False,
         )
         self._multipliers_ready = False
-        self.lookup_per_head_norms = nn.ModuleList(HY4FlashWeightOnlyNorm(head_dim, dtype) for _ in range(self.num_heads))
+        self.lookup_per_head_norms = nn.ModuleList(
+            HY4FlashWeightOnlyNorm(head_dim, dtype) for _ in range(self.num_heads)
+        )
         self.value_proj = nn.Linear(engram_size, self.hidden_size, dtype=dtype)
-        self.key_projs = nn.ModuleList(nn.Linear(engram_size, self.hidden_size, dtype=dtype) for _ in range(self.hc_mult))
+        self.key_projs = nn.ModuleList(
+            nn.Linear(engram_size, self.hidden_size, dtype=dtype) for _ in range(self.hc_mult)
+        )
         self.norm_key = nn.ModuleList(HY4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
         self.norm_query = nn.ModuleList(HY4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
         self.unified_pre_gamma = nn.Parameter(torch.ones(self.hidden_size, dtype=dtype))
@@ -226,5 +232,8 @@ class HY4FlashEngramLayer(nn.Module):
         logit = (key.float() * query.float()).sum(-1) * self.hidden_size**-0.5
         gate = torch.sigmoid(torch.copysign(logit.abs().clamp_min(1e-6).sqrt(), logit)).unsqueeze(-1)
         main = self.unified_pre_gamma.to(dtype) * F.rms_norm(self.value_proj(emb), (self.hidden_size,))
-        out = gate * main.float().unsqueeze(2) + main.unsqueeze(2).float() * torch.stack(list(self.unified_per_hc_scales)).float()
+        out = (
+            gate * main.float().unsqueeze(2)
+            + main.unsqueeze(2).float() * torch.stack(list(self.unified_per_hc_scales)).float()
+        )
         return out.masked_fill(~engram_mask[:, :, None, None], 0.0).to(dtype)

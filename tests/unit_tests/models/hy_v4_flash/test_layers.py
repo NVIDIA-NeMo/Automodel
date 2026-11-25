@@ -57,7 +57,9 @@ def test_rope_theta_negative_control_is_detected():
     rope_dim = 64
     x = torch.randn(1, 4, 1, rope_dim)
     pos = torch.tensor([[100, 200, 300, 400]])
-    cos, sin = mrope_cos_sin(pos[None].expand(3, -1, -1), inverse_frequencies(rope_dim, 1.0e4), [12, 10, 10], torch.float32)
+    cos, sin = mrope_cos_sin(
+        pos[None].expand(3, -1, -1), inverse_frequencies(rope_dim, 1.0e4), [12, 10, 10], torch.float32
+    )
     wrong = _oracle_rope(x, pos, 1.0e7).float()
     assert not torch.allclose(apply_interleaved_rope(x, cos, sin), wrong, atol=1e-2)
 

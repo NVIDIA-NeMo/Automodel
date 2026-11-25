@@ -26,6 +26,8 @@ from typing import Literal, NotRequired, TypeAlias, TypedDict
 
 from transformers import PretrainedConfig
 
+# Any JSON value of a ``config.json`` (the open set of extra checkpoint fields the base class retains).
+JsonValue: TypeAlias = "str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]"
 AttentionType: TypeAlias = Literal["deepseek_sparse_attention", "sliding_attention"]
 MlpType: TypeAlias = Literal["dense", "sparse"]
 
@@ -129,7 +131,7 @@ class HY4FlashTextConfig(PretrainedConfig):
         bos_token_id: int | None = 120000,
         eos_token_id: int | list[int] | None = 120025,
         tie_word_embeddings: bool = False,
-        **kwargs: object,
+        **kwargs: JsonValue,
     ) -> None:
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -199,14 +201,14 @@ class HY4FlashTextConfig(PretrainedConfig):
         try:
             self.layer_types = [_LAYER_TYPE_ALIASES[t] for t in layer_types]
         except KeyError as exc:
-            raise ValueError(f"unsupported layer type {exc.args[0]!r}; expected one of {sorted(_LAYER_TYPE_ALIASES)}") from exc
+            raise ValueError(
+                f"unsupported layer type {exc.args[0]!r}; expected one of {sorted(_LAYER_TYPE_ALIASES)}"
+            ) from exc
 
         # The base class rewrites ``rope_parameters`` with a flat default alongside the per-type entries, so the
         # per-type table is kept under its own name; a saved config carries both and the own name wins.
         source = layer_rope_parameters if layer_rope_parameters is not None else rope_parameters
-        rope = {
-            _LAYER_TYPE_ALIASES[k]: dict(v) for k, v in (source or {}).items() if k in _LAYER_TYPE_ALIASES
-        }
+        rope = {_LAYER_TYPE_ALIASES[k]: dict(v) for k, v in (source or {}).items() if k in _LAYER_TYPE_ALIASES}
         default_theta = {"deepseek_sparse_attention": 1.0e7, "sliding_attention": 1.0e4}
         for layer_type, theta in default_theta.items():
             params = rope.setdefault(layer_type, {"rope_type": "default"})
@@ -229,7 +231,9 @@ class HY4FlashTextConfig(PretrainedConfig):
     # ------------------------------------------------------------------ derived shapes
     def attention_heads(self, attention_type: AttentionType) -> int:
         """Number of query heads of a layer of the given attention type."""
-        return self.num_attention_heads if attention_type == "deepseek_sparse_attention" else self.swa_num_attention_heads
+        return (
+            self.num_attention_heads if attention_type == "deepseek_sparse_attention" else self.swa_num_attention_heads
+        )
 
     def attention_dims(self, attention_type: AttentionType) -> tuple[int, int, int]:
         """Return ``(qk_nope_head_dim, qk_rope_head_dim, v_head_dim)`` of the given attention type."""
@@ -302,7 +306,9 @@ class HY4FlashTextConfig(PretrainedConfig):
             orders = self.engram_max_ngram_size - 1
             for layer_id in self.engram_layer_ids:
                 if not 1 <= layer_id <= self.num_hidden_layers:
-                    raise ValueError(f"engram layer id {layer_id} is outside the one-based range 1..{self.num_hidden_layers}")
+                    raise ValueError(
+                        f"engram layer id {layer_id} is outside the one-based range 1..{self.num_hidden_layers}"
+                    )
                 sizes = (self.engram_layer_head_vocab_sizes or {}).get(str(layer_id))
                 if (
                     not isinstance(sizes, list)
@@ -336,7 +342,7 @@ class HY4FlashVisionConfig(PretrainedConfig):
         hidden_act: str = "gelu",
         max_image_size: int = 2048,
         interpolate_mode: str = "bilinear",
-        **kwargs: object,
+        **kwargs: JsonValue,
     ) -> None:
         if hidden_act != "gelu":
             raise ValueError(f"the vision tower implements the released gelu activation only, got {hidden_act!r}")
@@ -373,15 +379,15 @@ class HY4FlashConfig(PretrainedConfig):
 
     def __init__(
         self,
-        text_config: dict[str, object] | HY4FlashTextConfig | None = None,
-        vision_config: dict[str, object] | HY4FlashVisionConfig | None = None,
+        text_config: dict[str, JsonValue] | HY4FlashTextConfig | None = None,
+        vision_config: dict[str, JsonValue] | HY4FlashVisionConfig | None = None,
         image_token_id: int = 120120,
         video_token_id: int = 120124,
         image_start_token_id: int = 120118,
         image_end_token_id: int = 120119,
         image_newline_token_id: int = 120121,
         tie_word_embeddings: bool = False,
-        **kwargs: object,
+        **kwargs: JsonValue,
     ) -> None:
         if isinstance(text_config, dict):
             text_config = HY4FlashTextConfig(**{k: v for k, v in text_config.items() if k != "model_type"})

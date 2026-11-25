@@ -67,7 +67,9 @@ class HY4FlashVisionEmbeddings(nn.Module):
         weight = self.patch_embedding.weight
         patches = pixel_values.to(weight.dtype).reshape(-1, self.config.num_channels, self.patch_size, self.patch_size)
         embeds = self.patch_embedding(patches).flatten(1)
-        positions = [self.interpolate_positions(int(h), int(w), embeds.dtype).repeat(int(t), 1) for t, h, w in grid_thw.tolist()]
+        positions = [
+            self.interpolate_positions(int(h), int(w), embeds.dtype).repeat(int(t), 1) for t, h, w in grid_thw.tolist()
+        ]
         return embeds + torch.cat(positions)
 
 
@@ -93,7 +95,10 @@ class HY4FlashVisionAttention(nn.Module):
         Returns:
             Tensor of shape [patches, hidden].
         """
-        q, k, v = (proj(hidden_states).view(-1, self.num_heads, self.head_dim) for proj in (self.q_proj, self.k_proj, self.v_proj))
+        q, k, v = (
+            proj(hidden_states).view(-1, self.num_heads, self.head_dim)
+            for proj in (self.q_proj, self.k_proj, self.v_proj)
+        )
         outputs = []
         for q_i, k_i, v_i in zip(q.split(lengths), k.split(lengths), v.split(lengths)):
             out = F.scaled_dot_product_attention(*(t.transpose(0, 1).unsqueeze(0) for t in (q_i, k_i, v_i)))

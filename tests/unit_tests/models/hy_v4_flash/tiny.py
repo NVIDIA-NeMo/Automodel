@@ -29,7 +29,9 @@ def tiny_text_config(**overrides: object) -> HY4FlashTextConfig:
     return HY4FlashTextConfig(**{**TINY_TEXT_KWARGS, **overrides})
 
 
-def tiny_config(*, vision: dict[str, int] | None = None, image_token_id: int = 250, **overrides: object) -> HY4FlashConfig:
+def tiny_config(
+    *, vision: dict[str, int] | None = None, image_token_id: int = 250, **overrides: object
+) -> HY4FlashConfig:
     """Composite config around :func:`tiny_text_config`; ``vision`` overrides the tiny vision tower."""
     vision_kwargs = dict(
         hidden_size=32,

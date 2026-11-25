@@ -35,16 +35,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-
-import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
-from nemo_automodel.components.models.hy_v4_flash.config import AttentionType, HY4FlashTextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
+from nemo_automodel.components.models.hy_v4_flash.config import AttentionType, HY4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.layers import HY4FlashRMSNorm, apply_interleaved_rope
 
 
@@ -189,7 +188,9 @@ class HY4FlashCompressedIndexer(nn.Module):
             query = torch.cat(
                 (
                     query[..., :nope],
-                    apply_interleaved_rope(query[..., nope:].unsqueeze(0), query_rope.cos[None], query_rope.sin[None])[0],
+                    apply_interleaved_rope(query[..., nope:].unsqueeze(0), query_rope.cos[None], query_rope.sin[None])[
+                        0
+                    ],
                 ),
                 dim=-1,
             )
@@ -202,7 +203,9 @@ class HY4FlashCompressedIndexer(nn.Module):
                 ),
                 dim=-1,
             )
-            head_weights = self.head_weight_projection(hidden_states).float() * (self.n_heads**-0.5 * self.head_dim**-0.5)
+            head_weights = self.head_weight_projection(hidden_states).float() * (
+                self.n_heads**-0.5 * self.head_dim**-0.5
+            )
             scores = F.relu(torch.einsum("qhd,gd->qhg", query.float(), keys.float()))
             logits = torch.einsum("qh,qhg->qg", head_weights, scores)
             # A query sees only groups that closed before its own group.
@@ -249,7 +252,13 @@ def dense_causal_indices(query_slots: torch.Tensor, width: int) -> torch.Tensor:
 
 
 def reference_sparse_latent_attention(
-    q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sink: torch.Tensor, scale: float, value_dim: int, chunk: int = 64
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sink: torch.Tensor,
+    scale: float,
+    value_dim: int,
+    chunk: int = 64,
 ) -> torch.Tensor:
     """PyTorch implementation of the shared sparse latent attention kernel (CPU/CUDA, any dtype).
 
@@ -306,7 +315,9 @@ class HY4FlashAttention(nn.Module):
         self.kv_b_proj = initialize_linear_module(
             linear, config.kv_lora_rank, self.num_heads * (self.nope_dim + self.v_dim), False, dtype=dtype
         )
-        self.o_proj = initialize_linear_module(linear, self.num_heads * self.v_dim, hidden, config.attention_bias, dtype=dtype)
+        self.o_proj = initialize_linear_module(
+            linear, self.num_heads * self.v_dim, hidden, config.attention_bias, dtype=dtype
+        )
         self.gate_proj = initialize_linear_module(linear, hidden, self.num_heads * self.v_dim, False, dtype=dtype)
         self.sinks_param = HY4FlashFP32Parameter(torch.full((self.num_heads,), config.learnable_sink_init))
         self.compressed_indexer = (
@@ -386,7 +397,9 @@ class HY4FlashAttention(nn.Module):
                 local = dense_causal_indices(slots, self.index_topk)
             else:
                 group_keys = self.compressed_indexer.pool_groups(keys[start:end])
-                first_tokens = slice(start, start + group_keys.shape[0] * self.compressed_indexer.kpool, self.compressed_indexer.kpool)
+                first_tokens = slice(
+                    start, start + group_keys.shape[0] * self.compressed_indexer.kpool, self.compressed_indexer.kpool
+                )
                 local = self.compressed_indexer.select(
                     q_resid[q_start - lo : q_end - lo],
                     x[q_start - lo : q_end - lo],
@@ -427,7 +440,9 @@ class HY4FlashAttention(nn.Module):
             keys = gather_sequence(token_keys[None], self._cp_group)[0]
         return kv, keys
 
-    def _attend(self, query: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor) -> torch.Tensor:
+    def _attend(
+        self, query: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor
+    ) -> torch.Tensor:
         """Run the sparse latent attention kernel (or its PyTorch twin).
 
         Args:
@@ -441,6 +456,10 @@ class HY4FlashAttention(nn.Module):
         """
         if self.backend.attn == "cudnn":
             return cudnn_sparse_attention(
-                query.contiguous(), kv.unsqueeze(1).contiguous(), indices.unsqueeze(1).contiguous(), self.scale, attn_sink=sinks
+                query.contiguous(),
+                kv.unsqueeze(1).contiguous(),
+                indices.unsqueeze(1).contiguous(),
+                self.scale,
+                attn_sink=sinks,
             )
         return reference_sparse_latent_attention(query, kv, indices, sinks, self.scale, self.kv_lora_rank)

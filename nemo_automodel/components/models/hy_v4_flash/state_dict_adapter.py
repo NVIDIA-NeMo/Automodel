@@ -119,7 +119,11 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
     def _to_released_key(self, key: str) -> str:
         norm = _POST_MLP_NORM_NATIVE.fullmatch(key)
         if norm:
-            released = "post_fc2_norm" if self.config.text_config.mlp_layer_types[int(norm.group(2))] == "dense" else "combine_output_norm"
+            released = (
+                "post_fc2_norm"
+                if self.config.text_config.mlp_layer_types[int(norm.group(2))] == "dense"
+                else "combine_output_norm"
+            )
             return f"{norm.group(1)}.mlp.{released}.weight"
         for pattern, replacement in _INVERSE_RENAMES:
             key, count = re.subn(pattern, replacement, key)
@@ -147,7 +151,11 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         start = tensor.device_mesh.get_local_rank() * math.ceil(tensor.shape[0] / tensor.device_mesh.size())
         valid = max(0, min(local.shape[0], rows - start))
         return DTensor.from_local(
-            local[:valid], tensor.device_mesh, tensor.placements, shape=torch.Size((rows, tensor.shape[1])), stride=(tensor.shape[1], 1)
+            local[:valid],
+            tensor.device_mesh,
+            tensor.placements,
+            shape=torch.Size((rows, tensor.shape[1])),
+            stride=(tensor.shape[1], 1),
         )
 
     def _pad_engram_rows(self, tensor: torch.Tensor, layer: int) -> torch.Tensor:
@@ -167,7 +175,11 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         if local.shape[0] < local_rows:
             local = torch.nn.functional.pad(local, (0, 0, 0, local_rows - local.shape[0]))
         return DTensor.from_local(
-            local, tensor.device_mesh, tensor.placements, shape=torch.Size((local_rows * owners, tensor.shape[1])), stride=(tensor.shape[1], 1)
+            local,
+            tensor.device_mesh,
+            tensor.placements,
+            shape=torch.Size((local_rows * owners, tensor.shape[1])),
+            stride=(tensor.shape[1], 1),
         )
 
     # ------------------------------------------------------------------ released -> native
@@ -192,14 +204,30 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
                 continue
             expert = _EXPERT.fullmatch(key)
             if expert:
-                native = f"model.layers.{expert[1]}.mlp.experts." + ("gate_and_up_projs" if expert[2] == "gate_up_proj" else "down_projs")
+                native = f"model.layers.{expert[1]}.mlp.experts." + (
+                    "gate_and_up_projs" if expert[2] == "gate_up_proj" else "down_projs"
+                )
                 if state_dict_utils.is_dtensor(value):
                     converted[native] = value.transpose(1, 2)
                 else:
-                    start, end = state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts) if device_mesh is not None else (0, n_experts)
+                    start, end = (
+                        state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
+                        if device_mesh is not None
+                        else (0, n_experts)
+                    )
                     local = value[start:end].transpose(1, 2).to(self.dtype)
-                    rank = None if device_mesh is None else state_dict_utils.get_submesh(device_mesh, ("ep",)).get_rank() if "ep" in device_mesh.mesh_dim_names else device_mesh.get_rank()
-                    converted[native] = state_dict_utils.create_dtensor_from_local(local, device_mesh, rank) if device_mesh is not None else local
+                    rank = (
+                        None
+                        if device_mesh is None
+                        else state_dict_utils.get_submesh(device_mesh, ("ep",)).get_rank()
+                        if "ep" in device_mesh.mesh_dim_names
+                        else device_mesh.get_rank()
+                    )
+                    converted[native] = (
+                        state_dict_utils.create_dtensor_from_local(local, device_mesh, rank)
+                        if device_mesh is not None
+                        else local
+                    )
                 continue
             table = _ENGRAM_TABLE.fullmatch(key)
             if table:
@@ -212,15 +240,21 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         return converted
 
     # ------------------------------------------------------------------ native -> released
-    def to_hf(self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs: object) -> dict[str, torch.Tensor]:
+    def to_hf(
+        self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs: object
+    ) -> dict[str, torch.Tensor]:
         """Export native tensors under the released names and layouts."""
         out: dict[str, torch.Tensor] = {}
         for fqn, tensor in state_dict.items():
-            for key, value in self.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs):
+            for key, value in self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
+            ):
                 out[key] = value
         return out
 
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: torch.Tensor, **kwargs: object) -> list[tuple[str, torch.Tensor]]:
+    def convert_single_tensor_to_hf(
+        self, fqn: str, tensor: torch.Tensor, **kwargs: object
+    ) -> list[tuple[str, torch.Tensor]]:
         """Convert one native tensor.
 
         Args:
@@ -234,7 +268,9 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
             return []
         expert = _NATIVE_EXPERT.fullmatch(fqn)
         if expert:
-            key = f"model.layers.{expert[1]}.mlp.experts." + ("gate_up_proj" if expert[2] == "gate_and_up_projs" else "down_proj")
+            key = f"model.layers.{expert[1]}.mlp.experts." + (
+                "gate_up_proj" if expert[2] == "gate_and_up_projs" else "down_proj"
+            )
             result = [(key, tensor.transpose(1, 2))]
         else:
             key = self._to_released_key(fqn)
