@@ -59,11 +59,14 @@ for multimodal data and launch instructions. For Qwen3, follow the
 [model page](/model-coverage/reranking-models/qwen/Qwen3-Reranker-4B), including its model-specific collator.
 These workflows adapt existing checkpoints; they do not reproduce the released models' original training pipelines.
 
-The Llama quickstart below illustrates the shared training workflow using a base language model.
+Follow your selected released model's instructions first. The optional Llama verification below
+illustrates the shared training workflow using base language-model weights.
 For additional backbone initialization examples, refer to
 [Train Retrieval Models from Base Checkpoints](/recipes-e2e-examples/retrieval-base-models).
 
 ## Quickstart
+
+This optional verification uses base Llama weights. It does not fine-tune the released checkpoint selected above.
 
 Before running the examples:
 
@@ -93,12 +96,15 @@ automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 1 \
   --step_scheduler.global_batch_size 4 \
   --step_scheduler.local_batch_size 1 \
   --step_scheduler.max_steps 10 \
+  --lr_scheduler.lr_warmup_steps 0 \
   --dataset.max_train_samples 40
 ```
 
 `max_train_samples` shortens the training rows after the configured `hf://` split and corpus are loaded. This is a
 training-step verification, not a lightweight data-loading check. First-run downloads and corpus loading can still take
 time and disk. For a small data-loading check, point the config at a local retrieval JSON or JSONL sample.
+
+The short verification run disables warmup so the configured warmup does not exceed its 10 training steps.
 
 The first artifact to check is `training.jsonl` under `checkpoint.checkpoint_dir`. JSONL metrics are buffered, so
 standard output and error are still the best live signals during a very short run.
@@ -130,7 +136,6 @@ Choose a released model from [Embedding Models](/model-coverage/embedding-models
 or [Reranking Models](/model-coverage/reranking-models/overview). To initialize a custom
 retrieval model from Llama or Ministral weights, follow
 [Train Retrieval Models from Base Checkpoints](/recipes-e2e-examples/retrieval-base-models).
-
 
 Choose the recipe that matches your retrieval stage:
 

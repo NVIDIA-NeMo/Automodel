@@ -121,8 +121,8 @@ uv run automodel examples/retrieval/bi_encoder/mistral3_vl_embedding.yaml --npro
 uv run automodel examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml --nproc-per-node 8
 ```
 
-The reranker projects and scales scores in FP32, including under BF16 autocast.
-Its recipe computes cross entropy in FP32. Keep the top-level `temperature: 1.0`
+The reranker projects and scales scores in 32-bit floating point (FP32), including
+under bfloat16 (BF16) autocast. Its recipe computes cross entropy in FP32. Keep the top-level `temperature: 1.0`
 when using a non-unit `model.temperature`; setup rejects two active temperature
 sources.
 
@@ -134,6 +134,14 @@ freeze_config:
   freeze_vision_tower: true
   freeze_language_model: true
 ```
+
+## Verify Training
+
+Check `training.jsonl` under the selected recipe's `checkpoint.checkpoint_dir`
+for finite losses and advancing steps. The examples enable consolidated checkpoint
+export. After training finishes, locate `model/consolidated` inside the final
+step's checkpoint directory. Use a new `--checkpoint.checkpoint_dir` for each run
+to keep checkpoints and metrics separate.
 
 ## Backbone Reference
 
