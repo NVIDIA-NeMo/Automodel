@@ -53,11 +53,12 @@ def _reference():
     return out.logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
 
-def _worker(rank, rendezvous, queue):
+def _worker(rank, rendezvous, result_path):
+    # Built before the process group exists so the Engram tables stay complete and local (no owner sharding).
+    model = _model()
     dist.init_process_group("gloo", rank=rank, world_size=2, init_method=f"file://{rendezvous}", timeout=timedelta(seconds=120))
     try:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("cp",))
-        model = _model()
         for layer in model.model.layers:
             layer.self_attn.setup_cp_attention(mesh)
         ids, doc, positions = _inputs()
@@ -78,7 +79,7 @@ def _worker(rank, rendezvous, queue):
                 grad = parameter.grad.clone()
                 dist.all_reduce(grad)
                 grads[name] = grad
-        queue.put((rank, out.logits.detach(), grads))
+        torch.save({"logits": out.logits.detach(), "grads": grads}, result_path)
     finally:
         dist.destroy_process_group()
 
@@ -87,18 +88,15 @@ def _worker(rank, rendezvous, queue):
 def test_cp2_matches_single_rank_forward_and_gradients(tmp_path):
     reference_logits, reference_grads = _reference()
     context = mp.get_context("spawn")
-    queue = context.Queue()
-    processes = [context.Process(target=_worker, args=(rank, str(tmp_path / "init"), queue)) for rank in range(2)]
+    paths = [str(tmp_path / f"rank{rank}.pt") for rank in range(2)]
+    processes = [context.Process(target=_worker, args=(rank, str(tmp_path / "init"), paths[rank])) for rank in range(2)]
     for process in processes:
         process.start()
-    results = {}
-    for _ in range(2):
-        rank, logits, grads = queue.get(timeout=240)
-        results[rank] = (logits, grads)
     for process in processes:
-        process.join(timeout=60)
+        process.join(timeout=280)
         assert process.exitcode == 0
-    logits = torch.cat([results[0][0], results[1][0]], dim=1)
+    results = [torch.load(path) for path in paths]
+    logits = torch.cat([results[0]["logits"], results[1]["logits"]], dim=1)
     torch.testing.assert_close(logits, reference_logits, rtol=2e-4, atol=2e-4)
     for name, grad in reference_grads.items():
-        torch.testing.assert_close(results[0][1][name], grad, rtol=2e-3, atol=2e-4, msg=lambda m, name=name: f"grad {name}: {m}")
+        torch.testing.assert_close(results[0]["grads"][name], grad, rtol=2e-3, atol=2e-4, msg=lambda m, name=name: f"grad {name}: {m}")
