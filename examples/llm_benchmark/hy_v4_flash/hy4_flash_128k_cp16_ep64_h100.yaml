@@ -63,7 +63,7 @@ model:
     shared_expert_overlap: true
     compile_router_weight: true
     compile_hc: true  # hyper-connection cores compiled once per static shape; the first step takes minutes longer
-    compile_norm: false  # in BF16 the compiled core multiplies by the weight in FP32 and rounds once; the reference rounds twice
+    compile_norm: true  # in BF16 the compiled core multiplies by the weight in FP32 and rounds once; the reference rounds twice
     dispatcher_equal_token_counts: true
     fake_balanced_gate: true  # balanced routing: removes routing imbalance, not a measurement of learned routing
     fake_gate_noise: 0.0

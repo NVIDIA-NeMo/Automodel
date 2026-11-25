@@ -114,3 +114,36 @@ def test_fp32_parameter_forward_returns_a_copy_that_survives_freed_parameter_sto
     torch.testing.assert_close(out.detach(), expected)
     out.sum().backward()
     torch.testing.assert_close(holder.weight.grad, torch.ones(2, 3))
+
+
+def test_compiled_rms_norm_core_agrees_with_eager_to_rounding():
+    """What ``BackendConfig.compile_norm`` runs: the same mathematics as the eager core, with one rounding less in BF16.
+
+    The eager core (and the reference) normalise in fp32, round to BF16, multiply by the weight and round again. The
+    compiled core multiplies by the weight in fp32 and rounds once. In fp32 the two agree to rounding; in BF16 they
+    differ by at most one unit in the last place.
+    """
+    from nemo_automodel.components.models.hy_v4_flash import layers
+
+    torch.manual_seed(0)
+    x32 = torch.randn(2, 64, 96)
+    weight32 = 1 + 0.1 * torch.randn(96)
+    try:
+        compiled = torch.compile(layers._rms_norm_core, dynamic=False)
+        got32 = compiled(x32, weight32, 1e-5)
+    except Exception as error:  # no working compiler backend in this environment
+        pytest.skip(f"torch.compile cannot run here: {type(error).__name__}")
+    torch.testing.assert_close(got32, layers._rms_norm_core(x32, weight32, 1e-5), rtol=1e-5, atol=1e-6)
+
+    x16, weight16 = x32.bfloat16(), weight32.bfloat16()
+    eager = layers._rms_norm_core(x16, weight16, 1e-5).float()
+    got16 = compiled(x16, weight16, 1e-5)
+    assert got16.dtype == torch.bfloat16
+    got16 = got16.float()
+    # BF16 keeps 8 significant bits: the spacing of values in [2^e, 2^(e+1)) is 2^(e-7).
+    exponent = torch.floor(torch.log2(torch.maximum(eager.abs(), got16.abs()).clamp_min(1e-30)))
+    assert bool(((got16 - eager).abs() <= torch.pow(2.0, exponent - 7)).all())
+    # The single rounding: the compiled result is the fp32 product rounded once.
+    normalised = x16.float() * torch.rsqrt(x16.float().square().mean(-1, keepdim=True) + 1e-5)
+    once = (weight16.float() * normalised).bfloat16().float()
+    assert float((got16 == once).float().mean()) > 0.99
