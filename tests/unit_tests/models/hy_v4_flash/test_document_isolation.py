@@ -308,3 +308,28 @@ def test_engram_hash_multipliers_follow_a_lookup_table_loaded_after_initialisati
             expected = draw_hash_multipliers(engram.seed, engram.layer_id, engram.max_ngram_size, compressed)
             torch.testing.assert_close(engram.hash_multipliers, expected)
         torch.testing.assert_close(logits, expected_logits)
+
+
+def test_engram_gate_is_one_half_at_a_logit_of_exactly_zero():
+    """The reference gates with ``sqrt(clamp(|x|, 1e-6)) * sign(x)``; ``sign(0) = 0`` gives ``sigmoid(0) = 0.5``."""
+    import torch.nn.functional as F
+
+    from nemo_automodel.components.models.hy_v4_flash.engram import build_ngram_tokens
+
+    model = build_model()
+    engram = next(layer.engram_layer for layer in model.model.layers if layer.engram_layer is not None)
+    with torch.no_grad():
+        for projection in engram.key_projs:  # zero keys: every gate logit is exactly 0
+            projection.weight.zero_()
+            projection.bias.zero_()
+        ids = random_documents((11,))[0][None]
+        ngram = build_ngram_tokens(ids, torch.arange(ids.shape[1])[None], engram.max_ngram_size, engram.pad_id)
+        streams = torch.randn(1, ids.shape[1], engram.hc_mult, engram.hidden_size)
+        out = engram(streams, ngram, torch.ones_like(ids, dtype=torch.bool))
+        # the gated signal, computed independently of the gate
+        emb = engram.multi_head_embedding.embedding(engram.hash_ngrams(ngram))
+        emb = F.rms_norm(emb, (engram.head_dim,)) * torch.stack([n.weight for n in engram.lookup_per_head_norms])
+        main = engram.unified_pre_gamma * F.rms_norm(engram.value_proj(emb.flatten(-2)), (engram.hidden_size,))
+        scales = torch.stack(list(engram.unified_per_hc_scales))
+        expected = 0.5 * main.unsqueeze(2) + main.unsqueeze(2) * scales
+    torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-7)

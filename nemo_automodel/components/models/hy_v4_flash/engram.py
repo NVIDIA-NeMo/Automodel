@@ -241,7 +241,9 @@ class HY4FlashEngramLayer(nn.Module):
         key = F.rms_norm(key, (self.hidden_size,)) * torch.stack([n.weight for n in self.norm_key]).to(dtype)
         query = F.rms_norm(streams, (self.hidden_size,)) * torch.stack([n.weight for n in self.norm_query]).to(dtype)
         logit = (key.float() * query.float()).sum(-1) * self.hidden_size**-0.5
-        gate = torch.sigmoid(torch.copysign(logit.abs().clamp_min(1e-6).sqrt(), logit)).unsqueeze(-1)
+        # Signed square root as the reference writes it: ``sign(0) = 0``, so a logit of exactly zero gates at 0.5
+        # (``copysign`` would turn the clamp floor into +-1e-3 there).
+        gate = torch.sigmoid(logit.abs().clamp_min(1e-6).sqrt() * logit.sign()).unsqueeze(-1)
         main = self.unified_pre_gamma.to(dtype) * F.rms_norm(self.value_proj(emb), (self.hidden_size,))
         out = (
             gate * main.float().unsqueeze(2)
