@@ -18,7 +18,8 @@ A small FP32 model (HCA with a dense MLP, HCA with an MoE, DSA with an MoE) carr
 LoRA recipe. The Checkpointer writes its adapter checkpoint, ``nemo_automodel.export_merged_peft_checkpoint`` merges
 it into a model built with the backend that ``tools/merge_lora.py --automodel-native-export`` passes for
 ``--backend attn=sdpa experts=torch dispatcher=torch``, and the public loader reads the merged directory as a model
-without adapters. ``tests/unit_tests/tools/test_merge_lora.py`` checks that the tool passes that backend.
+without adapters. ``tests/unit_tests/tools/test_merge_lora.py`` checks that the tool passes the fields given to
+``--backend``.
 """
 
 from pathlib import Path

@@ -664,16 +664,25 @@ class TestMergeLoraFunction:
         )
 
     @pytest.mark.parametrize(
-        ("backend_args", "error"),
+        ("backend_args", "expected", "error"),
         [
-            (["attn=sdpa", "experts=torch", "dispatcher=torch"], None),
-            (["kernel=torch"], "--backend expects FIELD=VALUE"),
-            (["attn"], "--backend expects FIELD=VALUE"),
-            (["attn="], "--backend expects FIELD=VALUE"),
-            (["fake_balanced_gate=false"], "string-valued BackendConfig field"),
+            (
+                ["attn=sdpa", "experts=torch", "dispatcher=torch"],
+                {"attn": "sdpa", "experts": "torch", "dispatcher": "torch"},
+                None,
+            ),
+            # Values that are the default on no machine, so the case fails when the option, or any item
+            # after the first, is ignored. The case above passes values that are the defaults without CUDA.
+            (["attn=eager", "rms_norm=torch"], {"attn": "eager", "rms_norm": "torch"}, None),
+            (["kernel=torch"], None, "--backend expects FIELD=VALUE"),
+            (["attn"], None, "--backend expects FIELD=VALUE"),
+            (["attn="], None, "--backend expects FIELD=VALUE"),
+            (["fake_balanced_gate=false"], None, "string-valued BackendConfig field"),
         ],
     )
-    def test_automodel_export_backend_option_replaces_backend_fields(self, tmp_path, monkeypatch, backend_args, error):
+    def test_automodel_export_backend_option_replaces_backend_fields(
+        self, tmp_path, monkeypatch, backend_args, expected, error
+    ):
         import nemo_automodel
         from nemo_automodel.components.models.common import BackendConfig
         from tools import merge_lora as merge_mod
@@ -701,9 +710,7 @@ class TestMergeLoraFunction:
                 return
             merge_mod.main()
 
-        assert automodel_cls.from_pretrained.call_args.kwargs["backend"] == BackendConfig(
-            attn="sdpa", linear="torch", experts="torch", dispatcher="torch"
-        )
+        assert automodel_cls.from_pretrained.call_args.kwargs["backend"] == BackendConfig(linear="torch", **expected)
 
     def test_backend_option_requires_automodel_native_export(self, monkeypatch):
         from tools import merge_lora as merge_mod
