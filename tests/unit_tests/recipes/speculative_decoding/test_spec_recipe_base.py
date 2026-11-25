@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from types import SimpleNamespace
 
@@ -150,7 +151,7 @@ def test_min_warmup_steps_floor_is_used(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Optimizer construction (``optimizer:`` block -> ``build_optimizer``)
+# Optimizer construction (``optimizer:`` block -> ``build_optimizer_config``)
 # --------------------------------------------------------------------------- #
 def _recipe_with_optimizer(cls, opt_block, module, tmp_path):
     obj = cls.__new__(cls)
@@ -184,6 +185,60 @@ def test_eagle3_setup_honors_configured_optimizer_target_and_kwargs(tmp_path):
     # The scheduler wraps the configured optimizer, at the configured peak LR.
     assert obj.peak_lr == pytest.approx(3e-4)
     assert obj.lr_scheduler.optimizer is obj.optimizer
+
+
+_DRAFT_RECIPES = [
+    ("train_eagle1", "TrainEagle1Recipe"),
+    ("train_eagle2", "TrainEagle2Recipe"),
+    ("train_eagle3", "TrainEagle3Recipe"),
+    ("train_vispec", "TrainVispecRecipe"),
+    ("train_vispec", "TrainVispecStage1Recipe"),
+    ("train_dflash", "TrainDFlashRecipe"),
+    ("train_dflash2", "TrainDFlash2Recipe"),
+    ("train_domino", "TrainDominoRecipe"),
+    ("train_jetspec", "TrainJetSpecRecipe"),
+    ("train_dspark", "TrainDSparkRecipe"),
+]
+
+
+@pytest.mark.parametrize("module_name,class_name", _DRAFT_RECIPES)
+def test_every_draft_recipe_builds_the_configured_optimizer(module_name, class_name, tmp_path):
+    """No subclass may override the base builder and drop ``_target_`` again."""
+    cls = getattr(importlib.import_module(f"nemo_automodel.recipes.speculative_decoding.{module_name}"), class_name)
+    obj, recipe_cfg = _recipe_with_optimizer(
+        cls, {"_target_": "torch.optim.SGD", "lr": 3e-4, "momentum": 0.8}, torch.nn.Linear(2, 2), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+    assert type(obj.optimizer) is torch.optim.SGD
+    assert obj.optimizer.param_groups[0]["momentum"] == 0.8
+
+
+def test_file_form_target_builds(tmp_path, monkeypatch):
+    """A ``/path/file.py:Class`` target (user modules enabled) must build, not be re-imported by name."""
+    from nemo_automodel.components.config import loader
+
+    monkeypatch.setattr(loader, "ENABLE_USER_MODULES", True)
+    (tmp_path / "my_opt.py").write_text("import torch\n\n\nclass MyAdam(torch.optim.AdamW):\n    pass\n")
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"_target_": f"{tmp_path}/my_opt.py:MyAdam", "lr": 1e-4}, torch.nn.Linear(2, 2), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+    assert type(obj.optimizer).__name__ == "MyAdam"
+    assert isinstance(obj.optimizer, torch.optim.AdamW)
+
+
+def test_peft_draft_does_not_warn_about_bf16_torch_adam(tmp_path, caplog):
+    from nemo_automodel.components.optim import precision_warnings
+
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2).to(torch.bfloat16), tmp_path
+    )
+    obj.peft_config = SimpleNamespace()
+    with caplog.at_level(logging.WARNING):
+        obj._setup_training_state(recipe_cfg)
+    assert _torch_adam_warnings(caplog) == []
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
 
 
 def test_eagle3_setup_honors_adamw_eps(tmp_path):
@@ -274,7 +329,7 @@ def test_resolve_spec_defaults_to_adamw_when_no_target():
     target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
         ConfigNode({"lr": 6e-4, "warmup_ratio": 0.04, "min_lr_ratio": 0.1})
     )
-    assert target == "torch.optim.AdamW"
+    assert target is torch.optim.AdamW
     assert kwargs == {"lr": 6e-4, "betas": (0.9, 0.95), "weight_decay": 0.0}
 
 
@@ -293,7 +348,7 @@ def test_resolve_spec_respects_explicit_target_and_extra_kwargs():
             }
         )
     )
-    assert target == "transformer_engine.pytorch.optimizers.FusedAdam"
+    assert target.__name__ == "FusedAdam"
     assert kwargs == {
         "lr": 1e-5,
         "master_weights": True,
@@ -317,8 +372,15 @@ def test_resolve_spec_does_not_force_adamw_defaults_onto_explicit_target():
     target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
         ConfigNode({"_target_": "torch.optim.SGD", "lr": 0.1, "momentum": 0.9})
     )
-    assert target == "torch.optim.SGD"
+    assert target is torch.optim.SGD
     assert kwargs == {"lr": 0.1, "momentum": 0.9}
+
+
+def test_resolve_spec_rejects_param_group_overrides():
+    with pytest.raises(ValueError, match="optimizer.param_group_overrides is not supported"):
+        SpecDecodeRecipeBase._resolve_optimizer_spec(
+            ConfigNode({"lr": 1.0e-3, "param_group_overrides": [{"pattern": "bias", "lr_mult": 0.0}]})
+        )
 
 
 def test_build_draft_optimizer_builds_sgd_for_an_explicit_target():
