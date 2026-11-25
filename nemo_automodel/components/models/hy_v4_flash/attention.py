@@ -135,9 +135,13 @@ class HY4FlashFP32Parameter(nn.Module):
         self.weight = nn.Parameter(value.to(torch.float32))
 
     def forward(self, reference: torch.Tensor) -> torch.Tensor:
-        """Return the weight (``reference`` only anchors the FSDP hooks)."""
+        """Return a copy of the weight (``reference`` only anchors the FSDP hooks).
+
+        The copy is what makes the result safe to use after this call: an FSDP unit that reshards after forward
+        frees the unsharded parameter storage, so the parameter itself must not outlive the forward.
+        """
         del reference
-        return self.weight
+        return self.weight.clone()
 
 
 class HY4FlashCompressedIndexer(nn.Module):

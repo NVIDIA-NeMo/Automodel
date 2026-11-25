@@ -416,6 +416,8 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
     """Hy4-flash with an fp32 ``lm_head`` (text path)."""
 
     _owns_cp_attention: bool = True
+    # Both paths take document boundaries from the model-owned layout: the shared kernel and its PyTorch twin.
+    _packed_cp_attn_backends = ("cudnn", "sdpa")
     config_class = HY4FlashConfig
     base_model_prefix = "model"
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY

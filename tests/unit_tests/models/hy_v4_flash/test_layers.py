@@ -98,3 +98,19 @@ def test_hyper_connection_collapse_and_expand():
     assert post.shape == (2, 3, 4) and post.dtype == torch.float32
     out = torch.randn(2, 3, 16)
     torch.testing.assert_close(hc.expand(post, out, streams), post.unsqueeze(-1) * out.unsqueeze(2) + streams)
+
+
+def test_fp32_parameter_forward_returns_a_copy_that_survives_freed_parameter_storage():
+    """FSDP frees the unsharded parameter storage when a unit reshards after forward; the result must not alias it."""
+    from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashFP32Parameter
+
+    holder = HY4FlashFP32Parameter(torch.arange(6.0).reshape(2, 3))
+    out = holder(torch.zeros(1))
+    assert out.dtype == torch.float32 and out.requires_grad
+    assert out.data_ptr() != holder.weight.data_ptr()
+    expected = holder.weight.detach().clone()
+    with torch.no_grad():
+        holder.weight.zero_()  # stands in for the resharded (freed and reused) storage
+    torch.testing.assert_close(out.detach(), expected)
+    out.sum().backward()
+    torch.testing.assert_close(holder.weight.grad, torch.ones(2, 3))
