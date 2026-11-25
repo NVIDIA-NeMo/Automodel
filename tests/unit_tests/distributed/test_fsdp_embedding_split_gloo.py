@@ -17,8 +17,7 @@
 from __future__ import annotations
 
 import copy
-import os
-import socket
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -112,12 +111,6 @@ def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _run_case(
     mesh: DeviceMesh,
     *,
@@ -201,10 +194,8 @@ def _run_case(
         torch.testing.assert_close(_full_tensor(actual_state[name]), expected_parameter)
 
 
-def _worker(rank: int, world_size: int, port: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+def _worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         mesh = init_device_mesh("cpu", (1, world_size, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
         for parallelizer in (ModelParallelizer(), Qwen3_5ModelParallelizer()):
@@ -248,5 +239,5 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 @pytest.mark.parametrize("world_size", [1, 2])
-def test_split_embedding_fsdp_matches_unsharded_reference(world_size: int) -> None:
-    mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+def test_split_embedding_fsdp_matches_unsharded_reference(world_size: int, tmp_path: Path) -> None:
+    mp.spawn(_worker, args=(world_size, str(tmp_path / "process-group")), nprocs=world_size, join=True)

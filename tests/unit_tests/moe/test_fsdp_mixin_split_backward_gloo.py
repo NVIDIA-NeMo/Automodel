@@ -27,8 +27,7 @@ interleaved split orders under activation checkpointing, with
 from __future__ import annotations
 
 import copy
-import os
-import socket
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -240,10 +239,8 @@ def _run_case(
         ) from exc
 
 
-def _worker(rank: int, world_size: int, port: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+def _worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     # The deferred branch reduces only on the optimizer step; make every "last backward" one.
     fsdp_mixin.get_is_optim_step = lambda: True
     try:
@@ -264,13 +261,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 @pytest.mark.parametrize("world_size", [2])
-def test_moe_stage_backward_matches_unsharded_reference(world_size: int) -> None:
+def test_moe_stage_backward_matches_unsharded_reference(world_size: int, tmp_path: Path) -> None:
     """Full, split and mixed pipeline backwards, deferred and per-micro-batch, with and without AC, on real two-rank FSDP."""
-    mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+    mp.spawn(_worker, args=(world_size, str(tmp_path / "process-group")), nprocs=world_size, join=True)
