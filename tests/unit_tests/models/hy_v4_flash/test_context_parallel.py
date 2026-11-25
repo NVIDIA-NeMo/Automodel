@@ -30,7 +30,7 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 
 from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashAttention
-from tests.unit_tests.models.hy_v4_flash.tiny import (
+from tests.unit_tests.models.hy_v4_flash.conftest import (
     TOLERANCE,
     assert_documents_match_alone,
     build_model,

@@ -18,7 +18,7 @@ import torch
 
 from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
 from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HYV4FlashStateDictAdapter
-from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config
+from tests.unit_tests.models.hy_v4_flash.conftest import CPU_BACKEND, tiny_config
 
 
 def _model() -> HYV4FlashForCausalLM:

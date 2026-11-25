@@ -23,7 +23,7 @@ from nemo_automodel.components.models.hy_v4_flash.attention import (
     causal_prefix_plan,
 )
 from nemo_automodel.components.models.hy_v4_flash.layers import inverse_frequencies, mrope_cos_sin
-from tests.unit_tests.models.hy_v4_flash.tiny import (
+from tests.unit_tests.models.hy_v4_flash.conftest import (
     TOPK,
     build_model,
     complex_rotation,

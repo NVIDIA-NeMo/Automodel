@@ -23,7 +23,7 @@ from nemo_automodel.components.models.hy_v4_flash.engram import (
     weighted_rms_norm,
 )
 from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
-from tests.unit_tests.models.hy_v4_flash.tiny import build_model, pack, random_documents, tiny_text_config
+from tests.unit_tests.models.hy_v4_flash.conftest import build_model, pack, random_documents, tiny_text_config
 
 
 def test_engram_fp8_lookup_is_rejected_instead_of_ignored() -> None:

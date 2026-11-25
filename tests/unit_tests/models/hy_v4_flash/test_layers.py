@@ -25,7 +25,7 @@ from nemo_automodel.components.models.hy_v4_flash.layers import (
     mrope_cos_sin,
 )
 from nemo_automodel.components.moe.layers import MoE
-from tests.unit_tests.models.hy_v4_flash.tiny import build_model, complex_rotation
+from tests.unit_tests.models.hy_v4_flash.conftest import build_model, complex_rotation
 
 
 def _oracle_rope(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:

@@ -28,7 +28,7 @@ import torch
 
 import nemo_automodel.components.models.hy_v4_flash.model as model_module
 from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashBatch
-from tests.unit_tests.models.hy_v4_flash.tiny import (
+from tests.unit_tests.models.hy_v4_flash.conftest import (
     KPOOL,
     PAD_ID,
     TOKEN_RANGE,

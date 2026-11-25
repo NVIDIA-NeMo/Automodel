@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-from pathlib import Path
-
 import pytest
 
 from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig
 from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
-from tests.unit_tests.models.hy_v4_flash.tiny import tiny_config
+from tests.unit_tests.models.hy_v4_flash.conftest import released_config, tiny_config
 
 
 def _brute_force(cfg: HYV4FlashConfig, seq_len: int) -> float:
@@ -70,8 +67,7 @@ def test_text_config_resolves_the_same_formula() -> None:
 
 
 def test_released_config_has_roughly_the_model_card_active_parameters() -> None:
-    with Path(__file__).with_name("released_config.json").open() as handle:
-        cfg = HYV4FlashConfig(**json.load(handle))
+    cfg = released_config()
     per_token_at_one = cfg.flops_formula(cfg, 1, 1) / 6
     # model card: "Activated Parameters per Token: Text 11.3B"
     assert 11.2e9 < per_token_at_one < 11.4e9, per_token_at_one

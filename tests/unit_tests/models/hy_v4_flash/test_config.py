@@ -20,10 +20,7 @@ from transformers import AutoConfig
 
 import nemo_automodel._transformers.registry  # noqa: F401  (registers the custom configs with AutoConfig)
 from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig, HYV4FlashTextConfig
-from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config, tiny_text_config
-
-# ``config.json`` of https://huggingface.co/tencent/Hy4-flash at revision eccd3123eec73f2040f4c9ed0de1883593470510.
-RELEASED = Path(__file__).with_name("released_config.json")
+from tests.unit_tests.models.hy_v4_flash.conftest import CPU_BACKEND, released_config, tiny_config, tiny_text_config
 
 
 def test_autoconfig_resolves_the_local_class_from_a_checkpoint_style_config(tmp_path: Path) -> None:
@@ -42,8 +39,7 @@ def test_round_trip_keeps_the_per_type_rope_table(tmp_path: Path) -> None:
 
 
 def test_released_config_semantics() -> None:
-    with RELEASED.open() as handle:
-        text = HYV4FlashConfig(**json.load(handle)).text_config
+    text = released_config().text_config
     # config ids are one-based: zero-based layers 1, 11, 21, 31 (confirmed against the weight names)
     assert text.engram_layer_ids == [2, 12, 22, 32] and text.engram_layer_indices == [1, 11, 21, 31]
     assert text.engram_fp8_embedding is False

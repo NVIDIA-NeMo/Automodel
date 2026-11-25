@@ -12,14 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tiny Hy4-flash configuration with every distinguishing feature enabled (CPU-sized)."""
+"""Tiny Hy4-flash configuration with every distinguishing feature enabled (CPU-sized), shared by the tests."""
 
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig, HYV4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
-from tests.unit_tests.models.hy_v4_flash.tiny_kwargs import TINY_TEXT_KWARGS
+
+TINY_TEXT_KWARGS = dict(
+    vocab_size=300,
+    hidden_size=64,
+    intermediate_size=96,
+    moe_intermediate_size=32,
+    routed_expert_hidden_size=24,
+    num_hidden_layers=6,
+    num_attention_heads=4,
+    swa_num_attention_heads=8,
+    n_routed_experts=8,
+    num_experts_per_tok=2,
+    q_lora_rank=32,
+    kv_lora_rank=24,
+    qk_nope_head_dim=16,
+    qk_rope_head_dim=8,
+    v_head_dim=12,
+    swa_qk_nope_head_dim=16,
+    swa_qk_rope_head_dim=8,
+    swa_v_head_dim=12,
+    sliding_window=6,
+    index_topk=8,
+    index_head_dim=24,
+    # Sixteen heads make an exactly-zero group score (every head clipped by the ReLU) rare: such scores tie at the
+    # selection boundary, where the reference's ``torch.topk`` leaves the choice unspecified.
+    index_n_heads=16,
+    compressed_indexer_compress_ratio=2,
+    engram_layer_ids=[2, 4],
+    engram_max_ngram_size=3,
+    engram_n_head_per_ngram=2,
+    engram_n_embed_per_ngram=16,
+    engram_layer_head_vocab_sizes={str(i): [[1009, 1013], [1019, 1021]] for i in (2, 4)},
+    engram_fp8_embedding=False,  # the PR config defaults to True; the released config.json sets False
+    engram_pad_id=2,
+    engram_lookup_table_size=290,
+    rope_parameters={
+        "sliding_attention": {"rope_type": "default", "rope_theta": 1.0e4, "mrope_section": [2, 1, 1]},
+        "deepseek_sparse_attention": {"rope_type": "default", "rope_theta": 1.0e7, "mrope_section": [2, 1, 1]},
+    },
+    pad_token_id=2,
+    bos_token_id=0,
+    eos_token_id=1,
+)
 
 # Token ids the tests draw from (above the special ids, inside the tiny vocabulary) and the padding id.
 TOKEN_RANGE = (3, 280)
@@ -54,6 +96,49 @@ def tiny_config(
     return HYV4FlashConfig(
         text_config=tiny_text_config(**overrides).to_dict(), vision_config=vision_kwargs, image_token_id=image_token_id
     )
+
+
+def released_config() -> HYV4FlashConfig:
+    """The fields the model reads from ``config.json`` of tencent/Hy4-flash at revision eccd3123, as released."""
+    sparse, window = "deepseek_sparse_attention", "sliding_attention"
+    rope = {"mrope_interleaved": True, "mrope_section": [12, 10, 10], "rope_type": "default"}
+    text = dict(
+        vocab_size=120832,
+        hidden_size=3072,
+        intermediate_size=13824,
+        moe_intermediate_size=1536,
+        routed_expert_hidden_size=1536,
+        num_hidden_layers=42,
+        num_attention_heads=32,
+        swa_num_attention_heads=64,
+        n_routed_experts=512,
+        num_experts_per_tok=16,
+        q_lora_rank=1024,
+        kv_lora_rank=512,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        swa_qk_nope_head_dim=192,
+        swa_qk_rope_head_dim=64,
+        swa_v_head_dim=256,
+        sliding_window=512,
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=16,
+        compressed_indexer_compress_ratio=4,
+        hc_mult=4,
+        mlp_layer_types=["dense"] + ["sparse"] * 41,
+        layer_types=[sparse, *[sparse, window, window, window] * 10, sparse],
+        rope_parameters={window: {**rope, "rope_theta": 10000}, sparse: {**rope, "rope_theta": 10000000}},
+        engram_layer_ids=[2, 12, 22, 32],
+        engram_max_ngram_size=3,
+        engram_n_head_per_ngram=8,
+        engram_n_embed_per_ngram=768,
+        # The released moduli are 64 distinct primes just above 10,312,000; only their layout matters here.
+        engram_layer_head_vocab_sizes={str(i): [[10312007] * 8, [10312177] * 8] for i in (2, 12, 22, 32)},
+        engram_fp8_embedding=False,
+    )
+    return HYV4FlashConfig(text_config=text, image_token_id=120120)
 
 
 # index_topk 16 with 4-token groups (the released ratio): three recalled groups plus the query's own group.

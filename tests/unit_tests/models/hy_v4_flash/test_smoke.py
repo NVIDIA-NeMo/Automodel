@@ -21,7 +21,7 @@ import torch
 from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashRope, HYV4FlashSparsePlan
 from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
 from nemo_automodel.components.moe.parallelizer import apply_ac
-from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, TOKEN_RANGE, tiny_config
+from tests.unit_tests.models.hy_v4_flash.conftest import CPU_BACKEND, TOKEN_RANGE, tiny_config
 
 
 def test_tiny_forward_backward_is_finite() -> None:

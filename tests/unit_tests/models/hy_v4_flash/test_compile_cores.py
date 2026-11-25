@@ -23,7 +23,7 @@ from torch._dynamo.utils import counters as dynamo_counters
 import nemo_automodel.components.models.hy_v4_flash.layers as layers
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.hy_v4_flash.layers import HYV4FlashHyperConnection, HYV4FlashRMSNorm
-from tests.unit_tests.models.hy_v4_flash.tiny import tiny_text_config
+from tests.unit_tests.models.hy_v4_flash.conftest import tiny_text_config
 
 _CORE_NAMES = ("_rms_norm", "_hc_collapse", "_hc_expand", "_NORM_COMPILED", "_HC_COMPILED")
 
