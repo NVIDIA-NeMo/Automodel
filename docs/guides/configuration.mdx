@@ -282,13 +282,21 @@ increase steady-state training throughput.
 
 Training recipes detect the current CUDA device and look up its dense peak for
 the training compute dtype. The recipe uses its Transformer Engine FP8 or
-NVFP4 setting, hardware-accelerated TorchAO FP8 setting, or MoK MXFP8 experts
+NVFP4 setting, converted hardware-accelerated TorchAO FP8 linears, or MoK MXFP8 experts
 (`backend.mok.precision: mxfp8` with `dispatcher: mok`) when enabled.
-Otherwise, expert-parallel MoE layers use the MoE policy's `param_dtype`, and
-sharded FSDP2 uses its `mp_policy.param_dtype`. A single process does not
-shard, so the policy does not cast the GPU computation: MFU uses
-`autocast_dtype` when set and otherwise the model's predominant matrix
-parameter dtype. DDP uses the parameter dtype. For example, an H100 SXM uses
+Native `torch_mm_mxfp8` experts use the FP8 peak when their grouped GEMM
+dispatches to the TorchAO MXFP8 kernel.
+Otherwise, dLLM and sequence-classification recipes use their configured
+forward autocast dtype when running CUDA matmuls. Without recipe autocast,
+expert-parallel and sharded FSDP2 layers use their mixed-precision policy's
+`param_dtype`. A reduction-only policy leaves the compute dtype at the model
+default. On a single rank, FSDP2 wraps the forward with autocast on the mesh
+device. A CUDA mesh uses its configured FP16 or BF16 autocast or policy dtype;
+a CPU mesh leaves GPU matmuls in the model dtype. DDP also uses the model dtype
+unless the recipe enables autocast. For bitsandbytes 4-bit linears, the
+precision estimate uses the logical matrix size and compute dtype. Setting
+`NVIDIA_TF32_OVERRIDE=0` selects the FP32 peak for FP32 matmuls even when
+PyTorch allows TF32. For example, an H100 SXM uses
 989 TFLOPs/s for BF16 or FP16 and 1,979 TFLOPs/s for FP8. The training log
 records the selection once at setup, for example
 `MFU peak: 989 TFLOPs/s per device (NVIDIA H100 80GB HBM3, bfloat16)`, and

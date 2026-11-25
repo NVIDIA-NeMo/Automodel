@@ -463,12 +463,34 @@ def test_get_device_flops_uses_cuda_fp32_matmul_policy(monkeypatch, name, precis
     assert get_device_flops(dtype=torch.float32) == expected
 
 
+def test_get_device_flops_honors_cublas_disable_tf32(monkeypatch):
+    _mock_cuda_device(monkeypatch, "H100")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "tf32")
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+    assert get_device_flops(dtype=torch.float32) == 67.0
+
+
 @pytest.mark.parametrize("unit, expected", [("P", 0.989), ("t", 989.0), ("G", 989_000.0)])
 def test_get_device_flops_converts_units(monkeypatch, unit, expected):
     _mock_cuda_device(monkeypatch, "NVIDIA H100 80GB HBM3")
     assert get_device_flops(unit) == pytest.approx(expected)
     with pytest.raises(ValueError, match="Unsupported unit"):
         get_device_flops("X")
+
+
+@pytest.mark.parametrize("dtype_map", [{"": "bfloat16", "vision_config": "float32"}, {"vision_config": "bfloat16"}, {}])
+def test_automfu_saved_composite_dtype(monkeypatch, tmp_path, dtype_map):
+    from transformers import AutoConfig, Qwen3_5Config
+
+    Qwen3_5Config(dtype=dtype_map).save_pretrained(tmp_path)
+    loaded = AutoConfig.from_pretrained(tmp_path)
+    assert loaded.dtype == dtype_map
+    _mock_cuda_device(monkeypatch, "H100")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+    expected_dtype = getattr(torch, dtype_map[""]) if "" in dtype_map else torch.get_default_dtype()
+    for source in (tmp_path, loaded):
+        assert AutoMFU.from_pretrained(source).reference_mfu == get_device_flops(dtype=expected_dtype)
+        assert AutoMFU.from_pretrained(source, compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
 
 
 def test_automfu_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
@@ -485,6 +507,23 @@ def test_automfu_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
     _mock_cuda_device(monkeypatch, "H100")
     assert AutoMFU.from_config(model).reference_mfu == 989.0
     assert AutoMFU.from_config(model, compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
+
+
+@pytest.mark.parametrize("storage_dtype", [torch.uint8, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("plain_weight", [False, True])
+def test_automfu_counts_packed_matrices_at_compute_precision(monkeypatch, storage_dtype, plain_weight):
+    bnb = pytest.importorskip("bitsandbytes")
+    packed = bnb.nn.Linear4bit(64, 64, bias=False, compute_dtype=torch.bfloat16, quant_storage=storage_dtype)
+    model = torch.nn.Sequential(packed.to("cpu"), torch.nn.Linear(32, 64, bias=False))
+    if plain_weight:
+        packed.weight = torch.nn.Parameter(packed.weight.data, requires_grad=False)
+    else:
+        # Device moves may recreate Params4bit without its optional back-reference.
+        packed.weight.module = None
+    model.config = SimpleNamespace(dtype=torch.float32)
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    _mock_cuda_device(monkeypatch, "H100")
+    assert AutoMFU.from_config(model).reference_mfu == 989.0
 
 
 @pytest.mark.parametrize("override", [{"device": "H100"}, {"peak_tflops": 1979.0}])

@@ -78,10 +78,10 @@ def _mock_gb200(monkeypatch):
 @pytest.mark.parametrize(
     "raw_config, strategy, sharded, moe_config, ep_size, param_dtype, dtype_kwargs, expected",
     [
-        # A single process is not sharded, so the FSDP2 policy does not cast the parameters.
+        # A one-rank CPU mesh only autocasts CPU operations. The LLM recipe adds no CUDA autocast.
         ({}, FSDP2Config(), False, None, 1, torch.float32, {}, 80.0),
         ({}, FSDP2Config(), False, None, 1, torch.bfloat16, {}, 2500.0),
-        ({}, FSDP2Config(autocast_dtype=torch.bfloat16), False, None, 1, torch.float32, {}, 2500.0),
+        ({}, FSDP2Config(autocast_dtype=torch.bfloat16), False, None, 1, torch.float32, {}, 80.0),
         # Sharded FSDP2 computes in the policy's param_dtype, not its reduce_dtype or the storage dtype.
         ({}, FSDP2Config(), True, None, 1, torch.float32, {}, 2500.0),
         ({}, FSDP2Config(mp_policy=_FP32_BF16_REDUCE), True, None, 1, torch.bfloat16, {}, 80.0),
@@ -91,8 +91,18 @@ def _mock_gb200(monkeypatch):
         # Expert-parallel experts compute in the MoE policy's param_dtype.
         ({}, FSDP2Config(), True, MoEParallelizerConfig(mp_policy=_FP32_BF16_OUTPUT), 2, torch.bfloat16, {}, 80.0),
         ({}, FSDP2Config(), True, MoEParallelizerConfig(mp_policy=_FP32_BF16_OUTPUT), 1, torch.float32, {}, 2500.0),
-        # Hardware FP8 training uses the FP8 peak; emulated FP8 does not.
-        ({"fp8": {"enabled": True}}, FSDP2Config(), True, None, 1, torch.bfloat16, {}, 5000.0),
+        (
+            {},
+            FSDP2Config(),
+            True,
+            MoEParallelizerConfig(mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16)),
+            2,
+            torch.float32,
+            {},
+            80.0,
+        ),
+        # Enabling TorchAO without converting any layer leaves the BF16 peak.
+        ({"fp8": {"enabled": True}}, FSDP2Config(), True, None, 1, torch.bfloat16, {}, 2500.0),
         ({"fp8": {"enabled": True, "emulate": True}}, FSDP2Config(), True, None, 1, torch.bfloat16, {}, 2500.0),
         # An explicit compute dtype bypasses the selection.
         (
@@ -127,13 +137,59 @@ def test_recipe_mfu_uses_compute_precision(
         cfg=cfg,
         distributed_config=strategy,
         moe_parallel_config=moe_config,
-        mesh_context=SimpleNamespace(device_mesh=None, ep_size=ep_size),
+        mesh_context=SimpleNamespace(device_mesh=SimpleNamespace(device_type="cpu"), ep_size=ep_size),
     )
 
     calculator = TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, **dtype_kwargs)
 
     assert calculator.reference_mfu == expected
     assert not hasattr(recipe, "mfu_calculator")
+
+
+@pytest.mark.parametrize(
+    "mesh_device, sharded, expected_llm, expected_dllm",
+    [("cpu", False, 80.0, 2500.0), ("cuda", False, 2500.0, 2500.0), ("cuda", True, 80.0, 2500.0)],
+)
+def test_recipe_mfu_tracks_forward_autocast(mesh_device, sharded, expected_llm, expected_dllm, monkeypatch):
+    from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+
+    _mock_gb200(monkeypatch)
+    monkeypatch.setattr(base_recipe, "fsdp2_sharding_enabled", lambda device_mesh: sharded)
+    model = nn.Linear(16, 16, dtype=torch.float32)
+    model.config = SimpleNamespace(model_type="llama")
+
+    for recipe_type, expected in (
+        (TrainFinetuneRecipeForNextTokenPrediction, expected_llm),
+        (DiffusionLMSFTRecipe, expected_dllm),
+    ):
+        recipe = recipe_type.__new__(recipe_type)
+        recipe.cfg = {}
+        recipe.distributed_config = FSDP2Config(mp_policy=_FP32_BF16_REDUCE, autocast_dtype=torch.bfloat16)
+        recipe.mesh_context = SimpleNamespace(device_mesh=SimpleNamespace(device_type=mesh_device), ep_size=1)
+        recipe.moe_parallel_config = None
+        assert recipe._setup_mfu(model, recipe_autocast_dtype=recipe._forward_autocast_dtype).reference_mfu == expected
+
+
+def test_unsharded_cuda_mesh_uses_default_forward_policy(monkeypatch):
+    _mock_gb200(monkeypatch)
+    monkeypatch.setattr(base_recipe, "fsdp2_sharding_enabled", lambda device_mesh: False)
+    assert base_recipe._strategy_compute_dtype(FSDP2Config(), SimpleNamespace(device_type="cuda")) == torch.bfloat16
+
+
+@pytest.mark.parametrize("emulate, expected", [(False, 5000.0), (True, 2500.0)])
+def test_recipe_mfu_uses_converted_torchao_layers(monkeypatch, emulate, expected):
+    float8 = pytest.importorskip("torchao.float8")
+    model = nn.Sequential(nn.Linear(32, 32, dtype=torch.bfloat16))
+    model.config = SimpleNamespace(model_type="llama")
+    float8.convert_to_float8_training(model, config=float8.Float8LinearConfig(emulate=emulate))
+    _mock_gb200(monkeypatch)
+    recipe = SimpleNamespace(
+        cfg={"fp8": {"enabled": True, "emulate": emulate}},
+        distributed_config=None,
+        moe_parallel_config=None,
+        mesh_context=SimpleNamespace(device_mesh=None, ep_size=1),
+    )
+    assert TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model).reference_mfu == expected
 
 
 @pytest.mark.parametrize(

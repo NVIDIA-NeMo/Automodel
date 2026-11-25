@@ -45,6 +45,13 @@ class _StopAfterMFU(Exception):
             80.0,
         ),
         (DDPConfig(), True, torch.float32, 80.0),
+        (DDPConfig(autocast_dtype=torch.bfloat16), True, torch.float32, 2500.0),
+        (
+            FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32), autocast_dtype=torch.bfloat16),
+            True,
+            torch.float32,
+            2500.0,
+        ),
     ],
 )
 def test_classifier_mfu_uses_strategy_compute_dtype(strategy, sharded, param_dtype, expected, monkeypatch):
@@ -58,8 +65,10 @@ def test_classifier_mfu_uses_strategy_compute_dtype(strategy, sharded, param_dty
 
     model = nn.Linear(16, 2, dtype=param_dtype)
     model.config = SimpleNamespace(model_type="bert")
+    mesh = MagicMock(device_type="cpu", mesh_dim_names=("dp", "tp", "cp"))
+    mesh.__getitem__.return_value.size.return_value = 1
     distributed_setup = SimpleNamespace(
-        mesh_context=SimpleNamespace(device_mesh=None, moe_mesh=None, pp_enabled=False),
+        mesh_context=SimpleNamespace(device_mesh=mesh, moe_mesh=None, pp_enabled=False),
         strategy_config=strategy,
         pipeline_config=None,
         moe_parallel_config=None,

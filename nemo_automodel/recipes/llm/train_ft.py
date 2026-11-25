@@ -484,6 +484,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # disabled default keeps _forward_backward_step working if setup() is skipped
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
+    # Standard next-token training does not enter a recipe-level autocast context.
+    _forward_autocast_dtype: torch.dtype | None = None
     domain_mixture = None
     # Tokens per pack when sequence packing is on; setup() sets it.
     pack_size = None
@@ -933,7 +935,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
-        self.mfu_calculator = self._setup_mfu(self.model_parts[0])
+        self.mfu_calculator = self._setup_mfu(self.model_parts[0], recipe_autocast_dtype=self._forward_autocast_dtype)
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)

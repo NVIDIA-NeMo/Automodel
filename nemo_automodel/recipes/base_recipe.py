@@ -59,7 +59,9 @@ from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config, TENvfp4Config
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.moe.mxfp8 import uses_native_mxfp8_experts
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.quantization.fp8 import uses_hardware_fp8
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -68,6 +70,7 @@ from nemo_automodel.recipes._typed_config import RecipeConfig
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy
 
     from nemo_automodel.components.distributed.config import DistributedStrategyConfig, MoEParallelizerConfig
     from nemo_automodel.components.distributed.init_utils import DistInfo
@@ -78,27 +81,28 @@ logger = logging.getLogger(__name__)
 
 
 def _strategy_compute_dtype(
-    strategy: "DistributedStrategyConfig | None", device_mesh: "DeviceMesh | None"
+    strategy: "DistributedStrategyConfig | None",
+    device_mesh: "DeviceMesh | None",
+    *,
+    recipe_autocast_dtype: torch.dtype | None = None,
+    moe_policy: "MixedPrecisionPolicy | None" = None,
 ) -> torch.dtype | None:
-    """Return the compute dtype a distributed strategy sets, or None when the parameters' dtype applies.
-
-    Sharded FSDP2 casts parameters to its mixed-precision policy's ``param_dtype``. A single process
-    is not sharded: the policy then only autocasts the forward on the device mesh's device type,
-    which is CPU (gloo), so a GPU computes in the parameters' dtype unless the recipe autocasts the
-    forward to the deprecated ``autocast_dtype``.
-
-    Args:
-        strategy: Distributed strategy configuration.
-        device_mesh: Device mesh the strategy parallelizes the model over.
-
-    Returns:
-        The compute dtype, or None to infer it from the model's matrix parameters.
-    """
-    if not isinstance(strategy, FSDP2Config):
+    """Return the dtype used for CUDA matmuls, or None to infer it from the model."""
+    if recipe_autocast_dtype in (torch.bfloat16, torch.float16):
+        return recipe_autocast_dtype
+    if moe_policy is not None:
+        return moe_policy.param_dtype
+    if not isinstance(strategy, FSDP2Config) or device_mesh is None:
         return None
-    if not fsdp2_sharding_enabled(device_mesh):
-        return strategy.autocast_dtype
-    return strategy.mp_policy.param_dtype if strategy.mp_policy is not None else None
+    policy_dtype = strategy.mp_policy.param_dtype if strategy.mp_policy is not None else None
+    if fsdp2_sharding_enabled(device_mesh):
+        return policy_dtype
+    # Unsharded FSDP2 decorates the forward with autocast on the mesh's device.
+    # A one-rank Gloo mesh autocasts CPU ops even when the model is on CUDA.
+    autocast_dtype = strategy.autocast_dtype or policy_dtype
+    if device_mesh.device_type == "cuda" and autocast_dtype in (torch.bfloat16, torch.float16):
+        return autocast_dtype
+    return None
 
 
 def has_load_restore_state(object):
@@ -272,6 +276,7 @@ class BaseRecipe:
         model: torch.nn.Module,
         *,
         compute_dtype: torch.dtype | Literal["auto"] = "auto",
+        recipe_autocast_dtype: torch.dtype | None = None,
     ) -> AutoMFU:
         """Return the MFU calculator for the recipe's precision policy and model.
 
@@ -299,13 +304,16 @@ class BaseRecipe:
                 (HAVE_TE and isinstance(te_quantization, TEFp8Config))
                 # MoK runs the routed-expert GEMMs in MXFP8: E4M3 data with E8M0 block scales.
                 or (backend is not None and backend.dispatcher == "mok" and backend.mok.precision == "mxfp8")
-                or (fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False))
+                or uses_native_mxfp8_experts(model)
+                or (fp8_config and fp8_config.get("enabled", False) and uses_hardware_fp8(model))
             ):
                 return torch.float8_e4m3fn
-            if moe_config is not None and moe_config.mp_policy is not None and mesh_context.ep_size > 1:
-                if moe_config.mp_policy.param_dtype is not None:
-                    return moe_config.mp_policy.param_dtype
-            return _strategy_compute_dtype(strategy, mesh_context.device_mesh)
+            return _strategy_compute_dtype(
+                strategy,
+                mesh_context.device_mesh,
+                recipe_autocast_dtype=recipe_autocast_dtype,
+                moe_policy=moe_config.mp_policy if moe_config is not None and mesh_context.ep_size > 1 else None,
+            )
 
         return AutoMFU.from_config(
             model,

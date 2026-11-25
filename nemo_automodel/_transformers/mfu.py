@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
-from os import PathLike
+from os import PathLike, getenv
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -36,6 +36,7 @@ from nemo_automodel.components.utils.flops_utils import (
     get_flops_formula_for_hf_config,
     transformer_flops,
 )
+from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +111,29 @@ _CONFIG_ALIAS_ATTRS = (
 )
 
 
+def _model_matrix_dtype(model: torch.nn.Module) -> torch.dtype | None:
+    """Vote by logical matrix size, counting packed weights at their compute dtype."""
+    have_bnb, linear4bit = safe_import_from("bitsandbytes.nn", "Linear4bit")
+    packed_linears = {m.weight: m for m in model.modules() if isinstance(m, linear4bit)} if have_bnb else {}
+    elements_by_dtype: Counter[torch.dtype] = Counter()
+    for param in model.parameters():
+        if (linear := packed_linears.get(param)) is not None:
+            # FSDP can replace the packed weight by a plain Parameter.
+            # Linear4bit recovers its quantization state from the module in forward.
+            state = getattr(param, "quant_state", None) or linear.quant_state
+            if state is not None:
+                elements_by_dtype[linear.compute_dtype or state.dtype] += math.prod(state.shape)
+                continue
+        if param.ndim >= 2 and param.is_floating_point():
+            elements_by_dtype[param.dtype] += param.numel()
+    return max(elements_by_dtype, key=elements_by_dtype.__getitem__, default=None)
+
+
 def _peak_tflops(dtype: torch.dtype) -> tuple[str, _Precision | None, float]:
     """Look up the current device's dense peak for a compute dtype.
 
     Args:
-        dtype: Training compute dtype. FP32 follows the CUDA matmul TF32 setting.
+        dtype: Training compute dtype. FP32 follows the CUDA matmul TF32 setting and cuBLAS override.
 
     Returns:
         The device name, the table precision used for ``dtype``, and the peak in
@@ -123,7 +142,11 @@ def _peak_tflops(dtype: torch.dtype) -> tuple[str, _Precision | None, float]:
     device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU"
 
     precision = _DTYPE_PRECISIONS.get(dtype)
-    if dtype == torch.float32 and torch.backends.cuda.matmul.fp32_precision == "tf32":
+    if (
+        dtype == torch.float32
+        and torch.backends.cuda.matmul.fp32_precision == "tf32"
+        and getenv("NVIDIA_TF32_OVERRIDE") != "0"
+    ):
         precision = "tf32"
 
     normalized_device = device_name.lower()
@@ -140,7 +163,7 @@ def get_device_flops(unit: str = "T", *, dtype: torch.dtype = torch.bfloat16) ->
 
     Args:
         unit: One of ``B/K/M/G/T/P``. Default ``T`` (TFLOPs/s).
-        dtype: Training compute dtype. FP32 follows the CUDA matmul TF32 setting.
+        dtype: Training compute dtype. FP32 follows the CUDA matmul TF32 setting and cuBLAS override.
 
     Returns:
         Theoretical FLOPS in requested unit. Returns ``float("inf")`` for
@@ -185,7 +208,14 @@ class AutoMFU:
             for attr in ("hidden_size", "num_hidden_layers", "num_attention_heads", "intermediate_size", "vocab_size")
         ):
             self.flops_formula = None
-        dtype = compute_dtype or getattr(config, "dtype", None) or torch.bfloat16
+        dtype = compute_dtype or getattr(config, "dtype", None)
+        if isinstance(dtype, dict):
+            # Transformers uses the empty key as the model-wide dtype for composite configs.
+            dtype = dtype.get("", torch.get_default_dtype())
+            if isinstance(dtype, str):
+                dtype = getattr(torch, dtype)
+        if dtype is None:
+            dtype = torch.bfloat16
         device_name, precision, self.reference_mfu = _peak_tflops(dtype)
         if math.isfinite(self.reference_mfu):
             logger.info(
@@ -216,7 +246,8 @@ class AutoMFU:
             config_or_path_or_model: Either a PretrainedConfig object, a model object
                 (the .config attribute will be extracted), or a model ID/local path.
             compute_dtype: Training compute dtype. When omitted for a model, infer its predominant
-                floating-point matrix parameter dtype. Fall back to the config dtype, then BF16.
+                matrix dtype by logical element count. Packed 4-bit linears use their compute dtype.
+                Fall back to the config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
                 when loading from model ID/path.
 
@@ -235,11 +266,7 @@ class AutoMFU:
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
             if compute_dtype is None and isinstance(config_or_path_or_model, torch.nn.Module):
-                elements_by_dtype: Counter[torch.dtype] = Counter()
-                for param in config_or_path_or_model.parameters():
-                    if param.ndim >= 2 and param.is_floating_point():
-                        elements_by_dtype[param.dtype] += param.numel()
-                compute_dtype = max(elements_by_dtype, key=elements_by_dtype.__getitem__, default=None)
+                compute_dtype = _model_matrix_dtype(config_or_path_or_model)
         return cls(config, compute_dtype=compute_dtype)
 
     @classmethod
@@ -256,7 +283,8 @@ class AutoMFU:
             model_id_or_local_path_or_model: Model ID (e.g., "meta-llama/llama-3-70b"),
                 local path, or model object (the .config attribute will be extracted)
             compute_dtype: Training compute dtype. When omitted for a model, infer its predominant
-                floating-point matrix parameter dtype. Fall back to the config dtype, then BF16.
+                matrix dtype by logical element count. Packed 4-bit linears use their compute dtype.
+                Fall back to the config dtype, then BF16.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
 
         Returns:

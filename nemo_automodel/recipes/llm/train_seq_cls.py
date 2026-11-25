@@ -146,7 +146,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(
-            model, compute_dtype=_strategy_compute_dtype(self.distributed_config, self.mesh_context.device_mesh)
+            model,
+            compute_dtype=_strategy_compute_dtype(
+                self.distributed_config,
+                self.mesh_context.device_mesh,
+                recipe_autocast_dtype=getattr(self.distributed_config, "autocast_dtype", None),
+            ),
         )
 
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
