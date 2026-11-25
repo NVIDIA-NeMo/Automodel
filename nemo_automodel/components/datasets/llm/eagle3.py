@@ -27,6 +27,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
+from nemo_automodel.components.datasets.llm.offline_cache import sync_cache_phase
 
 logger = logging.getLogger(__name__)
 
@@ -296,48 +297,44 @@ def build_eagle3_token_mapping(
 
     distributed = dist.is_available() and dist.is_initialized()
     is_rank0 = (not distributed) or dist.get_rank() == 0
-    try:
-        total_batches = len(dataloader)
-    except TypeError:
-        total_batches = None
+    with sync_cache_phase("EAGLE-3 vocabulary counting"):
+        try:
+            total_batches = len(dataloader)
+        except TypeError:
+            total_batches = None
 
-    counts = torch.zeros(target_vocab_size, dtype=torch.long)
-    total_supervised_tokens = 0
-    # Drive the progress bar manually and iterate ``dataloader`` directly: wrapping
-    # the loader in ``tqdm(dataloader)`` triggers a second ``__iter__`` on loaders
-    # without ``__len__``, which would double-scan a single-pass / streaming loader.
-    progress = tqdm(
-        total=total_batches,
-        desc=f"Counting supervised tokens for draft vocab ({draft_vocab_size})",
-        unit="batch",
-        disable=not is_rank0,
-        leave=True,
-    )
-    for step, batch in enumerate(dataloader):
-        input_ids = batch["input_ids"]
-        loss_mask = batch["loss_mask"].bool()
-        supervised_ids = input_ids[loss_mask].to(torch.long).flatten()
-        progress.update(1)
-        if supervised_ids.numel() == 0:
-            continue
-        in_range = (supervised_ids >= 0) & (supervised_ids < target_vocab_size)
-        supervised_ids = supervised_ids[in_range]
-        total_supervised_tokens += supervised_ids.numel()
-        if is_rank0 and step % 100 == 0:
-            progress.set_postfix(tokens=total_supervised_tokens)
-        counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
-    progress.close()
+        counts = torch.zeros(target_vocab_size, dtype=torch.long)
+        total_supervised_tokens = 0
+        # Drive the progress bar manually and iterate ``dataloader`` directly: wrapping
+        # it in ``tqdm(dataloader)`` can double-scan a single-pass / streaming loader.
+        with tqdm(
+            total=total_batches,
+            desc=f"Counting supervised tokens for draft vocab ({draft_vocab_size})",
+            unit="batch",
+            disable=not is_rank0,
+            leave=True,
+        ) as progress:
+            for step, batch in enumerate(dataloader):
+                input_ids = batch["input_ids"]
+                loss_mask = batch["loss_mask"].bool()
+                supervised_ids = input_ids[loss_mask].to(torch.long).flatten()
+                progress.update(1)
+                if supervised_ids.numel() == 0:
+                    continue
+                in_range = (supervised_ids >= 0) & (supervised_ids < target_vocab_size)
+                supervised_ids = supervised_ids[in_range]
+                total_supervised_tokens += supervised_ids.numel()
+                if is_rank0 and step % 100 == 0:
+                    progress.set_postfix(tokens=total_supervised_tokens)
+                counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
+        # NCCL reduces on the rank's CUDA device. Check all ranks finished
+        # counting and staging their tensors before entering the reduction.
+        if distributed and dist.get_backend() == "nccl":
+            counts = counts.to(torch.device("cuda", torch.cuda.current_device()))
 
     if distributed:
-        # NCCL collectives require CUDA tensors; move counts onto the current
-        # device for the reduction and bring it back to CPU for the Python-side
-        # selection logic below.
-        if dist.get_backend() == "nccl" and torch.cuda.is_available():
-            counts_for_reduce = counts.to(torch.device("cuda", torch.cuda.current_device()))
-            dist.all_reduce(counts_for_reduce, op=dist.ReduceOp.SUM)
-            counts = counts_for_reduce.cpu()
-        else:
-            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        counts = counts.cpu()
 
     total_frequency = int(counts.sum().item())
     unique_tokens = int((counts > 0).sum().item())

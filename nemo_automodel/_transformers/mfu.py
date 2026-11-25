@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 # Device theoretical FLOPS (FLOPs/s) adapted from https://github.com/verl-project/verl/blob/main/verl/utils/flops_counter.py#L22-L85
 _DEVICE_FLOPS: dict[str, float] = {
     "CPU": 448e9,
+    # VR200 reports its name as "NVIDIA VR NVL72". NVIDIA's preliminary Vera Rubin NVL72 spec lists
+    # 288 PFLOPS dense FP16/BF16 per rack, 4 PFLOPS per Rubin GPU.
+    "VR NVL72": 4e15,
     "GB200": 2.5e15,
     # Blackwell Ultra keeps Blackwell's dense BF16 peak: NVIDIA lists 360 PFLOPS sparse per
     # GB300 NVL72 rack and 36 PFLOPS sparse per HGX B300, the same as GB200 NVL72 and HGX B200.
