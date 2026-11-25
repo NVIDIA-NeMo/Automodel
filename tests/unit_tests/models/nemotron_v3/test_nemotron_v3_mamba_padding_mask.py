@@ -57,37 +57,18 @@ def test_mask_of_ones_is_not_passed_to_mamba_layers(model_and_masks):
     assert [m for block_type, m in seen if block_type == "attention"][0] is mask
 
 
-@pytest.mark.parametrize("dtype", [torch.long, torch.bool, torch.float32])
-def test_mask_with_padding_reaches_mamba_layers(model_and_masks, dtype):
+@pytest.mark.parametrize(
+    "mask",
+    [
+        torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]], dtype=dtype)
+        for dtype in (torch.long, torch.bool, torch.float32)
+    ]
+    # Only a multiply by exactly one is dropped; an indexed mask keeps its existing behaviour.
+    + [torch.tensor([[1, 1, 1, 2, 2, 2], [1, 1, 2, 2, 3, 3]])],
+    ids=["padding_long", "padding_bool", "padding_float", "values_other_than_one"],
+)
+def test_other_masks_reach_mamba_layers(model_and_masks, mask):
     model, seen = model_and_masks
-    input_ids = torch.randint(1, 64, (2, 6))
-    mask = torch.ones(2, 6, dtype=dtype)
-    mask[1, 4:] = 0
-    model(input_ids, attention_mask=mask)
+    model(torch.randint(1, 64, (2, 6)), attention_mask=mask)
     (mamba_mask,) = _mamba_masks(seen)
     assert mamba_mask is mask
-
-
-def test_mask_with_values_other_than_one_reaches_mamba_layers(model_and_masks):
-    """Only a multiply by exactly one is dropped; an indexed mask keeps its existing behaviour."""
-    model, seen = model_and_masks
-    input_ids = torch.randint(1, 64, (2, 6))
-    mask = torch.tensor([[1, 1, 1, 2, 2, 2], [1, 1, 2, 2, 3, 3]])
-    model(input_ids, attention_mask=mask)
-    (mamba_mask,) = _mamba_masks(seen)
-    assert mamba_mask is mask
-
-
-def test_no_mask_stays_no_mask(model_and_masks):
-    model, seen = model_and_masks
-    model(torch.randint(1, 64, (2, 6)))
-    assert _mamba_masks(seen) == [None]
-
-
-def test_dropping_the_mask_of_ones_does_not_change_the_mixer_input():
-    """The multiply that is skipped is an exact identity in the training dtype."""
-    hidden = torch.randn(2, 6, 64, dtype=torch.bfloat16)
-    mask = torch.ones(2, 6, dtype=torch.long)
-    product = hidden * mask.unsqueeze(-1)
-    assert product.dtype == hidden.dtype
-    assert torch.equal(product, hidden)

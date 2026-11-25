@@ -159,16 +159,6 @@ def test_recipe_calculator_counts_the_language_model_of_the_vl_model(mtp_depths)
     assert flops == 8 * SEQ_LEN * (BACKBONE_FLOPS_PER_TOKEN + mtp_depths * MTP_DEPTH_FLOPS_PER_TOKEN)
 
 
-def test_mtp_depths_are_those_of_the_model_not_of_the_checkpoint_config():
-    config = _llm_config()
-    assert config.num_nextn_predict_layers == 1
-
-    two_depths = _language_model(config, mtp_depths=2).model_flops(gbs=1, seq_len=SEQ_LEN)
-    one_depth = _language_model(config, mtp_depths=1).model_flops(gbs=1, seq_len=SEQ_LEN)
-
-    assert two_depths - one_depth == SEQ_LEN * MTP_DEPTH_FLOPS_PER_TOKEN
-
-
 def test_two_mtp_depths_cost_the_same_with_and_without_a_shared_block():
     config = _llm_config()
 

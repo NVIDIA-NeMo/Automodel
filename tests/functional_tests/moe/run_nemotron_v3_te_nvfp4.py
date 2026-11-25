@@ -15,33 +15,19 @@
 
 r"""NVFP4 precision map of a small Nemotron 3 model, checked against Transformer Engine's own state.
 
-The model, the expert-parallel dispatcher, FSDP2, activation checkpointing and the ``te_nvfp4`` block are built
-by the training recipe from ``nemotron_v3_te_nvfp4_proxy.yaml``. Three passes run on identical tokens:
+The training recipe builds the model from ``nemotron_v3_te_nvfp4_proxy.yaml``. On identical tokens it runs
+(1) a forward without autocast, twice (high-precision reference and its repeatability), (2) forward and backward
+under the recipe's autocast, (3) the recipe's own training loop. A forward hook on every TE ``Linear`` /
+``GroupedLinear`` reads whether TE quantized the module and with which recipe; the expected precision is derived
+here from the layer pattern, not from the code under test. Before that, the two ranks compare their randomly
+initialized weights, which must differ (a weight drawn on a local shard comes out equal on both ranks).
 
-1. Forward without a Transformer Engine autocast (twice): the high-precision reference and its repeatability.
-2. Forward and backward under the recipe's autocast, as the train step runs them.
-3. The recipe's own training loop for the configured steps.
-
-A forward hook on every Transformer Engine ``Linear`` / ``GroupedLinear`` reads, right after the module ran,
-whether Transformer Engine had quantization enabled for it (``module.fp8``) and the recipe it stored for it
-(``module.fp8_meta["recipe"]``). The expected precision of each module is derived here from the layer pattern
-and from the constants below, not from the code under test. Passes 2 and 3 must match it for every module, and
-pass 1 must show every module in high precision, so a map that quantizes the wrong modules, or none, fails.
-
-Before the passes, the two ranks compare the weights they drew at random initialization: the shards of the
-FSDP-managed projections and each rank's own routed experts must differ between the ranks. Ranks hold one
-random state once a sharded tensor has been drawn, so a weight drawn on a rank's local tensor comes out equal
-on both and fails here.
-
-Scope: a small randomly initialized model on mock tokens. This checks which kernels run, that loss and
-gradients are finite, and that the quantized forward stays close to the high-precision one. It is no evidence
-of convergence.
+Scope: which kernels run, finite loss and gradients, quantized logits close to high precision. No convergence evidence.
 
 Usage::
 
     torchrun --nproc_per_node=2 tests/functional_tests/moe/run_nemotron_v3_te_nvfp4.py \
-        --config tests/functional_tests/moe/nemotron_v3_te_nvfp4_proxy.yaml \
-        --checkpoint.checkpoint_dir <dir>
+        --config tests/functional_tests/moe/nemotron_v3_te_nvfp4_proxy.yaml --checkpoint.checkpoint_dir <dir>
 """
 
 from __future__ import annotations
@@ -224,12 +210,6 @@ def check_random_initialization_differs_between_ranks(model: torch.nn.Module) ->
     Mamba, attention, latent and shared-expert projections and the router (one FSDP shard per rank), the Mamba
     convolution, and the routed experts (each rank holds its own half of them). The leading values of each
     rank's local tensor are exchanged and must not be equal.
-
-    Args:
-        model: The model after the recipe built, sharded and initialized it.
-
-    Returns:
-        Number of weights compared.
     """
     from torch.distributed.tensor import DTensor
 
@@ -276,7 +256,7 @@ def main() -> None:
     # Pass 1: no Transformer Engine autocast. Nothing may run quantized, MXFP8 modules included.
     with torch.no_grad():
         reference = model(input_ids=input_ids).logits.float()
-        counts_reference = check_executed(record, names, quantized=False, what="high-precision pass")
+        check_executed(record, names, quantized=False, what="high-precision pass")
         assert not record.raw_splits, "experts padded their tokens without a quantized recipe"
         repeat = model(input_ids=input_ids).logits.float()
     repeat_error = float((repeat - reference).norm() / reference.norm())
@@ -322,13 +302,7 @@ def main() -> None:
     result = {
         "rank": rank,
         "modules_by_precision": counts,
-        "modules_high_precision_pass": counts_reference,
         "padded_expert_groups": padded_groups,
-        "reference_loss": reference_loss,
-        "quantized_loss": float(loss),
-        "loss_relative_error": loss_error,
-        "logits_relative_error": logits_error,
-        "repeat_relative_error": repeat_error,
         "weights_that_differ_between_ranks": compared_weights,
     }
     if rank == 0:
@@ -337,8 +311,6 @@ def main() -> None:
         assert len(steps) == cfg.step_scheduler.max_steps, len(steps)
         for step in steps:
             assert math.isfinite(step["loss"]) and math.isfinite(step["grad_norm"]) and step["grad_norm"] > 0, step
-        result["training_loop_loss"] = [step["loss"] for step in steps]
-        result["training_loop_grad_norm"] = [step["grad_norm"] for step in steps]
     # With a learned gate the token groups are not aligned by themselves; a rank that padded none proves nothing.
     assert padded_groups > 0, "no expert token group needed padding"
     print("NVFP4_PRECISION_RESULT " + json.dumps(result), flush=True)

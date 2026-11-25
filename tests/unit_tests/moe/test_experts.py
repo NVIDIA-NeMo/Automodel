@@ -2694,41 +2694,16 @@ class _CountingDispatcher:
     def token_permutation2(
         self, hidden_states: torch.Tensor, token_probs: torch.Tensor, **kwargs: int | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pass the rows through as if every one were dispatched to this rank.
-
-        Args:
-            hidden_states: Tensor of shape [rows, hidden].
-            token_probs: Tensor of shape [rows, top_k].
-            **kwargs: Routing arguments of the real dispatcher (row count, [rows, top_k] expert indices); unused.
-
-        Returns:
-            ``hidden_states`` itself, the int32 counts of shape [local_experts], and the first routing
-            probability of every row, of shape [rows].
-        """
+        """Pass the rows through as if every one were dispatched to this rank."""
         return hidden_states, self.counts, token_probs[:, 0]
 
     def token_unpermutation(self, values: torch.Tensor) -> torch.Tensor:
-        """Return the expert outputs unchanged.
-
-        Args:
-            values: Tensor of shape [rows, hidden].
-
-        Returns:
-            ``values`` itself.
-        """
+        """Return the expert outputs unchanged."""
         return values
 
 
 def _gate_half_times_probs(values: torch.Tensor, probabilities: torch.Tensor) -> torch.Tensor:
-    """Expert activation stand-in: the gate half of the projection, scaled by the routing probability.
-
-    Args:
-        values: Tensor of shape [rows, 2 * inter_dim], the gate half first.
-        probabilities: Tensor of shape [rows, 1].
-
-    Returns:
-        Tensor of shape [rows, inter_dim].
-    """
+    """Expert activation stand-in: the gate half of the projection, scaled by the routing probability."""
     return values.chunk(2, -1)[0] * probabilities
 
 
@@ -2747,13 +2722,7 @@ def _native_te_experts(moe_config: MoEConfig, counts: list[int]) -> tuple[Groupe
     seen: list[torch.Tensor] = []
 
     def record_splits(module: torch.nn.Module, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-        """Keep the split sizes of one grouped GEMM call.
-
-        Args:
-            module: The grouped linear being called.
-            inputs: Its positional arguments: rows of shape [rows, features] and split sizes of shape
-                [local_experts].
-        """
+        """Keep the split sizes of one grouped GEMM call."""
         seen.append(inputs[1])
 
     for layer in (experts.gate_up_linear, experts.down_linear):
@@ -2793,12 +2762,7 @@ def test_te_grouped_tensor_keeps_host_split_sizes_under_a_quantization_recipe(mo
     padded: list[list[int]] = []
 
     def record_padding(module: torch.nn.Module, inputs: tuple[torch.Tensor, list[int]]) -> None:
-        """Keep the split sizes of one padding call.
-
-        Args:
-            module: The padding module being called.
-            inputs: Its positional arguments: rows of shape [rows, features] and the host list of split sizes.
-        """
+        """Keep the split sizes of one padding call."""
         padded.append(inputs[1])
 
     experts.native_fp8_padding.register_forward_pre_hook(record_padding)
@@ -3376,11 +3340,7 @@ class TestGroupedExpertsTE:
         from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
         def rank_weights(ep_rank: int) -> tuple[list[torch.Tensor], torch.Tensor]:
-            """Weights of the experts of one of two expert-parallel ranks, and the generator state afterwards.
-
-            Returns:
-                One tensor of shape [out_features, in_features] per expert weight, and the CUDA generator state.
-            """
+            """Weights of the experts of one of two expert-parallel ranks, and the generator state afterwards."""
             experts = GroupedExpertsTE(te_moe_config)
             mock_mesh = Mock()
             mock_mesh.size.return_value = 2

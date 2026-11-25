@@ -109,17 +109,7 @@ class _FakeGroupedLinear(torch.nn.Module):
         is_first_microbatch: bool | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Multiply the rows of every expert with its weight.
-
-        Args:
-            values: Rows of shape [rows, in_features], grouped by expert.
-            splits: Rows per expert: a tensor for the grouped-tensor GEMMs, a list for one GEMM per expert.
-            is_first_microbatch: The weight-cache flag the caller passes, ``None`` when it passes none.
-            out: Buffer of shape [rows, out_features] for the result, or ``None``.
-
-        Returns:
-            Tensor of shape [rows, out_features]; ``out`` holds the same values when it is given.
-        """
+        """Multiply the rows of every expert with its weight."""
         # Transformer Engine takes device split sizes on the grouped-tensor path and host ones otherwise.
         assert isinstance(splits, torch.Tensor) == self.use_grouped_tensor
         counts = splits.tolist() if isinstance(splits, torch.Tensor) else list(splits)
@@ -151,15 +141,7 @@ class _Padding(torch.nn.Module):
         self.align_size = 1 if align_size is None else align_size
 
     def forward(self, values: torch.Tensor, splits: list[int]) -> tuple[torch.Tensor, list[int]]:
-        """Return the rows and their split sizes unchanged.
-
-        Args:
-            values: Rows of shape [rows, features], grouped by expert.
-            splits: Rows per expert.
-
-        Returns:
-            ``values``, aliasing the input, and ``splits``.
-        """
+        """Return the rows and their split sizes unchanged."""
         return values, splits
 
 
@@ -170,15 +152,7 @@ class _Unpadding(torch.nn.Module):
         super().__init__()
 
     def forward(self, values: torch.Tensor, splits: list[int]) -> torch.Tensor:
-        """Return the rows unchanged.
-
-        Args:
-            values: Rows of shape [rows, features], grouped by expert.
-            splits: Rows per expert before padding.
-
-        Returns:
-            ``values``, aliasing the input.
-        """
+        """Return the rows unchanged."""
         return values
 
 
@@ -191,28 +165,11 @@ class _GroupedInputDispatcher:
     def token_permutation2(
         self, hidden_states: torch.Tensor, num_local_tokens: int, token_probs: torch.Tensor, token_indices: torch.Tensor
     ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
-        """Return the inputs without communication or permutation.
-
-        Args:
-            hidden_states: Tensor of shape [rows, hidden], grouped by expert.
-            num_local_tokens: Number of input rows.
-            token_probs: Tensor of shape [rows, 1] with one route per row.
-            token_indices: Integer tensor of shape [rows, 1] with the expert of the route.
-
-        Returns:
-            Hidden states of shape [rows, hidden], rows per expert, and probabilities of shape [rows].
-        """
+        """Return the inputs without communication or permutation."""
         return hidden_states, self.counts, token_probs[:, 0]
 
     def token_unpermutation(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return expert-grouped outputs unchanged.
-
-        Args:
-            hidden_states: Tensor of shape [rows, hidden], grouped by expert.
-
-        Returns:
-            The same tensor, aliasing the input.
-        """
+        """Return expert-grouped outputs unchanged."""
         return hidden_states
 
 
@@ -279,17 +236,7 @@ def _set_recipe(state: Mock, kind: str | None) -> None:
 def _run(
     module: GroupedExpertsTE, hidden: torch.Tensor, probs: torch.Tensor, upstream: torch.Tensor
 ) -> dict[str, torch.Tensor | None]:
-    """Forward and backward of the experts on rows that are already grouped by expert.
-
-    Args:
-        module: Expert module on the stand-in ``GroupedLinear``; its recorded calls are cleared first.
-        hidden: Rows of shape [rows, EXPERT_DIM].
-        probs: Routing weights of shape [rows, 1].
-        upstream: Output gradient of shape [rows, EXPERT_DIM].
-
-    Returns:
-        Output, input gradient, probability gradient and the gradient of every parameter, by name.
-    """
+    """Forward and backward of the experts on rows that are already grouped by expert."""
     module.zero_grad(set_to_none=True)
     for layer in (module.gate_up_linear, module.down_linear):
         layer.calls.clear()
@@ -376,16 +323,7 @@ def test_chunk_plan_covers_every_row_in_order_within_the_limit():
 
 
 def _expected_calls(kind: str | None, native: bool, m_splits: list[int]) -> list[list[int]] | None:
-    """What a dispatch of the 32-expert rank needs, derived from its element count.
-
-    Args:
-        kind: Recipe kind, ``None`` without a recipe.
-        native: Whether the module is built for grouped-tensor GEMMs.
-        m_splits: Rows per expert; equal for all experts with rows.
-
-    Returns:
-        ``None`` when the dispatch runs as the module is built, else the rows per expert of every call.
-    """
+    """What a dispatch of the 32-expert rank needs, derived from its element count."""
     if kind is None:
         return None
     elements = sum(m_splits) * RANK_WIDTH

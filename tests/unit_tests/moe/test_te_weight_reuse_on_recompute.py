@@ -84,12 +84,7 @@ def _module(kind: ModuleKind) -> torch.nn.Module:
 
 
 def _count_weight_quantizations(kind: ModuleKind, monkeypatch: pytest.MonkeyPatch) -> list[bool]:
-    """Record, per weight handed to Transformer Engine's weight quantization, whether it was quantized.
-
-    Returns:
-        The list the calls append to: ``True`` for a quantization (no stored copy, or a refresh of it),
-        ``False`` for a reuse of the stored copy.
-    """
+    """Record, per weight handed to Transformer Engine's weight quantization, whether it was quantized."""
     import transformer_engine.pytorch.module.grouped_linear as grouped_linear_module
     import transformer_engine.pytorch.module.linear as linear_module
 
@@ -111,12 +106,7 @@ def _checkpointed_step(
     recipe_name: RecipeName,
     context_fn: ContextFn | None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-    """Forward and backward of ``module`` through a non-reentrant checkpoint, both inside the autocast.
-
-    Returns:
-        Output of shape ``[EXPERTS * ROWS, OUT_FEATURES]``, input gradient of shape
-        ``[EXPERTS * ROWS, IN_FEATURES]`` and one gradient of shape ``[OUT_FEATURES, IN_FEATURES]`` per weight.
-    """
+    """Forward and backward of ``module`` through a non-reentrant checkpoint, both inside the autocast."""
     from transformer_engine.pytorch.quantization import autocast as te_autocast
 
     generator = torch.Generator(device="cuda").manual_seed(1)

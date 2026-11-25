@@ -49,11 +49,7 @@ def test_relu2_mlp_keeps_the_eager_chain_on_cpu(monkeypatch):
     import nemo_automodel.components.moe.layers as layers
 
     def fail(up: torch.Tensor) -> torch.Tensor:
-        """Stand-in for the compiled island that must stay unused.
-
-        Args:
-            up: Tensor of shape [tokens, inter_dim].
-        """
+        """Stand-in for the compiled island that must stay unused."""
         raise AssertionError("the compiled ReLU-squared must not run for CPU inputs")
 
     monkeypatch.setattr(layers, "_relu2_act", fail)

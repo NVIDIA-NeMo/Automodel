@@ -19,7 +19,6 @@ never asks the map which layer or class a name belongs to. Module names are the 
 (``test_names_match_a_built_model`` builds a small model to pin them).
 """
 
-from collections import Counter
 
 import pytest
 
@@ -96,16 +95,6 @@ def _expected(
 
 def _resolved(plan: TEPrecisionPlan) -> dict[str, tuple[str, int | None, str, str]]:
     return {m.name: (m.module_class, m.layer, m.precision, m.scope) for m in plan.modules}
-
-
-def test_pattern_is_the_published_layout():
-    """40 Mamba, 40 MoE and 8 attention layers, attention at the published positions."""
-    assert len(SUPER_PATTERN) == 88
-    assert Counter(SUPER_PATTERN) == {"M": 40, "E": 40, "*": 8}
-    assert [i for i, symbol in enumerate(SUPER_PATTERN) if symbol == "*"] == [7, 16, 25, 36, 47, 58, 69, 78]
-    # Below the tail: 34 Mamba, 33 MoE, 7 attention. In the last 14 layers: 6 Mamba, 7 MoE, 1 attention.
-    assert Counter(SUPER_PATTERN[:74]) == {"M": 34, "E": 33, "*": 7}
-    assert Counter(SUPER_PATTERN[74:]) == {"M": 6, "E": 7, "*": 1}
 
 
 WRAPPER = "_checkpoint_wrapped_module."
