@@ -294,11 +294,13 @@ class HY4FlashCompressedIndexer(nn.Module):
             visible = (first_query_slot + end - 1) // self.kpool
             if visible == 0:
                 continue
-            scores = torch.matmul(query[start:end].float().flatten(0, 1), keys[:visible].T).relu_()
+            # Out of place on purpose: selective activation checkpointing caches matmul / bmm results, and a cached
+            # tensor must not be mutated.
+            scores = torch.matmul(query[start:end].float().flatten(0, 1), keys[:visible].T).relu()
             logits = torch.bmm(head_weights[start:end, None], scores.view(end - start, self.n_heads, visible))[:, 0]
             group = torch.arange(visible, device=device)
             closed = group < own_group[start:end, None]
-            logits.masked_fill_(~closed, float("-inf"))
+            logits = logits.masked_fill(~closed, float("-inf"))
             # Top-k with a total order (score, then lowest group first), so the chosen set does not depend on how
             # the queries are chunked or split over context-parallel ranks: everything above the k-th score, then
             # the lowest-index groups tied with it. ``torch.topk`` alone leaves the order of ties unspecified, and

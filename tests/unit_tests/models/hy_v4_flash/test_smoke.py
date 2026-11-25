@@ -56,3 +56,48 @@ def test_moe_only_activation_checkpointing_wraps_the_moe_and_trains():
         assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
         losses.append(out.loss.detach())
     assert torch.equal(losses[0], losses[1])
+
+
+def test_selective_activation_checkpointing_trains_like_the_plain_model():
+    """Selective checkpointing caches matmul / bmm results, so the model must not mutate one in place.
+
+    The indexer's score block is such a result. The documents are longer than ``index_topk`` and the scores are
+    computed in several chunks, so the sparse selection runs under the wrapper.
+    """
+    from nemo_automodel.components.moe.parallelizer import apply_ac
+
+    ids = torch.randint(3, 280, (2, 40), generator=torch.Generator().manual_seed(1))
+    results = []
+    for wrap in (False, True):
+        torch.manual_seed(0)
+        model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
+        indexers = [m.self_attn.compressed_indexer for m in model.model.layers if m.self_attn.compressed_indexer]
+        chunked_calls = []
+        for indexer in indexers:
+            indexer.query_chunk = 5
+            original = indexer.select
+
+            def select(q_resid, *args, original=original):
+                chunked_calls.append(q_resid.shape[0] > 5)
+                return original(q_resid, *args)
+
+            indexer.select = select
+        assert ids.shape[1] > model.config.text_config.index_topk
+        if wrap:
+            apply_ac(model, selective=True)
+        torch.manual_seed(0)
+        model.initialize_weights(dtype=torch.float32)
+        model.train()
+        out = model(ids, labels=ids)
+        out.loss.backward()
+        assert chunked_calls and all(chunked_calls)
+        results.append(
+            (out.loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None})
+        )
+    (plain_loss, plain_grads), (wrapped_loss, wrapped_grads) = results
+    assert torch.equal(plain_loss, wrapped_loss)
+    assert plain_grads.keys() == wrapped_grads.keys() and len(plain_grads) > 0
+    for name, grad in plain_grads.items():
+        torch.testing.assert_close(
+            wrapped_grads[name], grad, rtol=1e-5, atol=1e-7, msg=lambda m, name=name: f"{name}: {m}"
+        )
