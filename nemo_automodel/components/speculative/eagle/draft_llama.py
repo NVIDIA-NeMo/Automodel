@@ -375,7 +375,25 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         cache_hidden: list[list[torch.Tensor]],
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
+        *,
+        position_offset: int | None = None,
     ) -> torch.Tensor:
+        """Project an EAGLE step and attend over its causal and diagonal blocks.
+
+        Args:
+            combined_states: Tensor of shape [batch, sequence, projection_input].
+            attention_mask: Additive Block-1 mask of shape [batch, 1, sequence, sequence].
+            position_ids: RoPE indices of shape [batch, sequence].
+            cache_hidden: Key and value lists of prior [batch, heads, sequence, head_dim]
+                blocks. Flash/CP blocks use [batch, sequence, heads, head_dim].
+                This call appends the new block.
+            cu_seqlens: Cumulative packed offsets of shape [num_documents + 1].
+            max_seqlen: Longest packed document.
+            position_offset: RoPE offset. Defaults to the prior cache length for TTT.
+
+        Returns:
+            Attention output of shape [batch, sequence, hidden].
+        """
         batch_size, seq_len, _ = combined_states.shape
         q, k, v = self._project_qkv(combined_states)
 
@@ -389,7 +407,9 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         cache_k, cache_v = cache_hidden
         step_idx = len(cache_k)
 
-        cos, sin = self.rotary_emb(combined_states, position_ids + step_idx)
+        cos, sin = self.rotary_emb(
+            combined_states, position_ids + (step_idx if position_offset is None else position_offset)
+        )
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         k, v = self._repeat_kv(k, v)
         if self._cp_group is not None:
@@ -790,7 +810,25 @@ class Eagle3LlamaDecoderLayer(_PeagleDecoderLayerMixin, nn.Module):
         cache_hidden: list[list[torch.Tensor]],
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
+        *,
+        position_offset: int | None = None,
     ) -> torch.Tensor:
+        """Run the shared fused-embedding decoder layer.
+
+        Args:
+            input_embeds: Token or query embeddings of shape [batch, sequence, hidden].
+            hidden_states: Recurrent features of shape [batch, sequence, hidden].
+            attention_mask: Additive Block-1 mask of shape [batch, 1, sequence, sequence].
+            position_ids: RoPE indices of shape [batch, sequence].
+            cache_hidden: Keys and values grouped by step, with native attention
+                cache layout. The attention appends this step's projected block.
+            cu_seqlens: Cumulative packed offsets of shape [num_documents + 1].
+            max_seqlen: Longest packed document.
+            position_offset: RoPE offset. Defaults to the prior cache length for TTT.
+
+        Returns:
+            Updated features of shape [batch, sequence, hidden].
+        """
         residual = hidden_states
         norm_input_embeds = self.input_layernorm(input_embeds)
         norm_hidden_states = self.hidden_norm(hidden_states)
@@ -802,6 +840,7 @@ class Eagle3LlamaDecoderLayer(_PeagleDecoderLayerMixin, nn.Module):
             cache_hidden=cache_hidden,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            position_offset=position_offset,
         )
 
         residual = hidden_states
