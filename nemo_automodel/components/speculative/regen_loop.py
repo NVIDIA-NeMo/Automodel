@@ -48,8 +48,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, fields
-from typing import Any
+from dataclasses import asdict, dataclass
 
 from nemo_automodel.components.speculative.decode_eval import (
     _resolve_worker_port,
@@ -100,63 +99,6 @@ class RegenConfig:
     max_model_len: int | None = None
     trust_remote_code: bool = False
     timeout_s: float = 3600.0
-
-
-def resolve_regen_config(
-    recipe_cfg: Any,
-    *,
-    default_target: str,
-    default_input_data: str | None,
-    output_dir: str,
-) -> RegenConfig | None:
-    """Read the optional ``regen:`` block from ``recipe_args``.
-
-    Returns ``None`` when the block is absent or ``every_steps`` is unset/0
-    (feature disabled). Raises on a partially-configured block so a typo'd GPU
-    reservation fails at setup rather than silently regenerating on a training
-    GPU. Field defaults live on :class:`RegenConfig` only; the block just
-    overrides the fields it sets.
-    """
-    block = recipe_cfg.get("regen", None)
-    if block is None:
-        return None
-    every_steps = int(block.get("every_steps", 0) or 0)
-    if every_steps <= 0:
-        return None
-    block = block.to_dict() if hasattr(block, "to_dict") else dict(block)
-    unknown = set(block) - {field.name for field in fields(RegenConfig)}
-    if unknown:
-        raise ValueError(f"Unknown regen option(s): {', '.join(sorted(unknown))}")
-    if "output_dir" in block:
-        raise ValueError(
-            "regen.output_dir is not configurable: shards are always written under "
-            "<run output_dir>/regen. Remove it from the regen block."
-        )
-    cuda_visible_devices = block.get("cuda_visible_devices", None)
-    if cuda_visible_devices is None or str(cuda_visible_devices) == "":
-        raise ValueError(
-            "regen.cuda_visible_devices is required: the regeneration engine needs a GPU the training "
-            "job does not use (e.g. reserve one card and shrink the torchrun world accordingly)."
-        )
-    input_data = block.get("input_data", None) or default_input_data
-    if not input_data:
-        raise ValueError("regen.input_data is required when recipe_args.train_data_path is not set.")
-    required = {"every_steps", "cuda_visible_devices", "target_model", "input_data", "output_dir"}
-    overrides = {}
-    for field in fields(RegenConfig):
-        if field.name in required:
-            continue
-        value = block.get(field.name, None)
-        if value is not None:
-            overrides[field.name] = value
-    return RegenConfig(
-        every_steps=every_steps,
-        cuda_visible_devices=str(cuda_visible_devices),
-        target_model=str(block.get("target_model", None) or default_target),
-        input_data=str(input_data),
-        output_dir=os.path.join(output_dir, "regen"),
-        **overrides,
-    )
 
 
 class RegenRunner:

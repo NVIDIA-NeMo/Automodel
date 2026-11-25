@@ -43,12 +43,11 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.recipes._dist_utils import (
     create_distributed_setup_from_config,
     shard_optimizers_for_megatron_fsdp,
 )
-from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes._typed_config import RecipeConfig, compile_config_from_node
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -124,7 +123,7 @@ def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
     if freeze_config is not None:
         kwargs["freeze_config"] = cfg.freeze_config
     if cfg.get("compile", None) is not None:
-        kwargs["compile_config"] = build_compile_config(cfg.compile)
+        kwargs["compile_config"] = compile_config_from_node(cfg.compile)
     return kwargs
 
 

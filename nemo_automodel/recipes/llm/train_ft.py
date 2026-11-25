@@ -103,7 +103,6 @@ from nemo_automodel.components.models.common.packing import (
     configure_packing_for_models,
     validate_thd_packing_support,
 )
-from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -116,9 +115,6 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
-from nemo_automodel.components.utils.compile_utils import (
-    build_compile_config,
-)
 from nemo_automodel.components.utils.model_utils import (
     FreezeConfig,
     _supports_logits_to_keep,
@@ -127,7 +123,12 @@ from nemo_automodel.components.utils.model_utils import (
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
-from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes._typed_config import (
+    RecipeConfig,
+    bnb_quantization_config_from_node,
+    compile_config_from_node,
+    fp8_config_from_node,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 
@@ -323,14 +324,12 @@ def build_model(
                     kwargs["qat_config"] = quantizer_attr.instantiate()
 
         if cfg_fp8 is not None:
-            kwargs["fp8_config"] = build_fp8_config(cfg_fp8)
+            kwargs["fp8_config"] = fp8_config_from_node(cfg_fp8)
         if cfg_compile is not None:
-            kwargs["compile_config"] = build_compile_config(cfg_compile)
+            kwargs["compile_config"] = compile_config_from_node(cfg_compile)
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
-            from nemo_automodel.components.quantization.qlora import create_bnb_config
-
-            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
+            kwargs["quantization_config"] = bnb_quantization_config_from_node(cfg_quantization).build()
 
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
@@ -562,7 +561,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # MagiAttention (FFA / context-parallel) backend, enabled via
         # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
-        self.magi = setup_magi(self.cfg, self.device_mesh)
+        self.magi = setup_magi(self.cfg.magi_backend, self.device_mesh)
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()

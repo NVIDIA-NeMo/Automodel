@@ -35,8 +35,8 @@ from nemo_automodel.components.speculative.regen_loop import (
     _regenerate_argv,
     _target_server_argv,
     main,
-    resolve_regen_config,
 )
+from nemo_automodel.recipes.speculative_decoding._spec_train_utils import resolve_regen_config
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -172,25 +172,19 @@ def test_resolve_fills_defaults_and_applies_overrides(tmp_path):
     assert resolved.output_dir == os.path.join(str(tmp_path / "run"), "regen")
 
 
-def test_resolve_accepts_block_with_to_dict(tmp_path):
-    class _Block:
-        def __init__(self, data):
-            self._data = data
+def test_resolve_accepts_the_recipe_config_node(tmp_path):
+    """The recipe passes its ``recipe_args`` ConfigNode; the nested ``regen`` node is read like a mapping."""
+    from nemo_automodel.components.config.loader import ConfigNode
 
-        def get(self, key, default=None):
-            return self._data.get(key, default)
-
-        def to_dict(self):
-            return dict(self._data)
-
-    block = _Block({"every_steps": 10, "cuda_visible_devices": "7", "input_data": "/d"})
+    recipe_args = ConfigNode({"regen": {"every_steps": 10, "cuda_visible_devices": "7", "input_data": "/d"}})
     resolved = resolve_regen_config(
-        {"regen": block},
+        recipe_args,
         default_target="/t",
         default_input_data=None,
         output_dir=str(tmp_path),
     )
     assert resolved is not None and resolved.input_data == "/d"
+    assert resolved.cuda_visible_devices == "7"
 
 
 # --------------------------------------------------------------------------- #

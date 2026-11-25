@@ -68,46 +68,27 @@ def _clean_sys_modules():
             del sys.modules[name]
 
 
-def test_build_comet_creates_experiment_with_config(monkeypatch):
-    calls = _install_fake_comet_ml()
-
+def _rank_zero(monkeypatch):
     import torch.distributed as dist
 
     monkeypatch.setattr(dist, "is_initialized", lambda: True, raising=False)
     monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
 
-    from nemo_automodel.components.loggers.comet_utils import build_comet
 
-    class CometCfg:
-        def __init__(self):
-            self._data = {
-                "project_name": "test-project",
-                "workspace": "test-workspace",
-                "experiment_name": "test-run",
-                "api_key": None,
-                "tags": ["finetune", "llama"],
-                "auto_metric_logging": False,
-            }
+def test_comet_config_build_creates_experiment(monkeypatch):
+    calls = _install_fake_comet_ml()
+    _rank_zero(monkeypatch)
 
-        def get(self, key, default=None):
-            return self._data.get(key, default)
+    from nemo_automodel.components.loggers.loggers import CometConfig
 
-    class ModelCfg:
-        pretrained_model_name_or_path = "org/my-model"
-
-    class Cfg:
-        def __init__(self):
-            self.comet = CometCfg()
-            self.model = ModelCfg()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-        def to_dict(self):
-            return {"model": "org/my-model"}
-
-    cfg = Cfg()
-    logger = build_comet(cfg)
+    config = CometConfig(
+        project_name="test-project",
+        workspace="test-workspace",
+        experiment_name="test-run",
+        tags=["finetune", "llama"],
+        auto_metric_logging=False,
+    )
+    logger = config.build(model_name="org/my-model")
     assert logger is not None
 
     assert calls["experiment_init"], "comet_ml.Experiment should have been called"
@@ -122,84 +103,39 @@ def test_build_comet_creates_experiment_with_config(monkeypatch):
     assert "finetune" in tags
     assert "llama" in tags
     assert "model:org/my-model" in tags
+    # build() leaves the config untouched.
+    assert config.tags == ["finetune", "llama"]
 
 
-def test_build_comet_auto_generates_experiment_name(monkeypatch):
+def test_comet_config_build_derives_experiment_name_from_model(monkeypatch):
     calls = _install_fake_comet_ml()
+    _rank_zero(monkeypatch)
 
-    import torch.distributed as dist
+    from nemo_automodel.components.loggers.loggers import CometConfig
 
-    monkeypatch.setattr(dist, "is_initialized", lambda: True, raising=False)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
-
-    from nemo_automodel.components.loggers.comet_utils import build_comet
-
-    class CometCfg:
-        def __init__(self):
-            self._data = {"project_name": "test-project"}
-
-        def get(self, key, default=None):
-            return self._data.get(key, default)
-
-    class ModelCfg:
-        pretrained_model_name_or_path = "org/my-model"
-
-    class Cfg:
-        def __init__(self):
-            self.comet = CometCfg()
-            self.model = ModelCfg()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    build_comet(Cfg())
+    CometConfig(project_name="test-project").build(model_name="org/my-model")
     assert calls["set_name"] == ["org_my-model"]
 
 
-def test_build_comet_raises_without_project_name(monkeypatch):
-    _install_fake_comet_ml()
-
-    import torch.distributed as dist
-
-    monkeypatch.setattr(dist, "is_initialized", lambda: True, raising=False)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
+def test_build_comet_is_deprecated_and_delegates_to_comet_config(monkeypatch):
+    calls = _install_fake_comet_ml()
+    _rank_zero(monkeypatch)
 
     from nemo_automodel.components.loggers.comet_utils import build_comet
 
     class CometCfg:
-        def __init__(self):
-            self._data = {"workspace": "test"}
-
         def get(self, key, default=None):
-            return self._data.get(key, default)
+            return {"project_name": "test-project"}.get(key, default)
 
     class Cfg:
-        def __init__(self):
-            self.comet = CometCfg()
+        comet = CometCfg()
 
         def get(self, key, default=None):
             return getattr(self, key, default)
 
-    with pytest.raises(ValueError, match="comet.project_name is required"):
+    with pytest.warns(FutureWarning, match="CometConfig.build"):
         build_comet(Cfg())
-
-
-def test_build_comet_raises_without_config(monkeypatch):
-    _install_fake_comet_ml()
-
-    import torch.distributed as dist
-
-    monkeypatch.setattr(dist, "is_initialized", lambda: True, raising=False)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
-
-    from nemo_automodel.components.loggers.comet_utils import build_comet
-
-    class Cfg:
-        def get(self, key, default=None):
-            return default
-
-    with pytest.raises(ValueError, match="Comet configuration not found"):
-        build_comet(Cfg())
+    assert calls["experiment_init"][-1]["project_name"] == "test-project"
 
 
 def test_log_params_delegates_to_experiment(monkeypatch):

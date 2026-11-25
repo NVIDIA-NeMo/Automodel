@@ -24,6 +24,7 @@ in each recipe.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import pathlib
@@ -42,7 +43,8 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
-from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.loggers.loggers import WandbConfig
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     make_warmup_cosine_schedule,
@@ -148,8 +150,11 @@ class SpecDecodeRecipeBase(BaseRecipe):
         wandb_kwargs = resolve_wandb_kwargs(wandb_cfg.to_dict())
         if wandb_kwargs is None:
             return
+        wandb_config = WandbConfig.from_kwargs(**wandb_kwargs)
+        if not wandb_config.name:
+            wandb_config = dataclasses.replace(wandb_config, name=default_name)
         suppress_wandb_log_messages()
-        self.wandb_run = init_wandb_run(wandb_kwargs, self.cfg.to_dict(), default_name=default_name)
+        self.wandb_run = wandb_config.build(run_config=self.cfg.to_dict())
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the draft checkpointer using the same plumbing as the standard recipes."""

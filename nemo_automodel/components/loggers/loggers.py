@@ -194,7 +194,7 @@ class WandbConfig:
             raise TypeError(f"wandb.swanlab must be a mapping of SwanLab options, got {swanlab!r}")
         return cls(**direct, extra=extra)
 
-    def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Any:
+    def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Run:
         """Initialise WandB and return the run.
 
         Args:

@@ -53,7 +53,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
-from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
+from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
@@ -72,7 +72,7 @@ from nemo_automodel.components.speculative.eagle.parallel_reconsideration import
 from nemo_automodel.components.speculative.eagle.registry import DraftSpec, resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.speculative.eagle.target import default_eagle3_aux_layer_ids
-from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolve_regen_config
+from nemo_automodel.components.speculative.regen_loop import RegenRunner
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -84,6 +84,8 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     apply_draft_fp8,
     packing_kwargs,
     read_load_metadata_with_gloo,
+    resolve_decode_eval_config,
+    resolve_regen_config,
     should_sync_grads,
     submesh_or_none,
 )

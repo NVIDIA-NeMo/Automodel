@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Protocol, TypeAlias, TypedDict
+from typing import Any, Dict, TypeAlias, TypedDict
 
 import torch
 import torch.nn as nn
@@ -26,12 +27,6 @@ logger = logging.getLogger(__name__)
 
 # Inductor option values, as typed by ``torch.compile(options=...)`` for options set from config.
 CompileOptionValue: TypeAlias = str | int | bool
-
-
-class _ConfigNodeOptions(Protocol):
-    """YAML-backed options container, such as a ``ConfigNode``; its values are validated before use."""
-
-    def to_dict(self) -> Mapping[str, object]: ...
 
 
 class _CompileKwargs(TypedDict, total=False):
@@ -52,7 +47,7 @@ class CompileConfig:
     fullgraph: bool = False
     dynamic: bool = False
     backend: str | None = None
-    options: Mapping[str, CompileOptionValue] | _ConfigNodeOptions = field(default_factory=dict)
+    options: Mapping[str, CompileOptionValue] = field(default_factory=dict)
     dynamo_cache_size_limit: int = 256
 
     def __init__(
@@ -62,7 +57,7 @@ class CompileConfig:
         fullgraph: bool = False,
         dynamic: bool = False,
         backend: str | None = None,
-        options: Mapping[str, CompileOptionValue] | _ConfigNodeOptions | None = None,
+        options: Mapping[str, CompileOptionValue] | None = None,
         dynamo_cache_size_limit: int = 256,
     ) -> None:
         self.enabled = enabled
@@ -70,7 +65,7 @@ class CompileConfig:
         self.fullgraph = fullgraph
         self.dynamic = dynamic
         self.backend = backend
-        self.options = options or {}
+        self.options = _validated_options(options) if options is not None else {}
         self.dynamo_cache_size_limit = dynamo_cache_size_limit
 
     def to_dict(self) -> Dict[str, Any]:
@@ -210,12 +205,17 @@ def apply_flash_attention_compile_fix() -> bool:
     return success
 
 
-def _compile_options(options: Mapping[str, CompileOptionValue] | _ConfigNodeOptions) -> dict[str, CompileOptionValue]:
-    """Return inductor options as a plain dict, validating the values of a YAML-backed container."""
-    if isinstance(options, Mapping):
-        return dict(options)
+def _validated_options(options: Mapping[str, CompileOptionValue]) -> dict[str, CompileOptionValue]:
+    """Copy inductor options, rejecting values that ``torch.compile(options=...)`` cannot take from a config.
+
+    The options usually come from YAML, whose values nothing has checked against
+    :data:`CompileOptionValue` yet; the recipe converts its ``compile.options`` block to a
+    plain mapping before building the config.
+    """
+    if not isinstance(options, Mapping):
+        raise TypeError(f"CompileConfig.options must be a mapping, got {type(options).__name__}")
     validated: dict[str, CompileOptionValue] = {}
-    for key, value in options.to_dict().items():
+    for key, value in options.items():
         if not isinstance(value, (str, int, bool)):
             raise TypeError(f"CompileConfig.options[{key!r}] must be a str, int or bool, got {type(value).__name__}")
         validated[key] = value
@@ -234,7 +234,7 @@ def _resolve_compile_kwargs(config: CompileConfig) -> tuple[_CompileKwargs, dict
     Returns:
         The keyword arguments other than ``options``, and the options to pass when non-empty.
     """
-    options = _compile_options(config.options)
+    options = dict(config.options)
     compile_kwargs: _CompileKwargs = {
         "fullgraph": config.fullgraph,
         "dynamic": config.dynamic,
@@ -317,15 +317,7 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
         return model
 
 
-def create_compile_config_from_dict(config_dict: Dict[str, Any]) -> CompileConfig:
-    """Create a CompileConfig from a dictionary.
-
-    Args:
-        config_dict: Dictionary containing compile configuration.
-
-    Returns:
-        CompileConfig instance.
-    """
+def _compile_config_from_mapping(config_dict: Mapping[str, Any]) -> CompileConfig:
     return CompileConfig(
         enabled=config_dict.get("enabled", False),
         mode=config_dict.get("mode", "default"),
@@ -337,19 +329,50 @@ def create_compile_config_from_dict(config_dict: Dict[str, Any]) -> CompileConfi
     )
 
 
-def build_compile_config(cfg: Dict[str, Any] | None) -> CompileConfig:
-    """Build a compile config from configuration.
+def create_compile_config_from_dict(config_dict: Mapping[str, Any]) -> CompileConfig:
+    """Deprecated: construct :class:`CompileConfig` directly instead.
+
+    Recipes build the typed config from their ``compile:`` block at the recipe
+    boundary (``nemo_automodel.recipes._typed_config.compile_config_from_node``).
+    This helper reads a raw ``compile:`` mapping inside the component and will be
+    removed.
 
     Args:
-        cfg: Configuration dictionary for compilation.
+        config_dict: Dictionary containing compile configuration.
 
     Returns:
         CompileConfig instance.
     """
+    warnings.warn(
+        "create_compile_config_from_dict is deprecated; construct CompileConfig(...) directly",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return _compile_config_from_mapping(config_dict)
+
+
+def build_compile_config(cfg: Mapping[str, Any] | None) -> CompileConfig:
+    """Deprecated: construct :class:`CompileConfig` directly instead.
+
+    Recipes build the typed config from their ``compile:`` block at the recipe
+    boundary (``nemo_automodel.recipes._typed_config.compile_config_from_node``).
+    This helper reads a raw ``compile:`` mapping inside the component and will be
+    removed.
+
+    Args:
+        cfg: Configuration dictionary for compilation; ``None`` returns a disabled config.
+
+    Returns:
+        CompileConfig instance.
+    """
+    warnings.warn(
+        "build_compile_config is deprecated; construct CompileConfig(...) directly",
+        FutureWarning,
+        stacklevel=2,
+    )
     if cfg is None:
         return CompileConfig(enabled=False)
-    else:
-        return create_compile_config_from_dict(cfg)
+    return _compile_config_from_mapping(cfg)
 
 
 # Apply Flash Attention fix when module is imported (dynamo config happens per-compilation)

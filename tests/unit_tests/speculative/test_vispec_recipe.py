@@ -436,6 +436,13 @@ class _StubConfigNode(dict):
             raise AttributeError(name) from exc
 
 
+class _StubDatasetNode(_StubConfigNode):
+    """``dataset:`` stand-in; the recipe instantiates it before building the dataloader."""
+
+    def instantiate(self):
+        return []
+
+
 class _FakeDistributedDataParallel(nn.Module):
     """Minimal DDP stand-in that preserves parameter discovery in setup tests."""
 
@@ -488,7 +495,7 @@ def _patch_setup_dependencies(monkeypatch, tmp_path, dataloader_batches=2):
             rank_loss_weight=0.25,
         ),
         optimizer=_StubConfigNode(lr=3.0e-6),
-        dataset=_StubConfigNode(),
+        dataset=_StubDatasetNode(),
     )
 
 

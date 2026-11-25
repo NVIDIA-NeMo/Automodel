@@ -8,6 +8,7 @@ from .fp8 import (
 )
 from .qlora import (
     HAS_BNB,
+    BnbQuantizationConfig,
     create_bnb_config,
     verify_qlora_quantization,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "HAVE_TORCHAO",
     "FP8Config",
     "HAS_BNB",
+    "BnbQuantizationConfig",
     "create_bnb_config",
     "verify_qlora_quantization",
 ]

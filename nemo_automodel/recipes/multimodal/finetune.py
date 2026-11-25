@@ -54,10 +54,9 @@ _HAS_WANDB, wandb = safe_import(
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
-from nemo_automodel.components.loggers.loggers import TrackioConfig  # noqa: E402
+from nemo_automodel.components.loggers.loggers import TrackioConfig, WandbConfig  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
-from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages  # noqa: E402
-from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
 from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa: E402
     build_bagel_from_hf_backbones,
     initialize_bagel_non_backbone_weights,
@@ -67,7 +66,11 @@ from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noq
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
 from nemo_automodel.components.training.utils import clip_grad_norm  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
-from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
+from nemo_automodel.recipes._typed_config import (  # noqa: E402
+    RecipeConfig,
+    compile_config_from_node,
+    fp8_config_from_node,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
 
 try:
@@ -305,15 +308,16 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     ):
         """Build BAGEL from HF backbones and apply the configured infrastructure."""
         logger.info("Building BAGEL from HF backbones (artifact_source=%s, stage=%d)", artifact_path, stage)
-        backend_cfg = resolve_bagel_backend(self.cfg.get("model.backend", None))
+        typed_cfg = RecipeConfig(self.cfg)
+        backbones = typed_cfg.bagel_backbones
         with ScopedRNG(seed=rank_seed, ranked=False):
             model = build_bagel_from_hf_backbones(
-                model_cfg=self.cfg.model,
+                backbones=backbones,
                 stage=stage,
-                vae_config=self.cfg.get("model.vae_config", None),
+                vae_config=typed_cfg.bagel_vae_config,
                 meta_init=True,
                 load_backbone_weights=False,
-                backend=backend_cfg,
+                backend=typed_cfg.bagel_backend,
             )
             if freeze_before_infrastructure:
                 model.eval()
@@ -324,8 +328,6 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 apply_model_infrastructure,
                 instantiate_infrastructure,
             )
-            from nemo_automodel.components.quantization.fp8 import build_fp8_config
-            from nemo_automodel.components.utils.compile_utils import build_compile_config
 
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 distributed_config=self.distributed_config,
@@ -335,9 +337,9 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 device=self.dist_env.device,
                 mesh=self.mesh_context,
             )
-            fp8_config = build_fp8_config(self.cfg.fp8) if self.cfg.get("fp8", None) is not None else None
+            fp8_config = fp8_config_from_node(self.cfg.fp8) if self.cfg.get("fp8", None) is not None else None
             compile_config = (
-                build_compile_config(self.cfg.compile) if self.cfg.get("compile", None) is not None else None
+                compile_config_from_node(self.cfg.compile) if self.cfg.get("compile", None) is not None else None
             )
             freeze_cfg = self.cfg.get("freeze_config", None)
             model = apply_model_infrastructure(
@@ -356,7 +358,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 freeze_config=freeze_cfg.to_dict() if freeze_cfg is not None else None,
             )
             initialize_bagel_non_backbone_weights(model, seed=init_seed)
-            load_bagel_hf_backbone_weights(model, self.cfg.model)
+            load_bagel_hf_backbone_weights(model, backbones)
         return model
 
     def _use_sharded_model_ema(self, *, ema_impl: str, model_init_mode: str) -> bool:
@@ -995,11 +997,10 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        # default name: model basename.
+        # An unnamed run is named after the model basename (WandbConfig.build derives it from model_name).
         mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
-        return init_wandb_run(
-            self.cfg.wandb.to_dict(), self.cfg.to_dict(), default_name="_".join(str(mp).split("/")[-2:])
-        )
+        wandb_config = WandbConfig.from_kwargs(**self.cfg.wandb.to_dict())
+        return wandb_config.build(run_config=self.cfg.to_dict(), model_name=str(mp))
 
     def log_train_metrics(self, log_data) -> None:
         if not self.dist_env.is_main:

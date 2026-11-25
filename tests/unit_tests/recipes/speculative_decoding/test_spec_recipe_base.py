@@ -459,9 +459,9 @@ def _wandb_recipe(monkeypatch, *, is_main=True, wandb_block=None):
     calls = []
     monkeypatch.setattr(_spec_recipe_base, "suppress_wandb_log_messages", lambda: calls.append("suppress"))
     monkeypatch.setattr(
-        _spec_recipe_base,
-        "init_wandb_run",
-        lambda wandb_kwargs, cfg_dict, default_name: calls.append((wandb_kwargs, cfg_dict, default_name)) or "RUN",
+        _spec_recipe_base.WandbConfig,
+        "build",
+        lambda self, run_config=None, model_name=None: calls.append((self, run_config)) or "RUN",
     )
     obj = _Recipe.__new__(_Recipe)
     obj.dist_env = SimpleNamespace(is_main=is_main)
@@ -488,7 +488,18 @@ def test_init_wandb_run_strips_enable_and_starts_on_main(monkeypatch):
     obj, calls = _wandb_recipe(monkeypatch, wandb_block={"enable": True, "project": "p", "group": "g"})
     obj._init_wandb_run("dspark_run")
     assert obj.wandb_run == "RUN"
-    assert calls == ["suppress", ({"project": "p", "group": "g"}, {"lr": 1e-4}, "dspark_run")]
+    assert calls[0] == "suppress"
+    ((wandb_config, run_config),) = calls[1:]
+    assert (wandb_config.project, wandb_config.group, wandb_config.name) == ("p", "g", "dspark_run")
+    assert wandb_config.extra == {}  # ``enable`` is the examples' opt-in flag, not a wandb.init kwarg
+    assert run_config == {"lr": 1e-4}
+
+
+def test_init_wandb_run_keeps_the_configured_name(monkeypatch):
+    obj, calls = _wandb_recipe(monkeypatch, wandb_block={"project": "p", "name": "mine"})
+    obj._init_wandb_run("dspark_run")
+    ((wandb_config, _),) = calls[1:]
+    assert wandb_config.name == "mine"
 
 
 # --------------------------------------------------------------------------- #

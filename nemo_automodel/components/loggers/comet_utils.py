@@ -15,14 +15,12 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Self
+from typing import Any, Self
 
 import torch
 import torch.distributed as dist
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.config.loader import ConfigNode
 
 logger = logging.getLogger(__name__)
 
@@ -128,14 +126,12 @@ class CometLogger:
         self.end()
 
 
-def build_comet(cfg: ConfigNode) -> CometLogger:
-    """Build a Comet logger from a raw config object.
+def build_comet(cfg: Any) -> CometLogger:
+    """Deprecated: build the logger with ``CometConfig.build`` instead.
 
-    Back-compat shim. The logger-construction logic lives in
-    :meth:`nemo_automodel.components.loggers.loggers.CometConfig.build` (the
-    single implementation); recipes construct ``CometConfig`` via
-    ``RecipeConfig.comet`` and call ``build`` directly. This wrapper maps a raw
-    cfg's ``comet:`` block onto the typed config so existing callers keep working.
+    Recipes get the typed config from ``RecipeConfig.comet`` and call
+    ``build(model_name=...)`` on it. This shim maps a raw config's ``comet:``
+    block onto ``CometConfig`` and will be removed.
 
     Args:
         cfg: Configuration object containing Comet settings.
@@ -143,6 +139,12 @@ def build_comet(cfg: ConfigNode) -> CometLogger:
     Returns:
         CometLogger instance.
     """
+    warnings.warn(
+        "build_comet is deprecated; use CometConfig.build(model_name=...) "
+        "(recipes get the config from RecipeConfig.comet)",
+        FutureWarning,
+        stacklevel=2,
+    )
     from nemo_automodel.components.loggers.loggers import CometConfig
 
     comet_config = cfg.get("comet", {})

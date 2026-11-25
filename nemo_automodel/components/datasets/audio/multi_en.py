@@ -117,8 +117,6 @@ def _coerce_source(spec: "Source | Mapping[str, Any]") -> "Source":
     """
     if isinstance(spec, Source):
         return spec
-    if hasattr(spec, "to_dict"):  # tolerate config-node objects that expose to_dict()
-        spec = spec.to_dict()
     if isinstance(spec, Mapping):
         allowed = {f.name for f in fields(Source)}
         unknown = set(spec) - allowed

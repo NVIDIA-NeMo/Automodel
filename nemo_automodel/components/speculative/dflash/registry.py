@@ -23,7 +23,7 @@ differs (Kimi K3's MLA) registers its own draft class.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 from torch import nn
 from transformers import PretrainedConfig
@@ -35,11 +35,12 @@ from nemo_automodel.components.speculative.dflash.draft_kimi_k3 import (
 )
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
+from nemo_automodel.components.speculative.dflash.target_options import DFlashTargetKwargs, DFlashTargetOptions
 
 
-def _no_target_kwargs(recipe_cfg) -> dict:
+def _no_target_kwargs(options: DFlashTargetOptions) -> DFlashTargetKwargs:
     """Default: a target needs no architecture-specific ``from_pretrained`` kwargs."""
-    del recipe_cfg
+    del options
     return {}
 
 
@@ -59,7 +60,7 @@ class DFlashDraftSpec:
             ``num_target_layers``, ``block_size``, ``dflash_config``, and
             ``attention_backend``.
         build_target_kwargs: Extra ``from_pretrained`` keyword arguments for the
-            frozen target, derived from the recipe's ``recipe_args``.
+            frozen target, derived from the recipe's target options.
         attention_backends: The attention backends this draft can run. The
             trainer's mask format is driven by the same knob and must agree (a
             flex ``BlockMask`` only works with the flex attention function, a
@@ -80,7 +81,7 @@ class DFlashDraftSpec:
     # around. A family whose draft is shaped differently registers a builder.
     build_draft_config: Callable[..., PretrainedConfig] | None = None
     draft2_cls: type[nn.Module] | None = None
-    build_target_kwargs: Callable[[Any], dict] = _no_target_kwargs
+    build_target_kwargs: Callable[[DFlashTargetOptions], DFlashTargetKwargs] = _no_target_kwargs
     attention_backends: tuple[str, ...] = ("flex_attention", "sdpa", "eager")
     supports_context_parallel: bool = True
 

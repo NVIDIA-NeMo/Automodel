@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import logging
+import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Literal, Protocol, TypedDict, overload
+from typing import Any, Literal, TypedDict
 
 import torch
 import torch.nn as nn
@@ -51,31 +53,6 @@ class _FP8ConfigDict(TypedDict):
     force_recompute_fp8_weight_in_bwd: bool
     fp8_filter_fqns: list[str]
     fp8_emulate: bool
-
-
-class _FP8ConfigSource(Protocol):
-    """Mapping-like FP8 configuration source; ``ConfigNode`` satisfies it."""
-
-    @overload
-    def get(self, key: Literal["enabled"], default: bool = ...) -> bool: ...
-
-    @overload
-    def get(self, key: Literal["recipe_name"], default: FP8RecipeName | None = ...) -> FP8RecipeName | None: ...
-
-    @overload
-    def get(self, key: Literal["enable_fsdp_float8_all_gather"], default: bool = ...) -> bool: ...
-
-    @overload
-    def get(self, key: Literal["precompute_float8_dynamic_scale_for_fsdp"], default: bool = ...) -> bool: ...
-
-    @overload
-    def get(self, key: Literal["force_recompute_fp8_weight_in_bwd"], default: bool = ...) -> bool: ...
-
-    @overload
-    def get(self, key: Literal["filter_fqns"], default: list[str] = ...) -> list[str]: ...
-
-    @overload
-    def get(self, key: Literal["emulate"], default: bool = ...) -> bool: ...
 
 
 @dataclass
@@ -362,17 +339,7 @@ def verify_fp8_conversion(model: nn.Module) -> _FP8ConversionStats:
     }
 
 
-def create_fp8_config_from_dict(config_dict: _FP8ConfigSource) -> FP8Config:
-    """Create a FP8Config from a mapping-like configuration source.
-
-    Args:
-        config_dict: Configuration source for FP8 quantization. A ``ConfigNode``
-            satisfies this protocol.
-
-    Returns:
-        FP8Config instance.
-    """
-
+def _fp8_config_from_mapping(config_dict: Mapping[str, Any]) -> FP8Config:
     return FP8Config(
         enabled=config_dict.get("enabled", False),
         recipe_name=config_dict.get("recipe_name", None),
@@ -384,18 +351,46 @@ def create_fp8_config_from_dict(config_dict: _FP8ConfigSource) -> FP8Config:
     )
 
 
-def build_fp8_config(cfg: _FP8ConfigSource | None) -> FP8Config:
-    """Build a FP8 config from configuration.
+def create_fp8_config_from_dict(config_dict: Mapping[str, Any]) -> FP8Config:
+    """Deprecated: construct :class:`FP8Config` directly instead.
+
+    Recipes build the typed config from their ``fp8:`` block at the recipe boundary
+    (``nemo_automodel.recipes._typed_config.fp8_config_from_node``). This helper reads
+    a raw ``fp8:`` mapping inside the component and will be removed.
 
     Args:
-        cfg: Configuration source for FP8 quantization. ``None`` returns a
+        config_dict: Configuration mapping for FP8 quantization.
+
+    Returns:
+        FP8Config instance.
+    """
+    warnings.warn(
+        "create_fp8_config_from_dict is deprecated; construct FP8Config(...) directly",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return _fp8_config_from_mapping(config_dict)
+
+
+def build_fp8_config(cfg: Mapping[str, Any] | None) -> FP8Config:
+    """Deprecated: construct :class:`FP8Config` directly instead.
+
+    Recipes build the typed config from their ``fp8:`` block at the recipe boundary
+    (``nemo_automodel.recipes._typed_config.fp8_config_from_node``). This helper reads
+    a raw ``fp8:`` mapping inside the component and will be removed.
+
+    Args:
+        cfg: Configuration mapping for FP8 quantization. ``None`` returns a
             disabled config.
 
     Returns:
         FP8Config instance.
     """
-
+    warnings.warn(
+        "build_fp8_config is deprecated; construct FP8Config(...) directly",
+        FutureWarning,
+        stacklevel=2,
+    )
     if cfg is None:
         return FP8Config(enabled=False)
-    else:
-        return create_fp8_config_from_dict(cfg)
+    return _fp8_config_from_mapping(cfg)

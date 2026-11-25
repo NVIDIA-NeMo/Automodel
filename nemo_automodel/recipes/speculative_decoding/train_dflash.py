@@ -52,6 +52,7 @@ from nemo_automodel.components.speculative.dflash.target import (
     HFDFlashTargetModel,
     resolve_text_config,
 )
+from nemo_automodel.components.speculative.dflash.target_options import DFlashTargetOptions
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.speculative_decoding._spec_recipe_base import SpecDecodeRecipeBase
@@ -439,7 +440,12 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
         )
         if target_attn_implementation is not None:
             target_kwargs["attn_implementation"] = target_attn_implementation
-        target_kwargs.update(draft_spec.build_target_kwargs(recipe_cfg))
+        target_options = DFlashTargetOptions(
+            dispatcher=recipe_cfg.get("target_dispatcher", None),
+            experts=recipe_cfg.get("target_experts", None),
+            enable_fsdp_optimizations=recipe_cfg.get("target_enable_fsdp_optimizations", None),
+        )
+        target_kwargs.update(draft_spec.build_target_kwargs(target_options))
         self.dist_setup = None
         self.device_mesh = None
         self.dp_mesh = None

@@ -116,7 +116,8 @@ def test_init_wandb_run_uses_default_name_and_forwards_config():
 
     from nemo_automodel.components.loggers.wandb_utils import init_wandb_run
 
-    init_wandb_run({"project": "p", "name": ""}, {"a": 1}, default_name="eagle1_model")
+    with pytest.warns(FutureWarning, match="WandbConfig.build"):
+        init_wandb_run({"project": "p", "name": ""}, {"a": 1}, default_name="eagle1_model")
     assert captured["project"] == "p"
     assert captured["name"] == "eagle1_model"  # empty name -> default
     assert captured["config"] == {"a": 1}
@@ -128,7 +129,8 @@ def test_init_wandb_run_keeps_explicit_name():
 
     from nemo_automodel.components.loggers.wandb_utils import init_wandb_run
 
-    init_wandb_run({"project": "p", "name": "myrun"}, {}, default_name="fallback")
+    with pytest.warns(FutureWarning, match="WandbConfig.build"):
+        init_wandb_run({"project": "p", "name": "myrun"}, {}, default_name="fallback")
     assert captured["name"] == "myrun"
 
 

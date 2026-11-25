@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping
+from dataclasses import fields
 from typing import Any
 
 import torch
@@ -39,9 +41,12 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     is_selective_activation_checkpointing,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
+from nemo_automodel.components.speculative.decode_eval import DecodeEvalConfig
+from nemo_automodel.components.speculative.regen_loop import RegenConfig
+from nemo_automodel.components.utils.compile_utils import compile_module_inplace
 from nemo_automodel.recipes._dist_utils import _normalize_activation_checkpointing
+from nemo_automodel.recipes._typed_config import compile_config_from_node, fp8_config_from_node
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +143,7 @@ def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
     """
     if cfg_fp8 is None:
         return
-    apply_fp8_to_model(draft_model, config=build_fp8_config(cfg_fp8))
+    apply_fp8_to_model(draft_model, config=fp8_config_from_node(cfg_fp8))
 
 
 def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
@@ -154,7 +159,7 @@ def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
     """
     if cfg_compile is None:
         return
-    compile_module_inplace(draft_model, build_compile_config(cfg_compile))
+    compile_module_inplace(draft_model, compile_config_from_node(cfg_compile))
 
 
 def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | str) -> None:
@@ -310,6 +315,127 @@ def resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
     if kwargs.pop("enable", True) is False:
         return None
     return kwargs
+
+
+def resolve_decode_eval_config(
+    recipe_cfg: ConfigNode | Mapping[str, Any],
+    *,
+    default_target: str,
+    default_input_data: str | None,
+    default_num_speculative_tokens: int,
+    output_dir: str,
+) -> DecodeEvalConfig | None:
+    """Read the optional ``decode_eval:`` block from ``recipe_args``.
+
+    Returns ``None`` when the block is absent or ``every_steps`` is unset/0
+    (feature disabled). Raises on a partially-configured block so a typo'd GPU
+    reservation fails at setup rather than silently evaluating on a training
+    GPU. Field defaults live on :class:`DecodeEvalConfig` only; the block just
+    overrides the fields it sets.
+    """
+    block = recipe_cfg.get("decode_eval", None)
+    if block is None:
+        return None
+    every_steps = int(block.get("every_steps", 0) or 0)
+    if every_steps <= 0:
+        return None
+    block = block.to_dict() if isinstance(block, ConfigNode) else dict(block)
+    unknown = set(block) - {field.name for field in fields(DecodeEvalConfig)}
+    if unknown:
+        raise ValueError(f"Unknown decode_eval option(s): {', '.join(sorted(unknown))}")
+    cuda_visible_devices = block.get("cuda_visible_devices", None)
+    if cuda_visible_devices is None or str(cuda_visible_devices) == "":
+        raise ValueError(
+            "decode_eval.cuda_visible_devices is required: the eval engine needs a GPU the training "
+            "job does not use (e.g. reserve one card and shrink the torchrun world accordingly)."
+        )
+    input_data = block.get("input_data", None) or default_input_data
+    if not input_data:
+        raise ValueError("decode_eval.input_data is required when recipe_args.train_data_path is not set.")
+    num_speculative_tokens = int(block.get("num_speculative_tokens", None) or default_num_speculative_tokens)
+    if num_speculative_tokens <= 0:
+        raise ValueError("decode_eval.num_speculative_tokens must be greater than 0.")
+    required = {
+        "every_steps",
+        "cuda_visible_devices",
+        "target_model",
+        "input_data",
+        "output_dir",
+        "num_speculative_tokens",
+    }
+    overrides = {}
+    for field in fields(DecodeEvalConfig):
+        if field.name in required:
+            continue
+        value = block.get(field.name, None)
+        if value is not None:
+            overrides[field.name] = value
+    return DecodeEvalConfig(
+        every_steps=every_steps,
+        cuda_visible_devices=str(cuda_visible_devices),
+        target_model=str(block.get("target_model", None) or default_target),
+        input_data=str(input_data),
+        output_dir=os.path.join(output_dir, "decode_eval"),
+        num_speculative_tokens=num_speculative_tokens,
+        **overrides,
+    )
+
+
+def resolve_regen_config(
+    recipe_cfg: ConfigNode | Mapping[str, Any],
+    *,
+    default_target: str,
+    default_input_data: str | None,
+    output_dir: str,
+) -> RegenConfig | None:
+    """Read the optional ``regen:`` block from ``recipe_args``.
+
+    Returns ``None`` when the block is absent or ``every_steps`` is unset/0
+    (feature disabled). Raises on a partially-configured block so a typo'd GPU
+    reservation fails at setup rather than silently regenerating on a training
+    GPU. Field defaults live on :class:`RegenConfig` only; the block just
+    overrides the fields it sets.
+    """
+    block = recipe_cfg.get("regen", None)
+    if block is None:
+        return None
+    every_steps = int(block.get("every_steps", 0) or 0)
+    if every_steps <= 0:
+        return None
+    block = block.to_dict() if isinstance(block, ConfigNode) else dict(block)
+    unknown = set(block) - {field.name for field in fields(RegenConfig)}
+    if unknown:
+        raise ValueError(f"Unknown regen option(s): {', '.join(sorted(unknown))}")
+    if "output_dir" in block:
+        raise ValueError(
+            "regen.output_dir is not configurable: shards are always written under "
+            "<run output_dir>/regen. Remove it from the regen block."
+        )
+    cuda_visible_devices = block.get("cuda_visible_devices", None)
+    if cuda_visible_devices is None or str(cuda_visible_devices) == "":
+        raise ValueError(
+            "regen.cuda_visible_devices is required: the regeneration engine needs a GPU the training "
+            "job does not use (e.g. reserve one card and shrink the torchrun world accordingly)."
+        )
+    input_data = block.get("input_data", None) or default_input_data
+    if not input_data:
+        raise ValueError("regen.input_data is required when recipe_args.train_data_path is not set.")
+    required = {"every_steps", "cuda_visible_devices", "target_model", "input_data", "output_dir"}
+    overrides = {}
+    for field in fields(RegenConfig):
+        if field.name in required:
+            continue
+        value = block.get(field.name, None)
+        if value is not None:
+            overrides[field.name] = value
+    return RegenConfig(
+        every_steps=every_steps,
+        cuda_visible_devices=str(cuda_visible_devices),
+        target_model=str(block.get("target_model", None) or default_target),
+        input_data=str(input_data),
+        output_dir=os.path.join(output_dir, "regen"),
+        **overrides,
+    )
 
 
 def resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmup_steps: int = 1) -> int:

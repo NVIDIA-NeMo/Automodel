@@ -50,8 +50,7 @@ import sys
 import time
 import urllib.request
 from argparse import Namespace
-from dataclasses import asdict, dataclass, fields
-from typing import Any
+from dataclasses import asdict, dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -111,70 +110,6 @@ class DecodeEvalConfig:
     max_model_len: int | None = None
     trust_remote_code: bool = False
     timeout_s: float = 1800.0
-
-
-def resolve_decode_eval_config(
-    recipe_cfg: Any,
-    *,
-    default_target: str,
-    default_input_data: str | None,
-    default_num_speculative_tokens: int,
-    output_dir: str,
-) -> DecodeEvalConfig | None:
-    """Read the optional ``decode_eval:`` block from ``recipe_args``.
-
-    Returns ``None`` when the block is absent or ``every_steps`` is unset/0
-    (feature disabled). Raises on a partially-configured block so a typo'd GPU
-    reservation fails at setup rather than silently evaluating on a training
-    GPU. Field defaults live on :class:`DecodeEvalConfig` only; the block just
-    overrides the fields it sets.
-    """
-    block = recipe_cfg.get("decode_eval", None)
-    if block is None:
-        return None
-    every_steps = int(block.get("every_steps", 0) or 0)
-    if every_steps <= 0:
-        return None
-    block = block.to_dict() if hasattr(block, "to_dict") else dict(block)
-    unknown = set(block) - {field.name for field in fields(DecodeEvalConfig)}
-    if unknown:
-        raise ValueError(f"Unknown decode_eval option(s): {', '.join(sorted(unknown))}")
-    cuda_visible_devices = block.get("cuda_visible_devices", None)
-    if cuda_visible_devices is None or str(cuda_visible_devices) == "":
-        raise ValueError(
-            "decode_eval.cuda_visible_devices is required: the eval engine needs a GPU the training "
-            "job does not use (e.g. reserve one card and shrink the torchrun world accordingly)."
-        )
-    input_data = block.get("input_data", None) or default_input_data
-    if not input_data:
-        raise ValueError("decode_eval.input_data is required when recipe_args.train_data_path is not set.")
-    num_speculative_tokens = int(block.get("num_speculative_tokens", None) or default_num_speculative_tokens)
-    if num_speculative_tokens <= 0:
-        raise ValueError("decode_eval.num_speculative_tokens must be greater than 0.")
-    required = {
-        "every_steps",
-        "cuda_visible_devices",
-        "target_model",
-        "input_data",
-        "output_dir",
-        "num_speculative_tokens",
-    }
-    overrides = {}
-    for field in fields(DecodeEvalConfig):
-        if field.name in required:
-            continue
-        value = block.get(field.name, None)
-        if value is not None:
-            overrides[field.name] = value
-    return DecodeEvalConfig(
-        every_steps=every_steps,
-        cuda_visible_devices=str(cuda_visible_devices),
-        target_model=str(block.get("target_model", None) or default_target),
-        input_data=str(input_data),
-        output_dir=os.path.join(output_dir, "decode_eval"),
-        num_speculative_tokens=num_speculative_tokens,
-        **overrides,
-    )
 
 
 def export_draft_snapshot(draft_model, out_dir: str) -> str:

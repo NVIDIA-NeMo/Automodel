@@ -34,9 +34,9 @@ from nemo_automodel.components.speculative.decode_eval import (
     _serve_argv,
     _worker_env,
     export_draft_snapshot,
-    resolve_decode_eval_config,
 )
 from nemo_automodel.components.speculative.serve_vllm import _find_draft_dir
+from nemo_automodel.recipes.speculative_decoding._spec_train_utils import resolve_decode_eval_config
 
 
 def _config(tmp_path, **overrides):

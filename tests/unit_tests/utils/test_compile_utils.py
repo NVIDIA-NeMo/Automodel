@@ -98,7 +98,8 @@ class TestBuildCompileConfig:
             "backend": "inductor",
             "dynamo_cache_size_limit": 512,
         }
-        config = build_compile_config(cfg_dict)
+        with pytest.warns(FutureWarning, match="construct CompileConfig"):
+            config = build_compile_config(cfg_dict)
         assert isinstance(config, CompileConfig)
         assert config.enabled is True
         assert config.mode == "reduce-overhead"
@@ -107,7 +108,8 @@ class TestBuildCompileConfig:
 
     def test_build_from_none(self):
         """Test building config from None returns disabled config."""
-        config = build_compile_config(None)
+        with pytest.warns(FutureWarning, match="construct CompileConfig"):
+            config = build_compile_config(None)
         assert isinstance(config, CompileConfig)
         assert config.enabled is False
 
@@ -126,7 +128,8 @@ class TestCreateCompileConfigFromDict:
             "options": {"test": "value"},
             "dynamo_cache_size_limit": 1024,
         }
-        config = create_compile_config_from_dict(config_dict)
+        with pytest.warns(FutureWarning, match="construct CompileConfig"):
+            config = create_compile_config_from_dict(config_dict)
         assert config.enabled is True
         assert config.mode == "max-autotune"
         assert config.fullgraph is True
@@ -138,7 +141,8 @@ class TestCreateCompileConfigFromDict:
     def test_create_with_defaults(self):
         """Test creating config with default values."""
         config_dict = {}
-        config = create_compile_config_from_dict(config_dict)
+        with pytest.warns(FutureWarning, match="construct CompileConfig"):
+            config = create_compile_config_from_dict(config_dict)
         assert config.enabled is False
         assert config.mode == "default"
         assert config.fullgraph is False
@@ -414,7 +418,7 @@ class TestCompileModuleInplace:
 
 
 class _YamlOptions:
-    """Stands in for a YAML-backed ``ConfigNode``: options are only reachable through ``to_dict``."""
+    """Stands in for a YAML ``ConfigNode``; the recipe converts it to a mapping before building the config."""
 
     def __init__(self, values: dict) -> None:
         self._values = values
@@ -423,14 +427,14 @@ class _YamlOptions:
         return dict(self._values)
 
 
-class TestYamlBackedCompileOptions:
+class TestCompileOptions:
     @patch("nemo_automodel.components.utils.compile_utils.configure_torch_dynamo")
     @patch("nemo_automodel.components.utils.compile_utils.apply_flash_attention_compile_fix")
     @patch("torch.compile")
-    def test_config_node_options_are_forwarded(self, mock_torch_compile, mock_fa_fix, mock_configure):
+    def test_options_are_forwarded(self, mock_torch_compile, mock_fa_fix, mock_configure):
         model = nn.Linear(2, 2)
         mock_torch_compile.return_value = MagicMock(spec=nn.Module)
-        config = CompileConfig(enabled=True, options=_YamlOptions({"max_autotune": True, "mode_tag": "x"}))
+        config = CompileConfig(enabled=True, options={"max_autotune": True, "mode_tag": "x"})
 
         compile_model(model, config)
 
@@ -438,8 +442,10 @@ class TestYamlBackedCompileOptions:
             model, fullgraph=False, dynamic=False, options={"max_autotune": True, "mode_tag": "x"}
         )
 
-    def test_config_node_option_with_unsupported_value_raises(self):
-        config = CompileConfig(enabled=True, options=_YamlOptions({"trace": {"enabled": True}}))
-
+    def test_option_with_unsupported_value_is_rejected_at_construction(self):
         with pytest.raises(TypeError, match=r"CompileConfig.options\['trace'\] must be a str, int or bool"):
-            compile_model(nn.Linear(2, 2), config)
+            CompileConfig(enabled=True, options={"trace": {"enabled": True}})
+
+    def test_options_must_be_a_mapping(self):
+        with pytest.raises(TypeError, match="CompileConfig.options must be a mapping"):
+            CompileConfig(enabled=True, options=_YamlOptions({"max_autotune": True}))

@@ -58,12 +58,18 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
+    from nemo_automodel.components.distributed.context_parallel.magi import MagiBackend
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
+    from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
+    from nemo_automodel.components.models.bagel.hf_backbone_loader import BagelBackbonesConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.quantization.fp8 import FP8Config
+    from nemo_automodel.components.quantization.qlora import BnbQuantizationConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
+    from nemo_automodel.components.utils.compile_utils import CompileConfig
     from nemo_automodel.components.utils.model_utils import FreezeConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
@@ -99,6 +105,27 @@ def _section_kwargs(node: Any) -> dict[str, Any]:
     d = node.to_dict() if hasattr(node, "to_dict") else dict(node)
     d.pop("_target_", None)
     return d
+
+
+def compile_config_from_node(node: "ConfigNode | Mapping[str, Any]") -> "CompileConfig":
+    """Typed ``torch.compile`` settings from a recipe's ``compile:`` block."""
+    from nemo_automodel.components.utils.compile_utils import CompileConfig
+
+    return CompileConfig(**_section_kwargs(node))
+
+
+def fp8_config_from_node(node: "ConfigNode | Mapping[str, Any]") -> "FP8Config":
+    """Typed FP8 training settings from a recipe's ``fp8:`` block."""
+    from nemo_automodel.components.quantization.fp8 import FP8Config
+
+    return FP8Config(**_section_kwargs(node))
+
+
+def bnb_quantization_config_from_node(node: "ConfigNode | Mapping[str, Any]") -> "BnbQuantizationConfig":
+    """Typed BitsAndBytes (QLoRA) settings from a recipe's ``quantization:`` block."""
+    from nemo_automodel.components.quantization.qlora import BnbQuantizationConfig
+
+    return BnbQuantizationConfig(**_section_kwargs(node))
 
 
 def _as_dict(cfg: Any | None) -> dict[str, Any]:
@@ -166,6 +193,19 @@ class RecipeConfig:
 
     def __init__(self, raw: "ConfigNode"):
         self._raw = raw
+
+    @property
+    def magi_backend(self) -> "MagiBackend" | None:
+        """Where the ``model:`` block selects MagiAttention, for ``setup_magi``.
+
+        ``"custom"`` when a custom model sets ``backend.attn: magi``, ``"hf"`` when an
+        HF model sets ``attn_implementation: magi``, ``None`` otherwise.
+        """
+        if str(self._raw.get("model.backend.attn", "")) == "magi":
+            return "custom"
+        if str(self._raw.get("model.attn_implementation", "")) == "magi":
+            return "hf"
+        return None
 
     @cached_property
     def freeze_config(self) -> FreezeConfig | None:
@@ -663,6 +703,38 @@ class RecipeConfig:
             pin_memory=loader_kwargs.pop("pin_memory", True),
             prefetch_factor=loader_kwargs.pop("prefetch_factor", 2),
         )
+
+    @cached_property
+    def bagel_backbones(self) -> "BagelBackbonesConfig":
+        """The ``model:`` block settings for building BAGEL from Qwen2 / SigLIP backbones (``init_mode: hf_backbones``).
+
+        Other keys of the block (``init_mode``, ``stage``, ``backend``, ``vae_config``, ...) belong to the
+        recipe or to the other BAGEL properties and are not read here.
+        """
+        from nemo_automodel.components.models.bagel.hf_backbone_loader import BagelBackbonesConfig
+        from nemo_automodel.shared.utils import dtype_from_str
+
+        model = _as_dict(self._raw.get("model", None))
+        if model.get("llm_path", None) is None:
+            raise ValueError("model.init_mode='hf_backbones' requires model.llm_path")
+        kwargs = {f.name: model[f.name] for f in fields(BagelBackbonesConfig) if f.name in model}
+        for key in ("torch_dtype", "logits_dtype"):
+            if isinstance(kwargs.get(key), str):
+                kwargs[key] = dtype_from_str(kwargs[key])
+        return BagelBackbonesConfig(**kwargs)
+
+    @cached_property
+    def bagel_backend(self) -> "BagelBackendConfig":
+        """BAGEL's kernel selection from ``model.backend`` (BAGEL's torch defaults when the block is absent)."""
+        from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
+
+        return BagelBackendConfig(**_as_dict(self._raw.get("model.backend", None)))
+
+    @cached_property
+    def bagel_vae_config(self) -> dict[str, int] | None:
+        """BAGEL's VAE latent geometry from ``model.vae_config``, or ``None`` when the block is absent."""
+        node = self._raw.get("model.vae_config", None)
+        return _as_dict(node) if node is not None else None
 
     @cached_property
     def loss_fn(self) -> "LossConfig" | None:

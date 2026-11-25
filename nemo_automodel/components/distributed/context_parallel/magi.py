@@ -45,14 +45,21 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.distributed.context_parallel.utils import _make_cp_batch_and_ctx, make_cp_batch_for_te
 
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
 logger = logging.getLogger(__name__)
+
+# Where the model selects MagiAttention: ``"hf"`` through ``attn_implementation="magi"``
+# (HF models), ``"custom"`` through ``backend.attn="magi"`` (custom models).
+MagiBackend: TypeAlias = Literal["hf", "custom"]
 
 _MAGI_REGISTERED = False
 # Default dispatch chunk size used by the load-balancing solver.
@@ -865,18 +872,31 @@ class MagiState:
         return (batch, local_indices) if return_local_indices else batch
 
 
-def setup_magi(cfg, device_mesh, *, domain: str = "llm", label: str = "") -> MagiState:
-    """Resolve MagiAttention from config: register the backend and CP group.
+def setup_magi(
+    backend: MagiBackend | None,
+    device_mesh: DeviceMesh | None,
+    *,
+    domain: str = "llm",
+    label: str = "",
+) -> MagiState:
+    """Wire MagiAttention for a recipe: register the backend and resolve the CP group.
 
-    Enabled when the model is configured with ``attn_implementation="magi"`` (HF) or
-    ``backend.attn="magi"`` (custom models). Returns a :class:`MagiState`
-    (``enabled=False`` when magi is not configured). ``label`` is an optional suffix
-    for the log line (e.g. ``"VLM language backbone"``).
+    Args:
+        backend: Where the model selects MagiAttention: ``"hf"`` for
+            ``attn_implementation="magi"``, ``"custom"`` for ``backend.attn="magi"``,
+            or ``None`` when it is not selected. The recipe reads this from its
+            config (``RecipeConfig.magi_backend``).
+        device_mesh: The recipe's device mesh; its ``"cp"`` dimension, if any, is
+            the context-parallel group.
+        domain: Recipe domain (``"llm"`` or ``"vlm"``).
+        label: Optional suffix for the log line (e.g. ``"VLM language backbone"``).
+
+    Returns:
+        The wiring, with ``enabled=False`` when ``backend`` is ``None``.
     """
-    custom = str(cfg.get("model.backend.attn", "")) == "magi"
-    enabled = custom or str(cfg.get("model.attn_implementation", "")) == "magi"
-    if not enabled:
+    if backend is None:
         return MagiState(domain=domain)
+    custom = backend == "custom"
 
     if not is_magi_available():
         raise RuntimeError(

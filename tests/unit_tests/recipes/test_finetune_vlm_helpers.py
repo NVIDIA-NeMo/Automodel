@@ -323,7 +323,7 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
 
 
 def test_build_model_passes_quantization_config():
-    """cfg_quantization is converted via create_bnb_config and forwarded as quantization_config."""
+    """cfg_quantization becomes a BnbQuantizationConfig whose build() is forwarded as quantization_config."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
     captured_kwargs = {}
@@ -339,16 +339,21 @@ def test_build_model_passes_quantization_config():
         def get(self, key, default=None):
             return getattr(self, key, default)
 
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.quantization.qlora import BnbQuantizationConfig
+
     cfg_model = CapturingModelConfig()
-    cfg_quantization = SimpleNamespace(load_in_4bit=True)
+    cfg_quantization = ConfigNode({"load_in_4bit": True, "bnb_4bit_quant_type": "fp4"})
     sentinel_bnb = object()
+    built_from = []
+
+    def _build(self):
+        built_from.append(self)
+        return sentinel_bnb
 
     with (
         patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True),
-        patch(
-            "nemo_automodel.components.quantization.qlora.create_bnb_config",
-            return_value=sentinel_bnb,
-        ) as mock_create,
+        patch.object(BnbQuantizationConfig, "build", _build),
     ):
         build_model(
             cfg_model=cfg_model,
@@ -358,8 +363,8 @@ def test_build_model_passes_quantization_config():
             cfg_quantization=cfg_quantization,
         )
 
-    # Wiring: cfg_quantization -> create_bnb_config(...) -> kwargs["quantization_config"]
-    mock_create.assert_called_once_with(cfg_quantization)
+    # Wiring: cfg_quantization -> BnbQuantizationConfig(...).build() -> kwargs["quantization_config"]
+    assert built_from == [BnbQuantizationConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4")]
     assert captured_kwargs.get("quantization_config") is sentinel_bnb
 
 

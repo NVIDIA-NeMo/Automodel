@@ -928,7 +928,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 # so mixed corpora are safe here without any dataset curation.
                 self.processor = build_minimax_m3_vl_processor(target_path, trust_remote_code=trust_remote_code)
                 self.train_dataloader = build_dspark_vlm_dataloader(
-                    dataset_cfg=self.cfg.dataset,
+                    dataset=self.cfg.dataset.instantiate(),
                     processor=self.processor,
                     batch_size=recipe_cfg.micro_batch_size,
                     max_length=recipe_cfg.seq_length,
@@ -939,7 +939,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 self.val_dataloader = None
                 if self.cfg.get("val_dataset", None) is not None:
                     self.val_dataloader = build_dspark_vlm_dataloader(
-                        dataset_cfg=self.cfg.val_dataset,
+                        dataset=self.cfg.val_dataset.instantiate(),
                         processor=self.processor,
                         batch_size=recipe_cfg.micro_batch_size,
                         max_length=recipe_cfg.seq_length,
