@@ -606,29 +606,30 @@ jobs:
             timeout: 60
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          # Also runs the optim, CLEF, and distributed suites, which moved out of L2_Distributed
+          # to keep that job near 30 minutes (about 9 minutes of pytest here).
           - test-name: L2_Retrieval
-            test-folder: retrieval
+            test-folder: retrieval,optim,decision_models/clef,distributed
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          # Also runs the Gemma4 and Mistral3.5 VLM parallelism parity tests, which moved out of
+          # L2_Distributed to keep that job near 30 minutes (about 10 minutes of pytest here).
           - test-name: L2_Diffusion
-            test-folder: diffusion,dllm
+            test-folder: diffusion,dllm,parallelism_vlm
             timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           # moe + parallelism merged (2.8 + 5.8 = 8.6 min median) to fit `max-parallel: 10`.
           # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
           # 2-rank parallel), so the budget is roughly double a single smoke test.
-          # The merged pytest run took 32-33 minutes before `distributed` was added. With
-          # that folder and the 3-test test_mxfp4_ep.py it needs about 51.5 minutes warm
-          # and an estimated 70-80 minutes on a cold cache, so one 90-minute attempt must be
-          # able to finish. Three attempts of 90 minutes stay below the 360-minute default
-          # job limit.
-          # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage, plus
-          # every test under tests/functional_tests/distributed.
+          # The optim, CLEF, and distributed suites run in L2_Retrieval and the VLM parity tests
+          # in L2_Diffusion, so this job needs about 30 minutes warm (about 45 on a cold MoE JIT
+          # cache); a 50-minute timeout leaves room for slow runners without letting a hung test
+          # retry for long. GB200 still runs all of them in its own L2_Distributed.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism,optim,decision_models/clef,distributed
-            timeout: 90
+            test-folder: moe,parallelism
+            timeout: 50
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
@@ -714,7 +715,7 @@ jobs:
           # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage, plus
           # every test under tests/functional_tests/distributed.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism,optim,decision_models/clef,distributed
+            test-folder: moe,parallelism,parallelism_vlm,optim,decision_models/clef,distributed
             timeout: 45
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
