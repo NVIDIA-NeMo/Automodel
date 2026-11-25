@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``BackendConfig.mamba_norm_backward_grid_scale`` and ``BackendConfig.mamba_out_proj_ac_exempt`` on a CPU stand-in.
+"""``BackendConfig.mamba_norm_backward_grid_scale`` and the mixer's ``scan_ac_exempt`` on a CPU stand-in.
 
 Which scan the mixer runs, how often an output projection that saves its input after computing (as a
 Transformer Engine linear does) runs under a non-reentrant activation checkpoint, and what context
@@ -41,16 +41,14 @@ def _backend(**mamba: int | float | bool | str) -> BackendConfig:
 
 
 @pytest.mark.cpu_only
-def test_defaults_keep_the_library_scan_and_checkpointed_projection():
+def test_defaults_keep_the_library_scan_and_checkpointed_scan_state():
     backend = _backend()
     assert backend.mamba_norm_backward_grid_scale == 1
-    assert backend.mamba_out_proj_ac_exempt is False
     for mixer in (
         NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0),
         NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=backend),
     ):
         assert mixer.norm_backward_grid_scale == 1
-        assert mixer.out_proj_ac_exempt is False
         assert mixer.scan_ac_exempt is False
 
 
@@ -92,11 +90,15 @@ def test_grid_scale_below_one_is_rejected(scale):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(("scale", "scan_exempt"), [(1, False), (8, False), (1, True), (8, True)])
-@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("fused", [True, False], ids=["torch_linear", "module_after_kernel"])
 def test_mixer_selects_the_scan_by_grid_scale_and_exemption(monkeypatch, scale, scan_exempt, fused):
     torch.manual_seed(3)
-    backend = _backend(mamba_norm_backward_grid_scale=scale, mamba_fused_out_proj=fused)
+    backend = _backend(mamba_norm_backward_grid_scale=scale)
     mixer = NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=backend).float()
+    if not fused:
+        # Only a plain ``torch.nn.Linear`` is applied inside the kernel; any other module, as a
+        # Transformer Engine linear, runs after it.
+        mixer.out_proj = _SaveAfterLinear(mixer.out_proj.weight)
     mixer.scan_ac_exempt = scan_exempt
     library_calls = _install_cpu_scan(monkeypatch, mixer)
     own_calls = []
@@ -120,6 +122,7 @@ def test_mixer_selects_the_scan_by_grid_scale_and_exemption(monkeypatch, scale, 
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
     if scale == 1 and not scan_exempt:
         assert len(library_calls) == 1 and own_calls == []
+        assert (library_calls[0]["outproj_weight"] is mixer.out_proj.weight) == fused
         return
     assert library_calls == [] and len(own_calls) == 1
     call = own_calls[0]
@@ -164,16 +167,26 @@ class _SaveAfterLinear(nn.Module):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("exempt", [False, True])
-def test_out_proj_ac_exempt_ends_the_checkpoint_recompute_at_the_scan(monkeypatch, exempt):
-    """The projection's GEMM runs twice under a checkpoint unless its saved tensors are exempt."""
+@pytest.mark.parametrize("scan_exempt", [False, True])
+def test_scan_ac_exempt_keeps_what_a_projection_after_the_kernel_saves(monkeypatch, scan_exempt):
+    """The GEMM of a projection applied after the kernel runs twice under a checkpoint unless the scan is exempt.
+
+    The stand-in scans are plain autograd operations, so they run in the forward and in the recompute either
+    way: here only the tensors saved by the projection are kept. That the real scan runs once is checked on
+    the real kernels.
+    """
     torch.manual_seed(17)
-    mixer = NemotronV3Mamba2Mixer(
-        MockNemotronV3Config(), layer_idx=0, backend=_backend(mamba_out_proj_ac_exempt=exempt)
-    ).float()
-    assert mixer.out_proj_ac_exempt is exempt
+    mixer = NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=_backend()).float()
+    mixer.scan_ac_exempt = scan_exempt
     mixer.out_proj = _SaveAfterLinear(mixer.out_proj.weight)
-    scan_calls = _install_cpu_scan(monkeypatch, mixer)
+    library_calls = _install_cpu_scan(monkeypatch, mixer)
+    own_calls = []
+
+    def own_scan(projected, conv_weight, conv_bias, dt_bias, a, d, **kwargs):
+        own_calls.append(kwargs)
+        return _pre_projection(projected, mixer.intermediate_size, kwargs["rmsnorm_weight"], kwargs["rmsnorm_eps"])
+
+    monkeypatch.setattr(nemotron_layers, "split_conv1d_scan", own_scan)
 
     x = torch.randn(2, 7, mixer.hidden_size)
     hidden = x.clone().requires_grad_()
@@ -181,9 +194,12 @@ def test_out_proj_ac_exempt_ends_the_checkpoint_recompute_at_the_scan(monkeypatc
     assert mixer.out_proj.computed == 1
     out.square().sum().backward()
 
-    assert len(scan_calls) == 2, "the scan runs in the forward and in the recompute"
+    # An exempt scan goes through ``split_conv1d_scan``, the other one through the library scan.
+    scan_calls, other_calls = (own_calls, library_calls) if scan_exempt else (library_calls, own_calls)
+    assert len(scan_calls) == 2, "the stand-in scan runs in the forward and in the recompute"
+    assert other_calls == []
     assert all(call["outproj_weight"] is None for call in scan_calls)
-    assert mixer.out_proj.computed == (1 if exempt else 2)
+    assert mixer.out_proj.computed == (1 if scan_exempt else 2)
 
     # Independent expectation: an uncheckpointed stand-in scan and plain matrix algebra under autograd.
     reference_hidden = x.clone().requires_grad_()
@@ -210,23 +226,16 @@ class _UnusedContextParallel:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("scan_exempt", "out_proj_exempt", "refused"),
-    [(True, False, True), (False, True, True), (True, True, True), (False, False, False)],
-)
-def test_checkpoint_exempt_scan_state_is_refused_with_context_parallelism(
-    monkeypatch, scan_exempt, out_proj_exempt, refused
-):
+@pytest.mark.parametrize("scan_exempt", [True, False])
+def test_checkpoint_exempt_scan_state_is_refused_with_context_parallelism(monkeypatch, scan_exempt):
     """The context-parallel scan has no checkpoint-exempt path: it must not silently recompute the state."""
     torch.manual_seed(23)
-    mixer = NemotronV3Mamba2Mixer(
-        MockNemotronV3Config(), layer_idx=0, backend=_backend(mamba_out_proj_ac_exempt=out_proj_exempt)
-    ).float()
+    mixer = NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0, backend=_backend()).float()
     mixer.scan_ac_exempt = scan_exempt
     _install_cpu_scan(monkeypatch, mixer)
     x = torch.randn(2, 7, mixer.hidden_size)
     mixer.cp = _UnusedContextParallel()
-    if refused:
+    if scan_exempt:
         with pytest.raises(ValueError, match="not supported with context parallelism"):
             mixer(x)
     else:

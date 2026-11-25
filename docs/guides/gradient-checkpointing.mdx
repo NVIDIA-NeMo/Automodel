@@ -190,26 +190,21 @@ distributed:
    `combine` skips the recomputed unpermute, barrier, and combine all-to-all; `moe_tail` additionally builds the down projection's autograd node without running its GEMM (torch grouped-GEMM experts without expert bias, router weight applied inside the activation). Gradients are unchanged. On DeepSeek-V4.1-Flash at 16 GB200 nodes (EP64, 4k sequences, local batch 2) the step time dropped by 1.4 % (`combine`) and 3.9 % (`moe_tail`) for +3.2 GiB of peak allocated memory (40 MoE layers × 80 MiB).
 
    With `activation_checkpointing: moe` the cache is installed only for MoE layers with a latent back-projection (`moe_latent_size`, for example Nemotron 3): that projection saves the combine output for its backward, so the recompute of the MoE-only region would run the combine again. Other MoE-only regions end at the combine and need no cache.
-4. **Blocks that keep their activations (Nemotron 3)**: Under block checkpointing, four settings keep part of the activations of Nemotron 3 models and shorten the recompute in exchange. Gradients are unchanged by all of them.
+4. **Blocks that keep their activations (Nemotron 3)**: Under block checkpointing, two settings change which activations a Nemotron 3 model keeps. Gradients are unchanged by both.
 
 ```yaml
 model:
-  mamba_ac_exempt_blocks: 8           # 0 (default) | N | all
   mamba_scan_ac_exempt_blocks: 13     # 0 (default) | N | all
-  backend:
-    mamba_out_proj_ac_exempt: true    # false (default) | true
 distributed:
   activation_checkpointing: true
   moe:
     checkpoint_repeated_mtp_moe: true # false (default) | true
 ```
 
-   - `model.mamba_ac_exempt_blocks` takes the first N Mamba blocks in layer order (`all` for every one) out of block checkpointing. The fused Mamba kernel recomputes its convolution and scan in its own backward, so a checkpointed Mamba block runs that forward three times per step and an exempt block twice. An exempt block keeps about 7.5 hidden-size activations per token.
-   - `model.mamba_scan_ac_exempt_blocks` counts from the first Mamba block that `mamba_ac_exempt_blocks` leaves checkpointed. The recompute of such a block ends after its input projection: the scan kernels and the output projection run once per step instead of twice. The block keeps its scan output and what its output projection saves, about 2 hidden-size activations per token plus the saved input of the output projection.
-   - `model.backend.mamba_out_proj_ac_exempt` keeps only what a Mamba output projection saves when it runs as a module after the scan kernel (`model.backend.mamba_linear: te`, or `model.backend.mamba_fused_out_proj: false`), so the recompute ends at the scan kernel.
+   - `model.mamba_scan_ac_exempt_blocks` selects the first N Mamba blocks in layer order (`all` for every one). The recompute of such a block ends after its input projection: the scan kernels and the output projection run once per step instead of twice. The block keeps its scan output and what its output projection saves, about 2 hidden-size activations per token plus the saved input of the output projection.
    - `distributed.moe.checkpoint_repeated_mtp_moe` checkpoints the MoE block of a weight-tied MTP head (`mtp_use_repeated_layer: true`), which otherwise keeps its activations for every MTP depth. It needs experts that are not FSDP-sharded, that is an `ep_size` that covers the whole data-parallel group, and is rejected otherwise. Without expert parallelism (`ep_size: 1`) the `distributed.moe` section is not read: the option is ignored with a warning.
 
-   `mamba_scan_ac_exempt_blocks` and `mamba_out_proj_ac_exempt` are not supported with context parallelism (`cp_size` above 1): the context-parallel Mamba scan has no path that keeps this state, and the model stops with an error instead of recomputing it. `mamba_ac_exempt_blocks` acts on whole blocks and does not depend on the scan path.
+   `mamba_scan_ac_exempt_blocks` is not supported with context parallelism (`cp_size` above 1): the context-parallel Mamba scan has no path that keeps this state, and the model stops with an error instead of recomputing it.
 
 ## Verify It Works
 Run a checked-in recipe config with activation checkpointing enabled and inspect the peak memory:

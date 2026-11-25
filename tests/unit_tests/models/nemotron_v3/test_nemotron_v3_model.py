@@ -98,8 +98,8 @@ def _model_parallelizer_checkpointing_worker(rank: int, rendezvous: str) -> None
     """One gloo rank: apply the model's own parallelizer with activation checkpointing on a CPU mesh.
 
     Without expert parallelism this parallelizer checkpoints every block of the native layout through the MoE
-    parallelizer's ``apply_ac``. What the model keeps out of block checkpointing has to stay out on this path
-    as it does with expert parallelism.
+    parallelizer's ``apply_ac``. A block whose scan state is exempt has to be checkpointed on this path as it
+    is with expert parallelism, and the MoE block of a weight-tied MTP depth has to keep its activations.
     """
     import torch.distributed as dist
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
@@ -118,18 +118,16 @@ def _model_parallelizer_checkpointing_worker(rank: int, rendezvous: str) -> None
             config = MockNemotronV3Config(
                 layers_block_type=["mamba", "attention", "mlp", "mamba", "moe"], num_hidden_layers=5
             )
-            model = NemotronHForCausalLM(
-                config, backend=backend, mamba_ac_exempt_blocks=1, mamba_scan_ac_exempt_blocks=1
-            )
+            model = NemotronHForCausalLM(config, backend=backend, mamba_scan_ac_exempt_blocks=1)
             PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=activation_checkpointing)
             blocks = list(model.model.layers.values())
-            # Every block is checkpointed except the first Mamba block, which ``mamba_ac_exempt_blocks`` exempts.
+            # Every block is checkpointed, the Mamba block that ``mamba_scan_ac_exempt_blocks`` selects too.
             wrapped = [isinstance(block, CheckpointWrapper) for block in blocks]
-            assert wrapped == [False, True, True, True, True], (activation_checkpointing, wrapped)
-            # ``mamba_scan_ac_exempt_blocks`` counts from the first checkpointed Mamba block: that block is
-            # wrapped and its mixer keeps the scan state.
-            assert blocks[0].mixer.scan_ac_exempt is False
-            assert blocks[3]._checkpoint_wrapped_module.mixer.scan_ac_exempt is True
+            assert wrapped == [True, True, True, True, True], (activation_checkpointing, wrapped)
+            # ``mamba_scan_ac_exempt_blocks`` counts from the first Mamba block: the mixer of that block
+            # keeps the scan state, the mixer of the second Mamba block does not.
+            assert blocks[0]._checkpoint_wrapped_module.mixer.scan_ac_exempt is True
+            assert blocks[3]._checkpoint_wrapped_module.mixer.scan_ac_exempt is False
 
         # One physical ``[attention, moe]`` MTP depth that runs twice.
         config = MockNemotronV3Config(
@@ -659,63 +657,11 @@ class TestNemotronHForCausalLM:
             torch.testing.assert_close(params[name], values)
         assert model.lm_head.weight.dtype == torch.bfloat16
 
-    def test_mamba_blocks_are_checkpointed_by_default(self, config, backend):
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    def test_model_parallelizer_checkpoints_scan_exempt_blocks(self, tmp_path):
+        """FSDP2 without expert parallelism (``NemotronHModelParallelizer``) checkpoints scan-exempt blocks too.
 
-        config.layers_block_type = ["mamba", "attention", "mlp"]
-        config.num_hidden_layers = 3
-        model = NemotronHForCausalLM(config, backend=backend)
-
-        assert all(block._nemo_disable_activation_checkpointing is False for block in model.model.layers.values())
-
-    @pytest.mark.parametrize(
-        ("exempt", "expected"),
-        [("all", [True, False, False, True, True]), (2, [True, False, False, True, False]), (0, [False] * 5)],
-    )
-    def test_mamba_ac_exempt_blocks_marks_the_first_mamba_blocks(self, config, backend, exempt, expected):
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-
-        config.layers_block_type = ["mamba", "attention", "mlp", "mamba", "mamba"]
-        config.num_hidden_layers = 5
-        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=exempt)
-
-        opted_out = [block._nemo_disable_activation_checkpointing for block in model.model.layers.values()]
-        assert opted_out == expected
-
-    @pytest.mark.parametrize("exempt", [-1, 3, "some", True, 1.0])
-    def test_mamba_ac_exempt_blocks_rejects_values_outside_the_mamba_block_count(self, config, backend, exempt):
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-
-        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
-        config.num_hidden_layers = 4
-
-        with pytest.raises(ValueError, match="mamba_ac_exempt_blocks must be 'all' or an integer between 0 and"):
-            NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=exempt)
-
-    def test_mamba_ac_exempt_blocks_are_left_unwrapped_by_gradient_checkpointing_enable(self, config, backend):
-        """The single-process entry point (world size 1, DDP) honors the exemption like the MoE parallelizer."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-
-        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
-        config.num_hidden_layers = 4
-        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=1)
-
-        model.gradient_checkpointing_enable()
-        assert [isinstance(block, NemotronV3Block) for block in model.model.layers.values()] == [
-            True,
-            False,
-            False,
-            False,
-        ]
-        model.gradient_checkpointing_disable()
-        assert all(isinstance(block, NemotronV3Block) for block in model.model.layers.values())
-
-    def test_model_parallelizer_keeps_exempt_blocks_out_of_checkpointing(self, tmp_path):
-        """FSDP2 without expert parallelism (``NemotronHModelParallelizer``) honors the exemptions too.
-
-        Full and selective checkpointing with ``mamba_ac_exempt_blocks`` and ``mamba_scan_ac_exempt_blocks``,
-        and the MoE block of a weight-tied MTP depth.
+        Full and selective checkpointing with ``mamba_scan_ac_exempt_blocks``, and the MoE block of a
+        weight-tied MTP depth.
         """
         import torch.multiprocessing as mp
 
@@ -726,50 +672,23 @@ class TestNemotronHForCausalLM:
             join=True,
         )
 
-    @pytest.mark.parametrize("selective", [False, True])
-    def test_mamba_ac_exempt_blocks_leaves_exempt_blocks_unwrapped(self, config, backend, selective):
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-        from nemo_automodel.components.moe.parallelizer import apply_ac
-
-        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
-        config.num_hidden_layers = 4
-        model = NemotronHForCausalLM(config, backend=backend, mamba_ac_exempt_blocks=1)
-
-        apply_ac(model, hidden_size=config.hidden_size, num_experts=config.n_routed_experts, selective=selective)
-
-        # A checkpoint wrapper replaces the block in the layer collection; an exempt block stays itself.
-        unwrapped = [isinstance(block, NemotronV3Block) for block in model.model.layers.values()]
-        assert unwrapped == [True, False, False, False]
-
     @pytest.mark.parametrize(
-        ("exempt", "scan_exempt", "expected"),
-        [
-            (0, "all", [True, True, True]),
-            (1, "all", [False, True, True]),
-            (1, 1, [False, True, False]),
-            (0, 2, [True, True, False]),
-            (2, 0, [False, False, False]),
-            ("all", "all", [False, False, False]),
-        ],
+        ("scan_exempt", "expected"),
+        [("all", [True, True, True]), (1, [True, False, False]), (2, [True, True, False]), (0, [False] * 3)],
     )
-    def test_mamba_scan_ac_exempt_blocks_marks_the_first_checkpointed_mamba_blocks(
-        self, config, backend, exempt, scan_exempt, expected
-    ):
+    def test_mamba_scan_ac_exempt_blocks_marks_the_first_mamba_blocks(self, config, backend, scan_exempt, expected):
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         config.layers_block_type = ["mamba", "attention", "mlp", "mamba", "mamba"]
         config.num_hidden_layers = 5
-        model = NemotronHForCausalLM(
-            config, backend=backend, mamba_ac_exempt_blocks=exempt, mamba_scan_ac_exempt_blocks=scan_exempt
-        )
+        model = NemotronHForCausalLM(config, backend=backend, mamba_scan_ac_exempt_blocks=scan_exempt)
 
         marked = [block.mixer.scan_ac_exempt for block in model.model.layers.values() if block.block_type == "mamba"]
         assert marked == expected
 
-    @pytest.mark.parametrize(("exempt", "scan_exempt"), [(0, 3), (1, 2), (0, -1), (0, "some"), (0, 1.5), (0, True)])
-    def test_mamba_scan_ac_exempt_blocks_rejects_values_outside_the_checkpointed_block_count(
-        self, config, backend, exempt, scan_exempt
+    @pytest.mark.parametrize("scan_exempt", [3, -1, "some", 1.5, True])
+    def test_mamba_scan_ac_exempt_blocks_rejects_values_outside_the_mamba_block_count(
+        self, config, backend, scan_exempt
     ):
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
@@ -777,9 +696,7 @@ class TestNemotronHForCausalLM:
         config.num_hidden_layers = 4
 
         with pytest.raises(ValueError, match="mamba_scan_ac_exempt_blocks must be 'all' or an integer between 0 and"):
-            NemotronHForCausalLM(
-                config, backend=backend, mamba_ac_exempt_blocks=exempt, mamba_scan_ac_exempt_blocks=scan_exempt
-            )
+            NemotronHForCausalLM(config, backend=backend, mamba_scan_ac_exempt_blocks=scan_exempt)
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""

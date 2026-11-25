@@ -276,32 +276,28 @@ class NemotronV3Mamba2Mixer(nn.Module):
     Requires mamba_ssm and causal_conv1d packages.
 
     The input and output projections follow ``backend.mamba_linear``. With ``"torch"`` (the default) both
-    are ``torch.nn.Linear`` and the training path applies the output projection inside the scan kernel
-    unless ``backend.mamba_fused_out_proj`` is False. With ``"te"`` both are Transformer Engine linears,
-    the output projection runs as a module after the scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize
-    both GEMMs like every other TE linear.
+    are ``torch.nn.Linear`` and the training path applies the output projection inside the scan kernel.
+    With ``"te"`` both are Transformer Engine linears, the output projection runs as a module after the
+    scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize both GEMMs like every other TE linear.
 
     ``backend.mamba_norm_backward_grid_scale`` above 1 runs the training scan through
     ``mamba_scan.split_conv1d_scan``, which launches the gated-RMSNorm backward kernel with that many times
-    the programs. ``backend.mamba_out_proj_ac_exempt`` keeps the tensors an output projection applied after
-    the kernel saves out of activation checkpointing. ``scan_ac_exempt`` (set per block through
-    ``mamba_scan_ac_exempt_blocks`` of ``NemotronV3ForCausalLM``) also keeps the scan kernel's state, so a
-    checkpoint recompute of the block ends after the input projection.
+    the programs. ``scan_ac_exempt`` (set per block through ``mamba_scan_ac_exempt_blocks`` of
+    ``NemotronV3ForCausalLM``) keeps the scan kernel's state and the tensors an output projection applied
+    after the kernel saves out of activation checkpointing, so a checkpoint recompute of the block ends
+    after the input projection.
 
     With context parallelism the scan runs through the context-parallel transport, which applies the norm and
-    the output projection as modules and has none of these paths: ``mamba_fused_out_proj`` and
-    ``mamba_norm_backward_grid_scale`` do not apply there, and a mixer with ``mamba_out_proj_ac_exempt`` or
-    ``scan_ac_exempt`` raises in its forward instead of silently recomputing what it was told to keep.
+    the output projection as modules and has neither path: ``mamba_norm_backward_grid_scale`` does not apply
+    there, and a mixer with ``scan_ac_exempt`` raises in its forward instead of silently recomputing what it
+    was told to keep.
     """
 
     def __init__(self, config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.layer_idx = layer_idx
         mamba_linear = backend.mamba_linear if backend is not None else "torch"
-        # Whether a plain torch.nn.Linear output projection is applied inside the scan kernel.
-        self.fused_out_proj = backend.mamba_fused_out_proj if backend is not None else True
         self.norm_backward_grid_scale = backend.mamba_norm_backward_grid_scale if backend is not None else 1
-        self.out_proj_ac_exempt = backend.mamba_out_proj_ac_exempt if backend is not None else False
         # Set by ``NemotronV3ForCausalLM`` through ``mamba_scan_ac_exempt_blocks``.
         self.scan_ac_exempt = False
 
@@ -492,12 +488,11 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             if self.cp is not None:
-                if self.scan_ac_exempt or self.out_proj_ac_exempt:
+                if self.scan_ac_exempt:
                     raise ValueError(
-                        "mamba_scan_ac_exempt_blocks and backend.mamba_out_proj_ac_exempt are not supported with "
-                        "context parallelism: the context-parallel Mamba scan has no checkpoint-exempt path and "
-                        "would recompute the scan and the output projection. Remove them, or use "
-                        "mamba_ac_exempt_blocks, which takes whole blocks out of activation checkpointing."
+                        "mamba_scan_ac_exempt_blocks is not supported with context parallelism: the "
+                        "context-parallel Mamba scan has no checkpoint-exempt path and would recompute the "
+                        "scan and the output projection. Remove it."
                     )
                 # ``MambaContextParallel`` uses a non-None ``cu_seqlens`` to
                 # select its packed 2D THD transport. SDPA/flex attention
@@ -554,7 +549,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(A_log.float())
                 # Adapters and sharded wrappers must execute their module forward/hooks.
-                fuse_out_proj = self.fused_out_proj and type(self.out_proj) is nn.Linear
+                fuse_out_proj = type(self.out_proj) is nn.Linear
 
                 if self.norm_backward_grid_scale > 1 or self.scan_ac_exempt:
                     out = split_conv1d_scan(
@@ -599,11 +594,11 @@ class NemotronV3Mamba2Mixer(nn.Module):
                         **dt_limit_kwargs,
                     )
                 if not fuse_out_proj:
-                    if self.out_proj_ac_exempt or self.scan_ac_exempt:
+                    if self.scan_ac_exempt:
                         # Only the innermost pair of saved-tensor hooks applies, so the projection's saved
                         # tensors bypass the hooks of an enclosing activation checkpoint: they stay alive,
-                        # and the checkpoint's recompute ends before the projection's forward (at the scan
-                        # kernel, or at the input projection when the scan's state is exempt too).
+                        # and the checkpoint's recompute, which already skips the scan kernels, ends after
+                        # the input projection.
                         with torch.autograd.graph.saved_tensors_hooks(_keep_saved_tensor, _keep_saved_tensor):
                             out = self.out_proj(out)
                     else:
@@ -857,11 +852,6 @@ class NemotronV3Block(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.residual_in_fp32 = getattr(config, "residual_in_fp32", False)
-        # Read by every activation-checkpointing entry point of the model (the MoE parallelizer, the model's
-        # own parallelizer and ``gradient_checkpointing_enable``): a block with this flag set is left out of
-        # block-level activation checkpointing (``NemotronV3ForCausalLM`` sets it through
-        # ``mamba_ac_exempt_blocks``).
-        self._nemo_disable_activation_checkpointing = False
 
         # RMSNorm
         self.norm = initialize_rms_norm_module(

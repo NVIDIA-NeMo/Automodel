@@ -74,8 +74,6 @@
 # Every memory figure in this header was taken with PYTORCH_ALLOC_CONF=expandable_segments:True in every rank
 # (ci.env_vars below); the file was not run without it. With the learned gate the buffer sizes of a rank
 # change from step to step.
-# model.mamba_ac_exempt_blocks: N (not set here) takes N Mamba blocks out of activation checkpointing: each
-# costs about 4 GiB at local_batch_size: 8 and saves about 0.15% of the step.
 #
 # Measured on mock tokens with NVTE_USE_FAST_MATH=1 and 2 learning-rate warm-up steps instead of 100, 26
 # steps of which the last 20 are timed. Loss and gradient norm were finite in every step of every run. All

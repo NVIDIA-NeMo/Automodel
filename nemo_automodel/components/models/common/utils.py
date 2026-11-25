@@ -1045,14 +1045,6 @@ class BackendConfig:
             inside the scan kernel. ``"te"`` builds both as Transformer Engine linears: the output
             projection then runs as a module after the scan kernel and ``te_fp8`` / ``te_nvfp4``
             quantize both GEMMs. Default ``"torch"``.
-        mamba_fused_out_proj: Whether a ``torch.nn.Linear`` Mamba output projection is applied inside
-            the scan kernel (NemotronV3). False applies it as a module after the kernel: the same
-            GEMMs, but under block activation checkpointing the recompute stops before the
-            projection's forward GEMM (``torch.nn.Linear`` saves its input before computing, and it
-            is the last operation of the block that saves anything), and the kernel's backward no
-            longer rebuilds the projection input. Ignored for ``mamba_linear="te"`` and for
-            adapter-wrapped projections, which always run after the kernel, and with context
-            parallelism, whose scan always applies the projection as a module. Default True.
         mamba_norm_backward_grid_scale: Number of programs of the gated-RMSNorm backward kernel in the
             Mamba training scan (NemotronV3), as a multiple of the number mamba_ssm launches (about one
             per streaming multiprocessor, each looping over thousands of rows). 1 runs mamba_ssm's own
@@ -1060,14 +1052,6 @@ class BackendConfig:
             same kernels in the same order, with shorter row loops for this one. The output is
             unchanged; of the gradients only the norm weight's changes, in its float32 summation
             order. Not used with context parallelism. Default 1.
-        mamba_out_proj_ac_exempt: Keep the tensors saved by a Mamba output projection that runs as a
-            module after the scan kernel (NemotronV3) out of activation checkpointing. A Transformer
-            Engine linear saves its (quantized) input only after its GEMM, so a checkpoint recompute
-            repeats the projection's quantization and GEMM just to rebuild them. With True they are
-            kept from the forward, which costs their memory per checkpointed Mamba block, and the
-            recompute ends at the scan kernel. No effect on a projection applied inside the kernel or
-            on blocks that are not checkpointed. Not supported with context parallelism: the mixer
-            raises. Default False.
     """
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -1164,9 +1148,7 @@ class BackendConfig:
     benchmark_static_routing: bool = False
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
     mamba_linear: Literal["torch", "te"] = "torch"
-    mamba_fused_out_proj: bool = True
     mamba_norm_backward_grid_scale: int = 1
-    mamba_out_proj_ac_exempt: bool = False
 
     def __post_init__(self) -> None:
         if self.mamba_linear not in ("torch", "te"):

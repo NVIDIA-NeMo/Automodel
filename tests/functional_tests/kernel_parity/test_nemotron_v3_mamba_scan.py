@@ -305,14 +305,17 @@ def test_split_conv1d_scan_backward_runs_in_the_autocast_dtype_of_its_forward(ch
     assert not torch.equal(plain_grads[0], library_grads[0])
 
 
-@pytest.mark.parametrize("fused", [False, True])
-def test_mixer_with_a_scaled_grid_matches_the_default_mixer_on_the_real_kernels(fused):
+@pytest.mark.parametrize("mamba_linear", ["torch", "te"])
+def test_mixer_with_a_scaled_grid_matches_the_default_mixer_on_the_real_kernels(mamba_linear):
+    """Torch projections apply the output projection inside the kernel, Transformer Engine ones after it."""
     pytest.importorskip("mamba_ssm")
+    if mamba_linear == "te":
+        pytest.importorskip("transformer_engine")
     config = MockNemotronV3Config(mamba_num_heads=4, n_groups=2)
     torch.manual_seed(20261123)
-    default = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_backend(mamba_fused_out_proj=fused))
+    default = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_backend(mamba_linear=mamba_linear))
     scaled = NemotronV3Mamba2Mixer(
-        config, layer_idx=0, backend=_backend(mamba_fused_out_proj=fused, mamba_norm_backward_grid_scale=8)
+        config, layer_idx=0, backend=_backend(mamba_linear=mamba_linear, mamba_norm_backward_grid_scale=8)
     )
     with torch.no_grad():
         default.norm.weight.uniform_(0.5, 1.5)
@@ -350,19 +353,18 @@ class _ForwardCounter:
 
 
 @pytest.mark.parametrize("scale", [1, 8])
-@pytest.mark.parametrize("projections", ["torch_fused", "torch_after_kernel", "te"])
+@pytest.mark.parametrize("mamba_linear", ["torch", "te"])
 @pytest.mark.parametrize("scan_exempt", [False, True])
-def test_scan_exempt_mixer_recomputes_only_its_input_projection(monkeypatch, scan_exempt, projections, scale):
-    """Under a checkpoint, an exempt scan runs once and the gradients are those of an uncheckpointed mixer."""
+def test_scan_exempt_mixer_recomputes_only_its_input_projection(monkeypatch, scan_exempt, mamba_linear, scale):
+    """Under a checkpoint, an exempt scan runs once and the gradients are those of an uncheckpointed mixer.
+
+    Torch projections apply the output projection inside the kernel, Transformer Engine ones after it.
+    """
     ssd_combined = pytest.importorskip("mamba_ssm.ops.triton.ssd_combined")
-    if projections == "te":
+    if mamba_linear == "te":
         pytest.importorskip("transformer_engine")
     config = MockNemotronV3Config(mamba_num_heads=4, n_groups=2)
-    backend = _backend(
-        mamba_linear="te" if projections == "te" else "torch",
-        mamba_fused_out_proj=projections == "torch_fused",
-        mamba_norm_backward_grid_scale=scale,
-    )
+    backend = _backend(mamba_linear=mamba_linear, mamba_norm_backward_grid_scale=scale)
     torch.manual_seed(20261123)
     mixer = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=backend)
     with torch.no_grad():

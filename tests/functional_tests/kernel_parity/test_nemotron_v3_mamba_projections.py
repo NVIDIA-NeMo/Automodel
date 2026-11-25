@@ -15,8 +15,8 @@
 """Mamba output projection of Nemotron V3 applied after the scan kernel against the one applied inside it.
 
 Runs the real scan kernel on CUDA twice on identical weights and inputs: with the output projection inside
-the kernel (the default) and with the projection as a module after the kernel, either as Transformer Engine linears
-(``mamba_linear="te"``) or as ``torch.nn.Linear`` (``mamba_fused_out_proj=False``).
+the kernel (the default) and with both projections as Transformer Engine linears (``mamba_linear="te"``),
+whose output projection runs as a module after the kernel.
 The two must agree in output and in every gradient. The first run of a dtype compiles the Triton kernels of
 the scan, about a minute each, which is why this comparison is not a unit test.
 """
@@ -25,7 +25,6 @@ import math
 
 import pytest
 import torch
-from torch import nn
 
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mamba_linear_backend import _backend
@@ -39,13 +38,12 @@ def _weighted_sum(output: torch.Tensor) -> torch.Tensor:
     return (output.float() * weights.reshape(output.shape)).sum()
 
 
-@pytest.mark.parametrize("projections", ["te", "torch_after_kernel"])
 @pytest.mark.parametrize(
     ("dtype", "rtol"),
     [(torch.float32, 2e-4), (torch.bfloat16, 3e-2)],
     ids=["fp32", "bf16"],
 )
-def test_projections_after_the_kernel_match_the_fused_projection_on_the_real_kernel(projections, dtype, rtol):
+def test_projections_after_the_kernel_match_the_fused_projection_on_the_real_kernel(dtype, rtol):
     pytest.importorskip("transformer_engine")
     pytest.importorskip("mamba_ssm")
     device = torch.device("cuda")
@@ -53,14 +51,9 @@ def test_projections_after_the_kernel_match_the_fused_projection_on_the_real_ker
 
     torch.manual_seed(20261123)
     fused = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_backend("torch"))
-    if projections == "te":
-        external = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_backend("te"))
-        assert type(external.in_proj).__module__.startswith("transformer_engine")
-        assert type(external.out_proj).__module__.startswith("transformer_engine")
-    else:
-        external = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_backend("torch", mamba_fused_out_proj=False))
-        assert type(external.in_proj) is nn.Linear and type(external.out_proj) is nn.Linear
-        assert fused.fused_out_proj and not external.fused_out_proj
+    external = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_backend("te"))
+    assert type(external.in_proj).__module__.startswith("transformer_engine")
+    assert type(external.out_proj).__module__.startswith("transformer_engine")
     # Identical parameter names and shapes: checkpoints are interchangeable between the two settings.
     assert [(name, parameter.shape) for name, parameter in fused.named_parameters()] == [
         (name, parameter.shape) for name, parameter in external.named_parameters()
