@@ -32,6 +32,7 @@ from .fused_a2a import (
     get_hybrid_ep_initialized_capacity,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    note_hybrid_ep_local_experts,
     publish_hybrid_ep_initialized_capacity,
     set_deepep_num_sms,
     set_uccl_num_sms,
@@ -553,6 +554,7 @@ class _HybridEPManager(_DispatchManager):
                 "HybridEP is not installed. Please install HybridEP package from "
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
+        note_hybrid_ep_local_experts(num_local_experts)
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Process routing map and probabilities to prepare dispatch metadata."""
@@ -1218,6 +1220,15 @@ class MoEFlexTokenDispatcher:
                     raise ValueError(
                         "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
                         "dispatch settings (and the same recompute-cache setting)"
+                    )
+                shared_counts = (self._comm_manager.num_experts, self._comm_manager.num_local_experts)
+                layer_counts = (self.tp_size * self.config.num_moe_experts, self.num_local_experts)
+                if shared_counts != layer_counts:
+                    raise ValueError(
+                        f"A shared HybridEP dispatcher was built for {shared_counts[0]} experts "
+                        f"({shared_counts[1]} per rank) and cannot serve a layer with {layer_counts[0]} experts "
+                        f"({layer_counts[1]} per rank). Set dispatcher_share_token_dispatcher=False for models "
+                        "whose MoE layers differ in expert count."
                     )
             else:
                 self._comm_manager = _HybridEPManager(

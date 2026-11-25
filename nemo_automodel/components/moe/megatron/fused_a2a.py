@@ -565,6 +565,17 @@ _hybrid_ep_buffer = None
 _hybrid_ep_runtime_signature: tuple[int | torch.dtype | torch.device | None, ...] | None = None
 _hybrid_ep_initialized_capacity = 0
 
+# The buffer is process-global, but the per-rank expert count can differ between MoE layers.
+# Growing it at a later layer reallocates the buffer and invalidates handles saved for
+# activation-checkpoint recompute, so allocate for the largest count any layer registered.
+_hybrid_ep_max_local_experts = 0
+
+
+def note_hybrid_ep_local_experts(num_local_experts: int) -> None:
+    """Record a layer's per-rank expert count so the first allocation covers every layer."""
+    global _hybrid_ep_max_local_experts
+    _hybrid_ep_max_local_experts = max(_hybrid_ep_max_local_experts, int(num_local_experts))
+
 
 def get_hybrid_ep_initialized_capacity(signature: tuple[int | torch.dtype | torch.device | None, ...]) -> int:
     """Return process-global initialized capacity after validating the resource signature.
@@ -725,7 +736,7 @@ def init_hybrid_ep_buffer(
         group=group,
         hidden_dim=hidden_dim,
         max_num_of_tokens_per_rank=seq_len,
-        num_local_experts=num_local_experts,
+        num_local_experts=max(int(num_local_experts), _hybrid_ep_max_local_experts),
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,

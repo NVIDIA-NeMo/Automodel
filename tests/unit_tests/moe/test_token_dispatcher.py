@@ -439,6 +439,34 @@ def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, sett
         MoEFlexTokenDispatcher(2, [0, 1], config, group)
 
 
+def test_shared_hybridep_manager_rejects_a_layer_with_a_different_expert_count(monkeypatch):
+    """A shared manager is sized for one expert count; a differently sized layer must not reuse it."""
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", Mock())
+    group = Mock()
+    group.size.return_value = 4
+    small = TokenDispatcherConfig(moe_flex_dispatcher_backend="hybridep", num_moe_experts=8)
+    large = TokenDispatcherConfig(moe_flex_dispatcher_backend="hybridep", num_moe_experts=16)
+    MoEFlexTokenDispatcher(2, [0, 1], small, group)
+
+    with pytest.raises(ValueError, match="dispatcher_share_token_dispatcher=False"):
+        MoEFlexTokenDispatcher(4, [0, 1, 2, 3], large, group)
+
+
+def test_unshared_hybridep_managers_accept_layers_with_different_expert_counts(monkeypatch):
+    """Without sharing, each layer gets a manager built for its own expert count."""
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", Mock())
+    group = Mock()
+    group.size.return_value = 4
+    kwargs = dict(moe_flex_dispatcher_backend="hybridep", moe_share_token_dispatcher=False)
+    small = MoEFlexTokenDispatcher(2, [0, 1], TokenDispatcherConfig(num_moe_experts=8, **kwargs), group)
+    large = MoEFlexTokenDispatcher(4, [0, 1, 2, 3], TokenDispatcherConfig(num_moe_experts=16, **kwargs), group)
+
+    assert (small._comm_manager.num_experts, large._comm_manager.num_experts) == (8, 16)
+    assert (small._comm_manager.num_local_experts, large._comm_manager.num_local_experts) == (2, 4)
+
+
 @pytest.mark.parametrize("share_token_dispatcher", [True, False])
 def test_flex_dispatcher_forwards_max_tokens_per_rank_for_both_sharing_modes(monkeypatch, share_token_dispatcher):
     """The capacity hint must reach the HybridEP manager whether or not dispatchers are shared."""
@@ -1202,3 +1230,17 @@ def test_hybridep_first_capacity_dispatch_backward(
     torch.testing.assert_close(values.grad, values.detach().cos(), rtol=0, atol=0)
     assert manager._hybridep_capacity == 8
     assert transport.call_count == (2 if checkpointed else 1)
+
+
+def test_hybrid_ep_manager_registers_its_local_expert_count_for_buffer_sizing(monkeypatch):
+    """Managers of differently sized MoE layers leave the largest per-rank expert count registered."""
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_max_local_experts", 0)
+
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=lambda *a, **kw: None,
+    ):
+        for num_local_experts in (30, 62, 46):
+            _HybridEPManager(group=None, num_local_experts=num_local_experts, num_experts=496, router_topk=2)
+
+    assert fused_a2a._hybrid_ep_max_local_experts == 62

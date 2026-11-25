@@ -31,9 +31,11 @@ def _restore_buffer():
     saved_hybridep = fused_a2a._hybrid_ep_buffer
     saved_hybridep_signature = fused_a2a._hybrid_ep_runtime_signature
     saved_hybridep_capacity = fused_a2a._hybrid_ep_initialized_capacity
+    saved_hybridep_max_local_experts = fused_a2a._hybrid_ep_max_local_experts
     try:
         yield
     finally:
+        fused_a2a._hybrid_ep_max_local_experts = saved_hybridep_max_local_experts
         fused_a2a._buffer = saved
         fused_a2a._hybrid_ep_buffer = saved_hybridep
         fused_a2a._hybrid_ep_runtime_signature = saved_hybridep_signature
@@ -716,3 +718,39 @@ def test_hybridep_combine_without_cache_flag_ignores_the_bound_cache():
         fused_a2a.HybridEPCombine.apply(x, "handle", None, None, False, False)
     assert not cache.has_next()
     assert buffer.combines == 1
+
+
+def _init_hybridep_buffer_with_local_experts(monkeypatch, num_local_experts: int) -> mock.Mock:
+    buffer = mock.Mock()
+    monkeypatch.setattr(fused_a2a, "HybridEPBuffer", buffer, raising=False)
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    fused_a2a.init_hybrid_ep_buffer(
+        group=mock.Mock(),
+        hidden_dim=64,
+        seq_len=128,
+        num_local_experts=num_local_experts,
+        num_sms_dispatch_api=20,
+        num_sms_combine_api=20,
+        fp8_dispatch=False,
+    )
+    return buffer
+
+
+def test_init_hybridep_buffer_covers_largest_registered_layer(monkeypatch):
+    """Layers with different expert counts share one buffer, sized for the largest of them."""
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_max_local_experts", 0)
+    for num_local_experts in (30, 62, 46):
+        fused_a2a.note_hybrid_ep_local_experts(num_local_experts)
+
+    buffer = _init_hybridep_buffer_with_local_experts(monkeypatch, 30)
+
+    assert buffer.call_args.kwargs["num_local_experts"] == 62
+
+
+def test_init_hybridep_buffer_keeps_requested_local_experts_without_registrations(monkeypatch):
+    """Models with one expert count per layer allocate exactly what the layer asks for."""
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_max_local_experts", 0)
+
+    buffer = _init_hybridep_buffer_with_local_experts(monkeypatch, 16)
+
+    assert buffer.call_args.kwargs["num_local_experts"] == 16
