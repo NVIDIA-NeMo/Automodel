@@ -48,8 +48,11 @@ from nemo_automodel.components.datasets.vlm.fake_image import (
 from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
 
 if TYPE_CHECKING:
+    from datasets import Dataset as HfDataset
     from torch.distributed.device_mesh import DeviceMesh
     from transformers import ProcessorMixin
+
+    from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 
 
 def dspark_vlm_collate_fn(
@@ -128,7 +131,7 @@ def dspark_vlm_collate_fn(
 
 def build_dspark_vlm_dataloader(
     *,
-    dataset: Dataset,
+    dataset: HfDataset | Dataset | Sequence[ConversationSample],
     processor: ProcessorMixin,
     batch_size: int,
     max_length: int,

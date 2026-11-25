@@ -275,7 +275,15 @@ def test_target_kwargs_defaults_and_overrides():
     assert backend.enable_fsdp_optimizations is False
 
 
-def test_recipe_passes_target_options_from_recipe_args():
+@pytest.mark.parametrize(
+    ("fsdp_override", "expected"),
+    [
+        ({}, None),
+        ({"target_enable_fsdp_optimizations": False}, False),
+        ({"target_enable_fsdp_optimizations": None}, False),
+    ],
+)
+def test_recipe_passes_target_options_from_recipe_args(fsdp_override, expected):
     """The recipe reads ``recipe_args.target_*``; the spec callback only sees typed options."""
     import dataclasses
 
@@ -295,9 +303,9 @@ def test_recipe_passes_target_options_from_recipe_args():
     recipe_args = {
         "target_dispatcher": "deepep",
         "target_experts": "torch_mm",
-        "target_enable_fsdp_optimizations": False,
+        **fsdp_override,
     }
 
     with pytest.raises(_Stop):
         recipe._build_target_model(recipe_args, "moonshotai/Kimi-K3", spec)
-    assert seen == [DFlashTargetOptions(dispatcher="deepep", experts="torch_mm", enable_fsdp_optimizations=False)]
+    assert seen == [DFlashTargetOptions(dispatcher="deepep", experts="torch_mm", enable_fsdp_optimizations=expected)]

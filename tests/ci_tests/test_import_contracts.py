@@ -135,8 +135,21 @@ class RecipeImportContractTests(unittest.TestCase):
                 self.assertIn(f"{CONFIG_BOUNDARY_CONTRACT} BROKEN", output)
                 self.assertIn("nemo_automodel.components.config.loader", output)
 
+    def test_components_cannot_import_config_indirectly(self) -> None:
+        """A shared module cannot bridge a component to the config layer."""
+        bridge = self.root / "nemo_automodel" / "shared" / "_config_boundary_probe.py"
+        bridge.write_text("from nemo_automodel.components.config import loader\n")
+        source = self.root / "nemo_automodel" / "components" / "speculative" / "_config_boundary_probe.py"
+        source.write_text("from nemo_automodel.shared import _config_boundary_probe\n")
+
+        returncode, output = self._lint_imports()
+
+        self.assertEqual(returncode, 1, output)
+        self.assertIn(f"{CONFIG_BOUNDARY_CONTRACT} BROKEN", output)
+        self.assertIn("nemo_automodel.shared._config_boundary_probe", output)
+
     def test_config_boundary_contract_covers_every_component(self) -> None:
-        """Every component package except ``config`` is a source of the config-boundary contract."""
+        """Every component package and module except ``config`` is a source of the config-boundary contract."""
         contracts = self._importlinter_config()["contracts"]
         (contract,) = [c for c in contracts if c["name"] == CONFIG_BOUNDARY_CONTRACT]
         components = self.root / "nemo_automodel" / "components"
@@ -145,6 +158,9 @@ class RecipeImportContractTests(unittest.TestCase):
             for path in components.glob("*/__init__.py")
             if path.parent.name != "config"
         }
+        expected.update(
+            f"nemo_automodel.components.{path.stem}" for path in components.glob("*.py") if path.stem != "__init__"
+        )
         self.assertEqual(expected, set(contract["source_modules"]))
         self.assertEqual(
             {"nemo_automodel.components.config", "nemo_automodel.recipes"}, set(contract["forbidden_modules"])

@@ -40,8 +40,8 @@ not yet comply; use these guidelines to guide changes within your task's scope.
   a component is the same boundary violation; it does not make the configuration typed. Do not reconstruct or
   interpret the YAML schema inside components. Typing a component parameter as `ConfigNode` (even through a
   `TYPE_CHECKING` import) or as a `Protocol` that `ConfigNode` satisfies does not fix the violation either.
-  import-linter rejects any component import of `nemo_automodel.components.config`, and
-  `tools/lint_config_boundary.py` rejects the duck-typed forms.
+  The component import contract blocks dependencies on `nemo_automodel.components.config` or
+  `nemo_automodel.recipes`. The `tools/lint_config_boundary.py` check catches common duck-typed forms.
 - **Let configs own construction.** Use typed `build(...)` methods; keep runtime objects out of serializable configs.
   Preserve typed configs internally, serialize at shared boundaries, and do not mutate configs during construction.
 - **Keep artifact versions consistent.** Resolve related external artifacts, such as configs and weights,

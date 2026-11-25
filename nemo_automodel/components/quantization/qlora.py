@@ -115,6 +115,9 @@ def create_bnb_config(config: Mapping[str, Any]) -> BitsAndBytesConfig | None:
         stacklevel=2,
     )
     settings = {f.name: config.get(f.name, None) for f in fields(BnbQuantizationConfig) if f.name in config}
+    for flag in ("load_in_4bit", "load_in_8bit"):
+        if flag in settings:
+            settings[flag] = bool(settings[flag])
     return BnbQuantizationConfig(**settings).build()
 
 

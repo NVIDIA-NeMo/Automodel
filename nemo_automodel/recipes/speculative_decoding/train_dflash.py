@@ -443,7 +443,11 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
         target_options = DFlashTargetOptions(
             dispatcher=recipe_cfg.get("target_dispatcher", None),
             experts=recipe_cfg.get("target_experts", None),
-            enable_fsdp_optimizations=recipe_cfg.get("target_enable_fsdp_optimizations", None),
+            enable_fsdp_optimizations=(
+                bool(recipe_cfg.get("target_enable_fsdp_optimizations"))
+                if "target_enable_fsdp_optimizations" in recipe_cfg
+                else None
+            ),
         )
         target_kwargs.update(draft_spec.build_target_kwargs(target_options))
         self.dist_setup = None

@@ -25,7 +25,7 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-# Inductor option values, as typed by ``torch.compile(options=...)`` for options set from config.
+# Common scalar options for callers that build their settings from YAML.
 CompileOptionValue: TypeAlias = str | int | bool
 
 
@@ -40,14 +40,17 @@ class _CompileKwargs(TypedDict, total=False):
 
 @dataclass
 class CompileConfig:
-    """Configuration for torch.compile."""
+    """Configuration for torch.compile.
+
+    The selected backend defines which option names and value types it accepts.
+    """
 
     enabled: bool = False
     mode: str = "default"
     fullgraph: bool = False
     dynamic: bool = False
     backend: str | None = None
-    options: Mapping[str, CompileOptionValue] = field(default_factory=dict)
+    options: Mapping[str, Any] = field(default_factory=dict)
     dynamo_cache_size_limit: int = 256
 
     def __init__(
@@ -57,7 +60,7 @@ class CompileConfig:
         fullgraph: bool = False,
         dynamic: bool = False,
         backend: str | None = None,
-        options: Mapping[str, CompileOptionValue] | None = None,
+        options: Mapping[str, Any] | None = None,
         dynamo_cache_size_limit: int = 256,
     ) -> None:
         self.enabled = enabled
@@ -65,7 +68,9 @@ class CompileConfig:
         self.fullgraph = fullgraph
         self.dynamic = dynamic
         self.backend = backend
-        self.options = _validated_options(options) if options is not None else {}
+        if options is not None and not isinstance(options, Mapping):
+            raise TypeError(f"CompileConfig.options must be a mapping, got {type(options).__name__}")
+        self.options = options if options is not None else {}
         self.dynamo_cache_size_limit = dynamo_cache_size_limit
 
     def to_dict(self) -> Dict[str, Any]:
@@ -205,24 +210,7 @@ def apply_flash_attention_compile_fix() -> bool:
     return success
 
 
-def _validated_options(options: Mapping[str, CompileOptionValue]) -> dict[str, CompileOptionValue]:
-    """Copy inductor options, rejecting values that ``torch.compile(options=...)`` cannot take from a config.
-
-    The options usually come from YAML, whose values nothing has checked against
-    :data:`CompileOptionValue` yet; the recipe converts its ``compile.options`` block to a
-    plain mapping before building the config.
-    """
-    if not isinstance(options, Mapping):
-        raise TypeError(f"CompileConfig.options must be a mapping, got {type(options).__name__}")
-    validated: dict[str, CompileOptionValue] = {}
-    for key, value in options.items():
-        if not isinstance(value, (str, int, bool)):
-            raise TypeError(f"CompileConfig.options[{key!r}] must be a str, int or bool, got {type(value).__name__}")
-        validated[key] = value
-    return validated
-
-
-def _resolve_compile_kwargs(config: CompileConfig) -> tuple[_CompileKwargs, dict[str, CompileOptionValue]]:
+def _resolve_compile_kwargs(config: CompileConfig) -> tuple[_CompileKwargs, dict[str, Any]]:
     """Translate a CompileConfig into torch.compile keyword arguments and inductor options.
 
     ``torch.compile`` is keyword-only, rejects unknown kwargs, and treats
@@ -303,8 +291,7 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
 
     try:
         if options:
-            # torch.compile types ``options`` as an invariant dict whose values may also be callables.
-            compiled_model = torch.compile(model, options=dict(options), **compile_kwargs)
+            compiled_model = torch.compile(model, options=options, **compile_kwargs)
         else:
             compiled_model = torch.compile(model, **compile_kwargs)
         if not isinstance(compiled_model, nn.Module):
@@ -318,13 +305,17 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
 
 
 def _compile_config_from_mapping(config_dict: Mapping[str, Any]) -> CompileConfig:
+    options = config_dict.get("options")
+    # The deprecated helpers also accepted YAML nodes with nested options.
+    if not isinstance(options, Mapping) and hasattr(options, "to_dict"):
+        options = options.to_dict()
     return CompileConfig(
         enabled=config_dict.get("enabled", False),
         mode=config_dict.get("mode", "default"),
         fullgraph=config_dict.get("fullgraph", False),
         dynamic=config_dict.get("dynamic", False),
         backend=config_dict.get("backend", None),
-        options=config_dict.get("options", {}),
+        options=options,
         dynamo_cache_size_limit=config_dict.get("dynamo_cache_size_limit", 256),
     )
 

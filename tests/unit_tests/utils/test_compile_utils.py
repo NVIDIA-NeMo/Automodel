@@ -21,6 +21,7 @@ import torch.nn as nn
 # Disable torch.compile for testing to avoid compilation overhead
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.utils.compile_utils import (
     CompileConfig,
     apply_flash_attention_compile_fix,
@@ -434,17 +435,22 @@ class TestCompileOptions:
     def test_options_are_forwarded(self, mock_torch_compile, mock_fa_fix, mock_configure):
         model = nn.Linear(2, 2)
         mock_torch_compile.return_value = MagicMock(spec=nn.Module)
-        config = CompileConfig(enabled=True, options={"max_autotune": True, "mode_tag": "x"})
+        options = {"max_autotune": True, "max_autotune_subproc_graceful_timeout_seconds": 0.5, "compile_threads": None}
+        config = CompileConfig(enabled=True, options=options)
 
         compile_model(model, config)
 
-        mock_torch_compile.assert_called_once_with(
-            model, fullgraph=False, dynamic=False, options={"max_autotune": True, "mode_tag": "x"}
-        )
+        mock_torch_compile.assert_called_once_with(model, fullgraph=False, dynamic=False, options=options)
 
-    def test_option_with_unsupported_value_is_rejected_at_construction(self):
-        with pytest.raises(TypeError, match=r"CompileConfig.options\['trace'\] must be a str, int or bool"):
-            CompileConfig(enabled=True, options={"trace": {"enabled": True}})
+    @pytest.mark.parametrize("build", [build_compile_config, create_compile_config_from_dict])
+    def test_deprecated_helpers_accept_nested_config_node_options(self, build):
+        node = ConfigNode({"enabled": True, "options": {"shape_padding": False}})
+
+        with pytest.warns(FutureWarning, match="construct CompileConfig"):
+            config = build(node)
+
+        assert config.enabled
+        assert config.options == {"shape_padding": False}
 
     def test_options_must_be_a_mapping(self):
         with pytest.raises(TypeError, match="CompileConfig.options must be a mapping"):

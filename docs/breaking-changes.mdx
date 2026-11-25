@@ -31,8 +31,8 @@ module path.
 
 The recipes now read these YAML sections into their typed configs (`FP8Config`, `CompileConfig`, and
 `BnbQuantizationConfig`) when they load the configuration, as they already did for sections such as `mlflow`. A key
-that the typed config does not define raises `TypeError`. Previously the key was silently ignored, so a misspelled
-option had no effect. Remove or correct any such key.
+that the typed config does not define raises `TypeError`, except for the reserved `_target_` key, which recipes
+discard for these sections. Previously unknown keys were silently ignored. Remove or correct any such key.
 
 ### Python Files Named by `_target_` Require an Opt-In
 

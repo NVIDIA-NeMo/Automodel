@@ -125,7 +125,11 @@ def bnb_quantization_config_from_node(node: "ConfigNode | Mapping[str, Any]") ->
     """Typed BitsAndBytes (QLoRA) settings from a recipe's ``quantization:`` block."""
     from nemo_automodel.components.quantization.qlora import BnbQuantizationConfig
 
-    return BnbQuantizationConfig(**_section_kwargs(node))
+    kwargs = _section_kwargs(node)
+    for flag in ("load_in_4bit", "load_in_8bit"):
+        if flag in kwargs:
+            kwargs[flag] = bool(kwargs[flag])
+    return BnbQuantizationConfig(**kwargs)
 
 
 def _as_dict(cfg: Any | None) -> dict[str, Any]:
@@ -718,6 +722,29 @@ class RecipeConfig:
         if model.get("llm_path", None) is None:
             raise ValueError("model.init_mode='hf_backbones' requires model.llm_path")
         kwargs = {f.name: model[f.name] for f in fields(BagelBackbonesConfig) if f.name in model}
+        for key in (
+            "visual_und",
+            "copy_init_moe",
+            "llm_qk_norm",
+            "tie_word_embeddings",
+            "freeze_und",
+            "interpolate_pos",
+            "vit_rope",
+        ):
+            if key in kwargs:
+                kwargs[key] = bool(kwargs[key])
+        for key in (
+            "latent_patch_size",
+            "max_latent_size",
+            "vit_patch_size",
+            "vit_max_num_patch_per_side",
+            "vit_select_layer",
+        ):
+            if key in kwargs:
+                kwargs[key] = int(kwargs[key])
+        for key in ("text_cond_dropout_prob", "vae_cond_dropout_prob", "vit_cond_dropout_prob", "timestep_shift"):
+            if key in kwargs:
+                kwargs[key] = float(kwargs[key])
         for key in ("torch_dtype", "logits_dtype"):
             if isinstance(kwargs.get(key), str):
                 kwargs[key] = dtype_from_str(kwargs[key])

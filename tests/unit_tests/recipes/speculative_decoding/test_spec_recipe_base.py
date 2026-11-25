@@ -495,11 +495,14 @@ def test_init_wandb_run_strips_enable_and_starts_on_main(monkeypatch):
     assert run_config == {"lr": 1e-4}
 
 
-def test_init_wandb_run_keeps_the_configured_name(monkeypatch):
-    obj, calls = _wandb_recipe(monkeypatch, wandb_block={"project": "p", "name": "mine"})
+@pytest.mark.parametrize("wandb_routing", [{}, {"project": "p", "tags": []}])
+def test_init_wandb_run_keeps_the_configured_name(monkeypatch, wandb_routing):
+    obj, calls = _wandb_recipe(monkeypatch, wandb_block={"name": "mine", **wandb_routing})
     obj._init_wandb_run("dspark_run")
     ((wandb_config, _),) = calls[1:]
     assert wandb_config.name == "mine"
+    assert wandb_config.project == wandb_routing.get("project")
+    assert wandb_config.tags == wandb_routing.get("tags")
 
 
 # --------------------------------------------------------------------------- #

@@ -67,6 +67,10 @@ PROTOCOL_LOOKUP_METHODS = frozenset({"get", "to_dict", "to_yaml_dict", "instanti
 # (path relative to the repository root, enclosing function) -> why the shim may still read a raw config.
 ALLOWED: dict[tuple[str, str], str] = {
     (
+        "nemo_automodel/components/utils/compile_utils.py",
+        "_compile_config_from_mapping",
+    ): "Used by the deprecated compile helpers to accept nested options; delete this entry with the helpers.",
+    (
         "nemo_automodel/components/loggers/mlflow_utils.py",
         "configure_mlflow",
     ): "Back-compat shim for MLflowConfig.build (deprecation in #4947); delete this entry with the shim.",
@@ -102,6 +106,14 @@ def _is_config_param_name(name: str) -> bool:
 
 def _is_config_object_name(name: str) -> bool:
     return _is_config_param_name(name) or name == "config" or name.endswith("_config")
+
+
+def _is_config_receiver(receiver: ast.expr) -> bool:
+    if isinstance(receiver, ast.Name):
+        return _is_config_object_name(receiver.id)
+    if isinstance(receiver, ast.Attribute):
+        return _is_config_object_name(receiver.attr)
+    return False
 
 
 def _annotation_names(node: ast.expr) -> Iterator[str]:
@@ -168,7 +180,14 @@ class _ConfigBoundaryVisitor(ast.NodeVisitor):
         positional = args.posonlyargs + args.args
         defaults: list[ast.expr | None] = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
         candidates = list(zip(positional, defaults)) + list(zip(args.kwonlyargs, args.kw_defaults))
+        for arg in (args.vararg, args.kwarg):
+            if arg is not None and arg.annotation is not None:
+                self._check_annotation(arg.annotation)
         for arg, default in candidates:
+            if default is not None:
+                self.visit(default)
+            if arg.annotation is not None:
+                self._check_annotation(arg.annotation)
             if not _is_config_param_name(arg.arg):
                 continue
             # A literal default (``enable_cfg=True``) marks a flag, not a config object.
@@ -182,9 +201,6 @@ class _ConfigBoundaryVisitor(ast.NodeVisitor):
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self._scope.append(node.name)
         self._visit_arguments(node.args)
-        for annotated in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
-            if annotated.annotation is not None:
-                self._check_annotation(annotated.annotation)
         if node.returns is not None:
             self._check_annotation(node.returns)
         for child in node.body:
@@ -272,8 +288,7 @@ class _ConfigBoundaryVisitor(ast.NodeVisitor):
         if (
             isinstance(func, ast.Attribute)
             and func.attr == "get"
-            and isinstance(func.value, ast.Name)
-            and _is_config_object_name(func.value.id)
+            and _is_config_receiver(func.value)
             and node.args
             and isinstance(node.args[0], ast.Constant)
             and isinstance(node.args[0].value, str)

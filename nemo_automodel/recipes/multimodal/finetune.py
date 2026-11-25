@@ -997,9 +997,10 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        # An unnamed run is named after the model basename (WandbConfig.build derives it from model_name).
         mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
-        wandb_config = WandbConfig.from_kwargs(**self.cfg.wandb.to_dict())
+        wandb_options = {"project": None, "tags": None, **self.cfg.wandb.to_dict()}
+        wandb_options["name"] = wandb_options.get("name") or ""
+        wandb_config = WandbConfig.from_kwargs(**wandb_options)
         return wandb_config.build(run_config=self.cfg.to_dict(), model_name=str(mp))
 
     def log_train_metrics(self, log_data) -> None:

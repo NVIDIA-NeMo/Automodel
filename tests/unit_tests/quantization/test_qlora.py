@@ -132,6 +132,11 @@ def test_create_bnb_config_is_deprecated_and_delegates(fake_optional_deps) -> No
     assert result.kwargs == _4BIT_DEFAULTS
 
 
+def test_create_bnb_config_accepts_a_null_load_flag(fake_optional_deps) -> None:
+    with pytest.warns(FutureWarning, match="BnbQuantizationConfig"):
+        assert qlora.create_bnb_config({"load_in_4bit": None}) is None
+
+
 class _QuantizedModule(nn.Module):
     def __init__(self, state_type: type[_FakeQuantState] = _FakeQuantState) -> None:
         super().__init__()

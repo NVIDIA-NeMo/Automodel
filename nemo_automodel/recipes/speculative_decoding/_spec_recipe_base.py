@@ -150,7 +150,8 @@ class SpecDecodeRecipeBase(BaseRecipe):
         wandb_kwargs = resolve_wandb_kwargs(wandb_cfg.to_dict())
         if wandb_kwargs is None:
             return
-        wandb_config = WandbConfig.from_kwargs(**wandb_kwargs)
+        # Let W&B resolve omitted routing and tags from its settings as before.
+        wandb_config = WandbConfig.from_kwargs(**{"project": None, "tags": None, **wandb_kwargs})
         if not wandb_config.name:
             wandb_config = dataclasses.replace(wandb_config, name=default_name)
         suppress_wandb_log_messages()

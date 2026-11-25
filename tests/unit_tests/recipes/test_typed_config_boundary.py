@@ -64,6 +64,11 @@ def test_quantization_section():
     assert config == BnbQuantizationConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4")
 
 
+def test_quantization_null_load_flag_is_disabled():
+    config = bnb_quantization_config_from_node(ConfigNode({"load_in_4bit": None}))
+    assert config.load_in_4bit is False
+
+
 @pytest.mark.parametrize(
     ("convert", "section"),
     [
@@ -104,6 +109,25 @@ def test_bagel_sections():
     )
     assert config.bagel_backend == BagelBackendConfig(linear="te", fused_rope=True)
     assert config.bagel_vae_config == {"z_channels": 16, "downsample": 8}
+
+
+def test_bagel_backbone_scalar_overrides_are_normalized():
+    raw = ConfigNode(
+        {
+            "model": {
+                "llm_path": "/llm",
+                "visual_und": None,
+                "latent_patch_size": 2.0,
+                "max_latent_size": "064",
+                "timestep_shift": "2",
+            }
+        }
+    )
+    backbones = RecipeConfig(raw).bagel_backbones
+    assert backbones.visual_und is False
+    assert backbones.latent_patch_size == 2 and isinstance(backbones.latent_patch_size, int)
+    assert backbones.max_latent_size == 64 and isinstance(backbones.max_latent_size, int)
+    assert backbones.timestep_shift == 2.0 and isinstance(backbones.timestep_shift, float)
 
 
 def test_bagel_defaults_and_validation():

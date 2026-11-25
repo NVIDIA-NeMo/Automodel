@@ -39,6 +39,7 @@ def _codes(source: str) -> list[tuple[int, str]]:
         'def f(cfg: "ConfigNode | None") -> None:\n    pass\n',
         "def f(recipe: RecipeConfig) -> None:\n    pass\n",
         "x: loader.ConfigNode\n",
+        'def f(*args: "ConfigNode", **kwargs: "RecipeConfig"): pass\n',
         "class _ConfigNodeOptions:\n    pass\n",
     ],
 )
@@ -74,6 +75,10 @@ def test_rejects_config_node_only_methods():
             return node.raw_config
         """
     ) == [(3, "CB002"), (4, "CB002"), (5, "CB002")]
+
+
+def test_rejects_config_api_in_argument_defaults():
+    assert _codes("def f(x=node.instantiate(), *, y=node.get_as_string('k')): pass\n") == [(1, "CB002"), (1, "CB002")]
 
 
 def test_rejects_probes_for_the_config_node_api():
@@ -166,11 +171,13 @@ def test_rejects_dotted_yaml_paths_on_config_objects_only():
         """
         def f(cfg, state_dict, modules):
             cfg.get("model.backend.attn", "")
+            self.cfg.get("model.backend.attn")
+            model_cfg.get("model.backend.attn")
             state_dict.get("model.norm.weight")
             modules.get("transformer_engine.pytorch")
             cfg.get("model")
         """
-    ) == [(2, "CB004"), (3, "CB006")]
+    ) == [(2, "CB004"), (3, "CB006"), (4, "CB006"), (5, "CB006")]
 
 
 # --------------------------------------------------------------------------- scope, allowlist and CLI
