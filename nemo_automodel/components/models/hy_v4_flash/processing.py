@@ -221,7 +221,7 @@ class HY4FlashProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs: TokenizerOption) -> HY4FlashProcessor:
-        """Load the checkpoint tokenizer; image constants come from ``processor_config.json`` (defaults match it)."""
+        """Load the checkpoint tokenizer; the image constants are this class's defaults (the released values)."""
         loading = {
             key: kwargs[key]
             for key in ("cache_dir", "revision", "token", "trust_remote_code", "local_files_only")

@@ -17,8 +17,8 @@
 Semantics follow ``HYV4VLVisionModel`` of the transformers reference (PR 50903): a learned position grid
 interpolated with an explicit ``scale_factor`` of ``(size + 0.1) / grid`` (this shifts the sampling grid relative to
 ``size=``), full bidirectional attention inside each image, an RMSNorm + 2x2 conv merge + 1x1 conv projector, and one
-``image_newline`` embedding appended to every merged row. Module names follow the released ``vit.*`` keys so only
-three renames are needed (see ``state_dict_adapter``).
+``image_newline`` embedding appended to every merged row. Module names follow the released ``vit.*`` keys, which
+the state-dict adapter therefore leaves unchanged.
 """
 
 from __future__ import annotations

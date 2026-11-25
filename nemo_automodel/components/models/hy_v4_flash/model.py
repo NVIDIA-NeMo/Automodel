@@ -23,7 +23,8 @@ Forward contract (transformers reference ``HYV4FlashTextModel``):
 3. ``hc_head`` collapses the streams, then the final RMSNorm and the fp32 ``lm_head``.
 
 Batch rows (or packed documents) are flattened into one token axis for attention; documents never attend to each
-other. Context parallelism, PP and vision are layered on this contract in sibling modules.
+other. Context parallelism is handled here (the packed row is sharded over the context-parallel group and keys are
+gathered per layer); the vision tower lives in ``vision.py``. Pipeline parallelism is not supported.
 """
 
 from __future__ import annotations
@@ -417,7 +418,7 @@ class HY4FlashModel(nn.Module):
 
 
 class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
-    """Hy4-flash with an fp32 ``lm_head`` (text path)."""
+    """Hy4-flash: the decoder stack, the vision tower for image-text inputs, and an fp32 ``lm_head``."""
 
     _owns_cp_attention: bool = True
     # Both paths take document boundaries from the model-owned layout: the shared kernel and its PyTorch twin.

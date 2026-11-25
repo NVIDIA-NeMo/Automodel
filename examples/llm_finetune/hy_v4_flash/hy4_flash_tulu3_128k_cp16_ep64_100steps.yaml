@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Hy4-flash SFT on Tulu-3 with 128K-token packed sequences.
-# 8 nodes x 8 H100 80GB; BF16; CP16, EP64, TP1, PP1 (DP4). Global and local batch are 4 packs: with DP4 each
+# 8 nodes x 8 H100 80GB; BF16; CP16, EP64, TP1, PP1 (DP4). The global batch is 4 packs and the local batch 1: each
 # data-parallel replica trains one 128K pack per step and every pack is split over 16 context-parallel ranks.
 # Tulu-3 conversations are shuffled with a fixed seed (shuffle_seed) BEFORE packing, then packed in order into THD
 # sequences of 131072 tokens; the packs keep that order (dataloader shuffle: false), so all CP/parallelism
