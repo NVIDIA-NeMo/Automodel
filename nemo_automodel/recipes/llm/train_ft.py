@@ -1698,6 +1698,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             domain_names=getattr(getattr(self, "domain_mixture", None), "names", ()),
             reference_mfu=self.mfu_calculator.reference_mfu if self.mfu_calculator is not None else None,
             calculate_mfu=calculate_mfu,
+            # Separate-mesh distillation trains on the student ranks only.
+            process_group=getattr(self, "_training_process_group", None),
         )
 
     def _snapshot_moe_metrics(self, sample: MetricsSample) -> None:
@@ -1944,8 +1946,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "grad_norm": Grad norm from the training step.
                     "lr": Learning rate.
                     "mem": Memory allocated.
-                    "tps": Tokens per second.
-                    "tps_per_gpu": Tokens per second per GPU.
+                    "tps": Tokens per second over the step's span, which excludes the time
+                        between steps (data loading, logging). "end_to_end_tps", present
+                        every 20 steps, includes it.
+                    "tps_per_gpu": Tokens per second per GPU over the same span; "mfu" uses it too.
                     "num_label_tokens": Number of label tokens.
                     "pack_fill": Share of pack capacity holding tokens; present only with sequence packing.
             remote_log: Saved logging cadence for an asynchronous sample.

@@ -139,6 +139,26 @@ def test_dllm_log_train_metrics_sends_the_window_mean_to_trackio():
     assert "mode" not in args[0]
 
 
+@pytest.mark.parametrize("recipe_name", ["kd", "dllm"])
+def test_loop_subclass_loggers_use_the_reported_step_and_cadence(recipe_name):
+    """The inherited training loop logs a step after the scheduler has moved past it."""
+    from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+    from nemo_automodel.recipes.llm.kd import KnowledgeDistillationRecipeForNextTokenPrediction
+
+    recipe_cls = {"kd": KnowledgeDistillationRecipeForNextTokenPrediction, "dllm": DiffusionLMSFTRecipe}[recipe_name]
+    run = Mock()
+    recipe = _ft_recipe(run, recipe_cls)
+    recipe.kd_ratio = 0.5
+    recipe.step_scheduler = types.SimpleNamespace(step=9, is_remote_logging_step=False)
+    sample = _train_sample(step=7)
+    sample.metrics.update(ce_loss=1.0, kd_loss=1.5, kd_ratio=0.5, temperature=1.0, dllm_loss=1.25, mode="mdlm")
+
+    recipe.log_train_metrics(sample, remote_log=True)
+
+    run.log.assert_called_once()
+    assert run.log.call_args.kwargs["step"] == 7
+
+
 @pytest.mark.parametrize("recipe_name", ["eagle1", "eagle3", "dflash", "dspark"])
 @pytest.mark.parametrize("wandb_active,trackio_active", [(False, False), (False, True), (True, False), (True, True)])
 def test_speculative_trainer_log_helper_calls_trackio(recipe_name, wandb_active, trackio_active):

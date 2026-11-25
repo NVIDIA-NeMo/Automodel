@@ -226,7 +226,12 @@ class StepMetricReducer:
 
 
 class TrainingStepReporter(DeferredStepReporter):
-    """Finalize training throughput, MFU, pack fill, and domain counts on CPU."""
+    """Finalize training throughput, MFU, pack fill, and domain counts on CPU.
+
+    ``tps``, ``tps_per_gpu`` and ``mfu`` use the step's span between its start and end
+    markers, the maximum over the reporting ranks. Time between steps, such as data loading
+    and logging, is not included. ``end_to_end_tps``, set every 20 steps, is the delivered rate.
+    """
 
     def __init__(
         self,
@@ -237,9 +242,10 @@ class TrainingStepReporter(DeferredStepReporter):
         domain_names: Sequence[str],
         reference_mfu: float | None,
         calculate_mfu: _MFUCalculator,
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
         """Configure metric derivation for the lifetime of a training loop."""
-        super().__init__(device)
+        super().__init__(device, process_group=process_group)
         self._world_size = world_size
         self._pack_size = pack_size
         self._domain_names = domain_names
@@ -295,7 +301,15 @@ class ExpertLoad(TypedDict):
 
 
 def snapshot_moe_metrics(sample: MetricsSample, loads: dict[str, ExpertLoad]) -> None:
-    """Attach expert counts [experts] and scalar auxiliary losses for readback."""
+    """Attach each layer's expert counts and auxiliary loss to a sample for deferred readback.
+
+    Args:
+        sample: Step sample. Its ``metrics`` gain ``_moe_load/<layer>``, the expert counts of
+            shape [experts], and ``_moe_aux/<layer>``, the auxiliary loss reshaped from [] to
+            [1]. These entries alias ``loads`` until ``DeferredStepReporter.enqueue`` copies
+            them on the training stream.
+        loads: Per-layer expert counts of shape [experts] and optional auxiliary losses of shape [].
+    """
     for name, data in loads.items():
         sample.metrics[f"_moe_load/{name}"] = data["expert_load"]
         if data["aux_loss"] is not None:
@@ -303,7 +317,16 @@ def snapshot_moe_metrics(sample: MetricsSample, loads: dict[str, ExpertLoad]) ->
 
 
 def restore_moe_metrics(sample: MetricsSample) -> dict[str, ExpertLoad]:
-    """Remove readback tensors from the sample and return layer loads for logging."""
+    """Remove the entries that ``snapshot_moe_metrics`` added and return the layer loads for logging.
+
+    Args:
+        sample: Completed sample whose readback entries now hold host tensors. They are
+            removed from ``sample.metrics``.
+
+    Returns:
+        Per-layer expert counts of shape [experts], auxiliary losses of shape [1] or None,
+        and the number of experts.
+    """
     loads: dict[str, ExpertLoad] = {}
     for key in tuple(sample.metrics):
         if key.startswith("_moe_load/"):

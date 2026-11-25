@@ -754,6 +754,7 @@ def scale_grads_and_clip_grad_norm(
     ep_param_ids = _ep_local_expert_param_ids(model_parts, ep_axis_name) if moe_mesh is not None else None
 
     # Single pass over parameters to apply both scalings where applicable
+    pp_inverses: dict[tuple[torch.device, bool], torch.Tensor] = {}
     if pp_divisor is not None or pp_inverse is not None or ep_ratio is not None:
         for mp in model_parts:
             for p in mp.parameters():
@@ -763,7 +764,12 @@ def scale_grads_and_clip_grad_norm(
                     p.grad.div_(pp_divisor)
                 elif pp_inverse is not None and pp_inverse_float is not None:
                     grad = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-                    inverse = pp_inverse if grad.dtype == torch.float64 else pp_inverse_float
+                    key = (grad.device, grad.dtype == torch.float64)
+                    if key not in pp_inverses:
+                        # FSDP2 CPU offload keeps gradients on the host while the count stays
+                        # on the training device; copy the reciprocal once per gradient device.
+                        pp_inverses[key] = (pp_inverse if key[1] else pp_inverse_float).to(grad.device)
+                    inverse = pp_inverses[key]
                     # A scalar-tensor operand would narrow to BF16 or FP16 before multiplying.
                     if grad.ndim:
                         torch.mul(grad, inverse.expand_as(grad), out=grad)

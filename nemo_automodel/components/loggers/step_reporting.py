@@ -27,6 +27,10 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 
 StepMarker = torch.cuda.Event | float
 
+# A poll finishes the oldest records beyond this many, waiting if it must, so a slow
+# timing reduction stalls training instead of retaining every later step's snapshot.
+MAX_OUTSTANDING_REPORTS = 8
+
 
 @dataclass
 class _MetricReadback:
@@ -47,14 +51,17 @@ class _PendingStep:
 class DeferredStepReporter:
     """Read completed step metrics and aggregate rank times on CPU."""
 
-    def __init__(self, device: torch.device) -> None:
-        """Set the training device and create a CPU process group when distributed.
+    def __init__(self, device: torch.device, *, process_group: dist.ProcessGroup | None = None) -> None:
+        """Set the training device and create a CPU process group for the reporting ranks.
 
         Args:
             device: Training device assigned to the calling rank.
+            process_group: Ranks that run the training step together and share its time, such as
+                the students of separate-mesh distillation. None means every rank. The reporter
+                owns a Gloo group with the same members and destroys it in ``close``.
         """
         self._device = device
-        self._group = dist.new_group(backend="gloo") if dist.is_initialized() and dist.get_world_size() > 1 else None
+        self._group = _new_gloo_group(process_group)
         self._pending: deque[_PendingStep] = deque()
         self._reducing: deque[tuple[_PendingStep, torch.Tensor, dist.Work | None]] = deque()
 
@@ -115,15 +122,19 @@ class DeferredStepReporter:
         Args:
             wait: Drain pending records, including incomplete reads. Use at
                 lifecycle boundaries that already need the exact completed sample.
+                Without it, only records beyond ``MAX_OUTSTANDING_REPORTS`` are waited for.
 
         Returns:
             Completed samples, their remote logging flags, and max rank durations.
         """
+        # The oldest records past the cap finish now. Records in _reducing are older than
+        # those in _pending, and both deques are in step order.
+        must_finish = len(self._reducing) + len(self._pending) - MAX_OUTSTANDING_REPORTS
         completed = []
         while self._pending:
             record = self._pending[0]
             if record.ready is not None and not record.ready.query():
-                if not wait:
+                if not wait and len(self._reducing) >= must_finish:
                     break
                 record.ready.synchronize()
             elapsed = torch.tensor(
@@ -141,7 +152,7 @@ class DeferredStepReporter:
         while self._reducing:
             record, elapsed, work = self._reducing[0]
             if work is not None:
-                if not wait and not work.is_completed():
+                if not wait and len(completed) >= must_finish and not work.is_completed():
                     break
                 work.wait()
 
@@ -157,9 +168,27 @@ class DeferredStepReporter:
         return completed
 
     def close(self) -> None:
-        """Release the reporting process group after the caller drains pending samples."""
+        """Release the reporting process group after the caller drains pending samples.
+
+        Samples still pending are dropped. After a rank-local failure the timing reduction
+        cannot finish without the other ranks, so close does not wait for it.
+        """
         if self._group is not None:
             dist.destroy_process_group(self._group)
+
+
+def _new_gloo_group(process_group: dist.ProcessGroup | None) -> dist.ProcessGroup | None:
+    """Create a Gloo group with the members of ``process_group``, or None for a single reporting rank."""
+    if not dist.is_initialized():
+        return None
+    if process_group is None:
+        return dist.new_group(backend="gloo") if dist.get_world_size() > 1 else None
+    ranks = dist.get_process_group_ranks(process_group)
+    if len(ranks) == 1:
+        return None
+    # Only the members create the group, so ranks outside it (separate-mesh distillation
+    # teachers, for example) never wait in this call.
+    return dist.new_group(ranks=ranks, backend="gloo", use_local_synchronization=True)
 
 
 def _elapsed_seconds(start: StepMarker, end: StepMarker) -> float:
