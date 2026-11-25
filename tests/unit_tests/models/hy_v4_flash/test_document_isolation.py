@@ -333,3 +333,66 @@ def test_engram_gate_is_one_half_at_a_logit_of_exactly_zero():
         scales = torch.stack(list(engram.unified_per_hc_scales))
         expected = 0.5 * main.unsqueeze(2) + main.unsqueeze(2) * scales
     torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-7)
+
+
+def _moe_oracle(mlp, x, limit, *, clamp_routed=True, clamp_shared=False):
+    """Latent MoE as the reference writes it: clamped SwiGLU in the routed experts, plain SwiGLU in the shared expert.
+
+    Args:
+        mlp: The layer's MoE module (only its weights are read).
+        x: Tensor of shape [tokens, hidden].
+        limit: ``swiglu_limit``.
+        clamp_routed: Clamp the routed experts' gate (one-sided) and up (two-sided) pre-activations.
+        clamp_shared: Clamp the shared expert the same way (the reference does not).
+
+    Returns:
+        Tuple of the output [tokens, hidden] and the largest routed and shared pre-activation magnitudes.
+    """
+    import torch.nn.functional as F
+
+    def swiglu(gate, up, clamp):
+        if clamp:
+            gate, up = gate.clamp(max=limit), up.clamp(min=-limit, max=limit)
+        return F.silu(gate) * up
+
+    scores = torch.sigmoid(x @ mlp.gate.weight.T)
+    top = (scores + mlp.gate.e_score_correction_bias).topk(mlp.gate.topk, dim=-1).indices
+    weights = scores.gather(1, top)
+    weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * mlp.gate.route_scale
+    latent = x @ mlp.fc1_latent_proj.weight.T
+    routed = torch.zeros_like(latent)
+    routed_peak = 0.0
+    for slot in range(top.shape[1]):
+        gate_up = torch.einsum("ti,tio->to", latent, mlp.experts.gate_and_up_projs[top[:, slot]])
+        gate, up = gate_up.chunk(2, dim=-1)
+        routed_peak = max(routed_peak, float(gate.max()), float(up.abs().max()))
+        hidden = swiglu(gate, up, clamp_routed)
+        routed += torch.einsum("ti,tio->to", hidden, mlp.experts.down_projs[top[:, slot]]) * weights[:, slot, None]
+    shared = mlp.shared_experts
+    gate, up = shared.gate_proj(x), shared.up_proj(x)
+    out = routed @ mlp.fc2_latent_proj.weight.T + shared.down_proj(swiglu(gate, up, clamp_shared))
+    return out, routed_peak, max(float(gate.max()), float(up.abs().max()))
+
+
+def test_swiglu_clamp_applies_to_routed_experts_and_not_to_the_shared_expert():
+    """The one MoE detail where Hy4-flash departs from the shared MoE: upstream clamps only the routed experts.
+
+    Random tiny models never reach the limit, so the input is scaled until both kinds of pre-activation exceed it.
+    The two wrong variants (shared expert clamped as the stock shared MoE does; routed experts not clamped) must
+    not match.
+    """
+    model = build_model()
+    mlp = next(layer.mlp for layer in model.model.layers if type(layer.mlp).__name__ == "MoE")
+    limit = model.config.text_config.swiglu_limit
+    torch.manual_seed(3)
+    x = torch.randn(40, model.config.text_config.hidden_size) * 400.0
+    with torch.no_grad():
+        mlp.experts.gate_and_up_projs.mul_(30.0)  # the latent projection shrinks the routed input; scale it back up
+        ours = mlp(x[None])[0]
+        expected, routed_peak, shared_peak = _moe_oracle(mlp, x, limit)
+        shared_clamped, _, _ = _moe_oracle(mlp, x, limit, clamp_shared=True)
+        routed_unclamped, _, _ = _moe_oracle(mlp, x, limit, clamp_routed=False)
+    assert routed_peak > limit and shared_peak > limit  # the clamp is actually exercised on both paths
+    torch.testing.assert_close(ours, expected, rtol=1e-4, atol=1e-4)
+    assert not torch.allclose(ours, shared_clamped, rtol=1e-2, atol=1e-2)
+    assert not torch.allclose(ours, routed_unclamped, rtol=1e-2, atol=1e-2)
