@@ -625,7 +625,10 @@ known-third-party = ["datasets", "transformers", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
-exclude_type_checking_imports = true
+# Count imports under ``if TYPE_CHECKING:`` too. A type-only import is still a dependency
+# on the other package; excluding them let components annotate with each other's types
+# (including the YAML ``ConfigNode``) while every contract below reported KEPT.
+exclude_type_checking_imports = false
 
 [[tool.importlinter.contracts]]
 name = "Components must not import each other"
@@ -651,6 +654,38 @@ ignore_imports = [
     # flattened ep axis is absent from mesh_dim_names and cannot be indexed directly.
     "nemo_automodel.components.training.utils -> nemo_automodel.components.distributed.mesh_utils",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Components must not import the YAML config layer or recipes"
+type = "forbidden"
+# Every package under nemo_automodel/components except config itself; components take
+# typed configs, and the recipe layer turns the YAML ConfigNode into them.
+# tests/ci_tests/test_import_contracts.py checks that this list covers every component.
+source_modules = [
+    "nemo_automodel.components._peft",
+    "nemo_automodel.components.attention",
+    "nemo_automodel.components.checkpoint",
+    "nemo_automodel.components.cuda_graphs",
+    "nemo_automodel.components.datasets",
+    "nemo_automodel.components.distributed",
+    "nemo_automodel.components.eval",
+    "nemo_automodel.components.flow_matching",
+    "nemo_automodel.components.launcher",
+    "nemo_automodel.components.loggers",
+    "nemo_automodel.components.loss",
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.moe",
+    "nemo_automodel.components.optim",
+    "nemo_automodel.components.quantization",
+    "nemo_automodel.components.speculative",
+    "nemo_automodel.components.training",
+    "nemo_automodel.components.utils",
+]
+forbidden_modules = [
+    "nemo_automodel.components.config",
+    "nemo_automodel.recipes",
+]
+# Indirect imports count as well (the default): no chain may reach the config layer.
 
 [[tool.importlinter.contracts]]
 name = "Datasets must not directly import models or attention"

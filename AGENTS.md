@@ -57,8 +57,8 @@ symlinked into `.claude/skills/`.
   Google-style docstrings; keep the NVIDIA copyright header on every Python file.
 - Guard optional dependencies with `safe_import()` from
   `nemo_automodel.shared.import_utils`.
-- Recipes compose components; components never import each other
-  (`import-linter` enforces this).
+- Recipes compose components; components never import each other, not even
+  under `if TYPE_CHECKING:` (`import-linter` enforces this and counts those imports).
 - Typed component configs own construction through `build(...)`. Runtime-only
   values (process groups, device meshes, tokenizers, devices) are explicit typed
   `build(...)` arguments, and `build(...)` must not mutate the config or cache
