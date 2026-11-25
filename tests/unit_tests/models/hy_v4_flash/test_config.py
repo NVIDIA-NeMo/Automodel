@@ -85,3 +85,9 @@ def test_reduced_depth_keeps_the_released_schedule_prefix():
     assert text.layer_types == ["deepseek_sparse_attention", "deepseek_sparse_attention", "sliding_attention"]
     assert len(text.mlp_layer_types) == 3
     assert text.engram_layer_indices == [1]  # id 4 (layer 3) is not built
+
+
+def test_fp32_lm_head_flag_cannot_be_silently_disabled():
+    assert tiny_text_config().enable_lm_head_fp32 is True
+    with pytest.raises(ValueError, match="enable_lm_head_fp32"):
+        tiny_text_config(enable_lm_head_fp32=False)

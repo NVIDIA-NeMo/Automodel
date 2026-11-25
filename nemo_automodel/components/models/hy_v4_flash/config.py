@@ -126,6 +126,8 @@ class HY4FlashTextConfig(PretrainedConfig):
         engram_fp8_embedding: bool = False,
         engram_seed: int = 0,
         engram_lookup_table_size: int = 120818,
+        enable_lm_head_fp32: bool = True,
+        fast_op_fp32_linear_gemm: bool = True,
         dtype: str = "bfloat16",
         pad_token_id: int | None = 120002,
         bos_token_id: int | None = 120000,
@@ -185,6 +187,12 @@ class HY4FlashTextConfig(PretrainedConfig):
         self.engram_fp8_embedding = engram_fp8_embedding
         self.engram_seed = engram_seed
         self.engram_lookup_table_size = engram_lookup_table_size
+        if not enable_lm_head_fp32:
+            raise ValueError("enable_lm_head_fp32=False is not supported: the reference always runs the head in fp32")
+        self.enable_lm_head_fp32 = enable_lm_head_fp32
+        # Training-framework flag of the release; neither the transformers reference nor the official finetune code reads
+        # it, so it has no effect here either. Kept so a saved config round-trips.
+        self.fast_op_fp32_linear_gemm = fast_op_fp32_linear_gemm
 
         first_k_dense = int(kwargs.pop("first_k_dense_replace", 1))
         self.mlp_layer_types = (
