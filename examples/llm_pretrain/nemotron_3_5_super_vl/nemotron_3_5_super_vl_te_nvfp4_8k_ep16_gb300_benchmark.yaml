@@ -16,7 +16,7 @@
 # initialization, through Transformer Engine: 4 nodes x 4 GB300, tp1 / cp1 / pp1 / ep16, 128 sequences of 8192
 # tokens per optimizer step (16 ranks x one micro-batch of 8), the MTP head trained with two prediction depths
 # through its one block. The vision tower and projector are frozen and never run on text batches.
-# BF16 counterpart: nemotron_3_5_super_vl_te_bf16_8k_ep16_gb300.yaml. Each of the two files is the fastest
+# BF16 counterpart: nemotron_3_5_super_vl_te_bf16_8k_ep16_gb300_benchmark.yaml. Each of the two files is the fastest
 # setting measured for its precision, so they differ in more than the precision (micro-batch, activation
 # checkpointing, optimizer). This file without the te_nvfp4 block is the BF16 run that differs in precision only.
 #
@@ -93,7 +93,7 @@
 # Launch on 4 nodes x 4 GPUs: on every node, from the repository root (26 steps, the first 6 are warm-up):
 #   torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=<first node>:<port> \
 #     -m nemo_automodel.cli.app \
-#     examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_8k_ep16_gb300.yaml \
+#     examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_8k_ep16_gb300_benchmark.yaml \
 #     --benchmark --step_scheduler.max_steps 26
 # The measured runs also passed --numa-binding=node to torchrun and set OMP_NUM_THREADS=8 in every rank; the
 # effect of either was not measured.
