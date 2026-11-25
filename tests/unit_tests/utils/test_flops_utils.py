@@ -332,6 +332,12 @@ def test_calculate_mfu_warns_for_legacy_default_reference():
     assert actual_mfu == 100.0
 
 
+@pytest.fixture(autouse=True)
+def _unset_cublas_tf32_override(monkeypatch):
+    """FP32 peaks read NVIDIA_TF32_OVERRIDE, which tests/unit_tests/models/beam/conftest.py sets to 0 session-wide."""
+    monkeypatch.delenv("NVIDIA_TF32_OVERRIDE", raising=False)
+
+
 def _mock_cuda_device(monkeypatch, name):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: name)
