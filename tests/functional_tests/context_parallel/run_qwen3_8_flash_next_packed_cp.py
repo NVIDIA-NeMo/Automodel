@@ -13,21 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-rank packed CP parity for Qwen3.8-Flash-Next QSA on the CUDA flex path.
+"""Two-rank packed CP parity for Qwen3.8-Flash-Next QSA on the CUDA flex and FA4 paths.
 
 One packed THD row (two documents plus CP padding) is sharded contiguously
 over CP=2 with the production sharder. Each rank runs its local shard through
-``Qwen3_8_FlashNextQSAAttention`` with the flex backend, which all-gathers K/V
-to the global length and builds the FlexAttention mask from the recorded
-routes. The result is compared against the same layer run in one process on
-the full packed row: routes are bitwise global, local outputs and hidden-state
-gradients match the corresponding slice, parameter gradients match after the
-cross-rank sum, and the CP padding tail is exactly zero.
+``Qwen3_8_FlashNextQSAAttention``, which all-gathers K/V to the global length
+and attends with the recorded global routes. The result is compared against
+the same layer and backend run in one process on the full packed row: routes
+are bitwise global, local outputs and hidden-state gradients match the
+corresponding slice, parameter gradients match after the cross-rank sum, and
+the CP padding tail is exactly zero.
 
-This is the configuration that regressed when the route selection sized the
-mask by the local shard instead of the gathered K/V (``mask=(8, 8)`` versus
-``tensors=(8, 16)``); the CPU unit tests cannot reach it because the flex mask
-is only built on CUDA.
+The flex backend covers the configuration that regressed when the route
+selection sized the mask by the local shard instead of the gathered K/V
+(``mask=(8, 8)`` versus ``tensors=(8, 16)``); the CPU unit tests cannot reach
+it because the flex mask is only built on CUDA. The FA4 backend builds its
+membership table and block lists from local queries against global keys. It
+has SM90 kernels only, so other GPUs skip it.
 
 Run::
 
@@ -42,7 +44,7 @@ import sys
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
@@ -56,7 +58,7 @@ WORLD_SIZE = 2
 BOUNDARIES = (0, 3, 10)  # two documents; the row is CP-padded to 16 tokens
 PADDED_LENGTH = 16
 DTYPE = torch.bfloat16
-# bf16 flex attention versus the same bf16 layer on the full row.
+# bf16 attention versus the same bf16 layer and backend on the full row.
 OUTPUT_TOL = dict(rtol=2e-2, atol=2e-2)
 # Parameter gradients sum two bf16 partials across ranks; reduce in fp32 and allow more.
 PARAM_TOL = dict(rtol=5e-2, atol=5e-2)
@@ -95,10 +97,10 @@ def _config() -> Qwen3_8_FlashNextTextConfig:
     )
 
 
-def _backend() -> BackendConfig:
+def _backend(attn: str) -> BackendConfig:
     return BackendConfig(
         linear="torch",
-        attn="flex",
+        attn=attn,
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
@@ -118,26 +120,21 @@ def _document_relative_freqs(cu_seqlens: tuple[int, ...], rotary_width: int) -> 
     return torch.cat(segments, dim=0).unsqueeze(0)
 
 
-def main() -> None:
-    if not {"RANK", "WORLD_SIZE", "LOCAL_RANK"}.issubset(os.environ):
-        print("ERROR: launch this script with torchrun.", file=sys.stderr)
-        sys.exit(1)
-    if torch.cuda.device_count() < WORLD_SIZE:
-        print(f"[skip] Qwen3.8-Flash-Next packed CP parity requires {WORLD_SIZE} CUDA devices", file=sys.stderr)
-        return
-    dist.init_process_group("nccl")
+def _fa4_supported(device: torch.device) -> bool:
+    """FA4 QSA has SM90 kernels only."""
+    return torch.cuda.get_device_capability(device) == (9, 0)
+
+
+def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device) -> None:
+    """Compare this rank's packed CP2 shard with the full packed row run in one process.
+
+    Args:
+        attn: QSA backend (``"flex"`` or ``"fa4"``) of both the CP2 layer and the CP1 reference.
+        cp_mesh: One-dimensional CP mesh over the two ranks.
+        device: This rank's CUDA device.
+    """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    if world_size != WORLD_SIZE:
-        if rank == 0:
-            print(f"ERROR: expected world size {WORLD_SIZE}, got {world_size}", file=sys.stderr)
-        dist.destroy_process_group()
-        sys.exit(1)
-
-    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))["cp"]
     total_tokens = BOUNDARIES[-1]
     input_ids = torch.arange(1, total_tokens + 1, dtype=torch.long).view(1, -1)
     document_positions = torch.cat([torch.arange(end - start) for start, end in zip(BOUNDARIES, BOUNDARIES[1:])]).view(
@@ -165,9 +162,9 @@ def main() -> None:
 
     torch.manual_seed(321)
     config = _config()
-    reference = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend())
+    reference = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend(attn))
     reference.init_weights(torch.device("cpu"))
-    cp_attention = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend())
+    cp_attention = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend(attn))
     cp_attention.load_state_dict(reference.state_dict())
     reference = reference.to(device=device, dtype=DTYPE)
     cp_attention = cp_attention.to(device=device, dtype=DTYPE)
@@ -246,10 +243,38 @@ def main() -> None:
         assert reference_gradient is not None, name
         torch.testing.assert_close(summed_gradient, reference_gradient.float(), **PARAM_TOL)
 
-    torch.cuda.synchronize()
-    dist.barrier()
-    if rank == 0:
-        print("[ok] Qwen3.8-Flash-Next packed CP2 flex forward/backward matches packed CP1")
+
+def main() -> None:
+    if not {"RANK", "WORLD_SIZE", "LOCAL_RANK"}.issubset(os.environ):
+        print("ERROR: launch this script with torchrun.", file=sys.stderr)
+        sys.exit(1)
+    if torch.cuda.device_count() < WORLD_SIZE:
+        print(f"[skip] Qwen3.8-Flash-Next packed CP parity requires {WORLD_SIZE} CUDA devices", file=sys.stderr)
+        return
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    if world_size != WORLD_SIZE:
+        if rank == 0:
+            print(f"ERROR: expected world size {WORLD_SIZE}, got {world_size}", file=sys.stderr)
+        dist.destroy_process_group()
+        sys.exit(1)
+
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))["cp"]
+    backends = ["flex"]
+    if _fa4_supported(device):
+        backends.append("fa4")
+    elif rank == 0:
+        print(f"[skip] FA4 QSA packed CP parity needs an SM90 GPU, got {torch.cuda.get_device_name(device)}")
+    for attn in backends:
+        _check_packed_cp_parity(attn, cp_mesh, device)
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 0:
+            print(f"[ok] Qwen3.8-Flash-Next packed CP2 {attn} forward/backward matches packed CP1")
     dist.destroy_process_group()
 
 
