@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel._transformers import te_attention
 from nemo_automodel._transformers.te_attention import (
     _detect_causal_mask,
     _infer_attn_params,
@@ -605,6 +606,136 @@ class TestTeSdpaImageBlockDispatch:
         original_sdpa.assert_not_called()
         te_module.assert_called_once()
         assert te_module.call_args.kwargs["attn_mask_type"] == "causal"
+
+
+class TestDetectCausalMaskCache:
+    """The verdict cache must never return a stale "causal"."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self):
+        te_attention._VERDICT_CACHE.clear()
+        yield
+        te_attention._VERDICT_CACHE.clear()
+
+    @staticmethod
+    def _scans():
+        """Patch the exact comparison with a counting wrapper."""
+        return mock.patch.object(te_attention, "_matches_causal_exactly", wraps=te_attention._matches_causal_exactly)
+
+    def test_repeated_calls_scan_once(self):
+        m = _to_mask([_visible_pattern(_S)] * 2, "bool")
+        with self._scans() as scan:
+            for _ in range(5):
+                assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        assert scan.call_count == 1
+
+    def test_in_place_edit_after_cached_verdict(self):
+        m = _to_mask([_visible_pattern(_S)], "bool")
+        assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        m[0, 0, 30, 31] = True  # add one future edge in place
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_in_place_edit_through_a_view(self):
+        m = _to_mask([_visible_pattern(_S)], "fp32")
+        assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        m.view(-1)[30 * _S + 31] = 0.0  # edit through a different alias of the same storage
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_new_mask_after_old_one_is_freed(self):
+        """A different mask that lands on the freed mask's address must not inherit its verdict."""
+        import gc
+
+        good_pattern = _visible_pattern(_S)[None, None]
+        bad_pattern = _add_block(_visible_pattern(_S), 20, _BLOCK)[None, None]
+        reused = 0
+        for _ in range(200):
+            good = torch.empty(1, 1, _S, _S, dtype=torch.bool)
+            good.copy_(good_pattern)
+            assert _detect_causal_mask(good, (-1, 0)) == ("causal", (-1, 0))
+            ptr = good.data_ptr()
+            del good
+            gc.collect()
+            bad = torch.empty(1, 1, _S, _S, dtype=torch.bool)
+            bad.copy_(bad_pattern)
+            reused += bad.data_ptr() == ptr
+            assert _detect_causal_mask(bad, (-1, 0)) is None
+            del bad
+            gc.collect()
+        if reused == 0:
+            pytest.skip("allocator never reused the freed address; the stale-address case was not exercised")
+
+    def test_cache_does_not_keep_masks_alive(self):
+        import gc
+        import weakref
+
+        m = _to_mask([_visible_pattern(_S)], "bool")
+        assert _detect_causal_mask(m, (-1, 0)) is not None
+        ref = weakref.ref(m)
+        del m
+        gc.collect()
+        assert ref() is None
+        assert len(te_attention._VERDICT_CACHE) == 0
+
+    def test_two_views_of_one_base_with_different_slices(self):
+        S2 = _S + 8
+        base = _to_mask([_visible_pattern(S2)], "bool")
+        full = base[:, :, :_S, :_S]  # top-left slice of a causal mask is causal
+        assert _detect_causal_mask(full, (-1, 0)) == ("causal", (-1, 0))
+        base[0, 0, 5, 6] = True  # edit the base: only the stale-view entry could hide it
+        assert _detect_causal_mask(full, (-1, 0)) is None
+        shifted = base[:, :, 8:, 8:]  # a different slice (offset) of the same base
+        assert _detect_causal_mask(shifted, (-1, 0)) == ("causal", (-1, 0))
+        assert _detect_causal_mask(base[:, :, :_S, :_S], (-1, 0)) is None
+
+    def test_same_mask_two_window_sizes(self):
+        m = _to_mask([_visible_pattern(_S, _WINDOW)], "bool")
+        assert _detect_causal_mask(m, (_WINDOW, 0)) == ("causal", (_WINDOW, 0))
+        assert _detect_causal_mask(m, (-1, 0)) is None
+        assert _detect_causal_mask(m, (_WINDOW + 1, 0)) is None
+        assert _detect_causal_mask(m, (_WINDOW, 0)) == ("causal", (_WINDOW, 0))
+
+    def test_exact_scans_in_a_forward_equal_distinct_masks(self):
+        """12 layers sharing two masks (full-causal and sliding) -> exactly 2 exact scans."""
+        causal = _to_mask([_visible_pattern(_S)] * 2, "bool")
+        sliding = _to_mask([_visible_pattern(_S, _WINDOW)] * 2, "bool")
+        layers = [(sliding, (_WINDOW, 0)) if i % 6 != 5 else (causal, (-1, 0)) for i in range(12)]
+        with self._scans() as scan:
+            for _ in range(3):  # three forwards re-using the same mask objects
+                for m, w in layers:
+                    assert _detect_causal_mask(m, w) is not None
+        assert scan.call_count == 2
+
+    def test_padded_mask_is_rejected_without_the_exact_scan(self):
+        vis = _visible_pattern(_S)
+        padded = vis.clone()
+        padded[:, _S - 4 :] = False
+        m = _to_mask([padded, vis], "bool")
+        with self._scans() as scan:
+            assert _detect_causal_mask(m, (-1, 0)) is None
+        scan.assert_not_called()
+
+    def test_inference_tensor_is_never_cached(self):
+        with torch.inference_mode():
+            m = _to_mask([_visible_pattern(_S)], "bool")
+            assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        assert len(te_attention._VERDICT_CACHE) == 0
+
+
+class TestFallbackWarningOnce:
+    def test_first_fallback_logs_once(self, caplog):
+        te_attention._MASK_FALLBACK_WARNED = False
+        te_module = mock.MagicMock()
+        original_sdpa = mock.MagicMock(return_value=torch.zeros(1, 4, _S, 16))
+        te_sdpa = _make_te_sdpa(te_module, num_heads=4, num_kv_heads=2, original_sdpa=original_sdpa)
+        q = torch.randn(1, 4, _S, 16)
+        k = torch.randn(1, 2, _S, 16)
+        mask = _to_mask([_add_block(_visible_pattern(_S), 20, _BLOCK)], "bool")
+        with caplog.at_level("WARNING", logger=te_attention.logger.name):
+            te_sdpa(q, k, k, attn_mask=mask, enable_gqa=True)
+            te_sdpa(q, k, k, attn_mask=mask, enable_gqa=True)
+        msgs = [r.getMessage() for r in caplog.records if "not plain causal" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "native SDPA" in msgs[0]
 
 
 # ---------------------------------------------------------------------------
