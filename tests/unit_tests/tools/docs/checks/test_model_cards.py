@@ -309,3 +309,65 @@ def test_description_validator_accepts_a_valid_model_card(tmp_path: Path):
     card.write_text(f'---\ntitle: "Model-1B"\ndescription: "{description}"\n---\n')
 
     checks._validate_descriptions(tmp_path)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("family", [False, True])
+def test_model_catalog_preserves_frontmatter_scalar_with_delimiter(tmp_path: Path, family: bool) -> None:
+    from tools.docs.build.coverage_tables import _load_model_doc_catalog
+
+    card = tmp_path / "docs/model-coverage/embedding/org/embed.mdx"
+    card.parent.mkdir(parents=True)
+    membership = "checkpoints:\n  - org/Embed-1B\n" if family else ""
+    card.write_text(
+        '---\ntitle: "Embed"\ndescription: "Train --- then evaluate"\n'
+        "slug: model-coverage/embedding-models/org/Embed\n"
+        + membership
+        + "---\n[Checkpoint](https://huggingface.co/org/Embed-1B)\n"
+    )
+
+    models, _, pages = _load_model_doc_catalog(tmp_path / "docs")
+
+    assert set(models) == {"org/Embed-1B"}
+    assert len(pages) == 1
+    assert pages[0].docs_page == "/model-coverage/embedding-models/org/Embed"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "checkpoint_url,accepted",
+    [
+        ("https://huggingface.co/org/Embed-1B", True),
+        ("https://huggingface.co/org/Embed-1B?download=true", True),
+        ("https://huggingface.co/org/Embed-1B#usage", True),
+        ("https://huggingface.co/org/Embed-1B/tree/main", True),
+        ("https://huggingface.co/org/Embed-1B/resolve/main/config.json", True),
+        ("https://huggingface.co/org/Embed%2D1B", True),
+        ("https://huggingface.co/org/Embed-1B%2Dwrong", False),
+        ("https://huggingface.co/org/Embed-1B%2Fwrong", False),
+        ("https://huggingface.co/org/Embed-1B%252Dwrong", False),
+        ("https://huggingface.co/org/Embed-1B/../Other", False),
+        ("https://huggingface.co/org/Embed-1B/%2e%2e/Other", False),
+        ("https://huggingface.co//org/Embed-1B", False),
+    ],
+)
+def test_family_checkpoint_links_match_complete_decoded_segments(
+    tmp_path: Path, checkpoint_url: str, accepted: bool
+) -> None:
+    from tools.docs.cards import checkpoint_links, family_checkpoints
+
+    document = (
+        '---\ntitle: "Embed"\nslug: model-coverage/embedding-models/org/Embed\n'
+        "checkpoints:\n  - org/Embed-1B\n---\n"
+        f"[Checkpoint]({checkpoint_url})\n"
+    )
+    card = tmp_path / "family.mdx"
+    card.write_text(document)
+
+    if accepted:
+        assert checkpoint_links(document) == {"org/Embed-1B"}
+        assert family_checkpoints(card) == {"org/Embed-1B"}
+    else:
+        assert "org/Embed-1B" not in checkpoint_links(document)
+        with pytest.raises(ValueError, match="exact HF link"):
+            family_checkpoints(card)

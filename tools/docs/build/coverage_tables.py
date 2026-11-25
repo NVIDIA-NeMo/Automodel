@@ -25,7 +25,14 @@ from pathlib import Path
 
 import yaml
 
-from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths, family_checkpoints
+from tools.docs.cards import (
+    _frontmatter_slug,
+    _model_card_aliases,
+    _model_card_paths,
+    checkpoint_links,
+    family_checkpoints,
+    fern_page_paths,
+)
 from tools.docs.catalog import (
     DATED_MODEL_TABLE_HEADER,
     DATED_SUPPORT_TABLE_HEADER,
@@ -646,6 +653,12 @@ def _resolve_model_card_routes(
 
     # Base checkpoints used to train retrieval models need not own retrieval
     # model cards. A redirect can point to a guide that documents that exact ID.
+    navigation_path = repo_root / "docs/fern/versions/nightly.yml"
+    selected_paths: dict[str, set[Path]] = {}
+    if navigation_path.is_file():
+        navigation = yaml.safe_load(navigation_path.read_text(encoding="utf-8"))["navigation"]
+        for route, paths in fern_page_paths(navigation, config_dir=navigation_path.parent).items():
+            selected_paths.setdefault(route.casefold(), set()).update(paths)
     guide_routes_by_model: dict[str, dict[str, str]] = {}
     guide_paths_by_route: dict[str, Path] = {}
     for path in (repo_root / "docs" / "guides").rglob("*.mdx"):
@@ -660,7 +673,9 @@ def _resolve_model_card_routes(
                 f"Retrieval guide routes collide case-insensitively: {guide_paths_by_route[route_key]} and {path}"
             )
         guide_paths_by_route[route_key] = path
-        for model_id in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document):
+        if selected_paths.get(route_key) != {path.resolve()}:
+            continue
+        for model_id in checkpoint_links(document):
             guide_routes_by_model.setdefault(model_id.casefold(), {})[route.casefold()] = route
 
     resolved: dict[tuple[str, str], str] = {}

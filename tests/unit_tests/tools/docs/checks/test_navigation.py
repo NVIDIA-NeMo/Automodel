@@ -183,7 +183,7 @@ def test_retrieval_guide_route_requires_navigation(
     if is_navigable:
         _validate_recipe_routes(tmp_path)
     else:
-        with pytest.raises(ValueError, match="Invalid retrieval training guide destination"):
+        with pytest.raises(ValueError, match="missing:"):
             _validate_recipe_routes(tmp_path)
 
 

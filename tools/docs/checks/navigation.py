@@ -17,7 +17,6 @@
 import base64
 import re
 from pathlib import Path
-from typing import TypedDict
 
 import yaml
 
@@ -27,49 +26,24 @@ from tools.docs.build.coverage_tables import (
     _load_model_releases,
     _resolve_model_card_routes,
 )
-from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths, family_checkpoints
+from tools.docs.cards import (
+    FernNavigationItem,
+    _frontmatter_slug,
+    _model_card_aliases,
+    _model_card_paths,
+    family_checkpoints,
+    fern_page_paths,
+)
 from tools.docs.catalog import (
     MAX_TOTAL_ENCODED_BYTES,
     PROVIDER_ORGS,
 )
 
-_NavigationItem = TypedDict(
-    "_NavigationItem",
-    {"page": str, "section": str, "path": str, "slug": str, "skip-slug": bool, "contents": list["_NavigationItem"]},
-    total=False,
-)
-
-
-def _fern_slug(value: str) -> str:
-    value = value.lower().replace("&", "and")
-    return re.sub("[^a-z0-9]+", "-", value).strip("-")
-
 
 def _collect_fern_routes(
-    items: list[_NavigationItem], parents: tuple[str, ...] = (), config_dir: Path | None = None
+    items: list[FernNavigationItem], parents: tuple[str, ...] = (), config_dir: Path | None = None
 ) -> set[str]:
-    routes = set()
-    for item in items:
-        if "section" in item:
-            slug = str(item.get("slug", _fern_slug(str(item["section"]))))
-            section_path = item.get("path")
-            if config_dir is not None and isinstance(section_path, str):
-                frontmatter_slug = _frontmatter_slug((config_dir / section_path).resolve())
-                if frontmatter_slug:
-                    routes.add("/" + frontmatter_slug)
-            child_parents = parents if item.get("skip-slug") else (*parents, slug)
-            routes.update(_collect_fern_routes(item.get("contents", []), child_parents, config_dir))
-        elif "page" in item:
-            page_path = item.get("path")
-            frontmatter_slug = None
-            if config_dir is not None and isinstance(page_path, str):
-                frontmatter_slug = _frontmatter_slug((config_dir / page_path).resolve())
-            if frontmatter_slug:
-                routes.add("/" + frontmatter_slug)
-            else:
-                slug = str(item.get("slug", _fern_slug(str(item["page"]))))
-                routes.add("/" + "/".join((*parents, slug)))
-    return routes
+    return set(fern_page_paths(items, parents=parents, config_dir=config_dir))
 
 
 def _model_size_key(hf_model_id: str) -> tuple[str, str]:
