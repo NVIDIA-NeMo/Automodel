@@ -285,7 +285,10 @@ the training compute dtype. The recipe uses its Transformer Engine FP8 or
 NVFP4 setting or hardware-accelerated TorchAO FP8 setting when enabled.
 Otherwise, it uses the distributed autocast dtype, the FSDP2 compute dtype, or
 the model's predominant matrix parameter dtype. For example, an H100 SXM uses
-989 TFLOPs/s for BF16 or FP16 and 1,979 TFLOPs/s for FP8.
+989 TFLOPs/s for BF16 or FP16 and 1,979 TFLOPs/s for FP8. The training log
+records the selection once at setup, for example
+`MFU peak: 989 TFLOPs/s per device (NVIDIA H100 80GB HBM3, bfloat16)`, and
+legacy benchmark summaries repeat the peak.
 
 Remove the `mfu` section from existing YAML. The section, including `device`
 and `peak_tflops`, is deprecated and ignored. Legacy benchmark recipes also

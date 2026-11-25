@@ -109,6 +109,31 @@ _CONFIG_ALIAS_ATTRS = (
 )
 
 
+def _peak_tflops(dtype: torch.dtype) -> tuple[str, _Precision | None, float]:
+    """Look up the current device's dense peak for a compute dtype.
+
+    Args:
+        dtype: Training compute dtype. FP32 follows the CUDA matmul TF32 setting.
+
+    Returns:
+        The device name, the table precision used for ``dtype``, and the peak in
+        TFLOPs/s, which is ``math.inf`` for unknown device and precision combinations.
+    """
+    device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU"
+
+    precision = _DTYPE_PRECISIONS.get(dtype)
+    if dtype == torch.float32 and torch.backends.cuda.matmul.fp32_precision == "tf32":
+        precision = "tf32"
+
+    normalized_device = device_name.lower()
+    if " mig " in normalized_device or precision is None:
+        return device_name, precision, math.inf
+    for key in sorted(_DEVICE_TFLOPS, key=len, reverse=True):
+        if key.lower() in normalized_device:
+            return device_name, precision, _DEVICE_TFLOPS[key].get(precision, math.inf)
+    return device_name, precision, math.inf
+
+
 def get_device_flops(unit: str = "T", *, dtype: torch.dtype = torch.bfloat16) -> float:
     """Get the current device's theoretical FLOPS in a requested unit.
 
@@ -124,20 +149,7 @@ def get_device_flops(unit: str = "T", *, dtype: torch.dtype = torch.bfloat16) ->
     if unit not in _UNIT_TO_SCALE:
         supported = ", ".join(_UNIT_TO_SCALE.keys())
         raise ValueError(f"Unsupported unit '{unit}'. Supported units: {supported}")
-
-    device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU"
-
-    precision = _DTYPE_PRECISIONS.get(dtype)
-    if dtype == torch.float32 and torch.backends.cuda.matmul.fp32_precision == "tf32":
-        precision = "tf32"
-
-    normalized_device = device_name.lower()
-    if " mig " in normalized_device or precision is None:
-        return math.inf
-    for key in sorted(_DEVICE_TFLOPS, key=len, reverse=True):
-        if key.lower() in normalized_device:
-            return _DEVICE_TFLOPS[key].get(precision, math.inf) * (1e12 / _UNIT_TO_SCALE[unit])
-    return math.inf
+    return _peak_tflops(dtype)[2] * (1e12 / _UNIT_TO_SCALE[unit])
 
 
 class AutoMFU:
@@ -173,10 +185,19 @@ class AutoMFU:
         ):
             self.flops_formula = None
         dtype = compute_dtype or getattr(config, "dtype", None) or torch.bfloat16
-        self.reference_mfu = get_device_flops(dtype=dtype)
-        if not math.isfinite(self.reference_mfu):
+        device_name, precision, self.reference_mfu = _peak_tflops(dtype)
+        if math.isfinite(self.reference_mfu):
+            logger.info(
+                "MFU peak: %g TFLOPs/s per device (%s, %s%s)",
+                self.reference_mfu,
+                device_name,
+                str(dtype).removeprefix("torch."),
+                " with TF32" if precision == "tf32" else "",
+            )
+        else:
             logger.warning(
-                "Unable to determine the theoretical peak for the current device with %s; MFU will be reported as 0%%.",
+                "Unable to determine the theoretical peak for %s with %s; MFU will be reported as 0%%.",
+                device_name,
                 dtype,
             )
 

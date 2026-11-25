@@ -596,9 +596,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     else f" (all {steps} iterations)"
                 )
             )
-            logger.info(f"{'=' * 60}\n")
-
             reported_peak = peak_tflops if math.isfinite(peak_tflops) else None
+            logger.info(
+                f"MFU peak: {reported_peak:g} TFLOPs/s per device" if reported_peak is not None else "MFU peak: unknown"
+            )
+            logger.info(f"{'=' * 60}\n")
 
             # Prepare summary data
             summary_data = {

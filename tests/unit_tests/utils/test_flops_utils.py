@@ -462,8 +462,28 @@ def test_automfu_warns_and_reports_zero_for_unknown_device(monkeypatch, caplog):
         calculator = AutoMFU(SimpleNamespace())
 
     assert calculator.reference_mfu == float("inf")
-    assert "MFU will be reported as 0%" in caplog.text
+    assert "NVIDIA Example GPU with torch.bfloat16; MFU will be reported as 0%" in caplog.text
     assert calculator((1, 1), time_delta=1.0, world_size=1) == 0.0
+
+
+@pytest.mark.parametrize(
+    "dtype, fp32_precision, expected",
+    [
+        (torch.bfloat16, "tf32", "MFU peak: 989 TFLOPs/s per device (NVIDIA H100 80GB HBM3, bfloat16)"),
+        (torch.float32, "tf32", "MFU peak: 494.5 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float32 with TF32)"),
+        (torch.float32, "ieee", "MFU peak: 67 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float32)"),
+        (torch.float8_e4m3fn, "tf32", "MFU peak: 1979 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float8_e4m3fn)"),
+    ],
+)
+def test_automfu_logs_the_peak_it_divides_by(dtype, fp32_precision, expected, monkeypatch, caplog):
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", fp32_precision)
+    _mock_cuda_device(monkeypatch, "NVIDIA H100 80GB HBM3")
+
+    with caplog.at_level("INFO", logger=mfu_module.__name__):
+        AutoMFU(SimpleNamespace(), compute_dtype=dtype)
+
+    assert [record.getMessage() for record in caplog.records] == [expected]
 
 
 def test_automfu_without_formula_preserves_the_calculator_interface(monkeypatch):

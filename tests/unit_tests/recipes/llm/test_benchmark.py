@@ -858,7 +858,12 @@ class TestBenchmarkingRecipeJSONOutput:
 
     @pytest.mark.parametrize("scope, peak_tflops", [("model", 989), ("text", 989), ("model", float("inf"))])
     def test_log_benchmark_summary_creates_json_file(
-        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, tmp_path: Path, scope: str, peak_tflops: float
+        self,
+        mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
+        tmp_path: Path,
+        scope: str,
+        peak_tflops: float,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Test that benchmark summary is written to JSON file."""
         json_file = tmp_path / "benchmark_summary.json"
@@ -874,8 +879,14 @@ class TestBenchmarkingRecipeJSONOutput:
             "iteration_warmup": mock_timer,
         }
 
-        with patch("torch.distributed.barrier"):
+        with (
+            patch("torch.distributed.barrier"),
+            caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"),
+        ):
             mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=peak_tflops, rank=0)
+
+        # The CI artifact collector reads the peak from this line.
+        assert ("MFU peak: 989 TFLOPs/s per device" if peak_tflops == 989 else "MFU peak: unknown") in caplog.text
 
         # Verify JSON file was created
         assert json_file.exists()
