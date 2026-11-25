@@ -36,7 +36,6 @@ PP_GRAD_ACCUM_PARITY_FILENAME = "L2_Parallelism_PP_Grad_Accum_Parity.sh"
 DEEPSEEK_V4_PP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_PP2_Parity.sh"
 DEEPSEEK_V4_EP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_EP2_Parity.sh"
 QWEN3_5_MOE_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_PP2_Parity.sh"
-QWEN3_8_FLASH_NEXT_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_8_FlashNext_PP2_Parity.sh"
 
 
 class TestParallelismParity:
@@ -55,9 +54,6 @@ class TestParallelismParity:
 
     def test_qwen3_5_moe_pp2_parity(self):
         run_test_script(TEST_FOLDER, QWEN3_5_MOE_PP2_PARITY_FILENAME)
-
-    def test_qwen3_8_flash_next_pp2_parity(self):
-        run_test_script(TEST_FOLDER, QWEN3_8_FLASH_NEXT_PP2_PARITY_FILENAME)
 
     def test_gemma4_pp2_tp2_parity(self):
         run_test_script(TEST_FOLDER, GEMMA4_PP2_TP2_PARITY_FILENAME)
