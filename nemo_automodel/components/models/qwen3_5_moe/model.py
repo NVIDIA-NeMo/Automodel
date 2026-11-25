@@ -1550,7 +1550,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
     def _vision_tower_is_trainable(self) -> bool:
         """Whether any vision-tower parameter is trainable (the tower is then its own FSDP unit)."""
-        visual = self.model.visual
+        visual = getattr(self.model, "visual", None)
         return visual is not None and any(param.requires_grad for param in visual.parameters())
 
     def _anchor_unused_vision_tower(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
