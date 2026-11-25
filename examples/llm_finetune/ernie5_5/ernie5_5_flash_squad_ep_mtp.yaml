@@ -1,0 +1,187 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Joint main-head and one-depth MTP SFT on SQuAD, using the released shared last MoE layer.
+# Select the native MTP class explicitly through the existing config override API; exported HF
+# configs retain the release architecture name. Keep the override when resuming an MTP checkpoint.
+# EP=8, TP=PP=CP=1; unpadded documents only. The DSA indexers and router biases stay frozen.
+# Uses the same GB200/cuDNN/HybridEP and TE FusedAdam requirements as ernie5_5_flash_squad_ep.yaml.
+# Validated on 16 nodes x 4 GB200 GPUs: 43 decoder layers plus shared MTP, EP8, 100 updates
+# and two validations on SQuAD documents of at most 256 tokens with global batch size 64.
+# See the model card for measurements and validation limits.
+# Checkpoint saving is disabled by default because full-model optimizer state is several TiB.
+# Run on 16 nodes with four GPUs each, with NODE_RANK and MASTER_ADDR set for the allocation:
+#   uv run torchrun --nnodes=16 --nproc-per-node=4 --node-rank=$NODE_RANK \
+#     --master-addr=$MASTER_ADDR --master-port=29500 -m nemo_automodel.cli.app \
+#     examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_mtp.yaml
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  # One unpadded document per rank and microbatch: padded input is not supported.
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  save_checkpoint_every_epoch: false
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+  revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+  trust_remote_code: false
+  dtype: bfloat16
+  config:
+    architectures: [Ernie5_5MTPForCausalLM]
+  num_nextn_predict_layers: 1
+  mtp_shared_last_layer: true
+  mtp_loss_scaling_factor: 0.1
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # cuDNN sparse attention for the DSA layers: requires nvidia-cudnn-frontend[cutedsl] and
+    # FlashMLA; validated on SM100-class GPUs (GB200) only.
+    attn: cudnn
+    # Supported expert/dispatcher pairs are torch_mm/hybridep (BF16 compute) and torch/torch
+    # (all-gather and all-reduce over the EP group). Other BackendConfig fields except
+    # enable_hf_state_dict_adapter must keep their defaults.
+    linear: torch
+    experts: torch_mm
+    dispatcher: hybridep
+
+distributed:
+  strategy: fsdp2
+  # FSDP2 with expert parallelism only: TP, PP, CP and dp_replicate_size must stay 1, and
+  # ep_size must be greater than 1.
+  tp_size: 1
+  pp_size: 1
+  cp_size: 1
+  ep_size: 8
+  # With true, the other decoder layers are checkpointed; the reused last layer stays excluded.
+  activation_checkpointing: false
+  # No compute cast: every parameter is used in its storage dtype (BF16, and FP32 where the
+  # model keeps FP32 parameters). Gradients are reduced in FP32.
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: null
+    reduce_dtype: float32
+    output_dtype: null
+    cast_forward_inputs: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+checkpoint:
+  # Full-model weights and optimizer state require terabytes of storage. Metrics are written
+  # here even when saving is disabled. Full 43-layer MTP checkpoint/export has not been
+  # measured. To save sharded checkpoints,
+  # enable saving and set save_consolidated: false, with sufficient storage and job time.
+  enabled: false
+  checkpoint_dir: checkpoints/ernie5_5_flash_squad_ep_mtp/
+  # Plan the loading of the released weights, and of a resume, over a CPU (Gloo) process group
+  # instead of NCCL. With NCCL, rank 0 can keep point-to-point buffers for other ranks for the
+  # whole run; how much depends on the placement of the ranks (see the model card). The switch
+  # covers loads only; a save still plans over NCCL. This example selects the Gloo path.
+  load_metadata_with_gloo: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  # Truncate without padding; the model accepts one unpadded document per microbatch.
+  # Truncation can remove every answer token from a row; the common token objective handles
+  # these empty-supervision rows. This example does not establish full-model MTP memory
+  # requirements for longer documents.
+  seq_length: 256
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+    revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
+
+packed_sequence:
+  # The MTP variant rejects packed inputs and context parallelism.
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  # No pad_seq_len_divisible: the collator must not pad.
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+# Native validation computes and reports the main decoder loss only.
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 128
+  seq_length: 256
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+    revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  # BF16 parameters with FP32 master weights, stored as 16-bit remainders, and BF16 moments.
+  # Updates at this learning rate are mostly below BF16 resolution, so they accumulate in the
+  # master weights instead of being rounded away on the BF16 parameters.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 1.0e-6
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: gb200
+  # EP=8 over WORLD=64: 16 nodes x 4 GPUs. The cuDNN DSA path is validated on SM100-class GPUs
+  # (GB200) only.
+  recipe_owner: linmuchuiyang
+  nodes: 16
+  time: "01:00:00"
+  nproc_per_node: 4

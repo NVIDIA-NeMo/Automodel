@@ -123,3 +123,28 @@ def test_ernie5_5_flash_recipe_keeps_fp32_master_weights_for_bf16_parameters() -
     assert optimizer["store_param_remainders"] is True
     assert dtype_from_str(optimizer["master_weight_dtype"]) == torch.float32
     assert dtype_from_str(optimizer["exp_avg_dtype"]) == dtype_from_str(optimizer["exp_avg_sq_dtype"])
+
+
+def test_ernie5_5_mtp_recipe_selects_shared_auxiliary_training() -> None:
+    """Parse the shipped opt-in MTP recipe and its supported distributed topology."""
+    path = RECIPE.with_name("ernie5_5_flash_squad_ep_mtp.yaml")
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    model = config["model"]
+    assert config["recipe"] == "TrainFinetuneRecipeForNextTokenPrediction"
+    assert model["pretrained_model_name_or_path"] == MODEL_ID
+    assert model["config"]["architectures"] == ["Ernie5_5MTPForCausalLM"]
+    assert model["num_nextn_predict_layers"] == 1
+    assert model["mtp_shared_last_layer"] is True
+    assert model["mtp_loss_scaling_factor"] == pytest.approx(0.1)
+    assert config["packed_sequence"]["packed_sequence_size"] == 0
+    assert config["step_scheduler"]["local_batch_size"] == 1
+    for section in ("dataset", "validation_dataset"):
+        assert config[section]["padding"] is False
+        assert config[section]["tokenizer"]["revision"] == model["revision"]
+    parsed = parse_distributed_section(config["distributed"])
+    sizes = parsed["parallelism_sizes"]
+    assert isinstance(parsed["strategy_config"], FSDP2Config)
+    assert (sizes.tp_size, sizes.pp_size, sizes.cp_size, sizes.ep_size) == (1, 1, 1, 8)
+    world = config["ci"]["nodes"] * config["ci"]["nproc_per_node"]
+    assert world % sizes.ep_size == 0
+    assert config["step_scheduler"]["global_batch_size"] % world == 0

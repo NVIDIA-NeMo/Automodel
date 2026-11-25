@@ -388,9 +388,9 @@ def decoder_only_config(config: Ernie5_5Config) -> Ernie5_5Config:
         raise ValueError("num_hidden_layers must be a positive integer")
     if not _is_integer(depth) or depth != 0:
         raise ValueError(
-            f"ERNIE 5.5 is trained without its MTP block and requires MTP depth 0, but the configuration has "
-            f"num_nextn_predict_layers={depth!r}. Set `model.num_nextn_predict_layers: 0` in the recipe; the MTP "
-            f"weights of the checkpoint are then not loaded."
+            f"The ERNIE 5.5 decoder entry requires MTP depth 0, but the configuration has "
+            f"num_nextn_predict_layers={depth!r}. Set `model.num_nextn_predict_layers: 0` for decoder-only training, "
+            f"or set `model.config.architectures: [Ernie5_5MTPForCausalLM]` to train the shared MTP block."
         )
     if not isinstance(ratios, (list, tuple)):
         raise ValueError("compress_ratios must list one entry per decoder layer")
@@ -563,3 +563,27 @@ def validate_architecture(config: Ernie5_5Config) -> None:
     ]
     if different:
         raise NotImplementedError(f"ERNIE 5.5 implements one variant of these settings; got {', '.join(different)}")
+
+
+def mtp_decoder_config(config: Ernie5_5Config) -> Ernie5_5Config:
+    """Validate the shared MTP plan and derive its decoder-only configuration.
+
+    Args:
+        config: One shared-last-layer MTP depth. The input is not modified.
+
+    Returns:
+        An independently owned decoder configuration normalized by
+        ``decoder_only_config``, with a fully validated attention schedule.
+
+    Raises:
+        ValueError: If the depth, sharing mode, attention schedule or last
+            decoder block is incompatible with one shared DSA/MoE MTP body.
+    """
+    if config.num_nextn_predict_layers != 1 or config.mtp_shared_last_layer is not True:
+        raise ValueError("ERNIE 5.5 MTP training requires one shared-last-layer MTP depth")
+    Ernie5_5ModelPlan.from_config(config)
+    if tuple(config.compress_ratios[-2:]) != (-2, -2) or config.num_hidden_layers <= config.first_k_dense_replace:
+        raise ValueError("The shared MTP body must be the last DSA/MoE decoder block")
+    result = copy.copy(config)
+    result.num_nextn_predict_layers = 0
+    return decoder_only_config(result)

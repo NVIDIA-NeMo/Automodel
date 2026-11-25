@@ -96,6 +96,7 @@ from nemo_automodel.components.models.ernie5_5.layers import (
     shard_start,
 )
 from nemo_automodel.components.models.ernie5_5.moe import Ernie5_5MoE
+from nemo_automodel.components.models.ernie5_5.mtp_router import Ernie5_5MTPRouterState
 from nemo_automodel.components.models.ernie5_5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.ernie5_5.state_dict_adapter import Ernie5_5StateDictAdapter
 from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import CudnnDsaPackedMetadata
@@ -351,33 +352,50 @@ class Ernie5_5Block(nn.Module):
             )
         return output
 
-    def forward(self, hidden_streams: torch.Tensor, inputs: Ernie5_5AttentionInputs) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_streams: torch.Tensor,
+        inputs: Ernie5_5AttentionInputs,
+        *,
+        routing_state: Ernie5_5MTPRouterState | None = None,
+    ) -> torch.Tensor:
         """Apply the attention site and the feed-forward site to the residual streams.
 
         Args:
             hidden_streams: FP32 tensor of shape [batch, sequence, streams, hidden], where ``streams`` is
                 ``hc_mult``.
             inputs: Position and mask inputs of the forward call.
+            routing_state: Independent MTP correction state, or None for the decoder.
+                With MTP state, BF16 streams are also accepted and each residual site
+                rounds back to that dtype. The correction bias has shape [experts].
 
         Returns:
-            FP32 tensor of shape [batch, sequence, streams, hidden].
+            Tensor of shape [batch, sequence, streams, hidden], in the input dtype.
 
         Raises:
-            ValueError: If ``hidden_streams`` does not have that shape or is not FP32.
+            ValueError: If the stream shape is invalid, or the dtype is not FP32
+                (FP32 or BF16 when MTP routing state is supplied).
         """
         if hidden_streams.ndim != 4 or hidden_streams.shape[-2:] != (self.streams, self.hidden_size):
             raise ValueError(
                 f"Expected streams [batch, sequence, {self.streams}, {self.hidden_size}]; "
                 f"got {tuple(hidden_streams.shape)}"
             )
-        if hidden_streams.dtype != torch.float32:
-            raise ValueError(f"Decoder residual streams must be FP32; got {hidden_streams.dtype}")
+        allowed = (torch.float32,) if routing_state is None else (torch.float32, torch.bfloat16)
+        if hidden_streams.dtype not in allowed:
+            expected = "FP32" if routing_state is None else "FP32 or BF16 with MTP routing state"
+            raise ValueError(f"Decoder residual streams must be {expected}; got {hidden_streams.dtype}")
         pre, post, comb = self.attn_hc(hidden_streams)
         normalized = self.input_layernorm(self.attn_hc.collapse(hidden_streams, pre))
         hidden_streams = self.attn_hc.expand(self._attend(normalized, inputs), hidden_streams, post, comb)
         pre, post, comb = self.ffn_hc(hidden_streams)
         normalized = self.post_attention_layernorm(self.ffn_hc.collapse(hidden_streams, pre))
-        output = self.moe(normalized, inputs.document_ids < 0) if self.is_moe else self.mlp(normalized)
+        if not self.is_moe:
+            output = self.mlp(normalized)
+        elif routing_state is None:
+            output = self.moe(normalized, inputs.document_ids < 0)
+        else:
+            output = self.moe(normalized, inputs.document_ids < 0, routing_state=routing_state)
         return self.ffn_hc.expand(output, hidden_streams, post, comb)
 
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
@@ -523,7 +541,9 @@ class Ernie5_5Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         document_ids: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
-    ) -> torch.Tensor:
+        *,
+        mtp_forward: Callable[[torch.Tensor, Ernie5_5AttentionInputs], torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute the logits of unpadded single-document rows, or of a packed row or shard.
 
         Args:
@@ -534,10 +554,18 @@ class Ernie5_5Model(nn.Module):
             document_ids: Document of every token of a packed row or shard, of shape [batch, sequence]; see
                 ``packed_attention_inputs``.
             cp_group: Context-parallel group whose ranks hold consecutive shards of the row, or None.
+            mtp_forward: Optional local single-document MTP call. Receives final
+                streams and attention inputs while this module's FSDP unit is
+                unsharded, so its shared MultiMax parameters remain available.
 
         Returns:
-            Logits of shape [batch, sequence, vocab] in the head's ``logits_dtype``, or the model dtype if unset.
+            Main logits [batch, sequence, vocab], or main and auxiliary logits
+            when ``mtp_forward`` is supplied. Logits use the head's ``logits_dtype``,
+            or the model dtype when it is unset.
         """
+        # Keep the inner callback safe for direct callers as well as the outer MTP class.
+        if mtp_forward is not None and (document_ids is not None or cp_group is not None):
+            raise ValueError("ERNIE 5.5 MTP requires an unpadded single document and CP1")
         if document_ids is None:
             inputs = self.attention_inputs(input_ids)
         else:
@@ -546,7 +574,8 @@ class Ernie5_5Model(nn.Module):
         streams = hidden.unsqueeze(-2).expand(*hidden.shape[:-1], self.config.hc_mult, -1).contiguous()
         for layer in self.layers:
             streams = layer(streams, inputs)
-        return self.multimax(self.lm_head(self.norm(self.hyper_head(streams))))
+        logits = self.multimax(self.lm_head(self.norm(self.hyper_head(streams))))
+        return logits if mtp_forward is None else (logits, mtp_forward(streams, inputs))
 
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
         """Initialize every parameter of the decoder after meta-device materialization.

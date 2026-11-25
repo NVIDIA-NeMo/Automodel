@@ -92,6 +92,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.ernie5_5.model", "Ernie5_5_MoeForCausalLM"),
         ),
         (
+            "Ernie5_5MTPForCausalLM",
+            ("nemo_automodel.components.models.ernie5_5.mtp_training", "Ernie5_5MTPForCausalLM"),
+        ),
+        (
             "FlintForCausalLM",
             ("nemo_automodel.components.models.flint.model", "FlintForCausalLM"),
         ),
