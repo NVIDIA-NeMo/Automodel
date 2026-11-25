@@ -1651,3 +1651,70 @@ def test_factory_preserves_intrinsic_fp32_without_a_trainable_surface(tmp_path):
     torch.testing.assert_close(bias.detach().cpu(), weights[bias_name], rtol=0, atol=0)
     assert parameters["model.layers.0.norm.weight"].dtype == torch.bfloat16
     assert all(p.requires_grad for p in parameters.values())
+
+
+def _per_layer_moe_config(**overrides) -> MockNemotronV3Config:
+    """Config whose MoE layers declare their own shape in ``block_configs`` and have no global MoE fields."""
+    config = MockNemotronV3Config(
+        num_hidden_layers=3,
+        layers_block_type=["moe", "attention", "moe"],
+        block_configs=[
+            {"block_type": "moe", "n_routed_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 64},
+            {"block_type": "attention"},
+            {"block_type": "moe", "n_routed_experts": 6, "num_experts_per_tok": 3, "moe_intermediate_size": 96},
+        ],
+        **overrides,
+    )
+    for global_field in ("n_routed_experts", "num_experts_per_tok", "moe_intermediate_size"):
+        delattr(config, global_field)
+    return config
+
+
+def _torch_backend() -> BackendConfig:
+    return BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+
+
+def test_model_builds_each_moe_layer_with_its_own_shape():
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+    model = NemotronV3Model(_per_layer_moe_config(), backend=_torch_backend())
+
+    assert sorted(model.moe_config.layer_configs) == [0, 2]
+    assert model.moe_config.routed_expert_counts == [4, 6]
+    for layer_idx, n_experts, top_k, width in ((0, 4, 2, 64), (2, 6, 3, 96)):
+        layer_config = model.moe_config.for_layer(layer_idx)
+        assert layer_config.n_routed_experts == n_experts
+        assert layer_config.n_activated_experts == top_k
+        assert layer_config.moe_inter_dim == width
+        assert layer_config.layer_configs is None
+        experts = model.layers[str(layer_idx)].mixer.experts
+        assert experts.gate_and_up_projs.shape == (n_experts, 256, width)
+        assert experts.down_projs.shape == (n_experts, width, 256)
+
+
+def test_model_with_global_moe_shape_has_no_layer_configs():
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+    config = MockNemotronV3Config(layers_block_type=["moe", "attention"])
+    model = NemotronV3Model(config, backend=_torch_backend())
+
+    assert model.moe_config.layer_configs is None
+    assert model.moe_config.for_layer(0) is model.moe_config
+    assert model.layers["0"].mixer.experts.gate_and_up_projs.shape[0] == config.n_routed_experts
+
+
+def test_model_without_global_or_per_layer_moe_shape_raises():
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+    config = MockNemotronV3Config(layers_block_type=["moe", "attention"])
+    del config.n_routed_experts
+
+    with pytest.raises(AttributeError, match="n_routed_experts"):
+        NemotronV3Model(config, backend=_torch_backend())

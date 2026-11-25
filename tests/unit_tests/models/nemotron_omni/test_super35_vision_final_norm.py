@@ -19,6 +19,7 @@ from torch.nn import functional as F
 from nemo_automodel.components.models.nemotron_omni.model import (
     NemotronOmniForConditionalGeneration,
     VisionProjector,
+    _has_vision_final_layernorm,
 )
 
 
@@ -205,3 +206,18 @@ def test_video_encoder_error_restores_mode_and_image_projection(legacy: bool, tr
     assert model.vision_model.training is training
     if legacy:
         assert model.vision_model.radio_model.model.patch_generator.embedder is model.vision_model.image_projection
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"]), True),
+        (SimpleNamespace(architectures=["SomeOtherArchitecture"]), False),
+        (SimpleNamespace(architectures=None), False),
+        # An explicit flag wins over the architecture name in both directions.
+        (SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"], vision_final_layernorm=False), False),
+        (SimpleNamespace(architectures=["SomeOtherArchitecture"], vision_final_layernorm=True), True),
+    ],
+)
+def test_vision_final_layernorm_follows_explicit_config_flag(config: SimpleNamespace, expected: bool) -> None:
+    assert _has_vision_final_layernorm(config) is expected

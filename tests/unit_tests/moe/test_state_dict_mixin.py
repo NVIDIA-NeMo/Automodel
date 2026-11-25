@@ -1586,3 +1586,101 @@ class TestInplaceLoadViews:
         down_ptr = down_storage.untyped_storage().data_ptr()
         assert all(value.untyped_storage().data_ptr() == down_ptr for _, value in down_result)
         assert "model.layers.3.mlp.experts.down_projs" in mixin._inplace_loaded_native_keys
+
+
+def _per_layer_mixin() -> MockMoEStateDictMixin:
+    """Mixin whose layer 0 has 2 experts of width 2 and layer 1 has 3 experts of width 4 (non-gated)."""
+    from dataclasses import replace
+
+    from nemo_automodel.components.moe.config import MoEConfig
+
+    base = MoEConfig(
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="sigmoid",
+        route_scale=1.0,
+        dim=3,
+        inter_dim=4,
+        moe_inter_dim=2,
+        norm_topk_prob=False,
+        expert_activation="relu2",
+        dtype=torch.float32,
+    )
+    base.layer_configs = {0: replace(base), 1: replace(base, n_routed_experts=3, moe_inter_dim=4)}
+    mixin = MockMoEStateDictMixin(dtype=torch.float32, expert_activation="relu2")
+    mixin.moe_config = base
+    return mixin
+
+
+def _per_layer_hf_state_dict(skip: tuple[int, int] | None = None) -> dict[str, torch.Tensor]:
+    hf_state_dict = {}
+    for layer, n_experts, width in ((0, 2, 2), (1, 3, 4)):
+        for expert in range(n_experts):
+            if skip == (layer, expert):
+                continue
+            prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+            hf_state_dict[f"{prefix}.up_proj.weight"] = torch.randn(width, 3)
+            hf_state_dict[f"{prefix}.down_proj.weight"] = torch.randn(3, width)
+    return hf_state_dict
+
+
+class TestPerLayerMoEShapes:
+    def test_from_hf_groups_each_layer_with_its_own_expert_count_and_width(self):
+        mixin = _per_layer_mixin()
+        hf_state_dict = _per_layer_hf_state_dict()
+
+        native = mixin._from_hf_w_merged_experts(dict(hf_state_dict))
+
+        for layer, n_experts, width in ((0, 2, 2), (1, 3, 4)):
+            gate_and_up = native[f"model.layers.{layer}.mlp.experts.gate_and_up_projs"]
+            down = native[f"model.layers.{layer}.mlp.experts.down_projs"]
+            assert gate_and_up.shape == (n_experts, 3, width)
+            assert down.shape == (n_experts, width, 3)
+            for expert in range(n_experts):
+                prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+                torch.testing.assert_close(gate_and_up[expert], hf_state_dict[f"{prefix}.up_proj.weight"].T)
+                torch.testing.assert_close(down[expert], hf_state_dict[f"{prefix}.down_proj.weight"].T)
+
+    def test_native_to_hf_round_trip_splits_each_layer_by_its_own_expert_count(self):
+        mixin = _per_layer_mixin()
+        hf_state_dict = _per_layer_hf_state_dict()
+        native = mixin._from_hf_w_merged_experts(dict(hf_state_dict))
+
+        exported = {}
+        for key, value in native.items():
+            exported.update(dict(mixin._convert_single_merged_expert_to_hf_split_experts(key, value)))
+
+        assert sorted(exported) == sorted(hf_state_dict)
+        for key, value in hf_state_dict.items():
+            torch.testing.assert_close(exported[key], value)
+
+    def test_validation_reports_an_expert_missing_from_the_larger_layer(self):
+        mixin = _per_layer_mixin()
+
+        with pytest.raises(RuntimeError, match=r"layers\.1\.mlp\.experts\.2\."):
+            mixin._from_hf_w_merged_experts(_per_layer_hf_state_dict(skip=(1, 2)))
+
+    def test_lora_recombine_uses_the_layer_expert_count(self):
+        mixin = _per_layer_mixin()
+        lora_state_dict = {
+            f"model.layers.1.mlp.experts.{expert}.down_proj.lora_A.weight": torch.randn(2, 4) for expert in range(3)
+        }
+
+        recombined = mixin._recombine_lora_expert_keys(lora_state_dict)
+
+        assert recombined["model.layers.1.mlp.experts.lora_down_A"].shape[0] == 3
+
+    def test_paramwrapper_lora_load_is_rejected(self):
+        mixin = _per_layer_mixin()
+        state_dict = {"model.layers.1.mlp.experts.lora_A.weight": torch.randn(6, 4)}
+
+        with pytest.raises(NotImplementedError, match="per-layer MoE shapes"):
+            mixin._convert_paramwrapper_to_native(state_dict)
+        untouched = {"model.norm.weight": torch.ones(3)}
+        assert mixin._convert_paramwrapper_to_native(untouched) is untouched

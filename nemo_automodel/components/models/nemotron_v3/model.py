@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Union
 
 import torch
@@ -70,6 +70,31 @@ class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
     mtp_loss_scaling_factor: float | None = None
 
 
+def _block_field(block: Any, key: str) -> Any:
+    """Read one field of a ``block_configs`` entry, which is a dict in config.json and may be an object."""
+    return block.get(key) if isinstance(block, dict) else getattr(block, key, None)
+
+
+def _per_layer_moe_fields(config: Any) -> dict[int, dict]:
+    """Read per-layer MoE shapes from a config's ``block_configs``.
+
+    Returns {layer_idx: {n_routed_experts, n_activated_experts, moe_inter_dim}} for MoE layers that
+    declare their own shape, or {} for configs with one global MoE shape.
+    """
+    out: dict[int, dict] = {}
+    for idx, block in enumerate(getattr(config, "block_configs", None) or []):
+        if _block_field(block, "block_type") != "moe":
+            continue
+        fields = {
+            "n_routed_experts": _block_field(block, "n_routed_experts"),
+            "n_activated_experts": _block_field(block, "num_experts_per_tok"),
+            "moe_inter_dim": _block_field(block, "moe_intermediate_size"),
+        }
+        if any(value is not None for value in fields.values()):
+            out[idx] = fields
+    return out
+
+
 class NemotronV3Model(nn.Module):
     """NemotronV3 base model (without LM head).
 
@@ -115,10 +140,21 @@ class NemotronV3Model(nn.Module):
         if not has_moe:
             self.moe_config = None
         else:
+            # Configs with ``block_configs`` carry MoE shapes per layer and have no global fields.
+            layer_moe = _per_layer_moe_fields(config) if moe_config is None else {}
+
+            def _global_or_first(attr: str, field: str):
+                value = getattr(config, attr, None)
+                if value is None and layer_moe:
+                    value = next(iter(layer_moe.values()))[field]
+                if value is None:
+                    raise AttributeError(f"config has neither a global {attr!r} nor per-layer block_configs")
+                return value
+
             moe_defaults = dict(
-                n_routed_experts=config.n_routed_experts,
+                n_routed_experts=_global_or_first("n_routed_experts", "n_routed_experts"),
                 n_shared_experts=1,  # NemotronV3 has 1 shared expert
-                n_activated_experts=config.num_experts_per_tok,
+                n_activated_experts=_global_or_first("num_experts_per_tok", "n_activated_experts"),
                 n_expert_groups=config.n_group,
                 n_limited_groups=config.topk_group,
                 train_gate=True,
@@ -128,7 +164,7 @@ class NemotronV3Model(nn.Module):
                 route_scale=config.routed_scaling_factor,
                 dim=config.hidden_size,
                 inter_dim=config.intermediate_size,  # For shared expert
-                moe_inter_dim=config.moe_intermediate_size,  # For routed experts
+                moe_inter_dim=_global_or_first("moe_intermediate_size", "moe_inter_dim"),  # For routed experts
                 norm_topk_prob=config.norm_topk_prob,
                 router_bias=False,
                 expert_bias=config.mlp_bias,
@@ -143,6 +179,12 @@ class NemotronV3Model(nn.Module):
             if moe_overrides:
                 moe_defaults.update(moe_overrides)
             self.moe_config = moe_config or MoEConfig(**moe_defaults)
+            if layer_moe:
+                base = self.moe_config
+                base.layer_configs = {
+                    idx: replace(base, layer_configs=None, **{k: v for k, v in fields.items() if v is not None})
+                    for idx, fields in layer_moe.items()
+                }
 
         # Embeddings
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -152,7 +194,15 @@ class NemotronV3Model(nn.Module):
         self.layers = nn.ModuleDict()
         for idx in range(config.num_hidden_layers):
             self.layers[str(idx)] = NemotronV3Block(
-                config, layer_idx=idx, moe_config=self.moe_config, backend=self.backend
+                config,
+                layer_idx=idx,
+                # MoE layers get their own shape when the config declares one per layer.
+                moe_config=(
+                    self.moe_config.for_layer(idx)
+                    if self.moe_config is not None and config.layers_block_type[idx] == "moe"
+                    else self.moe_config
+                ),
+                backend=self.backend,
             )
 
         # Final norm

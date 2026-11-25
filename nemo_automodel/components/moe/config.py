@@ -72,6 +72,22 @@ class MoEConfig:
     # expert selection so RL training reuses the rollout's routing decisions. See
     # nemo_automodel.components.moe.router_replay.
     enable_routing_replay: bool = False
+    # Optional per-layer configs for models whose MoE layers differ in expert count, width or
+    # top-k. Keys are backbone layer indices. When None, every MoE layer uses this config.
+    layer_configs: dict[int, "MoEConfig"] | None = None
+
+    def for_layer(self, layer_idx: int | str) -> "MoEConfig":
+        """Return the config for one backbone layer (self when layers are uniform)."""
+        if not self.layer_configs:
+            return self
+        return self.layer_configs[int(layer_idx)]
+
+    @property
+    def routed_expert_counts(self) -> list[int]:
+        """Distinct routed-expert counts across MoE layers."""
+        if not self.layer_configs:
+            return [self.n_routed_experts]
+        return sorted({c.n_routed_experts for c in self.layer_configs.values()})
 
     @property
     def expert_dim(self) -> int:
