@@ -13,7 +13,9 @@
 # limitations under the License.
 
 # Hy4-flash synthetic training benchmark: 4,096-token sequences of random token ids, randomly initialised BF16 weights.
-# 8 nodes x 8 H100 80GB; EP64, CP1, TP1, PP1 (DP64); one sequence per rank and step.
+# 8 nodes x 8 H100 80GB; EP64, CP1, TP1, PP1 (DP64); two sequences per rank and step, parameters kept unsharded
+# after the forward (about 61 GiB per GPU). Three sequences per rank exceed what HybridEP can register per rank on
+# this fabric, and the model does not fit in 80 GiB without activation checkpointing.
 # Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (issue #3959).
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -27,8 +29,8 @@ benchmark:
   peak_tflops: 989
   warmup_steps: 6
 step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 1
+  global_batch_size: 128
+  local_batch_size: 2
   max_steps: 20
   num_epochs: 1
   ckpt_every_steps: 1000
@@ -75,9 +77,9 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
   defer_fsdp_grad_sync: false
-  reshard_after_forward: true
+  reshard_after_forward: false
   moe:
-    reshard_after_forward: true
+    reshard_after_forward: false
     wrap_outer_model: true
     lm_head_precision: float32
     ignore_router_for_ac: true
