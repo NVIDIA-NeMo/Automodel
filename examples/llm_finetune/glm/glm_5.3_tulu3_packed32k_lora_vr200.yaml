@@ -129,3 +129,7 @@ ci:
   max_steps: 20
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # Perf runs take 50 steps: ~22 min with model loading, too close to ci.time's 30 min.
+  perf_testing:
+    schedule: weekly
+    time: "00:40:00"
