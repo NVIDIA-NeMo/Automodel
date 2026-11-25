@@ -30,6 +30,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashTextConfig
 
@@ -192,8 +193,10 @@ class HY4FlashHyperConnection(nn.Module):
         """Initialise as the reference does: small ``fn``, ``scale`` 0.01 and a ``-log(hc_mult - 1)`` pre bias."""
         nn.init.normal_(self.fn, mean=0.0, std=initializer_range)
         nn.init.constant_(self.scale, 0.01)
-        base = torch.zeros_like(self.base)
+        base = torch.zeros(2 * self.hc_mult, dtype=self.base.dtype, device=self.base.device)
         base[: self.hc_mult] = -math.log(max(self.hc_mult - 1, 1))
+        if isinstance(self.base, DTensor):  # already sharded by FSDP: shard the full value the same way
+            base = distribute_tensor(base, self.base.device_mesh, self.base.placements)
         self.base.copy_(base)
 
     def forward(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

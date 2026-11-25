@@ -114,9 +114,9 @@ def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot,
         groups = sorted({token // kpool for token in recalled})
         assert recalled == [group * kpool + offset for group in groups for offset in range(kpool)]
         assert len(groups) == min(recall, own) and all(group < own for group in groups)
-        rejected = [group for group in range(own) if group not in groups]
-        if groups and rejected:  # a valid top-k whatever the tie order (relu makes exact ties at zero possible)
-            assert logits[row, groups].min() >= logits[row, rejected].max() - 1e-5
+        # the brute-force top-k under the total order (score, then lowest group first)
+        ranked = sorted(range(own), key=lambda group: (-float(logits[row, group]), group))
+        assert groups == sorted(ranked[:recall])
         dropped += len(keys) < slot + 1
     assert dropped > 0, "no query dropped a visible key: sparse selection is not exercised"
 

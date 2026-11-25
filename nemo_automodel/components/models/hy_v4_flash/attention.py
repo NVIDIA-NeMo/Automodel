@@ -215,8 +215,8 @@ class HY4FlashCompressedIndexer(nn.Module):
     ) -> HY4FlashSparsePlan:
         """Select the document-local tokens every query of one contiguous query interval attends to.
 
-        A query recalls the ``index_topk // index_kpool - 1`` best-scoring groups that closed before its own group,
-        plus the tokens of its own group up to itself. Scores are fp32 ``[queries, heads, groups]`` in the
+        A query recalls the ``index_topk // index_kpool - 1`` best-scoring groups that closed before its own group
+        (ties broken towards the earlier group), plus the tokens of its own group up to itself. Scores are fp32 ``[queries, heads, groups]`` in the
         reference; they are materialised here ``query_chunk`` queries at a time and only over the groups the
         chunk can see, so the peak is ``query_chunk * heads * groups`` values whatever the document length.
 
@@ -257,7 +257,8 @@ class HY4FlashCompressedIndexer(nn.Module):
         own_group = slots // self.kpool
         recall = self.group_topk - 1
         sentinel = torch.iinfo(torch.int32).max // self.kpool
-        recalled = torch.full((queries, recall), sentinel, dtype=torch.long, device=device)
+        # One spare column absorbs the writes of the groups that are not chosen.
+        recalled = torch.full((queries, recall + 1), sentinel, dtype=torch.long, device=device)
         for start in range(0, queries, self.query_chunk):
             end = min(start + self.query_chunk, queries)
             # Groups that closed before the last query of the chunk; later groups are invisible to all of it.
@@ -266,13 +267,22 @@ class HY4FlashCompressedIndexer(nn.Module):
                 continue
             scores = torch.matmul(query[start:end].float().flatten(0, 1), keys[:visible].T).relu_()
             logits = torch.bmm(head_weights[start:end, None], scores.view(end - start, self.n_heads, visible))[:, 0]
-            own = own_group[start:end, None]
-            logits.masked_fill_(torch.arange(visible, device=device) >= own, float("-inf"))
-            chosen = logits.topk(min(recall, visible), dim=-1).indices
-            # Fewer visible groups than the budget: top-k pads with masked (not yet closed) groups; drop them.
-            recalled[start:end, : chosen.shape[1]] = torch.where(chosen < own, chosen, sentinel)
-        # Ascending valid prefix: recalled groups in key order, then the query's own group (always the largest).
-        recalled = recalled.sort(dim=-1).values
+            group = torch.arange(visible, device=device)
+            closed = group < own_group[start:end, None]
+            logits.masked_fill_(~closed, float("-inf"))
+            # Top-k with a total order (score, then lowest group first), so the chosen set does not depend on how
+            # the queries are chunked or split over context-parallel ranks: everything above the k-th score, then
+            # the lowest-index groups tied with it. ``torch.topk`` alone leaves the order of ties unspecified, and
+            # exact ties do occur (a group whose every head score is clipped by the ReLU scores exactly zero).
+            budget = min(recall, visible)
+            kth = logits.topk(budget, dim=-1).values[:, -1:]
+            above = logits > kth
+            tied = (logits == kth) & closed
+            chosen = above | (tied & (tied.cumsum(-1) <= budget - above.sum(-1, keepdim=True)))
+            # Compact the chosen groups to the front in ascending order (the kernel wants ascending key rows).
+            slot = torch.where(chosen, chosen.cumsum(-1) - 1, recall)
+            recalled[start:end].scatter_(1, slot, group.expand_as(slot))
+        recalled = recalled[:, :recall]
         groups_recalled = (recalled < sentinel).sum(dim=-1)
         offsets = torch.arange(self.kpool, device=device)
         tokens = (recalled[:, :, None] * self.kpool + offsets).masked_fill(recalled[:, :, None] == sentinel, -1)

@@ -18,6 +18,7 @@ Thinking models need a custom chat template that strips `<think>` tags from trai
 
 ```python
 from transformers import AutoTokenizer
+
 tokenizer = AutoTokenizer.from_pretrained("Your/Model", trust_remote_code=True)
 print(tokenizer.chat_template)
 ```

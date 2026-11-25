@@ -63,6 +63,7 @@ from nemo_automodel.components.models.hy_v4_flash.attention import (
 )
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLayer, build_ngram_tokens
+from nemo_automodel.components.models.hy_v4_flash.fsdp import PARALLELIZER
 from nemo_automodel.components.models.hy_v4_flash.layers import (
     HY4FlashHyperConnection,
     HY4FlashHyperHead,
@@ -96,8 +97,10 @@ def build_moe_config(text: HY4FlashTextConfig, dtype: torch.dtype) -> MoEConfig:
         score_func="sigmoid",
         route_scale=text.routed_scaling_factor,
         norm_topk_prob=text.norm_topk_prob,
+        # Router weights are stored in the released dtype (bf16) and upcast for the fp32 routing GEMM, as for the
+        # other sigmoid-router families; an fp32-stored weight next to the fp32 correction bias cannot be given its
+        # own FSDP unit.
         router_weights_fp32=True,
-        gate_dtype=torch.float32,
         force_e_score_correction_bias=True,
         swiglu_limit=text.swiglu_limit,
         moe_latent_size=text.routed_expert_hidden_size,
@@ -741,5 +744,6 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             cast_model_to_dtype(self, dtype)
 
 
+HY4FlashForCausalLM.parallelizer = PARALLELIZER
 HY4FlashForConditionalGeneration = HY4FlashForCausalLM
 ModelClass = HY4FlashForCausalLM
