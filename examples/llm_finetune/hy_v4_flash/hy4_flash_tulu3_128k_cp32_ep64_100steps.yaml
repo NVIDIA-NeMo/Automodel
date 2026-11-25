@@ -18,6 +18,10 @@
 # Tulu-3 conversations are shuffled with a fixed seed (shuffle_seed) BEFORE packing, then packed in order into THD
 # sequences of 131072 tokens; the packs keep that order (dataloader shuffle: false), so all CP/parallelism
 # configurations can reuse the same frozen packs. Packed documents never attend to each other.
+# Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (or NCCL_NET_PLUGIN=none
+# NCCL_NET=IB with PXN kept), as for DeepSeek-V4.1-Flash. With the container's default network plugin and PXN both
+# active, the Engram row-owner ID all-to-all receives corrupted IDs from ranks on another node and the recipe stops in
+# the shared table's received-ID check (issue #3959). ``ci.env_vars`` below sets it for CI.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
@@ -148,3 +152,5 @@ ci:
   nodes: 16
   time: "01:00:00"
   max_steps: 2
+  env_vars:
+    NCCL_PXN_DISABLE: "1"

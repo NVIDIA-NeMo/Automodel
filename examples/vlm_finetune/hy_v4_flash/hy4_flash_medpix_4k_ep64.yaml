@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Hy4-flash full SFT on MedPix-VQA (unpacked, 4K tokens), EP64 on 8 H100 nodes x 8 GPUs.
+# Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (or NCCL_NET_PLUGIN=none
+# NCCL_NET=IB with PXN kept), as for DeepSeek-V4.1-Flash. With the container's default network plugin and PXN both
+# active, the Engram row-owner ID all-to-all receives corrupted IDs from ranks on another node and the recipe stops in
+# the shared table's received-ID check (issue #3959). ``ci.env_vars`` below sets it for CI.
 
 recipe: FinetuneRecipeForVLM
 seed: 1234
@@ -149,3 +153,5 @@ ci:
   nodes: 8
   cluster_tag: h100
   time: "01:00:00"
+  env_vars:
+    NCCL_PXN_DISABLE: "1"
