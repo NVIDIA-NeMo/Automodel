@@ -3,6 +3,7 @@
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import (
     Glm5NextConfig,
     Glm5NextTextConfig,
@@ -58,7 +59,8 @@ def tiny_glm5_next_config() -> Glm5NextConfig:
     return Glm5NextConfig(text_config=text, vision_config=vision, image_token_id=63, pad_token_id=0)
 
 
-def tiny_backend(*, adapter: bool = True) -> BackendConfig:
+def tiny_shared_backend(*, adapter: bool = True) -> BackendConfig:
+    """The backend every other model takes: a plain ``BackendConfig`` without GLM fields."""
     return BackendConfig(
         attn="sdpa",
         linear="torch",
@@ -68,6 +70,10 @@ def tiny_backend(*, adapter: bool = True) -> BackendConfig:
         rope_fusion=False,
         enable_hf_state_dict_adapter=adapter,
     )
+
+
+def tiny_backend(*, adapter: bool = True) -> Glm5NextBackendConfig:
+    return Glm5NextBackendConfig.from_backend(tiny_shared_backend(adapter=adapter))
 
 
 def tiny_glm5_next_model() -> Glm5NextForConditionalGeneration:
