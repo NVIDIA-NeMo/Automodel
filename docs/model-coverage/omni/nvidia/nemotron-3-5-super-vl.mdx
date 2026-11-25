@@ -103,14 +103,16 @@ torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=$HEAD
   examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_gb300.yaml
 ```
 
-The figure and table compare the recipe with the same file without its `te_nvfp4` block (BF16), which was run
+The figure and tables compare the recipe with the same file without its `te_nvfp4` block (BF16), which was run
 twice. All runs use the same seed, initial weights, and data order on 16 GB300 GPUs (TE 2.19.0) and train
 1,500 optimizer steps, 1.57 billion tokens. Two settings differ from the recipe as written: a 1,500-step cosine
 schedule (`--step_scheduler.max_steps 1500`) and 4.5 billion tokens of FineWeb `sample-10BT` in 16 shards, one
-per rank, read in stored order (`--dataset.file_pattern`). "Original BF16" in the figure is the BF16 run on the
-code before the Mamba and MoE optimizations that this recipe uses; it took 3.66 hours.
+per rank, read in stored order (`--dataset.file_pattern`). Every run stops at step 1,500, the end of its
+schedule, so the runs are equal in steps and differ in time: a faster run ends earlier and its line in the
+wall-clock panels is shorter. "Original BF16" in the figure is the BF16 run on the code before the Mamba and
+MoE optimizations that this recipe uses; it took 3.66 hours.
 
-![Training loss of Nemotron 3.5 Super VL pretraining on FineWeb with 16 GB300 GPUs, NVFP4 against BF16, by optimizer step and by wall-clock time](./nemotron-3-5-super-vl-nvfp4-gb300-loss.png)
+![Training loss and optimizer steps completed of Nemotron 3.5 Super VL pretraining on FineWeb with 16 GB300 GPUs, NVFP4 against BF16, by optimizer step and by wall-clock time](./nemotron-3-5-super-vl-nvfp4-gb300-loss.png)
 
 | Run | Optimizer steps | Mean training loss, steps 1,400-1,499 | Step time | Tokens/sec/GPU | Peak memory | Time for 1,500 steps |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -120,12 +122,24 @@ code before the Mamba and MoE optimizations that this recipe uses; it took 3.66 
 
 Step time is the median over steps 100-1,499, and peak memory is the `nvidia-smi` maximum of the busiest GPU.
 Over the last 100 steps the NVFP4 loss is 0.020 (0.57%) above the BF16 loss, and the two BF16 runs differ by
-0.004. NVFP4 was run once, so its own run-to-run difference is not measured. The NVFP4 step is 4.7% faster. At
-equal wall-clock time the NVFP4 loss is lower after 1 hour (4.84 against 4.91) and after 3 hours (3.58 against
-3.60). From 3.1 hours on it is not lower: within 0.005 of the BF16 loss up to 3.3 hours and 0.015 higher at
-3.4 hours, shortly before its schedule ends. These are training losses on batches seen once, not held-out
-quality measurements. The learned gate of a randomly initialized model routes tokens unevenly across ranks, so
-these token rates are lower than the balanced-routing rows on mock data in the
+0.004. NVFP4 was run once, so its own run-to-run difference is not measured.
+
+The NVFP4 step is 4.7% faster, so the NVFP4 run finishes its 1,500 steps 9.6 minutes before the BF16 run, and
+at equal wall-clock time it has completed more steps (panel d of the figure). Time counts from the start of the
+first step:
+
+| Optimizer steps completed (mean training loss of the 50 most recent steps) after | NVFP4 (the recipe) | BF16 (without `te_nvfp4`) | BF16, second run |
+| --- | ---: | ---: | ---: |
+| 1 hour | 399 (4.836) | 381 (4.911) | 380 (4.910) |
+| 2 hours | 851 (3.893) | 811 (3.899) | 811 (3.889) |
+| 3 hours | 1,301 (3.581) | 1,241 (3.604) | 1,243 (3.607) |
+| 3.44 hours, when the NVFP4 run finished | 1,500 (3.538) | 1,430 (3.530) | 1,433 (3.533) |
+
+The learning rate follows the step, so at equal time the faster run is further down the same schedule. The
+NVFP4 loss is lower after 1 hour and after 3 hours, within 0.005 of the BF16 loss between 3.1 and 3.3 hours,
+and 0.008 above the BF16 run at the moment the NVFP4 run finishes. These are training losses on batches seen
+once, not held-out quality measurements. The learned gate of a randomly initialized model routes tokens unevenly
+across ranks, so these token rates are lower than the balanced-routing rows on mock data in the
 [Performance Summary](/performance/performance-summary).
 
 ## Model Reference
