@@ -36,13 +36,8 @@ fine-tuning code does; samples whose assistant turns carry reasoning are rendere
 
 ## Launch Requirements
 
-- **Set `NCCL_PXN_DISABLE=1`** (or `NCCL_NET_PLUGIN=none NCCL_NET=IB`) on multi-node InfiniBand H100 systems. With the
-  container's default NCCL network plugin and PXN both active, the Engram row-owner all-to-all receives corrupted IDs
-  from ranks on another node and the recipe stops in the table's received-ID check, as for DeepSeek-V4.1-Flash. See
-  [issue #3959](https://github.com/NVIDIA-NeMo/Automodel/issues/3959). The recipes set it in `ci.env_vars`.
-- **Point the JIT caches at node-local storage** (`HYBRID_EP_CACHE_DIR`, `TRITON_CACHE_DIR`).
-- The recipes compile the hyper-connection and norm cores (`compile_hc`, `compile_norm`), so the first step takes
-  several minutes longer than the following ones.
+The multi-node launch requirements (`NCCL_PXN_DISABLE=1`, JIT cache placement, and what `compile_norm` changes) are on
+the [language model card](/model-coverage/large-language-models/tencent/Hy4-flash#launch-requirements).
 
 ## Model Reference
 
@@ -52,6 +47,7 @@ fine-tuning code does; samples whose assistant turns carry reasoning are rendere
 | --- | --- |
 | Task | Image-text-to-text |
 | Architecture | `HYV4FlashForConditionalGeneration` |
+| Parameters | 219B total / 11B activated |
 | Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
 
 ### Available Models

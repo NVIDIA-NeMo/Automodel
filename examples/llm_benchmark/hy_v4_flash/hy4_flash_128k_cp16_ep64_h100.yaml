@@ -15,9 +15,10 @@
 # Hy4-flash synthetic training benchmark: 131,072-token sequences of random token ids (one document per sequence),
 # randomly initialised BF16 weights. 8 nodes x 8 H100 80GB; EP64, CP16, TP1, PP1 (DP4); one sequence per data-parallel
 # replica and step, split over 16 context-parallel ranks.
-# Parameters stay unsharded after the forward (about 62 GiB per GPU). Context parallelism takes one packed row per
-# rank, so the local batch size stays 1.
-# Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (issue #3959).
+# Parameters stay unsharded after the forward. Context parallelism takes one packed row per rank, so the local batch
+# size is 1.
+# Launch requirements (NCCL_PXN_DISABLE=1 on multi-node InfiniBand H100 systems, JIT cache placement): see the
+# Hy4-flash model card, docs/model-coverage/llm/tencent/hy4-flash.mdx.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
@@ -62,8 +63,8 @@ model:
     rope_fusion: false
     shared_expert_overlap: true
     compile_router_weight: true
-    compile_hc: true  # hyper-connection cores compiled once per static shape; the first step takes minutes longer
-    compile_norm: true  # in BF16 the compiled core multiplies by the weight in FP32 and rounds once; the reference rounds twice
+    compile_hc: true
+    compile_norm: true  # rounds once where the reference rounds twice in BF16; see the model card
     dispatcher_equal_token_counts: true
     fake_balanced_gate: true  # balanced routing: removes routing imbalance, not a measurement of learned routing
     fake_gate_noise: 0.0
@@ -124,8 +125,8 @@ ci:
   nemo_ci_schedule: skipped
   cluster_tag: h100
   recipe_owner: HuiyingLi
-  time: "00:45:00"
   nodes: 8
+  time: "00:45:00"
   nproc_per_node: 8
   env_vars:
     NCCL_PXN_DISABLE: "1"

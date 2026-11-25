@@ -18,12 +18,8 @@
 # Tulu-3 conversations are shuffled with a fixed seed (shuffle_seed) BEFORE packing, then packed in order into THD
 # sequences of 131072 tokens; the packs keep that order (dataloader shuffle: false), so all CP/parallelism
 # configurations can reuse the same frozen packs. Packed documents never attend to each other.
-# Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (or NCCL_NET_PLUGIN=none
-# NCCL_NET=IB with PXN kept), as for DeepSeek-V4.1-Flash. With the container's default network plugin and PXN both
-# active, the Engram row-owner ID all-to-all receives corrupted IDs from ranks on another node and the recipe stops in
-# the shared table's received-ID check (issue #3959). ``ci.env_vars`` below sets it for CI.
-# Point the JIT caches (HYBRID_EP_CACHE_DIR, TRITON_CACHE_DIR) at node-local storage, as on the DeepSeek-V4.1-Flash
-# model-coverage page.
+# Launch requirements (NCCL_PXN_DISABLE=1 on multi-node InfiniBand H100 systems, JIT cache placement): see the
+# Hy4-flash model card, docs/model-coverage/llm/tencent/hy4-flash.mdx.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
@@ -59,14 +55,12 @@ model:
     rope_fusion: false
     shared_expert_overlap: true
     compile_router_weight: true
-    compile_hc: true  # hyper-connection cores compiled once per static shape; the first step takes minutes longer
-    compile_norm: true  # in BF16 the compiled core multiplies by the weight in FP32 and rounds once; the reference rounds twice
+    compile_hc: true
+    compile_norm: true  # rounds once where the reference rounds twice in BF16; see the model card
     dispatcher_equal_token_counts: true  # packed CP synchronises physical lengths across EP ranks
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-  text_config:
-    output_hidden_states: true
 distributed:
   strategy: fsdp2
   tp_size: 1
@@ -75,6 +69,7 @@ distributed:
   ep_size: 64
   sequence_parallel: false
   activation_checkpointing: true
+  defer_fsdp_grad_sync: true  # one micro-batch per step here, so deferring changes nothing
   enable_compile: false
   reshard_after_forward: false
   moe:
@@ -147,8 +142,8 @@ lr_scheduler:
   wd_incr_steps: 100
 mfu:
   peak_tflops: 989
-validation_dataset: null
-validation_dataloader: null
+validation_dataset: none
+validation_dataloader: none
 ci:
   nemo_ci_schedule: release
   cluster_tag: h100

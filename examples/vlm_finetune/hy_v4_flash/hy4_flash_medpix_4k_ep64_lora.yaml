@@ -1,13 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Hy4-flash LoRA on MedPix-VQA (unpacked, 4K tokens), EP64 on 8 H100 nodes x 8 GPUs. Adapter targets, rank and alpha
 # follow the model's official finetune guide (MLA projections, rank 64, alpha 128, learning rate 2e-4).
-# Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (or NCCL_NET_PLUGIN=none
-# NCCL_NET=IB with PXN kept), as for DeepSeek-V4.1-Flash. With the container's default network plugin and PXN both
-# active, the Engram row-owner ID all-to-all receives corrupted IDs from ranks on another node and the recipe stops in
-# the shared table's received-ID check (issue #3959). ``ci.env_vars`` below sets it for CI.
-# Point the JIT caches (HYBRID_EP_CACHE_DIR, TRITON_CACHE_DIR) at node-local storage, as on the DeepSeek-V4.1-Flash
-# model-coverage page.
+# Launch requirements (NCCL_PXN_DISABLE=1 on multi-node InfiniBand H100 systems, JIT cache placement): see the
+# Hy4-flash model card, docs/model-coverage/llm/tencent/hy4-flash.mdx.
 
 recipe: FinetuneRecipeForVLM
 seed: 1234
@@ -50,8 +58,8 @@ model:
     rope_fusion: false
     shared_expert_overlap: true
     compile_router_weight: true
-    compile_hc: true  # hyper-connection cores compiled once per static shape; the first step takes minutes longer
-    compile_norm: true  # in BF16 the compiled core multiplies by the weight in FP32 and rounds once; the reference rounds twice
+    compile_hc: true
+    compile_norm: true  # rounds once where the reference rounds twice in BF16; see the model card
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -161,15 +169,15 @@ wandb:
   enable: false
   entity: Nemo-automodel
   project: hy4_flash
-  name: hy4-flash-medpix-4k-ep64-lora
+  name: hy4_flash_medpix_4k_ep64_lora
   mode: online
   dir: ../logs/wandb
 
 ci:
   nemo_ci_schedule: release
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 8
-  cluster_tag: h100
   time: "01:00:00"
   nproc_per_node: 8
   env_vars:

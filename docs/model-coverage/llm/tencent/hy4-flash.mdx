@@ -14,6 +14,9 @@ The text recipe trains on Tulu-3 packed into 131,072-token sequences with contex
 parallelism (EP64) on 8 nodes of 8 H100 GPUs. Conversations are shuffled with a fixed seed before packing, and packed
 documents never attend to each other. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
+Answer-only samples are rendered in the model's fast-thinking mode (`reasoning_effort=no_think`), as the official
+fine-tuning code does; samples whose assistant turns carry reasoning are rendered in `high` mode.
+
 ## Choose a Workflow
 
 | Goal | Start Here |
@@ -31,7 +34,9 @@ documents never attend to each other. Use the [Slurm launcher guide](/job-launch
   [issue #3959](https://github.com/NVIDIA-NeMo/Automodel/issues/3959). The recipes set it in `ci.env_vars`.
 - **Point the JIT caches at node-local storage** (`HYBRID_EP_CACHE_DIR`, `TRITON_CACHE_DIR`).
 - The recipes compile the hyper-connection and norm cores (`compile_hc`, `compile_norm`), so the first step takes
-  several minutes longer than the following ones.
+  several minutes longer than the following ones. In BF16 the compiled norm multiplies by the weight in FP32 and
+  rounds once, where the reference rounds to BF16 first; with it on, LoRA and full fine-tuning do not start from the
+  bit-identical forward. Set `compile_norm: false` to keep the reference's rounding.
 
 ## Model Reference
 
@@ -41,6 +46,7 @@ documents never attend to each other. Use the [Slurm launcher guide](/job-launch
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `HYV4FlashForConditionalGeneration` |
+| Parameters | 219B total / 11B activated |
 | Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
 
 ### Available Models
