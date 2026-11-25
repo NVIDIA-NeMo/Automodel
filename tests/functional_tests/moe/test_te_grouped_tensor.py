@@ -24,7 +24,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch.autograd.function import FunctionCtx
-from torch.utils.checkpoint import checkpoint, noop_context_fn
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import TENvfp4Config, set_is_first_microbatch
@@ -32,7 +32,6 @@ from nemo_automodel.components.moe import experts as experts_module
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.shared.import_utils import is_te_min_version
-from nemo_automodel.shared.recompute_replay import mark_checkpoint_recompute
 
 if TYPE_CHECKING:
     from transformer_engine.common.recipe import Recipe
@@ -344,7 +343,6 @@ def _nvfp4_step(
     upstream: torch.Tensor,
     *,
     checkpointed: bool,
-    mark_recompute: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Forward and backward of an expert module under a recipe, with the gradient of every input and parameter."""
     import transformer_engine.pytorch as te
@@ -361,8 +359,7 @@ def _nvfp4_step(
 
     with te.autocast(enabled=recipe is not None, recipe=recipe):
         if checkpointed:
-            context_fn = mark_checkpoint_recompute(None) if mark_recompute else noop_context_fn
-            output = checkpoint(run, hidden, probability, use_reentrant=False, context_fn=context_fn)
+            output = checkpoint(run, hidden, probability, use_reentrant=False)
         else:
             output = run(hidden, probability)
         output.backward(upstream)
@@ -436,7 +433,7 @@ def test_native_te_grouped_tensor_matches_the_split_path_under_nvfp4(checkpointe
             set_is_first_microbatch(microbatch == 0)
             x, probs, upstream = _random_batch(sum(counts))
             split, grouped = (
-                _nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed, mark_recompute=False)
+                _nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed)
                 for module in (reference, candidate)
             )
             # Same quantized operands in both paths: the forward and the input gradient agree bit for bit.
@@ -491,9 +488,7 @@ def test_nvfp4_dispatch_above_the_grouped_limit_runs_the_per_expert_path(
                 results, quantizations = [], []
                 for module in (reference, candidate):
                     weight_quantized.clear()
-                    results.append(
-                        _nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed, mark_recompute=False)
-                    )
+                    results.append(_nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed))
                     quantizations.append(sum(weight_quantized))
                 forwards += 2 if checkpointed else 1
                 # Two projections of four experts, quantized in the forward and again in its recompute.
@@ -510,7 +505,7 @@ def test_nvfp4_dispatch_above_the_grouped_limit_runs_the_per_expert_path(
         monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 768 * 1024)
         set_is_first_microbatch(None)
         per_expert, grouped = (
-            _nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed, mark_recompute=False)
+            _nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed)
             for module in (reference, candidate)
         )
         assert [path for _, path in candidate_calls[forwards:]] == [True] * (2 if checkpointed else 1)
@@ -569,10 +564,12 @@ def test_nvfp4_dispatch_above_the_per_expert_limit_runs_in_chunks(
                 # Every call ran one GEMM per expert on at most 512 rows; the chunks cover the padded rows.
                 assert calls == [(rows, False) for rows in chunk_rows] * forwards
                 assert candidate.gate_up_linear.use_grouped_tensor is native
-                # Two projections of four experts. Cached weights are quantized by the first call of a first
-                # micro-batch only; without the cache every call quantizes them.
-                assert single_quantizations == {True: 8, False: 0, None: 8 * forwards}[flag]
-                assert chunked_quantizations == {True: 8, False: 0, None: 8 * forwards * len(chunk_rows)}[flag]
+                # Two projections of four experts. In a first micro-batch the first call of the forward quantizes
+                # the cached weights and the first call of its recompute quantizes them again; without the cache
+                # every call quantizes them.
+                assert single_quantizations == {True: 8 * forwards, False: 0, None: 8 * forwards}[flag]
+                expected_chunked = {True: 8 * forwards, False: 0, None: 8 * forwards * len(chunk_rows)}
+                assert chunked_quantizations == expected_chunked[flag]
                 assert single.keys() == chunked.keys()
                 if len(chunk_rows) == 2:
                     for name, expected in single.items():
@@ -766,9 +763,7 @@ def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
             hidden = x.clone().requires_grad_()
             tokens = shared_input.clone().requires_grad_()
             with te.autocast(enabled=True, recipe=recipe):
-                output, side = checkpoint(
-                    block, hidden, tokens, use_reentrant=False, context_fn=mark_checkpoint_recompute(None)
-                )
+                output, side = checkpoint(block, hidden, tokens, use_reentrant=False)
                 torch.autograd.backward([output, side], [upstream, torch.ones_like(side) * 1e-3])
             assert hidden.grad is not None
 
@@ -958,9 +953,7 @@ def test_te_experts_beside_the_shared_expert_stream_write_every_gradient(
         shared.zero_grad(set_to_none=True)
         hidden = x.clone().requires_grad_()
         tokens = shared_input.clone().requires_grad_()
-        output, side = checkpoint(
-            block, hidden, tokens, use_reentrant=False, context_fn=mark_checkpoint_recompute(None)
-        )
+        output, side = checkpoint(block, hidden, tokens, use_reentrant=False)
         torch.autograd.backward([output, side], [upstream, shared_upstream])
         values = {
             "output": output.detach(),

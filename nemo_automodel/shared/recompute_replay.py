@@ -39,67 +39,11 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Generic, TypeVar
 
-__all__ = ["RecomputeReplay", "RecomputeReplayRecorder", "in_checkpoint_recompute", "mark_checkpoint_recompute"]
+__all__ = ["RecomputeReplay", "RecomputeReplayRecorder"]
 
 T = TypeVar("T")
 
 CheckpointContextFn = Callable[[], tuple[AbstractContextManager, AbstractContextManager]]
-
-
-class _RecomputeDepth(threading.local):
-    """Thread-local number of marked checkpoint recomputes open on the calling thread.
-
-    ``__init__`` runs once per thread, so pipeline-parallel worker threads count independently.
-    """
-
-    def __init__(self) -> None:
-        self.value = 0
-
-
-_recompute_depth = _RecomputeDepth()
-
-
-def in_checkpoint_recompute() -> bool:
-    """Whether the calling thread is inside the recompute forward of a marked activation checkpoint.
-
-    Returns:
-        ``True`` inside the recompute context of a checkpoint whose context factory went through
-        :func:`mark_checkpoint_recompute`; ``False`` in its forward and everywhere else.
-    """
-    return _recompute_depth.value > 0
-
-
-def mark_checkpoint_recompute(context_fn: CheckpointContextFn | None) -> CheckpointContextFn:
-    """Wrap a checkpoint ``context_fn`` so that :func:`in_checkpoint_recompute` holds inside its recompute.
-
-    The recompute replays a forward of the same micro-batch with the same parameters. A module that
-    prepared something from its parameters in that forward (a quantized copy of a weight, say) can ask
-    here whether it is being replayed and reuse it instead of preparing it again.
-
-    Args:
-        context_fn: Existing ``torch.utils.checkpoint`` context factory returning the
-            ``(forward, recompute)`` context managers, or ``None`` for no other contexts.
-
-    Returns:
-        A context factory with the same forward context and a recompute context that sets the mark
-        around the supplied one, also when the recompute leaves through an exception (early stop).
-    """
-
-    def wrapped_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-        forward_context, recompute_context = context_fn() if context_fn is not None else (nullcontext(), nullcontext())
-
-        @contextmanager
-        def recompute() -> Iterator[None]:
-            _recompute_depth.value += 1
-            try:
-                with recompute_context:
-                    yield
-            finally:
-                _recompute_depth.value -= 1
-
-        return forward_context, recompute()
-
-    return wrapped_context_fn
 
 
 class RecomputeReplayRecorder(Generic[T]):

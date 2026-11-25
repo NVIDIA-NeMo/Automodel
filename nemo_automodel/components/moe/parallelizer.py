@@ -59,7 +59,6 @@ from nemo_automodel.components.moe.layers import (
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
-from nemo_automodel.shared.recompute_replay import mark_checkpoint_recompute
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -664,7 +663,7 @@ def checkpoint_moe_block(
         return ptd_checkpoint_wrapper(
             block,
             preserve_rng_state=True,
-            context_fn=mark_checkpoint_recompute(_with_model_checkpoint_context(block, block_context_fn)),
+            context_fn=_with_model_checkpoint_context(block, block_context_fn),
         )
 
     def selective_checkpointing_context_fn():
@@ -688,7 +687,7 @@ def checkpoint_moe_block(
         block,
         preserve_rng_state=True,
         determinism_check=_register_moe_checkpoint_determinism_check(),
-        context_fn=mark_checkpoint_recompute(_with_model_checkpoint_context(block, block_context_fn)),
+        context_fn=_with_model_checkpoint_context(block, block_context_fn),
     )
 
 
@@ -957,7 +956,7 @@ def apply_ac(
                 moe_module,
                 preserve_rng_state=True,
                 determinism_check=_register_moe_checkpoint_determinism_check(),
-                context_fn=mark_checkpoint_recompute(block_context_fn),
+                context_fn=block_context_fn,
             )
             block.register_module(child_name, wrapped_moe)
             continue

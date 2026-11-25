@@ -2761,14 +2761,16 @@ class GroupedExpertsTE(nn.Module):
         Returns:
             Expert outputs of shape [rows, expert_dim].
         """
-        from nemo_automodel.components.models.common.utils import get_is_first_microbatch, weight_cache_flag_for_forward
+        from nemo_automodel.components.models.common.utils import get_is_first_microbatch
 
         row_counts = tuple(sum(chunk) for chunk in chunks)
         # The dtype Transformer Engine computes in: the autocast dtype, else the dtype of the rows.
         dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else hidden_states.dtype
         output = torch.empty((hidden_states.shape[0], self.config.expert_dim), dtype=dtype, device=hidden_states.device)
-        # A later call replays the weights of the first one, as the recompute of a checkpoint does.
-        later_call = weight_cache_flag_for_forward(get_is_first_microbatch(), True)
+        # A later call reuses the weights the first one quantized. Transformer Engine stores them under a
+        # micro-batch flag of True or False, and the later call then passes False; under None it stores nothing
+        # and the later call passes None as well.
+        later_call = None if get_is_first_microbatch() is None else False
         parts: list[torch.Tensor] = []
         row = 0
         for index, (chunk, rows, hidden) in enumerate(
