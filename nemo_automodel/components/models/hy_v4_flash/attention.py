@@ -367,13 +367,17 @@ class HY4FlashAttention(nn.Module):
 
     def __init__(self, config: HY4FlashTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
+        if backend.attn not in ("cudnn", "sdpa"):
+            raise ValueError(f"Hy4-flash attention supports backend.attn='cudnn' or 'sdpa', got {backend.attn!r}")
+        if backend.rms_norm != "torch":
+            raise ValueError(
+                f"Hy4-flash builds its own RMSNorm; backend.rms_norm must be 'torch', got {backend.rms_norm!r}"
+            )
         self.attention_type: AttentionType = config.attention_types[layer_idx]
         self.backend = backend
         self.num_heads = config.attention_heads(self.attention_type)
         self.nope_dim, self.rope_dim, self.v_dim = config.attention_dims(self.attention_type)
         self.kv_lora_rank = config.kv_lora_rank
-        self.window = config.sliding_window
         self.index_topk = config.index_topk
         self.scale = (self.nope_dim + self.rope_dim) ** -0.5
         hidden, dtype = config.hidden_size, torch.bfloat16
@@ -532,7 +536,7 @@ class HY4FlashAttention(nn.Module):
         Returns:
             The same tensors over the global sequence.
         """
-        if cp_group is None or dist.get_world_size(cp_group) == 1:
+        if cp_group is None:
             return kv_local, token_keys
         kv = gather_sequence(kv_local[None], cp_group)[0]
         if token_keys is None:

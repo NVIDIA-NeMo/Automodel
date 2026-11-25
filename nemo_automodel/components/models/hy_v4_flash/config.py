@@ -231,11 +231,16 @@ class HY4FlashTextConfig(PretrainedConfig):
             params.setdefault("mrope_section", [12, 10, 10])
         self.layer_rope_parameters = rope
 
-        # Fields of the released config that the model does not consume are retained by the base class so a
-        # saved config round-trips; they are listed so a future semantic change is a conscious decision.
+        # Fields of the released config that the model does not consume are retained by the base class, so a saved
+        # config round-trips.
         self._validate()
+        dtype = kwargs.pop("torch_dtype", dtype)
+        if dtype is not None and str(dtype).removeprefix("torch.") != "bfloat16":
+            raise ValueError(
+                f"Hy4-flash is built in bfloat16 (cast the model afterwards for another dtype); got dtype={dtype!r}"
+            )
         super().__init__(
-            dtype=kwargs.pop("torch_dtype", dtype),
+            dtype=dtype,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -314,6 +319,16 @@ class HY4FlashTextConfig(PretrainedConfig):
                 )
         if self.index_head_dim < self.qk_rope_head_dim:
             raise ValueError("index_head_dim must be at least qk_rope_head_dim")
+        # Settings the model does not implement are rejected rather than ignored.
+        if self.attention_bias:
+            raise ValueError("Hy4-flash attention projections have no bias; attention_bias=True is not supported")
+        if self.attention_dropout:
+            raise ValueError("Hy4-flash does not implement attention dropout; attention_dropout must be 0")
+        for layer_type, params in self.layer_rope_parameters.items():
+            if params.get("rope_type", "default") != "default":
+                raise ValueError(f"rope_type must be 'default' for {layer_type!r}, got {params['rope_type']!r}")
+            if not params.get("mrope_interleaved", True):
+                raise ValueError(f"only interleaved M-RoPE is implemented; mrope_interleaved=False for {layer_type!r}")
         if self.engram_layer_ids:
             if self.engram_max_ngram_size < 2:
                 raise ValueError("engram_max_ngram_size must be at least 2 when Engram is enabled")

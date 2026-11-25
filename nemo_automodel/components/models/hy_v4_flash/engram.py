@@ -19,11 +19,13 @@ table itself is the shared row-owner-sharded embedding that DeepSeek-V4.1 and Qw
 (``Qwen3_8_FlashNextEngramTableConfig``): one ~32 GB table per layer is sharded by rows across the owner group
 instead of replicated, and lookups travel by all-to-all.
 
-Checkpoint layout differences handled by the state-dict adapter: the reference keeps 16 per-head norms and
-``hc_mult`` key projections / norms as separate modules, which are stacked here so each runs as one kernel.
+The parameters keep the reference's names (16 per-head norms, ``hc_mult`` key projections and norms as separate
+modules), so the state-dict adapter only pads the table rows to the owner group; the forward stacks the per-head
+weights so each norm and projection runs as one kernel.
 
-Precision notes (intentional differences from the reference, which computes the gate in the activation dtype):
-the gate logit, its signed square root and the sigmoid are evaluated in fp32.
+Precision notes (intentional differences from the reference, which stays in the activation dtype): the gate logit,
+its signed square root and the sigmoid, and the sum of the gated signal and the per-stream branch are evaluated in
+fp32 and cast back.
 """
 
 from __future__ import annotations
@@ -126,6 +128,11 @@ class HY4FlashEngramLayer(nn.Module):
                 "the released checkpoint sets it to false"
             )
         self.layer_id = layer_idx + 1
+        if self.layer_id not in config.engram_layer_ids:
+            raise ValueError(
+                f"decoder layer {layer_idx} (one-based id {self.layer_id}) has no Engram block; "
+                f"engram_layer_ids is {config.engram_layer_ids}"
+            )
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.max_ngram_size = config.engram_max_ngram_size
@@ -262,8 +269,6 @@ class HY4FlashEngramLayer(nn.Module):
         # (``copysign`` would turn the clamp floor into +-1e-3 there).
         gate = torch.sigmoid(logit.abs().clamp_min(1e-6).sqrt() * logit.sign()).unsqueeze(-1)
         main = self.unified_pre_gamma.to(dtype) * F.rms_norm(self.value_proj(emb), (self.hidden_size,))
-        out = (
-            gate * main.float().unsqueeze(2)
-            + main.unsqueeze(2).float() * torch.stack(list(self.unified_per_hc_scales)).float()
-        )
+        main = main.float().unsqueeze(2)
+        out = gate * main + main * torch.stack(list(self.unified_per_hc_scales)).float()
         return out.masked_fill(~engram_mask[:, :, None, None], 0.0).to(dtype)
