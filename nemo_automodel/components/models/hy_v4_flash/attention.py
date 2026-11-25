@@ -115,13 +115,16 @@ class HY4FlashCompressedIndexer(nn.Module):
         self.kpool = config.index_kpool
         self.group_topk = config.index_topk // config.index_kpool
         self.rope_dim = config.qk_rope_head_dim
-        self.query_projection = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
-        self.head_weight_projection = nn.Linear(config.hidden_size, self.n_heads, bias=False)
-        self.token_key_projection = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.token_key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps)
+        self.query_projection = nn.Linear(
+            config.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=torch.bfloat16
+        )
+        self.head_weight_projection = nn.Linear(config.hidden_size, self.n_heads, bias=False, dtype=torch.bfloat16)
+        self.token_key_projection = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=torch.bfloat16)
+        self.token_key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.bfloat16)
         self.key_value_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         self.key_gate_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
-        self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps)
+        # The released key_norm weight is fp32; keep it exact instead of rounding it to bf16 (the output is cast back below).
+        self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32)
         self.intra_group_ape = HY4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
         for parameter in self.parameters():
             parameter.requires_grad_(False)

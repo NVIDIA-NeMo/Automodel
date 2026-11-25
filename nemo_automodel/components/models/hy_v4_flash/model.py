@@ -408,6 +408,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         "e_score_correction_bias",
         "key_value_projection",
         "key_gate_projection",
+        "compressed_indexer.key_norm",
         "intra_group_ape",
         "lm_head",
     ]
