@@ -49,7 +49,7 @@ COMMON_ARGS=(
 # --- Shared initial state: one PP2 step, saved as a native checkpoint ---
 # RNG state is saved per global rank, so the checkpoint is written by the
 # larger (two-rank) topology; the single-rank baseline reads rank 0's state.
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --step_scheduler.max_steps 1 \
