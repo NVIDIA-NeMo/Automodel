@@ -155,10 +155,10 @@ def test_selected_key_sets_match_reference_and_selection_is_sparse():
 def test_parity_fails_for_deliberately_wrong_variants(control):
     dump, model, _, _ = _load()
     if control == "rope_theta_swapped":
-        thetas = model.model._inv_freq_theta
-        thetas["sliding_attention"], thetas["indexed_attention"] = (
-            thetas["indexed_attention"],
-            thetas["sliding_attention"],
+        rope = model.model.config.layer_rope_parameters
+        rope["sliding_attention"]["rope_theta"], rope["indexed_attention"]["rope_theta"] = (
+            rope["indexed_attention"]["rope_theta"],
+            rope["sliding_attention"]["rope_theta"],
         )
     else:
         for layer in model.model.layers:

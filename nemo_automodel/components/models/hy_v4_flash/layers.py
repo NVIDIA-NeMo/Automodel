@@ -173,18 +173,6 @@ class HY4FlashRMSNorm(nn.Module):
         return core(hidden_states, self.weight, self.eps)
 
 
-def unweighted_rms_inverse(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """Return ``rsqrt(mean(x^2) + eps)`` over the last axis in the dtype of ``x``.
-
-    Args:
-        x: Tensor of shape [..., features], with arbitrary leading dimensions.
-
-    Returns:
-        Tensor of shape [..., 1].
-    """
-    return torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps).to(x.dtype)
-
-
 class HY4FlashHyperConnection(nn.Module):
     """iHC site: collapse ``hc_mult`` residual streams to one input and produce the scatter weights.
 
@@ -275,10 +263,11 @@ class HY4FlashHyperHead(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hidden] in the dtype of ``streams``.
         """
-        flat = streams.flatten(2).float()
-        mixes = F.linear(flat, self.hc_fn.float()) * unweighted_rms_inverse(flat, self.norm_eps).float()
+        wide = streams.float()
+        flat = wide.flatten(2)
+        mixes = F.linear(flat, self.hc_fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
-        return (pre.unsqueeze(-1) * streams.float()).sum(dim=2).to(streams.dtype)
+        return (pre.unsqueeze(-1) * wide).sum(dim=2).to(streams.dtype)
 
 
 def inverse_frequencies(rope_dim: int, theta: float) -> torch.Tensor:
@@ -316,15 +305,15 @@ def apply_interleaved_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     """Rotate interleaved channel pairs ``(x[2i], x[2i + 1])`` of the last axis in fp32.
 
     Args:
-        x: Tensor of shape [batch, sequence, heads, rope_dim].
-        cos: Tensor of shape [batch, sequence, rope_dim // 2].
-        sin: Tensor of shape [batch, sequence, rope_dim // 2].
+        x: Tensor of shape [..., rope_dim].
+        cos: Tensor broadcastable to [..., rope_dim // 2] (e.g. [tokens, 1, rope_dim // 2] for per-head queries).
+        sin: Tensor of the shape of ``cos``.
 
     Returns:
         Tensor of the shape and dtype of ``x``.
     """
     pairs = x.float().unflatten(-1, (-1, 2))
     even, odd = pairs[..., 0], pairs[..., 1]
-    c, s = cos.float().unsqueeze(2), sin.float().unsqueeze(2)
+    c, s = cos.float(), sin.float()
     out = torch.stack((even * c - odd * s, odd * c + even * s), dim=-1)
     return out.flatten(-2).to(x.dtype)

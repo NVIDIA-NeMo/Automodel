@@ -177,7 +177,7 @@ def compute_mrope_position_ids(
     mask = None if attention_mask is None else attention_mask.bool().cpu()
     for row in range(rows):
         row_types = types[row] if mask is None else types[row][mask[row]]
-        pieces, current, index = [], 0, 0
+        pieces, current = [], 0
         for key, group in itertools.groupby(row_types.tolist()):
             count = len(list(group))
             if key == 0:
@@ -193,7 +193,6 @@ def compute_mrope_position_ids(
                 current = int(block.max()) + 1
             else:
                 raise ValueError(f"unsupported mm_token_type_id {key}; only text (0) and image (1) are supported")
-            index += count
         flat = torch.cat(pieces, dim=1)
         if mask is None:
             positions[:, row] = flat
@@ -292,8 +291,6 @@ class HY4FlashModel(nn.Module):
         )
         self.hc_head = HY4FlashHyperHead(config)
         self.norm = HY4FlashRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
-        # Rotary frequencies are recomputed from the config in fp32 on every forward (never stored as a bf16 buffer).
-        self._inv_freq_theta = {t: p["rope_theta"] for t, p in config.layer_rope_parameters.items()}
 
     def prepare_batch(
         self,
@@ -366,12 +363,14 @@ class HY4FlashModel(nn.Module):
             cp_group if cp_size > 1 else None,
         )
         ropes = {}
-        for attention_type, theta in self._inv_freq_theta.items():
+        # Rotary tables are recomputed from the config on every forward and kept in fp32; the reference casts them to
+        # the activation dtype (bf16) before rotating.
+        for attention_type, rope_parameters in cfg.layer_rope_parameters.items():
             _, rope_dim, _ = cfg.attention_dims(attention_type)
             cos, sin = mrope_cos_sin(
                 flat_positions[:, None],
-                inverse_frequencies(rope_dim, theta),
-                cfg.layer_rope_parameters[attention_type]["mrope_section"],
+                inverse_frequencies(rope_dim, rope_parameters["rope_theta"]),
+                rope_parameters["mrope_section"],
                 torch.float32,
             )
             ropes[attention_type] = HY4FlashRope(cos[0], sin[0])
@@ -391,7 +390,7 @@ class HY4FlashModel(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         packed_seq_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor,
         image_token_mask: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
@@ -402,7 +401,7 @@ class HY4FlashModel(nn.Module):
             position_ids: Integer tensor of shape [3, batch, sequence].
             attention_mask: Optional tensor of shape [batch, sequence], 1 for real tokens.
             packed_seq_ids: Optional integer tensor of shape [batch, sequence] with document ids.
-            inputs_embeds: Optional tensor of shape [batch, sequence, hidden] replacing the token embeddings.
+            inputs_embeds: Tensor of shape [batch, sequence, hidden]: token embeddings with image features in place.
             image_token_mask: Optional bool tensor of shape [batch, sequence] of image placeholder tokens.
             cp_group: Optional context-parallel group; tensors then hold the local contiguous shard.
 
@@ -410,8 +409,7 @@ class HY4FlashModel(nn.Module):
             Tensor of shape [batch, sequence, hidden] after the final norm.
         """
         batch = self.prepare_batch(input_ids, position_ids, attention_mask, packed_seq_ids, image_token_mask, cp_group)
-        embedded = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        streams = embedded.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+        streams = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         for layer in self.layers:
             streams = layer(streams, batch)
         return self.norm(self.hc_head(streams))
@@ -438,10 +436,11 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         "intra_group_ape",
         "lm_head",
     ]
-    # Small fp32 modules that get one FSDP unit across all blocks (see ``parallelizer_utils.fully_shard_across_blocks``):
-    # the sinks, whose forward ignores its input, and the indexer's group-pooling modules, which only run for documents
-    # longer than ``index_topk``. A cross-block unit stays unsharded for the step, so each costs one all-gather per
-    # step (issued on every rank by ``HY4FlashCompressedIndexer.enter_pooling_units``) instead of one per call.
+    # Small fp32 modules that get one FSDP unit across all blocks (see
+    # ``parallelizer_utils.fully_shard_across_blocks``): the sinks, whose forward ignores its input, and the indexer's
+    # group-pooling modules, which only run for documents longer than ``index_topk``. A cross-block unit stays
+    # unsharded for the step, so each costs one all-gather per step (issued on every rank by
+    # ``HY4FlashCompressedIndexer.enter_pooling_units``) instead of one per call.
     _fsdp_shard_across_blocks = [
         "self_attn.sinks_param",
         "self_attn.compressed_indexer.key_value_projection",
@@ -559,8 +558,6 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             "cp_sharder": ContextParallelSharder(
                 shard_batch=partial(
                     shard_cp_batch,
-                    pad_multiple=1,
-                    packed_alignment=1,
                     sync_packed_length=self.backend.dispatcher == "hybridep",
                 ),
                 local_token_global_indices=contiguous_local_indices,
@@ -710,51 +707,20 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
                     nn.init.normal_(module.weight, std=std)
             layer.attn_hc.init_weights(std)
             layer.ffn_hc.init_weights(std)
-            attn = layer.self_attn
-            for module in (
-                attn.q_a_proj,
-                attn.q_b_proj,
-                attn.kv_a_proj_with_mqa,
-                attn.kv_b_proj,
-                attn.o_proj,
-                attn.gate_proj,
-            ):
-                nn.init.normal_(module.weight, std=std)
-            nn.init.constant_(attn.sinks_param.weight, text.learnable_sink_init)
+            layer.self_attn.reset_parameters(std, text.learnable_sink_init)
             for norm in (
                 layer.input_layernorm,
                 layer.post_self_attn_layernorm,
                 layer.post_attention_layernorm,
                 layer.post_mlp_layernorm,
-                attn.q_a_layernorm,
-                attn.kv_a_layernorm,
             ):
                 nn.init.ones_(norm.weight)
-            if attn.compressed_indexer is not None:
-                indexer = attn.compressed_indexer
-                for module in (
-                    indexer.query_projection,
-                    indexer.head_weight_projection,
-                    indexer.token_key_projection,
-                    indexer.key_value_projection,
-                    indexer.key_gate_projection,
-                ):
-                    nn.init.normal_(module.weight, std=std)
-                nn.init.normal_(indexer.intra_group_ape.weight, std=std)
-                nn.init.ones_(indexer.token_key_norm.weight)
-                nn.init.ones_(indexer.key_norm.weight)
             if layer.engram_layer is not None:
                 layer.engram_layer.init_weights()
         self.model.hc_head.init_weights(std)
         nn.init.ones_(self.model.norm.weight)
         if self.vit is not None:
-            for name, parameter in self.vit.named_parameters():
-                if name.endswith("bias"):
-                    nn.init.zeros_(parameter)
-                elif parameter.ndim > 1:
-                    nn.init.normal_(parameter, std=std)
-                else:
-                    nn.init.ones_(parameter) if "norm" in name else nn.init.normal_(parameter, std=std)
+            self.vit.reset_parameters(std)
         if not _has_dtensor_params(self):
             cast_model_to_dtype(self, dtype)
 

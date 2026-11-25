@@ -27,7 +27,8 @@ Per token (``hs`` hidden, ``H`` query heads of the layer type, ``nope + rope = 2
   query projection (q_lora x n_heads*d), head weights (hs x n_heads), token keys (hs x d), pooling value + gate
   projections (2 x d x d per token) and the group scoring ``n_heads * d`` MACs per visible complete group;
 * MoE layers: router (hs x experts), latent down / up projections (2 x hs x latent), ``top_k`` routed experts of
-  ``3 x latent x moe_inter`` plus one shared expert of ``3 x hs x moe_inter``; the dense layer is ``3 x hs x intermediate``;
+  ``3 x latent x moe_inter`` plus one shared expert of ``3 x hs x moe_inter``; the dense layer is ``3 x hs x
+  intermediate``;
 * hyper-connections: two sites per layer, each ``2*hc x hc*hs`` MACs; the head ``hc x hc*hs``;
 * Engram layers: ``hc`` key projections and one value projection of ``(orders * n_embed)`` x hs;
 * the fp32 ``lm_head`` (hs x vocab).

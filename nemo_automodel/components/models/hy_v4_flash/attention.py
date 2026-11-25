@@ -126,11 +126,14 @@ class HY4FlashRope:
 
 
 class HY4FlashFP32Parameter(nn.Module):
-    """FP32 parameter holder whose forward returns its weight and ignores the input.
+    """FP32 parameter holder whose forward returns a copy of its weight and ignores the input.
 
-    A bare parameter on a bf16 module would be cast by the FSDP mixed-precision policy. Holding it in its own module lets
-    the parallelizer give it a dedicated fp32 unit (and one cross-block unit for the sinks); the ignored input argument
-    ties the call to the activation graph so FSDP's pre/post hooks fire.
+    Not ``DeepseekV4FP32Parameter``: that holder returns the parameter itself, which an FSDP unit that reshards after
+    forward frees while the caller still uses it.
+
+    A bare parameter on a bf16 module would be cast by the FSDP mixed-precision policy. Holding it in its own module
+    lets the parallelizer give it a dedicated fp32 unit (and one cross-block unit for the sinks); the ignored input
+    argument ties the call to the activation graph so FSDP's pre/post hooks fire.
     """
 
     def __init__(self, value: torch.Tensor) -> None:
@@ -171,16 +174,29 @@ class HY4FlashCompressedIndexer(nn.Module):
         self.token_key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.bfloat16)
         self.key_value_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         self.key_gate_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
-        # The released key_norm weight is fp32; keep it exact instead of rounding it to bf16 (the output is cast back below).
+        # The released key_norm weight is fp32 and is kept in fp32 here; the reference rounds it to bf16 on load.
         # One call per document, each with that document's group count: keep it off the shape-specialised core.
         self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32, static_shape=False)
         self.intra_group_ape = HY4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
         # Queries are scored in chunks so the fp32 [queries, heads, groups] score block stays within this many bytes:
-        # one chunk for a 4K document, 256 queries at a time for a 128K one. ``query_chunk`` pins the chunk instead.
+        # one chunk for a 4K document, 256 queries at a time for a 128K one.
         self.score_block_bytes = 2**29
-        self.query_chunk: int | None = None
-        for parameter in self.parameters():
-            parameter.requires_grad_(False)
+        self.requires_grad_(False)
+
+    @torch.no_grad()
+    def reset_parameters(self, std: float) -> None:
+        """Initialise as the reference does: normal projections and pooling bias, unit norm weights."""
+        for module in (
+            self.query_projection,
+            self.head_weight_projection,
+            self.token_key_projection,
+            self.key_value_projection,
+            self.key_gate_projection,
+        ):
+            nn.init.normal_(module.weight, std=std)
+        nn.init.normal_(self.intra_group_ape.weight, std=std)
+        nn.init.ones_(self.token_key_norm.weight)
+        nn.init.ones_(self.key_norm.weight)
 
     @torch.no_grad()
     def token_keys(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -244,9 +260,10 @@ class HY4FlashCompressedIndexer(nn.Module):
         """Select the document-local tokens every query of one contiguous query interval attends to.
 
         A query recalls the ``index_topk // index_kpool - 1`` best-scoring groups that closed before its own group
-        (ties broken towards the earlier group), plus the tokens of its own group up to itself. Scores are fp32 ``[queries, heads, groups]`` in the
-        reference; they are materialised here a chunk of queries at a time and only over the groups the
-        chunk can see, with the chunk sized so the block stays within ``score_block_bytes`` whatever the document length.
+        (ties broken towards the earlier group), plus the tokens of its own group up to itself. Scores are fp32
+        ``[queries, heads, groups]`` in the reference; they are materialised here a chunk of queries at a time and
+        only over the groups the chunk can see, with the chunk sized so the block stays within ``score_block_bytes``
+        whatever the document length.
 
         Args:
             q_resid: Tensor of shape [queries, q_lora_rank]; consecutive tokens of one document.
@@ -266,9 +283,7 @@ class HY4FlashCompressedIndexer(nn.Module):
         keys = torch.cat(
             (
                 group_keys[:, :nope],
-                apply_interleaved_rope(group_keys[None, :, None, nope:], group_rope.cos[None], group_rope.sin[None])[
-                    0, :, 0
-                ],
+                apply_interleaved_rope(group_keys[:, nope:], group_rope.cos, group_rope.sin),
             ),
             dim=-1,
         ).float()
@@ -276,7 +291,7 @@ class HY4FlashCompressedIndexer(nn.Module):
         query = torch.cat(
             (
                 query[..., :nope],
-                apply_interleaved_rope(query[..., nope:].unsqueeze(0), query_rope.cos[None], query_rope.sin[None])[0],
+                apply_interleaved_rope(query[..., nope:], query_rope.cos[:, None], query_rope.sin[:, None]),
             ),
             dim=-1,
         )
@@ -287,7 +302,7 @@ class HY4FlashCompressedIndexer(nn.Module):
         sentinel = torch.iinfo(torch.int32).max // self.kpool
         # One spare column absorbs the writes of the groups that are not chosen.
         recalled = torch.full((queries, recall + 1), sentinel, dtype=torch.long, device=device)
-        chunk = self.query_chunk or max(1, self.score_block_bytes // (4 * self.n_heads * max(1, group_keys.shape[0])))
+        chunk = max(1, self.score_block_bytes // (4 * self.n_heads * max(1, group_keys.shape[0])))
         for start in range(0, queries, chunk):
             end = min(start + chunk, queries)
             # Groups that closed before the last query of the chunk; later groups are invisible to all of it.
@@ -403,6 +418,24 @@ class HY4FlashAttention(nn.Module):
             HY4FlashCompressedIndexer(config) if self.attention_type == "indexed_attention" else None
         )
 
+    @torch.no_grad()
+    def reset_parameters(self, std: float, sink_init: float) -> None:
+        """Initialise as the reference does: normal projections, constant sinks, unit norm weights, then the indexer."""
+        for module in (
+            self.q_a_proj,
+            self.q_b_proj,
+            self.kv_a_proj_with_mqa,
+            self.kv_b_proj,
+            self.o_proj,
+            self.gate_proj,
+        ):
+            nn.init.normal_(module.weight, std=std)
+        nn.init.constant_(self.sinks_param.weight, sink_init)
+        nn.init.ones_(self.q_a_layernorm.weight)
+        nn.init.ones_(self.kv_a_layernorm.weight)
+        if self.compressed_indexer is not None:
+            self.compressed_indexer.reset_parameters(std)
+
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
         """Accept the context-parallel mesh from the shared parallelizer without storing it.
 
@@ -448,11 +481,9 @@ class HY4FlashAttention(nn.Module):
         q_nope, q_rot = q[..., : self.nope_dim], q[..., self.nope_dim :]
         latent_rot = self.kv_a_proj_with_mqa(x)
         latent = self.kv_a_layernorm(latent_rot[..., : self.kv_lora_rank])
-        local_rope = HY4FlashRope(rope.cos[lo:hi], rope.sin[lo:hi])
-        q_rot = apply_interleaved_rope(q_rot[None], local_rope.cos[None], local_rope.sin[None])[0]
-        k_rot = apply_interleaved_rope(
-            latent_rot[None, :, None, self.kv_lora_rank :], local_rope.cos[None], local_rope.sin[None]
-        )[0, :, 0]
+        cos, sin = rope.cos[lo:hi], rope.sin[lo:hi]
+        q_rot = apply_interleaved_rope(q_rot, cos[:, None], sin[:, None])
+        k_rot = apply_interleaved_rope(latent_rot[:, self.kv_lora_rank :], cos, sin)
         gate = torch.sigmoid(self.gate_proj(x)).view(tokens, self.num_heads, self.v_dim)
 
         w_k, w_v = self._absorbed_weights(x.dtype, x.device)

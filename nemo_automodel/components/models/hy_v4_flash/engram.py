@@ -181,7 +181,10 @@ class HY4FlashEngramLayer(nn.Module):
 
     @torch.no_grad()
     def init_weights(self) -> None:
-        """Initialise as the reference does (``unified_pre_gamma`` 1, per-stream scales N(0, 0.006)) and refresh hash state."""
+        """Initialise as the reference does and refresh the hash state.
+
+        ``unified_pre_gamma`` is 1 and the per-stream scales are drawn from N(0, 0.006).
+        """
         self.multi_head_embedding.embedding.reset_parameters()
         std = self.initializer_range
         for linear in (self.value_proj, *self.key_projs):

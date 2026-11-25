@@ -188,6 +188,17 @@ class HY4FlashVisionTower(nn.Module):
         self.layers = nn.ModuleList(HY4FlashVisionBlock(config) for _ in range(config.num_hidden_layers))
         self.perceive = HY4FlashPerceive(config)
 
+    @torch.no_grad()
+    def reset_parameters(self, std: float) -> None:
+        """Initialise as the reference does: zero biases, unit norm weights, normal everything else."""
+        for name, parameter in self.named_parameters():
+            if name.endswith("bias"):
+                nn.init.zeros_(parameter)
+            elif parameter.ndim == 1 and "norm" in name:
+                nn.init.ones_(parameter)
+            else:
+                nn.init.normal_(parameter, std=std)
+
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """Encode images into language-width tokens.
 

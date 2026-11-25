@@ -43,6 +43,13 @@ _LAYER_TYPE_ALIASES: dict[str, AttentionType] = {
 }
 
 
+def _model_flops(config: HY4FlashTextConfig | HY4FlashConfig, gbs: int, seq_len: int | None) -> float:
+    """Call the FLOPs formula, imported on use because ``flops`` imports this module."""
+    from nemo_automodel.components.models.hy_v4_flash.flops import hy_v4_flash_flops
+
+    return hy_v4_flash_flops(config, gbs, seq_len)
+
+
 class HY4FlashRopeParameters(TypedDict):
     """Rotary parameters of one attention type, as stored in ``rope_parameters``."""
 
@@ -72,9 +79,7 @@ class HY4FlashTextConfig(PretrainedConfig):
     @staticmethod
     def flops_formula(config: HY4FlashTextConfig, gbs: int = 1, seq_len: int | None = None) -> float:
         """Model FLOPs of one step (see ``hy_v4_flash.flops``); picked up by ``get_flops_formula_for_hf_config``."""
-        from nemo_automodel.components.models.hy_v4_flash.flops import hy_v4_flash_flops
-
-        return hy_v4_flash_flops(config, gbs, seq_len)
+        return _model_flops(config, gbs, seq_len)
 
     def __init__(
         self,
@@ -132,7 +137,7 @@ class HY4FlashTextConfig(PretrainedConfig):
         engram_lookup_table_size: int = 120818,
         enable_lm_head_fp32: bool = True,
         fast_op_fp32_linear_gemm: bool = True,
-        dtype: str = "bfloat16",
+        dtype: Literal["bfloat16"] | None = "bfloat16",
         pad_token_id: int | None = 120002,
         bos_token_id: int | None = 120000,
         eos_token_id: int | list[int] | None = 120025,
@@ -177,7 +182,8 @@ class HY4FlashTextConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
-        # The released config names the pooling ratio ``compressed_indexer_compress_ratio``; the reference ``index_kpool``.
+        # The released config names the pooling ratio ``compressed_indexer_compress_ratio``; the reference
+        # ``index_kpool``.
         self.index_kpool = kwargs.pop("index_kpool", compressed_indexer_compress_ratio)
         self.hc_mult = hc_mult
         self.hc_magnitude = hc_magnitude
@@ -194,8 +200,8 @@ class HY4FlashTextConfig(PretrainedConfig):
         if not enable_lm_head_fp32:
             raise ValueError("enable_lm_head_fp32=False is not supported: the reference always runs the head in fp32")
         self.enable_lm_head_fp32 = enable_lm_head_fp32
-        # Training-framework flag of the release; neither the transformers reference nor the official finetune code reads
-        # it, so it has no effect here either. Kept so a saved config round-trips.
+        # Training-framework flag of the release; neither the transformers reference nor the official finetune code
+        # reads it, so it has no effect here either. Kept so a saved config round-trips.
         self.fast_op_fp32_linear_gemm = fast_op_fp32_linear_gemm
 
         first_k_dense = int(kwargs.pop("first_k_dense_replace", 1))
@@ -210,7 +216,8 @@ class HY4FlashTextConfig(PretrainedConfig):
                 "indexed_attention" if i < 2 or (i - 1) % 4 == 0 else "sliding_attention"
                 for i in range(num_hidden_layers)
             ]
-        # A reduced ``num_hidden_layers`` keeps the released schedules' prefix (a pretrained prefix keeps its identities).
+        # A reduced ``num_hidden_layers`` keeps the released schedules' prefix (a pretrained prefix keeps its
+        # identities).
         layer_types = list(layer_types)[:num_hidden_layers]
         self.mlp_layer_types = self.mlp_layer_types[:num_hidden_layers]
         try:
@@ -315,7 +322,8 @@ class HY4FlashTextConfig(PretrainedConfig):
             section = self.layer_rope_parameters[layer_type]["mrope_section"]
             if len(section) != 3 or sum(section) != rope_dim // 2:
                 raise ValueError(
-                    f"mrope_section must have three entries summing to {rope_dim // 2} for {layer_type!r}, got {section}"
+                    f"mrope_section must have three entries summing to {rope_dim // 2} for {layer_type!r}, "
+                    f"got {section}"
                 )
         if self.index_head_dim < self.qk_rope_head_dim:
             raise ValueError("index_head_dim must be at least qk_rope_head_dim")
@@ -370,9 +378,9 @@ class HY4FlashVisionConfig(PretrainedConfig):
         out_hidden_size: int = 3072,
         rms_norm_eps: float = 1e-5,
         rope_2d_theta: float = 10000.0,
-        hidden_act: str = "gelu",
+        hidden_act: Literal["gelu"] = "gelu",
         max_image_size: int = 2048,
-        interpolate_mode: str = "bilinear",
+        interpolate_mode: Literal["bilinear"] = "bilinear",
         **kwargs: JsonValue,
     ) -> None:
         if hidden_act != "gelu":
@@ -404,9 +412,7 @@ class HY4FlashConfig(PretrainedConfig):
     @staticmethod
     def flops_formula(config: HY4FlashConfig, gbs: int = 1, seq_len: int | None = None) -> float:
         """Model FLOPs of one step of the text backbone; the vision tower is not counted."""
-        from nemo_automodel.components.models.hy_v4_flash.flops import hy_v4_flash_flops
-
-        return hy_v4_flash_flops(config, gbs, seq_len)
+        return _model_flops(config, gbs, seq_len)
 
     def __init__(
         self,

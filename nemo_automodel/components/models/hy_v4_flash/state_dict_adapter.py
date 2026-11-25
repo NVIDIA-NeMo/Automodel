@@ -60,37 +60,43 @@ from nemo_automodel.components.moe.config import MoEConfig
 # Checkpoint-protocol options (``quantization``, ``for_checkpoint_load``, ``exclude_key_regex``, ...).
 AdapterOption: TypeAlias = "bool | str | None"
 _LAYER = r"model\.layers\.(\d+)\."
-# (released regex, native replacement); the native direction is the inverse of each pair.
-_RENAMES: tuple[tuple[str, str], ...] = (
-    (r"\.hc_attn_layer\.hc_pre\.hc_(fn|base|scale)$", r".attn_hc.\1"),
-    (r"\.hc_mlp_layer\.hc_pre\.hc_(fn|base|scale)$", r".ffn_hc.\1"),
-    (r"^model\.hc_head\.hc_head_(fn|base|scale)$", r"model.hc_head.hc_\1"),
-    (r"\.self_attn\.learnable_sink_param$", ".self_attn.sinks_param.weight"),
-    (r"\.compressed_indexer\.intra_group_ape$", ".compressed_indexer.intra_group_ape.weight"),
-    (r"\.self_attn\.linear_gate\.weight$", ".self_attn.gate_proj.weight"),
-    (r"\.self_attn\.post_proj_norm\.weight$", ".post_self_attn_layernorm.weight"),
-    (r"\.mlp\.routed_expert_down_proj\.weight$", ".mlp.fc1_latent_proj.weight"),
-    (r"\.mlp\.routed_expert_up_proj\.weight$", ".mlp.fc2_latent_proj.weight"),
-)
-# Native -> released, written out because the group references of the forward rules do not invert mechanically.
-_INVERSE_RENAMES: tuple[tuple[str, str], ...] = (
-    (r"\.attn_hc\.(fn|base|scale)$", r".hc_attn_layer.hc_pre.hc_\1"),
-    (r"\.ffn_hc\.(fn|base|scale)$", r".hc_mlp_layer.hc_pre.hc_\1"),
-    (r"^model\.hc_head\.hc_(fn|base|scale)$", r"model.hc_head.hc_head_\1"),
-    (r"\.self_attn\.sinks_param\.weight$", ".self_attn.learnable_sink_param"),
-    (r"\.compressed_indexer\.intra_group_ape\.weight$", ".compressed_indexer.intra_group_ape"),
-    (r"\.self_attn\.gate_proj\.weight$", ".self_attn.linear_gate.weight"),
-    (r"\.post_self_attn_layernorm\.weight$", ".self_attn.post_proj_norm.weight"),
-    (r"\.mlp\.fc1_latent_proj\.weight$", ".mlp.routed_expert_down_proj.weight"),
-    (r"\.mlp\.fc2_latent_proj\.weight$", ".mlp.routed_expert_up_proj.weight"),
+# (released suffix, native suffix) of every renamed key; either direction swaps one suffix for the other.
+_SUFFIXES: tuple[tuple[str, str], ...] = (
+    *((f".hc_attn_layer.hc_pre.hc_{name}", f".attn_hc.{name}") for name in ("fn", "base", "scale")),
+    *((f".hc_mlp_layer.hc_pre.hc_{name}", f".ffn_hc.{name}") for name in ("fn", "base", "scale")),
+    *((f".hc_head.hc_head_{name}", f".hc_head.hc_{name}") for name in ("fn", "base", "scale")),
+    (".self_attn.learnable_sink_param", ".self_attn.sinks_param.weight"),
+    (".compressed_indexer.intra_group_ape", ".compressed_indexer.intra_group_ape.weight"),
+    (".self_attn.linear_gate.weight", ".self_attn.gate_proj.weight"),
+    (".self_attn.post_proj_norm.weight", ".post_self_attn_layernorm.weight"),
+    (".mlp.routed_expert_down_proj.weight", ".mlp.fc1_latent_proj.weight"),
+    (".mlp.routed_expert_up_proj.weight", ".mlp.fc2_latent_proj.weight"),
 )
 _POST_MLP_NORM_RELEASED = re.compile(r"(model\.layers\.\d+)\.mlp\.(?:combine_output_norm|post_fc2_norm)\.weight$")
 _POST_MLP_NORM_NATIVE = re.compile(r"(model\.layers\.(\d+))\.post_mlp_layernorm\.weight$")
 _EXPERT = re.compile(_LAYER + r"mlp\.experts\.(gate_up_proj|down_proj)$")
 _NATIVE_EXPERT = re.compile(_LAYER + r"mlp\.experts\.(gate_and_up_projs|down_projs)$")
 _ENGRAM_TABLE = re.compile(_LAYER + r"engram_layer\.multi_head_embedding\.embedding\.weight$")
-# Whole keys are matched: the speculative drafter (``model.dfly_layers.*``, serving only) and TE ``_extra_state`` buffers.
+# Whole keys are matched: the speculative drafter (``model.dfly_layers.*``, serving only) and TE ``_extra_state``
+# buffers.
 _SKIPPED = re.compile(r"(model\.dfly_layers\..*|.*_extra_state)")
+
+
+def _swap_suffix(key: str, *, released: bool) -> str:
+    """Rename ``key`` between the released and the native spelling.
+
+    Args:
+        key: Parameter name in the source spelling.
+        released: Whether ``key`` is a released name (the result is then native), or the reverse.
+
+    Returns:
+        The key in the other spelling; unchanged when it is not a renamed key.
+    """
+    source, target = (0, 1) if released else (1, 0)
+    for pair in _SUFFIXES:
+        if key.endswith(pair[source]):
+            return key[: -len(pair[source])] + pair[target]
+    return key
 
 
 class HY4FlashStateDictAdapter(StateDictAdapter):
@@ -114,11 +120,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         norm = _POST_MLP_NORM_RELEASED.fullmatch(key)
         if norm:
             return f"{norm.group(1)}.post_mlp_layernorm.weight"
-        for pattern, replacement in _RENAMES:
-            key, count = re.subn(pattern, replacement, key)
-            if count:
-                break
-        return key
+        return _swap_suffix(key, released=True)
 
     def _to_released_key(self, key: str) -> str:
         norm = _POST_MLP_NORM_NATIVE.fullmatch(key)
@@ -129,11 +131,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
                 else "combine_output_norm"
             )
             return f"{norm.group(1)}.mlp.{released}.weight"
-        for pattern, replacement in _INVERSE_RENAMES:
-            key, count = re.subn(pattern, replacement, key)
-            if count:
-                break
-        return key
+        return _swap_suffix(key, released=False)
 
     # ------------------------------------------------------------------ Engram owner padding
     def _logical_engram_rows(self, tensor: torch.Tensor, layer: int) -> torch.Tensor:
@@ -148,6 +146,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         """
         rows = self._engram_rows[layer]
         if not state_dict_utils.is_dtensor(tensor):
+            # May hold fewer rows than the table: the key-listing pass hands in owner-local shape-only tensors.
             return tensor[:rows]
         if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
             raise ValueError("Engram tables require Shard(0) on a one-dimensional owner mesh")
@@ -173,6 +172,8 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         """
         if not state_dict_utils.is_dtensor(tensor):
             return tensor
+        if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
+            raise ValueError("Engram tables require Shard(0) on a one-dimensional owner mesh")
         owners = tensor.device_mesh.size()
         local_rows = math.ceil(self._engram_rows[layer] / owners)
         local = tensor.to_local()
@@ -214,11 +215,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
                 if state_dict_utils.is_dtensor(value):
                     converted[native] = value.transpose(1, 2)
                 else:
-                    start, end = (
-                        state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
-                        if device_mesh is not None
-                        else (0, n_experts)
-                    )
+                    start, end = state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
                     local = value[start:end].transpose(1, 2).to(self.dtype)
                     rank = (
                         None
@@ -227,11 +224,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
                         if "ep" in device_mesh.mesh_dim_names
                         else device_mesh.get_rank()
                     )
-                    converted[native] = (
-                        state_dict_utils.create_dtensor_from_local(local, device_mesh, rank)
-                        if device_mesh is not None
-                        else local
-                    )
+                    converted[native] = state_dict_utils.create_dtensor_from_local(local, device_mesh, rank)
                 continue
             table = _ENGRAM_TABLE.fullmatch(key)
             if table:

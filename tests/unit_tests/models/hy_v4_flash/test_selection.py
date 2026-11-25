@@ -71,7 +71,7 @@ def _brute_force_logits(indexer, q_resid, hidden, group_keys, slots, theta):
 
 
 @pytest.mark.parametrize("first_slot", [0, 5])
-@pytest.mark.parametrize("query_chunk", [3, 256, None])  # None: sized from the score-block budget
+@pytest.mark.parametrize("query_chunk", [3, 256, None])  # queries scored at a time; None: the default budget
 def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot, query_chunk):
     torch.manual_seed(0)
     config = tiny_text_config()  # index_topk 8, kpool 2: three recalled groups plus the query's own group
@@ -80,12 +80,13 @@ def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot,
     indexer = HY4FlashCompressedIndexer(config).float()
     for parameter in indexer.parameters():
         torch.nn.init.normal_(parameter, std=0.5)
-    indexer.query_chunk = query_chunk
     kpool, recall, document = indexer.kpool, indexer.group_topk - 1, 41
     slots = torch.arange(first_slot, document)
     q_resid = torch.randn(len(slots), config.q_lora_rank)
     hidden = torch.randn(len(slots), config.hidden_size)
     group_keys = indexer.pool_groups(torch.randn(document, config.index_head_dim))
+    if query_chunk is not None:  # the fp32 score block of ``query_chunk`` queries: [queries, heads, groups]
+        indexer.score_block_bytes = query_chunk * 4 * indexer.n_heads * group_keys.shape[0]
     cos, sin = mrope_cos_sin(
         torch.arange(document).expand(3, 1, -1),
         inverse_frequencies(config.qk_rope_head_dim, theta),

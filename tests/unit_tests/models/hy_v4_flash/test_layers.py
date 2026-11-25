@@ -49,7 +49,7 @@ def test_text_rope_matches_complex_oracle_at_nonzero_positions(theta):
     x = torch.randn(2, 5, 1, rope_dim)
     pos = torch.tensor([[7, 8, 9, 1000, 1001], [0, 3, 4, 5, 3000]])
     cos, sin = mrope_cos_sin(pos[None].expand(3, -1, -1), inverse_frequencies(rope_dim, theta), section, torch.float32)
-    got = apply_interleaved_rope(x, cos, sin).double()
+    got = apply_interleaved_rope(x, cos.unsqueeze(2), sin.unsqueeze(2)).double()
     torch.testing.assert_close(got, _oracle_rope(x, pos, theta).to(got.dtype), rtol=1e-4, atol=1e-4)
 
 
@@ -61,7 +61,7 @@ def test_rope_theta_negative_control_is_detected():
         pos[None].expand(3, -1, -1), inverse_frequencies(rope_dim, 1.0e4), [12, 10, 10], torch.float32
     )
     wrong = _oracle_rope(x, pos, 1.0e7).float()
-    assert not torch.allclose(apply_interleaved_rope(x, cos, sin), wrong, atol=1e-2)
+    assert not torch.allclose(apply_interleaved_rope(x, cos.unsqueeze(2), sin.unsqueeze(2)), wrong, atol=1e-2)
 
 
 def test_mrope_interleaves_height_and_width_planes():

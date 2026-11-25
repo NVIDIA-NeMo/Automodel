@@ -74,11 +74,11 @@ def test_selective_activation_checkpointing_trains_like_the_plain_model():
         indexers = [m.self_attn.compressed_indexer for m in model.model.layers if m.self_attn.compressed_indexer]
         chunked_calls = []
         for indexer in indexers:
-            indexer.query_chunk = 5
+            indexer.score_block_bytes = 1  # one query per score chunk
             original = indexer.select
 
             def select(q_resid, *args, original=original):
-                chunked_calls.append(q_resid.shape[0] > 5)
+                chunked_calls.append(q_resid.shape[0] > 1)
                 return original(q_resid, *args)
 
             indexer.select = select

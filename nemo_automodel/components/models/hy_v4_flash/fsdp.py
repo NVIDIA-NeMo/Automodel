@@ -39,18 +39,18 @@ class HY4FlashModelParallelizer(ModelParallelizer):
 
     def _fully_shard_module(
         self,
-        module: nn.Module,
+        module: nn.Module | list[nn.Module],
         *,
         mesh: DeviceMesh,
         mp_policy: MixedPrecisionPolicy,
         offload_policy: OffloadPolicy | None = None,
         reshard_after_forward: bool | int | None = None,
         ignored_params: set[nn.Parameter] | None = None,
-    ) -> nn.Module:
+    ) -> nn.Module | list[nn.Module]:
         """Shard ``module`` in place, first isolating a directly owned ``hc_head``.
 
         Args:
-            module: Module to shard.
+            module: Module, or list of modules forming one unit, to shard.
             mesh: Runtime FSDP device mesh.
             mp_policy: Mixed-precision policy of the module's bf16 parameters.
             offload_policy: Parameter/gradient offload policy.
