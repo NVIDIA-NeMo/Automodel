@@ -84,6 +84,23 @@ class HY4FlashWeightOnlyNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(size, dtype=dtype))
 
 
+def weighted_rms_norm(x: torch.Tensor, norms: nn.ModuleList) -> torch.Tensor:
+    """Apply one weighted RMSNorm per slice of the second-to-last axis, as ``torch.nn.RMSNorm`` evaluates it.
+
+    The normalization and the multiplication by the weight both run in fp32 and the result is cast once (for a
+    BF16 input ``F.rms_norm(x) * weight`` would round before the weight is applied).
+
+    Args:
+        x: Tensor of shape [..., slices, features].
+        norms: ``slices`` modules, each holding a ``weight`` of shape [features].
+
+    Returns:
+        Tensor of the shape and dtype of ``x``.
+    """
+    weight = torch.stack([norm.weight for norm in norms])
+    return (F.rms_norm(x.float(), (x.shape[-1],)) * weight.float()).to(x.dtype)
+
+
 class HY4FlashEngramLayer(nn.Module):
     """One Engram block (decoder layer ``layer_idx``, one-based id ``layer_idx + 1``).
 
@@ -232,14 +249,14 @@ class HY4FlashEngramLayer(nn.Module):
         dtype = streams.dtype
         rows = self.hash_ngrams(ngram_tokens)
         emb = self.multi_head_embedding.embedding(rows).to(dtype)  # [B, S, heads, head_dim]
-        emb = F.rms_norm(emb, (self.head_dim,)) * torch.stack([n.weight for n in self.lookup_per_head_norms]).to(dtype)
+        emb = weighted_rms_norm(emb, self.lookup_per_head_norms)
         emb = emb.flatten(-2)
         batch, seq = emb.shape[:2]
         key_weight = torch.cat([m.weight for m in self.key_projs]).to(dtype)
         key_bias = torch.cat([m.bias for m in self.key_projs]).to(dtype)
         key = F.linear(emb, key_weight, key_bias).view(batch, seq, self.hc_mult, -1)
-        key = F.rms_norm(key, (self.hidden_size,)) * torch.stack([n.weight for n in self.norm_key]).to(dtype)
-        query = F.rms_norm(streams, (self.hidden_size,)) * torch.stack([n.weight for n in self.norm_query]).to(dtype)
+        key = weighted_rms_norm(key, self.norm_key)
+        query = weighted_rms_norm(streams, self.norm_query)
         logit = (key.float() * query.float()).sum(-1) * self.hidden_size**-0.5
         # Signed square root as the reference writes it: ``sign(0) = 0``, so a logit of exactly zero gates at 0.5
         # (``copysign`` would turn the clamp floor into +-1e-3 there).
