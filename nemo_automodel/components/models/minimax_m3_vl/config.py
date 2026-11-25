@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING, Any, Protocol, Required, TypedDict, Union
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils.hub import cached_file
 
+from nemo_automodel.components.models.minimax_m3_vl.flops import model_flops
+
 if TYPE_CHECKING:
     from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
 
@@ -122,6 +124,7 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
 
     model_type = "minimax_m3"
     architectures = ["MiniMaxM3SparseForCausalLM"]
+    flops_formula = staticmethod(model_flops)
 
     def __init__(
         self,

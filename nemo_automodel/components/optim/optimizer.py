@@ -47,7 +47,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, Required, TypedDict, cast
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
@@ -63,7 +63,6 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from nemo_automodel.components.optim.gradient_sketch import SketchSettings
-    from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -983,6 +982,29 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
 # ---------------------------------------------------------------------------
 
 
+class StepSchedule(Protocol):
+    """The training-loop lengths an LR schedule is derived from.
+
+    ``nemo_automodel.components.training.step_scheduler.StepScheduler`` provides them; the
+    recipe passes its scheduler in.
+    """
+
+    @property
+    def epoch_len(self) -> int | None:
+        """Optimizer steps per epoch, or ``None`` for an iterable/streaming dataloader."""
+        ...
+
+    @property
+    def num_epochs(self) -> int:
+        """Number of epochs to train."""
+        ...
+
+    @property
+    def max_steps(self) -> int | None:
+        """Cap on the number of optimizer steps, or ``None`` when unbounded."""
+        ...
+
+
 @dataclass
 class LRSchedulerConfig:
     """LR scheduler configuration.  ``None`` fields are computed by
@@ -1006,7 +1028,7 @@ class LRSchedulerConfig:
     def build(
         self,
         optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
-        step_scheduler: StepScheduler,
+        step_scheduler: StepSchedule,
     ) -> list[OptimizerParamScheduler]:
         """Build one LR scheduler per optimizer.
 

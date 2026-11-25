@@ -2263,10 +2263,6 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
 
     # Get config class name
     config_class_name = config.__class__.__name__
-    if config_class_name == "Step5Config":
-        from nemo_automodel.components.models.step5.flops import step5_flops
-
-        return step5_flops
 
     # Map config class names to FLOPs formulas
     class_name_to_formula = {
@@ -2336,11 +2332,6 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "BloomConfig": transformer_flops,
         "FalconConfig": transformer_flops,
     }
-
-    if config_class_name == "MiniMaxM3VLTextConfig":
-        from nemo_automodel.components.models.minimax_m3_vl.flops import model_flops
-
-        class_name_to_formula[config_class_name] = model_flops
 
     # Try exact match first
     formula = class_name_to_formula.get(config_class_name)
