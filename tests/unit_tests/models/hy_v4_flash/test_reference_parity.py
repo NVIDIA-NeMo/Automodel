@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(DUMP is None or not os.path.exists(DUMP), reason
 
 def _load():
     dump = torch.load(DUMP, weights_only=False)
-    model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND).float().eval()
+    model = HY4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
     adapter = HY4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
     native = adapter.from_hf({k: v.clone() for k, v in dump["state"].items()})
     missing, unexpected = model.load_state_dict(native, strict=False)
@@ -107,3 +107,54 @@ def test_image_text_logits_and_positions_match_reference():
     with torch.no_grad():
         out = model(dump["ids"], pixel_values=dump["pixels"], image_grid_thw=dump["grid"], mm_token_type_ids=dump["types"])
     torch.testing.assert_close(out.logits, dump["logits"], rtol=2e-4, atol=2e-4)
+
+
+def test_selected_key_sets_match_reference_and_selection_is_sparse():
+    """Per-query key sets of every sparse layer agree with the reference; report how many queries dropped valid keys."""
+    dump, model, _, _ = _load()
+    captured = {}
+    for index, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+        if attn.compressed_indexer is not None:
+            original = attn._attend
+
+            def spy(query, kv, indices, index=index, original=original):
+                captured[index] = indices.clone()
+                return original(query, kv, indices)
+
+            attn._attend = spy
+    with torch.no_grad():
+        model(dump["ids"])
+    total_dropped = 0
+    for key, selected in dump["sub_out"].items():
+        if not key.endswith(".selected"):
+            continue
+        layer = int(key.split(".")[0])
+        indices = captured[layer].long()
+        mine = torch.zeros_like(selected)
+        for query, row in enumerate(indices):
+            mine[query, row[row >= 0]] = True
+        causal = torch.tril(torch.ones_like(selected))
+        # the reference only recalls groups once the sequence is longer than index_topk; compare causal-visible keys
+        assert torch.equal(mine & causal, selected & causal), f"selected key sets differ in layer {layer}"
+        total_dropped += int(((selected & causal).sum(-1) < causal.sum(-1)).sum())
+    assert total_dropped > 0, "selection never dropped a valid key: sparse behaviour is untested"
+
+
+@pytest.mark.parametrize("control", ["rope_theta_swapped", "engram_layer_id_shifted"])
+def test_parity_fails_for_deliberately_wrong_variants(control):
+    dump, model, _, _ = _load()
+    if control == "rope_theta_swapped":
+        thetas = model.model._inv_freq_theta
+        thetas["sliding_attention"], thetas["deepseek_sparse_attention"] = (
+            thetas["deepseek_sparse_attention"],
+            thetas["sliding_attention"],
+        )
+    else:
+        for layer in model.model.layers:
+            if layer.engram_layer is not None:
+                layer.engram_layer.layer_id += 1
+                layer.engram_layer.refresh_hash_state()
+    with torch.no_grad():
+        logits = model(dump["ids"]).logits
+    assert not torch.allclose(logits, dump["logits"], rtol=2e-4, atol=2e-4)

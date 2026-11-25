@@ -63,6 +63,13 @@ class HY4FlashTextConfig(PretrainedConfig):
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"num_local_experts": "n_routed_experts"}
 
+    @staticmethod
+    def flops_formula(config: HY4FlashTextConfig, gbs: int = 1, seq_len: int | None = None) -> float:
+        """Model FLOPs of one step (see ``hy_v4_flash.flops``); picked up by ``get_flops_formula_for_hf_config``."""
+        from nemo_automodel.components.models.hy_v4_flash.flops import hy_v4_flash_flops
+
+        return hy_v4_flash_flops(config, gbs, seq_len)
+
     def __init__(
         self,
         vocab_size: int = 120832,
@@ -356,6 +363,13 @@ class HY4FlashConfig(PretrainedConfig):
 
     model_type = "hy_v4_flash"
     sub_configs = {"text_config": HY4FlashTextConfig, "vision_config": HY4FlashVisionConfig}
+
+    @staticmethod
+    def flops_formula(config: HY4FlashConfig, gbs: int = 1, seq_len: int | None = None) -> float:
+        """Model FLOPs of one step of the text backbone; the vision tower is not counted."""
+        from nemo_automodel.components.models.hy_v4_flash.flops import hy_v4_flash_flops
+
+        return hy_v4_flash_flops(config, gbs, seq_len)
 
     def __init__(
         self,
