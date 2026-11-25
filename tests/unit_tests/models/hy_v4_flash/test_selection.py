@@ -71,7 +71,7 @@ def _brute_force_logits(indexer, q_resid, hidden, group_keys, slots, theta):
 
 
 @pytest.mark.parametrize("first_slot", [0, 5])
-@pytest.mark.parametrize("query_chunk", [3, 256])
+@pytest.mark.parametrize("query_chunk", [3, 256, None])  # None: sized from the score-block budget
 def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot, query_chunk):
     torch.manual_seed(0)
     config = tiny_text_config()  # index_topk 8, kpool 2: three recalled groups plus the query's own group

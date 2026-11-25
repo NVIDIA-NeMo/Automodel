@@ -174,8 +174,10 @@ class HY4FlashCompressedIndexer(nn.Module):
         # The released key_norm weight is fp32; keep it exact instead of rounding it to bf16 (the output is cast back below).
         self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32)
         self.intra_group_ape = HY4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
-        # Queries scored at a time: bounds the fp32 [queries, heads, groups] score block (0.5 GB at 128K tokens).
-        self.query_chunk = 256
+        # Queries are scored in chunks so the fp32 [queries, heads, groups] score block stays within this many bytes:
+        # one chunk for a 4K document, 256 queries at a time for a 128K one. ``query_chunk`` pins the chunk instead.
+        self.score_block_bytes = 2**29
+        self.query_chunk: int | None = None
         for parameter in self.parameters():
             parameter.requires_grad_(False)
 
@@ -242,8 +244,8 @@ class HY4FlashCompressedIndexer(nn.Module):
 
         A query recalls the ``index_topk // index_kpool - 1`` best-scoring groups that closed before its own group
         (ties broken towards the earlier group), plus the tokens of its own group up to itself. Scores are fp32 ``[queries, heads, groups]`` in the
-        reference; they are materialised here ``query_chunk`` queries at a time and only over the groups the
-        chunk can see, so the peak is ``query_chunk * heads * groups`` values whatever the document length.
+        reference; they are materialised here a chunk of queries at a time and only over the groups the
+        chunk can see, with the chunk sized so the block stays within ``score_block_bytes`` whatever the document length.
 
         Args:
             q_resid: Tensor of shape [queries, q_lora_rank]; consecutive tokens of one document.
@@ -284,8 +286,9 @@ class HY4FlashCompressedIndexer(nn.Module):
         sentinel = torch.iinfo(torch.int32).max // self.kpool
         # One spare column absorbs the writes of the groups that are not chosen.
         recalled = torch.full((queries, recall + 1), sentinel, dtype=torch.long, device=device)
-        for start in range(0, queries, self.query_chunk):
-            end = min(start + self.query_chunk, queries)
+        chunk = self.query_chunk or max(1, self.score_block_bytes // (4 * self.n_heads * max(1, group_keys.shape[0])))
+        for start in range(0, queries, chunk):
+            end = min(start + chunk, queries)
             # Groups that closed before the last query of the chunk; later groups are invisible to all of it.
             visible = (first_query_slot + end - 1) // self.kpool
             if visible == 0:
