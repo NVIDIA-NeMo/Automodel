@@ -13,9 +13,8 @@
 # limitations under the License.
 
 import faulthandler
-import os
-import socket
 import types
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -1184,25 +1183,21 @@ class TestAutoPipelineUpdateSeqLen:
         ]
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, port: int) -> None:
+def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, init_file: str) -> None:
     import datetime
 
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
 
     faulthandler.dump_traceback_later(90, exit=True)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     try:
-        dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=20))
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{init_file}",
+            rank=rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=20),
+        )
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("pp", "dp_replicate", "dp_shard"))
         ap = AutoPipeline(
             world_mesh=mesh,
@@ -1248,11 +1243,11 @@ def _update_seq_len_hsdp_uneven_batches_worker(rank: int, world_size: int, port:
 
 # Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
 @pytest.mark.timeout(150)
-def test_update_seq_len_hsdp_replicas_with_uneven_batches_gloo():
-    mp.spawn(_update_seq_len_hsdp_uneven_batches_worker, args=(8, _free_port()), nprocs=8, join=True)
+def test_update_seq_len_hsdp_replicas_with_uneven_batches_gloo(tmp_path: Path):
+    mp.spawn(_update_seq_len_hsdp_uneven_batches_worker, args=(8, str(tmp_path / "process-group")), nprocs=8, join=True)
 
 
-def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) -> None:
+def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, init_file: str) -> None:
     import datetime
 
     import torch.distributed as dist
@@ -1261,8 +1256,6 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) ->
     from transformers import LlamaConfig, LlamaForCausalLM
 
     faulthandler.dump_traceback_later(120, exit=True)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     torch.set_num_threads(1)
     vocab_size, batch_size = 256, 2
     # Length of each evaluation batch per DP-shard rank: batches 1 and 3 change length only on
@@ -1272,7 +1265,13 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) ->
     # like the 1-sample microbatches, so only the fp32 accumulation order of CPU kernels may differ.
     rtol = atol = 1e-5
     try:
-        dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=60))
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{init_file}",
+            rank=rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=60),
+        )
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
         dp_rank = mesh.get_local_rank("dp_shard")
 
@@ -1349,6 +1348,6 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, port: int) ->
 
 # Hard watchdog for a collective hang: this test spawns worker processes; every child re-imports torch from scratch.
 @pytest.mark.timeout(150)
-def test_update_seq_len_pp_fsdp_eval_with_rank_local_resets_gloo():
+def test_update_seq_len_pp_fsdp_eval_with_rank_local_resets_gloo(tmp_path: Path):
     """PP2 x DP-shard2 FSDP2 evaluation with an unwrapped stage root finishes and matches the reference."""
-    mp.spawn(_pp_fsdp_eval_seq_len_reset_worker, args=(4, _free_port()), nprocs=4, join=True)
+    mp.spawn(_pp_fsdp_eval_seq_len_reset_worker, args=(4, str(tmp_path / "process-group")), nprocs=4, join=True)

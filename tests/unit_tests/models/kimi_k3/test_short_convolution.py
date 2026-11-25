@@ -15,8 +15,7 @@
 
 """Numerical regression for the K3 training short convolution (FLA kernels)."""
 
-import os
-import socket
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -106,26 +105,18 @@ def test_short_convolution_matches_per_document_reference(dtype, lengths, cotang
     assert x.grad[0, :first].abs().sum() > 0
 
 
-def _free_port() -> int:
-    """Return an unused local TCP port for the process group."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _cp_rank(rank: int, port: int, dtype: torch.dtype) -> None:
+def _cp_rank(rank: int, init_file: str, dtype: torch.dtype) -> None:
     """Compare one rank's CP2 shard of a 16-token packed row against CP1.
 
     Args:
         rank: CP rank owning tokens [8 * rank, 8 * rank + 8).
-        port: Rendezvous port.
+        init_file: Path of the file the ranks rendezvous through.
         dtype: Input dtype; weights stay FP32.
     """
     from nemo_automodel.components.models.kimi_k3.cp import KimiPackedContext, build_fla_cp_context
 
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=2)
+    dist.init_process_group("nccl", init_method=f"file://{init_file}", rank=rank, world_size=2)
     try:
         device = torch.device("cuda", rank)
         # The second document spans the CP cut at token 8.
@@ -161,5 +152,5 @@ def _cp_rank(rank: int, port: int, dtype: torch.dtype) -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="CP short convolution needs 2 GPUs")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_short_convolution_cp2_matches_cp1_across_document_cut(dtype):
-    mp.spawn(_cp_rank, args=(_free_port(), dtype), nprocs=2, join=True)
+def test_short_convolution_cp2_matches_cp1_across_document_cut(dtype, tmp_path: Path):
+    mp.spawn(_cp_rank, args=(str(tmp_path / "process-group"), dtype), nprocs=2, join=True)
