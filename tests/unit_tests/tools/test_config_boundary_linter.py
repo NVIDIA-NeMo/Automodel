@@ -28,27 +28,44 @@ def _codes(source: str) -> list[tuple[int, str]]:
     return [(error.line, error.code) for error in lint_source(textwrap.dedent(source), MODULE)]
 
 
-# --------------------------------------------------------------------------- CB001 ConfigNode references
-
-
 @pytest.mark.parametrize(
-    "source",
+    ("source", "expected"),
     [
-        "from nemo_automodel.components.config.loader import ConfigNode\n",
-        "def f(cfg: ConfigNode) -> None:\n    pass\n",
-        'def f(cfg: "ConfigNode | None") -> None:\n    pass\n',
-        "def f(recipe: RecipeConfig) -> None:\n    pass\n",
-        "x: loader.ConfigNode\n",
-        'def f(*args: "ConfigNode", **kwargs: "RecipeConfig"): pass\n',
-        "class _ConfigNodeOptions:\n    pass\n",
+        ("from nemo_automodel.components.config.loader import ConfigNode", ["CB001"]),
+        ("def f(cfg: ConfigNode) -> None: pass", ["CB001"]),
+        ('def f(cfg: "ConfigNode | None") -> None: pass', ["CB001"]),
+        ("def f(recipe: RecipeConfig) -> None: pass", ["CB001"]),
+        ("x: loader.ConfigNode", ["CB001"]),
+        ('def f(*args: "ConfigNode", **kwargs: "RecipeConfig"): pass', ["CB001", "CB001"]),
+        ("class _ConfigNodeOptions: pass", ["CB001"]),
+        ("node.to_yaml_dict(use_orig_values=True)", ["CB002"]),
+        ("dataset.instantiate()", ["CB002"]),
+        ("node.raw_config", ["CB002"]),
+        ("def f(x=node.instantiate(), *, y=node.get_as_string('k')): pass", ["CB002", "CB002"]),
+        ('block.to_dict() if hasattr(block, "to_dict") else dict(block)', ["CB003"]),
+        ('getattr(optimizer, "_target_", None)', ["CB003"]),
+        ('hasattr(model, "weight")', []),
+        ("def f(cfg): pass", ["CB004"]),
+        ("def f(model_cfg: Any): pass", ["CB004"]),
+        ("def f(*, recipe_cfg: Any | None = None): pass", ["CB004"]),
+        ("def f(cfg_fp8: Optional[Any]): pass", ["CB004"]),
+        ("def f(cfg: 'Any'): pass", ["CB004"]),
+        ("g = lambda cfg: cfg", ["CB004"]),
+        ("def f(cfg: MLflowConfig): pass", []),
+        ("def f(block_cfg: dict[str, int]): pass", []),
+        ("def f(enable_cfg=True): pass", []),
+        ("def f(config: Any): pass", []),
+        ("class Source(Protocol):\n    def get(self, key: str, default: bool = ...) -> bool: ...", ["CB005"]),
+        ("class Options(Protocol):\n    def to_dict(self) -> dict[str, int]: ...", ["CB005"]),
+        ("class StepSchedule(Protocol):\n    @property\n    def max_steps(self) -> int | None: ...", []),
+        ("class Cache:\n    def get(self, key: str) -> int: return 0", []),
     ],
 )
-def test_rejects_config_node_references(source):
-    assert "CB001" in [code for _, code in _codes(source)]
+def test_config_boundary_rules(source: str, expected: list[str]) -> None:
+    assert [code for _, code in _codes(source)] == expected
 
 
-def test_type_checking_import_is_still_a_reference():
-    """The PR #4947 shape: a ``TYPE_CHECKING`` import of ConfigNode to annotate a component."""
+def test_type_checking_import_is_still_a_reference() -> None:
     assert _codes(
         """
         from typing import TYPE_CHECKING
@@ -63,110 +80,7 @@ def test_type_checking_import_is_still_a_reference():
     ) == [(5, "CB001"), (8, "CB001")]
 
 
-# --------------------------------------------------------------------------- CB002 / CB003 ConfigNode API
-
-
-def test_rejects_config_node_only_methods():
-    assert _codes(
-        """
-        def f(node, dataset):
-            node.to_yaml_dict(use_orig_values=True)
-            dataset.instantiate()
-            return node.raw_config
-        """
-    ) == [(3, "CB002"), (4, "CB002"), (5, "CB002")]
-
-
-def test_rejects_config_api_in_argument_defaults():
-    assert _codes("def f(x=node.instantiate(), *, y=node.get_as_string('k')): pass\n") == [(1, "CB002"), (1, "CB002")]
-
-
-def test_rejects_probes_for_the_config_node_api():
-    assert _codes(
-        """
-        def f(block, optimizer):
-            block = block.to_dict() if hasattr(block, "to_dict") else dict(block)
-            return getattr(optimizer, "_target_", None)
-        """
-    ) == [(3, "CB003"), (4, "CB003")]
-
-
-def test_allows_unrelated_reflection():
-    assert _codes('def f(m):\n    return hasattr(m, "weight")\n') == []
-
-
-# --------------------------------------------------------------------------- CB004 duck-typed config parameters
-
-
-@pytest.mark.parametrize(
-    "signature",
-    [
-        "def f(cfg): pass",
-        "def f(model_cfg: Any): pass",
-        "def f(*, recipe_cfg: Any | None = None): pass",
-        "def f(cfg_fp8: Optional[Any]): pass",
-        "def f(cfg: 'Any'): pass",
-        "g = lambda cfg: cfg",
-    ],
-)
-def test_rejects_untyped_config_parameters(signature):
-    assert [code for _, code in _codes(signature + "\n")] == ["CB004"]
-
-
-@pytest.mark.parametrize(
-    "signature",
-    [
-        "def f(cfg: MLflowConfig): pass",
-        "def f(block_cfg: dict[str, int]): pass",
-        "def f(enable_cfg=True): pass",  # classifier-free guidance flag, not a config
-        "def f(config: Any): pass",  # HF model configs are out of scope
-    ],
-)
-def test_allows_typed_config_parameters(signature):
-    assert _codes(signature + "\n") == []
-
-
-# --------------------------------------------------------------------------- CB005 / CB006
-
-
-def test_rejects_protocols_that_mirror_a_config_node():
-    assert _codes(
-        """
-        from typing import Protocol
-
-
-        class _Source(Protocol):
-            def get(self, key: str, default: bool = ...) -> bool: ...
-
-
-        class _Options(Protocol):
-            def to_dict(self) -> dict[str, int]: ...
-        """
-    ) == [(5, "CB005"), (9, "CB005")]
-
-
-def test_allows_other_protocols_and_plain_classes_with_get():
-    assert (
-        _codes(
-            """
-        from typing import Protocol
-
-
-        class StepSchedule(Protocol):
-            @property
-            def max_steps(self) -> int | None: ...
-
-
-        class Cache:
-            def get(self, key: str) -> int:
-                return 0
-        """
-        )
-        == []
-    )
-
-
-def test_rejects_dotted_yaml_paths_on_config_objects_only():
+def test_rejects_dotted_yaml_paths_on_config_objects_only() -> None:
     assert _codes(
         """
         def f(cfg, state_dict, modules):
@@ -180,9 +94,6 @@ def test_rejects_dotted_yaml_paths_on_config_objects_only():
     ) == [(2, "CB004"), (3, "CB006"), (4, "CB006"), (5, "CB006")]
 
 
-# --------------------------------------------------------------------------- scope, allowlist and CLI
-
-
 def _write(root: Path, relative: str, source: str) -> Path:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,12 +101,12 @@ def _write(root: Path, relative: str, source: str) -> Path:
     return path
 
 
-def test_findings_name_their_enclosing_function():
+def test_findings_name_their_enclosing_function() -> None:
     (error,) = lint_source("class A:\n    def build(self, cfg):\n        pass\n", MODULE)
     assert error.function == "A.build"
 
 
-def test_allowlisted_shims_pass_and_stale_entries_are_reported(tmp_path, monkeypatch):
+def test_allowlisted_shims_pass_and_stale_entries_are_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         lint_config_boundary,
         "ALLOWED",
@@ -220,7 +131,7 @@ def test_allowlisted_shims_pass_and_stale_entries_are_reported(tmp_path, monkeyp
     ]
 
 
-def test_skips_the_config_package_and_files_outside_components(tmp_path):
+def test_skips_the_config_package_and_files_outside_components(tmp_path: Path) -> None:
     _write(tmp_path, "nemo_automodel/components/config/loader.py", "class ConfigNode:\n    pass\n")
     _write(tmp_path, "nemo_automodel/recipes/recipe.py", "def f(cfg):\n    pass\n")
     kept = _write(tmp_path, "nemo_automodel/components/utils/x.py", "X = 1\n")
@@ -230,7 +141,7 @@ def test_skips_the_config_package_and_files_outside_components(tmp_path):
     assert files == [kept]
 
 
-def test_main_exit_codes(tmp_path, capsys, monkeypatch):
+def test_main_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lint_config_boundary, "ALLOWED", {})
     _write(tmp_path, "nemo_automodel/components/loggers/__init__.py", "")
     clean = ["--automodel-dir", str(tmp_path)]
@@ -246,7 +157,7 @@ def test_main_exit_codes(tmp_path, capsys, monkeypatch):
     assert main([str(tmp_path / "missing.py"), *clean]) == 2
 
 
-def test_repository_components_are_clean():
+def test_repository_components_are_clean() -> None:
     """The real tree passes, with every ALLOWED entry still in use."""
     root = Path(__file__).resolve().parents[3]
     files = collect_python_files([root / "nemo_automodel" / "components"], root)

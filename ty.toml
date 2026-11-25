@@ -82,6 +82,9 @@ include = [
     "nemo_automodel/components/eval/tool_call_evaluator.py",
     "nemo_automodel/components/loss/kd_loss.py",
     "nemo_automodel/components/datasets/reservoir_sampler.py",
+    "nemo_automodel/recipes/speculative_decoding/_spec_train_utils.py",
+    "tests/unit_tests/tools/test_config_boundary_linter.py",
+    "tools/lint_config_boundary.py",
 ]
 
 [overrides.rules]

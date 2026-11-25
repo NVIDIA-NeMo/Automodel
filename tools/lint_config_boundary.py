@@ -12,33 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reject YAML ``ConfigNode`` handling inside ``nemo_automodel/components``.
+"""Check components for ConfigNode use that the import contracts cannot see.
 
-Components consume typed configs and typed runtime arguments; the recipe layer
-(``nemo_automodel/recipes``, ``RecipeConfig``) turns the YAML ``ConfigNode`` into
-them (CODING_GUIDELINES.md, "Stop YAML at the typed-config boundary").
-import-linter rejects a component that imports ``nemo_automodel.components.config``,
-including under ``TYPE_CHECKING``. This checker rejects the forms it cannot see
-because nothing is imported:
-
-* CB001 a reference to ``ConfigNode`` or ``RecipeConfig``: a name, an attribute, an
-  annotation (quoted too), or a class named after one;
-* CB002 a call of a method only ``ConfigNode`` has (``to_yaml_dict``, ``instantiate``,
-  ``instantiate_path``, ``get_as_string``, ``set_by_dotted``) or a ``raw_config`` read;
-* CB003 a ``hasattr``/``getattr`` probe for the ``ConfigNode`` API, such as
-  ``hasattr(x, "to_dict")``;
-* CB004 a config-named parameter (``cfg``, ``*_cfg``, ``cfg_*``) left unannotated or
-  annotated ``Any``, the duck-typed way to take a ``ConfigNode``;
-* CB005 a ``Protocol`` that declares ``ConfigNode``'s lookup surface (``get``,
-  ``to_dict``, ``to_yaml_dict``, ``instantiate``, ``__getattr__``): a structural
-  stand-in for the node;
-* CB006 a ``.get()`` on a config-named object (``cfg``, ``*_cfg``, ``config``, ...) with a
-  dotted string key (``cfg.get("model.backend.attn")``), a YAML path only ``ConfigNode``
-  resolves.
-
-Deprecated shims that still read a raw config are listed in ``ALLOWED`` by file and
-function. An entry that no longer matches any finding is reported as stale, so the
-list shrinks as the shims are deleted.
+CB001–CB006 cover config types, node-only APIs, reflection, untyped config
+parameters, structural substitutes, and dotted YAML lookups. Deprecated shims
+are allowed by file and function until removed.
 """
 
 from __future__ import annotations
@@ -50,9 +28,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_PATHS = ("nemo_automodel/components",)
-# The config package owns ConfigNode.
-EXEMPT_DIRS = ("nemo_automodel/components/config",)
+COMPONENTS = Path("nemo_automodel/components")
 
 CONFIG_TYPES = frozenset({"ConfigNode", "RecipeConfig"})
 CONFIG_NODE_ONLY_METHODS = frozenset(
@@ -104,16 +80,11 @@ def _is_config_param_name(name: str) -> bool:
     return name == "cfg" or name.endswith("_cfg") or name.startswith("cfg_")
 
 
-def _is_config_object_name(name: str) -> bool:
-    return _is_config_param_name(name) or name == "config" or name.endswith("_config")
-
-
-def _is_config_receiver(receiver: ast.expr) -> bool:
-    if isinstance(receiver, ast.Name):
-        return _is_config_object_name(receiver.id)
-    if isinstance(receiver, ast.Attribute):
-        return _is_config_object_name(receiver.attr)
-    return False
+def _name(node: ast.AST) -> str:
+    match node:
+        case ast.Name(id=name) | ast.Attribute(attr=name):
+            return name
+    return ""
 
 
 def _annotation_names(node: ast.expr) -> Iterator[str]:
@@ -133,35 +104,21 @@ def _annotation_names(node: ast.expr) -> Iterator[str]:
 
 def _is_any(annotation: ast.expr | None) -> bool:
     """True when ``annotation`` is ``Any``, optionally ``| None`` / ``Optional[...]`` around it."""
-    if annotation is None:
-        return False
-    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
-        try:
-            return _is_any(ast.parse(annotation.value, mode="eval").body)
-        except SyntaxError:
-            return False
-    if isinstance(annotation, ast.Name):
-        return annotation.id == "Any"
-    if isinstance(annotation, ast.Attribute):
-        return annotation.attr == "Any"
-    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-        parts = (annotation.left, annotation.right)
-        return any(_is_any(part) for part in parts) and all(
-            _is_any(part) or (isinstance(part, ast.Constant) and part.value is None) for part in parts
-        )
-    if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, (ast.Name, ast.Attribute)):
-        name = annotation.value.id if isinstance(annotation.value, ast.Name) else annotation.value.attr
-        return name == "Optional" and _is_any(annotation.slice)
-    return False
-
-
-def _is_protocol_class(node: ast.ClassDef) -> bool:
-    for base in node.bases:
-        target = base.value if isinstance(base, ast.Subscript) else base
-        if isinstance(target, ast.Name) and target.id == "Protocol":
-            return True
-        if isinstance(target, ast.Attribute) and target.attr == "Protocol":
-            return True
+    match annotation:
+        case ast.Constant(value=str(source)):
+            try:
+                return _is_any(ast.parse(source, mode="eval").body)
+            except SyntaxError:
+                return False
+        case ast.BinOp(left=left, op=ast.BitOr(), right=right):
+            parts = (left, right)
+            return any(_is_any(part) for part in parts) and all(
+                _is_any(part) or isinstance(part, ast.Constant) and part.value is None for part in parts
+            )
+        case ast.Subscript(value=base, slice=inner) if _name(base) == "Optional":
+            return _is_any(inner)
+        case ast.expr():
+            return _name(annotation) == "Any"
     return False
 
 
@@ -173,7 +130,7 @@ class _ConfigBoundaryVisitor(ast.NodeVisitor):
         self.errors: list[LintError] = []
         self._scope: list[str] = []
 
-    def _report(self, node: ast.AST, code: str, message: str) -> None:
+    def _report(self, node: ast.expr | ast.stmt | ast.arg, code: str, message: str) -> None:
         self.errors.append(LintError(self.path, node.lineno, node.col_offset, code, message, ".".join(self._scope)))
 
     def _visit_arguments(self, args: ast.arguments) -> None:
@@ -226,7 +183,7 @@ class _ConfigBoundaryVisitor(ast.NodeVisitor):
         """Flag classes named after ConfigNode and Protocols that mirror its lookup surface."""
         if "ConfigNode" in node.name:
             self._report(node, "CB001", f"class `{node.name}` stands in for ConfigNode")
-        if _is_protocol_class(node):
+        if any(_name(base.value if isinstance(base, ast.Subscript) else base) == "Protocol" for base in node.bases):
             members = sorted(
                 stmt.name
                 for stmt in node.body
@@ -274,28 +231,22 @@ class _ConfigBoundaryVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         """Flag ConfigNode-only method calls, reflection probes for its API and dotted-key lookups."""
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr in CONFIG_NODE_ONLY_METHODS:
-            self._report(node, "CB002", f"`.{func.attr}()` is ConfigNode API")
-        if (
-            isinstance(func, ast.Name)
-            and func.id in ("hasattr", "getattr")
-            and len(node.args) >= 2
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value in PROBED_ATTRIBUTES
-        ):
-            self._report(node, "CB003", f'`{func.id}(..., "{node.args[1].value}")` probes for a config node')
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == "get"
-            and _is_config_receiver(func.value)
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and "." in node.args[0].value
-            and " " not in node.args[0].value
-        ):
-            self._report(node, "CB006", f'`.get("{node.args[0].value}")` resolves a dotted YAML path')
+        match node:
+            case ast.Call(func=ast.Attribute(attr=method)) if method in CONFIG_NODE_ONLY_METHODS:
+                self._report(node, "CB002", f"`.{method}()` is ConfigNode API")
+            case ast.Call(
+                func=ast.Name(id="hasattr" | "getattr" as probe), args=[_, ast.Constant(value=str(attr)), *_]
+            ):
+                if attr in PROBED_ATTRIBUTES:
+                    self._report(node, "CB003", f'`{probe}(..., "{attr}")` probes for a config node')
+            case ast.Call(func=ast.Attribute(value=receiver, attr="get"), args=[ast.Constant(value=str(key)), *_]):
+                name = _name(receiver)
+                if (
+                    "." in key
+                    and " " not in key
+                    and (_is_config_param_name(name) or name == "config" or name.endswith("_config"))
+                ):
+                    self._report(node, "CB006", f'`.get("{key}")` resolves a dotted YAML path')
         self.generic_visit(node)
 
 
@@ -318,25 +269,19 @@ def _relative(path: Path, automodel_dir: Path) -> str:
         return path.as_posix()
 
 
-def _allowed_key(error: LintError, automodel_dir: Path) -> tuple[str, str]:
-    return (_relative(error.path, automodel_dir), error.function.split(".")[0])
-
-
-def _in(relative: str, directory: str) -> bool:
-    return relative == directory or relative.startswith(directory + "/")
-
-
 def collect_python_files(paths: list[Path], automodel_dir: Path) -> list[Path]:
-    """Expand files and directories into the component files to lint, skipping the config package."""
+    """Expand paths to component Python files, excluding the config package."""
+    components = automodel_dir.resolve() / COMPONENTS
     files: list[Path] = []
     for path in paths:
-        candidates = sorted(p for p in path.rglob("*.py") if p.is_file()) if path.is_dir() else [path]
+        candidates = sorted(path.rglob("*.py")) if path.is_dir() else [path]
         for candidate in candidates:
-            relative = _relative(candidate, automodel_dir)
+            resolved = candidate.resolve()
             if (
                 candidate.suffix == ".py"
-                and any(_in(relative, root) for root in DEFAULT_PATHS)
-                and not any(_in(relative, exempt) for exempt in EXEMPT_DIRS)
+                and candidate.is_file()
+                and resolved.is_relative_to(components)
+                and not resolved.is_relative_to(components / "config")
             ):
                 files.append(candidate)
     return files
@@ -348,7 +293,7 @@ def check(files: list[Path], automodel_dir: Path, *, report_stale: bool) -> list
     used: set[tuple[str, str]] = set()
     lines: list[str] = []
     for error in errors:
-        key = _allowed_key(error, automodel_dir)
+        key = (_relative(error.path, automodel_dir), error.function.partition(".")[0])
         if key in ALLOWED:
             used.add(key)
             continue
@@ -369,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         "paths",
         nargs="*",
         type=Path,
-        help=f"Files or directories to lint. Defaults to: {', '.join(DEFAULT_PATHS)}.",
+        help=f"Files or directories to lint. Defaults to {COMPONENTS}.",
     )
     parser.add_argument("--automodel-dir", type=Path, default=Path.cwd(), help="Path to the AutoModel repository root.")
     args = parser.parse_args(argv)
@@ -388,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        paths = [automodel_dir / name for name in DEFAULT_PATHS]
+        paths = [automodel_dir / COMPONENTS]
 
     files = collect_python_files(paths, automodel_dir)
     if not files:
