@@ -139,11 +139,11 @@ first step:
 | 3.44 hours, when the NVFP4 run finished | 1,500 (3.538) | 1,430 (3.530) | 1,433 (3.533) |
 
 The learning rate follows the step, so at equal time the faster run is further down the same schedule. The
-NVFP4 loss is lower after 1 hour and after 3 hours, within 0.005 of the BF16 loss between 3.1 and 3.3 hours,
-and 0.008 above the BF16 run at the moment the NVFP4 run finishes. These are training losses on batches seen
-once, not held-out quality measurements. The learned gate of a randomly initialized model routes tokens unevenly
-across ranks, so these token rates are lower than the balanced-routing rows on mock data in the
-[Performance Summary](/performance/performance-summary).
+NVFP4 loss is lower after 1 hour and after 3 hours. Between 3.1 and 3.3 hours it crosses the loss of each BF16
+run several times and stays within 0.011 of it, and at the moment the NVFP4 run finishes it is 0.008 above the
+BF16 run. These are training losses on batches seen once, not held-out quality measurements. The learned gate
+of a randomly initialized model routes tokens unevenly across ranks, so these token rates are lower than the
+balanced-routing rows on mock data in the [Performance Summary](/performance/performance-summary).
 
 ## Model Reference
 
