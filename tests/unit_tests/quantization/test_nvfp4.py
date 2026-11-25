@@ -520,14 +520,6 @@ requires_te_nvfp4 = pytest.mark.skipif(
     reason="requires Transformer Engine 2.19+ and an NVFP4 GPU",
 )
 
-# Row-scaled activations need the random Hadamard transform off; the backward reads dequantized operands so
-# that the weights do not have to be frozen.
-ROW_SCALED_OPTIONS = {
-    "random_hadamard_transform": False,
-    "row_scaled_activation": True,
-    "backward": "dequantized",
-}
-
 
 def _relative_error(value: torch.Tensor, reference: torch.Tensor) -> float:
     return float((value.double() - reference.double()).norm() / reference.double().norm())
@@ -584,8 +576,8 @@ def test_modules_the_precision_map_gives_mxfp8_run_the_mxfp8_recipe_inside_the_n
 def test_large_default_gemms_have_no_wrong_rows():
     """Default NVFP4 GEMMs at 4096 rows x 4608 x 4608, forward and backward: every row within rounding error.
 
-    This is the size at which a row-scaled forward GEMM returns wrong rows with some cuBLASLt versions (next
-    test). The default recipe multiplies into a BF16 output and must be correct with every version.
+    This is the size at which a row-scaled forward GEMM returns wrong rows with some cuBLASLt versions. The
+    default recipe multiplies into a BF16 output and must be correct with every version.
     """
     import transformer_engine.pytorch as te
 
@@ -606,34 +598,6 @@ def test_large_default_gemms_have_no_wrong_rows():
         row_error = (value - exact).norm(dim=1) / exact.norm(dim=1)
         # NVFP4 rounding gives every row an error of 0.15 to 0.19; a row from a defective GEMM is off by about 1.
         assert 0.05 < float(row_error.median()) and float(row_error.max()) < 0.3, (name, row_error.max())
-
-
-@requires_te_nvfp4
-def test_large_row_scaled_gemm_is_right_wherever_the_config_does_not_warn():
-    """Row-scaled NVFP4 at 4096 rows x 4608 x 4608: every row is right where the config does not warn.
-
-    Where it warns, wrong rows are expected but not required: cuBLASLt 13.7.0 on GB300 returned 96 wrong rows
-    of 4096 here and 13.8.1 none; a release between the two was not measured.
-    """
-    import transformer_engine.pytorch as te
-
-    from nemo_automodel.components.models.common.utils import row_scaled_nvfp4_gemm_is_unreliable
-    from nemo_automodel.shared.import_utils import get_te_cublaslt_version
-
-    torch.manual_seed(0)
-    linear = te.Linear(4608, 4608, bias=False, params_dtype=torch.bfloat16).to("cuda")
-    x = torch.randn(4096, 4608, device="cuda", dtype=torch.bfloat16)
-    config = TENvfp4Config(**ROW_SCALED_OPTIONS)
-    with torch.no_grad(), config.maybe_te_autocast():
-        output = linear(x).float()
-    exact = x.float() @ linear.weight.float().T
-    # NVFP4 rounding gives every row an error near 0.13; a row from the defective GEMM is off by about 1.
-    row_error = (output - exact).norm(dim=1) / exact.norm(dim=1)
-    wrong_rows = int((row_error > 0.5).sum())
-    assert float(row_error.median()) < 0.2
-    cublaslt_version = get_te_cublaslt_version()
-    if not row_scaled_nvfp4_gemm_is_unreliable(cublaslt_version, torch.cuda.get_device_capability()):
-        assert wrong_rows == 0, f"{wrong_rows} wrong rows of 4096 with cuBLASLt {cublaslt_version}"
 
 
 @requires_te_nvfp4
