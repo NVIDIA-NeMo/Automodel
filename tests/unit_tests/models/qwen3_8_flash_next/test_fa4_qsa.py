@@ -213,6 +213,7 @@ def test_triton_preprocess_matches_the_eager_reference(
         shape = (batch, queries, width + 3)
         wide = torch.randint(-3, kv_length + 4, shape, generator=generator, device="cuda", dtype=dtype)
         cases.append((wide[..., :width], kv_length))  # route rows strided like the trimmed indexer output
+        cases.append((wide[..., :width:2], kv_length))  # non-unit route-width stride
     causal = torch.arange(600, device="cuda", dtype=dtype)
     cases.append((torch.where(causal[None, :] <= causal[:, None], causal[None, :], -1).unsqueeze(0), 600))
     # Indexer-shaped routes: aligned 4-key blocks (stored as words), an unaligned consecutive group, a
@@ -229,3 +230,26 @@ def test_triton_preprocess_matches_the_eager_reference(
         for result, reference in zip(actual, expected, strict=True):
             assert result.shape == reference.shape and result.dtype == reference.dtype
             assert torch.equal(result, reference)
+
+
+@_CUDA_AND_TRITON
+def test_scatter_reuses_kernel_across_route_widths(monkeypatch: pytest.MonkeyPatch) -> None:
+    kernels = []
+    run = fa4_qsa._scatter_routes_kernel.run
+
+    def record_launch(*args, **kwargs):
+        kernel = run(*args, **kwargs)
+        kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(fa4_qsa._scatter_routes_kernel, "run", record_launch)
+    for width in (1, 32, 33, 2049):
+        routes = torch.arange(width, device="cuda", dtype=torch.int32).repeat(2, 3, 1)
+        # Only the last route selects key 127, including in the second block at width 2049.
+        routes.remainder_(127)
+        routes[..., -1] = 127
+        membership, *_ = fa4_qsa._preprocess(routes, 128, 80, 64)
+        expected = torch.arange(128, device="cuda") < width - 1
+        expected[-1] = True
+        assert torch.equal(membership, expected.expand_as(membership))
+    assert len(kernels) == 4 and all(kernel is kernels[0] for kernel in kernels)

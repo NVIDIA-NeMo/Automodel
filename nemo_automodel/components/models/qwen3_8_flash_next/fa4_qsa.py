@@ -82,7 +82,7 @@ def _load_fa4() -> tuple[Callable, type, Callable]:
 if HAVE_TRITON:
     # The route width follows each packed batch's longest document; keep it a runtime value so a
     # new width never compiles a new kernel variant.
-    @triton.jit(do_not_specialize=["width"])
+    @triton.jit(do_not_specialize=["width", "route_batch_stride", "route_query_stride"])
     def _scatter_routes_kernel(
         routes,
         membership,
@@ -121,7 +121,7 @@ if HAVE_TRITON:
         lanes = tl.arange(0, 4)
         for start in range(0, width, BLOCK):
             offsets = start + tl.arange(0, BLOCK)
-            ids = tl.load(source + offsets * route_width_stride, mask=offsets < width, other=-1)
+            ids = tl.load(source + offsets.to(tl.int64) * route_width_stride, mask=offsets < width, other=-1)
             valid = (ids >= 0) & (ids < kv_length)
             groups = tl.reshape(ids, (BLOCK // 4, 4))
             first = tl.sum(tl.where(lanes[None, :] == 0, groups, 0), axis=1)
@@ -278,7 +278,7 @@ def _preprocess(
         kv_length,
         *routes.stride(),
         row_stride,
-        BLOCK=max(16, min(2048, triton.next_power_of_2(width))),
+        BLOCK=2048,
         ROW_BLOCK=min(4096, triton.next_power_of_2(row_stride)),
         # Fewer, wider programs keep fewer rows in flight, so a zeroed row is still in L2 when its routes land:
         # on H100 (50 MiB L2) the scatter of 24K-32K-token rows runs up to 1.9x faster than with 4 warps, and
