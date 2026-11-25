@@ -107,10 +107,10 @@ The figure and tables compare the recipe with the same file without its `te_nvfp
 twice. All runs use the same seed, initial weights, and data order on 16 GB300 GPUs (TE 2.19.0) and train
 1,500 optimizer steps, 1.57 billion tokens. Two settings differ from the recipe as written: a 1,500-step cosine
 schedule (`--step_scheduler.max_steps 1500`) and 4.5 billion tokens of FineWeb `sample-10BT` in 16 shards, one
-per rank, read in stored order (`--dataset.file_pattern`). Every run stops at step 1,500, the end of its
-schedule, so the runs are equal in steps and differ in time: a faster run ends earlier and its line in the
-wall-clock panels is shorter. "Original BF16" in the figure is the BF16 run on the code before the Mamba and
-MoE optimizations that this recipe uses; it took 3.66 hours.
+per rank, read in stored order (`--dataset.file_pattern`). Every run completed its 1,500-step schedule before
+its time budget of 13,800 seconds and stopped there, so the runs are equal in steps and differ in time: a
+faster run ends earlier, and its line in the wall-clock panels is shorter. "Original BF16" in the figure is
+the BF16 run on the code before the Mamba and MoE optimizations that this recipe uses; it took 3.66 hours.
 
 ![Training loss and optimizer steps completed of Nemotron 3.5 Super VL pretraining on FineWeb with 16 GB300 GPUs, NVFP4 against BF16, by optimizer step and by wall-clock time](./nemotron-3-5-super-vl-nvfp4-gb300-loss.png)
 
@@ -125,7 +125,10 @@ Over the last 100 steps the NVFP4 loss is 0.020 (0.57%) above the BF16 loss, and
 0.004. NVFP4 was run once, so its own run-to-run difference is not measured.
 
 The NVFP4 step is 4.7% faster, so the NVFP4 run finishes its 1,500 steps 9.6 minutes before the BF16 run, and
-at equal wall-clock time it has completed more steps (panel d of the figure). Time counts from the start of the
+at equal wall-clock time it has completed more steps. Panel (d) of the figure shows the optimizer steps
+completed against wall-clock time for the whole run and, enlarged, for the last 25 minutes. When the NVFP4 run
+completed step 1,500 after 3.44 hours, it was 70 steps ahead of the BF16 run, 67 ahead of the second BF16 run,
+and 93 ahead of the Original BF16 run, which had completed 1,407 steps. Time counts from the start of the
 first step:
 
 | Optimizer steps completed (mean training loss of the 50 most recent steps) after | NVFP4 (the recipe) | BF16 (without `te_nvfp4`) | BF16, second run |
