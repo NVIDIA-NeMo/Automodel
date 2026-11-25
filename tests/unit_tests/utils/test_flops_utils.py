@@ -371,10 +371,21 @@ def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expe
     assert get_device_flops(unit="T") == expected_tflops
 
 
-def test_get_device_flops_recognizes_vr200(monkeypatch):
-    """VR200 reports "NVIDIA VR NVL72"; an unknown name would make every step log MFU 0."""
+@pytest.mark.parametrize(
+    "dtype, fp32_precision, expected",
+    [
+        (torch.bfloat16, "ieee", 4000.0),
+        (torch.float8_e4m3fn, "ieee", 17500.0),
+        (torch.float4_e2m1fn_x2, "ieee", 35000.0),
+        (torch.float32, "tf32", 2000.0),
+        (torch.float32, "ieee", 130.0),
+    ],
+)
+def test_get_device_flops_recognizes_vr200(dtype, fp32_precision, expected, monkeypatch):
+    """VR200 reports "NVIDIA VR NVL72"; a missing entry would make every step log MFU 0."""
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", fp32_precision)
     _mock_cuda_device(monkeypatch, "NVIDIA VR NVL72")
-    assert get_device_flops(unit="T") == 4000.0
+    assert get_device_flops(dtype=dtype) == expected
 
 
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):

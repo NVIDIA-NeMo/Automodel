@@ -48,14 +48,15 @@ _Precision = Literal["fp32", "tf32", "fp16", "fp8", "fp4"]
 # https://www.nvidia.com/en-us/data-center/a100/
 # https://www.nvidia.com/en-us/data-center/gb200-nvl72/
 # https://www.nvidia.com/en-us/data-center/gb300-nvl72/
+# https://www.nvidia.com/en-us/data-center/vera-rubin-nvl72/ (per Rubin GPU; FP8 and NVFP4 training)
 # https://www.nvidia.com/en-us/data-center/hgx/
 # https://www.nvidia.com/en-us/data-center/l40s/ and the Ada architecture whitepaper (L40)
 # https://www.nvidia.com/en-us/products/workstations/rtx-5880/ and the Ada workstation whitepaper
 # Other 16-bit entries retain the existing lookup adapted from verl's flops_counter.py.
 _DEVICE_TFLOPS: dict[str, dict[_Precision, float]] = {
     "CPU": {"fp16": 0.448},
-    # The preliminary Vera Rubin NVL72 spec lists 288 dense FP16/BF16 PFLOPs/s per rack.
-    "VR NVL72": {"fp16": 4000},
+    # VR200 reports its name as "NVIDIA VR NVL72".
+    "VR NVL72": {"fp32": 130, "tf32": 2000, "fp16": 4000, "fp8": 17500, "fp4": 35000},
     "GB200": {"fp32": 80, "tf32": 1250, "fp16": 2500, "fp8": 5000, "fp4": 10000},
     "GB300": {"fp32": 80, "tf32": 1250, "fp16": 2500, "fp8": 5000, "fp4": 15000},
     "B200": {"fp32": 75, "tf32": 1125, "fp16": 2250, "fp8": 4500, "fp4": 9000},
