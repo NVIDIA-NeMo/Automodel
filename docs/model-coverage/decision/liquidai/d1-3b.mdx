@@ -1,0 +1,73 @@
+---
+title: "d1-3B"
+description: "Post-train the d1-3B decision readout with NeMo AutoModel in an experimental, text-only example that keeps the backbone frozen and also covers D1 Omni."
+slug: model-coverage/decision-models/liquidai/d1-3B
+---
+
+[d1-3B](https://huggingface.co/LiquidAI/d1-3B) is a Liquid AI decision model built on the LFM2-VL vision-language
+architecture. Like other [decision models](/model-coverage/decision-models/overview), it returns a probability for
+every allowed option of each typed question. NeMo AutoModel provides experimental post-training for D1-3B and the
+related D1 Omni model through the `d1_posttrain.py` example. The example keeps the backbone frozen and trains only the
+readout: additive answer-token rows for D1-3B, or the released marker head for D1 Omni. It adapts the readout on
+text-only records. The vision modules of both models, and the D1 Omni audio modules, remain frozen.
+
+## Post-Train D1-3B
+
+From the repository root, generate fictional training, validation, and test records. The generator rejects an
+existing output directory, so skip this step if you already generated `data/soc_triage` for another decision model:
+
+```bash
+PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+    --output-dir data/soc_triage --seed 7
+```
+
+Run each stage on a CUDA GPU. Start with the baseline, which evaluates the released checkpoint and compares its
+probabilities with the publisher implementation. The supervised fine-tuning (SFT) and reinforcement learning (RL)
+stages do not repeat that comparison. Each stage writes `metrics_validation.json` and `metrics_test.json` to its
+output directory.
+
+```bash
+uv run python examples/decision/d1_posttrain.py \
+  --model d1-3b --mode base --data-dir data/soc_triage \
+  --cache-dir runs/d1-cache --output-dir runs/d1-3b/base
+uv run python examples/decision/d1_posttrain.py \
+  --model d1-3b --mode sft --data-dir data/soc_triage \
+  --cache-dir runs/d1-cache --output-dir runs/d1-3b/sft
+uv run python examples/decision/d1_posttrain.py \
+  --model d1-3b --mode rl --data-dir data/soc_triage \
+  --cache-dir runs/d1-cache --input-dir runs/d1-3b/sft --output-dir runs/d1-3b/rl
+```
+
+To run D1 Omni, replace `--model d1-3b` with `--model d1-omni`, and use separate output directories, such as
+`runs/d1-omni/base`. The example loads D1-3B in BF16 and D1 Omni in FP32, and it pins the model and tokenizer
+revisions. The RL stage requires `--input-dir` set to the output directory of the SFT stage. It loads only the readout
+weights (`head.pt`) from that directory and starts with a new optimizer.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Lfm2VlForConditionalGeneration` (D1-3B) and `D1OmniModel` (D1 Omni) |
+| D1-3B checkpoint | [`LiquidAI/d1-3B`](https://huggingface.co/LiquidAI/d1-3B/tree/051bcc464b01b9f92942b364d9586b0ef5912432) |
+| D1 Omni checkpoint | [`LiquidAI/d1-omni-600M`](https://huggingface.co/LiquidAI/d1-omni-600M/tree/02b55d7076f15129e59ab3f94783f32c4b088674) |
+| Training scope | Text-only adaptation of the decision readout on one GPU, with a frozen backbone |
+| Parallelism | Single GPU. Both native model classes mark tensor, context, pipeline, and expert parallelism (TP, CP, PP, and EP) as unsupported. |
+
+NeMo AutoModel uses its D1 implementation, which matches released D1 numerics such as FP32 rotary embeddings, only for
+checkpoints whose configuration maps `AutoModel` to the publisher's `modeling_d1.D1Model` class. Other LFM2-VL
+checkpoints use the Hugging Face implementation.
+
+The `d1_posttrain.py` example downloads pinned publisher code for both models and loads it with
+`trust_remote_code=True`. D1 Omni also needs that code to build its vision and audio modules. To run offline, download
+the checkpoints and the publisher code to your Hugging Face cache first.
+
+The D1 examples do not demonstrate distributed adaptation, and their results do not measure downstream task quality.
+Downloaded publisher code and checkpoints keep their own [license terms](https://www.liquid.ai/lfm-license).
+
+## Related Resources
+
+- [Decision post-training examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/README.md)
+- [D1 readout tutorial](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/README.md#experimental-d1-readouts)
+- [D1 publisher-comparison checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/decision_models/d1/README.md)

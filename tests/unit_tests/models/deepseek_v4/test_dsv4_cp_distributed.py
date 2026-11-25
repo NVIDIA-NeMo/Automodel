@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -45,14 +45,6 @@ pytestmark = [
     pytest.mark.timeout(70),
     pytest.mark.run_only_on("GPU"),
 ]
-
-
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 def _tiny_attention_config(compress_ratio: int = 0) -> DeepseekV4Config:
@@ -111,17 +103,15 @@ def _compress_rotary(cfg: DeepseekV4Config) -> DeepseekV4RotaryEmbedding:
     )
 
 
-def _init_gloo(rank: int, world_size: int, port: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+def _init_gloo(rank: int, world_size: int, init_file: str) -> None:
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
 
 
-def _cp_collective_worker(rank: int, world_size: int, port: int) -> None:
+def _cp_collective_worker(rank: int, world_size: int, init_file: str) -> None:
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_file)
 
         local = torch.arange(rank * 2, rank * 2 + 2, dtype=torch.float32).requires_grad_(True)
         gathered = dsv4_cp_all_gather(local, dim=0, cp_group=dist.group.WORLD)
@@ -157,9 +147,9 @@ def _cp_collective_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _attention_equivalence_worker(rank: int, world_size: int, port: int) -> None:
+def _attention_equivalence_worker(rank: int, world_size: int, init_file: str) -> None:
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_file)
         torch.set_num_threads(1)
         torch.manual_seed(123)
 
@@ -230,9 +220,9 @@ def _attention_equivalence_worker(rank: int, world_size: int, port: int) -> None
             dist.destroy_process_group()
 
 
-def _compressed_attention_equivalence_worker(rank: int, world_size: int, port: int) -> None:
+def _compressed_attention_equivalence_worker(rank: int, world_size: int, init_file: str) -> None:
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_file)
         torch.set_num_threads(1)
         torch.manual_seed(123)
 
@@ -297,15 +287,15 @@ def _compressed_attention_equivalence_worker(rank: int, world_size: int, port: i
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_dsv4_cp_collectives_have_autograd_and_global_padding_mask():
-    mp.spawn(_cp_collective_worker, args=(2, _free_port()), nprocs=2, join=True)
+def test_dsv4_cp_collectives_have_autograd_and_global_padding_mask(tmp_path: Path):
+    mp.spawn(_cp_collective_worker, args=(2, str(tmp_path / "process-group")), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_dsv4_attention_cp_matches_full_sequence_sliding_window():
-    mp.spawn(_attention_equivalence_worker, args=(2, _free_port()), nprocs=2, join=True)
+def test_dsv4_attention_cp_matches_full_sequence_sliding_window(tmp_path: Path):
+    mp.spawn(_attention_equivalence_worker, args=(2, str(tmp_path / "process-group")), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_dsv4_compressed_attention_cp_uses_global_pool_positions():
-    mp.spawn(_compressed_attention_equivalence_worker, args=(2, _free_port()), nprocs=2, join=True)
+def test_dsv4_compressed_attention_cp_uses_global_pool_positions(tmp_path: Path):
+    mp.spawn(_compressed_attention_equivalence_worker, args=(2, str(tmp_path / "process-group")), nprocs=2, join=True)

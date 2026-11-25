@@ -34,6 +34,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -41,7 +42,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
-    compute_lm_head_logits,
 )
 from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config, MiMoV2FlashConfig
 from nemo_automodel.components.models.mimo_v2_flash.cp import (
@@ -1109,26 +1109,25 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         *,
         revision: str | None = None,
-        **kwargs,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
     ) -> None:
         """Construct the model and bind checkpoint metadata reads to ``revision``."""
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = MiMoV2FlashModel(
             config,
             backend=self.backend,
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             config.hidden_size,
             config.vocab_size,
-            bias=False,
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            logits_dtype=logits_dtype,
         )
         self.visual = None
         if config.vision_config is not None:
@@ -1299,7 +1298,48 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast | torch.Tensor:
-        """Run text or VLM forward with TE-local packed media placement."""
+        """Run the text or vision-language forward and project the kept positions to vocabulary logits.
+
+        Packed (THD) input requires the TE backend and ``cu_seqlens``; each TE shard splices only its own media
+        feature rows.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens] or
+                [tokens]. Later pipeline stages pass hidden states of shape [batch, sequence, hidden] or
+                [1, tokens, hidden].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or [1, tokens, hidden] when
+                packed, used instead of input_ids.
+            position_ids: Optional positions of shape [batch, sequence], or [1, tokens] when packed; None numbers
+                positions 0 to sequence - 1, across the whole pack for packed input.
+            attention_mask: Optional Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding.
+                Without TE it may instead be a bool or additive mask of shape [batch, 1, sequence, sequence], or a
+                dict of such masks keyed ``full_attention`` and ``sliding_attention``. Packed input ignores it.
+            padding_mask: Optional bool Tensor of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; when None, it is derived from a Tensor attention_mask.
+            pixel_values: Optional flattened image patches of shape [patches, patch_features].
+            image_grid_thw: Optional int grid of shape [images, 3] holding each image's (t, h, w) patch counts, or
+                [images, 2] holding (h, w).
+            pixel_values_videos: Optional flattened video patches of shape [patches, patch_features].
+            video_grid_thw: Optional int grid of shape [videos, 3] holding each video's (t, h, w) patch counts.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            output_hidden_states: Whether the output carries the final hidden states; None reads
+                ``config.output_hidden_states``.
+            **kwargs: Backend metadata for the decoder: ``qkv_format``, int32 ``cu_seqlens`` and
+                ``cu_seqlens_padded`` of shape [1, documents + 1] or [documents + 1], padded with -1000,
+                ``max_seqlen``, ``cp_size`` and ``cp_rank``, plus the private media and local-token maps that
+                MiMo's context-parallel sharder adds, which this method consumes.
+
+        Returns:
+            With ``_pp_return_hidden_states`` set, the hidden states Tensor of shape [batch, sequence, hidden], or
+            [1, tokens, hidden] when packed. On a pipeline stage without the head, a CausalLMOutputWithPast whose
+            ``logits``, and ``hidden_states`` when requested, hold those hidden states. Otherwise a
+            CausalLMOutputWithPast whose ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] when
+            packed, in the head's ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may
+            lower; ``hidden_states``, when requested, are the final hidden states of shape
+            [batch, sequence, hidden], or [tokens, hidden] for packed input, matching the flattened [tokens]
+            labels of fused cross-entropy.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -1359,24 +1399,13 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        output = compute_lm_head_logits(
-            self.lm_head,
-            hidden,
-            logits_to_keep,
-            is_thd=is_thd,
-            output_hidden_states=output_hidden_states,
-        )
-        if (
-            is_thd
-            and output.hidden_states is not None
-            and output.hidden_states.ndim == 3
-            and output.hidden_states.shape[0] == 1
-        ):
+        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if output_hidden_states and is_thd and hidden.shape[0] == 1:
             # The TE THD sharder flattens labels to [T]. FusedLinearCrossEntropy
             # therefore consumes [T,H], while logits retain the public [1,T,V]
             # shape. PP returns above and keeps [microbatch,T,H] for its schedule.
-            output.hidden_states = output.hidden_states.squeeze(0)
-        return output
+            hidden = hidden.squeeze(0)
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     def get_pipeline_stage_metas(
         self,
@@ -1396,8 +1425,10 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         has_lm_head = self.lm_head is not None
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
-        output_width = vocab_size if has_lm_head and not emits_hidden_states else hidden_size
-        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=dtype),)
+        emits_logits = has_lm_head and not emits_hidden_states
+        output_width = vocab_size if emits_logits else hidden_size
+        output_dtype = (self.lm_head.logits_dtype or dtype) if emits_logits else dtype
+        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=output_dtype),)
         return inputs_meta, outputs_meta
 
     def customize_pipeline_stage_modules(

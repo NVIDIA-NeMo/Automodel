@@ -25,6 +25,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
+from tests.unit_tests.models.passthrough_layers import passthrough_layers
 
 
 def _tiny_vl_config(**text_kwargs):
@@ -332,3 +333,37 @@ class TestQwen3_5MoeTextOnlyVisionTower:
         frozen_grads = dict(frozen.model.language_model.named_parameters())
         for name, param in trainable.model.language_model.named_parameters():
             torch.testing.assert_close(param.grad, frozen_grads[name].grad, rtol=0, atol=0)
+    def test_moe_vlm_packed_forward_keeps_a_batch_axis(self):
+        cfg = _tiny_vl_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5MoeForConditionalGeneration(cfg, backend=_backend())
+        model.train()
+        tokens = 6
+        # Two packed documents of 3 tokens; M-RoPE positions are [axes, batch, tokens].
+        positions = torch.arange(3).repeat(2).expand(3, 1, tokens)
+
+        layers = [*model.model.language_model.layers.values(), *model.mtp.layers]
+
+        with passthrough_layers(layers) as layer_inputs:
+            out = model(
+                input_ids=torch.randint(1, 50, (1, tokens)),
+                position_ids=positions,
+                qkv_format="thd",
+                cu_seqlens=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+                max_seqlen=torch.tensor([3]),
+            )
+
+        hidden_size = cfg.text_config.hidden_size
+        # The decoder and the MTP blocks run on packed states; the MTP blocks embed the packed ids.
+        assert layer_inputs == [(tokens, hidden_size)] * len(layers)
+        assert out.logits.shape == (1, tokens, cfg.text_config.vocab_size)
+        assert [tuple(h.shape) for h in out.mtp_per_depth_h] == [(tokens, hidden_size)]
+
+    @pytest.mark.parametrize("logits_dtype", [None, torch.float32])
+    def test_moe_vlm_stage_metas_declare_the_head_logits_dtype(self, logits_dtype):
+        model = Qwen3_5MoeForConditionalGeneration(_tiny_vl_config(), backend=_backend(), logits_dtype=logits_dtype)
+
+        _, outputs = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=6, dtype=torch.bfloat16
+        )
+
+        assert [output.dtype for output in outputs] == [logits_dtype or torch.bfloat16]

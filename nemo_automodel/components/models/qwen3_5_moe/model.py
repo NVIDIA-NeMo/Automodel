@@ -76,6 +76,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
@@ -87,7 +88,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
@@ -747,9 +748,10 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         """Decode text tokens with model-forward-owned packed GDN metadata.
 
         Args:
-            input_ids: Optional token IDs of shape [batch, sequence].
+            input_ids: Optional token IDs of shape [batch, sequence], or packed
+                (THD) IDs of shape [tokens] after the multimodal wrapper squeezes them.
             inputs_embeds: Optional token embeddings of shape [batch, sequence,
-                hidden].
+                hidden], or packed [tokens, hidden].
             attention_mask: Optional validity, indexed document, or backend mask
                 of shape [batch, sequence] or [batch, 1, sequence, sequence].
             position_ids: Optional positions of shape [batch, sequence] or
@@ -771,7 +773,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
-            hidden].
+            hidden]; packed [tokens, hidden] input from the multimodal wrapper
+            comes back as [1, tokens, hidden].
         """
         for key in ("cu_seqlens", "max_seqlen"):
             if f"_text_{key}" in attn_kwargs:
@@ -856,6 +859,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
 
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return Qwen3_5MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=None,
@@ -942,15 +947,14 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
-        **kwargs: Any,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
     ) -> None:
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
-        moe_overrides = kwargs.pop("moe_overrides", None)
-        if kwargs:
-            raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
 
         self.config = config
         self.backend = _qwen3_5_moe_backend(backend)
@@ -962,13 +966,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=dtype,
-        )
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size, dtype=dtype, logits_dtype=logits_dtype)
         self.vocab_size = config.vocab_size
         self.pad_token_id = config.pad_token_id if config.pad_token_id is not None else -1
 
@@ -1106,11 +1104,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        lm_output = compute_lm_head_logits(
-            self.lm_head,
-            hidden_states,
-            logits_to_keep,
-            output_hidden_states=output_hidden_states,
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
@@ -1161,8 +1156,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 )
 
         return Qwen3_5MoeCausalLMOutputWithPast(
-            logits=lm_output.logits,
-            hidden_states=lm_output.hidden_states,
+            logits=logits,
+            hidden_states=hidden_states if output_hidden_states else None,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
         )
@@ -1279,7 +1274,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         backend: BackendConfig | None = None,
         mtp_loss_scaling_factor: float = 0.1,
         num_nextn_predict_layers: int | None = None,
-        **kwargs,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
     ):
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
@@ -1309,18 +1306,16 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.language_model = Qwen3_5MoeTextModelBackend(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
 
         # Replace lm_head with NeMo backend linear
-        self.lm_head = initialize_linear_module(
-            self.backend.linear,
+        self.lm_head = LMHead(
             text_config.hidden_size,
             text_config.vocab_size,
-            bias=False,
             dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
+            logits_dtype=logits_dtype,
         )
 
         dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
@@ -1689,7 +1684,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         has_lm_head = getattr(self, "lm_head", None) is not None
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
         if has_lm_head and not emits_hidden_states:
-            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=dtype),)
+            logits_dtype = self.lm_head.logits_dtype or dtype
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=logits_dtype),)
         else:
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
         return inputs_meta, outputs_meta
@@ -1746,8 +1742,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             ``[batch, sequence, vocab]`` (or ``[batch, sequence, hidden]`` on a
             non-final pipeline stage), whose requested hidden states have shape
             ``[batch, sequence, hidden]``, and whose optional MTP tensors each
-            have shape ``[batch, sequence, hidden]``. Under CP, ``sequence`` is
-            the local padded shard.
+            have shape ``[batch, sequence, hidden]``. Packed (THD) input keeps a
+            batch axis of one, except for the MTP tensors, which are packed
+            ``[tokens, hidden]``. Under CP, ``sequence`` is the local padded shard.
         """
         # Resolve from the text/decoder sub-config for this VL model.
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
@@ -1893,13 +1890,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         hidden_states = outputs.last_hidden_state
-
-        lm_output = compute_lm_head_logits(
-            self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
         )
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
+            # The MTP blocks embed the packed [tokens] ids, so they take packed [tokens, hidden] states.
+            mtp_hidden = hidden_states.squeeze(0) if kwargs.get("qkv_format") == "thd" else hidden_states
             language_model = self.model.language_model
             source_embeds = inputs_embeds if inputs_embeds is not None else language_model.embed_tokens(input_ids)
             mtp_position_ids = _split_qwen3_5_moe_position_ids(
@@ -1923,7 +1921,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             }
             if mtp_embed_inputs is not None:
                 mtp_per_depth_h = self.mtp(
-                    hidden_states,
+                    mtp_hidden,
                     embed_inputs=mtp_embed_inputs,
                     position_ids_per_depth=mtp_per_depth_position_ids,
                     attention_mask=attention_mask,
@@ -1935,7 +1933,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 raise ValueError("Context-parallel Qwen3.5-MoE MTP requires globally prepared per-depth inputs")
             elif input_ids is None:
                 mtp_per_depth_h = self.mtp(
-                    hidden_states,
+                    mtp_hidden,
                     embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
                     position_ids=mtp_position_ids,
                     attention_mask=attention_mask,
@@ -1945,7 +1943,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 )
             else:
                 mtp_per_depth_h = self.mtp(
-                    hidden_states,
+                    mtp_hidden,
                     input_ids=input_ids,
                     embed_fn=language_model.embed_tokens,
                     position_ids=mtp_position_ids,
@@ -1955,13 +1953,13 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     **mtp_kwargs,
                 )
             return Qwen3_5MoeCausalLMOutputWithPast(
-                logits=lm_output.logits,
-                hidden_states=lm_output.hidden_states,
+                logits=logits,
+                hidden_states=hidden_states if output_hidden_states else None,
                 mtp_per_depth_h=mtp_per_depth_h,
                 mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
             )
 
-        return lm_output
+        return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
     @torch.no_grad()
     def initialize_weights(

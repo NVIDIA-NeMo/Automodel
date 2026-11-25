@@ -175,3 +175,23 @@ def test_te_parallel_cross_entropy_rejects_per_token_weights():
     parameters = inspect.signature(TEParallelCrossEntropy.__call__).parameters
     assert "loss_weights" not in parameters
     assert _supports_loss_weights(TEParallelCrossEntropy(reduction="sum")) is False
+
+
+@pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_te_parallel_cross_entropy_does_not_mutate_labels():
+    """The caller's labels must survive a masked TE loss unchanged.
+
+    ``TEParallelCrossEntropy`` calls ``to_local()`` on a DTensor ``labels``, and
+    that local shard aliases the DTensor's storage -- so an in-place fill would
+    corrupt the caller's distributed tensor, not just a local copy.
+    """
+    torch.manual_seed(0)
+    logits = torch.randn(2, 4, 5, device="cuda")
+    labels = torch.randint(high=5, size=(2, 4), device="cuda")
+    mask = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1]], device="cuda")
+
+    before = labels.clone()
+    TEParallelCrossEntropy()(logits, labels, mask=mask)
+
+    assert torch.equal(labels, before), f"labels were mutated in place: {before.tolist()} -> {labels.tolist()}"

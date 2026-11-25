@@ -89,9 +89,9 @@ class DistInfo:
 
 
 def initialize_distributed(
-    backend,
-    timeout_minutes=1,
-):
+    backend: str,
+    timeout_minutes: int = 1,
+) -> DistInfo:
     """Initialize the torch.distributed environment and core model parallel infrastructure.
 
     This function sets the device based on the local rank, configures the process group,
@@ -106,7 +106,7 @@ def initialize_distributed(
         DistInfo: An instance containing the distributed environment configuration.
     """
     device_count = torch.cuda.device_count()
-    device = None
+    device: torch.device
     if torch.distributed.is_initialized():
         if get_rank_safe() == 0:
             print(
@@ -114,40 +114,45 @@ def initialize_distributed(
                 flush=True,
             )
         if device_count > 0:
-            device = torch.cuda.current_device()
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            device = torch.device("cpu")
     else:
         if get_rank_safe() == 0:
             print("> initializing torch distributed with {} workers.".format(get_world_size_safe()), flush=True)
 
-        # Call the init process
-        init_pg_kwargs = {
-            "backend": backend,
-            "world_size": get_world_size_safe(),
-            "rank": get_rank_safe(),
-            "timeout": datetime.timedelta(minutes=timeout_minutes),
-        }
+        world_size = get_world_size_safe()
+        rank = get_rank_safe()
+        timeout = datetime.timedelta(minutes=timeout_minutes)
+        store: torch.distributed.Store | None = None
 
-        # Manually set the device ids.
-        device = None
         if device_count > 0:
-            rank = get_local_rank_preinit()
-            device = torch.device("cuda", rank)
+            local_rank = get_local_rank_preinit()
+            device = torch.device("cuda", local_rank)
             torch.cuda.set_device(device)
+        else:
+            device = torch.device("cpu")
 
-        if get_world_size_safe() == 1:
-            init_pg_kwargs["world_size"] = 1
-            init_pg_kwargs["rank"] = 0
-            init_pg_kwargs["backend"] = "gloo"
+        if world_size == 1:
+            world_size = 1
+            rank = 0
+            backend = "gloo"
             if hasattr(torch.distributed, "HashStore"):
-                init_pg_kwargs["store"] = torch.distributed.HashStore()
+                store = torch.distributed.HashStore()
             else:
                 # Windows builds omit HashStore. Retain the directory until after
                 # process-group teardown; atexit runs callbacks in reverse order.
                 store_dir = tempfile.TemporaryDirectory(prefix="automodel-store-")
                 atexit.register(store_dir.cleanup)
-                init_pg_kwargs["store"] = torch.distributed.FileStore(os.path.join(store_dir.name, "store"), 1)
+                store = torch.distributed.FileStore(os.path.join(store_dir.name, "store"), 1)
 
-        torch.distributed.init_process_group(**init_pg_kwargs)
+        torch.distributed.init_process_group(
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+            timeout=timeout,
+            store=store,
+        )
         atexit.register(destroy_global_state)
         # Skip barrier in single process case (e.g., torchrun --nproc-per-node=1)
         if get_world_size_safe() > 1:
@@ -158,7 +163,7 @@ def initialize_distributed(
     return DistInfo(backend, rank, world_size, device, rank == 0)
 
 
-def destroy_global_state():
+def destroy_global_state() -> None:
     """Destroy the torch.distributed process group during cleanup.
 
     This function is registered to execute at exit to ensure the process group is properly destroyed.

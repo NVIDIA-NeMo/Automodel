@@ -12,6 +12,7 @@ from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
     Qwen2ForCausalLM,
     _apply_qk_norm,
 )
+from nemo_automodel.components.models.common.lm_head import LMHead
 
 
 def _config() -> Qwen2Config:
@@ -54,21 +55,36 @@ def test_bagel_backend_rejects_unknown_fields() -> None:
         resolve_bagel_backend({"unsupported": True})
 
 
-def test_lm_head_uses_configured_linear_backend(monkeypatch) -> None:
-    import nemo_automodel.components.models.bagel.modeling_qwen2_packed as qwen_module
+def test_lm_head_takes_logits_dtype() -> None:
+    model = Qwen2ForCausalLM(_config(), backend=resolve_bagel_backend(), logits_dtype=torch.float32)
 
-    def _fake_initialize_linear_module(_backend, in_features, out_features, *, bias, dtype):
-        del dtype
-        module = nn.Linear(in_features, out_features, bias=bias)
-        module.test_backend = _backend
-        return module
+    assert type(model.lm_head) is LMHead and model.lm_head.logits_dtype == torch.float32
 
-    monkeypatch.setattr(qwen_module, "initialize_linear_module", _fake_initialize_linear_module)
-    backend = resolve_bagel_backend({"linear": "te"})
 
-    model = Qwen2ForCausalLM(_config(), backend=backend)
+def test_vocabulary_resize_keeps_the_logits_dtype() -> None:
+    model = Qwen2ForCausalLM(_config(), backend=resolve_bagel_backend(), logits_dtype=torch.float32)
 
-    assert model.lm_head.test_backend == "te"
+    model.resize_token_embeddings(40)
+
+    assert type(model.lm_head) is LMHead and model.lm_head.logits_dtype == torch.float32
+    assert model.lm_head.weight.shape == (40, 64)
+
+
+def test_hf_backbone_builder_passes_logits_dtype(tmp_path) -> None:
+    from nemo_automodel.components.models.bagel.hf_backbone_loader import build_bagel_from_hf_backbones
+
+    config = _config()
+    config.pad_token_id = 0  # within the tiny vocabulary
+    config.save_pretrained(tmp_path)
+    model = build_bagel_from_hf_backbones(
+        model_cfg={"llm_path": str(tmp_path), "visual_und": False, "logits_dtype": "float32"},
+        stage=1,
+        vae_config=None,
+        meta_init=True,
+        load_backbone_weights=False,
+    )
+
+    assert model.get_output_embeddings().logits_dtype == torch.float32
 
 
 def test_te_qk_norm_keeps_explicit_fp32_inference_path() -> None:

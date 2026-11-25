@@ -24,6 +24,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
@@ -200,21 +201,42 @@ class Inkling2MoE(MoE):
             cast(GroupedExperts, self.experts).expert_activation_grouped = activation
 
 
-class Inkling2LMHead(nn.Linear):
-    """Bias-free output projection with FP32 arithmetic and ordinary FSDP hooks."""
+class Inkling2LMHead(LMHead):
+    """Bias-free FP32 output projection that owns the logit softcap and padded-vocabulary mask."""
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Project through the module boundary so FSDP gathers its weight.
+    def __init__(self, config: Inkling2TextConfig, *, dtype: torch.dtype, logits_dtype: torch.dtype) -> None:
+        """Create the [vocab, hidden] head with ``config``'s softcap and usable vocabulary.
 
         Args:
-            input: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+            config: Text configuration with the hidden and vocabulary sizes, the logit softcap and the usable
+                (unpadded) vocabulary size.
+            dtype: Dtype of the weight.
+            logits_dtype: Dtype of the logits; the projection, softcap and mask run in FP32 before the cast.
+        """
+        super().__init__(
+            config.hidden_size,
+            config.vocab_size,
+            dtype=dtype,
+            logits_dtype=logits_dtype,
+            logit_softcapping=config.final_logit_softcapping,
+        )
+        self.unpadded_vocab_size = config.unpadded_vocab_size
+
+    def project(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Project FP32 copies of the hidden states with a supplied vocabulary weight.
+
+        Args:
+            input: Tensor of shape [..., hidden], with arbitrary leading dimensions, in any floating dtype.
+            weight: Tensor of shape [vocab, hidden] on input's device: the head's own weight, or the weight a
+                chunked loss gathered. A column-parallel DTensor uses Shard(0), with input replicated on its mesh.
 
         Returns:
-            FP32 tensor of shape [..., vocab]. Weight storage may be FP32 or BF16.
-            The caller applies softcapping and unused-vocabulary masking.
+            Logits of shape [..., vocab] in ``logits_dtype``, with the head's softcap applied and negative infinity
+            in the padded vocabulary rows from ``unpadded_vocab_size`` on. Inputs are not mutated.
         """
-        with torch.autocast(device_type=input.device.type, enabled=False):
-            return F.linear(input.float(), self.weight.float(), self.bias.float() if self.bias is not None else None)
+        logits = super().project(input.float(), weight.float())
+        padded = torch.arange(logits.shape[-1], device=logits.device) >= self.unpadded_vocab_size
+        return logits.masked_fill(padded, float("-inf"))
 
 
 class ShortConvolution(nn.Module):

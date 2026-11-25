@@ -103,6 +103,7 @@ _TARGET_PROBS_INDICES = "target_probs_indices"
 _TOPK_PROBS_KEYS = (_TARGET_PROBS_VALUES, _TARGET_PROBS_INDICES)
 
 DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+_FLOAT_HEADER_DTYPES = {"bf16": "BF16", "fp16": "F16", "fp32": "F32"}
 
 
 def is_compressed(target_probs_topk: int | None, draft_vocab_size: int) -> bool:
@@ -161,6 +162,69 @@ def existing_shard_indices(cache_dir: str) -> set[int]:
 def manifest_path(cache_dir: str) -> str:
     """Return the EAGLE-3 manifest path inside ``cache_dir``."""
     return _manifest_path(cache_dir)
+
+
+def _validate_safetensors_header(path: str, expected: dict[str, tuple[list[int], str]]) -> None:
+    _, safe_open = load_safetensors(_CACHE_NAME)
+    try:
+        with safe_open(path, framework="pt") as handle:
+            keys = set(handle.keys())
+            if keys != expected.keys():
+                raise ValueError(
+                    f"missing keys {sorted(expected.keys() - keys)}, extra keys {sorted(keys - expected.keys())}"
+                )
+            for key, (shape, dtype) in expected.items():
+                tensor = handle.get_slice(key)
+                if (tensor.get_shape(), tensor.get_dtype()) != (shape, dtype):
+                    raise ValueError(
+                        f"{key} expected shape {shape} and dtype {dtype}, "
+                        f"got shape {tensor.get_shape()} and dtype {tensor.get_dtype()}"
+                    )
+    except Exception as exc:
+        raise ValueError(f"Invalid EAGLE-3 cache file {path}: {exc}") from exc
+
+
+def validate_eagle3_shard(cache_dir: str, *, shard_index: int, manifest: dict[str, Any]) -> None:
+    """Check the stored shapes and dtypes for one manifest-declared shard.
+
+    Args:
+        cache_dir: Directory holding the EAGLE-3 cache.
+        shard_index: Global shard index within the manifest's sample count.
+        manifest: Matched EAGLE-3 cache manifest defining the sequence width,
+            actual row count, and full or top-k probability layout.
+    """
+    shard_size = int(manifest["shard_size"])
+    rows = min(shard_size, int(manifest["num_samples"]) - shard_index * shard_size)
+    sequence = [rows, int(manifest["seq_length"])]
+    dtype = _FLOAT_HEADER_DTYPES[manifest["dtype"]]
+    vocab_size = int(manifest["draft_vocab_size"])
+    topk = int(manifest["target_probs_topk"])
+    expected = {key: (sequence, "I64") for key in ("input_ids", "attention_mask", "loss_mask")}
+    expected["aux_hidden_states"] = ([*sequence, int(manifest["aux_hidden_dim"])], dtype)
+    expected["position_mask"] = ([*sequence, 1], "BOOL")
+    if is_compressed(topk, vocab_size):
+        expected[_TARGET_PROBS_VALUES] = ([*sequence, topk], dtype)
+        expected[_TARGET_PROBS_INDICES] = ([*sequence, topk], "I32")
+    else:
+        expected["target_probs"] = ([*sequence, vocab_size], dtype)
+    _validate_safetensors_header(shard_path(cache_dir, shard_index), expected)
+
+
+def validate_target_embeddings(cache_dir: str, *, shape: torch.Size) -> bool:
+    """Check the target embedding header when a committed file exists.
+
+    Args:
+        cache_dir: Directory holding the EAGLE-3 cache.
+        shape: Expected embedding table shape [embedding_vocab, hidden].
+
+    Returns:
+        True when the saved float32 table is present and compatible.
+    """
+    path = os.path.join(cache_dir, _EMBEDDINGS_NAME)
+    if not os.path.exists(path):
+        return False
+    _validate_safetensors_header(path, {"weight": (list(shape), "F32")})
+    return True
 
 
 def write_target_embeddings(cache_dir: str, weight: torch.Tensor) -> str:
