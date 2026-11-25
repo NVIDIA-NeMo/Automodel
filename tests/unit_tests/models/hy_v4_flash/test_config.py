@@ -78,3 +78,10 @@ def test_wrong_engram_layer_offset_is_detected_by_the_layer_id_check():
     assert cfg.engram_layer_indices == [1, 3]
     with pytest.raises(KeyError):
         HY4FlashEngramLayer(cfg, 2, dtype=torch.float32)  # layer_id 3 has no head-vocab table in the config
+
+
+def test_reduced_depth_keeps_the_released_schedule_prefix():
+    text = tiny_text_config(num_hidden_layers=3)
+    assert text.layer_types == ["deepseek_sparse_attention", "deepseek_sparse_attention", "sliding_attention"]
+    assert len(text.mlp_layer_types) == 3
+    assert text.engram_layer_indices == [1]  # id 4 (layer 3) is not built

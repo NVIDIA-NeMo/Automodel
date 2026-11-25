@@ -198,6 +198,9 @@ class HY4FlashTextConfig(PretrainedConfig):
                 "deepseek_sparse_attention" if i < 2 or (i - 1) % 4 == 0 else "sliding_attention"
                 for i in range(num_hidden_layers)
             ]
+        # A reduced ``num_hidden_layers`` keeps the released schedules' prefix (a pretrained prefix keeps its identities).
+        layer_types = list(layer_types)[:num_hidden_layers]
+        self.mlp_layer_types = self.mlp_layer_types[:num_hidden_layers]
         try:
             self.layer_types = [_LAYER_TYPE_ALIASES[t] for t in layer_types]
         except KeyError as exc:
@@ -243,8 +246,8 @@ class HY4FlashTextConfig(PretrainedConfig):
 
     @property
     def engram_layer_indices(self) -> list[int]:
-        """Zero-based indices of the decoder layers that carry an Engram block."""
-        return [layer_id - 1 for layer_id in (self.engram_layer_ids or [])]
+        """Zero-based indices of the *built* decoder layers that carry an Engram block."""
+        return [layer_id - 1 for layer_id in (self.engram_layer_ids or []) if layer_id <= self.num_hidden_layers]
 
     # ------------------------------------------------------------------ validation
     def _validate(self) -> None:
@@ -305,10 +308,8 @@ class HY4FlashTextConfig(PretrainedConfig):
                 raise ValueError("engram_pad_id must lie inside the lookup table")
             orders = self.engram_max_ngram_size - 1
             for layer_id in self.engram_layer_ids:
-                if not 1 <= layer_id <= self.num_hidden_layers:
-                    raise ValueError(
-                        f"engram layer id {layer_id} is outside the one-based range 1..{self.num_hidden_layers}"
-                    )
+                if layer_id < 1:
+                    raise ValueError(f"engram layer ids are one-based, got {layer_id}")
                 sizes = (self.engram_layer_head_vocab_sizes or {}).get(str(layer_id))
                 if (
                     not isinstance(sizes, list)

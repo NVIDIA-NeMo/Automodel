@@ -83,6 +83,6 @@ def hy_v4_flash_flops(config: HY4FlashConfig | HY4FlashTextConfig, gbs: int = 1,
         macs_per_token += 2 * (2 * hc) * hc * hs
     macs_per_token += hc * hc * hs
     engram_in = (text.engram_max_ngram_size - 1) * text.engram_n_embed_per_ngram
-    macs_per_token += len(text.engram_layer_ids or []) * (hc + 1) * engram_in * hs
+    macs_per_token += len(text.engram_layer_indices) * (hc + 1) * engram_in * hs
     macs_per_token += hs * text.vocab_size
     return float(6 * gbs * seq_len * macs_per_token + 6 * gbs * attention_keys_macs + 2 * gbs * indexer_macs)

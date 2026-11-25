@@ -352,7 +352,7 @@ class HY4FlashModel(nn.Module):
             )
             ropes[attention_type] = HY4FlashRope(cos[0], sin[0])
         ngram = engram_mask = None
-        if cfg.engram_layer_ids:
+        if cfg.engram_layer_indices:
             ngram = build_ngram_tokens(global_ids, global_time, cfg.engram_max_ngram_size, cfg.engram_pad_id)
             ngram = ngram[:, local_start : local_start + seq]
             engram_mask = valid & (input_ids != cfg.engram_pad_id)
