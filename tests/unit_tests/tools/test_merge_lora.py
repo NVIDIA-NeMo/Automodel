@@ -653,8 +653,8 @@ class TestMergeLoraFunction:
             merge_mod.main()
 
         load_kwargs = automodel_cls.from_pretrained.call_args.kwargs
-        assert isinstance(load_kwargs["backend"], BackendConfig)
-        assert load_kwargs["backend"].linear == "torch"
+        # Without --backend only the linear kernel is set; the other fields keep the defaults of the machine.
+        assert load_kwargs["backend"] == BackendConfig(linear="torch")
         assert load_kwargs["peft_config"].dim == 192
         assert load_kwargs["peft_config"].moe_rank_scaling is True
         native_export.assert_called_once_with(
@@ -662,6 +662,57 @@ class TestMergeLoraFunction:
             adapter_path=str(adapter_dir),
             output_dir=str(tmp_path / "merged"),
         )
+
+    @pytest.mark.parametrize(
+        ("backend_args", "error"),
+        [
+            (["attn=sdpa", "experts=torch", "dispatcher=torch"], None),
+            (["kernel=torch"], "--backend expects FIELD=VALUE"),
+            (["attn"], "--backend expects FIELD=VALUE"),
+            (["attn="], "--backend expects FIELD=VALUE"),
+            (["fake_balanced_gate=false"], "string-valued BackendConfig field"),
+        ],
+    )
+    def test_automodel_export_backend_option_replaces_backend_fields(self, tmp_path, monkeypatch, backend_args, error):
+        import nemo_automodel
+        from nemo_automodel.components.models.common import BackendConfig
+        from tools import merge_lora as merge_mod
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text(
+            json.dumps({"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": 8, "lora_alpha": 32}), encoding="utf-8"
+        )
+        (adapter_dir / "automodel_peft_config.json").write_text("{}", encoding="utf-8")
+        automodel_cls = MagicMock()
+        argv = ["prog", "-m", "/fake/model", "-a", str(adapter_dir), "-o", str(tmp_path / "merged")]
+        monkeypatch.setattr(
+            sys, "argv", [*argv, "--no-save-tokenizer", "--automodel-native-export", "--backend", *backend_args]
+        )
+
+        with patch.dict(
+            nemo_automodel.__dict__,
+            {"NeMoAutoModelForCausalLM": automodel_cls, "export_merged_peft_checkpoint": MagicMock()},
+        ):
+            if error is not None:
+                with pytest.raises(ValueError, match=error):
+                    merge_mod.main()
+                automodel_cls.from_pretrained.assert_not_called()
+                return
+            merge_mod.main()
+
+        assert automodel_cls.from_pretrained.call_args.kwargs["backend"] == BackendConfig(
+            attn="sdpa", linear="torch", experts="torch", dispatcher="torch"
+        )
+
+    def test_backend_option_requires_automodel_native_export(self, monkeypatch):
+        from tools import merge_lora as merge_mod
+
+        monkeypatch.setattr(
+            sys, "argv", ["prog", "-m", "/model", "-a", "/adapter", "-o", "/out", "--backend", "attn=sdpa"]
+        )
+        with pytest.raises(ValueError, match="--backend requires --automodel-native-export"):
+            merge_mod.main()
 
     def test_automodel_native_export_rejects_qlora(self, monkeypatch):
         from tools import merge_lora as merge_mod
