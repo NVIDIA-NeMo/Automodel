@@ -230,7 +230,8 @@ class TrainingStepReporter(DeferredStepReporter):
 
     ``tps``, ``tps_per_gpu`` and ``mfu`` use the step's span between its start and end
     markers, the maximum over the reporting ranks. Time between steps, such as data loading
-    and logging, is not included. ``end_to_end_tps``, set every 20 steps, is the delivered rate.
+    and logging, is not included. ``end_to_end_tps`` includes that time and measures the delivered
+    rate over windows of at least 20 completed steps.
     """
 
     def __init__(

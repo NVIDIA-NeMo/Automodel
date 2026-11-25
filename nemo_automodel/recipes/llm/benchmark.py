@@ -15,6 +15,7 @@
 import json
 import logging
 import pathlib
+from contextlib import closing
 
 import torch
 
@@ -350,8 +351,14 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         This method implements a simplified training loop focused on benchmarking
         with timers and profiling support, similar to the original benchmarking script.
         """
+        try:
+            with closing(DeferredStepReporter(self.dist_env.device)) as reporter:
+                self._run_benchmark(reporter)
+        finally:
+            self._close_step_control_group()
+
+    def _run_benchmark(self, reporter: DeferredStepReporter) -> None:
         rank = self.dist_env.rank
-        device = self.dist_env.device
 
         # Get benchmarking config
         steps = self._bench_steps
@@ -383,7 +390,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
-        reporter = DeferredStepReporter(device)
         reducer = self._step_metric_reducer()
         elapsed_steps = []
 
@@ -468,7 +474,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             self._maybe_collect_garbage()
 
         elapsed_steps.extend(self._emit_benchmark_metrics(reporter, peak_tflops, rank, wait=True))
-        reporter.close()
 
         if self.partial_cuda_graph_manager is not None:
             self.partial_cuda_graph_manager.log_stats("benchmark")
@@ -500,6 +505,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         iteration = "iteration_warmup" if sample.step < self._bench_warmup_steps else "iteration"
         metrics = {key: value for key, value in sample.metrics.items() if key.endswith("-time")}
+        logger.info(
+            "Max phase times (seconds): %s", ", ".join(f"{key}={seconds:.6f}" for key, seconds in metrics.items())
+        )
         metrics.update({"loss": sample.metrics["loss"], f"{iteration}-time": elapsed})
         sinks = []
         if self._wandb_enabled and self.wandb_run is not None:
@@ -517,8 +525,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Get active times for summary
         setup_time = self.timers._timers["setup"].active_time() if "setup" in self.timers._timers else 0
+        warmup_steps = min(warmup_steps, steps)
         warmup_time = sum(elapsed_steps[:warmup_steps])
-        iter_time = sum(elapsed_steps[warmup_steps:]) if warmup_steps < steps else sum(elapsed_steps)
+        iter_time = sum(elapsed_steps[warmup_steps:])
 
         if rank == 0:
             logger.info(f"Total setup time: {setup_time:.2f} seconds")
@@ -529,7 +538,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if steps > warmup_steps:
                 avg_iter_time = iter_time / (steps - warmup_steps)
             else:
-                avg_iter_time = iter_time / steps
+                avg_iter_time = warmup_time / steps
 
             logger.info(
                 f"Average iteration time: {avg_iter_time:.3f} seconds"

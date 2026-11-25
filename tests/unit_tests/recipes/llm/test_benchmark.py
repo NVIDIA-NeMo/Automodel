@@ -456,6 +456,19 @@ class TestBenchmarkingRecipeSetup:
 class TestBenchmarkingRecipeRunBenchmark:
     """Test run_benchmark method of BenchmarkingRecipeForNextTokenPrediction."""
 
+    def test_run_benchmark_releases_groups_when_data_runs_out(self, mock_recipe, monkeypatch):
+        mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+        mock_recipe.dataloader = []
+        mock_recipe._step_control_group = object()
+        destroy = MagicMock()
+        monkeypatch.setattr(torch.distributed, "destroy_process_group", destroy, raising=False)
+        with patch("nemo_automodel.recipes.llm.benchmark.DeferredStepReporter", autospec=True) as reporter:
+            with pytest.raises(StopIteration):
+                mock_recipe.run_benchmark()
+        reporter.return_value.close.assert_called_once_with()
+        destroy.assert_called_once()
+        assert mock_recipe._step_control_group is None
+
     def test_run_benchmark_sets_models_to_train_mode(self, mock_recipe):
         """Test that run_benchmark sets all models to training mode."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
@@ -811,11 +824,16 @@ class TestBenchmarkingRecipeWandBIntegration:
     def test_log_iteration_mfu_uses_global_flops_once(
         self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, caplog: pytest.LogCaptureFixture
     ) -> None:
-        sample = MetricsSample(step=10, epoch=0, metrics={"loss": 0.5, "num_label_tokens": 10, "max_memory_gib": 1.0})
+        sample = MetricsSample(
+            step=10,
+            epoch=0,
+            metrics={"loss": 0.5, "num_label_tokens": 10, "max_memory_gib": 1.0, "forward_backward_0-time": 0.8},
+        )
         with caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"):
             mock_recipe._log_iteration_metrics(sample, peak_tflops=989, elapsed=1.5)
         expected_mfu = mock_recipe.tflops / (mock_recipe.dist_env.world_size * 1.5 * 989) * 100
         assert f"MFU: {expected_mfu:.6f}%" in caplog.text
+        assert "forward_backward_0-time=0.800000" in caplog.text
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
@@ -885,6 +903,21 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["seq_len"] == 2048
         assert summary_data["avg_iter_time_seconds"] == pytest.approx(10.0 / 20)
         assert summary_data["avg_mfu_percent"] == pytest.approx(mock_recipe.tflops / (8 * (10.0 / 20) * 989) * 100)
+
+    @pytest.mark.parametrize("warmup_steps", [2, 5])
+    def test_all_warmup_steps_have_no_measured_training_time(self, mock_recipe, tmp_path, warmup_steps):
+        import json
+
+        path = tmp_path / "warmup.json"
+        mock_recipe._bench_json_output_path = str(path)
+        mock_recipe._log_benchmark_summary(2, warmup_steps, 989, 0, elapsed_steps=[1.0, 2.0])
+
+        summary = json.loads(path.read_text())
+        assert summary["warmup_steps"] == 2
+        assert summary["warmup_time_seconds"] == 3.0
+        assert summary["training_steps"] == 0
+        assert summary["training_time_seconds"] == 0.0
+        assert summary["avg_iter_time_seconds"] == 1.5
 
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""

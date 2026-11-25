@@ -124,6 +124,23 @@ def single_rank_gloo():
         dist.destroy_process_group()
 
 
+def test_llm_kd_reporter_uses_student_group(monkeypatch, single_rank_gloo):
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1)
+    recipe.pack_size = 0
+    recipe.mfu_calculator = None
+    recipe._training_process_group = dist.new_group(ranks=[0])
+    get_ranks = Mock(wraps=dist.get_process_group_ranks)
+    monkeypatch.setattr(dist, "get_process_group_ranks", get_ranks)
+
+    try:
+        reporter = recipe._training_step_reporter()
+        reporter.close()
+        get_ranks.assert_called_once_with(recipe._training_process_group)
+    finally:
+        dist.destroy_process_group(recipe._training_process_group)
+
+
 def test_llm_kd_non_pp_step_clips_gradients_across_device_meshes(single_rank_gloo):
     """The non-PP KD step clips mixed EP and DP DTensor gradients together."""
     expert_mesh = DeviceMesh("cpu", torch.tensor([0]), mesh_dim_names=("ep",))

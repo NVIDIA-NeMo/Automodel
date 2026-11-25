@@ -514,7 +514,7 @@ jobs:
             is-unit-test: false
             cpu-only: false
             test-folder: kernel_parity,training/step_metrics
-            timeout: 20
+            timeout: 25
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     name: ${{ matrix.test-name }}

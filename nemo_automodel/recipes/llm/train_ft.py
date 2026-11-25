@@ -494,6 +494,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     domain_mixture = None
     # Tokens per pack when sequence packing is on; setup() sets it.
     pack_size = None
+    _pending_end_to_end_tps: float | None = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -1207,6 +1208,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
         finally:
             reporter.close()
+            self._close_step_control_group()
             close_dataloader(self.dataloader)
             for loader in self.val_dataloaders.values():
                 close_dataloader(loader)
@@ -1218,9 +1220,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             v.close()
 
         self._finalize_and_close_checkpointer()
-        if getattr(self, "_step_control_group", None) is not None:
-            torch.distributed.destroy_process_group(self._step_control_group)
-            self._step_control_group = None
 
         # Mark the MLflow run KILLED if training exited via SIGTERM.
         if self.step_scheduler.sigterm_flag:
@@ -1680,6 +1679,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             metrics=metrics,
         )
 
+    def _close_step_control_group(self) -> None:
+        if getattr(self, "_step_control_group", None) is not None:
+            torch.distributed.destroy_process_group(self._step_control_group)
+            self._step_control_group = None
+
     def _step_metric_reducer(self) -> StepMetricReducer:
         return StepMetricReducer(
             device=self.dist_env.device,
@@ -1934,6 +1938,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
+    def _remote_train_metrics(self, sample: MetricsSample, remote_log: bool | None) -> dict[str, Any] | None:
+        """Include the latest measured throughput window in the next scheduled remote payload."""
+        if "end_to_end_tps" in sample.metrics:
+            self._pending_end_to_end_tps = sample.metrics["end_to_end_tps"]
+        should_log = self.step_scheduler.is_remote_logging_step if remote_log is None else remote_log
+        if not should_log:
+            return None
+        metrics = sample.to_dict()
+        if self._pending_end_to_end_tps is not None:
+            metrics["end_to_end_tps"] = self._pending_end_to_end_tps
+            self._pending_end_to_end_tps = None
+        return metrics
+
     def log_train_metrics(self, log_data: MetricsSample, *, remote_log: bool | None = None) -> None:
         """Log metrics to wandb and other loggers.
 
@@ -1947,8 +1964,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "lr": Learning rate.
                     "mem": Memory allocated.
                     "tps": Tokens per second over the step's span, which excludes the time
-                        between steps (data loading, logging). "end_to_end_tps", present
-                        every 20 steps, includes it.
+                        between steps (data loading, logging). "end_to_end_tps" includes it and
+                        is measured over windows of at least 20 completed steps.
                     "tps_per_gpu": Tokens per second per GPU over the same span; "mfu" uses it too.
                     "num_label_tokens": Number of label tokens.
                     "pack_fill": Share of pack capacity holding tokens; present only with sequence packing.
@@ -1957,8 +1974,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        should_log_remotely = self.step_scheduler.is_remote_logging_step if remote_log is None else remote_log
-        if should_log_remotely:
+        remote_metrics = self._remote_train_metrics(log_data, remote_log)
+        if remote_metrics is not None:
             sinks = []
             trackio_logger = getattr(self, "trackio_logger", None)
             if _HAS_WANDB and wandb.run is not None:
@@ -1970,7 +1987,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 sinks.append(lambda metrics, step: mlflow.log_metrics(to_float_metrics(metrics), step=step))
             write_remote_step_metrics(
-                step=log_data.step, metrics=log_data.to_dict(), sinks=sinks, moe_metrics=self._compute_moe_metrics
+                step=log_data.step, metrics=remote_metrics, sinks=sinks, moe_metrics=self._compute_moe_metrics
             )
 
         # JSONL training log (always log for detailed local records)

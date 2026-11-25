@@ -2315,6 +2315,7 @@ def test_finite_recipe_publishes_periodic_and_terminal_checkpoints_with_validati
         recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
         recipe.pack_size = None
         recipe._moe_layer_loads = None
+        recipe._close_step_control_group = MethodType(recipe_type._close_step_control_group, recipe)
         recipe._training_step_reporter = MethodType(recipe_type._training_step_reporter, recipe)
         recipe._emit_train_metrics = MethodType(recipe_type._emit_train_metrics, recipe)
         recipe._snapshot_moe_metrics = MethodType(recipe_type._snapshot_moe_metrics, recipe)

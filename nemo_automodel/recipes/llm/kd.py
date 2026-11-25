@@ -1133,6 +1133,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                             best_metric_key=self.best_metric_key,
                         )
         finally:
+            self._close_step_control_group()
             if pbar is not None:
                 pbar.close()
         self.metric_logger_train.close()
@@ -1262,13 +1263,13 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             return
 
         # Log to remote services (WandB) according to step_scheduler frequency.
-        should_log_remotely = self.step_scheduler.is_remote_logging_step if remote_log is None else remote_log
-        if should_log_remotely:
+        remote_metrics = self._remote_train_metrics(log_data, remote_log)
+        if remote_metrics is not None:
             if _HAS_WANDB and wandb.run is not None:
-                wandb.log(log_data.to_dict(), step=log_data.step)
+                wandb.log(remote_metrics, step=log_data.step)
             trackio_logger = getattr(self, "trackio_logger", None)
             if trackio_logger is not None:
-                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+                trackio_logger.log_metrics(remote_metrics, step=log_data.step)
 
         # JSONL training log (always log for detailed local records).
         self.metric_logger_train.log(log_data)

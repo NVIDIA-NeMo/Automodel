@@ -101,6 +101,14 @@ def _sample(step: int, **metrics: torch.Tensor) -> MetricsSample:
 def test_poll_returns_a_readback_only_after_its_copy_finishes():
     device = torch.device("cuda", torch.cuda.current_device())
     reporter = DeferredStepReporter(device)
+    # Prime the pinned allocator with different values. A fresh 128 MiB host
+    # allocation can take longer than the queued GPU work on fast devices.
+    start = reporter.mark()
+    stale = torch.full((1 << 24,), -1, dtype=torch.int64, device=device)
+    reporter.enqueue(_sample(-1, vector=stale), start=start, end=reporter.mark(), remote_log=False)
+    reporter.poll(wait=True)
+    del stale
+
     busy = torch.randn(4096, 4096, device=device)
     start = reporter.mark()
     for _ in range(30):
