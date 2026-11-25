@@ -23,7 +23,8 @@ Released key (``model.layers.{L}.`` prefix unless noted)    AutoModel key
 ``hc_attn_layer.hc_pre.hc_{fn,base,scale}``                 ``attn_hc.{fn,base,scale}``
 ``hc_mlp_layer.hc_pre.hc_{fn,base,scale}``                  ``ffn_hc.{fn,base,scale}``
 ``model.hc_head.hc_head_{fn,base,scale}``                   ``model.hc_head.hc_{fn,base,scale}``
-``self_attn.learnable_sink_param``                          ``self_attn.sinks``
+``self_attn.learnable_sink_param``                          ``self_attn.sinks_param.weight``
+``compressed_indexer.intra_group_ape``                      ``compressed_indexer.intra_group_ape.weight``
 ``self_attn.linear_gate.weight``                            ``self_attn.gate_proj.weight``
 ``self_attn.post_proj_norm.weight``                         ``post_self_attn_layernorm.weight``
 ``mlp.combine_output_norm.weight`` (MoE layers)             ``post_mlp_layernorm.weight``
@@ -61,7 +62,8 @@ _RENAMES: tuple[tuple[str, str], ...] = (
     (r"\.hc_attn_layer\.hc_pre\.hc_(fn|base|scale)$", r".attn_hc.\1"),
     (r"\.hc_mlp_layer\.hc_pre\.hc_(fn|base|scale)$", r".ffn_hc.\1"),
     (r"^model\.hc_head\.hc_head_(fn|base|scale)$", r"model.hc_head.hc_\1"),
-    (r"\.self_attn\.learnable_sink_param$", ".self_attn.sinks"),
+    (r"\.self_attn\.learnable_sink_param$", ".self_attn.sinks_param.weight"),
+    (r"\.compressed_indexer\.intra_group_ape$", ".compressed_indexer.intra_group_ape.weight"),
     (r"\.self_attn\.linear_gate\.weight$", ".self_attn.gate_proj.weight"),
     (r"\.self_attn\.post_proj_norm\.weight$", ".post_self_attn_layernorm.weight"),
     (r"\.mlp\.routed_expert_down_proj\.weight$", ".mlp.fc1_latent_proj.weight"),
@@ -72,7 +74,8 @@ _INVERSE_RENAMES: tuple[tuple[str, str], ...] = (
     (r"\.attn_hc\.(fn|base|scale)$", r".hc_attn_layer.hc_pre.hc_\1"),
     (r"\.ffn_hc\.(fn|base|scale)$", r".hc_mlp_layer.hc_pre.hc_\1"),
     (r"^model\.hc_head\.hc_(fn|base|scale)$", r"model.hc_head.hc_head_\1"),
-    (r"\.self_attn\.sinks$", ".self_attn.learnable_sink_param"),
+    (r"\.self_attn\.sinks_param\.weight$", ".self_attn.learnable_sink_param"),
+    (r"\.compressed_indexer\.intra_group_ape\.weight$", ".compressed_indexer.intra_group_ape"),
     (r"\.self_attn\.gate_proj\.weight$", ".self_attn.linear_gate.weight"),
     (r"\.post_self_attn_layernorm\.weight$", ".self_attn.post_proj_norm.weight"),
     (r"\.mlp\.fc1_latent_proj\.weight$", ".mlp.routed_expert_down_proj.weight"),

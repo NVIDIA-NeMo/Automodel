@@ -118,9 +118,9 @@ def test_selected_key_sets_match_reference_and_selection_is_sparse():
         if attn.compressed_indexer is not None:
             original = attn._attend
 
-            def spy(query, kv, indices, index=index, original=original):
+            def spy(query, kv, indices, sinks, index=index, original=original):
                 captured[index] = indices.clone()
-                return original(query, kv, indices)
+                return original(query, kv, indices, sinks)
 
             attn._attend = spy
     with torch.no_grad():

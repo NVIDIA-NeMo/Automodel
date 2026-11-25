@@ -35,6 +35,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -353,14 +354,16 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         "attn_hc",
         "ffn_hc",
         "hc_head",
-        "sinks",
+        "sinks_param",
         "e_score_correction_bias",
-        "gate.weight",
         "key_value_projection",
         "key_gate_projection",
         "intra_group_ape",
         "lm_head",
     ]
+    # Tiny fp32 holders whose forward ignores its input: one FSDP unit across all blocks (see
+    # ``parallelizer_utils.fully_shard_across_blocks``).
+    _fsdp_shard_across_blocks = ["self_attn.sinks_param"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -435,6 +438,21 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         if int(mask.sum()) != features.shape[0]:
             raise ValueError(f"{int(mask.sum())} image placeholder tokens but {features.shape[0]} image features")
         return embedded.masked_scatter(mask.unsqueeze(-1), features)
+
+    def _nemo_prepare_model_owned_dtensors(self, fsdp_mesh: DeviceMesh) -> set[nn.Parameter]:
+        """Register the row-owner-sharded Engram tables as DTensors before FSDP records its ignored parameters.
+
+        Args:
+            fsdp_mesh: One-dimensional shard mesh whose ranks and order equal the Engram owner group.
+
+        Returns:
+            The table parameters (global shape [padded_rows, head_dim], ``Shard(0)``) that FSDP must not own.
+        """
+        return {
+            layer.engram_layer.multi_head_embedding.embedding.parallelize_weight(fsdp_mesh)
+            for layer in self.model.layers
+            if layer.engram_layer is not None
+        }
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the token embedding."""
@@ -532,14 +550,14 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             attn = layer.self_attn
             for module in (attn.q_a_proj, attn.q_b_proj, attn.kv_a_proj_with_mqa, attn.kv_b_proj, attn.o_proj, attn.gate_proj):
                 nn.init.normal_(module.weight, std=std)
-            nn.init.constant_(attn.sinks, text.learnable_sink_init)
+            nn.init.constant_(attn.sinks_param.weight, text.learnable_sink_init)
             for norm in (layer.input_layernorm, layer.post_self_attn_layernorm, layer.post_attention_layernorm, layer.post_mlp_layernorm, attn.q_a_layernorm, attn.kv_a_layernorm):
                 nn.init.ones_(norm.weight)
             if attn.compressed_indexer is not None:
                 indexer = attn.compressed_indexer
                 for module in (indexer.query_projection, indexer.head_weight_projection, indexer.token_key_projection, indexer.key_value_projection, indexer.key_gate_projection):
                     nn.init.normal_(module.weight, std=std)
-                nn.init.normal_(indexer.intra_group_ape, std=std)
+                nn.init.normal_(indexer.intra_group_ape.weight, std=std)
                 nn.init.ones_(indexer.token_key_norm.weight)
                 nn.init.ones_(indexer.key_norm.weight)
             if layer.engram_layer is not None:

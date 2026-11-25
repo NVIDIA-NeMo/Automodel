@@ -73,6 +73,24 @@ class HY4FlashRope:
     sin: torch.Tensor
 
 
+class HY4FlashFP32Parameter(nn.Module):
+    """FP32 parameter holder whose forward returns its weight and ignores the input.
+
+    A bare parameter on a bf16 module would be cast by the FSDP mixed-precision policy. Holding it in its own module lets
+    the parallelizer give it a dedicated fp32 unit (and one cross-block unit for the sinks); the ignored input argument
+    ties the call to the activation graph so FSDP's pre/post hooks fire.
+    """
+
+    def __init__(self, value: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(value.to(torch.float32))
+
+    def forward(self, reference: torch.Tensor) -> torch.Tensor:
+        """Return the weight (``reference`` only anchors the FSDP hooks)."""
+        del reference
+        return self.weight
+
+
 class HY4FlashCompressedIndexer(nn.Module):
     """Group-pooled lightning indexer. Selection is discrete, so the indexer receives no loss gradient.
 
@@ -96,7 +114,7 @@ class HY4FlashCompressedIndexer(nn.Module):
         self.key_value_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         self.key_gate_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps)
-        self.intra_group_ape = nn.Parameter(torch.empty(self.kpool, self.head_dim, dtype=torch.float32))
+        self.intra_group_ape = HY4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
         for parameter in self.parameters():
             parameter.requires_grad_(False)
 
@@ -127,7 +145,7 @@ class HY4FlashCompressedIndexer(nn.Module):
         with torch.autocast(device_type=token_keys.device.type, enabled=False):
             grouped = grouped.to(self.key_value_projection.weight.dtype)
             values = self.key_value_projection(grouped)
-            gates = self.key_gate_projection(grouped) + self.intra_group_ape
+            gates = self.key_gate_projection(grouped) + self.intra_group_ape(grouped)
             pooled = (values * gates.softmax(dim=1)).sum(dim=1)
         return self.key_norm(pooled).to(token_keys.dtype)
 
@@ -286,7 +304,7 @@ class HY4FlashAttention(nn.Module):
         )
         self.o_proj = initialize_linear_module(linear, self.num_heads * self.v_dim, hidden, config.attention_bias, dtype=dtype)
         self.gate_proj = initialize_linear_module(linear, hidden, self.num_heads * self.v_dim, False, dtype=dtype)
-        self.sinks = nn.Parameter(torch.full((self.num_heads,), config.learnable_sink_init, dtype=torch.float32))
+        self.sinks_param = HY4FlashFP32Parameter(torch.full((self.num_heads,), config.learnable_sink_init))
         self.compressed_indexer = (
             HY4FlashCompressedIndexer(config) if self.attention_type == "deepseek_sparse_attention" else None
         )
@@ -371,7 +389,7 @@ class HY4FlashAttention(nn.Module):
                 )
             indices[q_start - lo : q_end - lo, : local.shape[1]] = torch.where(local >= 0, local + start, -1)
 
-        out_latent = self._attend(query, kv, indices)
+        out_latent = self._attend(query, kv, indices, self.sinks_param(query))
         out = torch.einsum("qhc,hvc->qhv", out_latent, w_v) * gate
         return self.o_proj(out.reshape(tokens, -1))[None]
 
@@ -391,19 +409,20 @@ class HY4FlashAttention(nn.Module):
         """
         return kv_local, token_keys
 
-    def _attend(self, query: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    def _attend(self, query: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor) -> torch.Tensor:
         """Run the sparse latent attention kernel (or its PyTorch twin).
 
         Args:
             query: Tensor of shape [queries, heads, kv_lora_rank + rope_dim].
             kv: Tensor of shape [keys, kv_lora_rank + rope_dim].
             indices: Int32 tensor of shape [queries, width] into ``kv`` rows, ``-1`` unused.
+            sinks: fp32 tensor of shape [heads], the learned sink logits.
 
         Returns:
             Tensor of shape [queries, heads, kv_lora_rank].
         """
         if self.backend.attn == "cudnn":
             return cudnn_sparse_attention(
-                query.contiguous(), kv.unsqueeze(1).contiguous(), indices.unsqueeze(1).contiguous(), self.scale, attn_sink=self.sinks
+                query.contiguous(), kv.unsqueeze(1).contiguous(), indices.unsqueeze(1).contiguous(), self.scale, attn_sink=sinks
             )
-        return reference_sparse_latent_attention(query, kv, indices, self.sinks, self.scale, self.kv_lora_rank)
+        return reference_sparse_latent_attention(query, kv, indices, sinks, self.scale, self.kv_lora_rank)
