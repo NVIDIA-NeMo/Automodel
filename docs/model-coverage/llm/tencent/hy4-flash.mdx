@@ -10,17 +10,17 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Fine-Tune Hy4-flash
 
-The text recipe trains on Tulu-3 packed into 131,072-token sequences with context parallelism (CP32) and expert
-parallelism (EP64) on 16 nodes of 8 H100 GPUs. Conversations are shuffled with a fixed seed before packing, and packed
+The text recipe trains on Tulu-3 packed into 131,072-token sequences with context parallelism (CP16) and expert
+parallelism (EP64) on 8 nodes of 8 H100 GPUs. Conversations are shuffled with a fixed seed before packing, and packed
 documents never attend to each other. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Supervised fine-tuning (SFT) on packed 128K sequences, CP32 x EP64 | Use [hy4_flash_tulu3_128k_cp32_ep64_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v4_flash/hy4_flash_tulu3_128k_cp32_ep64_100steps.yaml). |
+| Supervised fine-tuning (SFT) on packed 128K sequences, CP16 x EP64 | Use [hy4_flash_tulu3_128k_cp16_ep64_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v4_flash/hy4_flash_tulu3_128k_cp16_ep64_100steps.yaml). |
 | Synthetic throughput benchmark, 4K sequences, EP64 | Use [hy4_flash_4k_ep64_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/hy_v4_flash/hy4_flash_4k_ep64_h100.yaml). |
-| Synthetic throughput benchmark, 128K sequences, CP32 x EP64 | Use [hy4_flash_128k_cp32_ep64_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/hy_v4_flash/hy4_flash_128k_cp32_ep64_h100.yaml). |
+| Synthetic throughput benchmark, 128K sequences, CP16 x EP64 | Use [hy4_flash_128k_cp16_ep64_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/hy_v4_flash/hy4_flash_128k_cp16_ep64_h100.yaml). |
 | Image-text fine-tuning | See the [vision-language model card](/model-coverage/vision-language-models/tencent/Hy4-flash). |
 
 ## Launch Requirements

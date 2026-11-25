@@ -13,20 +13,20 @@
 # limitations under the License.
 
 # Hy4-flash synthetic training benchmark: 131,072-token sequences of random token ids (one document per sequence),
-# randomly initialised BF16 weights. 16 nodes x 8 H100 80GB; EP64, CP32, TP1, PP1 (DP4); one sequence per data-parallel
-# replica and step, split over 32 context-parallel ranks.
-# Parameters stay unsharded after the forward (about 44 GiB per GPU). Context parallelism takes one packed row per
+# randomly initialised BF16 weights. 8 nodes x 8 H100 80GB; EP64, CP16, TP1, PP1 (DP4); one sequence per data-parallel
+# replica and step, split over 16 context-parallel ranks.
+# Parameters stay unsharded after the forward (about 62 GiB per GPU). Context parallelism takes one packed row per
 # rank, so the local batch size stays 1.
 # Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (issue #3959).
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 benchmark:
-  json_output_path: training_logs/hy4_flash_128k_cp32_ep64_h100.json
+  json_output_path: training_logs/hy4_flash_128k_cp16_ep64_h100.json
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 16
+  num_nodes: 8
   peak_tflops: 989
   warmup_steps: 6
 step_scheduler:
@@ -72,7 +72,7 @@ model:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 32
+  cp_size: 16
   pp_size: 1
   ep_size: 64
   sequence_parallel: false
@@ -125,7 +125,7 @@ ci:
   cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:45:00"
-  nodes: 16
+  nodes: 8
   nproc_per_node: 8
   env_vars:
     NCCL_PXN_DISABLE: "1"

@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parents[4]
 RECIPES = (
     "examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep64.yaml",
     "examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep64_lora.yaml",
-    "examples/llm_finetune/hy_v4_flash/hy4_flash_tulu3_128k_cp32_ep64_100steps.yaml",
+    "examples/llm_finetune/hy_v4_flash/hy4_flash_tulu3_128k_cp16_ep64_100steps.yaml",
 )
 
 

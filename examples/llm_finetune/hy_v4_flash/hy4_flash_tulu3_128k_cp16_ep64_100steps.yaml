@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Hy4-flash SFT on Tulu-3 with 128K-token packed sequences.
-# 16 nodes x 8 H100 80GB; BF16; CP32, EP64, TP1, PP1 (DP4). Global and local batch are 4 packs: with DP4 each
-# data-parallel replica trains one 128K pack per step and every pack is split over 32 context-parallel ranks.
+# 8 nodes x 8 H100 80GB; BF16; CP16, EP64, TP1, PP1 (DP4). Global and local batch are 4 packs: with DP4 each
+# data-parallel replica trains one 128K pack per step and every pack is split over 16 context-parallel ranks.
 # Tulu-3 conversations are shuffled with a fixed seed (shuffle_seed) BEFORE packing, then packed in order into THD
 # sequences of 131072 tokens; the packs keep that order (dataloader shuffle: false), so all CP/parallelism
 # configurations can reuse the same frozen packs. Packed documents never attend to each other.
@@ -70,15 +70,15 @@ model:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 32
+  cp_size: 16
   pp_size: 1
   ep_size: 64
   sequence_parallel: false
   activation_checkpointing: true
   enable_compile: false
-  reshard_after_forward: true
+  reshard_after_forward: false
   moe:
-    reshard_after_forward: true
+    reshard_after_forward: false
     wrap_outer_model: true
     lm_head_precision: float32
     ignore_router_for_ac: true
@@ -87,7 +87,7 @@ freeze_config:
   freeze_language_model: false
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/hy4_flash_tulu3_128k_cp32_ep64_100steps/
+  checkpoint_dir: checkpoints/hy4_flash_tulu3_128k_cp16_ep64_100steps/
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
   ignore_index: -100
@@ -131,9 +131,9 @@ wandb:
   enable: false
   entity: Nemo-automodel
   project: hy4_flash
-  name: hy4_flash_tulu3_128k_cp32_ep64_100steps
-  dir: logs/hy4_flash_tulu3_128k_cp32_ep64_100steps/wandb
-  tags: [hy4-flash, tulu3, packed128k, cp32, ep64]
+  name: hy4_flash_tulu3_128k_cp16_ep64_100steps
+  dir: logs/hy4_flash_tulu3_128k_cp16_ep64_100steps/wandb
+  tags: [hy4-flash, tulu3, packed128k, cp16, ep64]
 moe_metrics:
   enabled: true
   mode: brief
@@ -153,7 +153,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
-  nodes: 16
+  nodes: 8
   time: "01:00:00"
   max_steps: 2
   nproc_per_node: 8
