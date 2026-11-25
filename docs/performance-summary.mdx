@@ -107,7 +107,7 @@ TE current scaling; 10 warmup and 20 measured steps.
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/7a070e7d109d4492a845ccd8c2301e835858c827/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_bf16_8k_ep16_gb300.yaml) | Mock (text only), balanced routing | 16 | 128 | 4 | 4 | 2 | 8192 | 1 | 1 | 1 | 16 | - | 16 | TE attention/linear + TE grouped experts + HybridEP | 5.302 | 1,058.71 | 197,755 | 12,359.67 |
+| [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/6ff51b8c110de761809fa3cc12e7ab572e4c6c04/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_bf16_8k_ep16_gb300_benchmark.yaml) | Mock (text only), balanced routing | 16 | 128 | 4 | 4 | 2 | 8192 | 1 | 1 | 1 | 16 | - | 16 | TE attention/linear + TE grouped experts + HybridEP | 5.302 | 1,058.71 | 197,755 | 12,359.67 |
 
 - Full-length mock sequences; random initialization; balanced MoE routing (`--benchmark`); 6 warmup and 20 measured steps. The frozen vision tower does not run on text.
 - The Multi-Token Prediction (MTP) head is trained with two depths. Model TFLOPs count the language model, including both depths: 85.66 GFLOPs per token at this sequence length.
@@ -117,7 +117,7 @@ TE current scaling; 10 warmup and 20 measured steps.
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/7a070e7d109d4492a845ccd8c2301e835858c827/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_8k_ep16_gb300.yaml) | Mock (text only), balanced routing | 16 | 128 | 8 | 8 | 1 | 8192 | 1 | 1 | 1 | 16 | - | 16 | TE NVFP4/MXFP8 + TE attention + HybridEP | 4.944 | 1,135.36 | 212,073 | 13,254.58 |
+| [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/6ff51b8c110de761809fa3cc12e7ab572e4c6c04/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_8k_ep16_gb300_benchmark.yaml) | Mock (text only), balanced routing | 16 | 128 | 8 | 8 | 1 | 8192 | 1 | 1 | 1 | 16 | - | 16 | TE NVFP4/MXFP8 + TE attention + HybridEP | 4.944 | 1,135.36 | 212,073 | 13,254.58 |
 
 - Workload, step counts and TFLOPs as in the GB300 BF16 row; MFU uses the same BF16 peak.
 - TE NVFP4 for the routed and shared experts and the Mamba input projections of the first 74 layers, MXFP8 for their Mamba output projections, and BF16 for the last 14 layers, the attention and latent projections, the MTP head and `lm_head`.
