@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import math
 import re
+from typing import TypeAlias
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -56,6 +57,8 @@ from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.config import MoEConfig
 
+# Checkpoint-protocol options (``quantization``, ``for_checkpoint_load``, ``exclude_key_regex``, ...).
+AdapterOption: TypeAlias = "bool | str | None"
 _LAYER = r"model\.layers\.(\d+)\."
 # (released regex, native replacement); the native direction is the inverse of each pair.
 _RENAMES: tuple[tuple[str, str], ...] = (
@@ -184,7 +187,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
 
     # ------------------------------------------------------------------ released -> native
     def from_hf(
-        self, hf_state_dict: dict[str, torch.Tensor], device_mesh: DeviceMesh | None = None, **kwargs: object
+        self, hf_state_dict: dict[str, torch.Tensor], device_mesh: DeviceMesh | None = None, **kwargs: AdapterOption
     ) -> dict[str, torch.Tensor]:
         """Convert released tensors to AutoModel names and layouts.
 
@@ -241,7 +244,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
 
     # ------------------------------------------------------------------ native -> released
     def to_hf(
-        self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs: object
+        self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs: AdapterOption
     ) -> dict[str, torch.Tensor]:
         """Export native tensors under the released names and layouts."""
         out: dict[str, torch.Tensor] = {}
@@ -253,7 +256,7 @@ class HY4FlashStateDictAdapter(StateDictAdapter):
         return out
 
     def convert_single_tensor_to_hf(
-        self, fqn: str, tensor: torch.Tensor, **kwargs: object
+        self, fqn: str, tensor: torch.Tensor, **kwargs: AdapterOption
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert one native tensor.
 

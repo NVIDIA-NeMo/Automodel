@@ -427,9 +427,23 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         supports_thd: bool = True
 
     @classmethod
-    def from_config(cls, config: HY4FlashConfig, **kwargs: object) -> HY4FlashForCausalLM:
+    def from_config(
+        cls,
+        config: HY4FlashConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        *,
+        engram_process_group: dist.ProcessGroup | None = None,
+        logits_dtype: torch.dtype | None = torch.float32,
+    ) -> HY4FlashForCausalLM:
         """Construct using the NeMo registry's configuration entry point."""
-        return cls(config, **kwargs)
+        return cls(
+            config,
+            moe_config,
+            backend,
+            engram_process_group=engram_process_group,
+            logits_dtype=logits_dtype,
+        )
 
     def __init__(
         self,
