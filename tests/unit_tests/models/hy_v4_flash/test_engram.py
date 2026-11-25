@@ -17,7 +17,11 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLayer
+from nemo_automodel.components.models.hy_v4_flash.engram import (
+    HY4FlashEngramLayer,
+    HY4FlashWeightOnlyNorm,
+    weighted_rms_norm,
+)
 from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
 from tests.unit_tests.models.hy_v4_flash.tiny import build_model, pack, random_documents, tiny_text_config
 
@@ -92,3 +96,27 @@ def test_engram_gate_is_one_half_at_a_logit_of_exactly_zero() -> None:
         scales = torch.stack(list(engram.unified_per_hc_scales))
         expected = 0.5 * main.unsqueeze(2) + main.unsqueeze(2) * scales
     torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("scale", [1.0, 1e-3, 40.0])
+def test_weighted_rms_norm_equals_torch_rms_norm_bitwise(dtype: torch.dtype, scale: float) -> None:
+    """One ``nn.RMSNorm`` per slice with a non-unit weight, on inputs of ordinary, small and large magnitude.
+
+    In BF16, normalizing and then multiplying a BF16 weight rounds twice and differs from ``nn.RMSNorm`` on about a
+    quarter of the elements; ``nn.RMSNorm`` multiplies the weight in fp32 and casts once.
+    """
+    torch.manual_seed(0)
+    slices, features = 4, 96
+    x = (scale * torch.randn(2, 37, slices, features)).to(dtype)
+    weights = [(1 + 0.1 * torch.randn(features)).to(dtype) for _ in range(slices)]
+    ours = torch.nn.ModuleList(HY4FlashWeightOnlyNorm(features, dtype) for _ in range(slices))
+    reference = [torch.nn.RMSNorm(features).to(dtype) for _ in range(slices)]
+    with torch.no_grad():
+        for norm, module, weight in zip(ours, reference, weights):
+            norm.weight.copy_(weight)
+            module.weight.copy_(weight)
+    expected = torch.stack([module(x[..., index, :]) for index, module in enumerate(reference)], dim=-2)
+    got = weighted_rms_norm(x, ours)
+    assert got.dtype == dtype
+    assert torch.equal(got, expected)

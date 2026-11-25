@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import json
-import os
+from pathlib import Path
 
 import pytest
 
@@ -70,10 +70,8 @@ def test_text_config_resolves_the_same_formula() -> None:
 
 
 def test_released_config_has_roughly_the_model_card_active_parameters() -> None:
-    path = os.environ.get("HY4_CONFIG_JSON")
-    if not path or not os.path.exists(path):
-        pytest.skip("HY4_CONFIG_JSON not provided")
-    cfg = HY4FlashConfig(**json.load(open(path)))
+    with Path(__file__).with_name("released_config.json").open() as handle:
+        cfg = HY4FlashConfig(**json.load(handle))
     per_token_at_one = cfg.flops_formula(cfg, 1, 1) / 6
     # model card: "Activated Parameters per Token: Text 11.3B"
     assert 11.2e9 < per_token_at_one < 11.4e9, per_token_at_one

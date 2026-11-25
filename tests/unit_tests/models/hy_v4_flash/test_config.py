@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -23,10 +22,8 @@ import nemo_automodel._transformers.registry  # noqa: F401  (registers the custo
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
 from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config, tiny_text_config
 
-RELEASED = os.environ.get("HY4_CONFIG_JSON")
-needs_released = pytest.mark.skipif(
-    RELEASED is None or not os.path.exists(RELEASED), reason="HY4_CONFIG_JSON not provided"
-)
+# ``config.json`` of https://huggingface.co/tencent/Hy4-flash at revision eccd3123eec73f2040f4c9ed0de1883593470510.
+RELEASED = Path(__file__).with_name("released_config.json")
 
 
 def test_autoconfig_resolves_the_local_class_from_a_checkpoint_style_config(tmp_path: Path) -> None:
@@ -44,9 +41,9 @@ def test_round_trip_keeps_the_per_type_rope_table(tmp_path: Path) -> None:
     assert again.layer_rope_parameters["indexed_attention"]["rope_theta"] == 1.0e7
 
 
-@needs_released
 def test_released_config_semantics() -> None:
-    text = HY4FlashConfig(**json.load(open(RELEASED))).text_config
+    with RELEASED.open() as handle:
+        text = HY4FlashConfig(**json.load(handle)).text_config
     # config ids are one-based: zero-based layers 1, 11, 21, 31 (confirmed against the weight names)
     assert text.engram_layer_ids == [2, 12, 22, 32] and text.engram_layer_indices == [1, 11, 21, 31]
     assert text.engram_fp8_embedding is False

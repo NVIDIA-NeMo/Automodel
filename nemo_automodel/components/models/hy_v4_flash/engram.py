@@ -23,9 +23,9 @@ The parameters keep the reference's names (16 per-head norms, ``hc_mult`` key pr
 modules), so the state-dict adapter only pads the table rows to the owner group; the forward stacks the per-head
 weights so each norm and projection runs as one kernel.
 
-Precision notes (intentional differences from the reference, which stays in the activation dtype): the gate logit,
-its signed square root and the sigmoid, and the sum of the gated signal and the per-stream branch are evaluated in
-fp32 and cast back.
+Precision: the weighted norms are evaluated as the reference's ``nn.RMSNorm`` modules. The gate logit, its signed
+square root and the sigmoid, and the sum of the gated signal and the per-stream branch are evaluated in fp32 and cast
+back, where the reference stays in the activation dtype (BF16); in fp32 the two are identical.
 """
 
 from __future__ import annotations
