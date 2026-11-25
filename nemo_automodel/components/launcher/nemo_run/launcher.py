@@ -101,7 +101,7 @@ class NemoRunLauncher(Launcher):
 
     def launch(
         self,
-        config: Mapping[str, object],
+        config: dict[str, object],
         config_path: Path,
         recipe_target: str,
         launcher_config: Mapping[str, object],
@@ -111,7 +111,9 @@ class NemoRunLauncher(Launcher):
 
         Args:
             config: Parsed YAML config (without the ``nemo_run`` section). It is only
-                written back out as YAML for the job, so its values are not interpreted here.
+                written back out with ``yaml.dump`` for the job, so its values are not
+                interpreted here. It must be a plain ``dict``: the default dumper writes other
+                mappings with Python tags that the recipe's ``yaml.safe_load`` cannot read.
             config_path: Resolved path to the original YAML file.
             recipe_target: Dotted import path of the recipe class.
             launcher_config: The raw ``nemo_run:`` YAML section, validated by

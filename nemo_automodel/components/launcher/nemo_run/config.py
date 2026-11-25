@@ -84,7 +84,8 @@ class NemoRunConfig:
         Returns:
             The launcher configuration. A launcher key that is null in YAML takes its
             default, as if it were absent, except ``detach``: null keeps its existing
-            meaning of ``False``.
+            meaning of ``False``. Python callers may pass ``os.PathLike`` values for
+            ``executors_file`` and ``job_dir``; they are stored as ``str``.
 
         Raises:
             TypeError: If a non-null launcher key has the wrong type, or ``overrides``
@@ -98,6 +99,7 @@ class NemoRunConfig:
             raise TypeError(f"nemo_run.executor must be a string, got {type(executor).__name__}")
         executors_file = d.get("executors_file")
         executors_file = default.executors_file if executors_file is None else executors_file
+        executors_file = os.fspath(executors_file) if isinstance(executors_file, os.PathLike) else executors_file
         if not isinstance(executors_file, str):
             raise TypeError(f"nemo_run.executors_file must be a string, got {type(executors_file).__name__}")
         job_name = d.get("job_name")
@@ -106,6 +108,7 @@ class NemoRunConfig:
             raise TypeError(f"nemo_run.job_name must be a string, got {type(job_name).__name__}")
         job_dir = d.get("job_dir")
         job_dir = default.job_dir if job_dir is None else job_dir
+        job_dir = os.fspath(job_dir) if isinstance(job_dir, os.PathLike) else job_dir
         if not isinstance(job_dir, str):
             raise TypeError(f"nemo_run.job_dir must be a string, got {type(job_dir).__name__}")
         detach = d.get("detach", default.detach)

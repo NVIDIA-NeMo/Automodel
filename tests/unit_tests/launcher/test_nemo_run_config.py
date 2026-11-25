@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 import yaml
@@ -207,12 +209,33 @@ def test_from_dict_does_not_mutate_input():
     assert section == {"overrides": {"mem": "64G"}, "nodes": 2}
 
 
+class _BytesPath(os.PathLike):
+    def __fspath__(self) -> bytes:
+        return b"/tmp/jobs"
+
+
+def test_from_dict_accepts_path_objects_for_paths():
+    cfg = NemoRunConfig.from_dict(
+        {"executor": "my_slurm", "executors_file": Path("/tmp/executors.py"), "job_dir": Path("/tmp/jobs")}
+    )
+    assert cfg.executors_file == "/tmp/executors.py"
+    assert cfg.job_dir == "/tmp/jobs"
+
+
+def test_from_dict_accepts_read_only_overrides_mapping():
+    cfg = NemoRunConfig.from_dict({"overrides": MappingProxyType({"mem": "64G"}), "nodes": 2})
+    assert cfg.overrides == {"mem": "64G", "nodes": 2}
+
+
 @pytest.mark.parametrize(
     ("section", "message"),
     [
         ({"executor": 3}, "nemo_run.executor must be a string, got int"),
         ({"executor": False}, "nemo_run.executor must be a string, got bool"),
         ({"executors_file": 1}, "nemo_run.executors_file must be a string, got int"),
+        ({"executors_file": False}, "nemo_run.executors_file must be a string, got bool"),
+        ({"executors_file": b"/a.py"}, "nemo_run.executors_file must be a string, got bytes"),
+        ({"job_dir": _BytesPath()}, "nemo_run.job_dir must be a string, got bytes"),
         ({"job_name": 7}, "nemo_run.job_name must be a string, got int"),
         ({"job_name": 0}, "nemo_run.job_name must be a string, got int"),
         ({"job_name": False}, "nemo_run.job_name must be a string, got bool"),
