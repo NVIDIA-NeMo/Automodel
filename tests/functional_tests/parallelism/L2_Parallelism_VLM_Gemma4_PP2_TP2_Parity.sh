@@ -46,6 +46,7 @@ LOG_FILE="$RUN_DIR/pp2.log"
 PROXY_CKPT="$RUN_DIR/proxy"
 cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
+source tests/functional_tests/parallelism/parity_legs.sh
 
 # Build the randomly-initialized proxy checkpoint. Both runs load the same
 # weights, which is what makes the two loss trajectories comparable at all.
@@ -68,7 +69,7 @@ COMMON_ARGS=(
 )
 
 # --- Baseline: single rank, no parallelism ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=1 --nnodes=1 -m coverage run \
+start_leg baseline env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=1 --nnodes=1 -m coverage run \
     examples/vlm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/baseline" \
@@ -77,7 +78,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=1 --nnod
     --distributed.pp_size 1
 
 # --- Pipeline parallel: 2 ranks, pp_size=2 ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+start_leg pp2 env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/vlm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/pp2" \
@@ -85,8 +86,21 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.cp_size 1 \
     --distributed.pp_size 2 \
     --distributed.pipeline.pp_schedule 1f1b \
-    --distributed.pipeline.pp_microbatch_size 1 \
-    2>&1 | tee "$LOG_FILE"
+    --distributed.pipeline.pp_microbatch_size 1
+
+# --- Tensor parallel: 2 ranks, tp_size=2 ---
+# FSDP2Manager skips parallelization at world_size 1, so the baseline runs unwrapped
+# while the tp2 run gets FSDP2's default bf16 MixedPrecisionPolicy; hence the looser
+# gradient-norm bound.
+start_leg tp2 env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
+    examples/vlm_finetune/finetune.py \
+    "${COMMON_ARGS[@]}" \
+    --checkpoint.checkpoint_dir "$RUN_DIR/tp2" \
+    --distributed.tp_size 2 \
+    --distributed.cp_size 1 \
+    --distributed.pp_size 1
+
+wait_legs
 
 # Guard against the `_precompute_stage_shapes` bug from PR #2983. Assert the
 # static path positively as well: if the precompute is skipped outright, the
@@ -110,18 +124,6 @@ python tests/functional_tests/parallelism/compare_parallel_parity.py \
     --axis pp \
     --loss-tol 0.05 \
     --grad-norm-rtol 0.20
-
-# --- Tensor parallel: 2 ranks, tp_size=2 ---
-# FSDP2Manager skips parallelization at world_size 1, so the baseline runs unwrapped
-# while the tp2 run gets FSDP2's default bf16 MixedPrecisionPolicy; hence the looser
-# gradient-norm bound.
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
-    examples/vlm_finetune/finetune.py \
-    "${COMMON_ARGS[@]}" \
-    --checkpoint.checkpoint_dir "$RUN_DIR/tp2" \
-    --distributed.tp_size 2 \
-    --distributed.cp_size 1 \
-    --distributed.pp_size 1
 
 python tests/functional_tests/parallelism/compare_parallel_parity.py \
     "$RUN_DIR/baseline/training.jsonl" \

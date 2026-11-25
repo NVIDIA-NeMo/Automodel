@@ -35,6 +35,7 @@ RUN_DIR=$(mktemp -d)
 LOG_FILE="$RUN_DIR/pp2.log"
 cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
+source tests/functional_tests/parallelism/parity_legs.sh
 
 COMMON_ARGS=(
     --config tests/functional_tests/parallelism/deepseek_v4_proxy.yaml
@@ -74,7 +75,7 @@ RESUME_ARGS=(
 )
 
 # --- Baseline: single rank, no parallelism ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=1 --nnodes=1 -m coverage run \
+start_leg baseline env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=1 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     "${RESUME_ARGS[@]}" \
@@ -82,13 +83,14 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=1 --nnod
     --distributed.pp_size 1
 
 # --- Pipeline parallel: 2 ranks ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+start_leg pp2 env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     "${RESUME_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/pp2" \
-    --distributed.pp_size 2 \
-    2>&1 | tee "$LOG_FILE"
+    --distributed.pp_size 2
+
+wait_legs
 
 # Guard against the `_precompute_stage_shapes` bug from PR #2983. Assert the
 # static path positively as well: if the precompute is skipped outright, the
