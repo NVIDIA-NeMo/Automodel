@@ -20,6 +20,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 
 
+
 _TEST_DATA_DIR = os.environ.get("TEST_DATA_DIR", "/home/TestData/automodel")
 _TOKENIZER_BASE = Path(_TEST_DATA_DIR) / "tokenizers"
 GEMMA_TOKENIZER_PATH = _TOKENIZER_BASE / "gemma-2-9b-it"
@@ -34,7 +35,6 @@ def conversation_with_system_role():
         {"role": "assistant", "content": "I'm doing well, thank you!"},
         {"role": "user", "content": "What is the capital of France?"},
     ]
-
 
 @pytest.fixture
 def conversation_with_multiple_system_roles():
@@ -78,11 +78,8 @@ def test_gemma_tokenizer_system_role_handling(force_hf, conversation_with_system
         assert isinstance(token_ids, list)
         assert len(token_ids) > 0
 
-
 @pytest.mark.parametrize("force_hf", [True, False])
-def test_gemma_tokenizer_system_role_handling_with_multiple_system_roles(
-    force_hf, conversation_with_multiple_system_roles
-):
+def test_gemma_tokenizer_system_role_handling_with_multiple_system_roles(force_hf, conversation_with_multiple_system_roles):
     """
     Test that NeMoAutoTokenizer handles system role correctly for Gemma-2.
 
@@ -96,12 +93,8 @@ def test_gemma_tokenizer_system_role_handling_with_multiple_system_roles(
         assert not isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
         # Raw HF tokenizer should raise TemplateError for system role
         with pytest.raises(TemplateError, match="System role not supported"):
-            tokenizer.apply_chat_template(
-                conversation_with_multiple_system_roles, tokenize=True, add_generation_prompt=True
-            )
+            tokenizer.apply_chat_template(conversation_with_multiple_system_roles, tokenize=True, add_generation_prompt=True)
     else:
         assert isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
         with pytest.raises(ValueError, match="System role appeared in multiple messages."):
-            tokenizer.apply_chat_template(
-                conversation_with_multiple_system_roles, tokenize=True, add_generation_prompt=True
-            )
+            tokenizer.apply_chat_template(conversation_with_multiple_system_roles, tokenize=True, add_generation_prompt=True)

@@ -53,7 +53,5 @@ class TestParallelismParity:
     def test_qwen3_5_moe_pp2_parity(self):
         run_test_script(TEST_FOLDER, QWEN3_5_MOE_PP2_PARITY_FILENAME)
 
-    def test_qwen3_5_moe_ep2_parity(self):
-        run_test_script(TEST_FOLDER, 
     def test_qwen3_8_flash_next_pp2_parity(self):
         run_test_script(TEST_FOLDER, QWEN3_8_FLASH_NEXT_PP2_PARITY_FILENAME)

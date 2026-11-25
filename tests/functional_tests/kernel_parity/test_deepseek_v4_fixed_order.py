@@ -42,21 +42,14 @@ def test_fixed_order_masks_int64_overflow(
         indices = torch.tensor([[[1, index]]], device="cuda", dtype=dtype)
         if heads > 64:
             output = sparse_attn_tilelang_head_chunked(
-                q,
-                kv,
-                sink,
-                indices,
-                64,
+                q, kv, sink, indices, 64,
                 reference_rounding=reference_rounding,
                 backward_impl="deterministic",
                 backward_workspace_bytes=32 * 128 * 4,
             )
         else:
             output = sparse_attn_tilelang(
-                q,
-                kv,
-                sink,
-                indices,
+                q, kv, sink, indices,
                 reference_rounding=reference_rounding,
                 backward_impl="deterministic",
                 backward_workspace_bytes=32 * 128 * 4,

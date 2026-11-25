@@ -63,7 +63,8 @@ def main():
 
     common_steps = sorted(s for s in full if s >= args.ckpt_step and s in resumed)
     assert len(common_steps) > 0, (
-        f"No common steps >= {args.ckpt_step}. Full: {sorted(full.keys())}, Resumed: {sorted(resumed.keys())}"
+        f"No common steps >= {args.ckpt_step}. "
+        f"Full: {sorted(full.keys())}, Resumed: {sorted(resumed.keys())}"
     )
 
     max_delta = 0.0
@@ -85,7 +86,9 @@ def main():
     assert len(token_mismatches) == 0, (
         f"Dataloader state not restored: num_label_tokens mismatch at steps {token_mismatches}"
     )
-    assert max_delta < LOSS_THRESHOLD, f"Training loss mismatch: max delta {max_delta:.6f} >= {LOSS_THRESHOLD}"
+    assert max_delta < LOSS_THRESHOLD, (
+        f"Training loss mismatch: max delta {max_delta:.6f} >= {LOSS_THRESHOLD}"
+    )
     print("  PASSED")
 
 

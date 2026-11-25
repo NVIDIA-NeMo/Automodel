@@ -50,10 +50,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 # Publisher revisions whose remote-code interfaces the packing adapters target.
 _RELEASES = {
     "flash": ("nvidia/Nemotron-Flash-1B", "da87f707f678b5936e67fdcfe598f76ebcc5fdbc"),  # pragma: allowlist secret
-    "nas": (
-        "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
-        "420ba7d28211abf116b8b103ab700d92619daf98",
-    ),  # pragma: allowlist secret
+    "nas": ("nvidia/Llama-3_3-Nemotron-Super-49B-v1_5", "420ba7d28211abf116b8b103ab700d92619daf98"),  # pragma: allowlist secret
 }
 
 

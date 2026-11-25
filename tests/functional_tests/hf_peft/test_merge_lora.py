@@ -178,10 +178,7 @@ class TestDenseLoRAMerge:
         assert set(ref_sd.keys()) == set(tool_sd.keys()), "Key sets differ"
         for key in ref_sd:
             torch.testing.assert_close(
-                tool_sd[key],
-                ref_sd[key],
-                rtol=1e-5,
-                atol=1e-5,
+                tool_sd[key], ref_sd[key], rtol=1e-5, atol=1e-5,
                 msg=f"Mismatch at {key}",
             )
 
@@ -191,7 +188,10 @@ class TestDenseLoRAMerge:
         from transformers import AutoModelForCausalLM
 
         base_sd = {
-            n: p.data.clone() for n, p in AutoModelForCausalLM.from_pretrained(self.base_model_path).named_parameters()
+            n: p.data.clone()
+            for n, p in AutoModelForCausalLM.from_pretrained(
+                self.base_model_path
+            ).named_parameters()
         }
 
         output_dir = os.path.join(self.tmp_path, "merged_diff")
@@ -271,18 +271,12 @@ class TestDenseLoRAMerge:
         output_dir = os.path.join(self.tmp_path, "merged_cli")
         result = subprocess.run(
             [
-                sys.executable,
-                str(_REPO_ROOT / "tools" / "merge_lora.py"),
-                "--base-model",
-                self.base_model_path,
-                "--adapter-path",
-                self.adapter_path,
-                "--output-dir",
-                output_dir,
-                "--dtype",
-                "float32",
-                "--device",
-                "cpu",
+                sys.executable, str(_REPO_ROOT / "tools" / "merge_lora.py"),
+                "--base-model", self.base_model_path,
+                "--adapter-path", self.adapter_path,
+                "--output-dir", output_dir,
+                "--dtype", "float32",
+                "--device", "cpu",
                 "--no-save-tokenizer",
             ],
             cwd=str(_REPO_ROOT),
@@ -370,15 +364,11 @@ def _convert_grouped_to_hf_peft(grouped_sd):
 
     class _Adapter(MoESplitExpertsStateDictMixin):
         def __init__(self):
-            self.moe_config = type(
-                "C",
-                (),
-                {
-                    "n_routed_experts": N_EXPERTS,
-                    "moe_inter_dim": MOE_INTER_DIM,
-                    "expert_activation": "swiglu",
-                },
-            )()
+            self.moe_config = type("C", (), {
+                "n_routed_experts": N_EXPERTS,
+                "moe_inter_dim": MOE_INTER_DIM,
+                "expert_activation": "swiglu",
+            })()
             self.dtype = torch.float32
             self._uses_model_prefix = True
             self._last_expert_ids = []
@@ -433,7 +423,9 @@ class TestMoELoRAMerge:
         """HF PEFT can load the converted adapter without errors."""
         from peft import PeftModel
 
-        peft_model = PeftModel.from_pretrained(_HFStyleMoE(), self.adapter_path)
+        peft_model = PeftModel.from_pretrained(
+            _HFStyleMoE(), self.adapter_path
+        )
         assert peft_model is not None
         assert hasattr(peft_model, "base_model")
 
@@ -454,7 +446,9 @@ class TestMoELoRAMerge:
                     changed += 1
 
         expected = N_LAYERS * N_EXPERTS * 3  # gate, up, down per expert
-        assert changed == expected, f"Expected {expected} expert weights to change, got {changed}"
+        assert changed == expected, (
+            f"Expected {expected} expert weights to change, got {changed}"
+        )
 
     def test_merge_is_numerically_correct(self):
         """Merged weight = base + B @ A * scale for every expert projection."""
@@ -480,10 +474,7 @@ class TestMoELoRAMerge:
 
             expected = base_weights[name] + (self.hf_sd[lora_B_key] @ self.hf_sd[lora_A_key]) * scale
             torch.testing.assert_close(
-                param.data,
-                expected,
-                rtol=1e-4,
-                atol=1e-4,
+                param.data, expected, rtol=1e-4, atol=1e-4,
                 msg=f"Merge mismatch for {name}",
             )
 
@@ -491,7 +482,9 @@ class TestMoELoRAMerge:
         """Merged model must be clean of LoRA artifacts."""
         from peft import PeftModel
 
-        peft_model = PeftModel.from_pretrained(_HFStyleMoE(), self.adapter_path)
+        peft_model = PeftModel.from_pretrained(
+            _HFStyleMoE(), self.adapter_path
+        )
         merged = peft_model.merge_and_unload()
 
         for name, _ in merged.named_parameters():
@@ -504,10 +497,14 @@ class TestMoELoRAMerge:
         from peft import PeftModel
 
         torch.manual_seed(99)
-        ref_model = PeftModel.from_pretrained(_HFStyleMoE(), self.adapter_path).eval()
+        ref_model = PeftModel.from_pretrained(
+            _HFStyleMoE(), self.adapter_path
+        ).eval()
 
         torch.manual_seed(99)
-        merged = PeftModel.from_pretrained(_HFStyleMoE(), self.adapter_path).merge_and_unload().eval()
+        merged = PeftModel.from_pretrained(
+            _HFStyleMoE(), self.adapter_path
+        ).merge_and_unload().eval()
 
         torch.manual_seed(123)
         input_ids = torch.randint(0, MOE_VOCAB_SIZE, (2, 16))
@@ -528,15 +525,11 @@ class TestMoELoRAMerge:
 
         class _Adapter(MoESplitExpertsStateDictMixin):
             def __init__(self):
-                self.moe_config = type(
-                    "C",
-                    (),
-                    {
-                        "n_routed_experts": N_EXPERTS,
-                        "moe_inter_dim": MOE_INTER_DIM,
-                        "expert_activation": "swiglu",
-                    },
-                )()
+                self.moe_config = type("C", (), {
+                    "n_routed_experts": N_EXPERTS,
+                    "moe_inter_dim": MOE_INTER_DIM,
+                    "expert_activation": "swiglu",
+                })()
                 self.dtype = torch.float32
                 self._uses_model_prefix = True
                 self._last_expert_ids = []
@@ -547,7 +540,6 @@ class TestMoELoRAMerge:
         for key, original_tensor in self.grouped_sd.items():
             assert key in recovered, f"Key {key} missing after round-trip"
             torch.testing.assert_close(
-                recovered[key],
-                original_tensor,
+                recovered[key], original_tensor,
                 msg=f"Value mismatch for {key}",
             )

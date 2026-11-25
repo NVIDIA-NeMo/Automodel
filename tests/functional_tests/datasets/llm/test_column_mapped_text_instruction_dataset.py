@@ -174,7 +174,6 @@ def test_dataset_non_chat_padding_truncation_options(tmp_path: Path, seq_length,
             assert len(sample["input_ids"]) != seq_length
             assert len(sample["labels"]) != seq_length
 
-
 @pytest.mark.parametrize(
     "seq_length,padding,truncation",
     [

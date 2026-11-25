@@ -141,9 +141,7 @@ def test_thirteen_layer_training_parity(
     targets[:, -1] = -100
     if dtype == "bfloat16":
         loss_fn = Inkling2FusedLinearCrossEntropy(37)
-        loss = calculate_loss(
-            loss_fn, hidden_states=out.hidden_states, labels=targets, model=native, num_label_tokens=8
-        )
+        loss = calculate_loss(loss_fn, hidden_states=out.hidden_states, labels=targets, model=native, num_label_tokens=8)
     else:
         # The fused kernel takes BF16 operands only; FP32 runs keep the model's own FP32 projection.
         loss = F.cross_entropy(out.logits.flatten(0, 1), targets.flatten())
