@@ -1,16 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# DSV4.1-Flash full-parameter MedPix SFT: 40 language layers plus the complete
-# pretrained vision tower and projector. Target: 16 nodes x 4 GPUs, EP64/FSDP2
-# in one NVLink domain. CP, PP and sequence packing are disabled.
-#
-# TE gradient norm is enabled for the large Engram owner shards.
-# For a local snapshot, override both model.config checkpoint paths and the
-# processor checkpoint path. Keep the processor and model revision identical.
-
-recipe: FinetuneRecipeForVLM
-seed: 1234
-
 # Hy4-flash full SFT on MedPix-VQA (unpacked, 4K tokens), EP64 on 8 H100 nodes x 8 GPUs.
 
 recipe: FinetuneRecipeForVLM

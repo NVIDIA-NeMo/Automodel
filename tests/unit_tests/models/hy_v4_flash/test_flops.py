@@ -28,7 +28,7 @@ def _brute_force(cfg: HY4FlashConfig, seq_len: int) -> float:
     t = cfg.text_config
     total = 0.0
     hs, hc = t.hidden_size, t.hc_mult
-    for layer, kind in enumerate(t.layer_types):
+    for layer, kind in enumerate(t.attention_types):
         heads = t.attention_heads(kind)
         nope, rope, v = t.attention_dims(kind)
         linear = hs * t.q_lora_rank + t.q_lora_rank * heads * (nope + rope)

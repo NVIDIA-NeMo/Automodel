@@ -34,6 +34,111 @@ from torch import nn
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashTextConfig
 
 
+# ----------------------------------------------------------------------------------------- fp32 cores
+# The RMSNorm and the two hyper-connection steps each run several full-size fp32 passes over the activations in
+# eager mode (the streams are ``hc_mult`` times the hidden width). The arithmetic lives in the plain functions below
+# so ``torch.compile`` can fuse each into one or two kernels: ``BackendConfig.compile_norm`` wraps the RMSNorm core
+# and ``BackendConfig.compile_hc`` the hyper-connection cores, with the same lazy once-per-process pattern and static
+# shapes as DeepSeek-V4.1's cores. The modules call the module-level dispatchers, so instances built before the hook
+# ran still pick up the compiled core. Compiled numerics are allclose to eager, not bitwise-identical.
+def _rms_norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Normalise the last axis in fp32, cast back, then apply the weight (reference order).
+
+    Args:
+        hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden].
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of the shape and dtype of ``hidden_states``.
+    """
+    x = hidden_states.float()
+    x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    return weight * x.to(hidden_states.dtype)
+
+
+def _hc_collapse_core(
+    streams: torch.Tensor,
+    fn: torch.Tensor,
+    base: torch.Tensor,
+    scale: torch.Tensor,
+    norm_eps: float,
+    hc_eps: float,
+    hc_magnitude: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Collapse the residual streams with sigmoid ``pre`` weights and produce the ``post`` scatter weights.
+
+    Args:
+        streams: Tensor of shape [batch, sequence, hc_mult, hidden].
+        fn: fp32 tensor of shape [2 * hc_mult, hc_mult * hidden] (``pre`` rows first, then ``post`` rows).
+        base: fp32 tensor of shape [2 * hc_mult].
+        scale: fp32 tensor of shape [2] (``pre`` scale, ``post`` scale).
+        norm_eps: Epsilon of the unweighted RMS of the flattened streams.
+        hc_eps: Offset added to both weight groups.
+        hc_magnitude: Range of the ``post`` weights.
+
+    Returns:
+        ``post``: fp32 tensor of shape [batch, sequence, hc_mult]; ``collapsed``: tensor of shape
+        [batch, sequence, hidden] in the dtype of ``streams``.
+    """
+    hc_mult = streams.shape[2]
+    wide = streams.float()
+    flat = wide.flatten(2)
+    mixes = F.linear(flat, fn) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    pre_logits, post_logits = mixes.split(hc_mult, dim=-1)
+    pre = torch.sigmoid(pre_logits * scale[0] + base[:hc_mult]) + hc_eps
+    post = hc_magnitude * torch.sigmoid(post_logits * scale[1] + base[hc_mult:]) + hc_eps
+    return post, (pre.unsqueeze(-1) * wide).sum(dim=2).to(streams.dtype)
+
+
+def _hc_expand_core(post: torch.Tensor, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+    """Scatter a sub-layer output onto the streams: ``post * output + residual`` in fp32.
+
+    Args:
+        post: fp32 tensor of shape [batch, sequence, hc_mult].
+        output: Tensor of shape [batch, sequence, hidden].
+        residual: Tensor of shape [batch, sequence, hc_mult, hidden]; its dtype is the result dtype.
+
+    Returns:
+        Tensor of shape [batch, sequence, hc_mult, hidden] in the dtype of ``residual``.
+    """
+    return (post.unsqueeze(-1) * output.float().unsqueeze(-2) + residual.float()).to(residual.dtype)
+
+
+_rms_norm = _rms_norm_core
+_hc_collapse = _hc_collapse_core
+_hc_expand = _hc_expand_core
+_NORM_COMPILED = False
+_HC_COMPILED = False
+
+
+def compile_norm_core() -> None:
+    """Wrap the fp32 RMSNorm core with ``torch.compile`` (``BackendConfig.compile_norm``); runs once per process.
+
+    Static shapes (one specialisation per norm site shape and grad mode) and no ``fullgraph``: past dynamo's
+    recompile limit a shape runs eager instead of raising.
+    """
+    global _rms_norm, _NORM_COMPILED
+    if _NORM_COMPILED:
+        return
+    _rms_norm = torch.compile(_rms_norm_core, dynamic=False)
+    _NORM_COMPILED = True
+
+
+def compile_hc_cores() -> None:
+    """Wrap the hyper-connection collapse and expand cores with ``torch.compile`` (``BackendConfig.compile_hc``).
+
+    Runs once per process, static shapes: a new sequence length compiles the two cores again, so the knob is meant
+    for fixed-length batches (padded or packed). No ``fullgraph``: past the recompile limit a core runs eager.
+    """
+    global _hc_collapse, _hc_expand, _HC_COMPILED
+    if _HC_COMPILED:
+        return
+    _hc_collapse = torch.compile(_hc_collapse_core, dynamic=False)
+    _hc_expand = torch.compile(_hc_expand_core, dynamic=False)
+    _HC_COMPILED = True
+
+
 class HY4FlashRMSNorm(nn.Module):
     """RMSNorm that multiplies the weight after casting back to the activation dtype."""
 
@@ -51,10 +156,7 @@ class HY4FlashRMSNorm(nn.Module):
         Returns:
             Tensor of the same shape and dtype as ``hidden_states``.
         """
-        dtype = hidden_states.dtype
-        x = hidden_states.float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
-        return self.weight * x.to(dtype)
+        return _rms_norm(hidden_states, self.weight, self.eps)
 
 
 def unweighted_rms_inverse(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -104,15 +206,15 @@ class HY4FlashHyperConnection(nn.Module):
             ``post``: fp32 tensor of shape [batch, sequence, hc_mult]; ``collapsed``: tensor of shape
             [batch, sequence, hidden] in the dtype of ``streams``.
         """
-        flat = streams.flatten(2).float()
-        mixes = F.linear(flat, self.fn.float()) * unweighted_rms_inverse(flat, self.norm_eps).float()
-        pre_b, post_b = self.base.split(self.hc_mult)
-        pre_scale, post_scale = self.scale.unbind(0)
-        pre_logits, post_logits = mixes.split(self.hc_mult, dim=-1)
-        pre = torch.sigmoid(pre_logits * pre_scale + pre_b) + self.hc_eps
-        post = self.hc_magnitude * torch.sigmoid(post_logits * post_scale + post_b) + self.hc_eps
-        collapsed = (pre.unsqueeze(-1) * streams.float()).sum(dim=2)
-        return post, collapsed.to(streams.dtype)
+        return _hc_collapse(
+            streams,
+            self.fn.float(),
+            self.base.float(),
+            self.scale.float(),
+            self.norm_eps,
+            self.hc_eps,
+            self.hc_magnitude,
+        )
 
     @staticmethod
     def expand(post: torch.Tensor, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -126,7 +228,7 @@ class HY4FlashHyperConnection(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hc_mult, hidden] in the dtype of ``residual``.
         """
-        return (post.unsqueeze(-1) * output.float().unsqueeze(-2) + residual.float()).to(residual.dtype)
+        return _hc_expand(post, output, residual)
 
 
 class HY4FlashHyperHead(nn.Module):

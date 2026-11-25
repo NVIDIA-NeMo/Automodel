@@ -55,13 +55,20 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
-from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashAttention, HY4FlashDocLayout, HY4FlashRope
+from nemo_automodel.components.models.hy_v4_flash.attention import (
+    HY4FlashAttention,
+    HY4FlashDocLayout,
+    HY4FlashRope,
+    causal_prefix_plan,
+)
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLayer, build_ngram_tokens
 from nemo_automodel.components.models.hy_v4_flash.layers import (
     HY4FlashHyperConnection,
     HY4FlashHyperHead,
     HY4FlashRMSNorm,
+    compile_hc_cores,
+    compile_norm_core,
     inverse_frequencies,
     mrope_cos_sin,
 )
@@ -207,7 +214,7 @@ class HY4FlashBlock(nn.Module):
         dtype = torch.bfloat16
         eps = config.rms_norm_eps
         hidden = config.hidden_size
-        self.attention_type = config.layer_types[layer_idx]
+        self.attention_type = config.attention_types[layer_idx]
         self.self_attn = HY4FlashAttention(config, layer_idx, backend)
         if config.mlp_layer_types[layer_idx] == "sparse":
             self.mlp = MoE(moe_config, backend)
@@ -329,18 +336,26 @@ class HY4FlashModel(nn.Module):
         bounds = [0, *change, flat.numel()]
         host_ids = flat[bounds[:-1]].tolist()
         doc_ranges = tuple((s, e) for s, e, d in zip(bounds[:-1], bounds[1:], host_ids) if d > 0)
-        starts = torch.arange(flat.numel()) + 1  # padding: start after the token, so no key is valid
-        ends = starts.clone()
+        local_end = local_start + rows * seq
+        starts = torch.arange(local_start, local_end) + 1  # padding: start after the token, so no key is valid
+        covered = 0
         for start, end in doc_ranges:
-            starts[start:end] = start
-            ends[start:end] = end
-        local = slice(local_start, local_start + rows * seq)
+            lo, hi = max(start, local_start), min(end, local_end)
+            if hi > lo:
+                starts[lo - local_start : hi - local_start] = start
+                covered += hi - lo
+        doc_start = starts.to(flat.device)
+        position = torch.arange(local_start, local_end, device=flat.device)
+        window_plan = causal_prefix_plan(position, doc_start, cfg.sliding_window)
+        all_rows_nonempty = covered == rows * seq
         layout = HY4FlashDocLayout(
             doc_ranges,
             local_start,
-            local_start + rows * seq,
-            starts[local].to(flat.device),
-            ends[local].to(flat.device),
+            local_end,
+            window_plan,
+            causal_prefix_plan(position, doc_start, cfg.index_topk),
+            all_rows_nonempty,
+            None if all_rows_nonempty else torch.nonzero(window_plan.lengths > 0).flatten(),
         )
         ropes = {}
         for attention_type, theta in self._inv_freq_theta.items():
@@ -466,6 +481,10 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             engram_process_group = dist.group.WORLD
         moe_config = moe_config or build_moe_config(text, torch.bfloat16)
         self.moe_config = moe_config
+        if self.backend.compile_hc:
+            compile_hc_cores()
+        if self.backend.compile_norm:
+            compile_norm_core()
         self.model = HY4FlashModel(text, self.backend, moe_config, engram_process_group=engram_process_group)
         self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         vision = config.vision_config

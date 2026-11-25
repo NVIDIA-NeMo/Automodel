@@ -28,13 +28,17 @@ from transformers import PretrainedConfig
 
 # Any JSON value of a ``config.json`` (the open set of extra checkpoint fields the base class retains).
 JsonValue: TypeAlias = "str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]"
-AttentionType: TypeAlias = Literal["deepseek_sparse_attention", "sliding_attention"]
+AttentionType: TypeAlias = Literal["indexed_attention", "sliding_attention"]
 MlpType: TypeAlias = Literal["dense", "sparse"]
 
-# Layer-type spellings seen in the released config and in the transformers reference.
+# The released config spells the indexer layers ``deepseek_sparse_attention``; the transformers reference spells them
+# ``indexed_attention``, and the ``PretrainedConfig`` base class of transformers >= 5.18 rewrites ``layer_types`` to
+# that spelling in place (older base classes reject it). ``layer_types`` therefore keeps whatever the base class
+# leaves there, and the model reads ``attention_types``, which is the same under either spelling.
+_RELEASED_LAYER_TYPE = {"indexed_attention": "deepseek_sparse_attention", "sliding_attention": "sliding_attention"}
 _LAYER_TYPE_ALIASES: dict[str, AttentionType] = {
-    "deepseek_sparse_attention": "deepseek_sparse_attention",
-    "indexed_attention": "deepseek_sparse_attention",
+    "deepseek_sparse_attention": "indexed_attention",
+    "indexed_attention": "indexed_attention",
     "sliding_attention": "sliding_attention",
 }
 
@@ -203,14 +207,14 @@ class HY4FlashTextConfig(PretrainedConfig):
         if layer_types is None:
             # Two sparse layers, then three sliding layers for every sparse one.
             layer_types = [
-                "deepseek_sparse_attention" if i < 2 or (i - 1) % 4 == 0 else "sliding_attention"
+                "indexed_attention" if i < 2 or (i - 1) % 4 == 0 else "sliding_attention"
                 for i in range(num_hidden_layers)
             ]
         # A reduced ``num_hidden_layers`` keeps the released schedules' prefix (a pretrained prefix keeps its identities).
         layer_types = list(layer_types)[:num_hidden_layers]
         self.mlp_layer_types = self.mlp_layer_types[:num_hidden_layers]
         try:
-            self.layer_types = [_LAYER_TYPE_ALIASES[t] for t in layer_types]
+            self.layer_types = [_RELEASED_LAYER_TYPE[_LAYER_TYPE_ALIASES[t]] for t in layer_types]
         except KeyError as exc:
             raise ValueError(
                 f"unsupported layer type {exc.args[0]!r}; expected one of {sorted(_LAYER_TYPE_ALIASES)}"
@@ -220,7 +224,7 @@ class HY4FlashTextConfig(PretrainedConfig):
         # per-type table is kept under its own name; a saved config carries both and the own name wins.
         source = layer_rope_parameters if layer_rope_parameters is not None else rope_parameters
         rope = {_LAYER_TYPE_ALIASES[k]: dict(v) for k, v in (source or {}).items() if k in _LAYER_TYPE_ALIASES}
-        default_theta = {"deepseek_sparse_attention": 1.0e7, "sliding_attention": 1.0e4}
+        default_theta = {"indexed_attention": 1.0e7, "sliding_attention": 1.0e4}
         for layer_type, theta in default_theta.items():
             params = rope.setdefault(layer_type, {"rope_type": "default"})
             params.setdefault("rope_theta", theta)
@@ -240,15 +244,18 @@ class HY4FlashTextConfig(PretrainedConfig):
         )
 
     # ------------------------------------------------------------------ derived shapes
+    @property
+    def attention_types(self) -> list[AttentionType]:
+        """Attention type of every decoder layer, independent of how ``layer_types`` is spelled."""
+        return [_LAYER_TYPE_ALIASES[layer_type] for layer_type in self.layer_types]
+
     def attention_heads(self, attention_type: AttentionType) -> int:
         """Number of query heads of a layer of the given attention type."""
-        return (
-            self.num_attention_heads if attention_type == "deepseek_sparse_attention" else self.swa_num_attention_heads
-        )
+        return self.num_attention_heads if attention_type == "indexed_attention" else self.swa_num_attention_heads
 
     def attention_dims(self, attention_type: AttentionType) -> tuple[int, int, int]:
         """Return ``(qk_nope_head_dim, qk_rope_head_dim, v_head_dim)`` of the given attention type."""
-        if attention_type == "deepseek_sparse_attention":
+        if attention_type == "indexed_attention":
             return self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim
         return self.swa_qk_nope_head_dim, self.swa_qk_rope_head_dim, self.swa_v_head_dim
 
@@ -298,7 +305,7 @@ class HY4FlashTextConfig(PretrainedConfig):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive, got {value!r}")
-        for layer_type in set(self.layer_types):
+        for layer_type in set(self.attention_types):
             _, rope_dim, _ = self.attention_dims(layer_type)
             section = self.layer_rope_parameters[layer_type]["mrope_section"]
             if len(section) != 3 or sum(section) != rope_dim // 2:

@@ -59,7 +59,7 @@ def hy_v4_flash_flops(config: HY4FlashConfig | HY4FlashTextConfig, gbs: int = 1,
     macs_per_token = 0
     attention_keys_macs = 0
     indexer_macs = 0
-    for layer, attention_type in enumerate(text.layer_types):
+    for layer, attention_type in enumerate(text.attention_types):
         heads = text.attention_heads(attention_type)
         nope, rope, value = text.attention_dims(attention_type)
         qk = nope + rope

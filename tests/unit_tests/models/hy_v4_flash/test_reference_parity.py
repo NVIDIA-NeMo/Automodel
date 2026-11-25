@@ -128,9 +128,9 @@ def test_selected_key_sets_match_reference_and_selection_is_sparse():
         if attn.compressed_indexer is not None:
             original = attn._attend
 
-            def spy(query, kv, indices, sinks, index=index, original=original):
-                captured[index] = indices.clone()
-                return original(query, kv, indices, sinks)
+            def spy(query, kv, plan, sinks, layout, index=index, original=original):
+                captured[index] = plan.indices.clone()
+                return original(query, kv, plan, sinks, layout)
 
             attn._attend = spy
     with torch.no_grad():
@@ -156,8 +156,8 @@ def test_parity_fails_for_deliberately_wrong_variants(control):
     dump, model, _, _ = _load()
     if control == "rope_theta_swapped":
         thetas = model.model._inv_freq_theta
-        thetas["sliding_attention"], thetas["deepseek_sparse_attention"] = (
-            thetas["deepseek_sparse_attention"],
+        thetas["sliding_attention"], thetas["indexed_attention"] = (
+            thetas["indexed_attention"],
             thetas["sliding_attention"],
         )
     else:

@@ -43,7 +43,7 @@ def test_round_trip_keeps_the_per_type_rope_table(tmp_path):
     again = HY4FlashConfig.from_pretrained(tmp_path).text_config
     assert again.layer_rope_parameters == cfg.text_config.layer_rope_parameters
     assert again.layer_rope_parameters["sliding_attention"]["rope_theta"] == 1.0e4
-    assert again.layer_rope_parameters["deepseek_sparse_attention"]["rope_theta"] == 1.0e7
+    assert again.layer_rope_parameters["indexed_attention"]["rope_theta"] == 1.0e7
 
 
 @needs_released
@@ -53,13 +53,25 @@ def test_released_config_semantics():
     assert text.engram_layer_ids == [2, 12, 22, 32] and text.engram_layer_indices == [1, 11, 21, 31]
     assert text.engram_fp8_embedding is False
     assert (
-        text.layer_types.count("deepseek_sparse_attention") == 12 and text.layer_types.count("sliding_attention") == 30
+        text.attention_types.count("indexed_attention") == 12 and text.attention_types.count("sliding_attention") == 30
     )
-    assert [i for i, t in enumerate(text.layer_types) if t == "deepseek_sparse_attention"][:4] == [0, 1, 5, 9]
+    assert [i for i, t in enumerate(text.attention_types) if t == "indexed_attention"][:4] == [0, 1, 5, 9]
     assert text.index_kpool == 4 and text.index_topk // text.index_kpool == 512
-    assert text.attention_heads("sliding_attention") == 64 and text.attention_heads("deepseek_sparse_attention") == 32
+    assert text.attention_heads("sliding_attention") == 64 and text.attention_heads("indexed_attention") == 32
     assert text.layer_rope_parameters["sliding_attention"]["rope_theta"] == 10000
-    assert text.layer_rope_parameters["deepseek_sparse_attention"]["rope_theta"] == 10000000
+    assert text.layer_rope_parameters["indexed_attention"]["rope_theta"] == 10000000
+
+
+@pytest.mark.parametrize("spelling", ["deepseek_sparse_attention", "indexed_attention"])
+def test_released_and_reference_layer_type_spellings_build_the_same_layers(spelling):
+    # The released config says "deepseek_sparse_attention"; newer transformers base classes rewrite it to
+    # "indexed_attention". Either way the indexer layers must get the sparse head count, rotary base and an indexer.
+    text = tiny_text_config(num_hidden_layers=3, layer_types=[spelling, "sliding_attention", spelling])
+    assert text.attention_types == ["indexed_attention", "sliding_attention", "indexed_attention"]
+    assert [text.attention_heads(t) for t in text.attention_types] == [4, 8, 4]
+    again = HY4FlashTextConfig(**text.to_dict())
+    assert again.attention_types == text.attention_types
+    assert again.layer_rope_parameters["indexed_attention"]["rope_theta"] == 1.0e7
 
 
 def test_engram_fp8_lookup_is_rejected_instead_of_ignored():
@@ -82,7 +94,7 @@ def test_wrong_engram_layer_offset_is_detected_by_the_layer_id_check():
 
 def test_reduced_depth_keeps_the_released_schedule_prefix():
     text = tiny_text_config(num_hidden_layers=3)
-    assert text.layer_types == ["deepseek_sparse_attention", "deepseek_sparse_attention", "sliding_attention"]
+    assert text.attention_types == ["indexed_attention", "indexed_attention", "sliding_attention"]
     assert len(text.mlp_layer_types) == 3
     assert text.engram_layer_indices == [1]  # id 4 (layer 3) is not built
 
