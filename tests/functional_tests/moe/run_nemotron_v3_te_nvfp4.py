@@ -123,6 +123,8 @@ model:
     enable_hf_state_dict_adapter: false
     te_nvfp4:
       _target_: nemo_automodel.components.models.common.TENvfp4Config
+      # Empty next to a precision map; lm_head, the default entry, is a torch linear and runs in BF16 anyway.
+      exclude_fqns: []
       precision_map:
         _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
         high_precision_tail_layers: 3

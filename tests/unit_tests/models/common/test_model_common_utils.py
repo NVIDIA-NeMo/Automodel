@@ -462,6 +462,23 @@ class TestTENvfp4Config:
         with pytest.raises(ValueError, match=r"te_nvfp4.precision_map must be a precision map object"):
             BackendConfig(te_nvfp4={"precision_map": mapping})
 
+    def test_precision_map_and_exclude_fqns_are_mutually_exclusive(self):
+        """A map keeps modules in high precision itself, so a config with a map has an empty exclusion list."""
+        precision_map = _LastNamePrecisionMap({})
+        message = r"te_nvfp4.precision_map and te_nvfp4.exclude_fqns are mutually exclusive, got exclude_fqns="
+        # The default list is not empty.
+        with pytest.raises(ValueError, match=message + r"\['lm_head'\] .*exclusions in the map and set .* to \[\]"):
+            TENvfp4Config(precision_map=precision_map)
+        with pytest.raises(ValueError, match=message + r"\['model.score'\]"):
+            TENvfp4Config(precision_map=precision_map, exclude_fqns="model.score")
+        with pytest.raises(ValueError, match=message + r"\['lm_head', 'q_proj'\]"):
+            BackendConfig(te_nvfp4={"precision_map": precision_map, "exclude_fqns": ["lm_head", "q_proj"]})
+        cfg = TENvfp4Config(precision_map=precision_map, exclude_fqns=[])
+        assert cfg.precision_map is precision_map
+        assert cfg.exclude_fqns == ()
+        # Without a map the list is the one of every Transformer Engine quantization config.
+        assert TENvfp4Config(exclude_fqns=["model.score"]).exclude_fqns == ("model.score",)
+
     def test_exclude_fqns_default_and_normalization(self):
         assert TENvfp4Config().exclude_fqns == ("lm_head",)
         assert TENvfp4Config(exclude_fqns=["lm_head", "model.score"]).exclude_fqns == ("lm_head", "model.score")
@@ -508,7 +525,7 @@ class TestTENvfp4PrecisionMap:
 
     def test_scopes_get_the_forward_of_their_precision(self, caplog):
         precision_map = _LastNamePrecisionMap({"quantized": "nvfp4", "eight_bit": "mxfp8", "inner": "high_precision"})
-        cfg = TENvfp4Config(precision_map=precision_map)
+        cfg = TENvfp4Config(precision_map=precision_map, exclude_fqns=())
         x = torch.randn(2, 4)
         with _fake_te_mxfp8_autocast() as entered:
             from transformer_engine.pytorch.quantization import autocast
@@ -547,7 +564,8 @@ class TestTENvfp4PrecisionMap:
 
             model = nn.ModuleDict({"mlp": Linear(4, 4)})
             expected = model.mlp(x)
-            TENvfp4Config(precision_map=_LastNamePrecisionMap({"mlp": "mxfp8"})).prepare_modules(model)
+            precision_map = _LastNamePrecisionMap({"mlp": "mxfp8"})
+            TENvfp4Config(precision_map=precision_map, exclude_fqns=()).prepare_modules(model)
             assert "forward" in vars(model.mlp)
             torch.testing.assert_close(model.mlp(x), expected)
             with autocast(enabled=False):
@@ -576,11 +594,12 @@ class TestTENvfp4PrecisionMap:
         precisions = {"quantized": "nvfp4", "eight_bit": "mxfp8", "inner": "high_precision"}
         with _fake_te_mxfp8_autocast():
             model = self._model()
+            incomplete = _LastNamePrecisionMap(precisions, drop="eight_bit")
             with pytest.raises(ValueError, match=r"exactly once; missing \['eight_bit'\]"):
-                TENvfp4Config(precision_map=_LastNamePrecisionMap(precisions, drop="eight_bit")).prepare_modules(model)
+                TENvfp4Config(precision_map=incomplete, exclude_fqns=()).prepare_modules(model)
             assert all("forward" not in vars(module) for module in model.modules())
             with pytest.raises(ValueError, match="nothing would be quantized"):
-                TENvfp4Config(precision_map=_LastNamePrecisionMap(precisions)).prepare_modules(
+                TENvfp4Config(precision_map=_LastNamePrecisionMap(precisions), exclude_fqns=()).prepare_modules(
                     nn.ModuleDict({"torch_linear": nn.Linear(4, 4)})
                 )
 

@@ -438,22 +438,6 @@ def test_invalid_settings_are_rejected(changes: dict[str, str | int]):
 
 
 @pytest.mark.cpu_only
-def test_exclude_fqns_must_agree_with_the_map():
-    """``exclude_fqns`` keeps working next to the map, but may not contradict it."""
-    names = list(_expected("ME*M", 1, "", "", RECIPE))
-    gemm_modules = [(name, "GroupedLinear" if ".experts." in name else "Linear") for name in names]
-    recipe = _recipe_map(high_precision_tail_layers=1)
-    agreeing = TENvfp4Config(precision_map=recipe, exclude_fqns=["lm_head", "q_proj"])
-    assert _resolved(agreeing.resolve_precision_plan(names, gemm_modules)) == _expected("ME*M", 1, "", "", RECIPE)
-    with pytest.raises(ValueError, match="mixer.q_proj' the precision high_precision, .*precision_map gives it nvfp4"):
-        TENvfp4Config(
-            precision_map=_recipe_map(high_precision_tail_layers=1, attention="nvfp4"), exclude_fqns=["q_proj"]
-        ).resolve_precision_plan(names, gemm_modules)
-    with pytest.raises(ValueError, match="mixer.in_proj' the precision high_precision, .*precision_map gives it nvfp4"):
-        TENvfp4Config(precision_map=recipe, exclude_fqns=["in_proj"]).resolve_precision_plan(names, gemm_modules)
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("checkpointing", ["none", "blocks", "moe"])
 def test_names_match_a_built_model(checkpointing: str):
     """The names the test spells out are the ones a Nemotron 3 model registers, also after ``apply_ac``."""
@@ -558,7 +542,7 @@ def test_modules_the_precision_map_gives_mxfp8_run_the_mxfp8_recipe_inside_the_n
 
     model, mxfp8_model = build(), build()
     x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
-    config = TENvfp4Config(precision_map=_SecondLayerInMxfp8())
+    config = TENvfp4Config(precision_map=_SecondLayerInMxfp8(), exclude_fqns=())
     config.prepare_modules(model)
     with torch.no_grad():
         with config.maybe_te_autocast():

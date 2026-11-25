@@ -156,6 +156,9 @@ model:
     te_nvfp4:
       _target_: nemo_automodel.components.models.common.TENvfp4Config
       row_scaled_activation: false
+      # Empty next to a precision map, which keeps modules in high precision itself. The list defaults to
+      # lm_head, a torch linear in this model: it runs in BF16 with or without the entry.
+      exclude_fqns: []
       precision_map:
         _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
         high_precision_tail_layers: 14

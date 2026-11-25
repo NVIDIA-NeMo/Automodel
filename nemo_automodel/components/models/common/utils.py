@@ -562,14 +562,15 @@ class TENvfp4Config(TEQuantizationConfig):
     activations only work with frozen weights."""
     precision_map: TEPrecisionMap | None = None
     """Model-owned map that gives every Transformer Engine GEMM module its precision (NVFP4, MXFP8 or high
-    precision) by module class and decoder layer, e.g. ``NemotronV3PrecisionMap``. ``exclude_fqns`` still
-    applies; a module it takes out of the precision the map gives it is an error."""
+    precision) by module class and decoder layer, e.g. ``NemotronV3PrecisionMap``. Not together with
+    ``exclude_fqns``: a config with a map sets that list to empty and keeps modules in high precision
+    through the map."""
     resident_weights: bool = False
     """Hold the expert weights as NVFP4 tensors: an NVFP4 checkpoint fills them unchanged and they are saved
     in the same form. Training them needs Transformer Engine ``FusedAdam`` with ``master_weights=True``."""
 
     def __post_init__(self) -> None:
-        """Normalize ``exclude_fqns`` and reject options that Transformer Engine does not implement."""
+        """Normalize ``exclude_fqns``; reject options Transformer Engine lacks and a map next to exclusions."""
         super().__post_init__()
         if self.four_over_six not in ("none", "weights", "activations", "all"):
             raise ValueError(
@@ -585,6 +586,12 @@ class TENvfp4Config(TEQuantizationConfig):
                 "te_nvfp4.precision_map must be a precision map object such as NemotronV3PrecisionMap, got a "
                 f"mapping with the keys {sorted(self.precision_map)}. In YAML the config loader builds it only "
                 "when both te_nvfp4 and te_nvfp4.precision_map carry a `_target_` key."
+            )
+        if self.precision_map is not None and self.exclude_fqns:
+            raise ValueError(
+                "te_nvfp4.precision_map and te_nvfp4.exclude_fqns are mutually exclusive, got exclude_fqns="
+                f"{list(self.exclude_fqns)!r} (its default is ['lm_head']). The map gives every Transformer Engine "
+                "GEMM module its precision: express the exclusions in the map and set te_nvfp4.exclude_fqns to []."
             )
         if self.random_hadamard_transform and (
             self.row_scaled_activation or self.four_over_six in ("activations", "all")
@@ -645,8 +652,7 @@ class TENvfp4Config(TEQuantizationConfig):
             with the Transformer Engine class name as module class and no layers.
 
         Raises:
-            ValueError: If the plan of ``precision_map`` does not hold exactly the given modules, or
-                ``exclude_fqns`` takes a module out of the precision the map gives it.
+            ValueError: If the plan of ``precision_map`` does not hold exactly the given modules.
         """
         if self.precision_map is None:
             return TEPrecisionPlan(
@@ -672,17 +678,10 @@ class TENvfp4Config(TEQuantizationConfig):
                 f"missing {sorted(set(names) - set(planned))}, unexpected {sorted(set(planned) - set(names))}, "
                 f"{len(planned) - len(set(planned))} repeated"
             )
-        for module in plan.modules:
-            named = self._named_precision(module.name)
-            if named not in ("nvfp4", module.precision):
-                raise ValueError(
-                    f"te_nvfp4.exclude_fqns gives module {module.name!r} the precision {named}, "
-                    f"te_nvfp4.precision_map gives it {module.precision}; make them agree"
-                )
         return plan
 
     def prepare_modules(self, model: nn.Module) -> None:
-        """Apply ``exclude_fqns`` and ``precision_map`` to ``model``; idempotent.
+        """Apply ``exclude_fqns`` or ``precision_map``, whichever the config sets, to ``model``; idempotent.
 
         The scopes of the plan that do not run NVFP4 get an instance ``forward`` like the modules of
         ``exclude_fqns``: outside the Transformer Engine autocast for high precision, under the MXFP8 recipe
