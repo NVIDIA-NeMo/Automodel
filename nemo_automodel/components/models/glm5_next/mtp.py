@@ -23,8 +23,9 @@ import torch
 from torch import nn
 
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import initialize_linear_module
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule
+from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
 from nemo_automodel.components.models.glm5_next.layers import Glm5NextRMSNorm, Glm5NextSparseAttention
@@ -48,7 +49,7 @@ class Glm5NextMTPSublayer(nn.Module):
         config: Glm5NextTextConfig,
         layer_idx: int,
         moe_config: MoEConfig,
-        backend: BackendConfig,
+        backend: Glm5NextBackendConfig,
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
@@ -134,7 +135,7 @@ class Glm5NextMTP(MTPModule):
         config: Glm5NextTextConfig,
         mtp_config: MTPConfig,
         moe_config: MoEConfig,
-        backend: BackendConfig,
+        backend: Glm5NextBackendConfig,
         dtype: torch.dtype,
     ) -> None:
         if mtp_config.layer_pattern != "*":

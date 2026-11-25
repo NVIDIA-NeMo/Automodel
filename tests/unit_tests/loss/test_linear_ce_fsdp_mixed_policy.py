@@ -25,8 +25,7 @@ tiny dense DeepSeek-V3 (Qwen3MoE builds its rotary cache on the current CUDA dev
 
 from __future__ import annotations
 
-import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -46,12 +45,6 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 
 _WORLD_SIZE = 2
 _VOCAB = 100
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _config() -> DeepseekV3Config:
@@ -79,11 +72,9 @@ def _torch_compile_stand_in(hidden, weight, targets=None, *, ignore_index=-100, 
     )
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, init_file: str) -> None:
     torch.set_num_threads(1)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=_WORLD_SIZE)
     try:
         from nemo_automodel.components.loss import linear_ce as linear_ce_mod
 
@@ -142,5 +133,6 @@ def _worker(rank: int, port: int) -> None:
     hard_timeout=60,
     reason="spawns two Gloo FSDP2 workers for a tiny Qwen3MoE forward/backward/step twice",
 )
-def test_fused_loss_consumes_the_resharded_fp32_head_under_a_bf16_policy() -> None:
-    mp.spawn(_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
+def test_fused_loss_consumes_the_resharded_fp32_head_under_a_bf16_policy(tmp_path: Path) -> None:
+    init_file = tmp_path / "process-group"
+    mp.spawn(_worker, args=(str(init_file),), nprocs=_WORLD_SIZE, join=True)
