@@ -328,7 +328,19 @@ class HY4FlashModel(nn.Module):
         bounds = [0, *change, flat.numel()]
         host_ids = flat[bounds[:-1]].tolist()
         doc_ranges = tuple((s, e) for s, e, d in zip(bounds[:-1], bounds[1:], host_ids) if d > 0)
-        layout = HY4FlashDocLayout(doc_ranges, local_start, local_start + rows * seq)
+        starts = torch.arange(flat.numel()) + 1  # padding: start after the token, so no key is valid
+        ends = starts.clone()
+        for start, end in doc_ranges:
+            starts[start:end] = start
+            ends[start:end] = end
+        local = slice(local_start, local_start + rows * seq)
+        layout = HY4FlashDocLayout(
+            doc_ranges,
+            local_start,
+            local_start + rows * seq,
+            starts[local].to(flat.device),
+            ends[local].to(flat.device),
+        )
         ropes = {}
         for attention_type, theta in self._inv_freq_theta.items():
             _, rope_dim, _ = cfg.attention_dims(attention_type)

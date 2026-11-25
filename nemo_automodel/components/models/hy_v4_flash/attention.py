@@ -49,18 +49,23 @@ from nemo_automodel.components.models.hy_v4_flash.layers import HY4FlashRMSNorm,
 
 @dataclass(frozen=True)
 class HY4FlashDocLayout:
-    """Host-side document boundaries of one packed batch row, shared by every layer of a forward pass.
+    """Document boundaries of one packed row, built once per forward pass and shared by every layer.
 
     Attributes:
         doc_ranges: ``(start, end)`` token intervals of the real documents in the *global* sequence
             (``end`` exclusive); padding is not listed.
         local_start: First global token held by this rank (0 without context parallelism).
         local_end: One past the last global token held by this rank.
+        doc_start: Integer tensor of shape [local_tokens], the global index of the first token of each local token's
+            document; ``position + 1`` for padding, which makes every key of a padding query invalid.
+        doc_end: Integer tensor of shape [local_tokens], one past the last token of each local token's document.
     """
 
     doc_ranges: tuple[tuple[int, int], ...]
     local_start: int
     local_end: int
+    doc_start: torch.Tensor
+    doc_end: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -223,32 +228,38 @@ class HY4FlashCompressedIndexer(nn.Module):
         return F.pad(selected, (0, width - selected.shape[-1]), value=-1).to(torch.int32)
 
 
-def sliding_window_indices(query_slots: torch.Tensor, window: int) -> torch.Tensor:
-    """Document-local indices of the last ``window`` tokens (including the query) of each query.
+def sliding_window_indices(position: torch.Tensor, doc_start: torch.Tensor, window: int) -> torch.Tensor:
+    """Global indices of the last ``window`` tokens (including the query) of each query, inside its document.
 
     Args:
-        query_slots: Integer tensor of shape [queries], document-local token index of each query.
+        position: Integer tensor of shape [queries], global token index of each query.
+        doc_start: Integer tensor of shape [queries], global index of each query's document start.
         window: Number of keys per query.
 
     Returns:
-        Int32 tensor of shape [queries, window], ``-1`` before the document start.
+        Int32 tensor of shape [queries, window] of global key indices, ``-1`` before the document start.
     """
-    indices = query_slots[:, None] - torch.arange(window - 1, -1, -1, device=query_slots.device)
-    return indices.masked_fill(indices < 0, -1).to(torch.int32)
+    indices = position[:, None] - torch.arange(window - 1, -1, -1, device=position.device)
+    return torch.where(indices >= doc_start[:, None], indices, -1).to(torch.int32)
 
 
-def dense_causal_indices(query_slots: torch.Tensor, width: int) -> torch.Tensor:
-    """Document-local indices ``0..slot`` of every query, padded with ``-1`` to ``width``.
+def dense_causal_indices(
+    position: torch.Tensor, doc_start: torch.Tensor, doc_end: torch.Tensor, width: int
+) -> torch.Tensor:
+    """Global indices of every key of the query's document up to the query, padded with ``-1`` to ``width``.
 
     Args:
-        query_slots: Integer tensor of shape [queries]; every value must be ``< width``.
-        width: Output width.
+        position: Integer tensor of shape [queries], global token index of each query.
+        doc_start: Integer tensor of shape [queries], global start of each query's document.
+        doc_end: Integer tensor of shape [queries], global end (exclusive) of each query's document.
+        width: Output width; documents longer than ``width`` must not be passed.
 
     Returns:
         Int32 tensor of shape [queries, width].
     """
-    positions = torch.arange(width, device=query_slots.device)
-    return torch.where(positions[None] <= query_slots[:, None], positions[None], -1).to(torch.int32)
+    indices = doc_start[:, None] + torch.arange(width, device=position.device)
+    valid = (indices <= position[:, None]) & (indices < doc_end[:, None])
+    return torch.where(valid, indices, -1).to(torch.int32)
 
 
 def reference_sparse_latent_attention(
@@ -380,36 +391,31 @@ class HY4FlashAttention(nn.Module):
         token_keys = self.compressed_indexer.token_keys(x) if self.compressed_indexer is not None else None
         kv, keys = self._gather_keys(kv_local, token_keys)
 
-        indices = torch.full(
-            (tokens, self.window if self.compressed_indexer is None else self.index_topk),
-            -1,
-            dtype=torch.int32,
-            device=x.device,
-        )
-        for start, end in layout.doc_ranges:
-            q_start, q_end = max(start, lo), min(end, hi)
-            if q_end <= q_start:
-                continue
-            slots = torch.arange(q_start - start, q_end - start, device=x.device)
-            if self.compressed_indexer is None:
-                local = sliding_window_indices(slots, self.window)
-            elif end - start <= self.index_topk:
-                local = dense_causal_indices(slots, self.index_topk)
-            else:
+        position = torch.arange(lo, hi, device=x.device)
+        doc_start, doc_end = layout.doc_start, layout.doc_end
+        if self.compressed_indexer is None:
+            indices = sliding_window_indices(position, doc_start, self.window)
+        else:
+            # Documents that fit inside index_topk attend densely (vectorised over all such queries); longer ones
+            # select groups through the indexer, one document at a time.
+            indices = dense_causal_indices(position, doc_start, doc_end, self.index_topk)
+            for start, end in layout.doc_ranges:
+                q_start, q_end = max(start, lo), min(end, hi)
+                if end - start <= self.index_topk or q_end <= q_start:
+                    continue
                 group_keys = self.compressed_indexer.pool_groups(keys[start:end])
-                first_tokens = slice(
-                    start, start + group_keys.shape[0] * self.compressed_indexer.kpool, self.compressed_indexer.kpool
-                )
+                kpool = self.compressed_indexer.kpool
+                first_tokens = slice(start, start + group_keys.shape[0] * kpool, kpool)
                 local = self.compressed_indexer.select(
                     q_resid[q_start - lo : q_end - lo],
                     x[q_start - lo : q_end - lo],
                     HY4FlashRope(rope.cos[q_start:q_end], rope.sin[q_start:q_end]),
                     group_keys,
                     HY4FlashRope(rope.cos[first_tokens], rope.sin[first_tokens]),
-                    slots,
+                    position[q_start - lo : q_end - lo] - start,
                     end - start,
                 )
-            indices[q_start - lo : q_end - lo, : local.shape[1]] = torch.where(local >= 0, local + start, -1)
+                indices[q_start - lo : q_end - lo] = torch.where(local >= 0, local + start, -1)
 
         out_latent = self._attend(query, kv, indices, self.sinks_param(query))
         out = torch.einsum("qhc,hvc->qhv", out_latent, w_v) * gate
