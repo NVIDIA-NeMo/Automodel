@@ -80,7 +80,7 @@
 # Measured on mock tokens with NVTE_USE_FAST_MATH=1 and 2 learning-rate warm-up steps instead of 100, 26
 # steps of which the last 20 are timed. Loss and gradient norm were finite in every step of every run. All
 # of these runs had the shared expert on a side stream (backend.shared_expert_overlap: true), which this file
-# no longer sets; the step time of the file as written was not measured on 16 GPUs.
+# no longer sets; the step time of the file as written is under "Trained on FineWeb" below.
 #   - This file on 16 GB300 with the 512-expert model: 9.38 s per step (6,983 tokens/s/GPU), peak 215 GiB.
 #     On rank 0, 295 of 2,048 dispatches ran in chunks; the largest held 2,623,232 rows.
 #   - The same with local_batch_size: 8: 9.01 s per step (7,276 tokens/s/GPU), peak 276.5 GiB. The largest
@@ -96,14 +96,17 @@
 #     step on its loss and gradient norm stayed within 0.003 and 0.5% of the same run without te_nvfp4 (0.008
 #     and 2.4% in the first four steps).
 # The learned gate is slower than balanced routing because the rank with the most rows sets the pace of every
-# step. How the routing of a trained model on real text is spread was not measured. Running a dispatch in two
-# chunks instead of one call adds 2.5 ms to the 38 ms that the expert MLP of one layer takes for forward,
-# recompute and backward of 1.5e6 rows on one GB300.
+# step. How the rows are spread over the ranks while a model trains on real text was not measured: the row
+# counts of the ranks are not logged. In the FineWeb run below, 1,638 of the first 32,768 quantized dispatches
+# of rank 0 ran in chunks (the largest held 2,618,624 rows) and none from then, about step 250, to the last
+# count near step 995; the step time fell from 10.2 s (steps 10-29) to 8.0 s (from step 250). Running a dispatch
+# in two chunks instead of one call adds 2.5 ms to the 38 ms that the expert MLP of one layer takes for
+# forward, recompute and backward of 1.5e6 rows on one GB300.
 # Setting NVTE_USE_FAST_MATH=1 in the environment selects faster arithmetic in Transformer Engine's
 # quantization kernels: about 5% more throughput with balanced routing on 16 GB300. The loss of the first
 # step then differs in the fourth digit; the effect on convergence was not studied.
 #
-# Validation so far, all on mock tokens, none of it a convergence result:
+# Validation on mock tokens, none of it a convergence result:
 #   - A small model on 2 GB300 (tests/functional_tests/moe/run_nemotron_v3_te_nvfp4.py): every GEMM
 #     module ran the recipe above according to Transformer Engine's own state, loss and gradients were finite,
 #     and the loss was within 0.1% of the BF16 loss of the same weights and tokens (0.05% and 0.04% on the two
@@ -114,7 +117,21 @@
 #     (tests/functional_tests/moe/test_te_grouped_tensor.py): balanced and uneven dispatches of 1.9e9 to 4.4e9
 #     elements, one expert holding 4.3e9, experts without rows, with the shared expert on its side stream.
 #   - The 88-layer model on 16 GB300 and, with 128 of the 512 experts, on 4 GB300: the runs above.
-#   - Not run: real data, the 100 warm-up steps and 900 steps of this file, validation, checkpointing.
+#
+# Trained on FineWeb: the settings of this file on 16 GB300 with default arithmetic, started with
+# --dataset.file_pattern (16 shards of FineWeb sample-10BT tokenized as below, 4.5e9 tokens, one shard per rank,
+# read in stored order) and --step_scheduler.max_steps 1500, which is also the cosine horizon; the model config
+# was read from a local copy of the Hub repository. 1,500 optimizer steps with the 100 warm-up steps of this
+# file, 1.57e9 tokens, in 3.44 hours. One run.
+#   - Training loss 13.94 at step 0 and 3.541 over steps 1400-1499, finite in every step. The same file
+#     without the te_nvfp4 block (BF16), same seed, initial weights and data order: 3.521, and 3.525 in a
+#     second run. NVFP4 ends 0.020 (0.57%) above BF16; the two BF16 runs differ by 0.004.
+#   - 7.99 s per step (8,203 tokens/s/GPU; median of steps 100-1499) against 8.37 s for BF16; peak memory of
+#     the busiest GPU 205.6 GiB (nvidia-smi) against 212.5 GiB.
+#   - Figure, tables and limits: docs/model-coverage/omni/nvidia/nemotron-3-5-super-vl.mdx, section "NVFP4
+#     Pretraining on GB300".
+#   - Not run: the 900-step schedule and the single data file of this file as written, validation,
+#     checkpointing, and training with NVTE_USE_FAST_MATH=1 beyond 26 steps.
 #
 # Data: tokenize FineWeb with the model's tokenizer into a NanoGPT shard, then point dataset.file_pattern at
 # it. 1B tokens cover the 900 steps of 128 x 8192 tokens:
