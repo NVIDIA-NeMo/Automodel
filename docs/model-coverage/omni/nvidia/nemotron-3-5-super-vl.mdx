@@ -33,6 +33,7 @@ uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_
 | Full SFT on receipt images | Follow the [CORD-v2 guide](/recipes-e2e-examples/nemotron-3-5-super-vl). |
 | Text-to-SQL with LoRA | Follow the [Spider guide](/recipes-e2e-examples/nemotron-3-5-super-vl-text-to-sql). |
 | Continued pretraining on raw text | Follow the [FineWeb guide](/recipes-e2e-examples/nemotron-3-5-super-vl-continued-pretraining), including Megatron data preparation. |
+| NVFP4 pretraining from random initialization on 16 GB300 GPUs, `ep_size=16`; text only (vision tower frozen and unused) | Use [nemotron_3_5_super_vl_te_nvfp4_gb300.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_gb300.yaml). Dataset: FineWeb. See [NVFP4 Pretraining on GB300](#nvfp4-pretraining-on-gb300). |
 | Full SFT, text-only (vision/audio towers frozen and unused) | Use [nemotron_3_5_super_vl_tulu3_text_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml). Dataset: Tulu-3. |
 | 256K packed SFT on 16 GB200 GPUs, `cp_size=8` / `ep_size=16`; text-only packs (`inject_fake_images: false`) | Use [nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml). Dataset: Tulu-3 (packed, THD). |
 | Low-rank adaptation (LoRA) (rank 64) on the LLM linear projections, base model frozen; receipt image to structured field tokens; single node | Use [nemotron_3_5_super_vl_cord_v2_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml). Dataset: CORD-v2. |
@@ -54,6 +55,78 @@ weights or optimizer states for them, so the 121B model trains on a single node 
 | Training | 400 steps (global batch 8, 4 epochs of the 800 training receipts) in 13 min on one node; train loss 0.51 -> 0.01 |
 | Validation loss | 0.041 / 0.039 / 0.043 / 0.040 at steps 99 / 199 / 299 / 399 |
 | Field extraction (first 20 validation receipts, greedy, adapter merged into the base model) | step 199 (`LOWEST_VAL`): 8/20 exact match, mean similarity 0.954 (median 0.997), 20/20 structured outputs |
+
+### NVFP4 Pretraining on GB300
+
+`nemotron_3_5_super_vl_te_nvfp4_gb300.yaml` pretrains the language model from random initialization on
+[FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) text with Transformer Engine (TE) NVFP4 on
+16 GB300 GPUs. The vision tower and projector are frozen and do not run on text batches. As written, the recipe
+saves no checkpoint and has no validation set. Set `checkpoint.enabled` and add a validation dataset before a
+run whose model you keep; neither was exercised with this recipe.
+
+Precision follows the per-layer-type layout published for the model family in the
+[Nemotron 3 Super technical report](https://arxiv.org/abs/2604.12374) (section 2.2). The NVFP4 pretraining
+recipe is described in [arXiv:2509.25149](https://arxiv.org/abs/2509.25149). `te_nvfp4.precision_map` assigns it:
+
+| Precision | TE GEMM modules | Modules per rank |
+| --- | --- | ---: |
+| NVFP4 | Mamba input projections, routed experts, and shared experts of layers 0-73 | 166 |
+| MXFP8 | Mamba output projections of layers 0-73 | 34 |
+| BF16 | Every GEMM of the last 14 layers; the attention projections, latent projections, and Multi-Token Prediction (MTP) head | 163 |
+
+`lm_head` is a torch linear and stays in BF16. Parameters are BF16; TE `FusedAdam` keeps fp32 master weights
+and fp32 moments. Rank 0 logs the module counts at startup.
+
+| Property | Value |
+| --- | --- |
+| Hardware and software | 4 nodes with 4 GB300 GPUs each; NVFP4 needs Blackwell GPUs and TE 2.19 or newer |
+| Parallelism | FSDP2, `ep_size 16`, `tp_size 1`, `cp_size 1`, `pp_size 1` |
+| Batch | 128 sequences of 8,192 tokens per optimizer step, in 2 microbatches of 4 sequences per rank |
+| Model | 88-layer language model with 512 routed experts and the learned gate; MTP head trained with two depths |
+| Kernels | TE attention and linear layers, TE experts with one GEMM per expert, HybridEP, full-block activation checkpointing |
+| Optimizer | lr 3e-4 with 100 warmup steps from 3e-5 and cosine decay to 3e-5, weight decay 0.1, gradient clipping at 1.0 |
+
+Tokenize FineWeb with the model's tokenizer. The output path matches the recipe's `dataset.file_pattern`, and
+one billion tokens cover its 900 optimizer steps:
+
+```bash
+python tools/nanogpt_data_processor.py --dataset HuggingFaceFW/fineweb --set-name sample-10BT \
+  --max-tokens 1B --tokenizer nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 \
+  --output-dir fineweb_nemotron_3_5_super_vl
+```
+
+Launch on each of the 4 nodes from the repository root:
+
+```bash
+torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=$HEAD_NODE:29500 \
+  -m nemo_automodel.cli.app \
+  examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_gb300.yaml
+```
+
+The figure and table compare the recipe with the same file without its `te_nvfp4` block (BF16), which was run
+twice. All runs use the same seed, initial weights, and data order on 16 GB300 GPUs (TE 2.19.0) and train
+1,500 optimizer steps, 1.57 billion tokens. Two settings differ from the recipe as written: a 1,500-step cosine
+schedule (`--step_scheduler.max_steps 1500`) and 4.5 billion tokens of FineWeb `sample-10BT` in 16 shards, one
+per rank, read in stored order (`--dataset.file_pattern`). "Original BF16" in the figure is the BF16 run on the
+code before the Mamba and MoE optimizations that this recipe uses; it took 3.66 hours.
+
+![Training loss of Nemotron 3.5 Super VL pretraining on FineWeb with 16 GB300 GPUs, NVFP4 against BF16, by optimizer step and by wall-clock time](./nemotron-3-5-super-vl-nvfp4-gb300-loss.png)
+
+| Run | Optimizer steps | Mean training loss, steps 1,400-1,499 | Step time | Tokens/sec/GPU | Peak memory | Time for 1,500 steps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NVFP4 (the recipe) | 1,500 | 3.541 | 7.99 s | 8,203 | 205.6 GiB/GPU | 3.44 h |
+| BF16 (without `te_nvfp4`) | 1,500 | 3.521 | 8.37 s | 7,832 | 212.5 GiB/GPU | 3.60 h |
+| BF16, second run | 1,500 | 3.525 | 8.35 s | 7,849 | 212.1 GiB/GPU | 3.59 h |
+
+Step time is the median over steps 100-1,499, and peak memory is the `nvidia-smi` maximum of the busiest GPU.
+Over the last 100 steps the NVFP4 loss is 0.020 (0.57%) above the BF16 loss, and the two BF16 runs differ by
+0.004. NVFP4 was run once, so its own run-to-run difference is not measured. The NVFP4 step is 4.7% faster. At
+equal wall-clock time the NVFP4 loss is lower after 1 hour (4.84 against 4.91) and after 3 hours (3.58 against
+3.60). From 3.1 hours on it is not lower: within 0.005 of the BF16 loss up to 3.3 hours and 0.015 higher at
+3.4 hours, shortly before its schedule ends. These are training losses on batches seen once, not held-out
+quality measurements. The learned gate of a randomly initialized model routes tokens unevenly across ranks, so
+these token rates are lower than the balanced-routing rows on mock data in the
+[Performance Summary](/performance/performance-summary).
 
 ## Model Reference
 
