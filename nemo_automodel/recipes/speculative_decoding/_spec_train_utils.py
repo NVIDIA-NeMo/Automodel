@@ -47,7 +47,7 @@ from nemo_automodel.components.speculative.decode_eval import DecodeEvalConfig
 from nemo_automodel.components.speculative.regen_loop import RegenConfig
 from nemo_automodel.components.utils.compile_utils import compile_module_inplace
 from nemo_automodel.recipes._dist_utils import _normalize_activation_checkpointing
-from nemo_automodel.recipes._typed_config import _as_dict, compile_config_from_node, fp8_config_from_node
+from nemo_automodel.recipes._typed_config import compile_config_from_node, fp8_config_from_node
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +334,7 @@ def _read_worker_section(
     if every_steps <= 0:
         return None
 
-    values = _as_dict(block)
+    values = block.to_dict() if isinstance(block, ConfigNode) else dict(block)
     unknown = set(values) - {field.name for field in fields(config_type)}
     if unknown:
         raise ValueError(f"Unknown {section} option(s): {', '.join(sorted(unknown))}")
