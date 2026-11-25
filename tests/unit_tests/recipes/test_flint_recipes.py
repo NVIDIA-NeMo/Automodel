@@ -86,7 +86,7 @@ def test_bounded_control_keeps_full_lr_horizon_and_checkpoint_overlap(name: str)
             save_checkpoint_every_epoch=False,
             preemption_signal=None,
         )
-        schedule = LRSchedulerConfig(**raw["lr_scheduler"]).build(optimizer, steps)[0]
+        schedule = LRSchedulerConfig(**raw["lr_scheduler"]).build(optimizer, steps.total_steps)[0]
         observed = []
         saved = []
         checkpoint50 = None

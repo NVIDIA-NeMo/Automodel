@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch import nn
@@ -23,11 +25,7 @@ from nemo_automodel.components.models.deepseek_v41.config import (
 )
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
-
-
-class _Args(dict):
-    def __getattr__(self, name: str):
-        return self[name]
+from nemo_automodel.components.speculative.dspark.options import DSparkDraftOptions
 
 
 def _target_config() -> DeepseekV41Config:
@@ -61,21 +59,19 @@ def _target_config() -> DeepseekV41Config:
     return DeepseekV41Config(text_config=text, vision_config=DeepseekV41VisionConfig(num_hidden_layers=0))
 
 
-def _args(**overrides) -> _Args:
-    values = {
-        "num_draft_layers": 3,
-        "target_layer_ids": [0, 1],
-        "block_size": 5,
-        "num_anchors": 2,
-        "mask_token_id": 31,
-        "markov_rank": 4,
-        "markov_head_type": "vanilla",
-        "confidence_head_alpha": 1.0,
-        "confidence_head_with_markov": True,
-        "confidence_head_stop_gradient": False,
-    }
-    values.update(overrides)
-    return _Args(values)
+def _args(**overrides: int | float | str | list[int]) -> DSparkDraftOptions:
+    options = DSparkDraftOptions(
+        num_draft_layers=3,
+        target_layer_ids=[0, 1],
+        block_size=5,
+        num_anchors=2,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="vanilla",
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=True,
+    )
+    return replace(options, **overrides)
 
 
 def test_builder_forwards_confidence_head_stop_gradient() -> None:
@@ -83,7 +79,7 @@ def test_builder_forwards_confidence_head_stop_gradient() -> None:
     assert config.build_dspark_draft(_args()).confidence_head_stop_gradient is False
     model = config.build_dspark_draft(_args(confidence_head_stop_gradient=True))
     assert model.confidence_head_stop_gradient is True
-    assert model.mtp[-1].confidence_head.proj.weight.requires_grad
+    assert model.mtp[-1].get_parameter("confidence_head.proj.weight").requires_grad
 
 
 def test_builder_preserves_released_native_contract() -> None:
@@ -151,9 +147,9 @@ def test_training_forward_uses_shared_loss_and_stops_target_gradients() -> None:
         confidence_head_alpha=1.0,
     )
     loss.backward()
-    assert model.mtp[0].main_proj.weight.grad is not None
-    assert model.mtp[-1].markov_head.head.weight.grad is not None
-    assert model.mtp[-1].confidence_head.proj.weight.grad is not None
+    assert model.mtp[0].get_parameter("main_proj.weight").grad is not None
+    assert model.mtp[-1].get_parameter("markov_head.head.weight").grad is not None
+    assert model.mtp[-1].get_parameter("confidence_head.proj.weight").grad is not None
     assert model.embed_tokens.weight.grad is None
     assert model.lm_head.weight.grad is None
     assert target_features.grad is None

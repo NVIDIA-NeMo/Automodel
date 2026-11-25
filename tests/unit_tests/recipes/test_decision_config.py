@@ -178,17 +178,13 @@ def test_clm_example_native_optimizer_and_schedule_build_without_gpu():
     import torch
 
     from nemo_automodel.components.config.loader import ConfigNode
-    from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
     from nemo_automodel.recipes._typed_config import RecipeConfig
 
     root = Path(__file__).resolve().parents[3]
     config = RecipeConfig(ConfigNode(yaml.safe_load((root / "examples/decision/clm_soc_triage.yaml").read_text())))
     model = torch.nn.Linear(2, 1)
     optimizer = config.optimizer.build(model)
-    schedule = StepSchedulerConfig(global_batch_size=2, num_epochs=2, max_steps=6, preemption_signal=None).build(
-        dataloader=None, dp_group_size=1, local_batch_size=2
-    )
-    schedulers = config.lr_scheduler.build(optimizer, schedule)
+    schedulers = config.lr_scheduler.build(optimizer, total_steps=6)
     assert len(schedulers) == 1
     assert schedulers[0].lr_decay_steps == 6
     assert schedulers[0].lr_warmup_steps == 0

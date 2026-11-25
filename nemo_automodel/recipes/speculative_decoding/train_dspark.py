@@ -76,6 +76,7 @@ from nemo_automodel.components.speculative.dspark.config import (
     build_kimi_k3_draft_config,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
+from nemo_automodel.components.speculative.dspark.options import DSparkDraftOptions
 from nemo_automodel.components.speculative.dspark.registry import (
     ModelOwnedDSparkProvider,
     resolve_dspark_draft_spec,
@@ -1050,7 +1051,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
 
         draft_model = None
         if isinstance(target_config, ModelOwnedDSparkProvider):
-            margs = _DraftArgs(
+            options = DSparkDraftOptions(
                 num_draft_layers=draft_num_hidden_layers,
                 target_layer_ids=target_layer_ids,
                 block_size=self.block_size,
@@ -1062,7 +1063,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 confidence_head_with_markov=bool(recipe_cfg.get("confidence_head_with_markov", True)),
                 confidence_head_stop_gradient=bool(recipe_cfg.get("confidence_head_stop_gradient", False)),
             )
-            draft_model = target_config.build_dspark_draft(margs)
+            draft_model = target_config.build_dspark_draft(options)
         elif is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_kimi_k3_target:
             # Gemma4, DeepSeek V4, GLM-5.2, and Kimi K3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.

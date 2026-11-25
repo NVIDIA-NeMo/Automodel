@@ -913,7 +913,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build learning rate scheduler (None when no lr_scheduler section).
         self.lr_scheduler = (
-            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler.total_steps)
             if self.cfg.lr_scheduler is not None
             else None
         )

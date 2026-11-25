@@ -75,7 +75,6 @@ from nemo_automodel.components.models.clef.joint_schema_head import (
     load_joint_head,
 )
 from nemo_automodel.components.models.clef.stage import ClefStageManifest
-from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -370,6 +369,8 @@ class TrainClefDecisionRecipe(BaseRecipe):
         loss_cfg = self.loss_config
         loss_fn = loss_cfg.build()
         epochs = int(self.cfg.get("train.epochs", 2))
+        if epochs <= 0:
+            raise ValueError("train.epochs must be positive")
         local_bs = int(self.cfg.get("train.local_batch_size", 2))
         global_bs = int(self.cfg.get("train.global_batch_size", 32))
         world = self._get_dp_group_size()
@@ -400,11 +401,8 @@ class TrainClefDecisionRecipe(BaseRecipe):
                 "data.train contains no complete optimizer batch; reduce train.global_batch_size or add records"
             )
         total = epochs * steps_per_epoch
-        step_schedule = StepSchedulerConfig(
-            global_batch_size=global_bs, num_epochs=epochs, max_steps=total, preemption_signal=None
-        ).build(dataloader=None, dp_group_size=world, local_batch_size=local_bs, process_group=self._dp_group())
         schedulers = (
-            self.cfg.lr_scheduler.build([*self.optimizer, self.head_optimizer], step_schedule)
+            self.cfg.lr_scheduler.build([*self.optimizer, self.head_optimizer], total)
             if self.cfg.lr_scheduler is not None
             else []
         )

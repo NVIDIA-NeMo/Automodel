@@ -973,7 +973,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.num_epochs = self.step_scheduler.num_epochs
 
         self.lr_scheduler = (
-            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler.total_steps)
             if self.cfg.lr_scheduler is not None
             else None
         )

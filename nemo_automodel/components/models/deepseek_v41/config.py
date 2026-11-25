@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
 
@@ -29,21 +29,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.config import DistributedSetup
     from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
     from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
-
-
-class _DSparkDraftOptions(Protocol):
-    """Declarative DSpark settings supplied by the generic training recipe."""
-
-    num_draft_layers: int
-    target_layer_ids: list[int]
-    block_size: int
-    num_anchors: int
-    mask_token_id: int
-    markov_rank: int
-    markov_head_type: str
-    confidence_head_alpha: float
-    confidence_head_with_markov: bool
-    confidence_head_stop_gradient: bool
+    from nemo_automodel.components.speculative.dspark.options import DSparkDraftOptions
 
 
 class DeepseekV41TextConfig(PretrainedConfig):
@@ -496,7 +482,7 @@ class DeepseekV41Config(PretrainedConfig):
             raise TypeError("DeepSeek-V4.1 Engram requires the checkpoint's original fast tokenizer")
         return tokenizer
 
-    def build_dspark_draft(self, options: _DSparkDraftOptions) -> DeepseekV41DSparkModel:
+    def build_dspark_draft(self, options: DSparkDraftOptions) -> DeepseekV41DSparkModel:
         """Build the model-owned DSpark training adapter.
 
         Args:
@@ -507,16 +493,16 @@ class DeepseekV41Config(PretrainedConfig):
         """
         return DeepseekV41DSparkConfig(
             text_config=self.text_config,
-            num_draft_layers=int(options.num_draft_layers),
-            target_layer_ids=tuple(int(layer_id) for layer_id in options.target_layer_ids),
-            block_size=int(options.block_size),
-            num_anchors=int(options.num_anchors),
-            mask_token_id=int(options.mask_token_id),
-            markov_rank=int(options.markov_rank),
-            markov_head_type=str(options.markov_head_type),
-            confidence_head_alpha=float(options.confidence_head_alpha),
-            confidence_head_with_markov=bool(options.confidence_head_with_markov),
-            confidence_head_stop_gradient=bool(options.confidence_head_stop_gradient),
+            num_draft_layers=options.num_draft_layers,
+            target_layer_ids=tuple(options.target_layer_ids),
+            block_size=options.block_size,
+            num_anchors=options.num_anchors,
+            mask_token_id=options.mask_token_id,
+            markov_rank=options.markov_rank,
+            markov_head_type=options.markov_head_type,
+            confidence_head_alpha=options.confidence_head_alpha,
+            confidence_head_with_markov=options.confidence_head_with_markov,
+            confidence_head_stop_gradient=options.confidence_head_stop_gradient,
             quantization_config=copy.deepcopy(getattr(self, "quantization_config", None)),
         ).build()
 

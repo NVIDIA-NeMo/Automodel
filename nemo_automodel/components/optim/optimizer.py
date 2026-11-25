@@ -47,7 +47,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, Required, TypedDict, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict, cast
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
@@ -982,29 +982,6 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
 # ---------------------------------------------------------------------------
 
 
-class StepSchedule(Protocol):
-    """The training-loop lengths an LR schedule is derived from.
-
-    ``nemo_automodel.components.training.step_scheduler.StepScheduler`` provides them; the
-    recipe passes its scheduler in.
-    """
-
-    @property
-    def epoch_len(self) -> int | None:
-        """Optimizer steps per epoch, or ``None`` for an iterable/streaming dataloader."""
-        ...
-
-    @property
-    def num_epochs(self) -> int:
-        """Number of epochs to train."""
-        ...
-
-    @property
-    def max_steps(self) -> int | None:
-        """Cap on the number of optimizer steps, or ``None`` when unbounded."""
-        ...
-
-
 @dataclass
 class LRSchedulerConfig:
     """LR scheduler configuration.  ``None`` fields are computed by
@@ -1028,7 +1005,7 @@ class LRSchedulerConfig:
     def build(
         self,
         optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
-        step_scheduler: StepSchedule,
+        total_steps: int,
     ) -> list[OptimizerParamScheduler]:
         """Build one LR scheduler per optimizer.
 
@@ -1037,7 +1014,7 @@ class LRSchedulerConfig:
 
         Args:
             optimizer: The optimizer(s) to schedule.
-            step_scheduler: The step scheduler, used to derive total steps.
+            total_steps: Number of optimizer steps in the training schedule.
 
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
@@ -1049,19 +1026,6 @@ class LRSchedulerConfig:
             raise ValueError(
                 f"lr_warmup_steps must be an integer step count, got {self.lr_warmup_steps!r}. "
                 "Fractional warmup is not supported; set the number of warmup steps directly."
-            )
-        # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
-        # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
-        # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.
-        if step_scheduler.epoch_len is not None:
-            total_steps = step_scheduler.num_epochs * step_scheduler.epoch_len
-            if step_scheduler.max_steps is not None:
-                total_steps = min(total_steps, step_scheduler.max_steps)
-        elif step_scheduler.max_steps is not None:
-            total_steps = step_scheduler.max_steps
-        else:
-            raise ValueError(
-                "Cannot infer total steps for an iterable/streaming dataset; set step_scheduler.max_steps."
             )
         lr_decay_steps = self.lr_decay_steps if self.lr_decay_steps is not None else total_steps
         wd_incr_steps = self.wd_incr_steps if self.wd_incr_steps is not None else total_steps

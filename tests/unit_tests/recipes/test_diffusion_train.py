@@ -14,7 +14,6 @@
 
 import math
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -289,16 +288,12 @@ def _legacy_diffusion_lr(style: str, warmup: int, total: int, base_lr: float, st
 
 @pytest.mark.parametrize("style", ["constant", "cosine"])
 @pytest.mark.parametrize("warmup", [0, 500])
-def test_lr_scheduler_config_matches_legacy_diffusion_trajectories(style, warmup):
+def test_lr_scheduler_config_matches_legacy_diffusion_trajectories(style: str, warmup: int) -> None:
     base_lr = 1.0e-4
     total = 1000
     optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=base_lr)
-    step_scheduler = SimpleNamespace(epoch_len=100, num_epochs=10, max_steps=None)
 
-    schedulers = LRSchedulerConfig(lr_decay_style=style, lr_warmup_steps=warmup).build(
-        [optimizer],
-        step_scheduler,
-    )
+    schedulers = LRSchedulerConfig(lr_decay_style=style, lr_warmup_steps=warmup).build([optimizer], total_steps=total)
     assert len(schedulers) == 1
     scheduler = schedulers[0]
 
@@ -311,12 +306,11 @@ def test_lr_scheduler_config_matches_legacy_diffusion_trajectories(style, warmup
             )
 
 
-def test_lr_scheduler_config_rejects_fractional_warmup():
+def test_lr_scheduler_config_rejects_fractional_warmup() -> None:
     optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=1.0e-4)
-    step_scheduler = SimpleNamespace(epoch_len=100, num_epochs=10, max_steps=None)
 
     with pytest.raises(ValueError, match="Fractional warmup"):
-        LRSchedulerConfig(lr_warmup_steps=0.1).build([optimizer], step_scheduler)
+        LRSchedulerConfig(lr_warmup_steps=0.1).build([optimizer], total_steps=1000)
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,6 @@
 """Muown layout, state, grouping and per-expert update regressions."""
 
 import copy
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -270,9 +269,7 @@ def test_router_override_matches_adamw_and_preserves_matrix_groups(update_scale)
         [expected_router], lr=0.0005, betas=(0.8, 0.9), eps=1e-6, weight_decay=0.02, fused=True
     )
     # Also exercise the native scheduler: scalar LR must not become matrix LR.
-    schedule = LRSchedulerConfig(lr_warmup_steps=2, init_lr=0.0, min_lr=0.0003).build(
-        opt, SimpleNamespace(epoch_len=10, num_epochs=1, max_steps=10)
-    )[0]
+    schedule = LRSchedulerConfig(lr_warmup_steps=2, init_lr=0.0, min_lr=0.0003).build(opt, total_steps=10)[0]
     for step in range(5):
         if step:
             schedule.step(1)
@@ -335,9 +332,7 @@ def test_all_matrix_parameters_can_use_adamw_without_changing_scheduler_base():
     optimizer = config.build(model)[0]
     assert len(optimizer.param_groups) == 1
     assert optimizer.param_groups[0]["lr"] == 0.0005
-    schedule = LRSchedulerConfig(lr_warmup_steps=0, lr_decay_style="constant").build(
-        optimizer, SimpleNamespace(epoch_len=10, num_epochs=1, max_steps=10)
-    )[0]
+    schedule = LRSchedulerConfig(lr_warmup_steps=0, lr_decay_style="constant").build(optimizer, total_steps=10)[0]
     assert schedule.max_lr == 0.003
     assert optimizer.param_groups[0]["lr"] == 0.0005
     assert optimizer.param_groups[0]["weight_decay"] == 0.0

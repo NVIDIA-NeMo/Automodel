@@ -20,8 +20,9 @@ plus the contract and export a target's ``dspark/config.json`` selects.
 """
 
 import json
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,6 +35,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.models.minimax_m3_vl import dspark as minimax_m3_dspark
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
+from nemo_automodel.components.speculative.dspark.options import DSparkDraftOptions
 from nemo_automodel.components.speculative.dspark.registry import ModelOwnedDSparkProvider
 from nemo_automodel.recipes.speculative_decoding._dspark_warm_start import load_dspark_draft_weights
 
@@ -78,19 +80,19 @@ RELEASED_KEYS = {f"language_model.model.dspark.{key}" for key in RELEASED_DRAFT_
 }
 
 
-def _options(**overrides):
-    options = {
-        "num_draft_layers": RELEASED_LAYERS,
-        "target_layer_ids": TARGET_LAYER_IDS,
-        "block_size": RELEASED_BLOCK,
-        "mask_token_id": RELEASED_MASK,
-        "num_anchors": 8,
-        "markov_rank": RELEASED_MARKOV,
-        "markov_head_type": "vanilla",
-        "confidence_head_alpha": 1.0,
-        "confidence_head_with_markov": True,
-    }
-    return SimpleNamespace(**{**options, **overrides})
+def _options(**overrides: int | float | str | list[int]) -> DSparkDraftOptions:
+    options = DSparkDraftOptions(
+        num_draft_layers=RELEASED_LAYERS,
+        target_layer_ids=TARGET_LAYER_IDS,
+        block_size=RELEASED_BLOCK,
+        mask_token_id=RELEASED_MASK,
+        num_anchors=8,
+        markov_rank=RELEASED_MARKOV,
+        markov_head_type="vanilla",
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=True,
+    )
+    return replace(options, **overrides)
 
 
 def _target_config(name_or_path: str = "") -> MiniMaxM3VLConfig:
@@ -114,7 +116,7 @@ def _target_config(name_or_path: str = "") -> MiniMaxM3VLConfig:
     return config
 
 
-def _write_released_target(root: Path, **overrides) -> str:
+def _write_released_target(root: Path, **overrides: float | list[str]) -> str:
     """Write the part of MiniMax-M3.1-Flash ``dspark/config.json`` the draft reads."""
     target_text_config = _target_config().text_config
     text_config = {
@@ -169,7 +171,7 @@ def _finish_draft(model: MiniMaxM3DSparkModel, attn_implementation: str = "sdpa"
     return model
 
 
-def _build_minimax_m3_draft():
+def _build_minimax_m3_draft() -> MiniMaxM3DSparkModel:
     target_config = _target_config()
     assert isinstance(target_config, ModelOwnedDSparkProvider)
     model = target_config.build_dspark_draft(_options())
@@ -184,7 +186,7 @@ def _build_released_draft(root: Path, attn_implementation: str = "sdpa") -> Mini
     return _finish_draft(target_config.build_dspark_draft(_options()), attn_implementation)
 
 
-def test_minimax_m3_draft_forward_shapes():
+def test_minimax_m3_draft_forward_shapes() -> None:
     model = _build_minimax_m3_draft()
     b, s, block, anchors = 2, 16, 4, 8
     gen = torch.Generator().manual_seed(0)
@@ -201,7 +203,7 @@ def test_minimax_m3_draft_forward_shapes():
     assert torch.isfinite(out.draft_logits).all()
 
 
-def test_minimax_m3_rotary_device_resynced_after_to():
+def test_minimax_m3_rotary_device_resynced_after_to() -> None:
     """``RotaryEmbedding`` caches its frequencies via ``functools.cache`` keyed on
     the module instance, not a persistent buffer, so plain ``nn.Module._apply``
     (which only visits parameters/buffers) never touches it -- a later
@@ -219,20 +221,20 @@ def test_minimax_m3_rotary_device_resynced_after_to():
     assert model.rotary_emb.device == next(model.parameters()).device
 
 
-def test_minimax_m3_draft_reuses_dense_intermediate_size_field():
+def test_minimax_m3_draft_reuses_dense_intermediate_size_field() -> None:
     """The draft's MLP width should come from the routed-expert-scale
     ``intermediate_size`` (kept narrow), not the target-only wide
     ``dense_intermediate_size``."""
     model = _build_minimax_m3_draft()
-    assert model.layers[0].mlp.gate_proj.out_features == 2 * HIDDEN
+    assert model.get_parameter("layers.0.mlp.gate_proj.weight").shape[0] == 2 * HIDDEN
 
 
-def test_minimax_m3_flex_attention_compiles_with_dynamic_shapes(monkeypatch):
+def test_minimax_m3_flex_attention_compiles_with_dynamic_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
     captured = {}
 
-    def compile_fn(fn, **kwargs):
+    def compile_fn(fn: Callable[..., torch.Tensor], **kwargs: bool | str) -> Callable[..., torch.Tensor]:
         captured["fn"] = fn
         captured["kwargs"] = kwargs
         return fn
@@ -247,7 +249,7 @@ def test_minimax_m3_flex_attention_compiles_with_dynamic_shapes(monkeypatch):
         importlib.reload(minimax_m3_dspark)
 
 
-def test_recipe_config_path_resolves_the_model_owned_provider(tmp_path):
+def test_recipe_config_path_resolves_the_model_owned_provider(tmp_path: Path) -> None:
     """``AutoConfig`` must return the local config, not the Transformers built-in of the same name."""
     assert "MiniMaxM3SparseForConditionalGeneration" in MODEL_ARCH_MAPPING
     target_dir = Path(_write_released_target(tmp_path))
@@ -256,21 +258,21 @@ def test_recipe_config_path_resolves_the_model_owned_provider(tmp_path):
     target_config = AutoConfig.from_pretrained(str(target_dir))
     assert isinstance(target_config, ModelOwnedDSparkProvider)
     model = target_config.build_dspark_draft(_options())
-    assert model.layers[0].mlp.gate_proj.out_features == RELEASED_FFN
+    assert model.get_parameter("layers.0.mlp.gate_proj.weight").shape[0] == RELEASED_FFN
 
 
-def test_target_without_released_config_keeps_native_draft(tmp_path):
+def test_target_without_released_config_keeps_native_draft(tmp_path: Path) -> None:
     target_config = _target_config(str(tmp_path))
     model = target_config.build_dspark_draft(_options())
-    assert model.layers[0].mlp.gate_proj.out_features == target_config.text_config.intermediate_size
+    assert model.get_parameter("layers.0.mlp.gate_proj.weight").shape[0] == target_config.text_config.intermediate_size
     assert not hasattr(model, "state_dict_adapter")
     assert model._get_consolidated_hf_metadata_exporter(tokenizer=None, original_model_path=None) is None
 
 
-def test_released_config_sets_ffn_width(tmp_path):
+def test_released_config_sets_ffn_width(tmp_path: Path) -> None:
     model = _build_released_draft(tmp_path)
-    assert model.layers[0].mlp.gate_proj.out_features == RELEASED_FFN
-    assert model.layers[0].mlp.down_proj.in_features == RELEASED_FFN
+    assert model.get_parameter("layers.0.mlp.gate_proj.weight").shape[0] == RELEASED_FFN
+    assert model.get_parameter("layers.0.mlp.down_proj.weight").shape[1] == RELEASED_FFN
 
 
 @pytest.mark.parametrize(
@@ -286,7 +288,9 @@ def test_released_config_sets_ffn_width(tmp_path):
         {"confidence_head_with_markov": False},
     ],
 )
-def test_released_config_rejects_recipe_mismatch(tmp_path, override):
+def test_released_config_rejects_recipe_mismatch(
+    tmp_path: Path, override: dict[str, int | float | str | list[int]]
+) -> None:
     target_config = _target_config(_write_released_target(tmp_path))
     field = next(iter(override))
     with pytest.raises(ValueError, match=field):
@@ -297,7 +301,7 @@ def test_released_config_rejects_recipe_mismatch(tmp_path, override):
     "override",
     [{"dspark_use_dense_ffn": False}, {"layer_types": ["sliding_attention", "full_attention"]}],
 )
-def test_released_config_rejects_other_draft_shapes(tmp_path, override):
+def test_released_config_rejects_other_draft_shapes(tmp_path: Path, override: dict[str, bool | list[str]]) -> None:
     target_config = _target_config(_write_released_target(tmp_path, **override))
     with pytest.raises(ValueError, match="dense, sliding-window"):
         target_config.build_dspark_draft(_options())
@@ -315,13 +319,13 @@ def test_released_config_rejects_other_draft_shapes(tmp_path, override):
         {"swiglu_limit": 1.0},
     ],
 )
-def test_released_config_rejects_a_different_backbone(tmp_path, override):
+def test_released_config_rejects_a_different_backbone(tmp_path: Path, override: dict[str, float]) -> None:
     target_config = _target_config(_write_released_target(tmp_path, **override))
     with pytest.raises(ValueError, match=next(iter(override))):
         target_config.build_dspark_draft(_options())
 
 
-def test_released_config_names_a_missing_field(tmp_path):
+def test_released_config_names_a_missing_field(tmp_path: Path) -> None:
     target_dir = Path(_write_released_target(tmp_path))
     released_path = target_dir / "dspark" / "config.json"
     released = json.loads(released_path.read_text())
@@ -331,13 +335,13 @@ def test_released_config_names_a_missing_field(tmp_path):
         _target_config(str(target_dir)).build_dspark_draft(_options())
 
 
-def test_missing_released_config_warns(tmp_path, caplog):
+def test_missing_released_config_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("WARNING"):
         _target_config(str(tmp_path)).build_dspark_draft(_options())
     assert "has no dspark/config.json" in caplog.text
 
 
-def test_released_layout_requires_frozen_shared_weights(tmp_path):
+def test_released_layout_requires_frozen_shared_weights(tmp_path: Path) -> None:
     target_config = _target_config(_write_released_target(tmp_path))
     model = target_config.build_dspark_draft(_options())
     with pytest.raises(ValueError, match="freeze_embeddings"):
@@ -349,7 +353,9 @@ def test_released_layout_requires_frozen_shared_weights(tmp_path):
 
 
 @pytest.mark.parametrize("attn_implementation", ["sdpa", "flex_attention"])
-def test_released_window_hides_context_outside_it(tmp_path, monkeypatch, attn_implementation):
+def test_released_window_hides_context_outside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attn_implementation: str
+) -> None:
     """A block sees context at distance < window from each query, and nothing further back."""
     model = _build_released_draft(tmp_path, attn_implementation)
     sequence, anchor = 32, 24
@@ -379,7 +385,7 @@ def test_released_window_hides_context_outside_it(tmp_path, monkeypatch, attn_im
     assert not torch.equal(block_logits(oldest_visible), baseline)
 
 
-def test_released_export_names_match_the_release(tmp_path):
+def test_released_export_names_match_the_release(tmp_path: Path) -> None:
     model = _build_released_draft(tmp_path)
     adapter = model.state_dict_adapter
     exported = adapter.to_hf(model.state_dict())
@@ -392,13 +398,13 @@ def test_released_export_names_match_the_release(tmp_path):
         torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
 
 
-def test_adapter_rejects_keys_outside_the_draft(tmp_path):
+def test_adapter_rejects_keys_outside_the_draft(tmp_path: Path) -> None:
     model = _build_released_draft(tmp_path)
     with pytest.raises(ValueError, match="language_model.model.layers.0.mlp.weight"):
         model.state_dict_adapter.from_hf({"language_model.model.layers.0.mlp.weight": torch.zeros(1)})
 
 
-def test_warm_start_decodes_the_released_mxfp8_draft(tmp_path):
+def test_warm_start_decodes_the_released_mxfp8_draft(tmp_path: Path) -> None:
     model = _build_released_draft(tmp_path)
     embed_before = model.embed_tokens.weight.detach().clone()
     expected, source = {}, {}
@@ -434,20 +440,20 @@ def test_warm_start_decodes_the_released_mxfp8_draft(tmp_path):
     torch.testing.assert_close(state["embed_tokens.weight"], embed_before, rtol=0, atol=0)
 
 
-def test_adapter_rejects_an_fp8_weight_without_its_scale(tmp_path):
+def test_adapter_rejects_an_fp8_weight_without_its_scale(tmp_path: Path) -> None:
     adapter = _build_released_draft(tmp_path).state_dict_adapter
     key = "language_model.model.dspark.fc.weight"
     with pytest.raises(ValueError, match="missing its scale"):
         adapter.from_hf({key: torch.zeros(2, 2, dtype=torch.float8_e4m3fn)})
 
 
-def test_adapter_rejects_a_scale_without_its_weight(tmp_path):
+def test_adapter_rejects_a_scale_without_its_weight(tmp_path: Path) -> None:
     adapter = _build_released_draft(tmp_path).state_dict_adapter
     with pytest.raises(ValueError, match="no matching weight"):
         adapter.from_hf({"language_model.model.dspark.fc.weight_scale_inv": torch.zeros(2, 1, dtype=torch.uint8)})
 
 
-def test_released_checkpoint_exports_and_resumes(tmp_path):
+def test_released_checkpoint_exports_and_resumes(tmp_path: Path) -> None:
     model = _build_released_draft(tmp_path)
     checkpointer = Checkpointer(
         CheckpointingConfig(
