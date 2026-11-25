@@ -443,7 +443,7 @@ class GradientSketchConfig(OptimizerConfig):
 
         Raises:
             NotImplementedError: If ``model`` has several pipeline-parallel parts.
-            ValueError: If PEFT is enabled, or ``device_mesh`` uses HSDP or tensor parallelism.
+            ValueError: If PEFT is enabled, or ``device_mesh`` uses HSDP, tensor or pipeline parallelism.
         """
         # Local import keeps optimizer.py importable without the sketch package's dependencies at module load.
         from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
@@ -456,6 +456,8 @@ class GradientSketchConfig(OptimizerConfig):
             # Context parallelism is supported. Expert parallelism lives on the separate MoE mesh,
             # which this config never sees; ``clip_grads_for_optimizers`` rejects it at the first step.
             mesh_names = device_mesh.mesh_dim_names or ()
+            if "pp" in mesh_names and device_mesh["pp"].size() > 1:
+                raise ValueError("gradient sketch does not support pipeline parallelism")
             if "dp_replicate" in mesh_names and device_mesh["dp_replicate"].size() > 1:
                 raise ValueError("gradient sketch does not support HSDP")
             if "tp" in mesh_names and device_mesh["tp"].size() > 1:
