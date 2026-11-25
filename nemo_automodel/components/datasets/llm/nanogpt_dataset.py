@@ -126,7 +126,9 @@ def _bos_index_matches(bos_positions: np.ndarray, tokens: torch.Tensor, bos_toke
     Check that a loaded BOS index holds token positions of BOS tokens.
 
     Index files written before the index stored token positions hold byte offsets
-    instead; checking the first and last entries is enough to tell them apart.
+    instead. Past 2 GiB of data they can also mix int32 and int64 entries (NumPy 1.x
+    promotes the offsets), which decode as out-of-order int32 values. This checks the
+    order of all entries, but the tokens only at the first and last one.
 
     Args:
         bos_positions: int32 array of shape [n_bos] with BOS token positions.
@@ -134,10 +136,13 @@ def _bos_index_matches(bos_positions: np.ndarray, tokens: torch.Tensor, bos_toke
         bos_token: BOS token id.
 
     Returns:
-        True when the first and last entries are in range and point at ``bos_token``.
+        True when the entries strictly increase and the first and last ones are in
+        range and point at ``bos_token``.
     """
     if len(bos_positions) == 0:
         return True
+    if np.any(bos_positions[:-1] >= bos_positions[1:]):
+        return False
     ends = (int(bos_positions[0]), int(bos_positions[-1]))
     return all(0 <= pos < len(tokens) and tokens[pos].item() == bos_token for pos in ends)
 
@@ -426,7 +431,7 @@ class NanogptDataset(IterableDataset):
             bos_positions = _load_bos_index(file)
             if bos_positions is not None and not _bos_index_matches(bos_positions, tokens, self.bos_token):
                 logger.warning(
-                    "%s does not point at BOS tokens (written before the index stored token positions); "
+                    "%s does not hold increasing BOS token positions (written before the index stored token positions?); "
                     "falling back to linear BOS search. Regenerate it with tools/nanogpt_data_processor.py.",
                     Path(file).with_suffix(".bos.idx"),
                 )

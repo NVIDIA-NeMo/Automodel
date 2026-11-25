@@ -334,6 +334,8 @@ def test_bos_index_matches():
     assert _bos_index_matches(np.array([], dtype=np.int32), tokens, bos)
     assert not _bos_index_matches(np.array([0, 2], dtype=np.int32), tokens, bos)  # last entry is not BOS
     assert not _bos_index_matches(np.array([1024, 1030], dtype=np.int32), tokens, bos)  # stale byte offsets
+    assert not _bos_index_matches(np.array([3, 1, 0], dtype=np.int32), tokens, bos)  # BOS at both ends, but unordered
+    assert not _bos_index_matches(np.array([0, 3, 3], dtype=np.int32), tokens, bos)  # repeated entry
 
 
 def test_stale_bos_index_falls_back_to_linear_search(tmp_path, caplog):
@@ -347,6 +349,28 @@ def test_stale_bos_index_falls_back_to_linear_search(tmp_path, caplog):
         sample = next(iter(ds))
 
     assert sample["input_ids"] == [bos, 1, 2, 3]
+    assert "falling back to linear BOS search" in caplog.text
+
+
+def test_mixed_width_bos_index_falls_back_to_linear_search(tmp_path, caplog):
+    # With NumPy 1.x the old writer appended int64 byte offsets once the file position reached 2**31, after
+    # the int32 offsets of earlier chunks. Both ends of the decoded index point at BOS tokens of this shard.
+    bos = 50256
+    toks = np.zeros(1024 + 8, dtype=np.uint16)
+    toks[[0, 1024]] = bos
+    toks[1:4], toks[1025:1028] = [1, 2, 3], [4, 5, 6]
+    shard = _make_fake_shard(tmp_path, toks)
+    index = shard.with_suffix(".bos.idx")
+    index.write_bytes(np.array([1024, 2048], dtype=np.int32).tobytes() + np.array([2**31], dtype=np.int64).tobytes())
+    assert np.fromfile(index, dtype=np.int32).tolist() == [1024, 2048, -(2**31), 0]
+
+    ds = NanogptDataset(str(shard), seq_len=4, align_to_bos=True, bos_token=bos)
+    with caplog.at_level("WARNING"):
+        samples = iter(ds)
+        first, second = next(samples), next(samples)
+
+    assert first["input_ids"] == [bos, 1, 2, 3]
+    assert second["input_ids"] == [bos, 4, 5, 6]
     assert "falling back to linear BOS search" in caplog.text
 
 
