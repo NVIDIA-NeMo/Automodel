@@ -24,8 +24,6 @@ allowed among the autograd-saved tensors.
 from __future__ import annotations
 
 import json
-import os
-import socket
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -55,14 +53,9 @@ _SCENARIOS = (
     "padded_vocab_adapter",
     "inkling_chunked_head",
     "negative_infinity_chunk",
+    "large_common_logit_offset",
     "target_validation",
 )
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _data(vocab: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -239,6 +232,15 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         sharded = torch.nn.Parameter(distribute_tensor(_data(37)[0], flat, [Shard(0)]))
         with pytest.raises(ValueError, match="mesh size=4, reduction group size=1"):
             chunked.resolve_lm_weight(sharded, grad_reduce_group=singletons[rank])
+
+        # Both axes have two ranks but carry different samples, so reductions
+        # across these groups return a different weight gradient.
+        subgroup_weight = torch.nn.Parameter(distribute_tensor(_data(37)[0], hsdp["shard"], [Shard(0)]))
+        with pytest.raises(ValueError, match="ranks"):
+            chunked.resolve_lm_weight(subgroup_weight, grad_reduce_group=hsdp.get_group("replicate"))
+        assert isinstance(
+            chunked.resolve_lm_weight(subgroup_weight, grad_reduce_group=hsdp.get_group("shard")), ShardedLMHeadWeight
+        )
 
     def unsupported_placement_raises() -> None:
         weight, hidden, labels = _data(37)
@@ -462,6 +464,28 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         finally:
             linear_ce_base._STREAM_CHUNK_BYTES = old_budget
 
+    def large_common_logit_offset() -> None:
+        """Loss and gradients must retain the normalization even when the absolute logits dwarf it."""
+        old_budget = linear_ce_base._STREAM_CHUNK_BYTES
+        linear_ce_base._STREAM_CHUNK_BYTES = _WORLD_SIZE * 2 * 4
+        try:
+            # Each chunk holds rows from all ranks. The second chunk's largest logit is 8 larger.
+            weight = torch.tensor([[1.0, 0.0], [1.0, 8.0]] * _WORLD_SIZE)
+            hidden = torch.tensor([[1e8, 1.0]], requires_grad=True)
+            labels = torch.tensor([1])
+            dense_hidden = hidden.detach().clone().requires_grad_()
+            dense_weight = weight.clone().requires_grad_()
+            expected = F.cross_entropy(F.linear(dense_hidden, dense_weight), labels)
+            expected.backward()
+            sharded = torch.nn.Parameter(distribute_tensor(weight, flat, [Shard(0)]))
+            actual = chunked(hidden, labels, sharded, grad_reduce_group=world)
+            actual.backward()
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(sharded.grad.full_tensor(), dense_weight.grad)
+            torch.testing.assert_close(hidden.grad, dense_hidden.grad, atol=2e-6, rtol=1e-5)
+        finally:
+            linear_ce_base._STREAM_CHUNK_BYTES = old_budget
+
     def target_validation() -> None:
         """One bad rank fails all FSDP/HSDP peers before streaming; ignores stay valid."""
         for mesh, placements in ((flat, [Shard(0)]), (hsdp, [Replicate(), Shard(0)])):
@@ -517,6 +541,7 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "padded_vocab_adapter": padded_vocab_adapter,
         "inkling_chunked_head": inkling_chunked_head,
         "negative_infinity_chunk": negative_infinity_chunk,
+        "large_common_logit_offset": large_common_logit_offset,
         "target_validation": target_validation,
     }
     assert tuple(checks) == _SCENARIOS
@@ -532,11 +557,9 @@ def _run_scenarios(rank: int) -> dict[str, str]:
     return outcomes
 
 
-def _worker(rank: int, port: int, result_dir: str) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+def _worker(rank: int, result_dir: str) -> None:
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("gloo", init_method=(Path(result_dir) / "rdzv").as_uri(), rank=rank, world_size=_WORLD_SIZE)
     try:
         outcomes = _run_scenarios(rank)
     finally:
@@ -547,7 +570,7 @@ def _worker(rank: int, port: int, result_dir: str) -> None:
 @pytest.fixture(scope="module")
 def outcomes(tmp_path_factory: pytest.TempPathFactory) -> dict[str, list[str]]:
     result_dir = tmp_path_factory.mktemp("linear_ce_streamed")
-    mp.spawn(_worker, args=(_free_port(), str(result_dir)), nprocs=_WORLD_SIZE, join=True)
+    mp.spawn(_worker, args=(str(result_dir),), nprocs=_WORLD_SIZE, join=True)
     per_rank = [json.loads(Path(result_dir, f"rank{rank}.json").read_text()) for rank in range(_WORLD_SIZE)]
     return {name: [outcome[name] for outcome in per_rank] for name in _SCENARIOS}
 

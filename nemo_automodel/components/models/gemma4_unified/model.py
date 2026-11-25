@@ -30,6 +30,7 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import (
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_contiguous
 from nemo_automodel.components.models.common import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import call_hf_forward
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -190,7 +191,10 @@ class Gemma4UnifiedForConditionalGeneration(
                     position_ids,
                     mm_token_type_ids=mm_token_type_ids,
                 )
-            output = super().forward(
+            return call_hf_forward(
+                self,
+                super().forward,
+                compute_logits=compute_logits,
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
@@ -205,14 +209,10 @@ class Gemma4UnifiedForConditionalGeneration(
                 inputs_embeds=inputs_embeds,
                 labels=labels,
                 use_cache=use_cache,
-                # Hugging Face's forward always runs the head: without logits, project one position and drop it.
-                logits_to_keep=logits_to_keep if compute_logits else 1,
+                logits_to_keep=logits_to_keep,
                 mm_encoder_outputs=mm_encoder_outputs,
                 **kwargs,
             )
-            if not compute_logits:
-                output.logits = output.logits[..., :0]
-            return output
         if input_ids is None or inputs_embeds is not None or mm_encoder_outputs is not None:
             raise ValueError(
                 "Gemma4 Unified context parallelism requires input_ids, without inputs_embeds or mm_encoder_outputs."

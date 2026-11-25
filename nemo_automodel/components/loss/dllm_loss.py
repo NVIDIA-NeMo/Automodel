@@ -503,6 +503,10 @@ class SCDDLoss(nn.Module):
         x_0 = target_ids.to(shard.local.device)
 
         vocab = shard.vocab
+        if shard.group is not None:
+            # A sharded gather would otherwise return zero for an id that no rank owns.
+            valid_ids = (x_0 >= 0) & (x_0 < vocab) & (z_t >= 0) & (z_t < vocab)
+            torch._assert_async(valid_ids.all(), f"SCDD clean and noisy token ids must be in [0, {vocab})")
         # Domain of the denoiser: every token except the absorbing state.
         num_states = vocab - 1
 

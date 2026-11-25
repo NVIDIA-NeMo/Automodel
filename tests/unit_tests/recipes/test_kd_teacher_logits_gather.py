@@ -24,8 +24,6 @@ produced on every rank, while the other ranks return None, never call
 from __future__ import annotations
 
 import json
-import os
-import socket
 import traceback
 from pathlib import Path
 
@@ -35,12 +33,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 _WORLD_SIZE = 4
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _check(rank: int) -> None:
@@ -83,11 +75,9 @@ def _check(rank: int) -> None:
         assert actual is None
 
 
-def _worker(rank: int, port: int, result_dir: str) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+def _worker(rank: int, result_dir: str) -> None:
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("gloo", init_method=(Path(result_dir) / "rdzv").as_uri(), rank=rank, world_size=_WORLD_SIZE)
     try:
         try:
             _check(rank)
@@ -101,7 +91,7 @@ def _worker(rank: int, port: int, result_dir: str) -> None:
 
 @pytest.mark.runtime_budget(30, hard_timeout=90, reason="spawns four Gloo ranks once")
 def test_teacher_logits_assembled_on_transport_rank_only(tmp_path: Path) -> None:
-    mp.spawn(_worker, args=(_free_port(), str(tmp_path)), nprocs=_WORLD_SIZE, join=True)
+    mp.spawn(_worker, args=(str(tmp_path),), nprocs=_WORLD_SIZE, join=True)
     outcomes = [json.loads(Path(tmp_path, f"rank{rank}.json").read_text()) for rank in range(_WORLD_SIZE)]
     failures = [f"rank {rank}:\n{outcome}" for rank, outcome in enumerate(outcomes) if outcome != "ok"]
     assert not failures, "\n".join(failures)

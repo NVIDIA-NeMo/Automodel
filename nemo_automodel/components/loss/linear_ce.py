@@ -151,7 +151,7 @@ class _CCEVocabChunkKernel:
 
     def forward(
         self, hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """See :meth:`VocabChunkKernel.forward`; ``hidden`` and ``weight`` are bf16 or fp16 on CUDA."""
         lse = _cce_lse_forward.cce_lse_forward_kernel(e=hidden, c=weight, softcap=self.softcap)
         in_chunk = targets >= 0
@@ -159,14 +159,16 @@ class _CCEVocabChunkKernel:
         neg_dot = _cce_indexed_dot.indexed_neg_dot_forward_kernel(
             e=hidden, c=weight, inds=torch.where(in_chunk, targets, 0), softcap=self.softcap, out_dtype=torch.float32
         )
-        return lse, torch.where(in_chunk, -neg_dot, 0.0)
+        # CCE exposes the absolute chunk LSE, i.e. a partition of one relative to that shift.
+        return lse, torch.ones_like(lse), torch.where(in_chunk, -neg_dot, 0.0)
 
     def backward(
         self,
         hidden: torch.Tensor,
         weight: torch.Tensor,
         targets: torch.Tensor,
-        lse: torch.Tensor,
+        shift: torch.Tensor,
+        log_sum_exp: torch.Tensor,
         grad: torch.Tensor,
         *,
         need_hidden: bool,
@@ -183,7 +185,7 @@ class _CCEVocabChunkKernel:
             e=hidden.detach().requires_grad_(need_hidden),
             c=weight.detach().requires_grad_(need_weight),
             bias=None,
-            lse=lse,
+            lse=shift + log_sum_exp,
             valids=None,
             softcap=self.softcap,
             filter_eps=None,

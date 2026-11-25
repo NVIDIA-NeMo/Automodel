@@ -94,6 +94,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import call_hf_forward
 from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -1535,7 +1536,10 @@ class Gemma4ForConditionalGeneration(
             attention_mask = self.prepare_document_attention_mask(
                 attention_mask, mm_token_type_ids, kwargs.get("document_ids", kwargs.get("_packed_seq_ids"))
             )
-            output = super().forward(
+            return call_hf_forward(
+                self,
+                super().forward,
+                compute_logits=compute_logits,
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -1544,15 +1548,11 @@ class Gemma4ForConditionalGeneration(
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
                 mm_token_type_ids=mm_token_type_ids,
-                # Hugging Face's forward always runs the head: without logits, project one position and drop it.
-                logits_to_keep=logits_to_keep if compute_logits else 1,
+                logits_to_keep=logits_to_keep,
                 output_hidden_states=output_hidden_states,
                 past_key_values=kv_share_holder,
                 **kwargs,
             )
-            if not compute_logits:
-                output.logits = output.logits[..., :0]
-            return output
 
         # --- MoE forward path ---
         if cp_enabled:

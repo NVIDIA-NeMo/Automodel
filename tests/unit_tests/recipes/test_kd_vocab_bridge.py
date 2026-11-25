@@ -15,7 +15,7 @@
 """Real TP coverage of the separate-mesh KD bridge and its pipeline wrapper."""
 
 import datetime
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -27,7 +27,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tenso
 pytestmark = pytest.mark.cpu_only
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, init_method: str) -> None:
     """Compare bridge and PP loss/gradients on even, uneven, and empty TP shards."""
     from nemo_automodel.components.loss.kd_loss import KDLoss
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -36,7 +36,7 @@ def _worker(rank: int, port: int) -> None:
 
     torch.set_num_threads(1)
     dist.init_process_group(
-        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=4, timeout=datetime.timedelta(seconds=45)
+        "gloo", init_method=init_method, rank=rank, world_size=4, timeout=datetime.timedelta(seconds=45)
     )
     try:
         mesh = init_device_mesh("cpu", (4,))
@@ -92,9 +92,6 @@ def _worker(rank: int, port: int) -> None:
 
 
 @pytest.mark.runtime_budget(30, hard_timeout=90, reason="one four-rank Gloo spawn tests real KD and PP gradients")
-def test_kd_vocab_bridge_and_pp_wrapper() -> None:
+def test_kd_vocab_bridge_and_pp_wrapper(tmp_path: Path) -> None:
     """The bridge preserves the loss contract and torch.chunk vocabulary boundaries."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=4, join=True)
+    mp.spawn(_worker, args=((tmp_path / "rdzv").as_uri(),), nprocs=4, join=True)

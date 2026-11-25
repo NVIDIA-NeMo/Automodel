@@ -226,21 +226,24 @@ def logsumexp(local: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Ten
     return shift + torch.log(total)
 
 
-def log_softmax(local: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tensor:
+def log_softmax(
+    local: torch.Tensor, group: dist.ProcessGroup | None, *, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
     """Normalize vocabulary slices without subtracting an absolute log-sum-exp.
 
     Args:
         local: Tensor of shape [..., local_vocab] containing this rank's logits.
         group: Vocabulary-sharding group, or None for a whole vocabulary.
+        dtype: Dtype for normalization and returned log probabilities.
 
     Returns:
-        FP32 log probabilities of shape [..., local_vocab], normalized over the
+        Log probabilities in ``dtype`` of shape [..., local_vocab], normalized over the
         whole vocabulary. Centering before normalization preserves small log
         probabilities even when the logits have a large common offset.
     """
     if group is None:
-        return F.log_softmax(local, dim=-1, dtype=torch.float32)
-    local = local.float()
+        return F.log_softmax(local, dim=-1, dtype=dtype)
+    local = local.to(dtype)
     centered = local - _global_max(local, group).unsqueeze(-1)
     total = sum_over_group(centered.exp().sum(dim=-1), group)
     return centered - total.log().unsqueeze(-1)
@@ -365,11 +368,14 @@ def argmax(shard: VocabShard) -> torch.Tensor:
     else:
         value = local.new_full(local.shape[:-1], float("-inf"))
         index = torch.full(local.shape[:-1], shard.vocab, dtype=torch.long, device=local.device)
-    best = value.clone()
+    # Dense argmax picks the first NaN, even ahead of positive infinity.
+    nan = value.isnan()
+    best = value.masked_fill(nan, float("inf"))
     dist.all_reduce(best, op=dist.ReduceOp.MAX, group=shard.group)
     first = torch.where(value == best, index, torch.full_like(index, shard.vocab))
+    first = torch.where(nan, index - shard.vocab, first)
     dist.all_reduce(first, op=dist.ReduceOp.MIN, group=shard.group)
-    return first
+    return torch.where(first < 0, first + shard.vocab, first)
 
 
 def cross_entropy(shard: VocabShard, target: torch.Tensor, *, ignore_index: int) -> torch.Tensor:
@@ -382,9 +388,9 @@ def cross_entropy(shard: VocabShard, target: torch.Tensor, *, ignore_index: int)
         ignore_index: Target value excluded from the loss.
 
     Returns:
-        Tensor of shape [...] in ``shard.local.dtype``, zero at ignored
-        positions and the same on every rank. A sharded vocabulary is reduced in
-        FP32; an unsharded one uses ``F.cross_entropy`` in the input dtype.
+        Tensor of shape [...], zero at ignored positions and the same on every
+        rank. The result follows the input dtype and the autocast policy of
+        ``F.cross_entropy``. Reductions use at least FP32 precision.
     """
     if shard.group is None:
         return F.cross_entropy(
@@ -395,9 +401,12 @@ def cross_entropy(shard: VocabShard, target: torch.Tensor, *, ignore_index: int)
         ).reshape(target.shape)
     validate_targets(target, vocab=shard.vocab, ignore_index=ignore_index)
     target = target.long()
-    local = shard.local.float()
+    local = shard.local
+    compute_dtype = torch.promote_types(local.dtype, torch.float32)
     valid = target != ignore_index
     safe_target = torch.where(valid, target, torch.zeros_like(target))
-    loss = -gather(log_softmax(local, shard.group), safe_target, start=shard.start, group=shard.group)
+    log_probs = log_softmax(local, shard.group, dtype=compute_dtype)
+    loss = -gather(log_probs, safe_target, start=shard.start, group=shard.group)
     loss = torch.where(valid, loss, torch.zeros_like(loss))
-    return replicated(loss, shard.group).to(shard.local.dtype)
+    output_dtype = compute_dtype if torch.is_autocast_enabled(local.device.type) else local.dtype
+    return replicated(loss, shard.group).to(output_dtype)

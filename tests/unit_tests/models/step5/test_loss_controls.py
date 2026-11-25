@@ -36,6 +36,7 @@ def test_conditional_explicit_capability_and_defaults():
     parameters = inspect.signature(Step5ForConditionalGeneration.forward).parameters
     assert parameters["logits_to_keep"].default == 0
     assert parameters["output_hidden_states"].default is False
+    assert parameters["compute_logits"].default is True
     probe = Step5ForConditionalGeneration.__new__(Step5ForConditionalGeneration)
     nn.Module.__init__(probe)
     assert _supports_logits_to_keep(probe)
@@ -44,7 +45,12 @@ def test_conditional_explicit_capability_and_defaults():
 
 @pytest.mark.parametrize(
     "controls",
-    [{}, {"logits_to_keep": 2}, {"output_hidden_states": True}, {"logits_to_keep": 1, "output_hidden_states": True}],
+    [
+        {},
+        {"logits_to_keep": 2},
+        {"output_hidden_states": True},
+        {"compute_logits": False, "output_hidden_states": True},
+    ],
 )
 def test_conditional_forwards_loss_controls(monkeypatch, controls):
     model = Step5ForConditionalGeneration.__new__(Step5ForConditionalGeneration)
@@ -59,6 +65,7 @@ def test_conditional_forwards_loss_controls(monkeypatch, controls):
         inputs_embeds=None,
         logits_to_keep=controls.get("logits_to_keep", 0),
         output_hidden_states=controls.get("output_hidden_states", False),
+        compute_logits=controls.get("compute_logits", True),
         position_ids=positions,
     )
 
@@ -131,6 +138,9 @@ def test_conditional_public_outputs_keep_default_logits(conditional_model):
     torch.testing.assert_close(default.logits, explicit.logits)
     torch.testing.assert_close(retained.logits, default.logits[:, -2:, :])
     assert retained.hidden_states.shape == (1, 4, 32)
+    skipped = model(tokens, output_hidden_states=True, compute_logits=False)
+    assert skipped.logits.shape == (1, 4, 0)
+    torch.testing.assert_close(skipped.hidden_states, retained.hidden_states)
     indices = torch.tensor([0, 2])
     indexed = model(tokens, logits_to_keep=indices)
     torch.testing.assert_close(indexed.logits, default.logits[:, indices, :])

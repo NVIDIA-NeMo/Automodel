@@ -2774,6 +2774,8 @@ class TestForwardBackwardStepNonPP:
 
         # Create model and convert entirely to bfloat16
         model = CudaModelWithHiddenStates().cuda().bfloat16()
+        head_forward = MagicMock(wraps=model.lm_head.forward)
+        monkeypatch.setattr(model.lm_head, "forward", head_forward)
         non_pp_recipe = _create_non_pp_recipe(model, device="cuda")
         non_pp_recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
 
@@ -2801,6 +2803,7 @@ class TestForwardBackwardStepNonPP:
             is_train=True,
         )
 
+        head_forward.assert_not_called()
         assert len(loss_buffer) == 1
         assert isinstance(loss_buffer[0], torch.Tensor)
 

@@ -181,7 +181,8 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
             assert error * 10 < (control_grads[name].float() - reference_grad).norm(), name
 
 
-def test_vlm_validation_projects_chunked_ce_like_the_fp32_logits_head():
+def test_vlm_validation_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 0)
     model = _fp32_logits_llama()
     reference = copy.deepcopy(model)
     recipe = SimpleNamespace(

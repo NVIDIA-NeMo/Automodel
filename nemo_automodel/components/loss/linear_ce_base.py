@@ -18,7 +18,7 @@ A linear CE loss consumes the LM-head weight outside the owning FSDP module's
 forward. Gathering an FSDP-sharded head whole would hold a full
 ``[vocab, hidden]`` weight, plus a full-size gradient during backward, on every
 rank. Instead, :class:`ShardedLMHeadWeight` streams the head in vocabulary
-chunks. Forward all-gathers one chunk at a time and merges its log-sum-exp.
+chunks. Forward all-gathers one chunk at a time and merges its softmax normalization.
 Backward re-gathers each chunk and reduce-scatters its gradient straight into
 the local shard.
 """
@@ -49,8 +49,8 @@ class VocabChunkKernel(Protocol):
 
     def forward(
         self, hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the chunk's log-sum-exp and target logits.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the chunk's normalization and target logits.
 
         Args:
             hidden: Tensor of shape [tokens, hidden] holding supervised tokens only;
@@ -61,8 +61,8 @@ class VocabChunkKernel(Protocol):
                 in ``weight``, or -1 when the target row is in another chunk.
 
         Returns:
-            Two FP32 tensors of shape [tokens]: the log-sum-exp over the chunk's
-            logits, and each token's target logit (zero where ``targets`` is -1).
+            Three FP32 tensors of shape [tokens]: a shift, the sum of exponentials
+            relative to that shift, and the target logit (zero for a target outside this chunk).
         """
         ...
 
@@ -71,7 +71,8 @@ class VocabChunkKernel(Protocol):
         hidden: torch.Tensor,
         weight: torch.Tensor,
         targets: torch.Tensor,
-        lse: torch.Tensor,
+        shift: torch.Tensor,
+        log_sum_exp: torch.Tensor,
         grad: torch.Tensor,
         *,
         need_hidden: bool,
@@ -79,15 +80,14 @@ class VocabChunkKernel(Protocol):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return the chunk's share of the hidden-state and weight gradients.
 
-        Each token's loss is ``lse - target_logit`` over the whole vocabulary, so
-        the logit gradient is ``grad * (exp(logit - lse) - onehot(target))``.
+        Each token's probability is ``exp((logit - shift) - log_sum_exp)``.
 
         Args:
             hidden: Tensor of shape [tokens, hidden], as in :meth:`forward`.
             weight: Tensor of shape [chunk_vocab, hidden], as in :meth:`forward`.
             targets: Int64 tensor of shape [tokens], as in :meth:`forward`.
-            lse: FP32 tensor of shape [tokens], the log-sum-exp over the full
-                vocabulary.
+            shift: FP32 normalization shift of shape [tokens].
+            log_sum_exp: FP32 log-sum-exp over the full vocabulary relative to the shift, shape [tokens].
             grad: FP32 tensor of shape [tokens], the upstream gradient of each
                 token's loss.
             need_hidden: Whether to return the hidden-state gradient.
@@ -403,7 +403,7 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
         layout: _VocabShardLayout,
         kernel: VocabChunkKernel,
     ) -> torch.Tensor:
-        """Merge the log-sum-exp of every chunk, retaining no gathered rows.
+        """Merge the softmax normalization of every chunk, retaining no gathered rows.
 
         Args:
             ctx: Autograd context.
@@ -421,21 +421,29 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
         """
         owner = torch.div(targets, layout.rows_per_rank, rounding_mode="floor")
         offset = targets - owner * layout.rows_per_rank
-        lse = torch.full(targets.shape, float("-inf"), dtype=torch.float32, device=hidden.device)
-        target_logit = torch.zeros(targets.shape, dtype=torch.float32, device=hidden.device)
+        shift = torch.full_like(targets, float("-inf"), dtype=torch.float32)
+        sum_exp = torch.zeros_like(shift)
+        target_logit = torch.zeros_like(shift)
         for chunk, weight in layout.stream(shard):
             # Empty ranks still enter every collective, but have nothing to compute.
             if hidden.shape[0]:
-                chunk_lse, chunk_target = kernel.forward(hidden, weight, layout.chunk_targets(owner, offset, chunk))
-                lse = torch.logaddexp(lse, chunk_lse)
+                chunk_shift, chunk_sum, chunk_target = kernel.forward(
+                    hidden, weight, layout.chunk_targets(owner, offset, chunk)
+                )
+                next_shift = torch.maximum(shift, chunk_shift)
+                # A chunk of only -inf logits contributes zero, including when it is the first chunk.
+                origin = torch.where(next_shift.isneginf(), 0.0, next_shift)
+                sum_exp = sum_exp * (shift - origin).exp() + chunk_sum * (chunk_shift - origin).exp()
+                shift = next_shift
                 target_logit += chunk_target
-        ctx.save_for_backward(hidden, shard, owner, offset, lse)
+        log_sum_exp = sum_exp.log()
+        ctx.save_for_backward(hidden, shard, owner, offset, shift, log_sum_exp)
         ctx.layout = layout
         ctx.kernel = kernel
         ctx.device_type = hidden.device.type
         ctx.autocast_enabled = torch.is_autocast_enabled(ctx.device_type)
         ctx.autocast_dtype = torch.get_autocast_dtype(ctx.device_type)
-        return lse - target_logit
+        return (shift - target_logit) + log_sum_exp
 
     @staticmethod
     @torch.autograd.function.once_differentiable
@@ -445,8 +453,7 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
         """Re-gather each chunk and reduce-scatter its weight gradient into the shard.
 
         Args:
-            ctx: Context holding the forward inputs and the full-vocabulary
-                log-sum-exp of shape [tokens].
+            ctx: Context holding the forward inputs and per-token centered normalization.
             grad_loss: Tensor of shape [tokens], the upstream gradient of the
                 per-token losses.
 
@@ -455,7 +462,7 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
             ``shard`` ([local_vocab, hidden], shard dtype, averaged over the
             mesh), followed by three None entries.
         """
-        hidden, shard, owner, offset, lse = ctx.saved_tensors
+        hidden, shard, owner, offset, shift, log_sum_exp = ctx.saved_tensors
         layout: _VocabShardLayout = ctx.layout
         kernel: VocabChunkKernel = ctx.kernel
         need_hidden, need_weight = ctx.needs_input_grad[:2]
@@ -476,7 +483,8 @@ class _StreamedLinearCrossEntropy(torch.autograd.Function):
                         hidden,
                         weight,
                         layout.chunk_targets(owner, offset, chunk),
-                        lse,
+                        shift,
+                        log_sum_exp,
                         grad_loss,
                         need_hidden=need_hidden,
                         need_weight=need_weight,
@@ -590,7 +598,7 @@ def _chunk_lse_and_target(
     softcap: float | None,
     logits_dtype: torch.dtype | None,
     lm_head: LMHead | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project a token block and reduce its logits.
 
     Args:
@@ -603,12 +611,15 @@ def _chunk_lse_and_target(
         lm_head: The model's ``LMHead``, whose ``project`` gives the chunk's logits; None projects plainly.
 
     Returns:
-        Two FP32 tensors of shape [tokens]: the chunk log-sum-exp and target
-        logit, zero where ``targets`` is -1.
+        Three FP32 tensors of shape [tokens]: the maximum, the shifted sum of exponentials,
+        and the target logit (zero where ``targets`` is -1).
     """
     logits = _chunk_logits(hidden, weight, softcap, logits_dtype, lm_head)
     target_logit = logits.gather(-1, targets.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-    return torch.logsumexp(logits, dim=-1), torch.where(targets >= 0, target_logit, 0.0)
+    shift = logits.amax(dim=-1)
+    origin = torch.where(shift.isneginf(), 0.0, shift)
+    sum_exp = (logits - origin.unsqueeze(-1)).exp().sum(dim=-1)
+    return shift, sum_exp, torch.where(targets >= 0, target_logit, 0.0)
 
 
 _compiled_chunk_lse_and_target = torch.compile(_chunk_lse_and_target, dynamic=True)
@@ -641,7 +652,7 @@ class TorchVocabChunkKernel:
         self.token_block = token_block
         self.softcap = softcap
         self.logits_dtype = logits_dtype
-        self._compute: Callable[..., tuple[torch.Tensor, torch.Tensor]] = (
+        self._compute: Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
             _compiled_chunk_lse_and_target if compile else _chunk_lse_and_target
         )
         self._project: Callable[..., torch.Tensor] = _compiled_chunk_logits if compile else _chunk_logits
@@ -651,24 +662,26 @@ class TorchVocabChunkKernel:
 
     def forward(
         self, hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """See :meth:`VocabChunkKernel.forward`."""
-        lse = torch.empty(targets.shape, dtype=torch.float32, device=hidden.device)
-        target_logit = torch.empty_like(lse)
+        shift = torch.empty_like(targets, dtype=torch.float32)
+        sum_exp = torch.empty_like(shift)
+        target_logit = torch.empty_like(shift)
         block = self._block_len(hidden.shape[0])
         for start in range(0, hidden.shape[0], block):
             end = start + block
-            lse[start:end], target_logit[start:end] = self._compute(
+            shift[start:end], sum_exp[start:end], target_logit[start:end] = self._compute(
                 hidden[start:end], weight, targets[start:end], self.softcap, self.logits_dtype, self.lm_head
             )
-        return lse, target_logit
+        return shift, sum_exp, target_logit
 
     def backward(
         self,
         hidden: torch.Tensor,
         weight: torch.Tensor,
         targets: torch.Tensor,
-        lse: torch.Tensor,
+        shift: torch.Tensor,
+        log_sum_exp: torch.Tensor,
         grad: torch.Tensor,
         *,
         need_hidden: bool,
@@ -692,7 +705,7 @@ class TorchVocabChunkKernel:
                 local_hidden = hidden[start:end].detach().requires_grad_(need_hidden)
                 logits = self._project(local_hidden, local_weight, self.softcap, self.logits_dtype, self.lm_head)
                 with torch.no_grad():
-                    grad_logits = torch.exp(logits - lse[start:end].unsqueeze(-1))
+                    grad_logits = torch.exp((logits - shift[start:end, None]) - log_sum_exp[start:end, None])
                     block_targets = targets[start:end]
                     grad_logits.scatter_add_(
                         -1, block_targets.clamp(min=0).unsqueeze(-1), -(block_targets >= 0).float().unsqueeze(-1)
@@ -723,7 +736,7 @@ class LinearCrossEntropy(nn.Module):
                 tensor, a DTensor sharded by FSDP or HSDP on the vocabulary axis,
                 or an already resolved :class:`ShardedLMHeadWeight`.
             grad_reduce_group: Group of ranks contributing independent token
-                losses. Its size must match the DTensor mesh when a weight
+                losses. Its ranks must match the DTensor mesh when a weight
                 gradient is produced.
 
         Returns:
@@ -749,6 +762,12 @@ class LinearCrossEntropy(nn.Module):
                     f"DTensor mesh: mesh size={mesh_world_size}, reduction group size={reduce_world_size}. "
                     "Tensor-parallel or hierarchical layouts need an explicit compatible loss path."
                 )
+            # Equal-sized DP and TP subgroups can have different membership. The stream reduces
+            # weight gradients on the weight mesh, which must own these exact independent samples.
+            if 1 < mesh_world_size < dist.get_world_size():
+                mesh_ranks = set(lm_weight.device_mesh.mesh.flatten().tolist())
+                if mesh_ranks != set(dist.get_process_group_ranks(grad_reduce_group)):
+                    raise ValueError("grad_reduce_group and the LM-head DTensor mesh must contain the same ranks")
         if mesh_world_size == 1:
             return lm_weight.to_local()
         return ShardedLMHeadWeight(weight=lm_weight, dtype=lm_weight.dtype)

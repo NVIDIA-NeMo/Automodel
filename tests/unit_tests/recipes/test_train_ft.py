@@ -3787,8 +3787,8 @@ def test_default_collater_batches_per_sample_dataset_id():
     assert out["input_ids"].shape == (2, 4)
 
 
-@pytest.mark.parametrize("tied", [False, True])
-def test_recipe_profiles_model_and_loss_without_full_logits(tied):
+@pytest.mark.parametrize(("tied", "wrapped"), [(False, True), (True, True), (False, False)])
+def test_recipe_profiles_model_and_loss_without_full_logits(tied, wrapped):
     import torch.nn.functional as F
     from torch.profiler import ProfilerActivity, profile
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -3808,9 +3808,10 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
         tie_word_embeddings=tied,
         use_cache=False,
     )
-    # The loader gives a Hugging Face model's forward the compute_logits option.
+    # A raw HF factory is also a supported recipe target and exposes only logits_to_keep.
     model = LlamaForCausalLM(config)
-    model.__class__ = _get_mixin_wrapped_class(LlamaForCausalLM)
+    if wrapped:
+        model.__class__ = _get_mixin_wrapped_class(LlamaForCausalLM)
     reference = LlamaForCausalLM(config)
     reference.load_state_dict(model.state_dict())
     recipe = SimpleNamespace(

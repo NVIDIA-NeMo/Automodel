@@ -124,6 +124,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
     filter_forward_kwargs,
+    forward_for_linear_ce,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
@@ -1384,8 +1385,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             with train_ctx(), sync_ctx, te_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # The loss projects the final hidden states itself, so the model skips its LM head.
-                    out = model(**{**batch, "compute_logits": False, "output_hidden_states": True})
+                    out = forward_for_linear_ce(model, batch)
                     if "hidden_states" not in out:
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."

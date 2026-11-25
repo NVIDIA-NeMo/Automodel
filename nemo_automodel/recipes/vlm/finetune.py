@@ -105,7 +105,12 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import (
+    VLM_INPUT_KEYS,
+    _supports_logits_to_keep,
+    filter_forward_kwargs,
+    forward_for_linear_ce,
+)
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -1114,8 +1119,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # The loss projects the final hidden states itself, so the model skips its LM head.
-                    out = model(**{**batch, "compute_logits": False, "output_hidden_states": True})
+                    out = forward_for_linear_ce(model, batch)
                     if "hidden_states" not in out:
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
@@ -1392,7 +1396,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, LinearCrossEntropy):
-                        out = self.model_parts[0](**{**batch, "compute_logits": False, "output_hidden_states": True})
+                        out = forward_for_linear_ce(self.model_parts[0], batch)
                     else:
                         out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(

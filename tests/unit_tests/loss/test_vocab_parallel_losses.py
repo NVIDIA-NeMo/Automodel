@@ -26,11 +26,10 @@ the whole vocabulary. Vocabularies of 13 and 9 ids give uneven shards
 from __future__ import annotations
 
 import json
-import os
-import socket
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -47,6 +46,10 @@ _SCENARIOS = (
     "kd_loss_reads_a_sharded_teacher_whole",
     "kd_loss_rejects_mixed_layouts",
     "large_logit_offsets",
+    "ce_precision",
+    "kd_global_vocab",
+    "scdd_invalid_tokens",
+    "argmax_nan",
     "target_validation",
     "mdlm_and_encoder_ar",
     "hybrid_legacy_concat",
@@ -56,12 +59,6 @@ _SCENARIOS = (
     "dflash_nll_and_argmax",
     "argmax_ties_and_layout_errors",
 )
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _vocab_range(vocab: int, rank: int) -> tuple[int, int]:
@@ -303,6 +300,41 @@ def _run_scenarios(rank: int) -> dict[str, str]:
             torch.testing.assert_close(local_s.grad, dense_s.grad[..., start:end], atol=1e-6, rtol=1e-5)
             torch.testing.assert_close(local_t.grad, dense_t.grad[..., start:end], atol=1e-6, rtol=1e-5)
 
+    def ce_precision() -> None:
+        # FP32 cannot distinguish adjacent FP64 logits at this offset.
+        labels = randint(9, 2, 3)
+        logits = (1e10 + torch.arange(9, dtype=torch.float64)).expand(2, 3, 9)
+        loss = MaskedCrossEntropy(fp32_upcast=False)
+        _check_parity(mesh, logits, lambda x: loss(x, labels))
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            _check_parity(mesh, randn(2, 3, 9).bfloat16(), lambda x: loss(x, labels), rtol=0.01, atol=0.01)
+
+    def kd_global_vocab() -> None:
+        # The first three ranks have the same width and start for both vocabularies.
+        # Forbid entering the collective on a subset of ranks, even if the check regresses.
+        _, student = _as_sharded(mesh, randn(2, 3, 13), requires_grad=False)
+        _, teacher = _as_sharded(mesh, randn(2, 3, 14), requires_grad=False)
+        with patch("nemo_automodel.components.loss.kd_loss._kl_forward_tp", side_effect=AssertionError("entered KL")):
+            with pytest.raises(ValueError, match="vocabulary"):
+                KDLoss()(student, teacher, randint(13, 2, 3))
+
+    def scdd_invalid_tokens() -> None:
+        _, logits = _as_sharded(mesh, randn(1, 2, 9), requires_grad=False)
+        loss = SCDDLoss(mask_token_id=5)
+        clean = torch.tensor([[0, 1]])
+        for x0, zt in ((clean - 1, clean), (clean, clean + 8)):
+            with pytest.raises(RuntimeError):
+                loss(logits, x0, None, torch.full((1, 2), 0.5), torch.ones_like(clean), noisy_input_ids=zt)
+
+    def argmax_nan() -> None:
+        logits = randn(3, 9)
+        logits[0, 3] = logits[0, 8] = torch.nan
+        logits[1, 4] = torch.inf
+        logits[1, 7] = torch.nan
+        logits[2] = -torch.inf
+        shard = vocab_parallel.vocab_shard(_as_sharded(mesh, logits, requires_grad=False)[1])
+        assert torch.equal(vocab_parallel.argmax(shard), logits.argmax(-1))
+
     def target_validation() -> None:
         """Reject invalid ids/dtypes while preserving edge ids and custom ignores."""
         logits = randn(2, 3, 9)
@@ -450,6 +482,10 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         "kd_loss_reads_a_sharded_teacher_whole": kd_loss_reads_a_sharded_teacher_whole,
         "kd_loss_rejects_mixed_layouts": kd_loss_rejects_mixed_layouts,
         "large_logit_offsets": large_logit_offsets,
+        "ce_precision": ce_precision,
+        "kd_global_vocab": kd_global_vocab,
+        "scdd_invalid_tokens": scdd_invalid_tokens,
+        "argmax_nan": argmax_nan,
         "target_validation": target_validation,
         "mdlm_and_encoder_ar": mdlm_and_encoder_ar,
         "hybrid_legacy_concat": hybrid_legacy_concat,
@@ -465,18 +501,16 @@ def _run_scenarios(rank: int) -> dict[str, str]:
         try:
             check()
             outcomes[name] = "ok"
-        except Exception:
+        except (Exception, pytest.fail.Exception):
             outcomes[name] = traceback.format_exc()
         # A failed scenario must not desynchronize the collectives of the next one.
         dist.barrier()
     return outcomes
 
 
-def _worker(rank: int, port: int, result_dir: str) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+def _worker(rank: int, result_dir: str) -> None:
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+    dist.init_process_group("gloo", init_method=(Path(result_dir) / "rdzv").as_uri(), rank=rank, world_size=_WORLD_SIZE)
     try:
         outcomes = _run_scenarios(rank)
     finally:
@@ -487,7 +521,7 @@ def _worker(rank: int, port: int, result_dir: str) -> None:
 @pytest.fixture(scope="module")
 def outcomes(tmp_path_factory: pytest.TempPathFactory) -> dict[str, list[str]]:
     result_dir = tmp_path_factory.mktemp("vocab_parallel_losses")
-    mp.spawn(_worker, args=(_free_port(), str(result_dir)), nprocs=_WORLD_SIZE, join=True)
+    mp.spawn(_worker, args=(str(result_dir),), nprocs=_WORLD_SIZE, join=True)
     per_rank = [json.loads(Path(result_dir, f"rank{rank}.json").read_text()) for rank in range(_WORLD_SIZE)]
     return {name: [outcome[name] for outcome in per_rank] for name in _SCENARIOS}
 

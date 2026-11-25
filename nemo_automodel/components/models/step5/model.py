@@ -522,6 +522,7 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
         num_patches: torch.Tensor | list[int] | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool = False,
+        compute_logits: bool = True,
         **kwargs: ConfigValue | torch.Tensor,
     ) -> CausalLMOutputWithPast | torch.Tensor:
         """Inject projected crop/overview tokens and run the text backbone.
@@ -535,6 +536,7 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
             logits_to_keep: Last-token count, or a tensor of shape
                 [selected_sequence] with sequence indices to project. Zero keeps all positions.
             output_hidden_states: Attach final hidden states for native fused CE.
+            compute_logits: Whether to project the hidden states into vocabulary logits.
             **kwargs: Tensor and scalar arguments with the layouts documented by Step5ForCausalLM.forward.
 
         Returns:
@@ -589,6 +591,7 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
             inputs_embeds=inputs_embeds,
             logits_to_keep=logits_to_keep,
             output_hidden_states=output_hidden_states,
+            compute_logits=compute_logits,
             **kwargs,
         )
 

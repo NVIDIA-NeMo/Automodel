@@ -103,14 +103,20 @@ def test_hugging_face_forward_projects_one_position_without_logits(
     input_ids = torch.randint(5, 29, (2, 6), generator=torch.Generator().manual_seed(1))
 
     with torch.no_grad():
-        with_logits = model(input_ids=input_ids, output_hidden_states=True)
+        with_logits = model(input_ids=input_ids, output_hidden_states=True, use_cache=False)
         projected.clear()
-        output = model(input_ids=input_ids, output_hidden_states=True, compute_logits=False)
+        output = model(input_ids=input_ids, output_hidden_states=True, use_cache=False, compute_logits=False)
+        tuple_output = model(
+            input_ids=input_ids, output_hidden_states=True, use_cache=False, compute_logits=False, return_dict=False
+        )
 
     assert with_logits.logits.shape == (2, 6, vocab_size)
     # Hugging Face's forward runs the head, so it projects only the last position, and the logits stay empty.
-    assert projected == [torch.Size([2, 1])]
+    assert projected == [torch.Size([2, 1])] * 2
     assert output.logits.shape[-1] == 0
+    assert isinstance(tuple_output, tuple)
+    torch.testing.assert_close(tuple_output, output.to_tuple(), rtol=0, atol=0)
+    assert tuple_output[0].untyped_storage().nbytes() == 0
     assert not leaf_tensors_requiring_grad(output)
     torch.testing.assert_close(get_final_hidden_states(output), get_final_hidden_states(with_logits), rtol=0, atol=0)
 
@@ -175,6 +181,37 @@ def test_loaded_hugging_face_class_takes_compute_logits():
     assert output.logits.shape == (2, 1, 0)
     assert not leaf_tensors_requiring_grad(output)
     torch.testing.assert_close(output.hidden_states[-1], expected.hidden_states[-1], rtol=0, atol=0)
+
+    with torch.no_grad():
+        expected_loss = reference(input_ids=input_ids, labels=input_ids).loss
+        loss, empty_logits = model(input_ids, labels=input_ids, compute_logits=False, return_dict=False)
+        torch.testing.assert_close(loss, expected_loss)
+        assert empty_logits.shape == (*input_ids.shape, 0)
+
+    # Cover an explicit tuple request and the model-wide default. Passing logits_to_keep
+    # positionally must still allow compute_logits=False to limit the head to one position.
+    with torch.no_grad():
+        # Llama reads named outputs from its decoder, which has its own return format.
+        model.config = copy.deepcopy(model.config)
+        for config_default, options in [(True, {"return_dict": False}), (False, {})]:
+            model.config.return_dict = config_default
+            result = model(
+                input_ids,
+                None,
+                None,
+                None,
+                None,
+                None,
+                False,
+                3,
+                compute_logits=False,
+                output_hidden_states=True,
+                **options,
+            )
+            assert isinstance(result, tuple)
+            assert result[0].shape == (2, 1, 0)
+            assert result[0].untyped_storage().nbytes() == 0
+            torch.testing.assert_close(result[1][-1], expected.hidden_states[-1])
 
 
 def test_hugging_face_forward_without_logits_to_keep_is_not_wrapped():

@@ -37,7 +37,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, call_hf_forward, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -403,7 +403,10 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         )
         use_packed_media_path = cp_size <= 1 and has_media and has_packed_flash_metadata
         if cp_size <= 1 and not use_packed_media_path:
-            output = super().forward(
+            return call_hf_forward(
+                self,
+                super().forward,
+                compute_logits=compute_logits,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -417,13 +420,9 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                 mm_token_type_ids=mm_token_type_ids,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                # Hugging Face's forward always runs the head: without logits, project one position and drop it.
-                logits_to_keep=logits_to_keep if compute_logits else 1,
+                logits_to_keep=logits_to_keep,
                 **kwargs,
             )
-            if not compute_logits:
-                output.logits = output.logits[..., :0]
-            return output
 
         if input_ids is None:
             if inputs_embeds is None:

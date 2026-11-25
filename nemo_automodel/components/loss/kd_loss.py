@@ -43,17 +43,17 @@ def _forward_kl_from_log_probs(
     return (teacher_prob * log_ratio).sum(dim=-1)
 
 
-def _vocab_layout(shard: vocab_parallel.VocabShard) -> tuple[tuple[int, ...] | None, int, int]:
+def _vocab_layout(shard: vocab_parallel.VocabShard) -> tuple[tuple[int, ...] | None, int, int, int]:
     """Return a vocabulary slice's comparable layout.
 
     Args:
         shard: Logits of global shape [..., vocab] held locally as [..., local_vocab].
 
     Returns:
-        The group's ranks (or None), first vocabulary id, and local vocabulary size.
+        The group's ranks (or None), global vocabulary size, first id, and local vocabulary size.
     """
     ranks = None if shard.group is None else tuple(torch.distributed.get_process_group_ranks(shard.group))
-    return ranks, shard.start, shard.local.shape[-1]
+    return ranks, shard.vocab, shard.start, shard.local.shape[-1]
 
 
 def _kl_forward_tp(
@@ -232,8 +232,8 @@ class KDLoss(nn.Module):
                 raise ValueError(
                     "KDLoss needs student and teacher logits with one vocabulary layout: both sharded on the "
                     "vocabulary axis over the same group, or both holding the whole vocabulary. Got student ids "
-                    f"[{student.start}, {student.start + student.local.shape[-1]}) and teacher ids "
-                    f"[{teacher.start}, {teacher.start + teacher.local.shape[-1]}). Slice whole teacher logits to "
+                    f"[{student.start}, {student.start + student.local.shape[-1]}) of {student.vocab} and teacher ids "
+                    f"[{teacher.start}, {teacher.start + teacher.local.shape[-1]}) of {teacher.vocab}. Slice whole teacher logits to "
                     "the student's shard first (KDMeshBridge.match_student_vocab_shard)."
                 )
             tp_group = student.group

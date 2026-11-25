@@ -78,7 +78,7 @@ def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype, lm_h
         lm_head: Optional ``LMHead`` whose ``project`` gives the chunk's logits.
 
     Returns:
-        FP32 tensors of shape [tokens]: the chunk log-sum-exp and target logits.
+        FP32 tensors of shape [tokens]: the chunk maximum, shifted sum of exponentials, and target logits.
     """
     from nemo_automodel.components.loss import linear_ce_base
 

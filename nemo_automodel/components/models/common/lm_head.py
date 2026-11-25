@@ -277,16 +277,49 @@ class LMHead(nn.Linear):
         return new_head.train(head.training)
 
 
-def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., ModelOutput]:
+def call_hf_forward(
+    model: "PreTrainedModel", forward: Callable[..., ModelOutput], *, compute_logits: bool, **kwargs: Any
+) -> ModelOutput | tuple:
+    """Call a bound HF forward, preserving its output format when skipping logits.
+
+    Args:
+        model: Model whose config supplies the default return format.
+        forward: Bound HF causal language model forward.
+        compute_logits: Whether to retain logits.
+        **kwargs: Named forward inputs, including an optional return_dict override.
+
+    Returns:
+        The requested HF output, with an empty vocabulary dimension when skipping logits.
+    """
+    if compute_logits:
+        return forward(**kwargs)
+    return_dict = kwargs.get("return_dict")
+    if return_dict is None:
+        return_dict = model.config.return_dict
+    # The recipes compute loss externally. A caller requesting HF's own loss
+    # still needs every selected position to align with its labels.
+    if kwargs.get("labels") is None and kwargs.get("shift_labels") is None:
+        kwargs["logits_to_keep"] = 1
+    if not return_dict:
+        # Get named fields before converting: optional losses can precede logits in the tuple.
+        kwargs["return_dict"] = True
+    output = forward(**kwargs)
+    # Fused upstream losses can already omit logits entirely.
+    if (logits := output.get("logits")) is not None:
+        output["logits"] = logits.new_empty((*logits.shape[:-1], 0))
+    return output if return_dict else output.to_tuple()
+
+
+def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., ModelOutput | tuple]:
     """Give a Hugging Face forward the ``compute_logits`` option that the repo's forwards take.
 
     Args:
         forward: Hugging Face ``forward``, which always runs its head.
 
     Returns:
-        ``forward`` with a keyword-only ``compute_logits``, True by default. False projects the last position only
-        and returns the output with empty logits of shape [batch, 1, 0]. Its signature is ``forward``'s plus
-        ``compute_logits``, so signature-based checks see the parameters ``forward`` takes. A forward that already
+        ``forward`` with a keyword-only ``compute_logits``, True by default. False discards the logits after projecting
+        only the last position, unless labels require the original positions for the upstream loss. Its signature
+        adds ``compute_logits``, so signature-based checks see the parameters ``forward`` takes. A forward that already
         takes ``compute_logits``, or takes no ``logits_to_keep`` to limit its head, is returned as is.
     """
     signature = inspect.signature(forward)
@@ -296,24 +329,27 @@ def with_compute_logits(forward: Callable[..., ModelOutput]) -> Callable[..., Mo
     @functools.wraps(forward)
     def forward_with_compute_logits(
         self: "PreTrainedModel", *args: Any, compute_logits: bool = True, **kwargs: Any
-    ) -> ModelOutput:
-        """Run ``forward``, or without logits, project the last position only and drop it.
+    ) -> ModelOutput | tuple:
+        """Run the forward with the requested logits and output format.
 
         Args:
             self: Hugging Face model.
             *args: ``forward``'s positional inputs, such as input_ids of shape [batch, sequence].
-            compute_logits: Whether to return logits; False returns empty logits for a loss that projects the
-                final hidden states itself.
+            compute_logits: Whether to return logits. With external loss, False projects only the last position.
             **kwargs: ``forward``'s keyword inputs.
 
         Returns:
-            ``forward``'s output; without logits, its logits have shape [batch, 1, 0].
+            ``forward``'s output with the requested vocabulary dimension.
         """
         if compute_logits:
             return forward(self, *args, **kwargs)
-        output = forward(self, *args, **{**kwargs, "logits_to_keep": 1})
-        output["logits"] = output["logits"][..., :0]
-        return output
+        if args:
+            # HF positional model inputs (including logits_to_keep) are also named arguments.
+            positional = signature.bind_partial(self, *args).arguments
+            positional.pop(next(iter(signature.parameters)))
+        else:
+            positional = {}
+        return call_hf_forward(self, functools.partial(forward, self), compute_logits=False, **positional, **kwargs)
 
     parameters = list(signature.parameters.values())
     # A keyword-only parameter goes before **kwargs.
