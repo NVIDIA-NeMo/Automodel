@@ -23,6 +23,7 @@ import os
 import pathlib
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import torch
@@ -63,6 +64,10 @@ from nemo_automodel.components.speculative.eagle.eagle4 import (
     CANDIDATE_HEAD_KEYS,
     Eagle4CandidateHeadConfig,
     Eagle4Config,
+)
+from nemo_automodel.components.speculative.eagle.parallel_reconsideration import (
+    LlamaParallelReconsiderationDraftModel,
+    ParallelReconsiderationConfig,
 )
 from nemo_automodel.components.speculative.eagle.registry import DraftSpec, resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
@@ -734,6 +739,33 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
         # two stages (see components/speculative/eagle/eagle4.py). Gated before the
         # target loads, like P-EAGLE.
         self.eagle4 = _parse_eagle4_config(recipe_cfg.get("eagle4", None))
+        reconsideration = recipe_cfg.get("parallel_reconsideration", None)
+        self.parallel_reconsideration = (
+            None
+            if reconsideration is None
+            else ParallelReconsiderationConfig(
+                **(reconsideration.to_dict() if hasattr(reconsideration, "to_dict") else reconsideration)
+            )
+        )
+        if self.parallel_reconsideration is not None:
+            compile_config = self.cfg.get("compile", None)
+            fp8_config = self.cfg.get("fp8", None)
+            incompatible = {
+                "parallel_drafting": parallel_drafting,
+                "eagle4": self.eagle4 is not None,
+                "context parallelism": int(self.cfg.get("distributed.cp_size", 1) or 1) > 1,
+                "sequence packing": int(recipe_cfg.get("packed_sequence_size", 0) or 0) > 0,
+                "lk_loss_type": recipe_cfg.get("lk_loss_type", None) is not None,
+                "decode_eval": recipe_cfg.get("decode_eval", None) is not None,
+                "peft": self.cfg.get("peft", None) is not None,
+                "compile": compile_config is not None and compile_config.get("enabled", False),
+                "fp8": fp8_config is not None and fp8_config.get("enabled", False),
+            }
+            conflicts = [name for name, enabled in incompatible.items() if enabled]
+            if conflicts:
+                raise ValueError(f"Parallel Reconsideration does not support {', '.join(conflicts)}")
+            if draft_spec.draft_cls is not LlamaEagle3DraftModel:
+                raise ValueError("Parallel Reconsideration requires the dense Llama-style EAGLE-3.1 draft")
         if self.eagle4 is not None:
             _validate_eagle4_gates(
                 self.eagle4,
@@ -809,6 +841,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
         # and serve time alike.
         draft_config["fc_norm"] = bool(recipe_cfg.get("fc_norm", False))
         draft_config["norm_output"] = bool(recipe_cfg.get("norm_output", False))
+        if self.parallel_reconsideration is not None:
+            draft_cls = LlamaParallelReconsiderationDraftModel
+            draft_config.update(
+                architectures=[draft_cls.__name__],
+                num_hidden_layers=1,
+                layer_types=["full_attention"],
+                fc_norm=bool(recipe_cfg.get("fc_norm", True)),
+                norm_output=bool(recipe_cfg.get("norm_output", True)),
+                parallel_reconsideration=asdict(self.parallel_reconsideration),
+            )
         # P-EAGLE (parallel drafting). When enabled, the draft registers a
         # learnable ``mask_hidden`` placeholder and the trainer predicts all
         # ``num_depths`` draft tokens in a single COD-subsampled parallel forward
@@ -843,7 +885,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
         # Gemma4TextConfig / ...) so architecture-specific defaults like
         # attention_bias and head_dim flow into the draft (LlamaConfig for EAGLE-4).
         draft_config_obj = draft_config_cls.from_dict(draft_config)
-        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # The reconsideration trainer uses BF16 autocast with FP32 optimizer
+        # weights. The existing recipes keep their configured compute dtype.
+        draft_dtype = torch.float32 if self.parallel_reconsideration is not None else self.compute_dtype
+        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=draft_dtype)
         # Seed draft embeddings from the target: directly from the live target,
         # or from the embeddings stored alongside the offline cache.
         embed_source = (
@@ -856,10 +901,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
         self.draft_model.set_vocab_mapping(selected_token_ids)
         if freeze_embeddings:
             self.draft_model.freeze_embeddings()
-        # P-EAGLE memory knob: recompute the draft layers' activations in the
-        # backward instead of storing them, lowering the activation peak of the
-        # long flattened COD sequence (complements ``sequence_partitions``).
-        # Off by default; only affects the parallel-drafting forward.
+        # Recompute draft layers for P-EAGLE and Parallel Reconsideration when
+        # requested. The default EAGLE-3 TTT path is unchanged.
         if recipe_cfg.get("draft_gradient_checkpointing", False):
             self.draft_model.gradient_checkpointing_enable()
         # Optionally warm-start from a trained draft's consolidated export. This is
@@ -908,7 +951,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
 
         lk_loss_type = recipe_cfg.get("lk_loss_type", None)
 
-        if parallel_drafting:
+        if self.parallel_reconsideration is not None:
+            trainer_module = self.parallel_reconsideration.build(
+                self.draft_model,
+                selected_token_ids=selected_token_ids,
+                selected_token_mask=selected_token_mask,
+                ttt_steps=recipe_cfg.ttt_steps,
+            ).to(self.device)
+        elif parallel_drafting:
             if self.cp_group is not None:
                 raise NotImplementedError("Context parallelism is not supported with parallel drafting (P-EAGLE).")
             trainer_module = self.build_peagle_trainer(
@@ -1730,18 +1780,25 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist EAGLE-3 meta: global_step, epoch, and vocab mapping tensors."""
+        reconsideration = getattr(self, "parallel_reconsideration", None)
+        options = {} if reconsideration is None else {"parallel_reconsideration": asdict(reconsideration)}
         self._save_meta(
             path,
             "eagle_meta.pt",
             epoch,
             selected_token_ids=self._module().selected_token_ids.cpu(),
             selected_token_mask=self._module().selected_token_mask.cpu(),
+            **options,
         )
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
         """Restore EAGLE-3 meta: global_step, epoch, and vocab mapping tensors."""
         meta = self._load_meta(ckpt_dir, "eagle_meta.pt", legacy_filename="eagle3_meta.pt")
         if meta is not None:
+            reconsideration = getattr(self, "parallel_reconsideration", None)
+            expected = None if reconsideration is None else asdict(reconsideration)
+            if meta.get("parallel_reconsideration") != expected:
+                raise ValueError("Checkpoint and requested Parallel Reconsideration settings differ")
             # Align the cadence-driven runners to the restored step so resume does
             # not immediately fire a redundant launch for an already-covered region.
             for runner_attr in ("regen_runner", "decode_eval_runner"):

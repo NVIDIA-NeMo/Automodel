@@ -36,6 +36,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 RUN_DIR=$(mktemp -d)
 cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
+source tests/functional_tests/parallelism/parity_legs.sh
 
 COMMON_ARGS=(
     --config tests/functional_tests/parallelism/deepseek_v4_proxy.yaml
@@ -47,18 +48,20 @@ COMMON_ARGS=(
 )
 
 # --- Reference: 2 ranks, data parallel only ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+start_leg dp2 env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/dp2" \
     --distributed.ep_size 1
 
 # --- Expert parallel: same 2 ranks, experts sharded ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+start_leg ep2 env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/ep2" \
     --distributed.ep_size 2
+
+wait_legs
 
 python tests/functional_tests/parallelism/compare_parallel_parity.py \
     "$RUN_DIR/dp2/training.jsonl" \
