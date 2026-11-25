@@ -219,7 +219,10 @@ class HY4FlashBlock(nn.Module):
         hidden = config.hidden_size
         self.attention_type = config.attention_types[layer_idx]
         self.self_attn = HY4FlashAttention(config, layer_idx, backend)
-        if config.mlp_layer_types[layer_idx] == "sparse":
+        # Recorded here because ``activation_checkpointing: moe`` later replaces ``self.mlp`` with a checkpoint wrapper,
+        # which forwards attribute access and calls but is not an instance of ``MoE``.
+        self.has_moe = config.mlp_layer_types[layer_idx] == "sparse"
+        if self.has_moe:
             self.mlp = MoE(moe_config, backend)
             # The reference shared expert is a plain SwiGLU; the shared MoE would clamp it like the routed experts.
             self.mlp.shared_experts = MLP(
@@ -262,7 +265,7 @@ class HY4FlashBlock(nn.Module):
         streams = self.attn_hc.expand(post, x, streams)
         post, x = self.ffn_hc(streams)
         x = self.post_attention_layernorm(x)
-        x = self.mlp(x, batch.padding_mask) if isinstance(self.mlp, MoE) else self.mlp(x)
+        x = self.mlp(x, batch.padding_mask) if self.has_moe else self.mlp(x)
         x = self.post_mlp_layernorm(x)
         return self.ffn_hc.expand(post, x, streams)
 
@@ -699,7 +702,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
         nn.init.normal_(self.model.embed_tokens.weight, std=std)
         nn.init.normal_(self.lm_head.weight, std=std)
         for layer in self.model.layers:
-            if isinstance(layer.mlp, MoE):
+            if layer.has_moe:
                 layer.mlp.init_weights(buffer_device, init_std=std)
             else:
                 for module in (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
