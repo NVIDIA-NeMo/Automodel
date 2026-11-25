@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.config import DistributedStrategyConfig, MoEParallelizerConfig
     from nemo_automodel.components.distributed.init_utils import DistInfo
     from nemo_automodel.components.distributed.mesh import MeshContext
-    from nemo_automodel.components.models.common.utils import TEQuantizationConfig
+    from nemo_automodel.components.models.common.utils import BackendConfig
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +282,7 @@ class BaseRecipe:
             *,
             compute_dtype: torch.dtype | Literal["auto"],
             fp8_config: ConfigNode | None,
-            te_quantization: "TEQuantizationConfig | None",
+            backend: "BackendConfig | None",
             moe_config: "MoEParallelizerConfig | None",
             mesh_context: "MeshContext",
             strategy: "DistributedStrategyConfig | None",
@@ -292,10 +292,14 @@ class BaseRecipe:
             if compute_dtype != "auto":
                 raise TypeError('compute_dtype must be "auto" or a torch.dtype')
 
+            te_quantization = backend.te_quantization if backend is not None else None
             if HAVE_TE and isinstance(te_quantization, TENvfp4Config):
                 return torch.float4_e2m1fn_x2
-            if (HAVE_TE and isinstance(te_quantization, TEFp8Config)) or (
-                fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False)
+            if (
+                (HAVE_TE and isinstance(te_quantization, TEFp8Config))
+                # MoK runs the routed-expert GEMMs in MXFP8: E4M3 data with E8M0 block scales.
+                or (backend is not None and backend.dispatcher == "mok" and backend.mok.precision == "mxfp8")
+                or (fp8_config and fp8_config.get("enabled", False) and not fp8_config.get("emulate", False))
             ):
                 return torch.float8_e4m3fn
             if moe_config is not None and moe_config.mp_policy is not None and mesh_context.ep_size > 1:
@@ -308,7 +312,7 @@ class BaseRecipe:
             compute_dtype=infer_compute_dtype(
                 compute_dtype=compute_dtype,
                 fp8_config=self.cfg.get("fp8"),
-                te_quantization=getattr(self, "te_quantization", None),
+                backend=getattr(model, "backend", None),
                 moe_config=self.moe_parallel_config,
                 mesh_context=self.mesh_context,
                 strategy=self.distributed_config,

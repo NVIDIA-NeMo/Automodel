@@ -282,7 +282,8 @@ increase steady-state training throughput.
 
 Training recipes detect the current CUDA device and look up its dense peak for
 the training compute dtype. The recipe uses its Transformer Engine FP8 or
-NVFP4 setting or hardware-accelerated TorchAO FP8 setting when enabled.
+NVFP4 setting, hardware-accelerated TorchAO FP8 setting, or MoK MXFP8 experts
+(`backend.mok.precision: mxfp8` with `dispatcher: mok`) when enabled.
 Otherwise, expert-parallel MoE layers use the MoE policy's `param_dtype`, and
 sharded FSDP2 uses its `mp_policy.param_dtype`. A single process does not
 shard, so it uses `autocast_dtype` when set and otherwise the model's

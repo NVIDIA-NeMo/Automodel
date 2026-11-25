@@ -44,6 +44,12 @@ from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.models.common.utils import (
+    BackendConfig,
+    MoKBackendConfig,
+    TEFp8Config,
+    TENvfp4Config,
+)
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes import base_recipe
@@ -120,7 +126,6 @@ def test_recipe_mfu_uses_compute_precision(
     recipe = SimpleNamespace(
         cfg=cfg,
         distributed_config=strategy,
-        te_quantization=None,
         moe_parallel_config=moe_config,
         mesh_context=SimpleNamespace(device_mesh=None, ep_size=ep_size),
     )
@@ -129,6 +134,36 @@ def test_recipe_mfu_uses_compute_precision(
 
     assert calculator.reference_mfu == expected
     assert not hasattr(recipe, "mfu_calculator")
+
+
+@pytest.mark.parametrize(
+    "backend_kwargs, expected",
+    [
+        ({"linear": "te", "te_nvfp4": TENvfp4Config()}, 10000.0),
+        ({"linear": "te", "te_fp8": TEFp8Config()}, 5000.0),
+        ({"linear": "te", "te_fp8": TEFp8Config(recipe="mxfp8")}, 5000.0),
+        # MoK runs the routed-expert GEMMs in MXFP8; its precision is unused with another dispatcher.
+        ({"dispatcher": "mok", "mok": MoKBackendConfig(precision="mxfp8")}, 5000.0),
+        ({"dispatcher": "mok", "mok": MoKBackendConfig(precision="bf16")}, 2500.0),
+        ({"dispatcher": "torch", "mok": MoKBackendConfig(precision="mxfp8")}, 2500.0),
+        (None, 2500.0),
+    ],
+)
+def test_recipe_mfu_uses_quantized_training_precision(backend_kwargs, expected, monkeypatch):
+    _mock_gb200(monkeypatch)
+    monkeypatch.setattr(base_recipe, "HAVE_TE", True)
+    monkeypatch.setattr(base_recipe, "fsdp2_sharding_enabled", lambda device_mesh: True)
+    model = nn.Linear(32, 32, dtype=torch.bfloat16)
+    model.config = SimpleNamespace(model_type="llama")
+    model.backend = BackendConfig(**backend_kwargs) if backend_kwargs is not None else None
+    recipe = SimpleNamespace(
+        cfg=RecipeConfig(ConfigNode({})),
+        distributed_config=FSDP2Config(),
+        moe_parallel_config=None,
+        mesh_context=SimpleNamespace(device_mesh=None, ep_size=1),
+    )
+
+    assert TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model).reference_mfu == expected
 
 
 def test_recipe_mfu_rejects_none_compute_dtype():
