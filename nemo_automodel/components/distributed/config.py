@@ -196,10 +196,6 @@ class MoEParallelizerConfig:
     # different number of tokens per expert than the forward pass, which makes
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
-    # Default False: a weight-tied MTP block with an MoE sub-block keeps its activations for every
-    # MTP depth. True checkpoints it like the other decoder blocks (one recompute per depth); only
-    # valid when the experts are not FSDP-sharded, i.e. ep_size covers the data-parallel group.
-    checkpoint_repeated_mtp_moe: bool = False
     reshard_after_forward: bool = False
     lm_head_precision: Union[str, torch.dtype] | None = None
     wrap_outer_model: bool = True

@@ -112,36 +112,48 @@ def _model() -> tuple[NemotronHForCausalLM, MockNemotronV3Config]:
     return model, config
 
 
-def _is_checkpointed(model: NemotronHForCausalLM) -> list[bool]:
-    return [isinstance(block, CheckpointWrapper) for block in model.mtp.layers]
-
-
-def test_the_moe_block_of_a_repeated_mtp_depth_is_checkpointed_only_on_request() -> None:
-    default, config = _model()
-    apply_ac(default, hidden_size=config.hidden_size, num_experts=config.n_routed_experts)
-    assert _is_checkpointed(default) == [True, False]
-
-    requested, config = _model()
+@pytest.mark.parametrize("experts_rank_local", [False, True])
+def test_the_moe_block_of_a_repeated_mtp_depth_is_checkpointed_with_rank_local_experts(
+    experts_rank_local: bool,
+) -> None:
+    """Rank-local experts: checkpointed like the other blocks. Otherwise (FSDP-sharded experts, or a caller without
+    expert parallelism, which is the default of ``apply_ac``) the block keeps its activations."""
+    model, config = _model()
     apply_ac(
-        requested,
+        model,
         hidden_size=config.hidden_size,
         num_experts=config.n_routed_experts,
-        checkpoint_repeated_mtp_moe=True,
+        experts_rank_local=experts_rank_local,
     )
-    assert _is_checkpointed(requested) == [True, True]
+    assert [isinstance(block, CheckpointWrapper) for block in model.mtp.layers] == [True, experts_rank_local]
+
+    # MoE-only mode wraps the MoE child of a block, not the block.
+    moe_only, config = _model()
+    apply_ac(
+        moe_only,
+        moe_only=True,
+        hidden_size=config.hidden_size,
+        num_experts=config.n_routed_experts,
+        experts_rank_local=experts_rank_local,
+    )
+    attention_block, moe_block = moe_only.mtp.layers
+    assert not isinstance(attention_block, CheckpointWrapper) and not isinstance(moe_block, CheckpointWrapper)
+    assert isinstance(moe_block.mixer, CheckpointWrapper) is experts_rank_local
 
 
-def test_checkpointing_the_repeated_mtp_moe_block_keeps_loss_and_gradients() -> None:
+@pytest.mark.parametrize("moe_only", [False, True])
+def test_checkpointing_the_repeated_mtp_moe_block_keeps_loss_and_gradients(moe_only: bool) -> None:
     """One CPU forward/backward over the backbone and both MTP depths: loss and gradients are bitwise equal."""
     reference, config = _model()
-    default = copy.deepcopy(reference)
-    apply_ac(default, hidden_size=config.hidden_size, num_experts=config.n_routed_experts)
-    requested = copy.deepcopy(reference)
+    kept = copy.deepcopy(reference)
+    apply_ac(kept, moe_only=moe_only, hidden_size=config.hidden_size, num_experts=config.n_routed_experts)
+    checkpointed = copy.deepcopy(reference)
     apply_ac(
-        requested,
+        checkpointed,
+        moe_only=moe_only,
         hidden_size=config.hidden_size,
         num_experts=config.n_routed_experts,
-        checkpoint_repeated_mtp_moe=True,
+        experts_rank_local=True,
     )
 
     input_ids = torch.randint(0, config.vocab_size, (2, 8), generator=torch.Generator().manual_seed(3))
@@ -168,7 +180,7 @@ def test_checkpointing_the_repeated_mtp_moe_block_keeps_loss_and_gradients() -> 
     mtp_expert_grads = [grad for name, grad in ref_grads.items() if name.startswith("mtp.") and ".experts." in name]
     assert mtp_expert_grads and all(grad.abs().sum() > 0 for grad in mtp_expert_grads)
 
-    for model in (default, requested):
+    for model in (kept, checkpointed):
         loss, grads = loss_and_grads(model)
         assert torch.equal(loss, ref_loss)
         assert set(grads) == set(ref_grads)

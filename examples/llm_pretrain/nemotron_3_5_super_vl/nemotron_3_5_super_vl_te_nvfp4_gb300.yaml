@@ -66,8 +66,8 @@
 # 16 GB300 one micro-batch of 8 peaked at 276.5 GiB of 276.6 GiB on two GPUs, two micro-batches of 4 at
 # 215 GiB (measured, below). With forced balanced routing one micro-batch of 8 fits (260 GiB). Also in use:
 #   - the master weights are stored as remainders (see above),
-#   - the weight-tied MTP MoE block is checkpointed like the other blocks
-#     (distributed.moe.checkpoint_repeated_mtp_moe; valid here because ep_size covers all 16 ranks),
+#   - the weight-tied MTP MoE block is checkpointed like the other blocks. No key selects that: ep_size
+#     covers all 16 ranks, so every rank owns its experts and FSDP does not shard them (rank 0 logs it),
 #   - the loss is FusedLinearCrossEntropy, which does not keep the logits of the three heads.
 # distributed.defer_fsdp_grad_sync is false so that no unsharded gradient copy is held between the two
 # micro-batches.
@@ -233,7 +233,6 @@ distributed:
   defer_fsdp_grad_sync: false
   moe:
     reshard_after_forward: true
-    checkpoint_repeated_mtp_moe: true
   multimodal:
     frozen_sharding: replicate
 

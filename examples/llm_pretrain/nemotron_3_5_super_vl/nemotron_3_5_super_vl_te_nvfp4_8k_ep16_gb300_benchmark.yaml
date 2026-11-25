@@ -47,8 +47,8 @@
 # map on FineWeb; its header describes the map and the NVFP4 size requirements in full.
 #
 # What makes the step fast, each measured on this workload:
-#   - One micro-batch of 8 sequences per rank under full-block activation checkpointing
-#     (distributed.moe.checkpoint_repeated_mtp_moe covers the shared MTP MoE block as well).
+#   - One micro-batch of 8 sequences per rank under full-block activation checkpointing. It covers the
+#     weight-tied MTP MoE block as well: ep_size covers all 16 ranks, so FSDP does not shard the experts.
 #   - model.mamba_scan_ac_exempt_blocks: 13 keeps the scan state of the first 13 Mamba blocks, so their
 #     recompute in the backward pass skips the scan: about 1.5 GiB per block.
 #   - reshard_after_forward: false (FSDP and MoE) keeps the unsharded parameters between forward and backward.
@@ -179,7 +179,6 @@ distributed:
   defer_fsdp_grad_sync: false
   moe:
     reshard_after_forward: false
-    checkpoint_repeated_mtp_moe: true
   multimodal:
     frozen_sharding: replicate
 

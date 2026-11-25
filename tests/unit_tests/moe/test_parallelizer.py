@@ -1677,14 +1677,14 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         activation_checkpointing=True,
     )
     apply_ep_mock.assert_called_once()
-    # AC enabled
+    # AC enabled; the expert shard mesh has two ranks, so the experts are FSDP-sharded, not rank-local
     apply_ac_mock.assert_called_once_with(
         model,
         ignore_router=True,
         selective=False,
         activation_checkpointing_scope="all",
         moe_only=False,
-        checkpoint_repeated_mtp_moe=False,
+        experts_rank_local=False,
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
@@ -2788,35 +2788,21 @@ def test_parallelize_model_passes_ignore_router_for_ac_to_apply_ac(monkeypatch):
     assert kwargs.get("ignore_router") is True
 
 
-def test_parallelize_model_passes_checkpoint_repeated_mtp_moe_to_apply_ac(monkeypatch):
-    """The option reaches apply_ac when the experts are not FSDP-sharded (expert shard mesh of one rank)."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    apply_ac_mock = MagicMock()
-    monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
-    monkeypatch.setattr(P, "apply_ep", MagicMock())
-    monkeypatch.setattr(P, "apply_fsdp", MagicMock())
-
-    world_mesh = FakeWorldMesh({"dp": 2, ("dp",): 2}, mesh_dim_names=["dp"])
-    moe_mesh = FakeMoeMesh({"ep": 2, ("es",): 1})
-    model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
-
-    P.parallelize_model(
-        model=model,
-        world_mesh=world_mesh,
-        moe_mesh=moe_mesh,
-        dp_axis_names=("dp",),
-        ep_axis_name="ep",
-        ep_shard_axis_names=("es",),
-        activation_checkpointing=True,
-        checkpoint_repeated_mtp_moe=True,
-    )
-
-    apply_ac_mock.assert_called_once()
-    assert apply_ac_mock.call_args.kwargs["checkpoint_repeated_mtp_moe"] is True
-
-
-def test_parallelize_model_rejects_checkpoint_repeated_mtp_moe_with_fsdp_sharded_experts(monkeypatch):
-    """FSDP-sharded experts cannot be unsharded again for the second recompute of the weight-tied block."""
+@pytest.mark.parametrize(
+    ("moe_mesh_sizes", "experts_rank_local"),
+    [
+        # Expert parallelism over all four ranks: every rank owns its experts.
+        ({"ep": 4, ("es",): 1}, True),
+        # Two expert-parallel ranks, each expert held by two ranks: FSDP shards the experts.
+        ({"ep": 2, ("es",): 2}, False),
+        # No expert parallelism: the experts are part of their block's FSDP group.
+        (None, False),
+    ],
+)
+def test_parallelize_model_tells_apply_ac_whether_the_experts_are_rank_local(
+    monkeypatch, moe_mesh_sizes, experts_rank_local
+):
+    """Only rank-local experts let apply_ac checkpoint a weight-tied MTP MoE block; the other layouts are no error."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     apply_ac_mock = MagicMock()
     apply_fsdp_mock = MagicMock()
@@ -2825,23 +2811,25 @@ def test_parallelize_model_rejects_checkpoint_repeated_mtp_moe_with_fsdp_sharded
     monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
 
     world_mesh = FakeWorldMesh({"dp": 4, ("dp",): 4}, mesh_dim_names=["dp"])
-    moe_mesh = FakeMoeMesh({"ep": 2, ("es",): 2})
+    expert_parallel = moe_mesh_sizes is not None
     model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
 
-    with pytest.raises(ValueError, match="checkpoint_repeated_mtp_moe=true needs experts that are not FSDP-sharded"):
-        P.parallelize_model(
-            model=model,
-            world_mesh=world_mesh,
-            moe_mesh=moe_mesh,
-            dp_axis_names=("dp",),
-            ep_axis_name="ep",
-            ep_shard_axis_names=("es",),
-            activation_checkpointing=True,
-            checkpoint_repeated_mtp_moe=True,
-        )
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=FakeMoeMesh(moe_mesh_sizes) if expert_parallel else None,
+        dp_axis_names=("dp",),
+        ep_axis_name="ep" if expert_parallel else None,
+        ep_shard_axis_names=("es",) if expert_parallel else None,
+        activation_checkpointing=True,
+    )
 
-    apply_ac_mock.assert_not_called()
-    apply_fsdp_mock.assert_not_called()
+    apply_ac_mock.assert_called_once()
+    assert apply_ac_mock.call_args.kwargs["experts_rank_local"] is experts_rank_local
+    # FSDP is told the same layout: rank-local experts are neither sharded by it nor left in a block's group.
+    apply_fsdp_mock.assert_called_once()
+    fsdp_kwargs = apply_fsdp_mock.call_args.kwargs
+    assert (fsdp_kwargs["ep_enabled"] and not fsdp_kwargs["ep_shard_enabled"]) is experts_rank_local
 
 
 def test_parallelize_model_ignore_router_for_ac_defaults_to_true(monkeypatch):
@@ -2960,12 +2948,10 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
         assert getattr(w, sentinel_flag, False) is True
 
 
-@pytest.mark.parametrize("checkpoint_repeated_mtp_moe", [False, True])
+@pytest.mark.parametrize("experts_rank_local", [False, True])
 @pytest.mark.parametrize("selective", [False, True])
-def test_apply_ac_repeated_mtp_checkpoints_dense_blocks_and_skips_moe(
-    monkeypatch, selective, checkpoint_repeated_mtp_moe
-):
-    """Weight-tied MTP AC skips only blocks with the shared experts group, unless asked to checkpoint them."""
+def test_apply_ac_repeated_mtp_checkpoints_dense_blocks_and_skips_moe(monkeypatch, selective, experts_rank_local):
+    """Weight-tied MTP AC skips only blocks with the shared experts group, and none with rank-local experts."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
 
@@ -3006,11 +2992,11 @@ def test_apply_ac_repeated_mtp_checkpoints_dense_blocks_and_skips_moe(
         selective=selective,
         hidden_size=8,
         num_experts=4,
-        checkpoint_repeated_mtp_moe=checkpoint_repeated_mtp_moe,
+        experts_rank_local=experts_rank_local,
     )
 
     assert set(model.model.layers.registered) == {"0"}
-    if checkpoint_repeated_mtp_moe:
+    if experts_rank_local:
         assert [wrapper.block for wrapper in wrapped] == [backbone, mtp_attention, mtp_moe]
         assert set(model.mtp.layers.registered) == {"0", "1"}
     else:

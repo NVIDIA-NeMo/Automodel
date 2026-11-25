@@ -162,12 +162,13 @@ def _get_moe_module(block: nn.Module) -> MoE | None:
 
 
 def _repeated_mtp_moe_block_ids(model: nn.Module) -> set[int]:
-    """Return weight-tied MTP blocks whose experts cannot be recomputed safely.
+    """Return weight-tied MTP blocks whose experts cannot be recomputed safely when FSDP shards them.
 
     A repeated MTP depth may contain multiple physical sublayers. Only MoE
     sublayers own the EP-sharded expert parameter group whose second FSDP2
     checkpoint recompute is unsafe; attention, MLP, and Mamba sublayers remain
-    eligible for activation checkpointing.
+    eligible for activation checkpointing. Rank-local experts are in no FSDP
+    group, and ``apply_ac`` then checkpoints these blocks as well.
     """
     mtp_module = getattr(model, "mtp", None)
     if mtp_module is None or not hasattr(mtp_module, "layers"):
@@ -728,7 +729,7 @@ def apply_ac(
     selective: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     moe_only: bool = False,
-    checkpoint_repeated_mtp_moe: bool = False,
+    experts_rank_local: bool = False,
 ):
     """Apply activation checkpointing to the model.
 
@@ -749,12 +750,13 @@ def apply_ac(
         moe_only: If True, checkpoint only each decoder block's MoE sub-block (``moe``/``mlp``)
             and save every other activation of the block. Requires ``ignore_router=True`` and
             ``selective=False``; blocks without an MoE sub-block are left uncheckpointed.
-        checkpoint_repeated_mtp_moe: If True, a weight-tied MTP block with an MoE sub-block is
-            checkpointed like every other decoder block and recomputed once per MTP depth in the
-            backward pass. The default keeps its activations for every depth, because FSDP2 cannot
-            unshard an EP-sharded experts group again for a second recompute; the caller must
-            therefore only set it when the experts are not FSDP-sharded
-            (:func:`parallelize_model` checks this).
+        experts_rank_local: True when expert parallelism is on and FSDP does not shard the experts,
+            so that every rank owns its experts whole (:func:`parallelize_model` derives it from the
+            expert meshes). A weight-tied MTP block with an MoE sub-block is then checkpointed like
+            every other decoder block and recomputed once per MTP depth in the backward pass. With
+            the default False, which also stands for a caller without expert parallelism, the block
+            keeps its activations for every depth: FSDP2 cannot unshard a sharded experts group
+            again for the second recompute.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
@@ -793,12 +795,20 @@ def apply_ac(
             "checkpointing; with ignore_router_for_ac=false and full checkpointing the recompute dispatch "
             "is sized to the capacity while the forward calibration dispatch was not"
         )
-    repeated_mtp_moe_block_ids = (
-        _repeated_mtp_moe_block_ids(model) if checkpoint_decoder and not checkpoint_repeated_mtp_moe else set()
-    )
-    if repeated_mtp_moe_block_ids:
+    # Blocks left out of checkpointing below: the weight-tied MTP blocks with an MoE sub-block, unless the
+    # experts are rank-local.
+    repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
+    if repeated_mtp_moe_block_ids and experts_rank_local:
         logger.info(
-            "Skipping activation checkpointing on %d weight-tied MTP MoE block(s)",
+            "Checkpointing %d weight-tied MTP MoE block(s) like the other decoder blocks: the experts are "
+            "rank-local, so recomputing the block once per MTP depth needs no FSDP unshard",
+            len(repeated_mtp_moe_block_ids),
+        )
+        repeated_mtp_moe_block_ids = set()
+    elif repeated_mtp_moe_block_ids:
+        logger.info(
+            "Skipping activation checkpointing on %d weight-tied MTP MoE block(s): the experts are "
+            "FSDP-sharded or there is no expert parallelism",
             len(repeated_mtp_moe_block_ids),
         )
     if checkpoint_decoder and not selective and not ignore_router:
@@ -1353,7 +1363,6 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
-    checkpoint_repeated_mtp_moe: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
@@ -1370,10 +1379,6 @@ def parallelize_model(
     """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
 
     Args:
-        checkpoint_repeated_mtp_moe: Checkpoint a weight-tied MTP block that has an MoE
-            sub-block instead of keeping its activations for every MTP depth. Rejected when
-            the experts are FSDP-sharded (the ``ep_shard_axis_names`` mesh has more than one
-            rank).
         reapply_trainability: Optional callback that re-resolves parameter
             trainability after TP/EP/AC surgery and immediately before FSDP
             construction.
@@ -1436,22 +1441,19 @@ def parallelize_model(
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]
     else:
         ep_shard_mesh = None
+    # FSDP shards the experts over the expert shard mesh when that mesh has more than one rank.
+    ep_shard_enabled = ep_shard_mesh is not None and ep_shard_mesh.size() > 1
 
     if activation_checkpointing:
-        if checkpoint_repeated_mtp_moe and ep_shard_mesh is not None and ep_shard_mesh.size() > 1:
-            raise ValueError(
-                "distributed.moe.checkpoint_repeated_mtp_moe=true needs experts that are not FSDP-sharded, "
-                f"but the expert shard mesh has {ep_shard_mesh.size()} ranks: the weight-tied MTP block is "
-                "recomputed once per MTP depth and FSDP2 cannot unshard its experts group for the second "
-                "recompute. Use an ep_size that covers the whole data-parallel group or leave the option off."
-            )
         apply_ac(
             model,
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
             moe_only=_is_moe_only_ac(activation_checkpointing),
-            checkpoint_repeated_mtp_moe=checkpoint_repeated_mtp_moe,
+            # With expert parallelism and an expert shard mesh of one rank every rank owns its experts
+            # whole: apply_fsdp below keeps them out of every FSDP group.
+            experts_rank_local=ep_enabled and not ep_shard_enabled,
         )
 
     if reapply_trainability is not None:
@@ -1472,7 +1474,7 @@ def parallelize_model(
             model,
             fsdp_mesh,
             ep_enabled=ep_enabled,
-            ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
+            ep_shard_enabled=ep_shard_enabled,
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
