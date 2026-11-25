@@ -190,7 +190,7 @@ class HY4FlashVisionTower(nn.Module):
 
     @torch.no_grad()
     def reset_parameters(self, std: float) -> None:
-        """Initialise as the reference does: zero biases, unit norm weights, normal everything else."""
+        """Initialize as the reference does: zero biases, unit norm weights, normal everything else."""
         for name, parameter in self.named_parameters():
             if name.endswith("bias"):
                 nn.init.zeros_(parameter)

@@ -692,7 +692,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
     def initialize_weights(
         self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
     ) -> None:
-        """Initialise every weight (checkpoint-free path) as the reference does."""
+        """Initialize every weight (checkpoint-free path) as the reference does."""
         if buffer_device is None:
             buffer_device = next(self.parameters()).device
         text = self.config.text_config

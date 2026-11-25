@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from nemo_automodel.components.models.hy_v4_flash.processing import HY4FlashProcessor
+
 CKPT = os.environ.get("HY4_CKPT_DIR")
 TEMPLATE = (
     Path(__file__).resolve().parents[4] / "examples/llm_finetune/hy_v4_flash/hy4_flash_training_chat_template.jinja"
@@ -36,7 +38,9 @@ CONVERSATIONS = [
 
 @pytest.mark.skipif(CKPT is None, reason="HY4_CKPT_DIR (tokenizer + released chat template) not provided")
 @pytest.mark.parametrize("conversation", CONVERSATIONS)
-def test_training_template_renders_like_the_released_one_and_marks_only_answers(conversation):
+def test_training_template_renders_like_the_released_one_and_marks_only_answers(
+    conversation: list[dict[str, str]],
+) -> None:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(CKPT)
@@ -61,20 +65,18 @@ class _RecordingTokenizer:
     chat_template = "unused"
     unk_token_id = 0
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.calls = []
 
-    def convert_tokens_to_ids(self, token):
+    def convert_tokens_to_ids(self, token: str) -> None:
         return None
 
-    def apply_chat_template(self, messages, **kwargs):
+    def apply_chat_template(self, messages: list[dict[str, str]], **kwargs: str | bool) -> str:
         self.calls.append(kwargs)
         return "rendered"
 
 
-def _processor(tokenizer):
-    from nemo_automodel.components.models.hy_v4_flash.processing import HY4FlashProcessor
-
+def _processor(tokenizer: _RecordingTokenizer) -> HY4FlashProcessor:
     processor = HY4FlashProcessor.__new__(HY4FlashProcessor)
     processor.tokenizer = tokenizer
     return processor
@@ -87,7 +89,7 @@ WITH_REASONING = [
 ]
 
 
-def test_training_render_uses_the_official_sft_reasoning_mode():
+def test_training_render_uses_the_official_sft_reasoning_mode() -> None:
     """Answer-only training data is fast-thinking data: the released template's ``high`` default must not apply."""
     tokenizer = _RecordingTokenizer()
     processor = _processor(tokenizer)
@@ -97,7 +99,7 @@ def test_training_render_uses_the_official_sft_reasoning_mode():
     assert [call["reasoning_effort"] for call in tokenizer.calls] == ["no_think", "high", "no_think", "high"]
 
 
-def test_explicit_reasoning_effort_and_generation_prompts_are_left_alone():
+def test_explicit_reasoning_effort_and_generation_prompts_are_left_alone() -> None:
     tokenizer = _RecordingTokenizer()
     processor = _processor(tokenizer)
     processor.apply_chat_template(ANSWER_ONLY, reasoning_effort="high")
@@ -107,7 +109,7 @@ def test_explicit_reasoning_effort_and_generation_prompts_are_left_alone():
 
 
 def test_released_processor_config_gives_the_default_image_settings() -> None:
-    """``image_processor`` block of ``processor_config.json`` at tencent/Hy4-flash revision eccd3123 (consumed fields)."""
+    """The consumed fields of ``processor_config.json`` at tencent/Hy4-flash revision eccd3123 give the defaults."""
     from nemo_automodel.components.models.hy_v4_flash.processing import (
         HY4FlashImageSettings,
         image_settings_from_processor_config,

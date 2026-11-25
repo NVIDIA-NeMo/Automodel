@@ -181,7 +181,7 @@ class HY4FlashEngramLayer(nn.Module):
 
     @torch.no_grad()
     def init_weights(self) -> None:
-        """Initialise as the reference does and refresh the hash state.
+        """Initialize as the reference does and refresh the hash state.
 
         ``unified_pre_gamma`` is 1 and the per-stream scales are drawn from N(0, 0.006).
         """
@@ -215,8 +215,8 @@ class HY4FlashEngramLayer(nn.Module):
         """Identity of the current lookup-table contents without reading them: storage address and version counter.
 
         Any way a checkpoint can reach the buffer changes one of the two: an in-place write (``load_state_dict``,
-        ``copy_``) bumps the version, a replaced or moved buffer has a new address. Weight initialisation runs
-        before the checkpoint is loaded, so multipliers drawn at initialisation must not be kept once the frozen
+        ``copy_``) bumps the version, a replaced or moved buffer has a new address. Weight initialization runs
+        before the checkpoint is loaded, so multipliers drawn at initialization must not be kept once the frozen
         vocabulary map arrives; comparing this state on every forward costs no device read.
         """
         return (self.lookup_table.data_ptr(), self.lookup_table._version)

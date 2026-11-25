@@ -20,48 +20,23 @@ with that boundary handling removed must make the same check fail.
 """
 
 import dataclasses
+from collections.abc import Callable
 
 import pytest
 import torch
 
 import nemo_automodel.components.models.hy_v4_flash.model as model_module
-from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
-
-from .tiny import CPU_BACKEND, tiny_config
-
-# index_topk 16 with 4-token groups (the released ratio): three recalled groups plus the query's own group.
-KPOOL, TOPK, WINDOW = 4, 16, 6
-# Starts at every offset mod 4, documents of 1, 2 and 3 tokens, documents shorter and longer than window and top-k.
-DOC_LENGTHS = (1, 2, 3, 21, 22, 23, 37, 5, 41)
-TOLERANCE = dict(rtol=1e-4, atol=2e-5)  # fp32: same arithmetic, only the GEMM batch shapes (summation order) differ
-
-
-def build_model() -> HY4FlashForCausalLM:
-    torch.manual_seed(0)
-    config = tiny_config(
-        vision={"num_hidden_layers": 0},
-        index_topk=TOPK,
-        compressed_indexer_compress_ratio=KPOOL,
-        sliding_window=WINDOW,
-    )
-    model = HY4FlashForCausalLM(config, backend=CPU_BACKEND).float()
-    model.initialize_weights(dtype=torch.float32)
-    return model
-
-
-def random_documents(lengths=DOC_LENGTHS, seed=1) -> list[torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
-    return [torch.randint(3, 280, (length,), generator=generator) for length in lengths]
-
-
-def pack(documents: list[torch.Tensor], padding: int = 0) -> dict[str, torch.Tensor]:
-    """One packed row: token ids, document ids (0 = padding) and document-local positions, each of shape [1, tokens]."""
-    ids = torch.cat([*documents, torch.full((padding,), 2)])
-    doc = torch.cat([*(torch.full((len(d),), i + 1) for i, d in enumerate(documents)), torch.zeros(padding).long()])
-    positions = torch.cat([*(torch.arange(len(d)) for d in documents), torch.zeros(padding).long()])
-    return dict(
-        input_ids=ids[None], packed_seq_ids=doc[None], position_ids=positions[None], attention_mask=doc[None] > 0
-    )
+from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashBatch
+from tests.unit_tests.models.hy_v4_flash.tiny import (
+    KPOOL,
+    TOLERANCE,
+    TOPK,
+    WINDOW,
+    build_model,
+    build_plain_model,
+    pack,
+    random_documents,
+)
 
 
 def run_packed(model, documents, padding=0, **overrides) -> list[torch.Tensor]:
@@ -88,7 +63,7 @@ def assert_documents_match_alone(model, documents, padding=0, **overrides) -> No
             )
 
 
-def test_layout_exercises_selection_and_windows():
+def test_layout_exercises_selection_and_windows() -> None:
     # The oracle comparison only means something if sparse selection and the window actually drop keys.
     model = build_model()
     documents = random_documents()
@@ -112,7 +87,7 @@ def test_layout_exercises_selection_and_windows():
     assert dropped["indexed_attention"] > 0 and dropped["sliding_attention"] > 0
 
 
-def _starts(documents):
+def _starts(documents: list[torch.Tensor]) -> list[int]:
     starts, total = [], 0
     for document in documents:
         starts.append(total)
@@ -121,11 +96,11 @@ def _starts(documents):
 
 
 @pytest.mark.parametrize("padding", [0, 7])
-def test_every_packed_document_equals_the_document_run_alone(padding):
+def test_every_packed_document_equals_the_document_run_alone(padding: int) -> None:
     assert_documents_match_alone(build_model(), random_documents(), padding)
 
 
-def test_duplicate_document_attack():
+def test_duplicate_document_attack() -> None:
     # The same document four times back to back, next to a near-copy: any leak makes a later copy differ.
     model = build_model()
     document = random_documents((39,))[0]
@@ -141,7 +116,7 @@ def test_duplicate_document_attack():
     assert not torch.allclose(packed[2][-1], alone[-1], **TOLERANCE)
 
 
-def test_victim_is_unchanged_when_every_other_document_is_replaced_by_adversarial_content():
+def test_victim_is_unchanged_when_every_other_document_is_replaced_by_adversarial_content() -> None:
     # Neighbours are copies of the victim (identical index keys, so they would win its top-k if they were visible),
     # shifted copies (a pooled group straddling the boundary would mix them in) and unrelated text.
     model = build_model()
@@ -157,12 +132,12 @@ def test_victim_is_unchanged_when_every_other_document_is_replaced_by_adversaria
                 torch.testing.assert_close(packed[3], alone, **TOLERANCE)
 
 
-def test_gradient_isolation_and_additivity():
+def test_gradient_isolation_and_additivity() -> None:
     model = build_model()
     documents = random_documents((23, 3, 37, 1, 18), seed=9)
     captured = {}
 
-    def keep_embedding_gradient(module, args, output):
+    def keep_embedding_gradient(module: torch.nn.Module, args: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
         output.retain_grad()
         captured["embeddings"] = output
 
@@ -179,7 +154,7 @@ def test_gradient_isolation_and_additivity():
         else:  # exactly zero, not small: no path from another document to the victim's loss
             assert torch.count_nonzero(grad[start : start + length]) == 0
 
-    def gradients(run):
+    def gradients(run: Callable[[], None]) -> dict[str, torch.Tensor]:
         model.zero_grad(set_to_none=True)
         run()
         return {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
@@ -195,7 +170,7 @@ def test_gradient_isolation_and_additivity():
 
 
 # ------------------------------------------------------------------------------------------------- negative controls
-def _leaky_window(monkeypatch):
+def _leaky_window(monkeypatch: pytest.MonkeyPatch) -> None:
     original = model_module.causal_prefix_plan
     monkeypatch.setattr(
         model_module,
@@ -204,7 +179,7 @@ def _leaky_window(monkeypatch):
     )
 
 
-def _leaky_dense(monkeypatch):
+def _leaky_dense(monkeypatch: pytest.MonkeyPatch) -> None:
     original = model_module.causal_prefix_plan
     monkeypatch.setattr(
         model_module,
@@ -213,11 +188,11 @@ def _leaky_dense(monkeypatch):
     )
 
 
-def _leaky_indexer_groups(monkeypatch):
+def _leaky_indexer_groups(monkeypatch: pytest.MonkeyPatch) -> None:
     # The indexer treats the whole pack as one document: groups are pack-aligned and may come from other documents.
     original = model_module.HY4FlashModel.prepare_batch
 
-    def prepare(self, *args, **kwargs):
+    def prepare(self: model_module.HY4FlashModel, *args: torch.Tensor, **kwargs: torch.Tensor | None) -> HY4FlashBatch:
         batch = original(self, *args, **kwargs)
         layout = dataclasses.replace(batch.layout, doc_ranges=((0, batch.layout.local_end),))
         return dataclasses.replace(batch, layout=layout)
@@ -225,7 +200,7 @@ def _leaky_indexer_groups(monkeypatch):
     monkeypatch.setattr(model_module.HY4FlashModel, "prepare_batch", prepare)
 
 
-def _leaky_engram(monkeypatch):
+def _leaky_engram(monkeypatch: pytest.MonkeyPatch) -> None:
     original = model_module.build_ngram_tokens
     monkeypatch.setattr(
         model_module,
@@ -235,7 +210,9 @@ def _leaky_engram(monkeypatch):
 
 
 @pytest.mark.parametrize("leak", [_leaky_window, _leaky_dense, _leaky_indexer_groups, _leaky_engram])
-def test_removing_one_boundary_mechanism_is_detected(monkeypatch, leak):
+def test_removing_one_boundary_mechanism_is_detected(
+    monkeypatch: pytest.MonkeyPatch, leak: Callable[[pytest.MonkeyPatch], None]
+) -> None:
     model = build_model()
     documents = random_documents()
     assert_documents_match_alone(model, documents)  # the unbroken model passes on this exact input
@@ -244,7 +221,7 @@ def test_removing_one_boundary_mechanism_is_detected(monkeypatch, leak):
         assert_documents_match_alone(model, documents)
 
 
-def test_positions_that_do_not_restart_per_document_are_detected():
+def test_positions_that_do_not_restart_per_document_are_detected() -> None:
     model = build_model()
     documents = random_documents()
     running = torch.arange(sum(map(len, documents)))[None]
@@ -252,152 +229,31 @@ def test_positions_that_do_not_restart_per_document_are_detected():
         assert_documents_match_alone(model, documents, position_ids=running)
 
 
-@pytest.mark.parametrize("lengths", [(5, 9, 3), (5, 41, 3)])
-def test_pooling_modules_are_entered_whether_or_not_a_document_needs_selection(lengths):
-    """FSDP turns the first call of a sharded unit into a collective, so every rank must issue the same calls.
-
-    The fp32 group-pooling modules only do work for documents longer than ``index_topk``. A rank whose pack holds no
-    such document must still enter them, at the same place, or its collective sequence differs from a rank that does
-    (a deadlock under FSDP). Both packs must therefore enter each module in every sparse layer.
-    """
-    model = build_model()
-    assert (max(lengths) > TOPK) == (lengths == (5, 41, 3))
-    sparse_layers = [layer for layer in model.model.layers if layer.self_attn.compressed_indexer is not None]
-    assert sparse_layers
-    entered = []
-    for index, layer in enumerate(sparse_layers):
-        indexer = layer.self_attn.compressed_indexer
-        for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm"):
-            getattr(indexer, name).register_forward_pre_hook(
-                lambda module, args, index=index, name=name: entered.append((index, name))
-            )
+def test_packed_documents_equal_separate_forwards() -> None:
+    """Packing must not let documents see each other: packed logits equal each document run alone."""
+    model = build_plain_model()
+    generator = torch.Generator().manual_seed(2)
+    lengths = [21, 12, 9]
+    docs = [torch.randint(3, 280, (1, n), generator=generator) for n in lengths]
     with torch.no_grad():
-        model(**pack(random_documents(lengths)))
-    first_entries = list(dict.fromkeys(entered))
-    assert first_entries == [
-        (index, name)
-        for index in range(len(sparse_layers))
-        for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm")
-    ]
+        alone = torch.cat([model(d).logits for d in docs], dim=1)
+        packed = model(
+            torch.cat(docs, dim=1),
+            seq_lens=torch.tensor([lengths]),
+            qkv_format="thd",
+        ).logits
+    torch.testing.assert_close(packed, alone, **TOLERANCE)
 
 
-def test_engram_hash_multipliers_follow_a_lookup_table_loaded_after_initialisation():
-    """Recipe order: weights are initialised first, the checkpoint (with its frozen vocabulary map) is loaded second.
-
-    The hash multipliers are bounded by the number of distinct compressed ids of the loaded map. Multipliers drawn
-    at initialisation, for the placeholder identity map, send every n-gram to a different table row than the
-    checkpoint was trained with; they must be redrawn when the map arrives, whichever way it is loaded.
-    """
-    from nemo_automodel.components.models.hy_v4_flash.engram import draw_hash_multipliers
-
-    def engram_layers(model):
-        return [layer.engram_layer for layer in model.model.layers if layer.engram_layer is not None]
-
-    def run(model):
-        with torch.no_grad():
-            return model(**pack(random_documents((9, 12)))).logits
-
-    source = build_model()
-    for engram in engram_layers(source):  # a many-to-few map, like the released one (fewer compressed ids than tokens)
-        engram.lookup_table.copy_(torch.arange(engram.lookup_table.numel(), dtype=torch.int32) % 97)
-    expected_logits = run(source)
-    state = source.state_dict()
-    for in_place in (True, False):
-        target = build_model()  # ``initialize_weights`` has drawn multipliers for the identity map
-        run(target)
-        target.load_state_dict(state, assign=not in_place)
-        logits = run(target)
-        for engram in engram_layers(target):
-            compressed = int(engram.lookup_table.max()) + 1
-            assert compressed == 97
-            expected = draw_hash_multipliers(engram.seed, engram.layer_id, engram.max_ngram_size, compressed)
-            torch.testing.assert_close(engram.hash_multipliers, expected)
-        torch.testing.assert_close(logits, expected_logits)
-
-
-def test_engram_gate_is_one_half_at_a_logit_of_exactly_zero():
-    """The reference gates with ``sqrt(clamp(|x|, 1e-6)) * sign(x)``; ``sign(0) = 0`` gives ``sigmoid(0) = 0.5``."""
-    import torch.nn.functional as F
-
-    from nemo_automodel.components.models.hy_v4_flash.engram import build_ngram_tokens
-
-    model = build_model()
-    engram = next(layer.engram_layer for layer in model.model.layers if layer.engram_layer is not None)
+def test_padded_batch_rows_equal_separate_forwards() -> None:
+    model = build_plain_model()
+    generator = torch.Generator().manual_seed(3)
+    a, b = torch.randint(3, 280, (1, 20), generator=generator), torch.randint(3, 280, (1, 13), generator=generator)
+    batch = torch.full((2, 20), 2)
+    batch[0], batch[1, :13] = a[0], b[0]
+    mask = torch.zeros(2, 20, dtype=torch.long)
+    mask[0], mask[1, :13] = 1, 1
     with torch.no_grad():
-        for projection in engram.key_projs:  # zero keys: every gate logit is exactly 0
-            projection.weight.zero_()
-            projection.bias.zero_()
-        ids = random_documents((11,))[0][None]
-        ngram = build_ngram_tokens(ids, torch.arange(ids.shape[1])[None], engram.max_ngram_size, engram.pad_id)
-        streams = torch.randn(1, ids.shape[1], engram.hc_mult, engram.hidden_size)
-        out = engram(streams, ngram, torch.ones_like(ids, dtype=torch.bool))
-        # the gated signal, computed independently of the gate
-        emb = engram.multi_head_embedding.embedding(engram.hash_ngrams(ngram))
-        emb = F.rms_norm(emb, (engram.head_dim,)) * torch.stack([n.weight for n in engram.lookup_per_head_norms])
-        main = engram.unified_pre_gamma * F.rms_norm(engram.value_proj(emb.flatten(-2)), (engram.hidden_size,))
-        scales = torch.stack(list(engram.unified_per_hc_scales))
-        expected = 0.5 * main.unsqueeze(2) + main.unsqueeze(2) * scales
-    torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-7)
-
-
-def _moe_oracle(mlp, x, limit, *, clamp_routed=True, clamp_shared=False):
-    """Latent MoE as the reference writes it: clamped SwiGLU in the routed experts, plain SwiGLU in the shared expert.
-
-    Args:
-        mlp: The layer's MoE module (only its weights are read).
-        x: Tensor of shape [tokens, hidden].
-        limit: ``swiglu_limit``.
-        clamp_routed: Clamp the routed experts' gate (one-sided) and up (two-sided) pre-activations.
-        clamp_shared: Clamp the shared expert the same way (the reference does not).
-
-    Returns:
-        Tuple of the output [tokens, hidden] and the largest routed and shared pre-activation magnitudes.
-    """
-    import torch.nn.functional as F
-
-    def swiglu(gate, up, clamp):
-        if clamp:
-            gate, up = gate.clamp(max=limit), up.clamp(min=-limit, max=limit)
-        return F.silu(gate) * up
-
-    scores = torch.sigmoid(x @ mlp.gate.weight.T)
-    top = (scores + mlp.gate.e_score_correction_bias).topk(mlp.gate.topk, dim=-1).indices
-    weights = scores.gather(1, top)
-    weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * mlp.gate.route_scale
-    latent = x @ mlp.fc1_latent_proj.weight.T
-    routed = torch.zeros_like(latent)
-    routed_peak = 0.0
-    for slot in range(top.shape[1]):
-        gate_up = torch.einsum("ti,tio->to", latent, mlp.experts.gate_and_up_projs[top[:, slot]])
-        gate, up = gate_up.chunk(2, dim=-1)
-        routed_peak = max(routed_peak, float(gate.max()), float(up.abs().max()))
-        hidden = swiglu(gate, up, clamp_routed)
-        routed += torch.einsum("ti,tio->to", hidden, mlp.experts.down_projs[top[:, slot]]) * weights[:, slot, None]
-    shared = mlp.shared_experts
-    gate, up = shared.gate_proj(x), shared.up_proj(x)
-    out = routed @ mlp.fc2_latent_proj.weight.T + shared.down_proj(swiglu(gate, up, clamp_shared))
-    return out, routed_peak, max(float(gate.max()), float(up.abs().max()))
-
-
-def test_swiglu_clamp_applies_to_routed_experts_and_not_to_the_shared_expert():
-    """The one MoE detail where Hy4-flash departs from the shared MoE: upstream clamps only the routed experts.
-
-    Random tiny models never reach the limit, so the input is scaled until both kinds of pre-activation exceed it.
-    The two wrong variants (shared expert clamped as the stock shared MoE does; routed experts not clamped) must
-    not match.
-    """
-    model = build_model()
-    mlp = next(layer.mlp for layer in model.model.layers if type(layer.mlp).__name__ == "MoE")
-    limit = model.config.text_config.swiglu_limit
-    torch.manual_seed(3)
-    x = torch.randn(40, model.config.text_config.hidden_size) * 400.0
-    with torch.no_grad():
-        mlp.experts.gate_and_up_projs.mul_(30.0)  # the latent projection shrinks the routed input; scale it back up
-        ours = mlp(x[None])[0]
-        expected, routed_peak, shared_peak = _moe_oracle(mlp, x, limit)
-        shared_clamped, _, _ = _moe_oracle(mlp, x, limit, clamp_shared=True)
-        routed_unclamped, _, _ = _moe_oracle(mlp, x, limit, clamp_routed=False)
-    assert routed_peak > limit and shared_peak > limit  # the clamp is actually exercised on both paths
-    torch.testing.assert_close(ours, expected, rtol=1e-4, atol=1e-4)
-    assert not torch.allclose(ours, shared_clamped, rtol=1e-2, atol=1e-2)
-    assert not torch.allclose(ours, routed_unclamped, rtol=1e-2, atol=1e-2)
+        out = model(batch, attention_mask=mask).logits
+        torch.testing.assert_close(out[0], model(a).logits[0], **TOLERANCE)
+        torch.testing.assert_close(out[1, :13], model(b).logits[0], **TOLERANCE)

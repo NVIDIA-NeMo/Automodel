@@ -18,7 +18,7 @@ The released chat template renders each image as ``<image_start><image_pad><imag
 single pad into ``(h / merge) * (w / merge + 1)`` pads (one extra slot per merged row for the newline feature) and
 produces the flat patches the vision tower consumes. Preprocessing follows the transformers reference
 (``HYV4VLImageProcessor``): ``smart_resize`` to multiples of ``patch_size * merge``, bicubic resize on the uint8 tensor,
-rescale by 1/255, normalise with mean/std 0.5, row-major patches. The released ``processor_config`` names LANCZOS as
+rescale by 1/255, normalize with mean/std 0.5, row-major patches. The released ``processor_config`` names LANCZOS as
 the resampling filter, but the reference (and the original implementation) always resize bicubically; so does this code.
 """
 
@@ -84,8 +84,8 @@ class HY4FlashImageSettings:
         merge_size: Spatial merge factor of the projector.
         min_pixels: Lower bound of the resized area.
         max_pixels: Upper bound of the resized area.
-        mean: Per-channel normalisation mean.
-        std: Per-channel normalisation standard deviation.
+        mean: Per-channel normalization mean.
+        std: Per-channel normalization standard deviation.
     """
 
     patch_size: int = 16
@@ -153,7 +153,7 @@ def num_image_tokens(grid_h: int, grid_w: int, merge: int) -> int:
 
 
 def preprocess_image(image: Image.Image, settings: HY4FlashImageSettings) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Resize, normalise and patchify one image.
+    """Resize, normalize and patchify one image.
 
     Args:
         image: PIL image (converted to RGB).
@@ -212,7 +212,7 @@ def training_reasoning_effort(messages: Sequence[ChatMessage]) -> Literal["no_th
 
 
 class ProcessorOptions(TypedDict, total=False):
-    """Tokenisation options forwarded by the collator through ``processor_kwargs``."""
+    """Tokenization options forwarded by the collator through ``processor_kwargs``."""
 
     padding: bool | str
     truncation: bool
@@ -247,7 +247,7 @@ class HY4FlashProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs: TokenizerOption) -> HY4FlashProcessor:
-        """Load the checkpoint's tokenizer, image token id (``config.json``) and image constants (``processor_config.json``)."""
+        """Load the tokenizer, the image token id and the image constants of a checkpoint."""
         loading = {
             key: kwargs[key]
             for key in ("cache_dir", "revision", "token", "trust_remote_code", "local_files_only")
@@ -260,7 +260,7 @@ class HY4FlashProcessor(ProcessorMixin):
             settings = image_settings_from_processor_config(json.load(handle)["image_processor"])
         return cls(tokenizer=tokenizer, image_token_id=config.image_token_id, settings=settings)
 
-    # ------------------------------------------------------------------ tokenisation
+    # ------------------------------------------------------------------ tokenization
     def __call__(
         self,
         text: str | list[str],
@@ -272,7 +272,7 @@ class HY4FlashProcessor(ProcessorMixin):
         max_length: int | None = None,
         **kwargs: TokenizerOption,
     ) -> BatchFeature:
-        """Tokenise rendered prompts, expanding every image pad.
+        """Tokenize rendered prompts, expanding every image pad.
 
         Args:
             text: Rendered prompt(s), each containing one image pad token per image.
@@ -383,11 +383,11 @@ class HY4FlashProcessor(ProcessorMixin):
         processor_kwargs: ProcessorOptions | None = None,
         **kwargs: TokenizerOption,
     ) -> str | list[str] | torch.Tensor | BatchFeature:
-        """Render conversations with the checkpoint's jinja template and, optionally, tokenise them.
+        """Render conversations with the checkpoint's jinja template and, optionally, tokenize them.
 
         Args:
             conversation: Chat messages (or a batch of them) with string or text / image content blocks.
-            tokenize: Whether to tokenise (expanding images) instead of returning the rendered text.
+            tokenize: Whether to tokenize (expanding images) instead of returning the rendered text.
             return_dict: Whether to return the whole ``BatchFeature``.
             return_tensors: ``"pt"`` or ``None``.
             add_generation_prompt: Append the assistant header.

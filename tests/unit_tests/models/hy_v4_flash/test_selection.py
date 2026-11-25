@@ -23,8 +23,7 @@ from nemo_automodel.components.models.hy_v4_flash.attention import (
     causal_prefix_plan,
 )
 from nemo_automodel.components.models.hy_v4_flash.layers import inverse_frequencies, mrope_cos_sin
-
-from .tiny import tiny_text_config
+from tests.unit_tests.models.hy_v4_flash.tiny import TOPK, build_model, pack, random_documents, tiny_text_config
 
 
 def _rotate(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:
@@ -46,7 +45,14 @@ def _rotate(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Ten
     return torch.view_as_real(rotated).reshape(x.shape).float()
 
 
-def _brute_force_logits(indexer, q_resid, hidden, group_keys, slots, theta):
+def _brute_force_logits(
+    indexer: HY4FlashCompressedIndexer,
+    q_resid: torch.Tensor,
+    hidden: torch.Tensor,
+    group_keys: torch.Tensor,
+    slots: torch.Tensor,
+    theta: float,
+) -> torch.Tensor:
     """Group logits of every query from the full [heads, groups] score block, one query at a time.
 
     Args:
@@ -72,7 +78,7 @@ def _brute_force_logits(indexer, q_resid, hidden, group_keys, slots, theta):
 
 @pytest.mark.parametrize("first_slot", [0, 5])
 @pytest.mark.parametrize("query_chunk", [3, 256, None])  # queries scored at a time; None: the default budget
-def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot, query_chunk):
+def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot: int, query_chunk: int | None) -> None:
     torch.manual_seed(0)
     config = tiny_text_config()  # index_topk 8, kpool 2: three recalled groups plus the query's own group
     theta = config.layer_rope_parameters["indexed_attention"]["rope_theta"]
@@ -122,7 +128,7 @@ def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot,
     assert dropped > 0, "no query dropped a visible key: sparse selection is not exercised"
 
 
-def test_causal_prefix_plan_windows_stay_inside_documents_and_padding_has_no_keys():
+def test_causal_prefix_plan_windows_stay_inside_documents_and_padding_has_no_keys() -> None:
     # documents [0, 5) and [5, 9), then one padding token whose document "starts" after itself
     position = torch.arange(10)
     doc_start = torch.tensor([0, 0, 0, 0, 0, 5, 5, 5, 5, 10])
@@ -142,10 +148,10 @@ def test_causal_prefix_plan_windows_stay_inside_documents_and_padding_has_no_key
     ]
 
 
-def test_pooled_key_norm_stays_off_the_shape_specialised_core(monkeypatch):
+def test_pooled_key_norm_stays_off_the_compiled_core(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pooling runs once per document with that document's group count, so it must not reach the compiled norm core.
 
-    The compiled core specialises on the input shape: called with a new group count it compiles again, which costs
+    The compiled core specializes on the input shape: called with a new group count it compiles again, which costs
     seconds per new document layout on packed data. The stand-in below records every shape the compiled core would see.
     """
     from nemo_automodel.components.models.hy_v4_flash import layers
@@ -168,3 +174,32 @@ def test_pooled_key_norm_stays_off_the_shape_specialised_core(monkeypatch):
     # Control: a norm with a fixed input shape does go through the swappable core.
     indexer.token_keys(torch.randn(5, cfg.hidden_size))
     assert seen == [(5, indexer.head_dim)]
+
+
+@pytest.mark.parametrize("lengths", [(5, 9, 3), (5, 41, 3)])
+def test_pooling_modules_are_entered_whether_or_not_a_document_needs_selection(lengths: tuple[int, ...]) -> None:
+    """FSDP turns the first call of a sharded unit into a collective, so every rank must issue the same calls.
+
+    The fp32 group-pooling modules only do work for documents longer than ``index_topk``. A rank whose pack holds no
+    such document must still enter them, at the same place, or its collective sequence differs from a rank that does
+    (a deadlock under FSDP). Both packs must therefore enter each module in every sparse layer.
+    """
+    model = build_model()
+    assert (max(lengths) > TOPK) == (lengths == (5, 41, 3))
+    sparse_layers = [layer for layer in model.model.layers if layer.self_attn.compressed_indexer is not None]
+    assert sparse_layers
+    entered = []
+    for index, layer in enumerate(sparse_layers):
+        indexer = layer.self_attn.compressed_indexer
+        for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm"):
+            getattr(indexer, name).register_forward_pre_hook(
+                lambda module, args, index=index, name=name: entered.append((index, name))
+            )
+    with torch.no_grad():
+        model(**pack(random_documents(lengths)))
+    first_entries = list(dict.fromkeys(entered))
+    assert first_entries == [
+        (index, name)
+        for index in range(len(sparse_layers))
+        for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm")
+    ]

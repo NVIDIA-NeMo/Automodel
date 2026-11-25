@@ -154,7 +154,7 @@ class HY4FlashCompressedIndexer(nn.Module):
     """Group-pooled lightning indexer. Selection is discrete, so the indexer receives no loss gradient.
 
     Token keys are pooled ``index_kpool`` at a time through a softmax over fp32 value / gate projections
-    (``key_value_projection`` / ``key_gate_projection`` biased by ``intra_group_ape``), normalised, and rotated
+    (``key_value_projection`` / ``key_gate_projection`` biased by ``intra_group_ape``), normalized, and rotated
     with the sparse layer's RoPE at the first token of each group. Queries come from the attention's
     ``q_a_layernorm`` output.
     """
@@ -175,7 +175,7 @@ class HY4FlashCompressedIndexer(nn.Module):
         self.key_value_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         self.key_gate_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         # The released key_norm weight is fp32 and is kept in fp32 here; the reference rounds it to bf16 on load.
-        # One call per document, each with that document's group count: keep it off the shape-specialised core.
+        # One call per document, each with that document's group count: keep it off the shape-specialized core.
         self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32, static_shape=False)
         self.intra_group_ape = HY4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
         # Queries are scored in chunks so the fp32 [queries, heads, groups] score block stays within this many bytes:
@@ -185,7 +185,7 @@ class HY4FlashCompressedIndexer(nn.Module):
 
     @torch.no_grad()
     def reset_parameters(self, std: float) -> None:
-        """Initialise as the reference does: normal projections and pooling bias, unit norm weights."""
+        """Initialize as the reference does: normal projections and pooling bias, unit norm weights."""
         for module in (
             self.query_projection,
             self.head_weight_projection,
@@ -200,7 +200,7 @@ class HY4FlashCompressedIndexer(nn.Module):
 
     @torch.no_grad()
     def token_keys(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalised per-token index keys.
+        """Normalized per-token index keys.
 
         Args:
             hidden_states: Tensor of shape [tokens, hidden].
@@ -261,7 +261,7 @@ class HY4FlashCompressedIndexer(nn.Module):
 
         A query recalls the ``index_topk // index_kpool - 1`` best-scoring groups that closed before its own group
         (ties broken towards the earlier group), plus the tokens of its own group up to itself. Scores are fp32
-        ``[queries, heads, groups]`` in the reference; they are materialised here a chunk of queries at a time and
+        ``[queries, heads, groups]`` in the reference; they are materialized here a chunk of queries at a time and
         only over the groups the chunk can see, with the chunk sized so the block stays within ``score_block_bytes``
         whatever the document length.
 
@@ -420,7 +420,7 @@ class HY4FlashAttention(nn.Module):
 
     @torch.no_grad()
     def reset_parameters(self, std: float, sink_init: float) -> None:
-        """Initialise as the reference does: normal projections, constant sinks, unit norm weights, then the indexer."""
+        """Initialize as the reference does: normal projections, constant sinks, unit norm weights, then the indexer."""
         for module in (
             self.q_a_proj,
             self.q_b_proj,
@@ -517,7 +517,7 @@ class HY4FlashAttention(nn.Module):
             rope: Rotary tables of the sparse layers over the global sequence (the indexer shares them).
             q_resid: Tensor of shape [local_tokens, q_lora_rank].
             hidden_states: Tensor of shape [local_tokens, hidden].
-            token_keys: Tensor of shape [global_tokens, index_head_dim], normalised index keys.
+            token_keys: Tensor of shape [global_tokens, index_head_dim], normalized index keys.
 
         Returns:
             Plan over this rank's queries with global key rows.

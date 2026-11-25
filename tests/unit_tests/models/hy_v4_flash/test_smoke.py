@@ -16,11 +16,10 @@
 import torch
 
 from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
+from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config
 
-from .tiny import CPU_BACKEND, tiny_config
 
-
-def test_tiny_forward_backward_is_finite():
+def test_tiny_forward_backward_is_finite() -> None:
     torch.manual_seed(0)
     model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
     model.initialize_weights(dtype=torch.float32)
@@ -31,11 +30,11 @@ def test_tiny_forward_backward_is_finite():
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
-def test_moe_only_activation_checkpointing_wraps_the_moe_and_trains():
-    """``activation_checkpointing: moe`` replaces each block's MoE with a checkpoint wrapper before initialisation.
+def test_moe_only_activation_checkpointing_wraps_the_moe_and_trains() -> None:
+    """``activation_checkpointing: moe`` replaces each block's MoE with a checkpoint wrapper before initialization.
 
     The wrapper forwards attribute access and calls but is not a ``MoE`` instance, so a block must not classify its
-    MLP by type: the wrapped model has to initialise, run and differentiate exactly like the unwrapped one.
+    MLP by type: the wrapped model has to initialize, run and differentiate exactly like the unwrapped one.
     """
     from nemo_automodel.components.moe.parallelizer import apply_ac
 
@@ -58,7 +57,7 @@ def test_moe_only_activation_checkpointing_wraps_the_moe_and_trains():
     assert torch.equal(losses[0], losses[1])
 
 
-def test_selective_activation_checkpointing_trains_like_the_plain_model():
+def test_selective_activation_checkpointing_trains_like_the_plain_model() -> None:
     """Selective checkpointing caches matmul / bmm results, so the model must not mutate one in place.
 
     The indexer's score block is such a result. The documents are longer than ``index_topk`` and the scores are

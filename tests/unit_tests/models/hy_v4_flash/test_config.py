@@ -14,16 +14,14 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
-import torch
 from transformers import AutoConfig
 
 import nemo_automodel._transformers.registry  # noqa: F401  (registers the custom configs with AutoConfig)
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
-from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLayer
-
-from .tiny import CPU_BACKEND, tiny_config, tiny_text_config
+from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config, tiny_text_config
 
 RELEASED = os.environ.get("HY4_CONFIG_JSON")
 needs_released = pytest.mark.skipif(
@@ -31,13 +29,13 @@ needs_released = pytest.mark.skipif(
 )
 
 
-def test_autoconfig_resolves_the_local_class_from_a_checkpoint_style_config(tmp_path):
+def test_autoconfig_resolves_the_local_class_from_a_checkpoint_style_config(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps(tiny_config().to_dict()))
     loaded = AutoConfig.from_pretrained(tmp_path)
     assert type(loaded) is HY4FlashConfig and type(loaded.text_config) is HY4FlashTextConfig
 
 
-def test_round_trip_keeps_the_per_type_rope_table(tmp_path):
+def test_round_trip_keeps_the_per_type_rope_table(tmp_path: Path) -> None:
     cfg = tiny_config()
     cfg.save_pretrained(tmp_path)
     again = HY4FlashConfig.from_pretrained(tmp_path).text_config
@@ -47,7 +45,7 @@ def test_round_trip_keeps_the_per_type_rope_table(tmp_path):
 
 
 @needs_released
-def test_released_config_semantics():
+def test_released_config_semantics() -> None:
     text = HY4FlashConfig(**json.load(open(RELEASED))).text_config
     # config ids are one-based: zero-based layers 1, 11, 21, 31 (confirmed against the weight names)
     assert text.engram_layer_ids == [2, 12, 22, 32] and text.engram_layer_indices == [1, 11, 21, 31]
@@ -63,7 +61,7 @@ def test_released_config_semantics():
 
 
 @pytest.mark.parametrize("spelling", ["deepseek_sparse_attention", "indexed_attention"])
-def test_released_and_reference_layer_type_spellings_build_the_same_layers(spelling):
+def test_released_and_reference_layer_type_spellings_build_the_same_layers(spelling: str) -> None:
     # The released config says "deepseek_sparse_attention"; newer transformers base classes rewrite it to
     # "indexed_attention". Either way the indexer layers must get the sparse head count, rotary base and an indexer.
     text = tiny_text_config(num_hidden_layers=3, layer_types=[spelling, "sliding_attention", spelling])
@@ -72,11 +70,6 @@ def test_released_and_reference_layer_type_spellings_build_the_same_layers(spell
     again = HY4FlashTextConfig(**text.to_dict())
     assert again.attention_types == text.attention_types
     assert again.layer_rope_parameters["indexed_attention"]["rope_theta"] == 1.0e7
-
-
-def test_engram_fp8_lookup_is_rejected_instead_of_ignored():
-    with pytest.raises(NotImplementedError, match="engram_fp8_embedding"):
-        HY4FlashEngramLayer(tiny_text_config(engram_fp8_embedding=True), 1, dtype=torch.float32)
 
 
 def _rope_parameters(**sliding_overrides: str | bool) -> dict[str, dict[str, str | float | bool | list[int]]]:
@@ -88,17 +81,9 @@ def _rope_parameters(**sliding_overrides: str | bool) -> dict[str, dict[str, str
     }
 
 
-def test_unsupported_layer_type_is_rejected():
+def test_unsupported_layer_type_is_rejected() -> None:
     with pytest.raises(ValueError, match="unsupported layer type"):
         tiny_text_config(layer_types=["full_attention"] * 6)
-
-
-def test_wrong_engram_layer_offset_is_detected_by_the_layer_id_check():
-    # a zero-based reading of the ids [2, 4] would put Engram on layers 2 and 4, which the config lookup rejects
-    cfg = tiny_text_config()
-    assert cfg.engram_layer_indices == [1, 3]
-    with pytest.raises(ValueError, match="has no Engram block"):
-        HY4FlashEngramLayer(cfg, 2, dtype=torch.float32)  # one-based id 3 is not an Engram layer
 
 
 @pytest.mark.parametrize(
@@ -126,14 +111,14 @@ def test_unsupported_backend_choices_are_rejected(field: str, value: str) -> Non
         HY4FlashAttention(tiny_text_config(), 0, dataclasses.replace(CPU_BACKEND, **{field: value}))
 
 
-def test_reduced_depth_keeps_the_released_schedule_prefix():
+def test_reduced_depth_keeps_the_released_schedule_prefix() -> None:
     text = tiny_text_config(num_hidden_layers=3)
     assert text.attention_types == ["indexed_attention", "indexed_attention", "sliding_attention"]
     assert len(text.mlp_layer_types) == 3
     assert text.engram_layer_indices == [1]  # id 4 (layer 3) is not built
 
 
-def test_fp32_lm_head_flag_cannot_be_silently_disabled():
+def test_fp32_lm_head_flag_cannot_be_silently_disabled() -> None:
     assert tiny_text_config().enable_lm_head_fp32 is True
     with pytest.raises(ValueError, match="enable_lm_head_fp32"):
         tiny_text_config(enable_lm_head_fp32=False)

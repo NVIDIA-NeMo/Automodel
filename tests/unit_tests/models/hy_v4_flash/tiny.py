@@ -14,10 +14,12 @@
 
 """Tiny Hy4-flash configuration with every distinguishing feature enabled (CPU-sized)."""
 
+import torch
+
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
-
-from .tiny_kwargs import TINY_TEXT_KWARGS
+from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
+from tests.unit_tests.models.hy_v4_flash.tiny_kwargs import TINY_TEXT_KWARGS
 
 CPU_BACKEND = BackendConfig(
     attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch", rope_fusion=False
@@ -47,4 +49,47 @@ def tiny_config(
     vision_kwargs.update(vision or {})
     return HY4FlashConfig(
         text_config=tiny_text_config(**overrides).to_dict(), vision_config=vision_kwargs, image_token_id=image_token_id
+    )
+
+
+# index_topk 16 with 4-token groups (the released ratio): three recalled groups plus the query's own group.
+KPOOL, TOPK, WINDOW = 4, 16, 6
+# Starts at every offset mod 4, documents of 1, 2 and 3 tokens, documents shorter and longer than window and top-k.
+DOC_LENGTHS = (1, 2, 3, 21, 22, 23, 37, 5, 41)
+TOLERANCE = dict(rtol=1e-4, atol=2e-5)  # fp32: same arithmetic, only the GEMM batch shapes (summation order) differ
+
+
+def build_model() -> HY4FlashForCausalLM:
+    torch.manual_seed(0)
+    config = tiny_config(
+        vision={"num_hidden_layers": 0},
+        index_topk=TOPK,
+        compressed_indexer_compress_ratio=KPOOL,
+        sliding_window=WINDOW,
+    )
+    model = HY4FlashForCausalLM(config, backend=CPU_BACKEND).float()
+    model.initialize_weights(dtype=torch.float32)
+    return model
+
+
+def build_plain_model() -> HY4FlashForCausalLM:
+    """The tiny model with its default top-k, pooling ratio and window."""
+    torch.manual_seed(0)
+    model = HY4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
+    model.initialize_weights(dtype=torch.float32)
+    return model
+
+
+def random_documents(lengths=DOC_LENGTHS, seed=1) -> list[torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    return [torch.randint(3, 280, (length,), generator=generator) for length in lengths]
+
+
+def pack(documents: list[torch.Tensor], padding: int = 0) -> dict[str, torch.Tensor]:
+    """One packed row: token ids, document ids (0 = padding) and document-local positions, each of shape [1, tokens]."""
+    ids = torch.cat([*documents, torch.full((padding,), 2)])
+    doc = torch.cat([*(torch.full((len(d),), i + 1) for i, d in enumerate(documents)), torch.zeros(padding).long()])
+    positions = torch.cat([*(torch.arange(len(d)) for d in documents), torch.zeros(padding).long()])
+    return dict(
+        input_ids=ids[None], packed_seq_ids=doc[None], position_ids=positions[None], attention_mask=doc[None] > 0
     )

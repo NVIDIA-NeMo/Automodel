@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Hy4-flash synthetic training benchmark: 4,096-token sequences of random token ids, randomly initialised BF16 weights.
+# Hy4-flash synthetic training benchmark: 4,096-token sequences of random token ids, randomly initialized BF16 weights.
 # 8 nodes x 8 H100 80GB; EP64, CP1, TP1, PP1 (DP64); two sequences per rank and step, parameters kept unsharded
 # after the forward.
 # Launch requirements (NCCL_PXN_DISABLE=1 on multi-node InfiniBand H100 systems, JIT cache placement): see the
@@ -43,7 +43,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    # Architecture from the official checkpoint; weights are randomly initialised BF16 (load_base_model: false).
+    # Architecture from the official checkpoint; weights are randomly initialized BF16 (load_base_model: false).
     _target_: nemo_automodel.components.models.hy_v4_flash.config.HY4FlashConfig.from_pretrained
     pretrained_model_name_or_path: tencent/Hy4-flash
     revision: eccd3123eec73f2040f4c9ed0de1883593470510  # pragma: allowlist secret (public model commit SHA)

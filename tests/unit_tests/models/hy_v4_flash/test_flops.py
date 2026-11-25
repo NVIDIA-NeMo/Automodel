@@ -19,8 +19,7 @@ import pytest
 
 from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig
 from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
-
-from .tiny import tiny_config
+from tests.unit_tests.models.hy_v4_flash.tiny import tiny_config
 
 
 def _brute_force(cfg: HY4FlashConfig, seq_len: int) -> float:
@@ -57,20 +56,20 @@ def _brute_force(cfg: HY4FlashConfig, seq_len: int) -> float:
 
 
 @pytest.mark.parametrize("seq_len", [1, 7, 40])
-def test_formula_matches_per_query_counting(seq_len):
+def test_formula_matches_per_query_counting(seq_len: int) -> None:
     cfg = tiny_config()
     formula = get_flops_formula_for_hf_config(cfg)
     assert formula(cfg, gbs=3, seq_len=seq_len) == pytest.approx(3 * _brute_force(cfg, seq_len), rel=1e-12)
 
 
-def test_text_config_resolves_the_same_formula():
+def test_text_config_resolves_the_same_formula() -> None:
     cfg = tiny_config()
     assert get_flops_formula_for_hf_config(cfg.text_config)(cfg.text_config, 1, 16) == get_flops_formula_for_hf_config(
         cfg
     )(cfg, 1, 16)
 
 
-def test_released_config_has_roughly_the_model_card_active_parameters():
+def test_released_config_has_roughly_the_model_card_active_parameters() -> None:
     path = os.environ.get("HY4_CONFIG_JSON")
     if not path or not os.path.exists(path):
         pytest.skip("HY4_CONFIG_JSON not provided")

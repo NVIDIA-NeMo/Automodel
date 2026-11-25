@@ -21,6 +21,7 @@ window both drop keys while the keys live on other ranks), short documents and t
 """
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import torch
@@ -47,7 +48,7 @@ def _objective(logits: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tens
     return (logits.square().sum(-1) * attention_mask).sum()
 
 
-def _single_rank():
+def _single_rank() -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     model = build_model()
     batch = pack(random_documents(DOC_LENGTHS), PADDING)
     logits = model(**batch).logits
@@ -59,7 +60,12 @@ def _drop_remote_keys(rank: int, local_tokens: int) -> None:
     """Test-only broken variant: the cross-rank key gather returns zeros for every token of another rank."""
     original = HY4FlashAttention._gather_keys
 
-    def gather(self, kv_local, token_keys, cp_group):
+    def gather(
+        self: HY4FlashAttention,
+        kv_local: torch.Tensor,
+        token_keys: torch.Tensor | None,
+        cp_group: dist.ProcessGroup | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         kv, keys = original(self, kv_local, token_keys, cp_group)
         own = torch.zeros(kv.shape[0], 1, dtype=torch.bool)
         own[rank * local_tokens : (rank + 1) * local_tokens] = True
@@ -68,7 +74,7 @@ def _drop_remote_keys(rank: int, local_tokens: int) -> None:
     HY4FlashAttention._gather_keys = gather
 
 
-def _worker(rank, rendezvous, result_path, broken):
+def _worker(rank: int, rendezvous: str, result_path: str, broken: bool) -> None:
     # Built before the process group exists so the Engram tables stay complete and local (no owner sharding).
     model = build_model()
     dist.init_process_group(
@@ -102,7 +108,7 @@ def _worker(rank, rendezvous, result_path, broken):
         dist.destroy_process_group()
 
 
-def _run_ranks(tmp_path, broken):
+def _run_ranks(tmp_path: Path, broken: bool) -> list[dict[str, torch.Tensor | dict[str, torch.Tensor]]]:
     context = mp.get_context("spawn")
     paths = [str(tmp_path / f"rank{rank}.pt") for rank in range(WORLD)]
     processes = [
@@ -134,7 +140,7 @@ def _assert_documents_match_alone(logits: torch.Tensor) -> None:
 
 
 @pytest.mark.timeout(600)
-def test_cp4_matches_unpacked_documents_and_single_rank_gradients(tmp_path):
+def test_cp4_matches_unpacked_documents_and_single_rank_gradients(tmp_path: Path) -> None:
     logits, grads = _run_ranks(tmp_path, broken=False)
     _assert_documents_match_alone(logits)
     reference_logits, reference_grads = _single_rank()
@@ -148,7 +154,7 @@ def test_cp4_matches_unpacked_documents_and_single_rank_gradients(tmp_path):
 
 
 @pytest.mark.timeout(600)
-def test_cp4_without_the_cross_rank_key_gather_is_detected(tmp_path):
+def test_cp4_without_the_cross_rank_key_gather_is_detected(tmp_path: Path) -> None:
     logits, _ = _run_ranks(tmp_path, broken=True)
     with pytest.raises(AssertionError):
         _assert_documents_match_alone(logits)

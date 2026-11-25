@@ -16,7 +16,7 @@
 
 Semantics follow the transformers reference (PR 50903, ``modeling_hy_v4_flash.py``):
 
-* ``HY4FlashRMSNorm`` casts the normalised activations back to the input dtype *before* the weight multiply.
+* ``HY4FlashRMSNorm`` casts the normalized activations back to the input dtype *before* the weight multiply.
 * The hyper-connection (iHC) has no Sinkhorn mixing: a sigmoid ``pre`` weight collapses the ``hc_mult`` streams
   and a sigmoid ``post`` weight scatters the sub-layer output back, the old streams passing through unchanged.
 * RoPE rotates interleaved pairs of the trailing ``qk_rope_head_dim`` channels, with the time/height/width
@@ -43,7 +43,7 @@ from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashTextConf
 # shapes as DeepSeek-V4.1's cores. The modules call the module-level dispatchers, so instances built before the hook
 # ran still pick up the compiled core. Compiled numerics are allclose to eager, not bitwise-identical.
 def _rms_norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Normalise the last axis in fp32, cast back, then apply the weight (reference order).
+    """Normalize the last axis in fp32, cast back, then apply the weight (reference order).
 
     Args:
         hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
@@ -116,7 +116,7 @@ _HC_COMPILED = False
 def compile_norm_core() -> None:
     """Wrap the fp32 RMSNorm core with ``torch.compile`` (``BackendConfig.compile_norm``); runs once per process.
 
-    Static shapes (one specialisation per norm site shape and grad mode) and no ``fullgraph``: past dynamo's
+    Static shapes (one specialization per norm site shape and grad mode) and no ``fullgraph``: past dynamo's
     recompile limit a shape runs eager instead of raising.
     """
     global _rms_norm, _NORM_COMPILED
@@ -144,11 +144,11 @@ class HY4FlashRMSNorm(nn.Module):
     """RMSNorm that multiplies the weight after casting back to the activation dtype.
 
     Args:
-        hidden_size: Size of the normalised axis.
+        hidden_size: Size of the normalized axis.
         eps: Added to the mean square.
         dtype: Dtype of the weight.
         static_shape: Whether every call sees the same input shape. The compiled core (``BackendConfig.compile_norm``)
-            specialises on the shape, so a norm whose input length follows the data (the indexer's pooled group
+            specializes on the shape, so a norm whose input length follows the data (the indexer's pooled group
             keys: one call per document) passes ``False`` and always runs the eager core.
     """
 
@@ -161,7 +161,7 @@ class HY4FlashRMSNorm(nn.Module):
         self.static_shape = static_shape
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalise the last axis.
+        """Normalize the last axis.
 
         Args:
             hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
@@ -191,7 +191,7 @@ class HY4FlashHyperConnection(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, initializer_range: float) -> None:
-        """Initialise as the reference does: small ``fn``, ``scale`` 0.01 and a ``-log(hc_mult - 1)`` pre bias."""
+        """Initialize as the reference does: small ``fn``, ``scale`` 0.01 and a ``-log(hc_mult - 1)`` pre bias."""
         nn.init.normal_(self.fn, mean=0.0, std=initializer_range)
         nn.init.constant_(self.scale, 0.01)
         base = torch.zeros(2 * self.hc_mult, dtype=self.base.dtype, device=self.base.device)
@@ -249,7 +249,7 @@ class HY4FlashHyperHead(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, initializer_range: float) -> None:
-        """Initialise as the reference does."""
+        """Initialize as the reference does."""
         nn.init.normal_(self.hc_fn, mean=0.0, std=initializer_range)
         nn.init.constant_(self.hc_scale, 0.01)
         nn.init.constant_(self.hc_base, -math.log(max(self.hc_mult - 1, 1)))

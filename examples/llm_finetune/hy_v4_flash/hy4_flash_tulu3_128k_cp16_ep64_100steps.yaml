@@ -57,7 +57,7 @@ model:
     compile_router_weight: true
     compile_hc: true
     compile_norm: true  # rounds once where the reference rounds twice in BF16; see the model card
-    dispatcher_equal_token_counts: true  # packed CP synchronises physical lengths across EP ranks
+    dispatcher_equal_token_counts: true  # packed CP synchronizes physical lengths across EP ranks
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

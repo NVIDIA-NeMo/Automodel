@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Hy4-flash synthetic training benchmark: 131,072-token sequences of random token ids (one document per sequence),
-# randomly initialised BF16 weights. 8 nodes x 8 H100 80GB; EP64, CP16, TP1, PP1 (DP4); one sequence per data-parallel
+# randomly initialized BF16 weights. 8 nodes x 8 H100 80GB; EP64, CP16, TP1, PP1 (DP4); one sequence per data-parallel
 # replica and step, split over 16 context-parallel ranks.
 # Parameters stay unsharded after the forward. Context parallelism takes one packed row per rank, so the local batch
 # size is 1.
@@ -45,7 +45,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    # Architecture from the official checkpoint; weights are randomly initialised BF16 (load_base_model: false).
+    # Architecture from the official checkpoint; weights are randomly initialized BF16 (load_base_model: false).
     _target_: nemo_automodel.components.models.hy_v4_flash.config.HY4FlashConfig.from_pretrained
     pretrained_model_name_or_path: tencent/Hy4-flash
     revision: eccd3123eec73f2040f4c9ed0de1883593470510  # pragma: allowlist secret (public model commit SHA)
