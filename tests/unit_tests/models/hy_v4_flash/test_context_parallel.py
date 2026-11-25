@@ -30,8 +30,13 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 
 from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashAttention
-
-from .test_document_isolation import TOLERANCE, build_model, pack, random_documents, run_alone
+from tests.unit_tests.models.hy_v4_flash.tiny import (
+    TOLERANCE,
+    assert_documents_match_alone,
+    build_model,
+    pack,
+    random_documents,
+)
 
 DOC_LENGTHS = (23, 1, 1, 52, 3, 13)  # starts 0, 23, 24, 25, 77, 80; rank boundaries at 24, 48, 72
 PADDING = 3
@@ -95,14 +100,15 @@ def _worker(rank: int, rendezvous: str, result_path: str, broken: bool) -> None:
             _drop_remote_keys(rank, local_tokens)
         shard = {k: v[:, rank * local_tokens : (rank + 1) * local_tokens] for k, v in batch.items()}
         out = model(**shard)
-        # the per-rank objectives sum to the single-rank objective
-        _objective(out.logits, shard["attention_mask"]).backward()
         grads = {}
-        for name, parameter in model.named_parameters():
-            if parameter.grad is not None:
-                grad = parameter.grad.clone()
-                dist.all_reduce(grad)
-                grads[name] = grad
+        if not broken:  # the negative control only compares logits
+            # the per-rank objectives sum to the single-rank objective
+            _objective(out.logits, shard["attention_mask"]).backward()
+            for name, parameter in model.named_parameters():
+                if parameter.grad is not None:
+                    grad = parameter.grad.clone()
+                    dist.all_reduce(grad)
+                    grads[name] = grad
         torch.save({"logits": out.logits.detach(), "grads": grads}, result_path)
     finally:
         dist.destroy_process_group()
@@ -126,20 +132,13 @@ def _run_ranks(tmp_path: Path, broken: bool) -> list[dict[str, torch.Tensor | di
 
 def _assert_documents_match_alone(logits: torch.Tensor) -> None:
     """Compare the reassembled logits [1, tokens, vocab] document by document with each document run alone."""
-    model = build_model()
-    start = 0
-    with torch.no_grad():
-        for index, document in enumerate(random_documents(DOC_LENGTHS)):
-            torch.testing.assert_close(
-                logits[0, start : start + len(document)],
-                run_alone(model, document),
-                msg=lambda m, index=index: f"document {index}: {m}",
-                **TOLERANCE,
-            )
-            start += len(document)
+    documents = random_documents(DOC_LENGTHS)
+    per_document = list(logits[0, : sum(DOC_LENGTHS)].split(list(DOC_LENGTHS)))
+    assert_documents_match_alone(build_model(), documents, per_document)
 
 
-@pytest.mark.timeout(600)
+@pytest.mark.cpu_only
+@pytest.mark.runtime_budget(120, reason="spawns four Gloo workers that each build the tiny model")
 def test_cp4_matches_unpacked_documents_and_single_rank_gradients(tmp_path: Path) -> None:
     logits, grads = _run_ranks(tmp_path, broken=False)
     _assert_documents_match_alone(logits)
@@ -153,7 +152,8 @@ def test_cp4_matches_unpacked_documents_and_single_rank_gradients(tmp_path: Path
         )
 
 
-@pytest.mark.timeout(600)
+@pytest.mark.cpu_only
+@pytest.mark.runtime_budget(120, reason="spawns four Gloo workers that each build the tiny model")
 def test_cp4_without_the_cross_rank_key_gather_is_detected(tmp_path: Path) -> None:
     logits, _ = _run_ranks(tmp_path, broken=True)
     with pytest.raises(AssertionError):

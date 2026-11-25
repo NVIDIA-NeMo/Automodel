@@ -13,94 +13,92 @@
 # limitations under the License.
 
 
+from collections.abc import Callable
+
+import pytest
 import torch
 
+from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashRope, HY4FlashSparsePlan
 from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
-from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config
+from nemo_automodel.components.moe.parallelizer import apply_ac
+from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, TOKEN_RANGE, tiny_config
 
 
 def test_tiny_forward_backward_is_finite() -> None:
     torch.manual_seed(0)
     model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
     model.initialize_weights(dtype=torch.float32)
-    ids = torch.randint(3, 280, (2, 24))
+    ids = torch.randint(*TOKEN_RANGE, (2, 24))
     out = model(ids, labels=ids)
     assert torch.isfinite(out.logits).all()
     out.loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
-def test_moe_only_activation_checkpointing_wraps_the_moe_and_trains() -> None:
-    """``activation_checkpointing: moe`` replaces each block's MoE with a checkpoint wrapper before initialization.
+def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor], HY4FlashForCausalLM]:
+    """Loss and gradients of one training forward and backward, plain (``None``) or under a checkpointing mode.
 
-    The wrapper forwards attribute access and calls but is not a ``MoE`` instance, so a block must not classify its
-    MLP by type: the wrapped model has to initialize, run and differentiate exactly like the unwrapped one.
+    The documents are longer than ``index_topk`` and the indexer scores one query per chunk, so the sparse selection
+    runs (in several chunks) under the wrapper.
     """
-    from nemo_automodel.components.moe.parallelizer import apply_ac
+    ids = torch.randint(*TOKEN_RANGE, (2, 40), generator=torch.Generator().manual_seed(1))
+    torch.manual_seed(0)
+    model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
+    assert ids.shape[1] > model.config.text_config.index_topk
+    chunked_calls: list[bool] = []
+    for layer in model.model.layers:
+        indexer = layer.self_attn.compressed_indexer
+        if indexer is None:
+            continue
+        indexer.score_block_bytes = 1  # one query per score chunk
+        original = indexer.select
 
-    ids = torch.randint(3, 280, (2, 24), generator=torch.Generator().manual_seed(1))
-    losses = []
-    for wrap in (False, True):
-        torch.manual_seed(0)
-        model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
-        if wrap:
-            apply_ac(model, ignore_router=True, moe_only=True)
-            wrapped = [type(layer.mlp).__name__ for layer in model.model.layers]
-            assert wrapped.count("CheckpointWrapper") == model.config.text_config.mlp_layer_types.count("sparse") > 0
-        torch.manual_seed(0)
-        model.initialize_weights(dtype=torch.float32)
-        model.train()
-        out = model(ids, labels=ids)
-        out.loss.backward()
-        assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
-        losses.append(out.loss.detach())
-    assert torch.equal(losses[0], losses[1])
+        def select(
+            q_resid: torch.Tensor,
+            hidden_states: torch.Tensor,
+            query_rope: HY4FlashRope,
+            group_keys: torch.Tensor,
+            group_rope: HY4FlashRope,
+            first_query_slot: int,
+            original: Callable[..., HY4FlashSparsePlan] = original,
+        ) -> HY4FlashSparsePlan:
+            chunked_calls.append(q_resid.shape[0] > 1)
+            return original(q_resid, hidden_states, query_rope, group_keys, group_rope, first_query_slot)
+
+        indexer.select = select
+    if mode == "moe":
+        apply_ac(model, ignore_router=True, moe_only=True)
+    elif mode == "selective":
+        apply_ac(model, selective=True)
+    torch.manual_seed(0)
+    model.initialize_weights(dtype=torch.float32)
+    model.train()
+    out = model(ids, labels=ids)
+    out.loss.backward()
+    assert chunked_calls and all(chunked_calls)
+    # A checkpoint wrapper inserts its own level into parameter names; compare under the plain names.
+    grads = {
+        name.replace("_checkpoint_wrapped_module.", ""): parameter.grad.clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    return out.loss.detach(), grads, model
 
 
-def test_selective_activation_checkpointing_trains_like_the_plain_model() -> None:
-    """Selective checkpointing caches matmul / bmm results, so the model must not mutate one in place.
+@pytest.mark.parametrize("mode", ["moe", "selective"])
+def test_activation_checkpointing_modes_train_like_the_plain_model(mode: str) -> None:
+    """Both partial checkpointing modes wrap the model before its weights are initialized.
 
-    The indexer's score block is such a result. The documents are longer than ``index_topk`` and the scores are
-    computed in several chunks, so the sparse selection runs under the wrapper.
+    ``moe`` replaces each block's MoE with a checkpoint wrapper, which forwards attribute access and calls but is not a
+    ``MoE`` instance, so a block must not classify its MLP by type. ``selective`` caches matmul / bmm results, so the
+    model must not mutate one in place (the indexer's score block is such a result).
     """
-    from nemo_automodel.components.moe.parallelizer import apply_ac
-
-    ids = torch.randint(3, 280, (2, 40), generator=torch.Generator().manual_seed(1))
-    results = []
-    for wrap in (False, True):
-        torch.manual_seed(0)
-        model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
-        indexers = [m.self_attn.compressed_indexer for m in model.model.layers if m.self_attn.compressed_indexer]
-        chunked_calls = []
-        for indexer in indexers:
-            indexer.score_block_bytes = 1  # one query per score chunk
-            original = indexer.select
-
-            def select(q_resid, *args, original=original):
-                chunked_calls.append(q_resid.shape[0] > 1)
-                return original(q_resid, *args)
-
-            indexer.select = select
-        assert ids.shape[1] > model.config.text_config.index_topk
-        if wrap:
-            apply_ac(model, selective=True)
-        torch.manual_seed(0)
-        model.initialize_weights(dtype=torch.float32)
-        model.train()
-        out = model(ids, labels=ids)
-        out.loss.backward()
-        assert chunked_calls and all(chunked_calls)
-        # The wrapper inserts its own level into parameter names; compare under the plain names.
-        grads = {
-            name.replace("_checkpoint_wrapped_module.", ""): p.grad.clone()
-            for name, p in model.named_parameters()
-            if p.grad is not None
-        }
-        results.append((out.loss.detach(), grads))
-    (plain_loss, plain_grads), (wrapped_loss, wrapped_grads) = results
-    assert torch.equal(plain_loss, wrapped_loss)
-    assert plain_grads.keys() == wrapped_grads.keys() and len(plain_grads) > 0
+    plain_loss, plain_grads, _ = _train_step(None)
+    loss, grads, model = _train_step(mode)
+    if mode == "moe":
+        wrapped = [type(layer.mlp).__name__ for layer in model.model.layers]
+        assert wrapped.count("CheckpointWrapper") == model.config.text_config.mlp_layer_types.count("sparse") > 0
+    assert torch.equal(plain_loss, loss)
+    assert plain_grads.keys() == grads.keys() and len(plain_grads) > 0
     for name, grad in plain_grads.items():
-        torch.testing.assert_close(
-            wrapped_grads[name], grad, rtol=1e-5, atol=1e-7, msg=lambda m, name=name: f"{name}: {m}"
-        )
+        torch.testing.assert_close(grads[name], grad, rtol=1e-5, atol=1e-7, msg=lambda m, name=name: f"{name}: {m}")

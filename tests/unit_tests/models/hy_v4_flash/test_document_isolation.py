@@ -20,6 +20,7 @@ with that boundary handling removed must make the same check fail.
 """
 
 import dataclasses
+import functools
 from collections.abc import Callable
 
 import pytest
@@ -29,38 +30,19 @@ import nemo_automodel.components.models.hy_v4_flash.model as model_module
 from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashBatch
 from tests.unit_tests.models.hy_v4_flash.tiny import (
     KPOOL,
+    PAD_ID,
+    TOKEN_RANGE,
     TOLERANCE,
     TOPK,
     WINDOW,
+    assert_packed_matches_alone,
     build_model,
     build_plain_model,
     pack,
     random_documents,
+    run_alone,
+    run_packed,
 )
-
-
-def run_packed(model, documents, padding=0, **overrides) -> list[torch.Tensor]:
-    """Logits of every document of the pack, each of shape [document_tokens, vocab]."""
-    batch = {**pack(documents, padding), **overrides}
-    logits = model(**batch).logits[0]
-    return list(logits[: sum(map(len, documents))].split([len(d) for d in documents]))
-
-
-def run_alone(model, document) -> torch.Tensor:
-    """Logits of one unpacked document, of shape [document_tokens, vocab] (the independent oracle)."""
-    return model(document[None]).logits[0]
-
-
-def assert_documents_match_alone(model, documents, padding=0, **overrides) -> None:
-    with torch.no_grad():
-        packed = run_packed(model, documents, padding, **overrides)
-        for index, document in enumerate(documents):
-            torch.testing.assert_close(
-                packed[index],
-                run_alone(model, document),
-                msg=lambda m, index=index: f"document {index}: {m}",
-                **TOLERANCE,
-            )
 
 
 def test_layout_exercises_selection_and_windows() -> None:
@@ -97,7 +79,7 @@ def _starts(documents: list[torch.Tensor]) -> list[int]:
 
 @pytest.mark.parametrize("padding", [0, 7])
 def test_every_packed_document_equals_the_document_run_alone(padding: int) -> None:
-    assert_documents_match_alone(build_model(), random_documents(), padding)
+    assert_packed_matches_alone(build_model(), random_documents(), padding)
 
 
 def test_duplicate_document_attack() -> None:
@@ -170,21 +152,13 @@ def test_gradient_isolation_and_additivity() -> None:
 
 
 # ------------------------------------------------------------------------------------------------- negative controls
-def _leaky_window(monkeypatch: pytest.MonkeyPatch) -> None:
+def _leaky_plan(monkeypatch: pytest.MonkeyPatch, width: int) -> None:
+    """Drop the document start from the key lists of ``width`` (the sliding window or the dense causal prefix)."""
     original = model_module.causal_prefix_plan
     monkeypatch.setattr(
         model_module,
         "causal_prefix_plan",
-        lambda position, doc_start, width: original(position, doc_start * (width != WINDOW), width),
-    )
-
-
-def _leaky_dense(monkeypatch: pytest.MonkeyPatch) -> None:
-    original = model_module.causal_prefix_plan
-    monkeypatch.setattr(
-        model_module,
-        "causal_prefix_plan",
-        lambda position, doc_start, width: original(position, doc_start * (width != TOPK), width),
+        lambda position, doc_start, plan_width: original(position, doc_start * (plan_width != width), plan_width),
     )
 
 
@@ -209,16 +183,24 @@ def _leaky_engram(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.mark.parametrize("leak", [_leaky_window, _leaky_dense, _leaky_indexer_groups, _leaky_engram])
+@pytest.mark.parametrize(
+    "leak",
+    [
+        pytest.param(functools.partial(_leaky_plan, width=WINDOW), id="window"),
+        pytest.param(functools.partial(_leaky_plan, width=TOPK), id="dense_prefix"),
+        pytest.param(_leaky_indexer_groups, id="indexer_groups"),
+        pytest.param(_leaky_engram, id="engram"),
+    ],
+)
 def test_removing_one_boundary_mechanism_is_detected(
     monkeypatch: pytest.MonkeyPatch, leak: Callable[[pytest.MonkeyPatch], None]
 ) -> None:
     model = build_model()
     documents = random_documents()
-    assert_documents_match_alone(model, documents)  # the unbroken model passes on this exact input
+    assert_packed_matches_alone(model, documents)  # the unbroken model passes on this exact input
     leak(monkeypatch)
     with pytest.raises(AssertionError):
-        assert_documents_match_alone(model, documents)
+        assert_packed_matches_alone(model, documents)
 
 
 def test_positions_that_do_not_restart_per_document_are_detected() -> None:
@@ -226,7 +208,7 @@ def test_positions_that_do_not_restart_per_document_are_detected() -> None:
     documents = random_documents()
     running = torch.arange(sum(map(len, documents)))[None]
     with pytest.raises(AssertionError):
-        assert_documents_match_alone(model, documents, position_ids=running)
+        assert_packed_matches_alone(model, documents, position_ids=running)
 
 
 def test_packed_documents_equal_separate_forwards() -> None:
@@ -234,7 +216,7 @@ def test_packed_documents_equal_separate_forwards() -> None:
     model = build_plain_model()
     generator = torch.Generator().manual_seed(2)
     lengths = [21, 12, 9]
-    docs = [torch.randint(3, 280, (1, n), generator=generator) for n in lengths]
+    docs = [torch.randint(*TOKEN_RANGE, (1, n), generator=generator) for n in lengths]
     with torch.no_grad():
         alone = torch.cat([model(d).logits for d in docs], dim=1)
         packed = model(
@@ -248,8 +230,11 @@ def test_packed_documents_equal_separate_forwards() -> None:
 def test_padded_batch_rows_equal_separate_forwards() -> None:
     model = build_plain_model()
     generator = torch.Generator().manual_seed(3)
-    a, b = torch.randint(3, 280, (1, 20), generator=generator), torch.randint(3, 280, (1, 13), generator=generator)
-    batch = torch.full((2, 20), 2)
+    a, b = (
+        torch.randint(*TOKEN_RANGE, (1, 20), generator=generator),
+        torch.randint(*TOKEN_RANGE, (1, 13), generator=generator),
+    )
+    batch = torch.full((2, 20), PAD_ID)
     batch[0], batch[1, :13] = a[0], b[0]
     mask = torch.zeros(2, 20, dtype=torch.long)
     mask[0], mask[1, :13] = 1, 1

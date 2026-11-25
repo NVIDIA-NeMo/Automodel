@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 
 import pytest
 import torch
@@ -26,22 +25,12 @@ from nemo_automodel.components.models.hy_v4_flash.layers import (
     mrope_cos_sin,
 )
 from nemo_automodel.components.moe.layers import MoE
-from tests.unit_tests.models.hy_v4_flash.tiny import build_model
+from tests.unit_tests.models.hy_v4_flash.tiny import build_model, complex_rotation
 
 
 def _oracle_rope(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:
-    """Complex-number RoPE on interleaved pairs, written independently of the production helper."""
-    rope_dim = x.shape[-1]
-    out = torch.empty_like(x, dtype=torch.float64)
-    for b in range(x.shape[0]):
-        for s in range(x.shape[1]):
-            for i in range(rope_dim // 2):
-                angle = float(positions[b, s]) * theta ** (-2.0 * i / rope_dim)
-                z = complex(float(x[b, s, 0, 2 * i]), float(x[b, s, 0, 2 * i + 1])) * complex(
-                    math.cos(angle), math.sin(angle)
-                )
-                out[b, s, 0, 2 * i], out[b, s, 0, 2 * i + 1] = z.real, z.imag
-    return out
+    """The shared complex-rotation oracle on [batch, sequence, 1, rope_dim] inputs with [batch, sequence] positions."""
+    return torch.stack([complex_rotation(x[row, :, 0], positions[row], theta) for row in range(x.shape[0])])[:, :, None]
 
 
 @pytest.mark.parametrize("theta", [1.0e4, 1.0e7])

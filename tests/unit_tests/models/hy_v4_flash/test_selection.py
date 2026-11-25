@@ -23,26 +23,14 @@ from nemo_automodel.components.models.hy_v4_flash.attention import (
     causal_prefix_plan,
 )
 from nemo_automodel.components.models.hy_v4_flash.layers import inverse_frequencies, mrope_cos_sin
-from tests.unit_tests.models.hy_v4_flash.tiny import TOPK, build_model, pack, random_documents, tiny_text_config
-
-
-def _rotate(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:
-    """Complex rotation of interleaved pairs, independent of the production helper.
-
-    Args:
-        x: Tensor of shape [tokens, rope_dim].
-        positions: Integer tensor of shape [tokens].
-        theta: Rotary base.
-
-    Returns:
-        Tensor of shape [tokens, rope_dim].
-    """
-    half = x.shape[-1] // 2
-    angles = positions[:, None].double() * theta ** (-torch.arange(half).double() * 2 / x.shape[-1])
-    rotated = torch.view_as_complex(x.double().reshape(-1, half, 2).contiguous()) * torch.polar(
-        torch.ones_like(angles), angles
-    )
-    return torch.view_as_real(rotated).reshape(x.shape).float()
+from tests.unit_tests.models.hy_v4_flash.tiny import (
+    TOPK,
+    build_model,
+    complex_rotation,
+    pack,
+    random_documents,
+    tiny_text_config,
+)
 
 
 def _brute_force_logits(
@@ -68,10 +56,10 @@ def _brute_force_logits(
     """
     kpool, heads, dim, rope = indexer.kpool, indexer.n_heads, indexer.head_dim, indexer.rope_dim
     keys = group_keys.clone()
-    keys[:, dim - rope :] = _rotate(keys[:, dim - rope :], torch.arange(keys.shape[0]) * kpool, theta)
+    keys[:, dim - rope :] = complex_rotation(keys[:, dim - rope :], torch.arange(keys.shape[0]) * kpool, theta)
     query = indexer.query_projection(q_resid).view(-1, heads, dim).clone()
     for head in range(heads):
-        query[:, head, dim - rope :] = _rotate(query[:, head, dim - rope :], slots, theta)
+        query[:, head, dim - rope :] = complex_rotation(query[:, head, dim - rope :], slots, theta)
     weights = indexer.head_weight_projection(hidden) * (heads**-0.5 * dim**-0.5)
     return torch.stack([(weights[row][:, None] * torch.relu(query[row] @ keys.T)).sum(0) for row in range(len(slots))])
 

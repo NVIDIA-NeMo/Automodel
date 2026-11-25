@@ -21,6 +21,10 @@ from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, 
 from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
 from tests.unit_tests.models.hy_v4_flash.tiny_kwargs import TINY_TEXT_KWARGS
 
+# Token ids the tests draw from (above the special ids, inside the tiny vocabulary) and the padding id.
+TOKEN_RANGE = (3, 280)
+PAD_ID = 2
+
 CPU_BACKEND = BackendConfig(
     attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch", rope_fusion=False
 )
@@ -82,14 +86,67 @@ def build_plain_model() -> HY4FlashForCausalLM:
 
 def random_documents(lengths=DOC_LENGTHS, seed=1) -> list[torch.Tensor]:
     generator = torch.Generator().manual_seed(seed)
-    return [torch.randint(3, 280, (length,), generator=generator) for length in lengths]
+    return [torch.randint(*TOKEN_RANGE, (length,), generator=generator) for length in lengths]
 
 
 def pack(documents: list[torch.Tensor], padding: int = 0) -> dict[str, torch.Tensor]:
     """One packed row: token ids, document ids (0 = padding) and document-local positions, each of shape [1, tokens]."""
-    ids = torch.cat([*documents, torch.full((padding,), 2)])
+    ids = torch.cat([*documents, torch.full((padding,), PAD_ID)])
     doc = torch.cat([*(torch.full((len(d),), i + 1) for i, d in enumerate(documents)), torch.zeros(padding).long()])
     positions = torch.cat([*(torch.arange(len(d)) for d in documents), torch.zeros(padding).long()])
     return dict(
         input_ids=ids[None], packed_seq_ids=doc[None], position_ids=positions[None], attention_mask=doc[None] > 0
     )
+
+
+def run_packed(
+    model: HY4FlashForCausalLM, documents: list[torch.Tensor], padding: int = 0, **overrides: torch.Tensor
+) -> list[torch.Tensor]:
+    """Logits of every document of the pack, each of shape [document_tokens, vocab]."""
+    batch = {**pack(documents, padding), **overrides}
+    logits = model(**batch).logits[0]
+    return list(logits[: sum(map(len, documents))].split([len(d) for d in documents]))
+
+
+def run_alone(model: HY4FlashForCausalLM, document: torch.Tensor) -> torch.Tensor:
+    """Logits of one unpacked document, of shape [document_tokens, vocab] (the independent oracle)."""
+    return model(document[None]).logits[0]
+
+
+def assert_documents_match_alone(
+    model: HY4FlashForCausalLM, documents: list[torch.Tensor], logits: list[torch.Tensor]
+) -> None:
+    """Compare per-document logits (each [document_tokens, vocab]) with every document run alone and unpacked."""
+    with torch.no_grad():
+        for index, (document, got) in enumerate(zip(documents, logits, strict=True)):
+            torch.testing.assert_close(
+                got, run_alone(model, document), msg=lambda m, index=index: f"document {index}: {m}", **TOLERANCE
+            )
+
+
+def assert_packed_matches_alone(
+    model: HY4FlashForCausalLM, documents: list[torch.Tensor], padding: int = 0, **overrides: torch.Tensor
+) -> None:
+    """Run the documents as one pack and compare each with the same document run alone."""
+    with torch.no_grad():
+        packed = run_packed(model, documents, padding, **overrides)
+    assert_documents_match_alone(model, documents, packed)
+
+
+def complex_rotation(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:
+    """Complex rotation of interleaved pairs, independent of the production helper.
+
+    Args:
+        x: Tensor of shape [tokens, rope_dim].
+        positions: Integer tensor of shape [tokens].
+        theta: Rotary base.
+
+    Returns:
+        Tensor of shape [tokens, rope_dim].
+    """
+    half = x.shape[-1] // 2
+    angles = positions[:, None].double() * theta ** (-torch.arange(half).double() * 2 / x.shape[-1])
+    rotated = torch.view_as_complex(x.double().reshape(-1, half, 2).contiguous()) * torch.polar(
+        torch.ones_like(angles), angles
+    )
+    return torch.view_as_real(rotated).reshape(x.shape).float()
