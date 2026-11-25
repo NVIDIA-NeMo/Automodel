@@ -253,3 +253,16 @@ def test_scatter_reuses_kernel_across_route_widths(monkeypatch: pytest.MonkeyPat
         expected[-1] = True
         assert torch.equal(membership, expected.expand_as(membership))
     assert len(kernels) == 4 and all(kernel is kernels[0] for kernel in kernels)
+
+
+@_CUDA_AND_TRITON
+def test_preprocess_spans_cuda_grid_y_limit() -> None:
+    kv_length = 65535 * 256 + 1
+    routes = torch.tensor([[[0, kv_length - 1]]], device="cuda", dtype=torch.int32)
+    membership, pc, pi, fc, _, rpc, rpi, rfc, _ = fa4_qsa._preprocess(routes, kv_length, 80, 64)
+    assert membership.sum().item() == 2
+    assert pc.item() == 2 and fc.item() == 0
+    assert pi.flatten()[:2].tolist() == [0, (kv_length - 1) // 80]
+    assert rpc.sum().item() == 2 and rfc.sum().item() == 0
+    assert rpc.flatten()[[0, -1]].tolist() == [1, 1]
+    assert rpi.flatten()[[0, -1]].tolist() == [0, 0]

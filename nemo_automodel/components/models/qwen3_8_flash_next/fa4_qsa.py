@@ -154,8 +154,11 @@ if HAVE_TRITON:
                 full (2). Chunks that reach past the last query or key are never full.
         """
         tile = tl.program_id(0)
+        chunk_group = tl.program_id(2) * tl.num_programs(1) + tl.program_id(1)
         rows = (tile % row_blocks) * ROWS + tl.arange(0, ROWS)
-        cols = tl.program_id(1) * (CHUNKS_PER_PROGRAM * CHUNK_KEYS) + tl.arange(0, CHUNKS_PER_PROGRAM * CHUNK_KEYS)
+        cols = chunk_group.to(tl.int64) * (CHUNKS_PER_PROGRAM * CHUNK_KEYS) + tl.arange(
+            0, CHUNKS_PER_PROGRAM * CHUNK_KEYS
+        )
         # Bound columns by the 32-byte-aligned row stride, not kv_length, so loads stay vectorized: the
         # row padding past kv_length is zero, which keeps a chunk that reaches past the last key from being full.
         in_bounds = (rows < queries)[:, None] & (cols < membership_row_stride)[None, :]
@@ -163,7 +166,7 @@ if HAVE_TRITON:
         values = tl.load(membership + offsets, mask=in_bounds, other=0).to(tl.int32)
         counts = tl.sum(tl.sum(tl.reshape(values, (ROWS, CHUNKS_PER_PROGRAM, CHUNK_KEYS)), axis=2), axis=0)
         chunk_kinds = (counts > 0).to(tl.int8) + (counts == ROWS * CHUNK_KEYS).to(tl.int8)
-        chunk_ids = tl.program_id(1) * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
+        chunk_ids = chunk_group * CHUNKS_PER_PROGRAM + tl.arange(0, CHUNKS_PER_PROGRAM)
         tl.store(kinds + tile.to(tl.int64) * chunks + chunk_ids, chunk_kinds, mask=chunk_ids < chunks)
 
     @triton.jit
@@ -183,6 +186,7 @@ if HAVE_TRITON:
         COLUMN_CHUNK: tl.constexpr,
         SPAN: tl.constexpr,
         BLOCK_COLUMNS: tl.constexpr,
+        COLUMN_TILES: tl.constexpr,
     ):
         """Merge chunk kinds into FA4 block kinds and write one sorted block list per program.
 
@@ -200,38 +204,35 @@ if HAVE_TRITON:
         """
         program = tl.program_id(0)
         item = program % lists
-        cols = tl.arange(0, BLOCK_COLUMNS)
-        col_ok = cols < columns
-        row_block = item * LIST_ROW_BLOCK + cols * COLUMN_ROW_BLOCK
-        first_chunk = item * LIST_CHUNK + cols * COLUMN_CHUNK
-        base = kinds + ((program // lists) * row_blocks + row_block).to(tl.int64) * chunks
-        present = tl.zeros((BLOCK_COLUMNS,), tl.int1)
-        full = col_ok
-        for j in tl.static_range(SPAN):
-            chunk = first_chunk + j
-            kind = tl.load(base + chunk, mask=col_ok & (chunk < chunks), other=0)
-            present = present | (kind > 0)
-            full = full & (kind == 2)
-        partial = present & ~full
+        partial_count = 0
+        full_count = 0
         output = program.to(tl.int64) * columns
-        # Selected columns take the leading slots in ascending order; the rest fill the tail with
-        # the padding value, so every slot is written exactly once.
-        count = tl.sum(partial.to(tl.int32), axis=0)
-        slot = tl.where(
-            partial,
-            tl.cumsum(partial.to(tl.int32), axis=0) - 1,
-            count + tl.cumsum((col_ok & ~partial).to(tl.int32), axis=0) - 1,
-        )
-        tl.store(partial_ids + output + slot, tl.where(partial, cols, columns), mask=col_ok)
-        tl.store(partial_counts + program, count)
-        count = tl.sum(full.to(tl.int32), axis=0)
-        slot = tl.where(
-            full,
-            tl.cumsum(full.to(tl.int32), axis=0) - 1,
-            count + tl.cumsum((col_ok & ~full).to(tl.int32), axis=0) - 1,
-        )
-        tl.store(full_ids + output + slot, tl.where(full, cols, columns), mask=col_ok)
-        tl.store(full_counts + program, count)
+        for tile in range(COLUMN_TILES):
+            cols = tile * BLOCK_COLUMNS + tl.arange(0, BLOCK_COLUMNS)
+            col_ok = cols < columns
+            row_block = item * LIST_ROW_BLOCK + cols * COLUMN_ROW_BLOCK
+            first_chunk = item * LIST_CHUNK + cols * COLUMN_CHUNK
+            base = kinds + ((program // lists) * row_blocks + row_block).to(tl.int64) * chunks
+            present = tl.zeros((BLOCK_COLUMNS,), tl.int1)
+            full = col_ok
+            for j in tl.static_range(SPAN):
+                chunk = first_chunk + j
+                kind = tl.load(base + chunk, mask=col_ok & (chunk < chunks), other=0)
+                present = present | (kind > 0)
+                full = full & (kind == 2)
+            partial = present & ~full
+            # Append selected columns in ascending order. Write padding from the opposite
+            # end, so each column claims one slot without knowing the final counts.
+            partial_prefix = partial_count + tl.cumsum(partial.to(tl.int32), axis=0)
+            full_prefix = full_count + tl.cumsum(full.to(tl.int32), axis=0)
+            partial_slot = tl.where(partial, partial_prefix - 1, columns - 1 - cols + partial_prefix)
+            full_slot = tl.where(full, full_prefix - 1, columns - 1 - cols + full_prefix)
+            tl.store(partial_ids + output + partial_slot, tl.where(partial, cols, columns), mask=col_ok)
+            tl.store(full_ids + output + full_slot, tl.where(full, cols, columns), mask=col_ok)
+            partial_count += tl.sum(partial.to(tl.int32), axis=0)
+            full_count += tl.sum(full.to(tl.int32), axis=0)
+        tl.store(partial_counts + program, partial_count)
+        tl.store(full_counts + program, full_count)
 
 
 def _preprocess(
@@ -291,7 +292,10 @@ def _preprocess(
     row_blocks = triton.cdiv(queries, _QUERY_BLOCK)
     chunks_per_program = max(1, _KEYS_PER_CHUNK_PROGRAM // chunk_keys)
     kinds = torch.empty((batch, row_blocks, chunks), device=routes.device, dtype=torch.int8)
-    _chunk_kinds_kernel[(batch * row_blocks, triton.cdiv(chunks, chunks_per_program))](
+    # CUDA limits each of grid.y and grid.z to 65535 programs.
+    groups = triton.cdiv(chunks, chunks_per_program)
+    grid_z = triton.cdiv(groups, 65535)
+    _chunk_kinds_kernel[(batch * row_blocks, triton.cdiv(groups, grid_z), grid_z)](
         storage,
         kinds,
         queries,
@@ -313,6 +317,7 @@ def _preprocess(
         counts = torch.empty((batch, 1, lists), device=routes.device, dtype=torch.int32)
         ids = torch.empty((batch, 1, lists, columns), device=routes.device, dtype=torch.int32)
         full_counts, full_ids = torch.empty_like(counts), torch.empty_like(ids)
+        block_columns = min(4096, triton.next_power_of_2(columns))
         _compact_block_lists_kernel[(batch * lists,)](
             kinds,
             counts,
@@ -328,7 +333,8 @@ def _preprocess(
             LIST_CHUNK=list_chunk,
             COLUMN_CHUNK=column_chunk,
             SPAN=span,
-            BLOCK_COLUMNS=triton.next_power_of_2(columns),
+            BLOCK_COLUMNS=block_columns,
+            COLUMN_TILES=triton.cdiv(columns, block_columns),
         )
         block_lists += [counts, ids, full_counts, full_ids]
     return storage[..., :kv_length], *block_lists
