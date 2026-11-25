@@ -172,7 +172,8 @@ class HY4FlashCompressedIndexer(nn.Module):
         self.key_value_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         self.key_gate_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         # The released key_norm weight is fp32; keep it exact instead of rounding it to bf16 (the output is cast back below).
-        self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32)
+        # One call per document, each with that document's group count: keep it off the shape-specialised core.
+        self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32, static_shape=False)
         self.intra_group_ape = HY4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
         # Queries are scored in chunks so the fp32 [queries, heads, groups] score block stays within this many bytes:
         # one chunk for a 4K document, 256 queries at a time for a 128K one. ``query_chunk`` pins the chunk instead.

@@ -141,12 +141,24 @@ def compile_hc_cores() -> None:
 
 
 class HY4FlashRMSNorm(nn.Module):
-    """RMSNorm that multiplies the weight after casting back to the activation dtype."""
+    """RMSNorm that multiplies the weight after casting back to the activation dtype.
 
-    def __init__(self, hidden_size: int, eps: float = 1e-5, dtype: torch.dtype | None = None) -> None:
+    Args:
+        hidden_size: Size of the normalised axis.
+        eps: Added to the mean square.
+        dtype: Dtype of the weight.
+        static_shape: Whether every call sees the same input shape. The compiled core (``BackendConfig.compile_norm``)
+            specialises on the shape, so a norm whose input length follows the data (the indexer's pooled group
+            keys: one call per document) passes ``False`` and always runs the eager core.
+    """
+
+    def __init__(
+        self, hidden_size: int, eps: float = 1e-5, dtype: torch.dtype | None = None, static_shape: bool = True
+    ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.eps = eps
+        self.static_shape = static_shape
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Normalise the last axis.
@@ -157,7 +169,8 @@ class HY4FlashRMSNorm(nn.Module):
         Returns:
             Tensor of the same shape and dtype as ``hidden_states``.
         """
-        return _rms_norm(hidden_states, self.weight, self.eps)
+        core = _rms_norm if self.static_shape else _rms_norm_core
+        return core(hidden_states, self.weight, self.eps)
 
 
 def unweighted_rms_inverse(x: torch.Tensor, eps: float) -> torch.Tensor:

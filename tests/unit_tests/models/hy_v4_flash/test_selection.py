@@ -139,3 +139,34 @@ def test_causal_prefix_plan_windows_stay_inside_documents_and_padding_has_no_key
         [6, 7, 8],
         [-1, -1, -1],
     ]
+
+
+def test_pooled_key_norm_stays_off_the_shape_specialised_core(monkeypatch):
+    """Pooling runs once per document with that document's group count, so it must not reach the compiled norm core.
+
+    The compiled core specialises on the input shape: called with a new group count it compiles again, which costs
+    seconds per new document layout on packed data. The stand-in below records every shape the compiled core would see.
+    """
+    from nemo_automodel.components.models.hy_v4_flash import layers
+
+    seen: list[tuple[int, ...]] = []
+
+    def recording_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        seen.append(tuple(hidden_states.shape))
+        return layers._rms_norm_core(hidden_states, weight, eps)
+
+    cfg = tiny_text_config()
+    indexer = HY4FlashCompressedIndexer(cfg).float()
+    documents = [torch.randn(length, indexer.head_dim) for length in (3 * indexer.kpool, 7 * indexer.kpool + 1)]
+    expected = [indexer.pool_groups(document) for document in documents]
+
+    monkeypatch.setattr(layers, "_rms_norm", recording_core)
+    pooled = [indexer.pool_groups(document) for document in documents]
+    assert seen == []
+    assert [tuple(p.shape) for p in pooled] == [(3, indexer.head_dim), (7, indexer.head_dim)]
+    for got, want in zip(pooled, expected):
+        assert torch.equal(got, want)
+
+    # Control: a norm with a fixed input shape does go through the swappable core.
+    indexer.token_keys(torch.randn(5, cfg.hidden_size))
+    assert seen == [(5, indexer.head_dim)]
