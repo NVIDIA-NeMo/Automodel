@@ -60,11 +60,13 @@ class ChatContentBlock(TypedDict, total=False):
     image_url: str | ImageUrl
 
 
-class ChatMessage(TypedDict):
+class ChatMessage(TypedDict, total=False):
     """One chat message with string content or an ordered list of content blocks."""
 
-    role: Literal["system", "user", "assistant"]
-    content: str | list[ChatContentBlock]
+    role: Required[Literal["system", "user", "assistant"]]
+    content: Required[str | list[ChatContentBlock]]
+    reasoning_content: str
+    reasoning: str
 
 
 IMAGE_PAD_TOKEN = "<｜hy_image▁pad:opensource｜>"
@@ -160,6 +162,27 @@ def _open_image(value: Image.Image | str | Path | bytes) -> Image.Image:
 
         return Image.open(io.BytesIO(value))
     return Image.open(value)
+
+
+def training_reasoning_effort(messages: Sequence[ChatMessage]) -> Literal["no_think", "high"]:
+    """Reasoning mode of a complete (training) conversation, by the rule of the official fine-tuning scripts.
+
+    The released chat template defaults to ``reasoning_effort='high'``, which is its inference default. The official
+    SFT code instead treats a sample without a reasoning field as fast-thinking data and renders it with
+    ``'no_think'``; only samples whose assistant turns carry ``reasoning_content`` (or ``reasoning``) use ``'high'``.
+    Rendering answer-only data in ``'high'`` mode would train (and score) answers after an empty think block in the
+    mode where the model expects to reason first.
+
+    Args:
+        messages: Chat messages of one conversation.
+
+    Returns:
+        ``"high"`` when an assistant message has non-empty reasoning, else ``"no_think"``.
+    """
+    for message in messages:
+        if message.get("role") == "assistant" and (message.get("reasoning_content") or message.get("reasoning")):
+            return "high"
+    return "no_think"
 
 
 class ProcessorOptions(TypedDict, total=False):
@@ -339,7 +362,9 @@ class HY4FlashProcessor(ProcessorMixin):
             return_tensors: ``"pt"`` or ``None``.
             add_generation_prompt: Append the assistant header.
             processor_kwargs: Padding / truncation arguments for :meth:`__call__`.
-            **kwargs: Extra jinja template variables.
+            **kwargs: Extra jinja template variables. Without ``reasoning_effort``, a complete conversation
+                (``add_generation_prompt=False``, the training case) is rendered in the mode
+                :func:`training_reasoning_effort` picks; a generation prompt keeps the template's own default.
 
         Returns:
             Rendered text(s), ``input_ids``, or the full batch.
@@ -349,9 +374,12 @@ class HY4FlashProcessor(ProcessorMixin):
         texts, images = [], []
         for sample in conversations:
             messages, sources = self._split_images(sample)
+            template_kwargs = dict(kwargs)
+            if "reasoning_effort" not in template_kwargs and not add_generation_prompt:
+                template_kwargs["reasoning_effort"] = training_reasoning_effort(messages)
             texts.append(
                 self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=add_generation_prompt, **kwargs
+                    messages, tokenize=False, add_generation_prompt=add_generation_prompt, **template_kwargs
                 )
             )
             images.append(sources)

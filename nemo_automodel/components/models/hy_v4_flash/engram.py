@@ -139,7 +139,8 @@ class HY4FlashEngramLayer(nn.Module):
             draw_hash_multipliers(self.seed, self.layer_id, self.max_ngram_size, config.engram_lookup_table_size),
             persistent=False,
         )
-        self._multipliers_ready = False
+        # (storage address, version) of the lookup table the multipliers were drawn for; see ``_lookup_table_state``.
+        self._multipliers_drawn_for: tuple[int, int] | None = None
         self.lookup_per_head_norms = nn.ModuleList(
             HY4FlashWeightOnlyNorm(head_dim, dtype) for _ in range(self.num_heads)
         )
@@ -181,7 +182,17 @@ class HY4FlashEngramLayer(nn.Module):
         """
         compressed = int(self.lookup_table.max()) + 1
         self.hash_multipliers.copy_(draw_hash_multipliers(self.seed, self.layer_id, self.max_ngram_size, compressed))
-        self._multipliers_ready = True
+        self._multipliers_drawn_for = self._lookup_table_state()
+
+    def _lookup_table_state(self) -> tuple[int, int]:
+        """Identity of the current lookup-table contents without reading them: storage address and version counter.
+
+        Any way a checkpoint can reach the buffer changes one of the two: an in-place write (``load_state_dict``,
+        ``copy_``) bumps the version, a replaced or moved buffer has a new address. Weight initialisation runs
+        before the checkpoint is loaded, so multipliers drawn at initialisation must not be kept once the frozen
+        vocabulary map arrives; comparing this state on every forward costs no device read.
+        """
+        return (self.lookup_table.data_ptr(), self.lookup_table._version)
 
     def hash_ngrams(self, ngram_tokens: torch.Tensor) -> torch.Tensor:
         """Mix shifted token ids into one global table row per hash head.
@@ -216,7 +227,7 @@ class HY4FlashEngramLayer(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hc_mult, hidden] in the dtype of ``streams``.
         """
-        if not self._multipliers_ready:
+        if self._multipliers_drawn_for != self._lookup_table_state():
             self.refresh_hash_state()
         dtype = streams.dtype
         rows = self.hash_ngrams(ngram_tokens)

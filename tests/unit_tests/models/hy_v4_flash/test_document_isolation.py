@@ -274,3 +274,37 @@ def test_pooling_modules_are_entered_whether_or_not_a_document_needs_selection(l
         for index in range(len(sparse_layers))
         for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm")
     ]
+
+
+def test_engram_hash_multipliers_follow_a_lookup_table_loaded_after_initialisation():
+    """Recipe order: weights are initialised first, the checkpoint (with its frozen vocabulary map) is loaded second.
+
+    The hash multipliers are bounded by the number of distinct compressed ids of the loaded map. Multipliers drawn
+    at initialisation, for the placeholder identity map, send every n-gram to a different table row than the
+    checkpoint was trained with; they must be redrawn when the map arrives, whichever way it is loaded.
+    """
+    from nemo_automodel.components.models.hy_v4_flash.engram import draw_hash_multipliers
+
+    def engram_layers(model):
+        return [layer.engram_layer for layer in model.model.layers if layer.engram_layer is not None]
+
+    def run(model):
+        with torch.no_grad():
+            return model(**pack(random_documents((9, 12)))).logits
+
+    source = build_model()
+    for engram in engram_layers(source):  # a many-to-few map, like the released one (fewer compressed ids than tokens)
+        engram.lookup_table.copy_(torch.arange(engram.lookup_table.numel(), dtype=torch.int32) % 97)
+    expected_logits = run(source)
+    state = source.state_dict()
+    for in_place in (True, False):
+        target = build_model()  # ``initialize_weights`` has drawn multipliers for the identity map
+        run(target)
+        target.load_state_dict(state, assign=not in_place)
+        logits = run(target)
+        for engram in engram_layers(target):
+            compressed = int(engram.lookup_table.max()) + 1
+            assert compressed == 97
+            expected = draw_hash_multipliers(engram.seed, engram.layer_id, engram.max_ngram_size, compressed)
+            torch.testing.assert_close(engram.hash_multipliers, expected)
+        torch.testing.assert_close(logits, expected_logits)

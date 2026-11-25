@@ -53,3 +53,54 @@ def test_training_template_renders_like_the_released_one_and_marks_only_answers(
     supervised = [token for token, flag in zip(encoded["input_ids"], encoded["assistant_masks"]) if flag]
     expected = "".join(m["content"] + END for m in conversation if m["role"] == "assistant")
     assert tokenizer.decode(supervised) == expected
+
+
+class _RecordingTokenizer:
+    """Stands in for the checkpoint tokenizer: records the template variables of every render."""
+
+    chat_template = "unused"
+    unk_token_id = 0
+
+    def __init__(self):
+        self.calls = []
+
+    def convert_tokens_to_ids(self, token):
+        return None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append(kwargs)
+        return "rendered"
+
+
+def _processor(tokenizer):
+    from nemo_automodel.components.models.hy_v4_flash.processing import HY4FlashProcessor
+
+    processor = HY4FlashProcessor.__new__(HY4FlashProcessor)
+    processor.tokenizer = tokenizer
+    return processor
+
+
+ANSWER_ONLY = [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}]
+WITH_REASONING = [
+    {"role": "user", "content": "2+2?"},
+    {"role": "assistant", "content": "4", "reasoning_content": "Two and two make four."},
+]
+
+
+def test_training_render_uses_the_official_sft_reasoning_mode():
+    """Answer-only training data is fast-thinking data: the released template's ``high`` default must not apply."""
+    tokenizer = _RecordingTokenizer()
+    processor = _processor(tokenizer)
+    processor.apply_chat_template(ANSWER_ONLY)
+    processor.apply_chat_template(WITH_REASONING)
+    processor.apply_chat_template([ANSWER_ONLY, WITH_REASONING])
+    assert [call["reasoning_effort"] for call in tokenizer.calls] == ["no_think", "high", "no_think", "high"]
+
+
+def test_explicit_reasoning_effort_and_generation_prompts_are_left_alone():
+    tokenizer = _RecordingTokenizer()
+    processor = _processor(tokenizer)
+    processor.apply_chat_template(ANSWER_ONLY, reasoning_effort="high")
+    processor.apply_chat_template(ANSWER_ONLY[:1], add_generation_prompt=True)
+    assert tokenizer.calls[0]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in tokenizer.calls[1]  # inference keeps the template's own default
