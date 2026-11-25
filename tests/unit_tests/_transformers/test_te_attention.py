@@ -493,6 +493,120 @@ class TestDetectCausalMask:
         assert _detect_causal_mask(m, (3, 0)) is None
 
 
+def _visible_pattern(S, window=None):
+    """Visible[i, j] from index arithmetic: j <= i, and i - j <= window when given."""
+    rows = torch.arange(S).unsqueeze(1)
+    cols = torch.arange(S).unsqueeze(0)
+    vis = cols <= rows
+    if window is not None:
+        vis = vis & ((rows - cols) <= window)
+    return vis
+
+
+def _add_block(vis, start, length):
+    """Overlay a bidirectional block [start, start + length) like Gemma4's same-image attention."""
+    vis = vis.clone()
+    vis[start : start + length, start : start + length] = True
+    return vis
+
+
+def _to_mask(vis_per_batch, form):
+    """Stack per-item visible patterns into a [B, 1, S, S] mask in the requested form."""
+    vis = torch.stack(vis_per_batch).unsqueeze(1)
+    if form == "bool":
+        return vis
+    dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[form]
+    return torch.zeros(vis.shape, dtype=dtype).masked_fill(~vis, torch.finfo(dtype).min)
+
+
+_FORMS = ["bool", "fp32", "bf16", "fp16"]
+_S = 64
+_BLOCK = 20  # interior block of 20 tokens, 190 future edges
+_WINDOW = 16  # TE window_size[0] for a sliding window of 17 keys
+
+
+class TestDetectCausalMaskImageBlocks:
+    """Gemma4-style same-image bidirectional blocks must never be converted to causal."""
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_controls_still_convert(self, form):
+        causal = _to_mask([_visible_pattern(_S)] * 2, form)
+        sliding = _to_mask([_visible_pattern(_S, _WINDOW)] * 2, form)
+        assert _detect_causal_mask(causal, (-1, 0)) == ("causal", (-1, 0))
+        assert _detect_causal_mask(sliding, (_WINDOW, 0)) == ("causal", (_WINDOW, 0))
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_right_padded_control_is_none(self, form):
+        vis = _visible_pattern(_S)
+        padded = vis.clone()
+        padded[:, _S - 4 :] = False
+        assert _detect_causal_mask(_to_mask([padded, vis], form), (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_causal_with_interior_block(self, form):
+        m = _to_mask([_add_block(_visible_pattern(_S), 20, _BLOCK)] * 2, form)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_sliding_with_interior_block(self, form):
+        m = _to_mask([_add_block(_visible_pattern(_S, _WINDOW), 20, _BLOCK)] * 2, form)
+        assert _detect_causal_mask(m, (_WINDOW, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_two_blocks(self, form):
+        vis = _add_block(_add_block(_visible_pattern(_S), 8, 10), 36, 12)
+        assert _detect_causal_mask(_to_mask([vis], form), (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_block_only_in_batch_item_1(self, form):
+        plain = _visible_pattern(_S)
+        m = _to_mask([plain, _add_block(plain, 20, _BLOCK)], form)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_block_touching_last_token(self, form):
+        m = _to_mask([_add_block(_visible_pattern(_S), _S - 10, 10)], form)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_two_token_block_is_none(self):
+        """Smallest deviation: a single future edge anywhere in the interior."""
+        vis = _visible_pattern(_S)
+        vis[30, 31] = True
+        assert _detect_causal_mask(_to_mask([vis], "bool"), (-1, 0)) is None
+
+    def test_soft_bias_is_none(self):
+        """A float mask with a finite bias on visible entries is not a plain causal mask."""
+        m = _to_mask([_visible_pattern(_S)], "fp32")
+        m[0, 0, 10, 3] = -2.0
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+
+class TestTeSdpaImageBlockDispatch:
+    def _make(self):
+        B, H, Hkv, D = 1, 4, 2, 16
+        te_module = mock.MagicMock(return_value=torch.zeros(B, _S, H, D))
+        original_sdpa = mock.MagicMock(return_value=torch.zeros(B, H, _S, D))
+        te_sdpa = _make_te_sdpa(te_module, num_heads=H, num_kv_heads=Hkv, original_sdpa=original_sdpa)
+        q = torch.randn(B, H, _S, D)
+        k = torch.randn(B, Hkv, _S, D)
+        return te_sdpa, te_module, original_sdpa, q, k
+
+    def test_interior_block_goes_to_original_sdpa_with_the_mask(self):
+        te_sdpa, te_module, original_sdpa, q, k = self._make()
+        mask = _to_mask([_add_block(_visible_pattern(_S), 20, _BLOCK)], "fp32")
+        te_sdpa(q, k, k, attn_mask=mask, enable_gqa=True)
+        te_module.assert_not_called()
+        original_sdpa.assert_called_once()
+        assert original_sdpa.call_args.kwargs["attn_mask"] is mask
+
+    def test_plain_causal_goes_to_te(self):
+        te_sdpa, te_module, original_sdpa, q, k = self._make()
+        te_sdpa(q, k, k, attn_mask=_to_mask([_visible_pattern(_S)], "fp32"), enable_gqa=True)
+        original_sdpa.assert_not_called()
+        te_module.assert_called_once()
+        assert te_module.call_args.kwargs["attn_mask_type"] == "causal"
+
+
 # ---------------------------------------------------------------------------
 # _proj_out_features
 # ---------------------------------------------------------------------------
@@ -575,6 +689,7 @@ class TestScaleMismatchFallback:
         """Reset both the counter and the one-shot warning flag so tests are
         independent of ordering."""
         import nemo_automodel._transformers.te_attention as te_mod
+
         reset_te_attention_stats()
         te_mod._SCALE_MISMATCH_WARNED = False
 
@@ -618,6 +733,7 @@ class TestScaleMismatchFallback:
         """The warning is gated by a module-level flag; after the first
         mismatch, subsequent mismatches still fall back but do not re-warn."""
         import nemo_automodel._transformers.te_attention as te_mod
+
         self._reset()
         te_sdpa, _, original_sdpa = self._build(module_scale=0.125)
         q, k, v = self._qkv()

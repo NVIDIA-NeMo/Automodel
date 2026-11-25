@@ -42,10 +42,10 @@ Mask handling
 - ``is_causal=True`` with ``attn_mask=None`` → TE ``"causal"``.
 - ``is_causal=False`` with ``attn_mask=None`` → TE ``"no_mask"``.
 - A 4D ``attn_mask`` matching HF's canonical causal or causal+sliding pattern
-  is detected by :func:`_detect_causal_mask` in O(S) and converted to
+  is verified entry by entry by :func:`_detect_causal_mask` and converted to
   ``("causal", window_size)``, so HF's always-present mask doesn't force a
-  fallback. Per-sample padded batches or non-canonical mask patterns still
-  fall back to native SDPA.
+  fallback. Per-sample padded batches or any other mask pattern (e.g. Gemma4's
+  image-bidirectional blocks) still fall back to native SDPA.
 
 Sliding window
 --------------
@@ -254,14 +254,16 @@ def _detect_causal_mask(
     per-sample padding, has an unexpected shape, or is not a float additive mask.
     The caller should fall back to native SDPA in that case.
 
-    Detection is O(S) per call (two row reductions of length S_k) and transfers
-    one combined validation result to the host:
-    1. Upper-right corner scalar check: must be < -1e4 (causal-like).
-    2. First-row visible-key count across all batch items must equal 1
-       (each first query token can only attend to itself).
-    3. Last-row visible-key count across all batch items must equal ``S``
-       (full causal) or ``min(S, window_size[0]+1)`` (sliding window).
-    Any deviation indicates padding or a non-standard mask structure.
+    Detection is exact: every entry of the mask is compared with the causal (or
+    sliding-window causal) pattern built from index arithmetic, so any other
+    structure returns ``None`` and takes the native SDPA path.  That includes
+    padding, several packed documents, and bidirectional overlays such as
+    Gemma4's same-image blocks (``use_bidirectional_attention="vision"``),
+    wherever they sit in the sequence or batch.  A float mask must hold exactly
+    ``0`` where visible and a value below ``-1e4`` where masked; a bool mask must
+    be ``True`` where visible.  The check costs O(B * S^2) elementwise work
+    (the mask itself is already that size), is done with tensor reductions and
+    transfers one combined validation result to the host.
     """
     logger.debug(
         "_detect_causal_mask: dtype=%s shape=%s",
@@ -285,40 +287,18 @@ def _detect_causal_mask(
 
     S = sq
 
-    # Scalar guard: upper-right corner must indicate "masked" (causal structure).
-    # bool mask: False = masked; float mask: < -1e4 = masked.
-    # Count visible keys per row for all batch items.
-    # bool: True = visible; float: > -1e4 = visible.
-    first_row = attn_mask[:, 0, 0, :]
-    last_row = attn_mask[:, 0, -1, :]
+    # Expected pattern from index arithmetic: key j is visible to query i iff
+    # j <= i and (no window or i - j <= window_size[0]).
+    rows = torch.arange(S, device=attn_mask.device).unsqueeze(1)
+    cols = torch.arange(S, device=attn_mask.device).unsqueeze(0)
+    expected = cols <= rows
+    if window_size[0] >= 0:
+        expected = expected & ((rows - cols) <= window_size[0])
     if is_bool:
-        visible_first = first_row.sum(dim=-1)
-        visible_last = last_row.sum(dim=-1)
+        matches = attn_mask == expected
     else:
-        visible_first = (first_row > -1e4).sum(dim=-1)
-        visible_last = (last_row > -1e4).sum(dim=-1)
-
-    expected_last = S if window_size[0] < 0 else min(S, window_size[0] + 1)
-    corner = attn_mask[0, 0, 0, -1]
-    diag = attn_mask[0, 0, 0, 0]
-    if is_bool:
-        corner_masked = ~corner
-        diag_visible = diag
-    else:
-        corner_masked = corner < -1e4
-        diag_visible = diag > -1e4
-    first_valid = (visible_first == 1).all()
-    last_valid = (visible_last == expected_last).all()
-    mask_valid = corner_masked & diag_visible & first_valid & last_valid
-
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "_detect_causal_mask: S=%d visible_first=%s visible_last=%s window_size=%s",
-            S,
-            visible_first.tolist(),
-            visible_last.tolist(),
-            window_size,
-        )
+        matches = torch.where(expected, attn_mask == 0, attn_mask < -1e4)
+    mask_valid = matches.all()
 
     if not mask_valid.item():
         logger.debug("_detect_causal_mask: structural validation failed → None")
