@@ -27,7 +27,7 @@ from tools.docs.build.coverage_tables import (
     _load_model_releases,
     _resolve_model_card_routes,
 )
-from tools.docs.cards import _family_checkpoints, _frontmatter_slug, _model_card_aliases, _model_card_paths
+from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths, family_checkpoints
 from tools.docs.catalog import (
     MAX_TOTAL_ENCODED_BYTES,
     PROVIDER_ORGS,
@@ -230,7 +230,7 @@ def _validate_provider_sections(repo_root: Path) -> None:
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall("https://huggingface\\.co/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", document)
                 canonical_publishers = {owner for (owner, checkpoint) in hf_checkpoints if checkpoint == model_id}
-                family_ids = _family_checkpoints(model_path)
+                family_ids = family_checkpoints(model_path)
                 if family_ids:
                     canonical_publishers = {checkpoint.split("/", 1)[0] for checkpoint in family_ids}
                 if not canonical_publishers:
@@ -304,7 +304,7 @@ def _validate_recipe_routes(repo_root: Path) -> None:
     family_routes = {
         f"/{_frontmatter_slug(path)}": checkpoints
         for path in _model_card_paths(repo_root)
-        if (checkpoints := _family_checkpoints(path))
+        if (checkpoints := family_checkpoints(path))
     }
     missing = []
     for release in releases:

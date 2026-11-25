@@ -24,7 +24,7 @@ from tools.docs.build.coverage_tables import (
     _iter_pretrained_model_ids,
     _read_documented_recipe,
 )
-from tools.docs.cards import _family_checkpoints, _model_card_aliases, _model_card_paths
+from tools.docs.cards import _model_card_aliases, _model_card_paths, family_checkpoints
 
 
 def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
@@ -40,7 +40,7 @@ def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
     metadata = yaml.safe_load(document.split("---", 2)[1])
     title = metadata["title"]
-    family_ids = _family_checkpoints(card)
+    family_ids = family_checkpoints(card)
     if family_ids:
         if not recipe_ids.issubset(family_ids):
             raise ValueError(

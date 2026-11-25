@@ -25,7 +25,7 @@ from pathlib import Path
 
 import yaml
 
-from tools.docs.cards import _family_checkpoints, _frontmatter_slug, _model_card_aliases, _model_card_paths
+from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths, family_checkpoints
 from tools.docs.catalog import (
     DATED_MODEL_TABLE_HEADER,
     DATED_SUPPORT_TABLE_HEADER,
@@ -34,6 +34,7 @@ from tools.docs.catalog import (
     HOMEPAGE_START_MARKER,
     MODEL_TYPE_OVERVIEW_PATHS,
     MODEL_TYPE_ROUTE_CATEGORIES,
+    PROVIDER_ORGS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
     SUPPORT_LOG_END_MARKER,
@@ -493,7 +494,7 @@ def _load_model_doc_catalog(
             architecture_display,
         )
         documented_models.append(model_doc)
-        checkpoint_ids = _family_checkpoints(path) or re.findall(
+        checkpoint_ids = family_checkpoints(path) or re.findall(
             r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document
         )
         for hf_model_id in sorted(checkpoint_ids):
@@ -646,12 +647,19 @@ def _resolve_model_card_routes(
     # Base checkpoints used to train retrieval models need not own retrieval
     # model cards. A redirect can point to a guide that documents that exact ID.
     guide_routes_by_model: dict[str, dict[str, str]] = {}
+    guide_paths_by_route: dict[str, Path] = {}
     for path in (repo_root / "docs" / "guides").rglob("*.mdx"):
         document = path.read_text(encoding="utf-8")
-        slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
-        if slug_match is None:
+        slug = _frontmatter_slug(path)
+        if slug is None:
             continue
-        route = f"/{slug_match.group(1)}"
+        route = f"/{slug}"
+        route_key = route.casefold()
+        if route_key in guide_paths_by_route:
+            raise ValueError(
+                f"Retrieval guide routes collide case-insensitively: {guide_paths_by_route[route_key]} and {path}"
+            )
+        guide_paths_by_route[route_key] = path
         for model_id in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document):
             guide_routes_by_model.setdefault(model_id.casefold(), {})[route.casefold()] = route
 
@@ -676,13 +684,20 @@ def _resolve_model_card_routes(
         destinations = card_destinations(preferred_routes)
         if release.model_type in {"Embedding", "Reranking"}:
             guide_routes = guide_routes_by_model.get(release.hf_model_id.casefold(), {})
-            for source in redirects:
-                if source.startswith(f"/nemo/automodel/model-coverage/{category}/") and source.endswith(
-                    f"/{model_name.casefold()}"
-                ):
-                    destination = _resolve_redirect(_strip_automodel_route_prefix(source), redirects)
-                    if destination.casefold() in guide_routes:
-                        destinations.add(guide_routes[destination.casefold()])
+            provider_slugs = {
+                provider.casefold()
+                for provider, publisher in PROVIDER_ORGS.items()
+                if publisher.casefold() == owner.casefold()
+            }
+            provider_slugs.add(owner.casefold())
+            guide_sources = {
+                f"/nemo/automodel/model-coverage/{category}/{provider}/{model_name}".casefold()
+                for provider in provider_slugs
+            }
+            for source in guide_sources & redirects.keys():
+                destination = _resolve_redirect(_strip_automodel_route_prefix(source), redirects)
+                if destination.casefold() in guide_routes:
+                    destinations.add(guide_routes[destination.casefold()])
         if not destinations:
             # Some checkpoints are reused by a workflow classified differently
             # from the card, for example an Omni checkpoint in an LLM recipe.

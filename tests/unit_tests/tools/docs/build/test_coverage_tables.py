@@ -292,6 +292,82 @@ def test_retrieval_base_checkpoint_redirect_requires_matching_guide(
             _resolve_model_card_routes(tmp_path, [release], {}, [])
 
 
+@pytest.mark.parametrize(
+    "checkpoint,provider,slug,expected",
+    [
+        ("org/Base-1B", "org", "'recipes-e2e-examples/base'", True),
+        ("org/Base-1B", "org", '"recipes-e2e-examples/base" # routing metadata', True),
+        ("org/Base-1B", "other", "recipes-e2e-examples/base", False),
+        ("meta-llama/Base-1B", "meta", "recipes-e2e-examples/base", True),
+        ("meta-llama/Base-1B", "meta-llama", "recipes-e2e-examples/base", True),
+        ("meta-llama/Base-1B", "mistralai", "recipes-e2e-examples/base", False),
+    ],
+)
+def test_retrieval_guide_redirect_preserves_yaml_slugs_and_publisher_identity(
+    tmp_path: Path, checkpoint: str, provider: str, slug: str, expected: bool
+) -> None:
+    route = "/recipes-e2e-examples/base"
+    docs_config = tmp_path / "docs/fern/docs.yml"
+    docs_config.parent.mkdir(parents=True)
+    docs_config.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": f"/nemo/automodel/model-coverage/embedding-models/{provider}/Base-1B",
+                        "destination": f"/nemo/automodel/nightly{route}",
+                    }
+                ]
+            }
+        )
+    )
+    guide = tmp_path / "docs/guides/base.mdx"
+    guide.parent.mkdir(parents=True)
+    guide.write_text(
+        f"---\ntitle: Base model training\nslug: {slug}\n---\n"
+        f"[Starting checkpoint](https://huggingface.co/{checkpoint})\n"
+    )
+    release = _ModelRelease("2026-01-01", checkpoint, "", "Embedding", "recipe.yaml")
+    if expected:
+        assert _resolve_model_card_routes(tmp_path, [release], {}, []) == {(checkpoint, "Embedding"): route}
+    else:
+        with pytest.raises(ValueError, match="missing:"):
+            _resolve_model_card_routes(tmp_path, [release], {}, [])
+
+
+@pytest.mark.parametrize("hidden_slug", ["recipes-e2e-examples/base", "Recipes-E2E-Examples/Base"])
+def test_retrieval_guide_cannot_borrow_identity_from_hidden_page_with_same_slug(
+    tmp_path: Path, hidden_slug: str
+) -> None:
+    docs_config = tmp_path / "docs/fern/docs.yml"
+    docs_config.parent.mkdir(parents=True)
+    docs_config.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": "/nemo/automodel/model-coverage/embedding-models/org/Base-1B",
+                        "destination": "/nemo/automodel/nightly/recipes-e2e-examples/base",
+                    }
+                ]
+            }
+        )
+    )
+    guides = tmp_path / "docs/guides"
+    guides.mkdir()
+    (guides / "visible.mdx").write_text(
+        "---\ntitle: Visible guide\nslug: recipes-e2e-examples/base\n---\n"
+        "[Unrelated checkpoint](https://huggingface.co/other/Unrelated)\n"
+    )
+    (guides / "hidden.mdx").write_text(
+        f"---\ntitle: Hidden guide\nslug: {hidden_slug}\n---\n"
+        "[Starting checkpoint](https://huggingface.co/org/Base-1B)\n"
+    )
+    release = _ModelRelease("2026-01-01", "org/Base-1B", "", "Embedding", "recipe.yaml")
+    with pytest.raises(ValueError, match="guide routes collide case-insensitively"):
+        _resolve_model_card_routes(tmp_path, [release], {}, [])
+
+
 def test_case_insensitive_redirect_cannot_shadow_a_canonical_card(tmp_path):
     docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
     docs_config_path.parent.mkdir(parents=True)

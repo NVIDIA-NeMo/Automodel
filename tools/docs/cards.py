@@ -22,8 +22,19 @@ import yaml
 from tools.docs.catalog import MODEL_TYPE_ROUTE_CATEGORIES
 
 
-def _family_checkpoints(path: Path) -> set[str]:
-    """Read and validate the explicit checkpoint membership of a model family page."""
+def family_checkpoints(path: Path) -> set[str]:
+    """Read the explicit checkpoint membership of a model family page.
+
+    Args:
+        path: Model-card MDX file to inspect.
+
+    Returns:
+        Declared checkpoint IDs, or an empty set when no family is declared.
+
+    Raises:
+        ValueError: Declared checkpoints are invalid, duplicated, inconsistent
+            with the family title, unlinked, or published by different owners.
+    """
     document = path.read_text(encoding="utf-8")
     if not document.startswith("---\n"):
         return set()
