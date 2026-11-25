@@ -115,17 +115,10 @@ def test_fp32_parameter_forward_returns_a_copy_that_survives_freed_parameter_sto
 def _moe_oracle(
     mlp: MoE, x: torch.Tensor, limit: float, *, clamp_routed: bool = True, clamp_shared: bool = False
 ) -> torch.Tensor:
-    """Latent MoE as the reference writes it: clamped SwiGLU in the routed experts, plain SwiGLU in the shared expert.
+    """Latent MoE as the reference writes it, with the routed and the shared clamp switchable.
 
-    Args:
-        mlp: The layer's MoE module (only its weights are read).
-        x: Tensor of shape [tokens, hidden].
-        limit: ``swiglu_limit``.
-        clamp_routed: Clamp the routed experts' gate (one-sided) and up (two-sided) pre-activations.
-        clamp_shared: Clamp the shared expert the same way (the reference does not).
-
-    Returns:
-        Tuple of the output [tokens, hidden] and the largest routed and shared pre-activation magnitudes.
+    Returns the output [tokens, hidden] for ``x`` [tokens, hidden] and the largest routed and shared pre-activation
+    magnitudes.
     """
     import torch.nn.functional as F
 
@@ -154,11 +147,9 @@ def _moe_oracle(
 
 
 def test_swiglu_clamp_applies_to_routed_experts_and_not_to_the_shared_expert() -> None:
-    """The one MoE detail where Hy4-flash departs from the shared MoE: upstream clamps only the routed experts.
+    """Upstream clamps only the routed experts, unlike the shared MoE.
 
-    Random tiny models never reach the limit, so the input is scaled until both kinds of pre-activation exceed it.
-    The two wrong variants (shared expert clamped as the stock shared MoE does; routed experts not clamped) must
-    not match.
+    The input is scaled until both kinds of pre-activation exceed the limit; the two wrong variants must not match.
     """
     model = build_model()
     mlp = next(layer.mlp for layer in model.model.layers if type(layer.mlp).__name__ == "MoE")

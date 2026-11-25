@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-node H100 Hy4-flash recipes must carry the NCCL setting the Engram row-owner exchange needs.
+"""Multi-node H100 Hy4-flash recipes must carry ``NCCL_PXN_DISABLE=1`` (issue #3959).
 
-With the container's default NCCL network plugin and PXN both active, the Engram ID all-to-all receives corrupted IDs
-from ranks on another node (issue #3959; reproduced for Hy4-flash on 2 x 8 H100 with the first Engram layer, and gone
-with ``NCCL_PXN_DISABLE=1``). The exchange itself cannot be exercised in a unit test, so this guards the declaration.
+Without it the Engram ID all-to-all receives corrupted IDs from ranks on another node. The exchange cannot be
+exercised in a unit test, so this guards the declaration.
 """
 
 from pathlib import Path

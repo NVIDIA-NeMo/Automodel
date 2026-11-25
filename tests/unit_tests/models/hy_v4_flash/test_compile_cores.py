@@ -66,8 +66,7 @@ def test_compiled_cores_reach_modules_built_earlier(restore_cores: None, dtype: 
     """The hooks the recipes call swap the cores under modules that already exist.
 
     fp32: compiled equals eager to rounding. BF16: the compiled RMSNorm multiplies by the weight in fp32 and rounds
-    once, where the eager core (the reference order) rounds to BF16 first; the two differ by at most one unit in the
-    last place, and so do the hyper-connection outputs.
+    once where eager (the reference order) rounds twice, so outputs differ by at most one unit in the last place.
     """
     torch.manual_seed(0)
     config = tiny_text_config()

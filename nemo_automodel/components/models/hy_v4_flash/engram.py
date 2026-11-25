@@ -14,18 +14,14 @@
 
 """Hy4-flash Engram: hashed bigram / trigram memory added to the hyper-connection streams.
 
-The hash, the per-head norms and the gate follow the transformers reference (``HYV4FlashEngramLayer``). The
-table itself is the shared row-owner-sharded embedding that DeepSeek-V4.1 and Qwen3.8-Flash-Next already use
-(``Qwen3_8_FlashNextEngramTableConfig``): one ~32 GB table per layer is sharded by rows across the owner group
-instead of replicated, and lookups travel by all-to-all.
+The hash, the per-head norms and the gate follow the transformers reference (``HYV4FlashEngramLayer``); the table is
+the shared row-owner-sharded embedding of Qwen3.8-Flash-Next (one ~32 GB table per layer, sharded by rows across the
+owner group, lookups by all-to-all). Parameters keep the reference's names; the forward stacks the per-head weights
+so each norm and projection runs as one kernel.
 
-The parameters keep the reference's names (16 per-head norms, ``hc_mult`` key projections and norms as separate
-modules), so the state-dict adapter only pads the table rows to the owner group; the forward stacks the per-head
-weights so each norm and projection runs as one kernel.
-
-Precision: the weighted norms are evaluated as the reference's ``nn.RMSNorm`` modules. The gate logit, its signed
-square root and the sigmoid, and the sum of the gated signal and the per-stream branch are evaluated in fp32 and cast
-back, where the reference stays in the activation dtype (BF16); in fp32 the two are identical.
+Precision: the weighted norms are evaluated as the reference's ``nn.RMSNorm``. The gate, and the sum of the gated
+signal and the per-stream branch, are evaluated in fp32 and cast back, where the reference stays in BF16; in fp32
+the two are identical.
 """
 
 from __future__ import annotations
@@ -244,15 +240,10 @@ class HYV4FlashEngramLayer(nn.Module):
         return torch.cat(ids, dim=-1) + self.head_offsets
 
     def forward(self, streams: torch.Tensor, ngram_tokens: torch.Tensor, engram_mask: torch.Tensor) -> torch.Tensor:
-        """Return the update to add to the streams.
+        """Return the update to add to ``streams`` [batch, sequence, hc_mult, hidden] (same shape and dtype).
 
-        Args:
-            streams: Tensor of shape [batch, sequence, hc_mult, hidden].
-            ngram_tokens: Integer tensor of shape [batch, sequence, max_ngram_size].
-            engram_mask: Bool tensor of shape [batch, sequence]; False positions (image / padding) get zero.
-
-        Returns:
-            Tensor of shape [batch, sequence, hc_mult, hidden] in the dtype of ``streams``.
+        ``ngram_tokens`` is an integer tensor [batch, sequence, max_ngram_size]; positions where ``engram_mask``
+        [batch, sequence] is False (image / padding) get zero.
         """
         if self._multipliers_drawn_for != self._lookup_table_state():
             self.refresh_hash_state()

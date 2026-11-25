@@ -41,18 +41,9 @@ def _brute_force_logits(
     slots: torch.Tensor,
     theta: float,
 ) -> torch.Tensor:
-    """Group logits of every query from the full [heads, groups] score block, one query at a time.
+    """Group logits [queries, groups] from the full score block, one query at a time.
 
-    Args:
-        indexer: The indexer under test (its projections are the only shared code).
-        q_resid: Tensor of shape [queries, q_lora_rank].
-        hidden: Tensor of shape [queries, hidden].
-        group_keys: Tensor of shape [groups, index_head_dim], unrotated.
-        slots: Integer tensor of shape [queries], document-local positions of the queries.
-        theta: Rotary base of the sparse layers.
-
-    Returns:
-        Tensor of shape [queries, groups].
+    Only the indexer projections are shared with production; ``group_keys`` [groups, index_head_dim] are unrotated.
     """
     kpool, heads, dim, rope = indexer.kpool, indexer.n_heads, indexer.head_dim, indexer.rope_dim
     keys = group_keys.clone()
@@ -137,10 +128,9 @@ def test_causal_prefix_plan_windows_stay_inside_documents_and_padding_has_no_key
 
 
 def test_pooled_key_norm_stays_off_the_compiled_core(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pooling runs once per document with that document's group count, so it must not reach the compiled norm core.
+    """Pooling runs once per document with that document's group count.
 
-    The compiled core specializes on the input shape: called with a new group count it compiles again, which costs
-    seconds per new document layout on packed data. The stand-in below records every shape the compiled core would see.
+    The compiled norm core specializes on the input shape, so reaching it would recompile per document layout.
     """
     from nemo_automodel.components.models.hy_v4_flash import layers
 
@@ -166,11 +156,10 @@ def test_pooled_key_norm_stays_off_the_compiled_core(monkeypatch: pytest.MonkeyP
 
 @pytest.mark.parametrize("lengths", [(5, 9, 3), (5, 41, 3)])
 def test_pooling_modules_are_entered_whether_or_not_a_document_needs_selection(lengths: tuple[int, ...]) -> None:
-    """FSDP turns the first call of a sharded unit into a collective, so every rank must issue the same calls.
+    """Every rank must enter the fp32 pooling modules, at the same place.
 
-    The fp32 group-pooling modules only do work for documents longer than ``index_topk``. A rank whose pack holds no
-    such document must still enter them, at the same place, or its collective sequence differs from a rank that does
-    (a deadlock under FSDP). Both packs must therefore enter each module in every sparse layer.
+    FSDP turns the first call of a sharded unit into a collective; a rank whose pack has no document longer than
+    ``index_topk`` would otherwise issue a different sequence of collectives (a deadlock).
     """
     model = build_model()
     assert (max(lengths) > TOPK) == (lengths == (5, 41, 3))

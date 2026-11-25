@@ -40,11 +40,10 @@ def test_wrong_engram_layer_offset_is_detected_by_the_layer_id_check() -> None:
 
 
 def test_engram_hash_multipliers_follow_a_lookup_table_loaded_after_initialization() -> None:
-    """Recipe order: weights are initialized first, the checkpoint (with its frozen vocabulary map) is loaded second.
+    """Recipe order: weights are initialized first, the checkpoint (with its vocabulary map) is loaded second.
 
-    The hash multipliers are bounded by the number of distinct compressed ids of the loaded map. Multipliers drawn
-    at initialization, for the placeholder identity map, send every n-gram to a different table row than the
-    checkpoint was trained with; they must be redrawn when the map arrives, whichever way it is loaded.
+    Multipliers drawn for the placeholder identity map would hash every n-gram to another row than the checkpoint
+    was trained with, so they must be redrawn when the map arrives, whichever way it is loaded.
     """
     from nemo_automodel.components.models.hy_v4_flash.engram import draw_hash_multipliers
 
@@ -101,10 +100,9 @@ def test_engram_gate_is_one_half_at_a_logit_of_exactly_zero() -> None:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("scale", [1.0, 1e-3, 40.0])
 def test_weighted_rms_norm_equals_torch_rms_norm_bitwise(dtype: torch.dtype, scale: float) -> None:
-    """One ``nn.RMSNorm`` per slice with a non-unit weight, on inputs of ordinary, small and large magnitude.
+    """``nn.RMSNorm`` multiplies the weight in fp32 and casts once.
 
-    In BF16, normalizing and then multiplying a BF16 weight rounds twice and differs from ``nn.RMSNorm`` on about a
-    quarter of the elements; ``nn.RMSNorm`` multiplies the weight in fp32 and casts once.
+    Normalizing, rounding to BF16 and then multiplying differs from it on about a quarter of the elements.
     """
     torch.manual_seed(0)
     slices, features = 4, 96

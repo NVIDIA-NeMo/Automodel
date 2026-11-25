@@ -55,14 +55,10 @@ class HYV4FlashVisionEmbeddings(nn.Module):
         return grid.permute(0, 2, 3, 1).reshape(-1, grid.shape[1]).to(dtype)
 
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Embed flat patches.
+        """Embed flat patches into [patches, hidden].
 
-        Args:
-            pixel_values: Tensor of shape [patches, channels * patch_size * patch_size], row-major per image.
-            grid_thw: Integer tensor of shape [images, 3] of (time, height, width) patch counts.
-
-        Returns:
-            Tensor of shape [patches, hidden].
+        ``pixel_values`` has shape [patches, channels * patch_size * patch_size], row-major per image, and ``grid_thw``
+        [images, 3] holds the (time, height, width) patch counts.
         """
         weight = self.patch_embedding.weight
         patches = pixel_values.to(weight.dtype).reshape(-1, self.config.num_channels, self.patch_size, self.patch_size)
@@ -86,15 +82,7 @@ class HYV4FlashVisionAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size)
 
     def forward(self, hidden_states: torch.Tensor, lengths: list[int]) -> torch.Tensor:
-        """Attend inside each image.
-
-        Args:
-            hidden_states: Tensor of shape [patches, hidden], images concatenated.
-            lengths: Patch count of each image.
-
-        Returns:
-            Tensor of shape [patches, hidden].
-        """
+        """Attend inside each image: ``hidden_states`` [patches, hidden], ``lengths`` the patch count of each image."""
         q, k, v = (
             proj(hidden_states).view(-1, self.num_heads, self.head_dim)
             for proj in (self.q_proj, self.k_proj, self.v_proj)
@@ -154,14 +142,9 @@ class HYV4FlashPerceive(nn.Module):
         self.image_newline = nn.Parameter(torch.empty(config.out_hidden_size))
 
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Merge and project per image (frames are merged independently).
+        """Merge and project ``hidden_states`` [patches, hidden] per image (frames are merged independently).
 
-        Args:
-            hidden_states: Tensor of shape [patches, hidden].
-            grid_thw: Integer tensor of shape [images, 3].
-
-        Returns:
-            Tensor of shape [tokens, out_hidden]; each frame contributes ``(h/m) * (w/m + 1)`` row-major tokens.
+        Returns [tokens, out_hidden]; each frame of ``grid_thw`` [images, 3] gives ``(h/m) * (w/m + 1)`` tokens.
         """
         outputs = []
         start = 0
@@ -200,14 +183,9 @@ class HYV4FlashVisionTower(nn.Module):
                 nn.init.normal_(parameter, std=std)
 
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Encode images into language-width tokens.
+        """Encode images into language-width tokens [tokens, out_hidden], the images' tokens concatenated.
 
-        Args:
-            pixel_values: Tensor of shape [patches, channels * patch_size * patch_size].
-            grid_thw: Integer tensor of shape [images, 3] of (time, height, width) patch counts.
-
-        Returns:
-            Tensor of shape [tokens, out_hidden] where images' tokens are concatenated.
+        ``pixel_values`` has shape [patches, channels * patch_size * patch_size] and ``grid_thw`` [images, 3].
         """
         # Attention is bidirectional inside each frame; frames of a video do not attend to each other.
         lengths = [h * w for t, h, w in grid_thw.tolist() for _ in range(t)]

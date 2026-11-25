@@ -77,16 +77,7 @@ TEXT, IMAGE = 0, 1
 
 @dataclass(frozen=True)
 class HYV4FlashImageSettings:
-    """Preprocessing constants of the released ``processor_config.json``.
-
-    Attributes:
-        patch_size: Spatial patch size of the vision tower.
-        merge_size: Spatial merge factor of the projector.
-        min_pixels: Lower bound of the resized area.
-        max_pixels: Upper bound of the resized area.
-        mean: Per-channel normalization mean.
-        std: Per-channel normalization standard deviation.
-    """
+    """Preprocessing constants of ``processor_config.json``: patch and merge size, pixel bounds, mean and std."""
 
     patch_size: int = 16
     merge_size: int = 2
@@ -161,15 +152,10 @@ def num_image_tokens(grid_h: int, grid_w: int, merge: int) -> int:
 
 
 def preprocess_image(image: Image.Image, settings: HYV4FlashImageSettings) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Resize, normalize and patchify one image.
+    """Resize, normalize and patchify one PIL image (converted to RGB).
 
-    Args:
-        image: PIL image (converted to RGB).
-        settings: Preprocessing constants.
-
-    Returns:
-        ``(patches, (grid_h, grid_w))`` with ``patches`` of shape [grid_h * grid_w, 3 * patch_size * patch_size] in
-        row-major patch order.
+    Returns ``(patches, (grid_h, grid_w))`` with ``patches`` of shape [grid_h * grid_w, 3 * patch_size * patch_size]
+    in row-major patch order.
     """
     rgb = np.asarray(image.convert("RGB"))
     tensor = torch.from_numpy(rgb.copy()).permute(2, 0, 1)
@@ -201,14 +187,9 @@ def _open_image(value: Image.Image | str | Path | bytes) -> Image.Image:
 def training_reasoning_effort(messages: Sequence[ChatMessage]) -> Literal["no_think", "high"]:
     """Reasoning mode of a complete (training) conversation, by the rule of the official fine-tuning scripts.
 
-    The released chat template defaults to ``reasoning_effort='high'``, which is its inference default. The official
-    SFT code instead treats a sample without a reasoning field as fast-thinking data and renders it with
-    ``'no_think'``; only samples whose assistant turns carry ``reasoning_content`` (or ``reasoning``) use ``'high'``.
-    Rendering answer-only data in ``'high'`` mode would train (and score) answers after an empty think block in the
-    mode where the model expects to reason first.
-
-    Args:
-        messages: Chat messages of one conversation.
+    The released template defaults to ``'high'`` (its inference default). The official SFT code renders a sample
+    without a reasoning field with ``'no_think'``; rendering answer-only data in ``'high'`` mode would train answers
+    after an empty think block.
 
     Returns:
         ``"high"`` when an assistant message has non-empty reasoning, else ``"no_think"``.

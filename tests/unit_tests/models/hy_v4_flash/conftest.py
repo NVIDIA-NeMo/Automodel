@@ -219,16 +219,7 @@ def assert_packed_matches_alone(
 
 
 def complex_rotation(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:
-    """Complex rotation of interleaved pairs, independent of the production helper.
-
-    Args:
-        x: Tensor of shape [tokens, rope_dim].
-        positions: Integer tensor of shape [tokens].
-        theta: Rotary base.
-
-    Returns:
-        Tensor of shape [tokens, rope_dim].
-    """
+    """Rotate interleaved pairs of ``x`` [tokens, rope_dim] by ``positions`` [tokens], without the production helper."""
     half = x.shape[-1] // 2
     angles = positions[:, None].double() * theta ** (-torch.arange(half).double() * 2 / x.shape[-1])
     rotated = torch.view_as_complex(x.double().reshape(-1, half, 2).contiguous()) * torch.polar(

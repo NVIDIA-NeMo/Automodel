@@ -14,27 +14,16 @@
 
 """Model FLOPs of Hy4-flash, in the repository's convention (6 x MACs, causal-aware, recompute excluded).
 
-Registered through ``HYV4FlashConfig.flops_formula`` so no shared utility names this model.
+Registered through ``HYV4FlashConfig.flops_formula`` so no shared utility names this model. Counted per token:
 
-Per token (``hs`` hidden, ``H`` query heads of the layer type, ``nope + rope = 256`` query/key width, ``v = 256``):
+* the expanded MLA linears of every layer (the absorbed kernel's extra work is hardware FLOPs, not model FLOPs);
+* the QK^T and PV products over ``min(i + 1, window)`` keys in sliding layers and ``min(i + 1, index_topk)`` keys
+  in sparse layers;
+* the frozen compressed indexer on sparse layers, forward only (2 x MACs: a hard top-k has no gradient);
+* the MoE router, latent projections, ``top_k`` routed experts and the shared expert (a dense MLP in layer 0);
+* two hyper-connection sites per layer and the head, the Engram projections, and the fp32 ``lm_head``.
 
-* attention linears of every layer (expanded MLA, the mathematical definition; the absorbed kernel execution does extra
-  work that belongs to hardware FLOPs, not model FLOPs): ``q_a`` (hs x q_lora), ``q_b`` (q_lora x H*256),
-  ``kv_a`` (hs x (kv_lora + rope)), ``kv_b`` (kv_lora x H*(nope + v)), ``gate`` (hs x H*v), ``o`` (H*v x hs);
-* attention BMMs, summed over query positions: QK^T and PV each cost ``H * 256`` MACs per key.
-  Sliding layers see ``min(i + 1, window)`` keys; sparse layers see ``min(i + 1, index_topk)`` keys;
-* the frozen compressed indexer (hard top-k has no gradient; counted forward only, 2 x MACs) on sparse layers:
-  query projection (q_lora x n_heads*d), head weights (hs x n_heads), token keys (hs x d), pooling value + gate
-  projections (2 x d x d per token) and the group scoring ``n_heads * d`` MACs per visible complete group;
-* MoE layers: router (hs x experts), latent down / up projections (2 x hs x latent), ``top_k`` routed experts of
-  ``3 x latent x moe_inter`` plus one shared expert of ``3 x hs x moe_inter``; the dense layer is ``3 x hs x
-  intermediate``;
-* hyper-connections: two sites per layer, each ``2*hc x hc*hs`` MACs; the head ``hc x hc*hs``;
-* Engram layers: ``hc`` key projections and one value projection of ``(orders * n_embed)`` x hs;
-* the fp32 ``lm_head`` (hs x vocab).
-
-The vision tower is not counted (as for the other VLM entries). Table gathers, hashing, norms, RoPE and gating are
-not GEMMs and are not counted.
+The vision tower, table gathers, hashing, norms, RoPE and gating are not counted.
 """
 
 from __future__ import annotations
@@ -46,13 +35,8 @@ from nemo_automodel.components.utils.flops_utils import _sum_min_floor_div, _sum
 def hy_v4_flash_flops(config: HYV4FlashConfig | HYV4FlashTextConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs of one training step of ``gbs`` sequences of ``seq_len`` tokens.
 
-    Args:
-        config: Composite or text configuration.
-        gbs: Number of sequences per step.
-        seq_len: Tokens per sequence (documents are counted as one sequence); defaults to ``max_position_embeddings``.
-
-    Returns:
-        FLOPs of the step (6 x MACs for trainable GEMMs and attention BMMs, 2 x MACs for the frozen indexer).
+    ``config`` is the composite or the text configuration; ``seq_len`` defaults to ``max_position_embeddings``.
+    Trainable GEMMs and attention products count 6 x MACs, the frozen indexer 2 x MACs.
     """
     text = config.text_config if isinstance(config, HYV4FlashConfig) else config
     seq_len = int(text.max_position_embeddings if seq_len is None else seq_len)

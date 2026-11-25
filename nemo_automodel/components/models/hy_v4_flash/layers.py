@@ -45,13 +45,7 @@ from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashTextCon
 def _rms_norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Normalize the last axis in fp32, cast back, then apply the weight (reference order).
 
-    Args:
-        hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
-        weight: Tensor of shape [hidden].
-        eps: Epsilon added to the mean square.
-
-    Returns:
-        Tensor of the shape and dtype of ``hidden_states``.
+    ``hidden_states`` has shape [..., hidden] and ``weight`` [hidden]; the result keeps the input's shape and dtype.
     """
     x = hidden_states.float()
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -95,13 +89,8 @@ def _hc_collapse_core(
 def _hc_expand_core(post: torch.Tensor, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
     """Scatter a sub-layer output onto the streams: ``post * output + residual`` in fp32.
 
-    Args:
-        post: fp32 tensor of shape [batch, sequence, hc_mult].
-        output: Tensor of shape [batch, sequence, hidden].
-        residual: Tensor of shape [batch, sequence, hc_mult, hidden]; its dtype is the result dtype.
-
-    Returns:
-        Tensor of shape [batch, sequence, hc_mult, hidden] in the dtype of ``residual``.
+    ``post`` is fp32 [batch, sequence, hc_mult], ``output`` [batch, sequence, hidden] and ``residual``
+    [batch, sequence, hc_mult, hidden]; the result has the shape and dtype of ``residual``.
     """
     return (post.unsqueeze(-1) * output.float().unsqueeze(-2) + residual.float()).to(residual.dtype)
 
@@ -201,14 +190,9 @@ class HYV4FlashHyperConnection(nn.Module):
         self.base.copy_(base)
 
     def forward(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute the collapsed sub-layer input and the post weights.
+        """Compute the collapsed sub-layer input and the post weights of ``streams`` [batch, sequence, hc_mult, hidden].
 
-        Args:
-            streams: Tensor of shape [batch, sequence, hc_mult, hidden].
-
-        Returns:
-            ``post``: fp32 tensor of shape [batch, sequence, hc_mult]; ``collapsed``: tensor of shape
-            [batch, sequence, hidden] in the dtype of ``streams``.
+        Returns ``post`` (fp32 [batch, sequence, hc_mult]) and ``collapsed`` ([batch, sequence, hidden], input dtype).
         """
         return _hc_collapse(
             streams,
@@ -222,16 +206,7 @@ class HYV4FlashHyperConnection(nn.Module):
 
     @staticmethod
     def expand(post: torch.Tensor, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        """Scatter a sub-layer output onto the streams: ``post * output + residual``.
-
-        Args:
-            post: fp32 tensor of shape [batch, sequence, hc_mult].
-            output: Tensor of shape [batch, sequence, hidden].
-            residual: Tensor of shape [batch, sequence, hc_mult, hidden]; its dtype is the result dtype.
-
-        Returns:
-            Tensor of shape [batch, sequence, hc_mult, hidden] in the dtype of ``residual``.
-        """
+        """Scatter a sub-layer output onto the streams; shapes as in :func:`_hc_expand_core`."""
         return _hc_expand(post, output, residual)
 
 
@@ -304,13 +279,8 @@ def mrope_cos_sin(
 def apply_interleaved_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Rotate interleaved channel pairs ``(x[2i], x[2i + 1])`` of the last axis in fp32.
 
-    Args:
-        x: Tensor of shape [..., rope_dim].
-        cos: Tensor broadcastable to [..., rope_dim // 2] (e.g. [tokens, 1, rope_dim // 2] for per-head queries).
-        sin: Tensor of the shape of ``cos``.
-
-    Returns:
-        Tensor of the shape and dtype of ``x``.
+    ``x`` has shape [..., rope_dim]; ``cos`` and ``sin`` broadcast to [..., rope_dim // 2] (e.g.
+    [tokens, 1, rope_dim // 2] for per-head queries). The result keeps the shape and dtype of ``x``.
     """
     pairs = x.float().unflatten(-1, (-1, 2))
     even, odd = pairs[..., 0], pairs[..., 1]

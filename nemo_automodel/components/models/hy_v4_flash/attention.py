@@ -14,20 +14,16 @@
 
 """Gated MLA with learnable sinks for Hy4-flash: sliding-window and compressed-indexer sparse layers.
 
-Both layer types run the same *absorbed* latent attention. The per-head key up-projection is folded into the
-query (``q_nope @ W_k``), every head then attends over one shared ``[kv_lora_rank + rope]`` latent per token, and
-the value up-projection is applied to the latent output. This is mathematically the reference's expanded
-attention, and it is what the shared FlashMLA-forward / cuDNN-backward sparse kernel
-(``models/common/cudnn_sparse_attention``) consumes, so the kernel handles the learnable sink and per-document
-index lists for both layer types:
+Both layer types run the same absorbed latent attention: the per-head key up-projection is folded into the query,
+every head attends over one shared ``[kv_lora_rank + rope]`` latent per token, and the value up-projection is
+applied to the output. This equals the reference's expanded attention and is what the shared sparse kernel
+(``models/common/cudnn_sparse_attention``) consumes, with per-document index lists:
 
-* ``sliding_attention``: the indices of the last ``sliding_window`` tokens of the query's document.
-* ``indexed_attention``: dense causal attention while a document is not longer than ``index_topk``;
-  otherwise the tokens of the ``index_topk // index_kpool - 1`` best-scoring complete groups plus the query's own
-  group, chosen by :class:`HYV4FlashCompressedIndexer`.
+* ``sliding_attention``: the last ``sliding_window`` tokens of the query's document.
+* ``indexed_attention``: dense causal attention while a document is not longer than ``index_topk``; otherwise the
+  ``index_topk // index_kpool - 1`` best-scoring complete groups plus the query's own group.
 
-Packed documents are isolated: indices only ever point into the query's own document and groups are
-document-local.
+Indices only ever point into the query's own document, and groups are document-local.
 """
 
 from __future__ import annotations
@@ -260,10 +256,8 @@ class HYV4FlashCompressedIndexer(nn.Module):
         """Select the document-local tokens every query of one contiguous query interval attends to.
 
         A query recalls the ``index_topk // index_kpool - 1`` best-scoring groups that closed before its own group
-        (ties broken towards the earlier group), plus the tokens of its own group up to itself. Scores are fp32
-        ``[queries, heads, groups]`` in the reference; they are materialized here a chunk of queries at a time and
-        only over the groups the chunk can see, with the chunk sized so the block stays within ``score_block_bytes``
-        whatever the document length.
+        (ties towards the earlier group), plus its own group up to itself. The fp32 ``[queries, heads, groups]``
+        scores are materialized a chunk of queries at a time, within ``score_block_bytes``.
 
         Args:
             q_resid: Tensor of shape [queries, q_lora_rank]; consecutive tokens of one document.
@@ -473,14 +467,9 @@ class HYV4FlashAttention(nn.Module):
     ) -> torch.Tensor:
         """Attend within documents.
 
-        Args:
-            hidden_states: Tensor of shape [1, local_tokens, hidden] (the local interval of the packed row).
-            layout: Document boundaries of the packed row.
-            rope: Rotary tables of this layer's attention type over the global sequence (the indexer of a sparse
-                layer uses the same tables).
-
-        Returns:
-            Tensor of shape [1, local_tokens, hidden]; positions outside every document are zero.
+        ``hidden_states`` [1, local_tokens, hidden] is the local interval of the packed row; ``rope`` holds this layer
+        type's tables over the global sequence. The result has the same shape; positions outside every document are
+        zero.
         """
         x = hidden_states[0]
         tokens = x.shape[0]
@@ -521,15 +510,8 @@ class HYV4FlashAttention(nn.Module):
     ) -> HYV4FlashSparsePlan:
         """Key lists of a sparse layer: dense for short documents, the indexer's selection for long ones.
 
-        Args:
-            layout: Document boundaries of the packed row.
-            rope: Rotary tables of the sparse layers over the global sequence (the indexer shares them).
-            q_resid: Tensor of shape [local_tokens, q_lora_rank].
-            hidden_states: Tensor of shape [local_tokens, hidden].
-            token_keys: Tensor of shape [global_tokens, index_head_dim], normalized index keys.
-
-        Returns:
-            Plan over this rank's queries with global key rows.
+        ``q_resid`` [local_tokens, q_lora_rank] and ``hidden_states`` [local_tokens, hidden] are this rank's queries;
+        ``token_keys`` [global_tokens, index_head_dim] are the normalized index keys. The plan holds global key rows.
         """
         indexer = self.compressed_indexer
         indexer.enter_pooling_units(hidden_states)
@@ -564,17 +546,9 @@ class HYV4FlashAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the latent keys (and index token keys) over the global sequence.
 
-        Without context parallelism the local tensors already are the global ones. With it, only the 576-wide latent
-        keys (differentiable: backward reduce-scatters their gradients to the owning rank) and the 128-wide index token
-        keys (no gradient) travel, instead of the 3072-wide hidden states.
-
-        Args:
-            kv_local: Tensor of shape [local_tokens, kv_lora_rank + rope_dim].
-            token_keys: Optional tensor of shape [local_tokens, index_head_dim].
-            cp_group: Context-parallel group of the forward, or ``None``.
-
-        Returns:
-            The same tensors over the global sequence.
+        Under context parallelism only the latent keys ``kv_local`` [local_tokens, kv_lora_rank + rope_dim]
+        (differentiable: backward reduce-scatters their gradients to the owning rank) and the index ``token_keys``
+        [local_tokens, index_head_dim] (no gradient) travel, not the hidden states.
         """
         if cp_group is None:
             return kv_local, token_keys

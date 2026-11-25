@@ -36,11 +36,7 @@ def test_tiny_forward_backward_is_finite() -> None:
 
 
 def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor], HYV4FlashForCausalLM]:
-    """Loss and gradients of one training forward and backward, plain (``None``) or under a checkpointing mode.
-
-    The documents are longer than ``index_topk`` and the indexer scores one query per chunk, so the sparse selection
-    runs (in several chunks) under the wrapper.
-    """
+    """Loss and gradients of one training step, plain (``None``) or under a checkpointing mode; selection runs."""
     ids = torch.randint(*TOKEN_RANGE, (2, 40), generator=torch.Generator().manual_seed(1))
     torch.manual_seed(0)
     model = HYV4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
@@ -87,11 +83,10 @@ def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor]
 
 @pytest.mark.parametrize("mode", ["moe", "selective"])
 def test_activation_checkpointing_modes_train_like_the_plain_model(mode: str) -> None:
-    """Both partial checkpointing modes wrap the model before its weights are initialized.
+    """Both partial checkpointing modes train like the plain model.
 
-    ``moe`` replaces each block's MoE with a checkpoint wrapper, which forwards attribute access and calls but is not a
-    ``MoE`` instance, so a block must not classify its MLP by type. ``selective`` caches matmul / bmm results, so the
-    model must not mutate one in place (the indexer's score block is such a result).
+    ``moe`` wraps each MoE (not a ``MoE`` instance any more); ``selective`` caches matmul / bmm results, which the
+    model must not mutate in place.
     """
     plain_loss, plain_grads, _ = _train_step(None)
     loss, grads, model = _train_step(mode)

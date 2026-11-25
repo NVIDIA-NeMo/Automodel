@@ -12,19 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hy4-flash decoder stack for AutoModel training (text backbone; the vision path is added in ``vision.py``).
+"""Hy4-flash decoder stack for AutoModel training (text backbone; the vision tower is in ``vision.py``).
 
-Forward contract (transformers reference ``HYV4FlashTextModel``):
+Forward contract (transformers reference ``HYV4FlashTextModel``): tokens are embedded and replicated into ``hc_mult``
+residual streams ``[batch, sequence, hc_mult, hidden]``. Each block optionally applies Engram to the streams, then
+``attn_hc`` -> ``input_layernorm`` -> gated MLA -> ``post_self_attn_layernorm`` -> scatter, then ``ffn_hc`` ->
+``post_attention_layernorm`` -> dense MLP / latent MoE -> ``post_mlp_layernorm`` -> scatter. ``hc_head`` collapses
+the streams before the final RMSNorm and the fp32 ``lm_head``.
 
-1. Embed tokens and replicate them into ``hc_mult`` residual streams ``[batch, sequence, hc_mult, hidden]``.
-2. Each of the 42 blocks: optional Engram update of the streams, then
-   ``attn_hc`` -> ``input_layernorm`` -> gated MLA -> ``post_self_attn_layernorm`` -> scatter to the streams,
-   then ``ffn_hc`` -> ``post_attention_layernorm`` -> dense MLP / latent MoE -> ``post_mlp_layernorm`` -> scatter.
-3. ``hc_head`` collapses the streams, then the final RMSNorm and the fp32 ``lm_head``.
-
-Batch rows (or packed documents) are flattened into one token axis for attention; documents never attend to each
-other. Context parallelism is handled here (the packed row is sharded over the context-parallel group and keys are
-gathered per layer); the vision tower lives in ``vision.py``. Pipeline parallelism is not supported.
+Batch rows and packed documents are flattened into one token axis for attention and never attend to each other.
+Context parallelism shards the packed row and gathers keys per layer. Pipeline parallelism is not supported.
 """
 
 from __future__ import annotations
@@ -246,15 +243,7 @@ class HYV4FlashBlock(nn.Module):
         )
 
     def forward(self, streams: torch.Tensor, batch: HYV4FlashBatch) -> torch.Tensor:
-        """Run the layer.
-
-        Args:
-            streams: Tensor of shape [batch, sequence, hc_mult, hidden].
-            batch: Flattened-token view shared by all layers.
-
-        Returns:
-            Tensor of shape [batch, sequence, hc_mult, hidden].
-        """
+        """Run the layer on ``streams`` [batch, sequence, hc_mult, hidden]; the result has the same shape."""
         rows, seq, _, hidden = streams.shape
         if self.engram_layer is not None:
             streams = streams + self.engram_layer(streams, batch.ngram_tokens, batch.engram_mask)
@@ -398,19 +387,10 @@ class HYV4FlashModel(nn.Module):
         image_token_mask: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
-        """Compute the final hidden states.
+        """Compute the final hidden states [batch, sequence, hidden].
 
-        Args:
-            input_ids: Integer tensor of shape [batch, sequence] (also feeds Engram).
-            position_ids: Integer tensor of shape [3, batch, sequence].
-            attention_mask: Optional tensor of shape [batch, sequence], 1 for real tokens.
-            packed_seq_ids: Optional integer tensor of shape [batch, sequence] with document ids.
-            inputs_embeds: Tensor of shape [batch, sequence, hidden]: token embeddings with image features in place.
-            image_token_mask: Optional bool tensor of shape [batch, sequence] of image placeholder tokens.
-            cp_group: Optional context-parallel group; tensors then hold the local contiguous shard.
-
-        Returns:
-            Tensor of shape [batch, sequence, hidden] after the final norm.
+        ``inputs_embeds`` [batch, sequence, hidden] are the token embeddings with image features in place; the other
+        arguments are those of :meth:`prepare_batch`.
         """
         batch = self.prepare_batch(input_ids, position_ids, attention_mask, packed_seq_ids, image_token_mask, cp_group)
         streams = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
@@ -522,15 +502,9 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
         pixel_values: torch.Tensor | None,
         image_grid_thw: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Token embeddings with image features scattered into the ``<|image_pad|>`` positions.
+        """Token embeddings [batch, sequence, hidden] with image features scattered into the image pad positions.
 
-        Args:
-            input_ids: Integer tensor of shape [batch, sequence].
-            pixel_values: Optional tensor of shape [patches, channels * patch_size * patch_size].
-            image_grid_thw: Optional integer tensor of shape [images, 3].
-
-        Returns:
-            Tensor of shape [batch, sequence, hidden].
+        ``pixel_values`` has shape [patches, channels * patch_size * patch_size] and ``image_grid_thw`` [images, 3].
         """
         embedded = self.model.embed_tokens(input_ids)
         if self.vit is None:
@@ -551,12 +525,8 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
     def prepare_model_inputs_for_cp(self, batch: dict[str, torch.Tensor], *, num_chunks: int = 1) -> HYV4FlashCPInputs:
         """Select contiguous packed sharding (documents are never aligned or reordered).
 
-        Args:
-            batch: Full tensors of shape [batch, global_sequence] (the hook leaves them intact).
-            num_chunks: Framework chunk count; this model uses one chunk.
-
-        Returns:
-            The model-owned CP sharder; its local token tensors have shape [1, padded_global_sequence / cp_size].
+        ``batch`` holds full tensors [batch, global_sequence]; the returned model-owned sharder yields local token
+        tensors of shape [1, padded_global_sequence / cp_size]. ``num_chunks`` is unused: this model uses one chunk.
         """
         return {
             "cp_sharder": ContextParallelSharder(
@@ -626,13 +596,10 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
             output_hidden_states: Attach the final hidden states [batch, sequence, hidden].
             pixel_values: Optional tensor of shape [patches, channels * patch_size * patch_size].
             image_grid_thw: Optional integer tensor of shape [images, 3] of (time, height, width) patch counts.
-            mm_token_type_ids: Optional integer tensor of shape [batch, sequence], 0 text / 1 image; derived from the
-                image placeholder id when omitted.
-            cp_group: Context-parallel group; ``input_ids`` etc. are then the local contiguous shard prepared by the
-                model-owned sharder (``packed_seq_ids`` and document-local ``position_ids`` included).
-            seq_lens: Optional integer tensor of shape [batch, documents] of real document lengths of a packed row
-                (direct, non-CP packed forward). ``seq_lens_padded`` gives the physical spans and ``qkv_format`` must be
-                ``"thd"`` or omitted.
+            mm_token_type_ids: Optional integer tensor of shape [batch, sequence], 0 text / 1 image.
+            cp_group: Context-parallel group; the token tensors are then the shard from the model-owned sharder.
+            seq_lens: Optional integer tensor of shape [batch, documents] of document lengths of a packed row
+                (non-CP); ``seq_lens_padded`` gives the physical spans and ``qkv_format`` must be ``"thd"`` or omitted.
 
         Returns:
             ``CausalLMOutputWithPast`` with logits [batch, kept_sequence, vocab].

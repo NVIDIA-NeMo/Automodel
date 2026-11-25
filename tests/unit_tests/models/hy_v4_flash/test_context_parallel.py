@@ -14,10 +14,8 @@
 
 """Packed context parallelism (Gloo ranks) against independent single-process oracles, forward and backward.
 
-The pack is laid out to stress the rank boundaries of a four-rank split (24 tokens per rank): a document ending one
-token before a boundary, a one-token document on the last token of a rank, a one-token document on the first token of
-the next rank, a document spanning three ranks (longer than ``index_topk`` and the sliding window, so selection and the
-window both drop keys while the keys live on other ranks), short documents and trailing padding.
+The pack stresses the boundaries of a four-rank split (24 tokens per rank): documents ending just before, on and just
+after a boundary, and one spanning three ranks that is longer than ``index_topk`` and the sliding window.
 """
 
 from dataclasses import dataclass
@@ -44,12 +42,7 @@ WORLD = 4
 
 
 def _objective(logits: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Sum of squared logits of the real tokens.
-
-    Args:
-        logits: Tensor of shape [1, tokens, vocab].
-        attention_mask: Bool tensor of shape [1, tokens], False at padding.
-    """
+    """Sum of squared logits [1, tokens, vocab] over the real tokens of ``attention_mask`` [1, tokens]."""
     return (logits.square().sum(-1) * attention_mask).sum()
 
 
@@ -118,13 +111,7 @@ def _worker(rank: int, rendezvous: str, result_path: str) -> None:
 
 @dataclass(frozen=True)
 class _RankResults:
-    """Outputs of one four-rank run.
-
-    Attributes:
-        logits: Tensor of shape [1, tokens, vocab], the ranks' logits concatenated.
-        grads: Parameter gradients summed over the ranks, by parameter name.
-        broken_logits: Tensor of shape [1, tokens, vocab] of the forward without the cross-rank key gather.
-    """
+    """One four-rank run: logits [1, tokens, vocab], summed gradients, and the logits without the key gather."""
 
     logits: torch.Tensor
     grads: dict[str, torch.Tensor]
