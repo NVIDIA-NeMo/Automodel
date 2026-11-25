@@ -52,6 +52,16 @@ class IterableDataLoader:
         raise NotImplementedError("IterableDataLoader does not support __len__")
 
 
+@pytest.mark.parametrize(
+    ("epoch_batches", "max_steps", "expected"),
+    [(5, None, 9), (5, 20, 9), (5, 7, 7), (None, 7, 7)],
+)
+def test_total_steps(epoch_batches: int | None, max_steps: int | None, expected: int) -> None:
+    loader = IterableDataLoader(5) if epoch_batches is None else SizedDataLoader(epoch_batches)
+    schedule = StepScheduler(2, 1, 1, loader, num_epochs=3, max_steps=max_steps, preemption_signal=None)
+    assert schedule.total_steps == expected
+
+
 def test_iteration_groups_and_epoch_increment_sized():
     # grad_acc_steps = global // (local * dp) = 8 // (2 * 2) = 2
     dataloader = SizedDataLoader(num_batches=5)

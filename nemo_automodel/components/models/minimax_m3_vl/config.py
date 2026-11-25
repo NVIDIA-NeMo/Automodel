@@ -32,13 +32,16 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, Required, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Required, TypedDict, Union
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils.hub import cached_file
 
+from nemo_automodel.components.models.minimax_m3_vl.flops import model_flops
+
 if TYPE_CHECKING:
     from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
+    from nemo_automodel.components.speculative.dspark.options import DSparkDraftOptions
 
 
 logger = logging.getLogger(__name__)
@@ -75,20 +78,6 @@ _DSPARK_RELEASED_REQUIRED_FIELDS = (
 )
 
 
-class _DSparkDraftOptions(Protocol):
-    """Declarative DSpark settings supplied by the generic training recipe."""
-
-    num_draft_layers: int
-    target_layer_ids: list[int]
-    block_size: int
-    num_anchors: int
-    mask_token_id: int
-    markov_rank: int
-    markov_head_type: str
-    confidence_head_alpha: float
-    confidence_head_with_markov: bool
-
-
 class MiniMaxM3QuantizationConfig(TypedDict, total=False):
     """``quantization_config`` block of the released MiniMax M3 checkpoints.
 
@@ -122,6 +111,7 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
 
     model_type = "minimax_m3"
     architectures = ["MiniMaxM3SparseForCausalLM"]
+    flops_formula = staticmethod(model_flops)
 
     def __init__(
         self,
@@ -312,7 +302,7 @@ class MiniMaxM3VLConfig(PretrainedConfig):
     def to_dict(self):
         return _json_safe_value(super().to_dict())
 
-    def build_dspark_draft(self, options: _DSparkDraftOptions) -> MiniMaxM3DSparkModel:
+    def build_dspark_draft(self, options: DSparkDraftOptions) -> MiniMaxM3DSparkModel:
         """Build the model-owned DSpark draft.
 
         A target that ships ``dspark/config.json`` fixes the draft contract, and
@@ -326,15 +316,15 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         """
         return MiniMaxM3DSparkConfig(
             text_config=self.text_config,
-            num_draft_layers=int(options.num_draft_layers),
-            target_layer_ids=tuple(int(layer_id) for layer_id in options.target_layer_ids),
-            block_size=int(options.block_size),
-            num_anchors=int(options.num_anchors),
-            mask_token_id=int(options.mask_token_id),
-            markov_rank=int(options.markov_rank),
-            markov_head_type=str(options.markov_head_type),
-            confidence_head_alpha=float(options.confidence_head_alpha),
-            confidence_head_with_markov=bool(options.confidence_head_with_markov),
+            num_draft_layers=options.num_draft_layers,
+            target_layer_ids=tuple(options.target_layer_ids),
+            block_size=options.block_size,
+            num_anchors=options.num_anchors,
+            mask_token_id=options.mask_token_id,
+            markov_rank=options.markov_rank,
+            markov_head_type=options.markov_head_type,
+            confidence_head_alpha=options.confidence_head_alpha,
+            confidence_head_with_markov=options.confidence_head_with_markov,
             released=MiniMaxM3DSparkReleasedConfig.from_target(self.name_or_path),
         ).build()
 

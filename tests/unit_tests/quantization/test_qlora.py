@@ -58,31 +58,30 @@ def fake_optional_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_create_bnb_config_4bit_defaults(fake_optional_deps) -> None:
-    result = qlora.create_bnb_config(_FakeConfig({"load_in_4bit": True}))
+_4BIT_DEFAULTS = {
+    "load_in_4bit": True,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_use_double_quant": True,
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_quant_storage": "bfloat16",
+}
+
+
+def test_bnb_config_4bit_defaults(fake_optional_deps) -> None:
+    result = qlora.BnbQuantizationConfig(load_in_4bit=True).build()
 
     assert isinstance(result, _FakeBitsAndBytesConfig)
-    assert result.kwargs == {
-        "load_in_4bit": True,
-        "bnb_4bit_compute_dtype": "bfloat16",
-        "bnb_4bit_use_double_quant": True,
-        "bnb_4bit_quant_type": "nf4",
-        "bnb_4bit_quant_storage": "bfloat16",
-    }
+    assert result.kwargs == _4BIT_DEFAULTS
 
 
-def test_create_bnb_config_4bit_overrides(fake_optional_deps) -> None:
-    result = qlora.create_bnb_config(
-        _FakeConfig(
-            {
-                "load_in_4bit": True,
-                "bnb_4bit_compute_dtype": "float16",
-                "bnb_4bit_use_double_quant": False,
-                "bnb_4bit_quant_type": "fp4",
-                "bnb_4bit_quant_storage": "float16",
-            }
-        )
-    )
+def test_bnb_config_4bit_overrides(fake_optional_deps) -> None:
+    result = qlora.BnbQuantizationConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype="float16",
+        bnb_4bit_use_double_quant=False,
+        bnb_4bit_quant_type="fp4",
+        bnb_4bit_quant_storage="float16",
+    ).build()
 
     assert isinstance(result, _FakeBitsAndBytesConfig)
     assert result.kwargs == {
@@ -94,37 +93,48 @@ def test_create_bnb_config_4bit_overrides(fake_optional_deps) -> None:
     }
 
 
-def test_create_bnb_config_8bit_only(fake_optional_deps) -> None:
-    result = qlora.create_bnb_config(_FakeConfig({"load_in_8bit": True}))
+def test_bnb_config_8bit_only(fake_optional_deps) -> None:
+    result = qlora.BnbQuantizationConfig(load_in_8bit=True).build()
 
     assert isinstance(result, _FakeBitsAndBytesConfig)
     assert result.kwargs == {"load_in_8bit": True}
 
 
-def test_create_bnb_config_8bit_when_4bit_disabled(fake_optional_deps) -> None:
-    result = qlora.create_bnb_config(_FakeConfig({"load_in_4bit": False, "load_in_8bit": True}))
+def test_bnb_config_8bit_when_4bit_disabled(fake_optional_deps) -> None:
+    result = qlora.BnbQuantizationConfig(load_in_4bit=False, load_in_8bit=True).build()
 
     assert isinstance(result, _FakeBitsAndBytesConfig)
     assert result.kwargs == {"load_in_8bit": True}
 
 
-def test_create_bnb_config_4bit_wins_when_both_enabled(fake_optional_deps) -> None:
-    result = qlora.create_bnb_config(_FakeConfig({"load_in_4bit": True, "load_in_8bit": True}))
+def test_bnb_config_4bit_wins_when_both_enabled(fake_optional_deps) -> None:
+    result = qlora.BnbQuantizationConfig(load_in_4bit=True, load_in_8bit=True).build()
 
     assert isinstance(result, _FakeBitsAndBytesConfig)
     assert result.kwargs["load_in_4bit"] is True
     assert "load_in_8bit" not in result.kwargs
 
 
-def test_create_bnb_config_explicit_disable_returns_none(fake_optional_deps) -> None:
-    result = qlora.create_bnb_config(_FakeConfig({"load_in_4bit": False, "load_in_8bit": False}))
-
-    assert result is None
+def test_bnb_config_explicit_disable_returns_none(fake_optional_deps) -> None:
+    assert qlora.BnbQuantizationConfig(load_in_4bit=False, load_in_8bit=False).build() is None
 
 
-def test_create_bnb_config_requires_a_load_flag(fake_optional_deps) -> None:
+def test_bnb_config_requires_a_load_flag() -> None:
     with pytest.raises(ValueError, match="load_in_4bit.*load_in_8bit"):
-        qlora.create_bnb_config(_FakeConfig({}))
+        qlora.BnbQuantizationConfig()
+
+
+def test_create_bnb_config_is_deprecated_and_delegates(fake_optional_deps) -> None:
+    with pytest.warns(FutureWarning, match="BnbQuantizationConfig"):
+        result = qlora.create_bnb_config(_FakeConfig({"load_in_4bit": True}))
+
+    assert isinstance(result, _FakeBitsAndBytesConfig)
+    assert result.kwargs == _4BIT_DEFAULTS
+
+
+def test_create_bnb_config_accepts_a_null_load_flag(fake_optional_deps) -> None:
+    with pytest.warns(FutureWarning, match="BnbQuantizationConfig"):
+        assert qlora.create_bnb_config({"load_in_4bit": None}) is None
 
 
 class _QuantizedModule(nn.Module):

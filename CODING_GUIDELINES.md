@@ -38,7 +38,10 @@ not yet comply; use these guidelines to guide changes within your task's scope.
   boundary. Components must consume typed configs and explicit typed runtime arguments, never YAML or `ConfigNode`
   objects. Converting a `ConfigNode` into a plain dictionary, nested mapping, or `**kwargs` bag and passing it into
   a component is the same boundary violation; it does not make the configuration typed. Do not reconstruct or
-  interpret the YAML schema inside components.
+  interpret the YAML schema inside components. Typing a component parameter as `ConfigNode` (even through a
+  `TYPE_CHECKING` import) or as a `Protocol` that `ConfigNode` satisfies does not fix the violation either.
+  The component import contract blocks dependencies on `nemo_automodel.components.config` or
+  `nemo_automodel.recipes`. The `tools/lint_config_boundary.py` check catches common duck-typed forms.
 - **Let configs own construction.** Use typed `build(...)` methods; keep runtime objects out of serializable configs.
   Preserve typed configs internally, serialize at shared boundaries, and do not mutate configs during construction.
 - **Keep artifact versions consistent.** Resolve related external artifacts, such as configs and weights,

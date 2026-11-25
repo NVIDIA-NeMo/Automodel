@@ -150,13 +150,13 @@ class WandbConfig:
     forwarded to ``wandb.init()``.
 
     Attributes:
-        project: WandB project name.
+        project: WandB project name. ``None`` uses W&B's default project selection.
         entity: WandB team / entity.  ``None`` uses the default from
             the wandb config or ``WANDB_ENTITY`` env var.
         name: Display name for the run.  When empty, ``build`` derives
             one from the model name.
         group: Group name for related runs.
-        tags: List of string tags attached to the run.
+        tags: Tags attached to the run. ``None`` lets W&B supply its defaults.
         notes: Free-text notes shown in the WandB UI.
         swanlab: Optional :class:`SwanLabConfig` that mirrors this run to
             SwanLab (the ``wandb.swanlab:`` sub-block).
@@ -164,11 +164,11 @@ class WandbConfig:
             ...) carried through unfiltered.
     """
 
-    project: str = "automodel"
+    project: str | None = "automodel"
     entity: str | None = None
     name: str = ""
     group: str | None = None
-    tags: list[str] = field(default_factory=list)
+    tags: list[str] | None = field(default_factory=list)
     notes: str | None = None
     swanlab: SwanLabConfig | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -194,7 +194,7 @@ class WandbConfig:
             raise TypeError(f"wandb.swanlab must be a mapping of SwanLab options, got {swanlab!r}")
         return cls(**direct, extra=extra)
 
-    def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Any:
+    def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Run:
         """Initialise WandB and return the run.
 
         Args:

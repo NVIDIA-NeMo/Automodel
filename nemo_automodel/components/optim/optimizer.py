@@ -63,7 +63,6 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from nemo_automodel.components.optim.gradient_sketch import SketchSettings
-    from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -444,7 +443,7 @@ class GradientSketchConfig(OptimizerConfig):
 
         Raises:
             NotImplementedError: If ``model`` has several pipeline-parallel parts.
-            ValueError: If PEFT is enabled, or ``device_mesh`` uses HSDP or tensor parallelism.
+            ValueError: If PEFT is enabled, or ``device_mesh`` uses HSDP, tensor or pipeline parallelism.
         """
         # Local import keeps optimizer.py importable without the sketch package's dependencies at module load.
         from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
@@ -457,6 +456,8 @@ class GradientSketchConfig(OptimizerConfig):
             # Context parallelism is supported. Expert parallelism lives on the separate MoE mesh,
             # which this config never sees; ``clip_grads_for_optimizers`` rejects it at the first step.
             mesh_names = device_mesh.mesh_dim_names or ()
+            if "pp" in mesh_names and device_mesh["pp"].size() > 1:
+                raise ValueError("gradient sketch does not support pipeline parallelism")
             if "dp_replicate" in mesh_names and device_mesh["dp_replicate"].size() > 1:
                 raise ValueError("gradient sketch does not support HSDP")
             if "tp" in mesh_names and device_mesh["tp"].size() > 1:
@@ -1006,7 +1007,7 @@ class LRSchedulerConfig:
     def build(
         self,
         optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
-        step_scheduler: StepScheduler,
+        total_steps: int,
     ) -> list[OptimizerParamScheduler]:
         """Build one LR scheduler per optimizer.
 
@@ -1015,7 +1016,7 @@ class LRSchedulerConfig:
 
         Args:
             optimizer: The optimizer(s) to schedule.
-            step_scheduler: The step scheduler, used to derive total steps.
+            total_steps: Number of optimizer steps in the training schedule.
 
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
@@ -1027,19 +1028,6 @@ class LRSchedulerConfig:
             raise ValueError(
                 f"lr_warmup_steps must be an integer step count, got {self.lr_warmup_steps!r}. "
                 "Fractional warmup is not supported; set the number of warmup steps directly."
-            )
-        # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
-        # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
-        # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.
-        if step_scheduler.epoch_len is not None:
-            total_steps = step_scheduler.num_epochs * step_scheduler.epoch_len
-            if step_scheduler.max_steps is not None:
-                total_steps = min(total_steps, step_scheduler.max_steps)
-        elif step_scheduler.max_steps is not None:
-            total_steps = step_scheduler.max_steps
-        else:
-            raise ValueError(
-                "Cannot infer total steps for an iterable/streaming dataset; set step_scheduler.max_steps."
             )
         lr_decay_steps = self.lr_decay_steps if self.lr_decay_steps is not None else total_steps
         wd_incr_steps = self.wd_incr_steps if self.wd_incr_steps is not None else total_steps

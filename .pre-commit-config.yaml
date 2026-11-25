@@ -72,6 +72,12 @@ repos:
         entry: python tools/lint_no_globals.py
         files: '^(nemo_automodel|tools|scripts|examples|tutorials)/.*\.py$|^app\.py$'
         types: [file]
+      - id: config-boundary
+        name: "Keep YAML ConfigNode out of components"
+        language: system
+        entry: python tools/lint_config_boundary.py
+        files: '^nemo_automodel/components/.*\.py$'
+        types: [file]
       - id: model-parallelizer-contract
         name: "Enforce the ModelParallelizer contract"
         language: system

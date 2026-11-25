@@ -71,13 +71,16 @@ def test_vocabulary_resize_keeps_the_logits_dtype() -> None:
 
 
 def test_hf_backbone_builder_passes_logits_dtype(tmp_path) -> None:
-    from nemo_automodel.components.models.bagel.hf_backbone_loader import build_bagel_from_hf_backbones
+    from nemo_automodel.components.models.bagel.hf_backbone_loader import (
+        BagelBackbonesConfig,
+        build_bagel_from_hf_backbones,
+    )
 
     config = _config()
     config.pad_token_id = 0  # within the tiny vocabulary
     config.save_pretrained(tmp_path)
     model = build_bagel_from_hf_backbones(
-        model_cfg={"llm_path": str(tmp_path), "visual_und": False, "logits_dtype": "float32"},
+        backbones=BagelBackbonesConfig(llm_path=str(tmp_path), visual_und=False, logits_dtype=torch.float32),
         stage=1,
         vae_config=None,
         meta_init=True,

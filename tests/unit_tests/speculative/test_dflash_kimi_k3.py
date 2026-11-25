@@ -28,6 +28,7 @@ from nemo_automodel.components.speculative.dflash.draft_kimi_k3 import (
     build_kimi_k3_dflash_target_kwargs,
 )
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
+from nemo_automodel.components.speculative.dflash.target_options import DFlashTargetOptions
 from nemo_automodel.recipes.speculative_decoding import train_dflash
 from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
 
@@ -257,7 +258,7 @@ def test_trainer_module_trains_the_kimi_k3_draft():
 
 
 def test_target_kwargs_defaults_and_overrides():
-    kwargs = build_kimi_k3_dflash_target_kwargs({})
+    kwargs = build_kimi_k3_dflash_target_kwargs(DFlashTargetOptions())
     # The multimodal checkpoint must load as the text-only causal LM.
     assert kwargs["config"] == {"architectures": ["KimiK3ForCausalLM"]}
     backend = kwargs["backend"]
@@ -267,12 +268,44 @@ def test_target_kwargs_defaults_and_overrides():
     assert backend.enable_fsdp_optimizations is True
 
     backend = build_kimi_k3_dflash_target_kwargs(
-        {
-            "target_dispatcher": "deepep",
-            "target_experts": "torch_mm",
-            "target_enable_fsdp_optimizations": False,
-        }
+        DFlashTargetOptions(dispatcher="deepep", experts="torch_mm", enable_fsdp_optimizations=False)
     )["backend"]
     assert backend.dispatcher == "deepep"
     assert backend.experts == "torch_mm"
     assert backend.enable_fsdp_optimizations is False
+
+
+@pytest.mark.parametrize(
+    ("fsdp_override", "expected"),
+    [
+        ({}, None),
+        ({"target_enable_fsdp_optimizations": False}, False),
+        ({"target_enable_fsdp_optimizations": None}, False),
+    ],
+)
+def test_recipe_passes_target_options_from_recipe_args(fsdp_override, expected):
+    """The recipe reads ``recipe_args.target_*``; the spec callback only sees typed options."""
+    import dataclasses
+
+    seen = []
+
+    class _Stop(Exception):
+        pass
+
+    def _capture(options):
+        seen.append(options)
+        raise _Stop
+
+    spec = dataclasses.replace(resolve_dflash_draft_spec(["KimiK3ForCausalLM"]), build_target_kwargs=_capture)
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    recipe.cfg = {}
+    recipe.compute_dtype = torch.float32
+    recipe_args = {
+        "target_dispatcher": "deepep",
+        "target_experts": "torch_mm",
+        **fsdp_override,
+    }
+
+    with pytest.raises(_Stop):
+        recipe._build_target_model(recipe_args, "moonshotai/Kimi-K3", spec)
+    assert seen == [DFlashTargetOptions(dispatcher="deepep", experts="torch_mm", enable_fsdp_optimizations=expected)]

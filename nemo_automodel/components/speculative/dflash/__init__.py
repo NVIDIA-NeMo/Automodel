@@ -54,8 +54,11 @@ from nemo_automodel.components.speculative.dflash.registry import (
     resolve_dflash_draft_spec,
 )
 from nemo_automodel.components.speculative.dflash.target import DFlashTargetBatch, HFDFlashTargetModel
+from nemo_automodel.components.speculative.dflash.target_options import DFlashTargetKwargs, DFlashTargetOptions
 
 __all__ = [
+    "DFlashTargetKwargs",
+    "DFlashTargetOptions",
     "DFlashTrainerModule",
     "DFlashStepMetrics",
     "NoValidAnchorsError",

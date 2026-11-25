@@ -26,18 +26,36 @@ Checkpointer is passed explicitly (dependency injection) - no global state.
 """
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Protocol
 
 from torch import nn
 
 from nemo_automodel.components.models.common.lm_head import LMHead
 
 if TYPE_CHECKING:
+    from peft import PeftConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
-
 logger = logging.getLogger(__name__)
+
+
+class ModelSaver(Protocol):
+    """The part of a checkpointer that ``save_pretrained`` uses.
+
+    ``nemo_automodel.components.checkpoint.checkpointing.Checkpointer`` provides it; the
+    caller passes the checkpointer in, so model code does not import the checkpoint package.
+    """
+
+    def save_model(
+        self,
+        model: nn.Module,
+        weights_path: str,
+        peft_config: Optional["PeftConfig"] = None,
+        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
+        is_final_checkpoint: bool = False,
+    ) -> None:
+        """Save ``model``'s weights under ``weights_path``."""
+        ...
 
 
 class HFCheckpointingMixin:
@@ -92,7 +110,7 @@ class HFCheckpointingMixin:
     def save_pretrained(
         self,
         save_directory: str,
-        checkpointer: Optional["Checkpointer"] = None,
+        checkpointer: ModelSaver | None = None,
         tokenizer: Optional["PreTrainedTokenizerBase"] = None,
         **kwargs,
     ) -> None:

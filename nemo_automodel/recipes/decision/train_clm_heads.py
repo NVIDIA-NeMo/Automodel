@@ -76,7 +76,6 @@ from nemo_automodel.components.models.clm.heads import (
     save_clm_heads,
 )
 from nemo_automodel.components.models.clm.prompting import prepare_tokenizer
-from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -378,14 +377,10 @@ class TrainCLMHeadsRecipe(BaseRecipe):
         optimizers = self.cfg.optimizer.build(heads)
         params = [parameter for parameter in heads.parameters() if parameter.requires_grad]
         steps_per_epoch = math.ceil(len(train_records) / batch_size)
-        step_scheduler = StepSchedulerConfig(
-            global_batch_size=batch_size,
-            num_epochs=epochs,
-            max_steps=epochs * steps_per_epoch,
-            preemption_signal=None,
-        ).build(dataloader=None, dp_group_size=1, local_batch_size=batch_size)
         schedulers = (
-            self.cfg.lr_scheduler.build(optimizers, step_scheduler) if self.cfg.lr_scheduler is not None else []
+            self.cfg.lr_scheduler.build(optimizers, epochs * steps_per_epoch)
+            if self.cfg.lr_scheduler is not None
+            else []
         )
         generator = torch.Generator(device=self.device).manual_seed(self.seed)
 

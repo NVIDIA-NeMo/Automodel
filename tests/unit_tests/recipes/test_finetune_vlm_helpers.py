@@ -38,6 +38,7 @@ from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.models.qwen3_5.packing import HostTensor
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import (
     _STEP_SCHEDULER_RUNTIME_KEYS,
@@ -74,11 +75,13 @@ def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
     return StepSchedulerConfig(**kwargs).build(dataloader, dp_group_size, local_batch_size)
 
 
-def build_lr_scheduler(cfg, optimizer, step_scheduler):
+def build_lr_scheduler(
+    cfg: ConfigNode | None, optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer], total_steps: int
+) -> list[OptimizerParamScheduler] | None:
     """Build an LR scheduler from a YAML block (mirrors ``RecipeConfig.lr_scheduler.build``)."""
     if cfg is None:
         return None
-    return LRSchedulerConfig(**_section_kwargs(cfg)).build(optimizer, step_scheduler)
+    return LRSchedulerConfig(**_section_kwargs(cfg)).build(optimizer, total_steps)
 
 
 class _Cfg(SimpleNamespace):
@@ -323,7 +326,7 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
 
 
 def test_build_model_passes_quantization_config():
-    """cfg_quantization is converted via create_bnb_config and forwarded as quantization_config."""
+    """cfg_quantization becomes a BnbQuantizationConfig whose build() is forwarded as quantization_config."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
     captured_kwargs = {}
@@ -339,16 +342,21 @@ def test_build_model_passes_quantization_config():
         def get(self, key, default=None):
             return getattr(self, key, default)
 
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.quantization.qlora import BnbQuantizationConfig
+
     cfg_model = CapturingModelConfig()
-    cfg_quantization = SimpleNamespace(load_in_4bit=True)
+    cfg_quantization = ConfigNode({"load_in_4bit": True, "bnb_4bit_quant_type": "fp4"})
     sentinel_bnb = object()
+    built_from = []
+
+    def _build(self):
+        built_from.append(self)
+        return sentinel_bnb
 
     with (
         patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True),
-        patch(
-            "nemo_automodel.components.quantization.qlora.create_bnb_config",
-            return_value=sentinel_bnb,
-        ) as mock_create,
+        patch.object(BnbQuantizationConfig, "build", _build),
     ):
         build_model(
             cfg_model=cfg_model,
@@ -358,8 +366,8 @@ def test_build_model_passes_quantization_config():
             cfg_quantization=cfg_quantization,
         )
 
-    # Wiring: cfg_quantization -> create_bnb_config(...) -> kwargs["quantization_config"]
-    mock_create.assert_called_once_with(cfg_quantization)
+    # Wiring: cfg_quantization -> BnbQuantizationConfig(...).build() -> kwargs["quantization_config"]
+    assert built_from == [BnbQuantizationConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4")]
     assert captured_kwargs.get("quantization_config") is sentinel_bnb
 
 
@@ -1356,29 +1364,19 @@ class TestBuildLRScheduler:
 
     def test_build_lr_scheduler_returns_none_when_cfg_is_none(self):
         """Test that None config returns None scheduler."""
-        result = build_lr_scheduler(cfg=None, optimizer=MagicMock(), step_scheduler=MagicMock())
+        result = build_lr_scheduler(cfg=None, optimizer=MagicMock(), total_steps=1000)
         assert result is None
 
     def test_build_lr_scheduler_creates_schedulers_for_single_optimizer(self):
         """Test scheduler creation for single optimizer."""
         optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01, weight_decay=0.01)
 
-        mock_dataloader = MagicMock()
-        mock_dataloader.__len__ = MagicMock(return_value=100)
-
-        step_scheduler = MagicMock()
-        step_scheduler.num_epochs = 10
-        step_scheduler.dataloader = mock_dataloader
-        step_scheduler.grad_acc_steps = 1
-        step_scheduler.epoch_len = 100  # ceil(len(dataloader)=100 / grad_acc=1)
-        step_scheduler.max_steps = None
-
         cfg = MagicMock()
         cfg.to_dict.return_value = {
             "lr_decay_style": "cosine",
         }
 
-        schedulers = build_lr_scheduler(cfg=cfg, optimizer=optimizer, step_scheduler=step_scheduler)
+        schedulers = build_lr_scheduler(cfg=cfg, optimizer=optimizer, total_steps=1000)
 
         assert schedulers is not None
         assert len(schedulers) == 1
@@ -1393,20 +1391,10 @@ class TestBuildLRScheduler:
         opt2 = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.02)
         optimizers = [opt1, opt2]
 
-        mock_dataloader = MagicMock()
-        mock_dataloader.__len__ = MagicMock(return_value=100)
-
-        step_scheduler = MagicMock()
-        step_scheduler.num_epochs = 5
-        step_scheduler.dataloader = mock_dataloader
-        step_scheduler.grad_acc_steps = 2
-        step_scheduler.epoch_len = 50  # ceil(len(dataloader)=100 / grad_acc=2)
-        step_scheduler.max_steps = None
-
         cfg = MagicMock()
         cfg.to_dict.return_value = {}
 
-        schedulers = build_lr_scheduler(cfg=cfg, optimizer=optimizers, step_scheduler=step_scheduler)
+        schedulers = build_lr_scheduler(cfg=cfg, optimizer=optimizers, total_steps=250)
 
         assert schedulers is not None
         assert len(schedulers) == 2
@@ -1415,26 +1403,15 @@ class TestBuildLRScheduler:
         # Second scheduler uses second optimizer's LR
         assert schedulers[1].max_lr == 0.02
 
-    def test_build_lr_scheduler_respects_max_steps(self):
-        """Test that max_steps limits total_steps calculation."""
+    def test_build_lr_scheduler_uses_supplied_total_steps(self) -> None:
+        """The resolved training duration sets the default decay length."""
         optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
-
-        mock_dataloader = MagicMock()
-        mock_dataloader.__len__ = MagicMock(return_value=1000)
-
-        step_scheduler = MagicMock()
-        step_scheduler.num_epochs = 100  # Would be 100000 steps
-        step_scheduler.dataloader = mock_dataloader
-        step_scheduler.grad_acc_steps = 1
-        step_scheduler.epoch_len = 1000  # ceil(len(dataloader)=1000 / grad_acc=1)
-        step_scheduler.max_steps = 500  # Limit to 500
 
         cfg = MagicMock()
         cfg.to_dict.return_value = {}
 
-        schedulers = build_lr_scheduler(cfg=cfg, optimizer=optimizer, step_scheduler=step_scheduler)
+        schedulers = build_lr_scheduler(cfg=cfg, optimizer=optimizer, total_steps=500)
 
-        # Decay steps should be limited by max_steps
         assert schedulers[0].lr_decay_steps == 500
 
 

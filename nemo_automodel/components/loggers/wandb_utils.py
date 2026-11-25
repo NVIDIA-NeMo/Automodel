@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -21,12 +22,12 @@ if TYPE_CHECKING:
 
 
 def init_wandb_run(wandb_cfg: dict[str, Any], full_config: dict[str, Any], default_name: str = "") -> Run | None:
-    """Initialize a W&B run from a config dict.
+    """Deprecated: build the run with ``WandbConfig.build`` instead.
 
-    A recipe-agnostic counterpart to recipe-local ``build_wandb`` helpers: it
-    takes the already-resolved ``wandb`` kwargs (project, entity, name, ...) and
-    the full run config to record, and falls back to ``default_name`` when no
-    run name is given.
+    Recipes get the typed config from ``RecipeConfig.wandb`` (or
+    ``WandbConfig.from_kwargs``) and call ``build(run_config=..., model_name=...)``
+    on it. This helper re-parses a raw ``wandb:`` block next to that path and
+    will be removed.
 
     Args:
         wandb_cfg: Keyword args forwarded to ``wandb.init`` (e.g. project, entity, name).
@@ -36,6 +37,12 @@ def init_wandb_run(wandb_cfg: dict[str, Any], full_config: dict[str, Any], defau
     Returns:
         The initialized ``wandb.Run``.
     """
+    warnings.warn(
+        "init_wandb_run is deprecated; use WandbConfig.build(run_config=..., model_name=...) "
+        "(recipes get the config from RecipeConfig.wandb)",
+        FutureWarning,
+        stacklevel=2,
+    )
     try:
         import wandb
         from wandb import Settings

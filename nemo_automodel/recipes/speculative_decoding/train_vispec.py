@@ -231,7 +231,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
         )
 
         self.train_dataloader = build_dspark_vlm_dataloader(
-            dataset_cfg=self.cfg.dataset,
+            dataset=self.cfg.dataset.instantiate(),
             processor=self.processor,
             batch_size=micro_batch_size,
             max_length=recipe_cfg.seq_length,
@@ -243,7 +243,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
         self.val_dataloader = None
         if self.cfg.get("val_dataset", None) is not None:
             self.val_dataloader = build_dspark_vlm_dataloader(
-                dataset_cfg=self.cfg.val_dataset,
+                dataset=self.cfg.val_dataset.instantiate(),
                 processor=self.processor,
                 batch_size=micro_batch_size,
                 max_length=recipe_cfg.seq_length,

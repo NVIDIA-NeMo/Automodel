@@ -31,16 +31,6 @@ import nemo_automodel.components.distributed.context_parallel.magi as mu
 from nemo_automodel.components.distributed.context_parallel.magi import AttnMaskSpec, MagiState, setup_magi
 
 
-class _FakeCfg:
-    """Minimal stand-in for the recipe ConfigNode (dotted ``.get``)."""
-
-    def __init__(self, values: dict):
-        self._values = values
-
-    def get(self, key, default=None):
-        return self._values.get(key, default)
-
-
 class _FakeGroup:
     def __init__(self, size):
         self._size = size
@@ -170,13 +160,13 @@ class TestMagiState:
 # --------------------------------------------------------------------------- #
 class TestSetupMagi:
     def test_disabled_when_not_configured(self):
-        st = setup_magi(_FakeCfg({}), device_mesh=None)
+        st = setup_magi(None, device_mesh=None)
         assert st.enabled is False and st.custom is False and st.cp_size == 1
 
     def test_raises_when_magi_unavailable(self, monkeypatch):
         monkeypatch.setattr(mu, "is_magi_available", lambda: False)
         with pytest.raises(RuntimeError, match="not importable"):
-            setup_magi(_FakeCfg({"model.attn_implementation": "magi"}), device_mesh=object())
+            setup_magi("hf", device_mesh=object())
 
     def test_hf_backend_enabled(self, monkeypatch):
         calls = {"register": 0, "active": []}
@@ -185,7 +175,7 @@ class TestSetupMagi:
         monkeypatch.setattr(mu, "get_cp_group", lambda mesh: _FakeGroup(1))
         monkeypatch.setattr(mu, "set_active_cp_group", lambda g: calls["active"].append(g))
 
-        st = setup_magi(_FakeCfg({"model.attn_implementation": "magi"}), device_mesh=object())
+        st = setup_magi("hf", device_mesh=object())
         assert st.enabled and not st.custom and st.hf_dispatch
         assert st.cp_size == 1
         assert calls["register"] == 1
@@ -199,7 +189,7 @@ class TestSetupMagi:
         monkeypatch.setattr(mu, "get_cp_group", lambda mesh: grp)
         monkeypatch.setattr(mu, "set_active_cp_group", lambda g: active.append(g))
 
-        st = setup_magi(_FakeCfg({"model.backend.attn": "magi"}), device_mesh=object())
+        st = setup_magi("custom", device_mesh=object())
         assert st.enabled and st.custom and not st.hf_dispatch
         assert st.cp_size == 2
         assert active == [grp]  # custom path wires the active cp_group

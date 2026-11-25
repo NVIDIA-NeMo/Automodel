@@ -1104,7 +1104,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
-        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[], total_steps=1),
     )
     monkeypatch.setattr(
         "nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build",

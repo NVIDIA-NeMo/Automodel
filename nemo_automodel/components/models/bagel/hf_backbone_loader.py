@@ -21,7 +21,9 @@ import json
 import logging
 import math
 import pathlib
-from typing import TYPE_CHECKING, Any, Dict
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -31,6 +33,68 @@ if TYPE_CHECKING:
     from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, kw_only=True)
+class BagelBackbonesConfig:
+    """How to build BAGEL from upstream Qwen2 / SigLIP checkpoints (``init_mode: hf_backbones``).
+
+    The recipe fills it from its ``model:`` block; fields it leaves out keep these defaults.
+
+    Attributes:
+        llm_path: Qwen2 checkpoint (Hub id or local directory) for the language backbone.
+        vit_path: SigLIP checkpoint for the understanding-side vision tower. Required when
+            ``visual_und`` is set.
+        visual_und: Build the understanding-side vision path (SigLIP tower and connector).
+        copy_init_moe: Initialize the MoT generation-expert weights from the loaded
+            understanding weights.
+        layer_module: Decoder layer class name. ``None`` selects ``Qwen2MoTDecoderLayer`` for
+            stage 2 and ``Qwen2DecoderLayer`` otherwise.
+        llm_qk_norm: Use the Q/K RMSNorms BAGEL adds to the Qwen2 attention.
+        tie_word_embeddings: Tie the LM head to the input embeddings.
+        freeze_und: Freeze the understanding-path weights.
+        latent_patch_size: Forwarded to :class:`BagelConfig`.
+        max_latent_size: Forwarded to :class:`BagelConfig`.
+        vit_patch_size: Forwarded to :class:`BagelConfig`.
+        vit_max_num_patch_per_side: Forwarded to :class:`BagelConfig`.
+        connector_act: Forwarded to :class:`BagelConfig`.
+        interpolate_pos: Forwarded to :class:`BagelConfig`.
+        vit_select_layer: Forwarded to :class:`BagelConfig`.
+        vit_rope: Forwarded to :class:`BagelConfig`.
+        text_cond_dropout_prob: Forwarded to :class:`BagelConfig`.
+        vae_cond_dropout_prob: Forwarded to :class:`BagelConfig`.
+        vit_cond_dropout_prob: Forwarded to :class:`BagelConfig`.
+        timestep_shift: Forwarded to :class:`BagelConfig`.
+        torch_dtype: Default dtype while the modules are constructed.
+        logits_dtype: Output dtype of the LM head. ``None`` keeps the model default.
+    """
+
+    llm_path: str
+    vit_path: str | None = None
+    visual_und: bool = True
+    copy_init_moe: bool = True
+    layer_module: str | None = None
+    llm_qk_norm: bool = True
+    tie_word_embeddings: bool = False
+    freeze_und: bool = False
+    latent_patch_size: int = 2
+    max_latent_size: int = 64
+    vit_patch_size: int = 14
+    vit_max_num_patch_per_side: int = 70
+    connector_act: str = "gelu_pytorch_tanh"
+    interpolate_pos: bool = False
+    vit_select_layer: int = -2
+    vit_rope: bool = False
+    text_cond_dropout_prob: float = 0.1
+    vae_cond_dropout_prob: float = 0.3
+    vit_cond_dropout_prob: float = 0.3
+    timestep_shift: float = 1.0
+    torch_dtype: torch.dtype = torch.float32
+    logits_dtype: torch.dtype | None = None
+
+    def __post_init__(self) -> None:
+        if self.visual_und and self.vit_path is None:
+            raise ValueError("model.init_mode='hf_backbones' with visual_und=True requires model.vit_path")
 
 
 def _load_siglip_vision_config(vit_path: str):
@@ -212,106 +276,100 @@ def initialize_bagel_non_backbone_weights(model: torch.nn.Module, *, seed: int) 
             torch.nn.init.constant_(bagel.llm2vae.bias, 0.0)
 
 
-def load_bagel_hf_backbone_weights(model: torch.nn.Module, model_cfg: Any) -> None:
+def load_bagel_hf_backbone_weights(model: torch.nn.Module, backbones: BagelBackbonesConfig) -> None:
     """Load Qwen/SigLIP HF backbone weights into an already-built BAGEL model."""
-    llm_path = model_cfg.get("llm_path", None)
-    vit_path = model_cfg.get("vit_path", None)
-    visual_und = bool(model_cfg.get("visual_und", True))
-
-    if llm_path is None:
-        raise ValueError("model.init_mode='hf_backbones' requires model.llm_path")
-    if visual_und and vit_path is None:
-        raise ValueError("model.init_mode='hf_backbones' with visual_und=True requires model.vit_path")
-
-    _load_qwen_backbone_into_bagel(model, llm_path, copy_init_moe=bool(model_cfg.get("copy_init_moe", True)))
-    if visual_und:
-        _load_siglip_backbone_into_bagel(model, vit_path)
+    _load_qwen_backbone_into_bagel(model, backbones.llm_path, copy_init_moe=backbones.copy_init_moe)
+    # BagelBackbonesConfig requires vit_path whenever visual_und is set.
+    if backbones.visual_und and backbones.vit_path is not None:
+        _load_siglip_backbone_into_bagel(model, backbones.vit_path)
 
 
 def build_bagel_from_hf_backbones(
     *,
-    model_cfg: Any,
+    backbones: BagelBackbonesConfig,
     stage: int,
-    vae_config: Dict[str, int] | None,
+    vae_config: Mapping[str, int] | None,
     meta_init: bool = False,
     load_backbone_weights: bool = True,
     backend: BagelBackendConfig | None = None,
 ) -> torch.nn.Module:
-    """Build BAGEL from upstream Qwen/SigLIP backbone configs."""
+    """Build BAGEL from upstream Qwen/SigLIP backbone configs.
+
+    Args:
+        backbones: Backbone checkpoints and the BAGEL settings layered on top of them.
+        stage: Training stage; stage 2 adds the generation path (MoT experts, VAE latents).
+        vae_config: VAE latent geometry for stage 2; ignored for other stages.
+        meta_init: Construct the modules on the meta device without initializing weights.
+        load_backbone_weights: Copy the Qwen/SigLIP weights into the built model.
+        backend: Kernel selection; ``None`` uses BAGEL's torch defaults.
+
+    Returns:
+        The BAGEL model.
+    """
     from transformers import Qwen2Config
 
     from nemo_automodel.components.models.bagel.configuration import BagelConfig
     from nemo_automodel.components.models.bagel.model import BagelForUnifiedMultimodal
-    from nemo_automodel.shared.utils import dtype_from_str
-
-    llm_path = model_cfg.get("llm_path", None)
-    vit_path = model_cfg.get("vit_path", None)
-    if llm_path is None:
-        raise ValueError("model.init_mode='hf_backbones' requires model.llm_path")
 
     visual_gen = stage == 2
-    visual_und = bool(model_cfg.get("visual_und", True))
-    if visual_und and vit_path is None:
-        raise ValueError("model.init_mode='hf_backbones' with visual_und=True requires model.vit_path")
-    if hasattr(vae_config, "to_dict"):
-        vae_config = vae_config.to_dict()
-
-    llm_config = Qwen2Config.from_pretrained(llm_path)
+    llm_config = Qwen2Config.from_pretrained(backbones.llm_path)
     default_layer_module = "Qwen2MoTDecoderLayer" if visual_gen else "Qwen2DecoderLayer"
-    llm_config.layer_module = model_cfg.get("layer_module", default_layer_module)
-    llm_config.qk_norm = bool(model_cfg.get("llm_qk_norm", True))
-    llm_config.tie_word_embeddings = bool(model_cfg.get("tie_word_embeddings", False))
-    llm_config.freeze_und = bool(model_cfg.get("freeze_und", False))
+    llm_config.layer_module = backbones.layer_module if backbones.layer_module is not None else default_layer_module
+    llm_config.qk_norm = backbones.llm_qk_norm
+    llm_config.tie_word_embeddings = backbones.tie_word_embeddings
+    llm_config.freeze_und = backbones.freeze_und
 
-    vit_config = _load_siglip_vision_config(vit_path) if visual_und else None
+    # BagelBackbonesConfig requires vit_path whenever visual_und is set.
+    vit_config = (
+        _load_siglip_vision_config(backbones.vit_path)
+        if backbones.visual_und and backbones.vit_path is not None
+        else None
+    )
 
     bagel_config = BagelConfig(
         visual_gen=visual_gen,
-        visual_und=visual_und,
+        visual_und=backbones.visual_und,
         stage=stage,
         llm_config=llm_config,
         vit_config=vit_config,
-        vae_config=vae_config if visual_gen else None,
-        latent_patch_size=int(model_cfg.get("latent_patch_size", 2)),
-        max_latent_size=int(model_cfg.get("max_latent_size", 64)),
-        vit_patch_size=int(model_cfg.get("vit_patch_size", 14)),
-        vit_max_num_patch_per_side=int(model_cfg.get("vit_max_num_patch_per_side", 70)),
-        connector_act=model_cfg.get("connector_act", "gelu_pytorch_tanh"),
-        interpolate_pos=bool(model_cfg.get("interpolate_pos", False)),
-        vit_select_layer=int(model_cfg.get("vit_select_layer", -2)),
-        vit_rope=bool(model_cfg.get("vit_rope", False)),
-        text_cond_dropout_prob=float(model_cfg.get("text_cond_dropout_prob", 0.1)),
-        vae_cond_dropout_prob=float(model_cfg.get("vae_cond_dropout_prob", 0.3)),
-        vit_cond_dropout_prob=float(model_cfg.get("vit_cond_dropout_prob", 0.3)),
-        timestep_shift=float(model_cfg.get("timestep_shift", 1.0)),
+        vae_config=dict(vae_config) if visual_gen and vae_config is not None else None,
+        latent_patch_size=backbones.latent_patch_size,
+        max_latent_size=backbones.max_latent_size,
+        vit_patch_size=backbones.vit_patch_size,
+        vit_max_num_patch_per_side=backbones.vit_max_num_patch_per_side,
+        connector_act=backbones.connector_act,
+        interpolate_pos=backbones.interpolate_pos,
+        vit_select_layer=backbones.vit_select_layer,
+        vit_rope=backbones.vit_rope,
+        text_cond_dropout_prob=backbones.text_cond_dropout_prob,
+        vae_cond_dropout_prob=backbones.vae_cond_dropout_prob,
+        vit_cond_dropout_prob=backbones.vit_cond_dropout_prob,
+        timestep_shift=backbones.timestep_shift,
     )
 
-    torch_dtype = model_cfg.get("torch_dtype", "float32")
-    torch_dtype = dtype_from_str(torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
-    logits_dtype = model_cfg.get("logits_dtype")
-    logits_dtype = dtype_from_str(logits_dtype) if isinstance(logits_dtype, str) else logits_dtype
     original_dtype = torch.get_default_dtype()
     try:
-        torch.set_default_dtype(torch_dtype)
+        torch.set_default_dtype(backbones.torch_dtype)
         if meta_init:
             from transformers.initialization import no_init_weights
 
             from nemo_automodel.components.utils.model_utils import init_empty_weights
 
             with no_init_weights(), init_empty_weights():
-                model = BagelForUnifiedMultimodal(bagel_config, backend=backend, logits_dtype=logits_dtype)
+                model = BagelForUnifiedMultimodal(bagel_config, backend=backend, logits_dtype=backbones.logits_dtype)
         else:
-            model = BagelForUnifiedMultimodal(bagel_config, backend=backend, logits_dtype=logits_dtype)
+            model = BagelForUnifiedMultimodal(bagel_config, backend=backend, logits_dtype=backbones.logits_dtype)
     finally:
         torch.set_default_dtype(original_dtype)
 
     if load_backbone_weights:
-        load_bagel_hf_backbone_weights(model, model_cfg)
+        load_bagel_hf_backbone_weights(model, backbones)
 
     return model
 
 
 __all__ = [
+    "BagelBackbonesConfig",
     "build_bagel_from_hf_backbones",
     "initialize_bagel_non_backbone_weights",
     "load_bagel_hf_backbone_weights",

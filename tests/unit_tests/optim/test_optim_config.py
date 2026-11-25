@@ -15,7 +15,6 @@
 """Tests for nemo_automodel.components.optim.optimizer — typed configs + builders."""
 
 import math
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -436,15 +435,12 @@ class TestDionFamilyConfigs:
 
     def test_muon_expert_lr_scale_survives_scheduler(self):
         pytest.importorskip("dion")
-        from types import SimpleNamespace
 
         from nemo_automodel.components.optim.optimizer import MuonConfig
 
         model = _TransposedExpertsModel()
         opt = MuonConfig(lr=1e-3, weight_decay=0.1).build(model)[0]
-        schedule = LRSchedulerConfig(lr_warmup_steps=2, init_lr=0.0, min_lr=1e-4).build(
-            opt, SimpleNamespace(epoch_len=10, num_epochs=1, max_steps=10)
-        )[0]
+        schedule = LRSchedulerConfig(lr_warmup_steps=2, init_lr=0.0, min_lr=1e-4).build(opt, total_steps=10)[0]
         for step in range(5):
             if step:
                 schedule.step(1)
@@ -544,49 +540,11 @@ class TestLRSchedulerConfig:
         assert cfg.wsd_decay_steps == 2000
         assert cfg.lr_wsd_decay_style == "cosine"
 
-    @staticmethod
-    def _step_scheduler(*, epoch_len, num_epochs, max_steps):
-        """A StepScheduler stand-in whose dataloader has no usable ``len()``.
-
-        ``len(dataloader)`` raising mirrors an IterableDataset / streaming
-        dataloader and proves ``build`` derives ``total_steps`` from
-        ``epoch_len``/``max_steps`` and never calls ``len()``.
-        """
-        ss = MagicMock()
-        ss.epoch_len = epoch_len
-        ss.num_epochs = num_epochs
-        ss.max_steps = max_steps
-        ss.grad_acc_steps = 1
-        dl = MagicMock()
-        dl.__len__ = MagicMock(side_effect=TypeError("object of type 'IterableDataset' has no len()"))
-        ss.dataloader = dl
-        return ss
-
-    def test_build_uses_epoch_len_not_dataloader_len(self):
-        # epoch_len is already in optimizer-step units -> total_steps = num_epochs * epoch_len.
-        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
-        ss = self._step_scheduler(epoch_len=10, num_epochs=4, max_steps=None)
-        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
-        assert scheds[0].lr_decay_steps == 40  # defaults to total_steps
-
-    def test_build_iterable_falls_back_to_max_steps(self):
-        # epoch_len is None for iterable datasets -> total_steps comes from max_steps, no len().
-        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
-        ss = self._step_scheduler(epoch_len=None, num_epochs=10, max_steps=50)
-        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
-        assert scheds[0].lr_decay_steps == 50
-
-    def test_build_iterable_without_max_steps_raises(self):
-        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
-        ss = self._step_scheduler(epoch_len=None, num_epochs=10, max_steps=None)
-        with pytest.raises(ValueError, match="iterable/streaming"):
-            LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
-
-    def test_build_caps_total_steps_at_max_steps(self):
-        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
-        ss = self._step_scheduler(epoch_len=100, num_epochs=10, max_steps=20)
-        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
-        assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)
+    def test_build_defaults_decay_to_total_steps(self) -> None:
+        optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        scheduler = LRSchedulerConfig().build(optimizer, total_steps=50)[0]
+        assert scheduler.lr_decay_steps == scheduler.wd_incr_steps == 50
+        assert scheduler.lr_warmup_steps == 5
 
     def test_build_keeps_caller_param_group_lr_and_weight_decay(self):
         # The retrieval recipes build a no-decay group and a projection group with its own lr this way.
@@ -598,8 +556,7 @@ class TestLRSchedulerConfig:
                 {"params": [projection], "weight_decay": 0.0, "lr": 1e-3},
             ]
         )
-        ss = self._step_scheduler(epoch_len=100, num_epochs=1, max_steps=None)
-        scheduler = LRSchedulerConfig(lr_warmup_steps=10).build(opt, ss)[0]
+        scheduler = LRSchedulerConfig(lr_warmup_steps=10).build(opt, total_steps=100)[0]
         scheduler.step(10)  # end of warmup: group 0 is at the optimizer's lr
         decay_group, no_decay_group, projection_group = opt.param_groups
 
@@ -726,12 +683,7 @@ class TestParamGroupOverrides:
         assert len(opt.param_groups) == 1  # only the override group, no default
         assert opt.param_groups[0]["lr"] == pytest.approx(1e-3)  # unscaled at construction
 
-        step_scheduler = MagicMock()
-        step_scheduler.epoch_len = 100
-        step_scheduler.num_epochs = 1
-        step_scheduler.max_steps = 100
-        step_scheduler.grad_acc_steps = 1
-        scheduler = LRSchedulerConfig(lr_warmup_steps=0, lr_decay_style="constant").build(opt, step_scheduler)[0]
+        scheduler = LRSchedulerConfig(lr_warmup_steps=0, lr_decay_style="constant").build(opt, total_steps=100)[0]
         scheduler.step(1)
         # exactly one 0.1 factor applied (1e-4), not 1e-5 (double-scaled).
         assert opt.param_groups[0]["lr"] == pytest.approx(1e-4)
@@ -787,29 +739,22 @@ class TestGradientSketchConfig:
         with pytest.raises(ValueError, match="param_group_overrides"):
             GradientSketchConfig(native=AdamWConfig(), param_group_overrides=[{"pattern": "bias", "lr_mult": 0.5}])
 
-    class _FakeMesh:
-        def __init__(self, sizes):
-            self.sizes = sizes
-            self.mesh_dim_names = tuple(sizes)
-
-        def __getitem__(self, name):
-            size = self.sizes[name]
-            return type("_Dim", (), {"size": lambda self: size})()
-
     @pytest.mark.parametrize(
         "sizes, message",
         [
             ({"dp_replicate": 2, "dp_shard": 2, "cp": 1, "tp": 1}, "HSDP"),
             ({"dp_replicate": 1, "dp_shard": 2, "cp": 1, "tp": 2}, "tensor parallelism"),
+            ({"pp": 2, "dp_shard": 2}, "pipeline parallelism"),
         ],
     )
-    def test_build_rejects_unsupported_mesh(self, sizes, message):
+    def test_build_rejects_unsupported_mesh(self, sizes: dict[str, int], message: str, fake_world: None) -> None:
         cfg = GradientSketchConfig(native=AdamWConfig(), rank=2, target_modules=["0"])
         with pytest.raises(ValueError, match=f"gradient sketch does not support {message}"):
-            cfg.build(self._model(), device_mesh=self._FakeMesh(sizes))
+            mesh = init_device_mesh("cpu", tuple(sizes.values()), mesh_dim_names=tuple(sizes))
+            cfg.build(self._model(), device_mesh=mesh)
 
-    def test_build_accepts_fsdp_with_context_parallelism(self):
+    def test_build_accepts_fsdp_with_context_parallelism(self, fake_world: None) -> None:
         cfg = GradientSketchConfig(native=AdamWConfig(), rank=2, target_modules=["0"])
-        mesh = self._FakeMesh({"pp": 1, "dp_replicate": 1, "dp_shard": 2, "cp": 2, "tp": 1})
+        mesh = init_device_mesh("cpu", (1, 1, 2, 2, 1), mesh_dim_names=("pp", "dp_replicate", "dp_shard", "cp", "tp"))
         (opt,) = cfg.build(self._model(), device_mesh=mesh)
         assert isinstance(opt, GradientSketchOptimizer)

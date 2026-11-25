@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Union
+from typing import Any, Dict, Literal, TypedDict, Union
 
 from transformers import Qwen2Config
 from transformers.configuration_utils import PretrainedConfig
@@ -65,23 +65,30 @@ class BagelBackendConfig:
             raise ValueError(f"Unsupported BAGEL RMSNorm backend: {self.rms_norm!r}")
 
 
-def resolve_bagel_backend(backend: Any = None) -> BagelBackendConfig:
+class BagelBackendOverrides(TypedDict, total=False):
+    """A ``backend`` mapping (e.g. YAML ``model.backend``); keys it omits keep BAGEL's defaults."""
+
+    linear: Literal["torch", "te"]
+    rms_norm: Literal["torch", "torch_fp32", "te"]
+    fused_swiglu: bool
+    fused_rope: bool
+    mot_grouped: bool
+
+
+def resolve_bagel_backend(backend: BagelBackendConfig | BagelBackendOverrides | None = None) -> BagelBackendConfig:
     """Resolve a mapping against BAGEL's stable torch defaults."""
     if backend is None:
         return BagelBackendConfig()
     if isinstance(backend, BagelBackendConfig):
         return backend
 
-    if hasattr(backend, "to_dict"):
-        backend = backend.to_dict()
     if not isinstance(backend, Mapping):
         raise TypeError(f"BAGEL backend must be a mapping or BagelBackendConfig, got {type(backend)!r}")
 
-    overrides = dict(backend)
-    unknown_fields = sorted(overrides.keys() - {"linear", "rms_norm", "fused_swiglu", "fused_rope", "mot_grouped"})
+    unknown_fields = sorted(backend.keys() - BagelBackendOverrides.__optional_keys__)
     if unknown_fields:
         raise TypeError(f"Unknown BAGEL backend field(s): {unknown_fields}")
-    return BagelBackendConfig(**overrides)
+    return BagelBackendConfig(**backend)
 
 
 def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2Config:

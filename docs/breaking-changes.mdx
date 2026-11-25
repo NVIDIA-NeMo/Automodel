@@ -27,6 +27,13 @@ torchrun --nproc-per-node 8 -m nemo_automodel.recipes.speculative_decoding.train
 YAML configs launched through the `automodel` CLI are unaffected unless they name a recipe class by its fully qualified
 module path.
 
+### `fp8`, `compile`, and `quantization` Sections Reject Unknown Keys
+
+The recipes now read these YAML sections into their typed configs (`FP8Config`, `CompileConfig`, and
+`BnbQuantizationConfig`) when they load the configuration, as they already did for sections such as `mlflow`. A key
+that the typed config does not define raises `TypeError`, except for the reserved `_target_` key, which recipes
+discard for these sections. Previously unknown keys were silently ignored. Remove or correct any such key.
+
 ### Python Files Named by `_target_` Require an Opt-In
 
 A `_target_` or `*_fn` value in the `file.py:symbol` form runs the named file. NeMo AutoModel now loads such a file

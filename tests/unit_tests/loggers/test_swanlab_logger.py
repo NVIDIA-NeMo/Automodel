@@ -119,7 +119,9 @@ def test_wandb_config_build_without_swanlab_does_not_mirror(fake_swanlab, fake_w
 
 
 def test_init_wandb_run_mirrors_and_strips_swanlab(fake_swanlab, fake_wandb):
-    assert init_wandb_run({"project": "p", "swanlab": {"mode": "local"}}, {"lr": 0.1}, default_name="d") == "run"
+    with pytest.warns(FutureWarning, match="WandbConfig.build"):
+        run = init_wandb_run({"project": "p", "swanlab": {"mode": "local"}}, {"lr": 0.1}, default_name="d")
+    assert run == "run"
     assert fake_swanlab[0]["mode"] == "local"
     assert "swanlab" not in fake_wandb
     assert fake_wandb["name"] == "d"
@@ -145,7 +147,8 @@ def test_mirror_converts_tensor_scalars_before_wandb_log(fake_swanlab):
 
 
 def test_init_wandb_run_without_swanlab_does_not_mirror(fake_swanlab, fake_wandb):
-    init_wandb_run({"project": "p"}, {}, default_name="d")
+    with pytest.warns(FutureWarning, match="WandbConfig.build"):
+        init_wandb_run({"project": "p"}, {}, default_name="d")
     assert fake_swanlab == []
     assert fake_wandb["project"] == "p"
 

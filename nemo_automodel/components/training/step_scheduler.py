@@ -312,6 +312,13 @@ class StepScheduler(Stateful):
                 collate_set_epoch(epoch)
 
     @property
+    def total_steps(self) -> int:
+        """Planned optimizer steps across all epochs, capped by the configured step limit."""
+        if self.epoch_len is None:
+            return self.max_steps
+        return min(self.max_steps, self.num_epochs * self.epoch_len)
+
+    @property
     def is_remote_logging_step(self) -> bool:
         """
         Returns whether this step should log to remote services (WandB, MLflow, etc.).

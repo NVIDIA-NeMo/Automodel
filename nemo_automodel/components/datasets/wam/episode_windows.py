@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 import torch
@@ -34,7 +34,10 @@ from torch.utils.data import IterableDataset, get_worker_info
 if TYPE_CHECKING:
     from praxis.train.data import TrainingWindow
 
-    from nemo_automodel.components.models.praxis.config import JsonValue
+# A value of the policy's ``config.json``. Declared here rather than imported from the
+# model package: datasets do not import models.
+JsonScalar: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 def _mapping(config: Mapping[str, JsonValue], name: str) -> Mapping[str, JsonValue]:

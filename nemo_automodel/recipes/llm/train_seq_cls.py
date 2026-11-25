@@ -175,7 +175,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self._setup_garbage_collection(self.step_scheduler)
 
         self.lr_scheduler = (
-            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler.total_steps)
             if self.cfg.lr_scheduler is not None
             else None
         )

@@ -82,7 +82,6 @@ from nemo_automodel.components.models.nemotron_decision.serving_prompt import (
     PreparedQuestion,
     readout_token_ids,
 )
-from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -463,15 +462,14 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
         total = int(self.cfg.get("train.max_steps", 0) or 0) or max(
             1, int(steps_per_epoch * float(self.cfg.get("train.epochs", 1.0)))
         )
+        if total <= 0:
+            raise ValueError("train.max_steps must be positive when set")
         warmup = max(1, int(float(self.cfg.get("train.warmup_fraction", 0.05)) * total))
         canonical_fraction = float(self.cfg.get("train.canonical_fraction", 1.0))
         val_every = int(self.cfg.get("train.val_every_steps", 50))
         max_grad_norm = float(self.cfg.get("train.max_grad_norm", 1.0))
         is_lora = self.peft_config is not None
 
-        step_schedule = StepSchedulerConfig(
-            global_batch_size=batch, num_epochs=1, max_steps=total, preemption_signal=None
-        ).build(dataloader=None, dp_group_size=world, local_batch_size=1, process_group=self._get_dp_group())
         lr = self.optimizer[0].param_groups[0]["lr"]
         scheduler_config = dataclasses.replace(
             self.cfg.lr_scheduler,
@@ -481,7 +479,7 @@ class TrainNemotronDecisionRecipe(BaseRecipe):
             max_lr=lr,
             min_lr=float(self.cfg.get("train.min_lr_ratio", 0.1)) * lr,
         )
-        schedulers = scheduler_config.build(self.optimizer, step_schedule)
+        schedulers = scheduler_config.build(self.optimizer, total)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         if self.dist_env.is_main:
             config = {

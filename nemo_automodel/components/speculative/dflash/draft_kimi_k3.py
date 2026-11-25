@@ -53,6 +53,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.model import KimiK3MLP, KimiMLAAttention, KimiRMSNorm
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
+from nemo_automodel.components.speculative.dflash.target_options import DFlashTargetKwargs, DFlashTargetOptions
 
 
 class KimiK3DFlashAttention(KimiMLAAttention):
@@ -354,7 +355,7 @@ def build_kimi_k3_dflash_draft_config(
     return draft_config
 
 
-def build_kimi_k3_dflash_target_kwargs(recipe_cfg) -> dict:
+def build_kimi_k3_dflash_target_kwargs(options: DFlashTargetOptions) -> DFlashTargetKwargs:
     """Extra ``from_pretrained`` kwargs for a frozen Kimi K3 DFlash target.
 
     Two things a Qwen3-shaped target does not need:
@@ -371,7 +372,8 @@ def build_kimi_k3_dflash_target_kwargs(recipe_cfg) -> dict:
       ``gate_precision`` is left unset because K3 already defaults it to fp32.
 
     Args:
-        recipe_cfg: The recipe's ``recipe_args`` mapping.
+        options: The recipe's target options. Unset options default to the
+            ``hybridep`` dispatcher, ``torch_mm`` experts, and FSDP optimizations on.
 
     Returns:
         Keyword arguments to merge into the target's ``from_pretrained`` call.
@@ -383,10 +385,12 @@ def build_kimi_k3_dflash_target_kwargs(recipe_cfg) -> dict:
             linear="torch",
             rms_norm="torch_fp32",
             rope_fusion=False,
-            dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
-            experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+            dispatcher=options.dispatcher if options.dispatcher is not None else "hybridep",
+            experts=options.experts if options.experts is not None else "torch_mm",
             enable_hf_state_dict_adapter=True,
-            enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+            enable_fsdp_optimizations=(
+                options.enable_fsdp_optimizations if options.enable_fsdp_optimizations is not None else True
+            ),
         ),
     }
 

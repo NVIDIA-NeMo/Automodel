@@ -81,6 +81,7 @@ def test_vlm_setup_nvtx_preserves_forward_backward(monkeypatch, nvtx_ranges, nvt
         wandb=None,
         trackio=None,
         mlflow=None,
+        magi_backend=None,
         model=object(),
         loss_fn=SimpleNamespace(build=lambda: torch.nn.MSELoss()),
         checkpoint=SimpleNamespace(build=lambda **_: object(), load_metadata_with_gloo=False),

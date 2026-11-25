@@ -15,6 +15,8 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 from nemo_automodel.components.config.loader import load_yaml_config
 from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
 
@@ -106,17 +108,22 @@ def test_bagel_dataloader_resolved_through_recipeconfig():
         ), "bagel_dataloader must be resolved via RecipeConfig(self.cfg), not accessed on a raw ConfigNode"
 
 
-def test_bagel_build_wandb_uses_shared_init_with_model_default_name(monkeypatch):
-    """BAGEL starts W&B through ``init_wandb_run`` so a ``wandb.swanlab`` block is honored."""
+@pytest.mark.parametrize("wandb_routing", [{}, {"project": "p", "tags": []}])
+def test_bagel_build_wandb_uses_wandb_config_with_model_default_name(monkeypatch, wandb_routing):
+    """BAGEL starts W&B through ``WandbConfig.build``, which honors ``wandb.swanlab`` and names the run."""
     from types import SimpleNamespace
 
     from nemo_automodel.recipes.multimodal import finetune
     from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimodal
 
     calls = []
-    monkeypatch.setattr(finetune, "init_wandb_run", lambda *a, **kw: calls.append((a, kw)) or "run")
+    monkeypatch.setattr(
+        finetune.WandbConfig,
+        "build",
+        lambda self, run_config=None, model_name=None: calls.append((self, run_config, model_name)) or "run",
+    )
     values = {
-        "wandb": SimpleNamespace(to_dict=lambda: {"project": "p"}),
+        "wandb": SimpleNamespace(to_dict=lambda: {"swanlab": {"mode": "local"}, **wandb_routing}),
         "model.pretrained_model_name_or_path": "org/bagel-7b",
     }
     recipe = FinetuneRecipeForMultimodal.__new__(FinetuneRecipeForMultimodal)
@@ -127,4 +134,9 @@ def test_bagel_build_wandb_uses_shared_init_with_model_default_name(monkeypatch)
     )
 
     assert recipe._build_wandb() == "run"
-    assert calls == [(({"project": "p"}, {"all": 1}), {"default_name": "org_bagel-7b"})]
+    ((wandb_config, run_config, model_name),) = calls
+    assert wandb_config.project == wandb_routing.get("project")
+    assert wandb_config.tags == wandb_routing.get("tags")
+    assert wandb_config.swanlab == finetune.WandbConfig.from_kwargs(swanlab={"mode": "local"}).swanlab
+    assert run_config == {"all": 1}
+    assert model_name == "org/bagel-7b"

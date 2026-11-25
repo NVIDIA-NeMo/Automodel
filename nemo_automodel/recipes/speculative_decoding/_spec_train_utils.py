@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
-from typing import Any
+import os
+from collections.abc import Callable, Mapping
+from dataclasses import fields
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.activation_checkpointing import (
@@ -39,9 +42,12 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     is_selective_activation_checkpointing,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
+from nemo_automodel.components.speculative.decode_eval import DecodeEvalConfig
+from nemo_automodel.components.speculative.regen_loop import RegenConfig
+from nemo_automodel.components.utils.compile_utils import compile_module_inplace
 from nemo_automodel.recipes._dist_utils import _normalize_activation_checkpointing
+from nemo_automodel.recipes._typed_config import compile_config_from_node, fp8_config_from_node
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +67,7 @@ def all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def submesh_or_none(device_mesh, name: str):
+def submesh_or_none(device_mesh: DeviceMesh | None, name: str) -> DeviceMesh | None:
     """Return the named (flattened) submesh, or None if absent / no mesh.
 
     Uses ``get_flat_mesh`` so ``_flatten()``-created axes ("dp") resolve across
@@ -138,7 +144,7 @@ def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
     """
     if cfg_fp8 is None:
         return
-    apply_fp8_to_model(draft_model, config=build_fp8_config(cfg_fp8))
+    apply_fp8_to_model(draft_model, config=fp8_config_from_node(cfg_fp8))
 
 
 def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
@@ -154,7 +160,7 @@ def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
     """
     if cfg_compile is None:
         return
-    compile_module_inplace(draft_model, build_compile_config(cfg_compile))
+    compile_module_inplace(draft_model, compile_config_from_node(cfg_compile))
 
 
 def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | str) -> None:
@@ -172,7 +178,7 @@ def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | st
     mode = _normalize_activation_checkpointing(mode)
     if not mode:
         return
-    layers = list(getattr(draft_model, "layers", ()))
+    layers: list[nn.Module] = list(getattr(draft_model, "layers", ()))
     if not layers:
         logger.warning("Draft activation checkpointing requested, but the draft exposes no layers.")
         return
@@ -312,6 +318,97 @@ def resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
     return kwargs
 
 
+def _read_worker_section(
+    recipe_cfg: ConfigNode | Mapping[str, Any],
+    section: Literal["decode_eval", "regen"],
+    config_type: type[DecodeEvalConfig] | type[RegenConfig],
+    *,
+    default_target: str,
+    default_input_data: str | None,
+    output_dir: str,
+) -> dict[str, Any] | None:
+    block = recipe_cfg.get(section)
+    if block is None:
+        return None
+    every_steps = int(block.get("every_steps") or 0)
+    if every_steps <= 0:
+        return None
+
+    values = block.to_dict() if isinstance(block, ConfigNode) else dict(block)
+    unknown = set(values) - {field.name for field in fields(config_type)}
+    if unknown:
+        raise ValueError(f"Unknown {section} option(s): {', '.join(sorted(unknown))}")
+    if section == "regen" and "output_dir" in values:
+        raise ValueError(
+            "regen.output_dir is not configurable: shards are always written under "
+            "<run output_dir>/regen. Remove it from the regen block."
+        )
+    cuda_visible_devices = values.get("cuda_visible_devices")
+    if cuda_visible_devices in (None, ""):
+        worker = "eval" if section == "decode_eval" else "regeneration"
+        raise ValueError(
+            f"{section}.cuda_visible_devices is required: the {worker} engine needs a GPU the training "
+            "job does not use (e.g. reserve one card and shrink the torchrun world accordingly)."
+        )
+    input_data = values.get("input_data") or default_input_data
+    if not input_data:
+        raise ValueError(f"{section}.input_data is required when recipe_args.train_data_path is not set.")
+
+    values.update(
+        every_steps=every_steps,
+        cuda_visible_devices=str(cuda_visible_devices),
+        target_model=str(values.get("target_model") or default_target),
+        input_data=str(input_data),
+        output_dir=os.path.join(output_dir, section),
+    )
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def resolve_decode_eval_config(
+    recipe_cfg: ConfigNode | Mapping[str, Any],
+    *,
+    default_target: str,
+    default_input_data: str | None,
+    default_num_speculative_tokens: int,
+    output_dir: str,
+) -> DecodeEvalConfig | None:
+    """Resolve enabled decode evaluation with its own GPU and input data."""
+    values = _read_worker_section(
+        recipe_cfg,
+        "decode_eval",
+        DecodeEvalConfig,
+        default_target=default_target,
+        default_input_data=default_input_data,
+        output_dir=output_dir,
+    )
+    if values is None:
+        return None
+    num_speculative_tokens = int(values.get("num_speculative_tokens") or default_num_speculative_tokens)
+    if num_speculative_tokens <= 0:
+        raise ValueError("decode_eval.num_speculative_tokens must be greater than 0.")
+    values["num_speculative_tokens"] = num_speculative_tokens
+    return DecodeEvalConfig(**values)
+
+
+def resolve_regen_config(
+    recipe_cfg: ConfigNode | Mapping[str, Any],
+    *,
+    default_target: str,
+    default_input_data: str | None,
+    output_dir: str,
+) -> RegenConfig | None:
+    """Resolve enabled regeneration with its own GPU and input data."""
+    values = _read_worker_section(
+        recipe_cfg,
+        "regen",
+        RegenConfig,
+        default_target=default_target,
+        default_input_data=default_input_data,
+        output_dir=output_dir,
+    )
+    return RegenConfig(**values) if values is not None else None
+
+
 def resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmup_steps: int = 1) -> int:
     """Return the LR warmup length in optimizer steps.
 
@@ -381,7 +478,8 @@ def raise_if_target_not_materialized(model: nn.Module, target_path: str) -> None
             "distill the draft against random weights. Load the target without meta-device init."
         )
 
-    embedding = model.get_input_embeddings()
+    get_input_embeddings: Callable[[], nn.Module | None] = getattr(model, "get_input_embeddings")
+    embedding = get_input_embeddings()
     weight = getattr(embedding, "weight", None)
     if weight is None or weight.numel() == 0:
         return

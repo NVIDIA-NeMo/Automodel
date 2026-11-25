@@ -51,11 +51,6 @@ if TYPE_CHECKING:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
     from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-    # Same reason as above: these model modules import transformers' generation
-    # stack, which reaches sklearn. Only the qualnames are needed at runtime.
-    from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
-    from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
-
 
 def is_nemotron_flash_config(config) -> bool:
     """Return whether a Transformers config identifies Nemotron-Flash."""
@@ -338,10 +333,13 @@ def _parallelize_decilm_nemotron(
 
 
 def _parallelize_baichuan(
-    model: BaichuanForCausalLM | None,
+    model: torch.nn.Module | None,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a BaichuanForCausalLM model (MLP-only).
+
+    ``model`` is the in-repo ``BaichuanForCausalLM``; distributed infrastructure does not
+    import model implementations, and the plan below needs only its module names.
 
     Only the MLP is sharded. The attention path stays fully replicated
     because W_pack uses a non-interleaved [Q|K|V] layout (ColwiseParallel
@@ -399,10 +397,14 @@ def _parallelize_llama(
 
 
 def _parallelize_ministral3(
-    model: "Ministral3ForCausalLM",
+    model: torch.nn.Module | None,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
-    """Parallelizes a Ministral3ForCausalLM model across data and tensor parallel dimensions."""
+    """Parallelizes a Ministral3ForCausalLM model across data and tensor parallel dimensions.
+
+    ``model`` is the in-repo ``Ministral3ForCausalLM``; distributed infrastructure does not
+    import model implementations, and the plan below needs only its module names.
+    """
     base_model_tp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),

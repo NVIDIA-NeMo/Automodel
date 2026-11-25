@@ -14,9 +14,13 @@
 
 """Effective Step-5 text FLOPs, including CSA's forward-only discrete indexer."""
 
-from collections import Counter
+from __future__ import annotations
 
-from nemo_automodel.components.models.step5.configuration import Step5Config
+from collections import Counter
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.step5.configuration import Step5Config
 
 
 def _sum_history(length: int, region_size: int, cap: int | None) -> int:

@@ -30,10 +30,10 @@ shift-and-truncate step.
 from __future__ import annotations
 
 import functools
-from typing import Any, Dict, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Sequence
 
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     HAVE_QWEN_VL_UTILS,
@@ -46,6 +46,13 @@ from nemo_automodel.components.datasets.vlm.fake_image import (
     mask_fake_vision_tokens_batch,
 )
 from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
+
+if TYPE_CHECKING:
+    from datasets import Dataset as HfDataset
+    from torch.distributed.device_mesh import DeviceMesh
+    from transformers import ProcessorMixin
+
+    from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 
 
 def dspark_vlm_collate_fn(
@@ -124,24 +131,23 @@ def dspark_vlm_collate_fn(
 
 def build_dspark_vlm_dataloader(
     *,
-    dataset_cfg,
-    processor,
+    dataset: HfDataset | Dataset | Sequence[ConversationSample],
+    processor: ProcessorMixin,
     batch_size: int,
     max_length: int,
     shuffle: bool,
     num_workers: int = 0,
     distributed: bool = False,
-    dp_mesh=None,
+    dp_mesh: DeviceMesh | None = None,
     inject_fake_image: bool = True,
 ) -> DataLoader:
     """Build a multimodal DataLoader for DSpark training.
 
-    ``dataset_cfg`` is any config node exposing ``.instantiate()`` (the repo's
-    standard ``_target_`` convention, e.g. ``nemo_automodel.components.datasets
-    .vlm.datasets.make_medpix_dataset`` or any other function under that module
-    returning ``{"conversation": [...]}`` examples) -- the same convention the
-    VLM finetune recipe uses for its own ``dataset:`` config block. Deliberately
-    simpler than that recipe's ``build_dataloader``: no packing, no pipeline-
+    ``dataset`` is a map-style dataset of ``{"conversation": [...]}`` examples, which
+    the recipe builds from its ``dataset:`` block (e.g. with
+    ``nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset``), the
+    same convention the VLM finetune recipe uses. Deliberately simpler than that
+    recipe's ``build_dataloader``: no packing, no pipeline-
     parallel microbatch chunking, no mRoPE position-id generation, since none of
     that applies to DSpark's non-packed, non-pipelined target-capture call
     (MiniMax M3's text decoder defaults to plain sequential position ids
@@ -151,7 +157,6 @@ def build_dspark_vlm_dataloader(
     leaves text-only conversations text-only; see that function's docstring for
     when to turn the injection off.
     """
-    dataset = dataset_cfg.instantiate()
     collate_fn = functools.partial(
         dspark_vlm_collate_fn,
         processor=processor,

@@ -201,7 +201,7 @@ class TrainWAMFinetuneRecipe(BaseRecipe):
             process_group=self.mesh_context.process_group,
         )
         self.lr_scheduler = (
-            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler.total_steps)
             if self.cfg.lr_scheduler is not None
             else None
         )

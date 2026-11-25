@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from types import SimpleNamespace
 
 import torch
 
@@ -61,13 +60,14 @@ def test_skips_full_fp32_training(caplog):
     assert _WARNING_PREFIX not in caplog.text
 
 
-def test_warns_from_optimizer_config_target_and_parameters(caplog):
+def test_warns_from_explicit_parameters(caplog):
+    """``parameters`` overrides the optimizer's own groups when checking for trainable bf16 weights."""
     param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
-    optimizer_cfg = SimpleNamespace(_target_="torch.optim.AdamW")
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
 
     with caplog.at_level(logging.WARNING):
         warn_if_torch_adam_with_bf16_params(
-            optimizer_cfg=optimizer_cfg,
+            optimizer=optimizer,
             parameters=[param],
             context="unit-test",
         )

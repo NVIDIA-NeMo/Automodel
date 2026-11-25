@@ -25,6 +25,7 @@ from nemo_automodel.components.models.step3p7.configuration_step3p7 import (
     Step3p7TextConfig,
     StepRoboticsVisionEncoderConfig,
 )
+from nemo_automodel.components.models.step5.flops import step5_flops
 
 # JSON config values plus the torch dtype accepted by PretrainedConfig.
 ConfigValue: TypeAlias = bool | int | float | str | torch.dtype | None | list["ConfigValue"] | dict[str, "ConfigValue"]
@@ -110,6 +111,7 @@ class Step5Config(Step3p7TextConfig):
     model_type = "step5"
     base_config_key = "text_config"
     architectures = ["Step5ForCausalLM"]
+    flops_formula = staticmethod(step5_flops)
 
     def __init__(
         self,
