@@ -15,6 +15,8 @@
 # Hy4-flash synthetic training benchmark: 131,072-token sequences of random token ids (one document per sequence),
 # randomly initialised BF16 weights. 16 nodes x 8 H100 80GB; EP64, CP32, TP1, PP1 (DP4); one sequence per data-parallel
 # replica and step, split over 32 context-parallel ranks.
+# Parameters stay unsharded after the forward (about 44 GiB per GPU). Context parallelism takes one packed row per
+# rank, so the local batch size stays 1.
 # Launch requirement on multi-node InfiniBand H100 systems: export NCCL_PXN_DISABLE=1 (issue #3959).
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -76,9 +78,9 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
   defer_fsdp_grad_sync: false
-  reshard_after_forward: true
+  reshard_after_forward: false
   moe:
-    reshard_after_forward: true
+    reshard_after_forward: false
     wrap_outer_model: true
     lm_head_precision: float32
     ignore_router_for_ac: true
