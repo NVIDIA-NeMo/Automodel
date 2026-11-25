@@ -30,7 +30,6 @@ _HAS_WANDB, wandb = safe_import(
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
@@ -42,7 +41,7 @@ from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
-from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _strategy_compute_dtype
 from nemo_automodel.recipes.llm.train_ft import (
     _build_tokenizer,
     _get_model_name,
@@ -146,11 +145,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.model_parts = [model]
-        strategy = self.distributed_config
-        compute_dtype = getattr(strategy, "autocast_dtype", None)
-        if compute_dtype is None and isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
-            compute_dtype = strategy.mp_policy.param_dtype
-        self.mfu_calculator = AutoMFU.from_config(model, compute_dtype=compute_dtype)
+        self.mfu_calculator = AutoMFU.from_config(
+            model, compute_dtype=_strategy_compute_dtype(self.distributed_config, self.mesh_context.device_mesh)
+        )
 
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
 

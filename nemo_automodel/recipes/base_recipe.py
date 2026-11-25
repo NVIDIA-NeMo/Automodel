@@ -67,12 +67,38 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
     from nemo_automodel.components.distributed.config import DistributedStrategyConfig, MoEParallelizerConfig
     from nemo_automodel.components.distributed.init_utils import DistInfo
     from nemo_automodel.components.distributed.mesh import MeshContext
     from nemo_automodel.components.models.common.utils import TEQuantizationConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _strategy_compute_dtype(
+    strategy: "DistributedStrategyConfig | None", device_mesh: "DeviceMesh | None"
+) -> torch.dtype | None:
+    """Return the compute dtype a distributed strategy sets, or None when the parameters' dtype applies.
+
+    Sharded FSDP2 casts parameters to its mixed-precision policy's ``param_dtype``. A single process
+    is not sharded: the policy then only autocasts the forward on the device mesh's device type,
+    which is CPU (gloo), so a GPU computes in the parameters' dtype unless the recipe autocasts the
+    forward to the deprecated ``autocast_dtype``.
+
+    Args:
+        strategy: Distributed strategy configuration.
+        device_mesh: Device mesh the strategy parallelizes the model over.
+
+    Returns:
+        The compute dtype, or None to infer it from the model's matrix parameters.
+    """
+    if not isinstance(strategy, FSDP2Config):
+        return None
+    if not fsdp2_sharding_enabled(device_mesh):
+        return strategy.autocast_dtype
+    return strategy.mp_policy.param_dtype if strategy.mp_policy is not None else None
 
 
 def has_load_restore_state(object):
@@ -275,14 +301,7 @@ class BaseRecipe:
             if moe_config is not None and moe_config.mp_policy is not None and mesh_context.ep_size > 1:
                 if moe_config.mp_policy.param_dtype is not None:
                     return moe_config.mp_policy.param_dtype
-            elif isinstance(strategy, FSDP2Config) and not fsdp2_sharding_enabled(mesh_context.device_mesh):
-                # The unsharded FSDP2 path applies autocast instead of mixed-precision sharding.
-                if strategy.autocast_dtype is not None:
-                    return strategy.autocast_dtype
-
-            if isinstance(strategy, FSDP2Config) and strategy.mp_policy is not None:
-                return strategy.mp_policy.param_dtype
-            return None
+            return _strategy_compute_dtype(strategy, mesh_context.device_mesh)
 
         return AutoMFU.from_config(
             model,
