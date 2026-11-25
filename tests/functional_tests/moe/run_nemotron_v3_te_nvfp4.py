@@ -15,7 +15,7 @@
 
 r"""NVFP4 precision map of a small Nemotron 3 model, checked against Transformer Engine's own state.
 
-The training recipe builds the model from ``nemotron_v3_te_nvfp4_proxy.yaml``. On identical tokens it runs
+The training recipe builds the model from ``CONFIG_YAML`` below. On identical tokens it runs
 (1) a forward without autocast, twice (high-precision reference and its repeatability), (2) forward and backward
 under the recipe's autocast, (3) the recipe's own training loop. A forward hook on every TE ``Linear`` /
 ``GroupedLinear`` reads whether TE quantized the module and with which recipe; the expected precision is derived
@@ -27,7 +27,7 @@ Scope: which kernels run, finite loss and gradients, quantized logits close to h
 Usage::
 
     torchrun --nproc_per_node=2 tests/functional_tests/moe/run_nemotron_v3_te_nvfp4.py \
-        --config tests/functional_tests/moe/nemotron_v3_te_nvfp4_proxy.yaml --checkpoint.checkpoint_dir <dir>
+        --checkpoint.checkpoint_dir <dir>
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 
 import torch
@@ -43,9 +44,142 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
-DEFAULT_CONFIG = "tests/functional_tests/moe/nemotron_v3_te_nvfp4_proxy.yaml"
+# The configuration of the recipe: a small randomly initialized Nemotron 3 model (2 GPUs with NVFP4 kernels).
+#
+# Same module kinds and the same te_nvfp4 block as
+# examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_gb300.yaml: Mamba, MoE with a
+# latent space and a shared expert, attention, one MTP depth of [attention, moe], Transformer Engine experts
+# behind HybridEP, FSDP2 with activation checkpointing, and FusedAdam with FP32 master weights.
+# 8 layers with a high-precision tail of 3: layers 0-4 hold every module kind once below the tail, and
+# layers 5-7 (Mamba, MoE, Mamba) are the tail.
+#
+# Every GEMM dimension is a multiple of 128, as in the full model (the Mamba input projection has 1408 = 11 x 128
+# outputs; the full model has 18560 = 145 x 128). 2 x 256 tokens per rank reach the 8 routed experts with a
+# learned gate, so the per-expert token counts are not multiples of the NVFP4 alignment by themselves.
+CONFIG_YAML = """\
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: null
+  max_steps: 3
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: bfloat16
+  num_nextn_predict_layers: 1
+  config:
+    _target_: transformers.NemotronHConfig
+    architectures: [NemotronHForCausalLM]
+    vocab_size: 512
+    hidden_size: 256
+    layers_block_type: [mamba, moe, attention, mamba, moe, mamba, moe, mamba]
+    num_attention_heads: 8
+    num_key_value_heads: 2
+    head_dim: 32
+    mamba_num_heads: 128
+    mamba_head_dim: 4
+    ssm_state_size: 16
+    n_groups: 8
+    chunk_size: 128
+    intermediate_size: 128
+    n_routed_experts: 8
+    num_experts_per_tok: 2
+    moe_intermediate_size: 128
+    moe_shared_expert_intermediate_size: 256
+    moe_latent_size: 128
+    num_nextn_predict_layers: 1
+    mtp_layers_block_type: [attention, moe]
+    max_position_embeddings: 4096
+    pad_token_id: 0
+    dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    mamba_linear: te
+    rms_norm: te
+    experts: te
+    # One grouped GEMM per expert projection.
+    te_grouped_tensor: true
+    dispatcher: hybridep
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: false
+    te_nvfp4:
+      _target_: nemo_automodel.components.models.common.TENvfp4Config
+      precision_map:
+        _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
+        high_precision_tail_layers: 3
+        mamba_in_proj: nvfp4
+        mamba_out_proj: mxfp8
+        routed_experts: nvfp4
+        shared_experts: nvfp4
+        attention: high_precision
+        latent_proj: high_precision
+        mtp: high_precision
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 2
+  sequence_parallel: false
+  activation_checkpointing: true
+
+mtp:
+  scaling_factor: 0.3
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 512
+  seq_len: 256
+  include_position_ids: false
+  exclude_token_ids: [0]
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: false
+  exp_avg_dtype: float32
+  exp_avg_sq_dtype: float32
+
+clip_grad_norm:
+  max_norm: 1.0
+"""
 
 # The recipe under test, restated: the test fails if the YAML or the code drift from it.
 LAYER_PATTERN = ["mamba", "moe", "attention", "mamba", "moe", "mamba", "moe", "mamba"]
@@ -231,8 +365,16 @@ def check_random_initialization_differs_between_ranks(model: torch.nn.Module) ->
     return len(names)
 
 
+def load_config() -> ConfigNode:
+    """Load ``CONFIG_YAML`` the way the recipe loads a YAML file, with the command-line overrides applied."""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", encoding="utf-8") as config_file:
+        config_file.write(CONFIG_YAML)
+        config_file.flush()
+        return parse_args_and_load_config(config_file.name)
+
+
 def main() -> None:
-    cfg = parse_args_and_load_config(DEFAULT_CONFIG)
+    cfg = load_config()
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     recipe.setup()
     model = recipe.model_parts[0]

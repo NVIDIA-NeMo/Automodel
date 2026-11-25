@@ -15,8 +15,8 @@
 
 # te_nvfp4.precision_map on a small Nemotron 3 model, 2 GPUs with NVFP4 kernels (Blackwell).
 #
-# Leg 1 runs the recipe of nemotron_v3_te_nvfp4_proxy.yaml and checks, from Transformer Engine's state after
-# each module ran, that every GEMM module used the recipe the map gives it; see run_nemotron_v3_te_nvfp4.py.
+# Leg 1 runs the recipe on the configuration in run_nemotron_v3_te_nvfp4.py and checks, from Transformer
+# Engine's state after each module ran, that every GEMM module used the recipe the map gives it.
 # It also checks that the two ranks hold different values in every randomly initialized block weight.
 # Legs 2 and 3 are negative controls: with a tail one layer short, or with the Mamba output projection in
 # NVFP4 instead of MXFP8, the same checks must fail. Leg 4 builds the Mamba projections as torch.nn.Linear
@@ -36,7 +36,6 @@ run() {
     shift
     TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
         tests/functional_tests/moe/run_nemotron_v3_te_nvfp4.py \
-        --config tests/functional_tests/moe/nemotron_v3_te_nvfp4_proxy.yaml \
         --checkpoint.checkpoint_dir "$RUN_DIR/$name" "$@" 2>&1 | tee "$RUN_DIR/$name.log"
 }
 
