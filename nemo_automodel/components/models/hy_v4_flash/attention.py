@@ -24,7 +24,7 @@ index lists for both layer types:
 * ``sliding_attention``: the indices of the last ``sliding_window`` tokens of the query's document.
 * ``indexed_attention``: dense causal attention while a document is not longer than ``index_topk``;
   otherwise the tokens of the ``index_topk // index_kpool - 1`` best-scoring complete groups plus the query's own
-  group, chosen by :class:`HY4FlashCompressedIndexer`.
+  group, chosen by :class:`HYV4FlashCompressedIndexer`.
 
 Packed documents are isolated: indices only ever point into the query's own document and groups are
 document-local.
@@ -43,12 +43,12 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
-from nemo_automodel.components.models.hy_v4_flash.config import AttentionType, HY4FlashTextConfig
-from nemo_automodel.components.models.hy_v4_flash.layers import HY4FlashRMSNorm, apply_interleaved_rope
+from nemo_automodel.components.models.hy_v4_flash.config import AttentionType, HYV4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.layers import HYV4FlashRMSNorm, apply_interleaved_rope
 
 
 @dataclass(frozen=True)
-class HY4FlashSparsePlan:
+class HYV4FlashSparsePlan:
     """Kernel-ready key lists of this rank's queries.
 
     Attributes:
@@ -61,7 +61,7 @@ class HY4FlashSparsePlan:
     lengths: torch.Tensor
 
 
-def causal_prefix_plan(position: torch.Tensor, doc_start: torch.Tensor, width: int) -> HY4FlashSparsePlan:
+def causal_prefix_plan(position: torch.Tensor, doc_start: torch.Tensor, width: int) -> HYV4FlashSparsePlan:
     """Keys of the last ``width`` tokens (including the query) of each query, inside its document.
 
     This is the whole key list of a sliding-window layer (``width = sliding_window``) and of a sparse layer for
@@ -80,11 +80,11 @@ def causal_prefix_plan(position: torch.Tensor, doc_start: torch.Tensor, width: i
     lengths = (position - start + 1).clamp_min(0)
     slots = torch.arange(width, device=position.device)
     indices = torch.where(slots < lengths[:, None], start[:, None] + slots, -1)
-    return HY4FlashSparsePlan(indices.to(torch.int32), lengths.to(torch.int32))
+    return HYV4FlashSparsePlan(indices.to(torch.int32), lengths.to(torch.int32))
 
 
 @dataclass(frozen=True)
-class HY4FlashDocLayout:
+class HYV4FlashDocLayout:
     """Document boundaries and layer-independent key lists of one packed row, built once per forward pass.
 
     Attributes:
@@ -105,15 +105,15 @@ class HY4FlashDocLayout:
     doc_ranges: tuple[tuple[int, int], ...]
     local_start: int
     local_end: int
-    window_plan: HY4FlashSparsePlan
-    dense_plan: HY4FlashSparsePlan
+    window_plan: HYV4FlashSparsePlan
+    dense_plan: HYV4FlashSparsePlan
     all_rows_nonempty: bool
     valid_rows: torch.Tensor | None
     cp_group: dist.ProcessGroup | None = None
 
 
 @dataclass(frozen=True)
-class HY4FlashRope:
+class HYV4FlashRope:
     """Interleaved M-RoPE tables of one attention type over the *global* sequence.
 
     Attributes:
@@ -125,7 +125,7 @@ class HY4FlashRope:
     sin: torch.Tensor
 
 
-class HY4FlashFP32Parameter(nn.Module):
+class HYV4FlashFP32Parameter(nn.Module):
     """FP32 parameter holder whose forward returns a copy of its weight and ignores the input.
 
     Not ``DeepseekV4FP32Parameter``: that holder returns the parameter itself, which an FSDP unit that reshards after
@@ -150,7 +150,7 @@ class HY4FlashFP32Parameter(nn.Module):
         return self.weight.clone()
 
 
-class HY4FlashCompressedIndexer(nn.Module):
+class HYV4FlashCompressedIndexer(nn.Module):
     """Group-pooled lightning indexer. Selection is discrete, so the indexer receives no loss gradient.
 
     Token keys are pooled ``index_kpool`` at a time through a softmax over fp32 value / gate projections
@@ -159,7 +159,7 @@ class HY4FlashCompressedIndexer(nn.Module):
     ``q_a_layernorm`` output.
     """
 
-    def __init__(self, config: HY4FlashTextConfig) -> None:
+    def __init__(self, config: HYV4FlashTextConfig) -> None:
         super().__init__()
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -171,13 +171,13 @@ class HY4FlashCompressedIndexer(nn.Module):
         )
         self.head_weight_projection = nn.Linear(config.hidden_size, self.n_heads, bias=False, dtype=torch.bfloat16)
         self.token_key_projection = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=torch.bfloat16)
-        self.token_key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.bfloat16)
+        self.token_key_norm = HYV4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.bfloat16)
         self.key_value_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         self.key_gate_projection = nn.Linear(self.head_dim, self.head_dim, bias=False, dtype=torch.float32)
         # The released key_norm weight is fp32 and is kept in fp32 here; the reference rounds it to bf16 on load.
         # One call per document, each with that document's group count: keep it off the shape-specialized core.
-        self.key_norm = HY4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32, static_shape=False)
-        self.intra_group_ape = HY4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
+        self.key_norm = HYV4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32, static_shape=False)
+        self.intra_group_ape = HYV4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
         # Queries are scored in chunks so the fp32 [queries, heads, groups] score block stays within this many bytes:
         # one chunk for a 4K document, 256 queries at a time for a 128K one.
         self.score_block_bytes = 2**29
@@ -252,11 +252,11 @@ class HY4FlashCompressedIndexer(nn.Module):
         self,
         q_resid: torch.Tensor,
         hidden_states: torch.Tensor,
-        query_rope: HY4FlashRope,
+        query_rope: HYV4FlashRope,
         group_keys: torch.Tensor,
-        group_rope: HY4FlashRope,
+        group_rope: HYV4FlashRope,
         first_query_slot: int,
-    ) -> HY4FlashSparsePlan:
+    ) -> HYV4FlashSparsePlan:
         """Select the document-local tokens every query of one contiguous query interval attends to.
 
         A query recalls the ``index_topk // index_kpool - 1`` best-scoring groups that closed before its own group
@@ -337,7 +337,7 @@ class HY4FlashCompressedIndexer(nn.Module):
         own_tokens = own_tokens.masked_fill(own_tokens > slots[:, None], -1)
         indices.scatter_(1, groups_recalled[:, None] * self.kpool + offsets, own_tokens)
         lengths = groups_recalled * self.kpool + (slots - own_group * self.kpool + 1)
-        return HY4FlashSparsePlan(indices.to(torch.int32), lengths.to(torch.int32))
+        return HYV4FlashSparsePlan(indices.to(torch.int32), lengths.to(torch.int32))
 
 
 def reference_sparse_latent_attention(
@@ -377,10 +377,10 @@ def reference_sparse_latent_attention(
     return torch.cat(outputs, dim=0)
 
 
-class HY4FlashAttention(nn.Module):
+class HYV4FlashAttention(nn.Module):
     """Gated MLA of one decoder layer (``attention_type`` selects heads, indices and rotary theta)."""
 
-    def __init__(self, config: HY4FlashTextConfig, layer_idx: int, backend: BackendConfig) -> None:
+    def __init__(self, config: HYV4FlashTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
         if backend.attn not in ("cudnn", "sdpa"):
             raise ValueError(f"Hy4-flash attention supports backend.attn='cudnn' or 'sdpa', got {backend.attn!r}")
@@ -398,14 +398,14 @@ class HY4FlashAttention(nn.Module):
         hidden, dtype = config.hidden_size, torch.bfloat16
         linear = backend.linear
         self.q_a_proj = initialize_linear_module(linear, hidden, config.q_lora_rank, config.attention_bias, dtype=dtype)
-        self.q_a_layernorm = HY4FlashRMSNorm(config.q_lora_rank, config.rms_norm_eps, dtype)
+        self.q_a_layernorm = HYV4FlashRMSNorm(config.q_lora_rank, config.rms_norm_eps, dtype)
         self.q_b_proj = initialize_linear_module(
             linear, config.q_lora_rank, self.num_heads * (self.nope_dim + self.rope_dim), False, dtype=dtype
         )
         self.kv_a_proj_with_mqa = initialize_linear_module(
             linear, hidden, config.kv_lora_rank + self.rope_dim, config.attention_bias, dtype=dtype
         )
-        self.kv_a_layernorm = HY4FlashRMSNorm(config.kv_lora_rank, config.rms_norm_eps, dtype)
+        self.kv_a_layernorm = HYV4FlashRMSNorm(config.kv_lora_rank, config.rms_norm_eps, dtype)
         self.kv_b_proj = initialize_linear_module(
             linear, config.kv_lora_rank, self.num_heads * (self.nope_dim + self.v_dim), False, dtype=dtype
         )
@@ -413,9 +413,9 @@ class HY4FlashAttention(nn.Module):
             linear, self.num_heads * self.v_dim, hidden, config.attention_bias, dtype=dtype
         )
         self.gate_proj = initialize_linear_module(linear, hidden, self.num_heads * self.v_dim, False, dtype=dtype)
-        self.sinks_param = HY4FlashFP32Parameter(torch.full((self.num_heads,), config.learnable_sink_init))
+        self.sinks_param = HYV4FlashFP32Parameter(torch.full((self.num_heads,), config.learnable_sink_init))
         self.compressed_indexer = (
-            HY4FlashCompressedIndexer(config) if self.attention_type == "indexed_attention" else None
+            HYV4FlashCompressedIndexer(config) if self.attention_type == "indexed_attention" else None
         )
 
     @torch.no_grad()
@@ -440,7 +440,7 @@ class HY4FlashAttention(nn.Module):
         """Accept the context-parallel mesh from the shared parallelizer without storing it.
 
         The parallelizer offers the mesh to sliding-window blocks only, so a group stored here would be missing on
-        the sparse layers. Every layer instead reads the group from the forward's ``HY4FlashDocLayout.cp_group``
+        the sparse layers. Every layer instead reads the group from the forward's ``HYV4FlashDocLayout.cp_group``
         (keys are gathered over it, queries stay local).
         """
         del cp_mesh
@@ -459,8 +459,8 @@ class HY4FlashAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        layout: HY4FlashDocLayout,
-        rope: HY4FlashRope,
+        layout: HYV4FlashDocLayout,
+        rope: HYV4FlashRope,
     ) -> torch.Tensor:
         """Attend within documents.
 
@@ -504,12 +504,12 @@ class HY4FlashAttention(nn.Module):
     @torch.no_grad()
     def _select(
         self,
-        layout: HY4FlashDocLayout,
-        rope: HY4FlashRope,
+        layout: HYV4FlashDocLayout,
+        rope: HYV4FlashRope,
         q_resid: torch.Tensor,
         hidden_states: torch.Tensor,
         token_keys: torch.Tensor,
-    ) -> HY4FlashSparsePlan:
+    ) -> HYV4FlashSparsePlan:
         """Key lists of a sparse layer: dense for short documents, the indexer's selection for long ones.
 
         Args:
@@ -541,14 +541,14 @@ class HY4FlashAttention(nn.Module):
             selected = indexer.select(
                 q_resid[local],
                 hidden_states[local],
-                HY4FlashRope(rope.cos[q_start:q_end], rope.sin[q_start:q_end]),
+                HYV4FlashRope(rope.cos[q_start:q_end], rope.sin[q_start:q_end]),
                 indexer.pool_groups(token_keys[group_tokens]),
-                HY4FlashRope(rope.cos[first_tokens], rope.sin[first_tokens]),
+                HYV4FlashRope(rope.cos[first_tokens], rope.sin[first_tokens]),
                 q_start - start,
             )
             indices[local] = torch.where(selected.indices >= 0, selected.indices + start, -1)
             lengths[local] = selected.lengths
-        return plan if indices is None else HY4FlashSparsePlan(indices, lengths)
+        return plan if indices is None else HYV4FlashSparsePlan(indices, lengths)
 
     def _gather_keys(
         self, kv_local: torch.Tensor, token_keys: torch.Tensor | None, cp_group: dist.ProcessGroup | None
@@ -580,9 +580,9 @@ class HY4FlashAttention(nn.Module):
         self,
         query: torch.Tensor,
         kv: torch.Tensor,
-        plan: HY4FlashSparsePlan,
+        plan: HYV4FlashSparsePlan,
         sinks: torch.Tensor,
-        layout: HY4FlashDocLayout,
+        layout: HYV4FlashDocLayout,
     ) -> torch.Tensor:
         """Run the sparse latent attention kernel (or its PyTorch twin).
 

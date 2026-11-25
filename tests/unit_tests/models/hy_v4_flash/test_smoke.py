@@ -18,15 +18,15 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashRope, HY4FlashSparsePlan
-from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
+from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashRope, HYV4FlashSparsePlan
+from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
 from nemo_automodel.components.moe.parallelizer import apply_ac
 from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, TOKEN_RANGE, tiny_config
 
 
 def test_tiny_forward_backward_is_finite() -> None:
     torch.manual_seed(0)
-    model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
+    model = HYV4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
     model.initialize_weights(dtype=torch.float32)
     ids = torch.randint(*TOKEN_RANGE, (2, 24))
     out = model(ids, labels=ids)
@@ -35,7 +35,7 @@ def test_tiny_forward_backward_is_finite() -> None:
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
-def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor], HY4FlashForCausalLM]:
+def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor], HYV4FlashForCausalLM]:
     """Loss and gradients of one training forward and backward, plain (``None``) or under a checkpointing mode.
 
     The documents are longer than ``index_topk`` and the indexer scores one query per chunk, so the sparse selection
@@ -43,7 +43,7 @@ def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor]
     """
     ids = torch.randint(*TOKEN_RANGE, (2, 40), generator=torch.Generator().manual_seed(1))
     torch.manual_seed(0)
-    model = HY4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
+    model = HYV4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
     assert ids.shape[1] > model.config.text_config.index_topk
     chunked_calls: list[bool] = []
     for layer in model.model.layers:
@@ -56,12 +56,12 @@ def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor]
         def select(
             q_resid: torch.Tensor,
             hidden_states: torch.Tensor,
-            query_rope: HY4FlashRope,
+            query_rope: HYV4FlashRope,
             group_keys: torch.Tensor,
-            group_rope: HY4FlashRope,
+            group_rope: HYV4FlashRope,
             first_query_slot: int,
-            original: Callable[..., HY4FlashSparsePlan] = original,
-        ) -> HY4FlashSparsePlan:
+            original: Callable[..., HYV4FlashSparsePlan] = original,
+        ) -> HYV4FlashSparsePlan:
             chunked_calls.append(q_resid.shape[0] > 1)
             return original(q_resid, hidden_states, query_rope, group_keys, group_rope, first_query_slot)
 

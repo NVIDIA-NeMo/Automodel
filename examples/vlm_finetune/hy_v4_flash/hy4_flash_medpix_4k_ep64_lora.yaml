@@ -37,7 +37,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_config
   config:
-    _target_: nemo_automodel.components.models.hy_v4_flash.config.HY4FlashConfig.from_pretrained
+    _target_: nemo_automodel.components.models.hy_v4_flash.config.HYV4FlashConfig.from_pretrained
     pretrained_model_name_or_path: tencent/Hy4-flash
     name_or_path: tencent/Hy4-flash
     revision: eccd3123eec73f2040f4c9ed0de1883593470510  # pragma: allowlist secret (public model commit SHA)
@@ -65,7 +65,7 @@ model:
     enable_fsdp_optimizations: true
 
 processor:
-  _target_: nemo_automodel.components.models.hy_v4_flash.processing.HY4FlashProcessor.from_pretrained
+  _target_: nemo_automodel.components.models.hy_v4_flash.processing.HYV4FlashProcessor.from_pretrained
   pretrained_model_name_or_path: tencent/Hy4-flash
   revision: eccd3123eec73f2040f4c9ed0de1883593470510  # pragma: allowlist secret (public model commit SHA)
   trust_remote_code: false

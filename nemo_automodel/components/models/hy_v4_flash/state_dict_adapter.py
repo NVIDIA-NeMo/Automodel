@@ -53,7 +53,7 @@ from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.config import MoEConfig
 
@@ -99,11 +99,15 @@ def _swap_suffix(key: str, *, released: bool) -> str:
     return key
 
 
-class HY4FlashStateDictAdapter(StateDictAdapter):
+class HYV4FlashStateDictAdapter(StateDictAdapter):
     """Bridge the released Hy4-flash language-model tensors and the AutoModel module layout."""
 
     def __init__(
-        self, config: HY4FlashConfig, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype = torch.bfloat16
+        self,
+        config: HYV4FlashConfig,
+        moe_config: MoEConfig,
+        backend: BackendConfig,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self.config = config
         self.moe_config = moe_config

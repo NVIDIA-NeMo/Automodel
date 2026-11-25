@@ -16,21 +16,21 @@
 
 import torch
 
-from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
-from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HY4FlashStateDictAdapter
+from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
+from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HYV4FlashStateDictAdapter
 from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config
 
 
-def _model() -> HY4FlashForCausalLM:
+def _model() -> HYV4FlashForCausalLM:
     torch.manual_seed(0)
-    model = HY4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
+    model = HYV4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
     model.initialize_weights(dtype=torch.float32)
     return model
 
 
 def test_adapter_round_trip_restores_released_names_and_values() -> None:
     model = _model()
-    adapter = HY4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
+    adapter = HYV4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
     native = {k: v.detach().clone() for k, v in model.state_dict().items()}
     released = adapter.to_hf(native)
     assert not [k for k in released if "sinks_param" in k or "fc1_latent" in k or "attn_hc" in k], "native names leaked"
@@ -49,7 +49,7 @@ def test_adapter_round_trip_restores_released_names_and_values() -> None:
 def test_released_expert_layout_is_transposed_not_reshaped() -> None:
     """gate_up_proj[e] is [2 * inter, latent] (gate rows first); native gate_and_up_projs[e] is its transpose."""
     model = _model()
-    adapter = HY4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
+    adapter = HYV4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
     released = torch.arange(8 * 64 * 24, dtype=torch.float32).reshape(8, 64, 24)
     native = adapter.from_hf({"model.layers.1.mlp.experts.gate_up_proj": released})
     assert torch.equal(native["model.layers.1.mlp.experts.gate_and_up_projs"][3], released[3].T)
@@ -59,7 +59,7 @@ def test_drafter_and_extra_state_keys_are_skipped_in_both_directions() -> None:
     """The released checkpoint carries 87 ``model.dfly_layers.*`` keys (the serving-only drafter) the model has no
     parameters for; TE ``_extra_state`` buffers have no released counterpart."""
     model = _model()
-    adapter = HY4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
+    adapter = HYV4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
     kept = "model.layers.0.self_attn.linear_gate.weight"
     native = adapter.from_hf(
         {

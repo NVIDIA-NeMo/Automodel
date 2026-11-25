@@ -22,7 +22,7 @@ from torch._dynamo.utils import counters as dynamo_counters
 
 import nemo_automodel.components.models.hy_v4_flash.layers as layers
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.hy_v4_flash.layers import HY4FlashHyperConnection, HY4FlashRMSNorm
+from nemo_automodel.components.models.hy_v4_flash.layers import HYV4FlashHyperConnection, HYV4FlashRMSNorm
 from tests.unit_tests.models.hy_v4_flash.tiny import tiny_text_config
 
 _CORE_NAMES = ("_rms_norm", "_hc_collapse", "_hc_expand", "_NORM_COMPILED", "_HC_COMPILED")
@@ -71,9 +71,9 @@ def test_compiled_cores_reach_modules_built_earlier(restore_cores: None, dtype: 
     """
     torch.manual_seed(0)
     config = tiny_text_config()
-    connection = HY4FlashHyperConnection(config)
+    connection = HYV4FlashHyperConnection(config)
     connection.init_weights(config.initializer_range)
-    norm = HY4FlashRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+    norm = HYV4FlashRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
     with torch.no_grad():
         norm.weight.copy_((1 + 0.1 * torch.randn(config.hidden_size)).to(dtype))
     streams = torch.randn(2, 9, config.hc_mult, config.hidden_size).to(dtype)

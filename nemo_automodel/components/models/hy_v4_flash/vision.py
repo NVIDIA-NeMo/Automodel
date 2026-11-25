@@ -27,13 +27,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashVisionConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashVisionConfig
 
 
-class HY4FlashVisionEmbeddings(nn.Module):
+class HYV4FlashVisionEmbeddings(nn.Module):
     """Conv patch embedding plus an interpolated learned position grid."""
 
-    def __init__(self, config: HY4FlashVisionConfig) -> None:
+    def __init__(self, config: HYV4FlashVisionConfig) -> None:
         super().__init__()
         self.config = config
         self.patch_size = config.patch_size
@@ -73,10 +73,10 @@ class HY4FlashVisionEmbeddings(nn.Module):
         return embeds + torch.cat(positions)
 
 
-class HY4FlashVisionAttention(nn.Module):
+class HYV4FlashVisionAttention(nn.Module):
     """Bidirectional multi-head attention with biases."""
 
-    def __init__(self, config: HY4FlashVisionConfig) -> None:
+    def __init__(self, config: HYV4FlashVisionConfig) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
@@ -106,10 +106,10 @@ class HY4FlashVisionAttention(nn.Module):
         return self.o_proj(torch.cat(outputs))
 
 
-class HY4FlashVisionMLP(nn.Module):
+class HYV4FlashVisionMLP(nn.Module):
     """GELU MLP named like the release (``dense_h_to_4h`` / ``dense_4h_to_h``)."""
 
-    def __init__(self, config: HY4FlashVisionConfig) -> None:
+    def __init__(self, config: HYV4FlashVisionConfig) -> None:
         super().__init__()
         self.dense_h_to_4h = nn.Linear(config.hidden_size, config.intermediate_size)
         self.dense_4h_to_h = nn.Linear(config.intermediate_size, config.hidden_size)
@@ -119,15 +119,15 @@ class HY4FlashVisionMLP(nn.Module):
         return self.dense_4h_to_h(F.gelu(self.dense_h_to_4h(hidden_states)))
 
 
-class HY4FlashVisionBlock(nn.Module):
+class HYV4FlashVisionBlock(nn.Module):
     """Pre-norm ViT block."""
 
-    def __init__(self, config: HY4FlashVisionConfig) -> None:
+    def __init__(self, config: HYV4FlashVisionConfig) -> None:
         super().__init__()
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = HY4FlashVisionAttention(config)
+        self.self_attn = HYV4FlashVisionAttention(config)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = HY4FlashVisionMLP(config)
+        self.mlp = HYV4FlashVisionMLP(config)
 
     def forward(self, hidden_states: torch.Tensor, lengths: list[int]) -> torch.Tensor:
         """Run the block on a tensor of shape [patches, hidden]."""
@@ -135,10 +135,10 @@ class HY4FlashVisionBlock(nn.Module):
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
 
-class HY4FlashPerceive(nn.Module):
+class HYV4FlashPerceive(nn.Module):
     """Spatial-merge projector: RMSNorm, 2x2 conv, GELU, 1x1 conv, plus a newline embedding per merged row."""
 
-    def __init__(self, config: HY4FlashVisionConfig) -> None:
+    def __init__(self, config: HYV4FlashVisionConfig) -> None:
         super().__init__()
         merge = config.spatial_merge_size
         self.merge = merge
@@ -179,14 +179,14 @@ class HY4FlashPerceive(nn.Module):
         return torch.cat(outputs)
 
 
-class HY4FlashVisionTower(nn.Module):
+class HYV4FlashVisionTower(nn.Module):
     """``vit``: embeddings, blocks and the perceive projector."""
 
-    def __init__(self, config: HY4FlashVisionConfig) -> None:
+    def __init__(self, config: HYV4FlashVisionConfig) -> None:
         super().__init__()
-        self.embeddings = HY4FlashVisionEmbeddings(config)
-        self.layers = nn.ModuleList(HY4FlashVisionBlock(config) for _ in range(config.num_hidden_layers))
-        self.perceive = HY4FlashPerceive(config)
+        self.embeddings = HYV4FlashVisionEmbeddings(config)
+        self.layers = nn.ModuleList(HYV4FlashVisionBlock(config) for _ in range(config.num_hidden_layers))
+        self.perceive = HYV4FlashPerceive(config)
 
     @torch.no_grad()
     def reset_parameters(self, std: float) -> None:

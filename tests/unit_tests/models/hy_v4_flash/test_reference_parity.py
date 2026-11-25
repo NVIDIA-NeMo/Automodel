@@ -23,10 +23,10 @@ import os
 import pytest
 import torch
 
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashVisionConfig
-from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
-from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HY4FlashStateDictAdapter
-from nemo_automodel.components.models.hy_v4_flash.vision import HY4FlashVisionTower
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashVisionConfig
+from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
+from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HYV4FlashStateDictAdapter
+from nemo_automodel.components.models.hy_v4_flash.vision import HYV4FlashVisionTower
 from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config
 
 DUMP = os.environ.get("HY4_REF_DUMP")
@@ -35,10 +35,10 @@ needs_text_dump = pytest.mark.skipif(
 )
 
 
-def _load() -> tuple[dict[str, torch.Tensor], HY4FlashForCausalLM, list[str], list[str]]:
+def _load() -> tuple[dict[str, torch.Tensor], HYV4FlashForCausalLM, list[str], list[str]]:
     dump = torch.load(DUMP, weights_only=False)
-    model = HY4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
-    adapter = HY4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
+    model = HYV4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
+    adapter = HYV4FlashStateDictAdapter(model.config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
     native = adapter.from_hf({k: v.clone() for k, v in dump["state"].items()})
     missing, unexpected = model.load_state_dict(native, strict=False)
     return dump, model, missing, unexpected
@@ -109,8 +109,8 @@ def test_image_text_logits_and_positions_match_reference() -> None:
 
     dump = torch.load(VLM_DUMP, weights_only=False)
     config = tiny_config(vision=dump["vision_kwargs"], image_token_id=dump["image_token_id"])
-    model = HY4FlashForCausalLM(config, backend=CPU_BACKEND).float().eval()
-    adapter = HY4FlashStateDictAdapter(config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
+    model = HYV4FlashForCausalLM(config, backend=CPU_BACKEND).float().eval()
+    adapter = HYV4FlashStateDictAdapter(config, model.moe_config, CPU_BACKEND, dtype=torch.float32)
     missing, unexpected = model.load_state_dict(
         adapter.from_hf({k: v.clone() for k, v in dump["state"].items()}), strict=False
     )
@@ -185,7 +185,7 @@ VISION_DUMP = os.environ.get("HY4_REF_VISION_DUMP")
 )
 def test_vision_tower_matches_reference() -> None:
     dump = torch.load(VISION_DUMP, weights_only=False)
-    tower = HY4FlashVisionTower(HY4FlashVisionConfig(**dump["kwargs"])).float().eval()
+    tower = HYV4FlashVisionTower(HYV4FlashVisionConfig(**dump["kwargs"])).float().eval()
     state = {k.removeprefix("vit."): v for k, v in dump["state"].items()}
     missing, unexpected = tower.load_state_dict(state, strict=False)
     assert not missing and not unexpected, (missing, unexpected)

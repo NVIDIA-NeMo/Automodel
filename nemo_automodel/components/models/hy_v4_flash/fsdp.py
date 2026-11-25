@@ -14,7 +14,7 @@
 
 """FSDP policy of the Hy4-flash decoder root.
 
-The decoder blocks are sharded by dtype by the shared MoE parallelizer, but the root ``HY4FlashModel`` also owns the
+The decoder blocks are sharded by dtype by the shared MoE parallelizer, but the root ``HYV4FlashModel`` also owns the
 fp32 output hyper-connection (``hc_head``) next to the bf16 final norm. FSDP requires one parameter dtype per unit and
 would cast ``hc_head`` to the bf16 policy dtype, so ``hc_head`` gets its own fp32 unit before the root is sharded.
 """
@@ -29,10 +29,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.models.hy_v4_flash.layers import HY4FlashHyperHead
+from nemo_automodel.components.models.hy_v4_flash.layers import HYV4FlashHyperHead
 
 
-class HY4FlashModelParallelizer(ModelParallelizer):
+class HYV4FlashModelParallelizer(ModelParallelizer):
     """Give the fp32 output hyper-connection a dtype-uniform FSDP unit."""
 
     _customizes_moe_fsdp = True
@@ -64,7 +64,7 @@ class HY4FlashModelParallelizer(ModelParallelizer):
         if ignored_params:
             options["ignored_params"] = ignored_params
         head = getattr(module, "hc_head", None)
-        if isinstance(head, HY4FlashHyperHead):
+        if isinstance(head, HYV4FlashHyperHead):
             # Internal unit: fp32 parameters, activations keep the dtype the module produces.
             fully_shard(
                 head,
@@ -78,6 +78,6 @@ class HY4FlashModelParallelizer(ModelParallelizer):
         )
 
 
-PARALLELIZER = HY4FlashModelParallelizer()
+PARALLELIZER = HYV4FlashModelParallelizer()
 
-__all__ = ["PARALLELIZER", "HY4FlashModelParallelizer"]
+__all__ = ["PARALLELIZER", "HYV4FlashModelParallelizer"]

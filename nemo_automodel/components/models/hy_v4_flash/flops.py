@@ -14,7 +14,7 @@
 
 """Model FLOPs of Hy4-flash, in the repository's convention (6 x MACs, causal-aware, recompute excluded).
 
-Registered through ``HY4FlashConfig.flops_formula`` so no shared utility names this model.
+Registered through ``HYV4FlashConfig.flops_formula`` so no shared utility names this model.
 
 Per token (``hs`` hidden, ``H`` query heads of the layer type, ``nope + rope = 256`` query/key width, ``v = 256``):
 
@@ -39,11 +39,11 @@ not GEMMs and are not counted.
 
 from __future__ import annotations
 
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig, HYV4FlashTextConfig
 from nemo_automodel.components.utils.flops_utils import _sum_min_floor_div, _sum_min_window
 
 
-def hy_v4_flash_flops(config: HY4FlashConfig | HY4FlashTextConfig, gbs: int = 1, seq_len: int | None = None) -> float:
+def hy_v4_flash_flops(config: HYV4FlashConfig | HYV4FlashTextConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs of one training step of ``gbs`` sequences of ``seq_len`` tokens.
 
     Args:
@@ -54,7 +54,7 @@ def hy_v4_flash_flops(config: HY4FlashConfig | HY4FlashTextConfig, gbs: int = 1,
     Returns:
         FLOPs of the step (6 x MACs for trainable GEMMs and attention BMMs, 2 x MACs for the frozen indexer).
     """
-    text = config.text_config if isinstance(config, HY4FlashConfig) else config
+    text = config.text_config if isinstance(config, HYV4FlashConfig) else config
     seq_len = int(text.max_position_embeddings if seq_len is None else seq_len)
     hs, hc = text.hidden_size, text.hc_mult
     macs_per_token = 0

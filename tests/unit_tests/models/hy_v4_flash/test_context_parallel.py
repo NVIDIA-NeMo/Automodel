@@ -29,7 +29,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 
-from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashAttention
+from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashAttention
 from tests.unit_tests.models.hy_v4_flash.tiny import (
     TOLERANCE,
     assert_documents_match_alone,
@@ -63,10 +63,10 @@ def _single_rank() -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 
 def _drop_remote_keys(rank: int, local_tokens: int) -> None:
     """Test-only broken variant: the cross-rank key gather returns zeros for every token of another rank."""
-    original = HY4FlashAttention._gather_keys
+    original = HYV4FlashAttention._gather_keys
 
     def gather(
-        self: HY4FlashAttention,
+        self: HYV4FlashAttention,
         kv_local: torch.Tensor,
         token_keys: torch.Tensor | None,
         cp_group: dist.ProcessGroup | None,
@@ -76,7 +76,7 @@ def _drop_remote_keys(rank: int, local_tokens: int) -> None:
         own[rank * local_tokens : (rank + 1) * local_tokens] = True
         return kv * own, None if keys is None else keys * own
 
-    HY4FlashAttention._gather_keys = gather
+    HYV4FlashAttention._gather_keys = gather
 
 
 def _worker(rank: int, rendezvous: str, result_path: str, broken: bool) -> None:

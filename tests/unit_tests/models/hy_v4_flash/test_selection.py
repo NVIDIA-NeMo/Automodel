@@ -18,8 +18,8 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.hy_v4_flash.attention import (
-    HY4FlashCompressedIndexer,
-    HY4FlashRope,
+    HYV4FlashCompressedIndexer,
+    HYV4FlashRope,
     causal_prefix_plan,
 )
 from nemo_automodel.components.models.hy_v4_flash.layers import inverse_frequencies, mrope_cos_sin
@@ -34,7 +34,7 @@ from tests.unit_tests.models.hy_v4_flash.tiny import (
 
 
 def _brute_force_logits(
-    indexer: HY4FlashCompressedIndexer,
+    indexer: HYV4FlashCompressedIndexer,
     q_resid: torch.Tensor,
     hidden: torch.Tensor,
     group_keys: torch.Tensor,
@@ -71,7 +71,7 @@ def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot:
     config = tiny_text_config()  # index_topk 8, kpool 2: three recalled groups plus the query's own group
     theta = config.layer_rope_parameters["indexed_attention"]["rope_theta"]
     section = config.layer_rope_parameters["indexed_attention"]["mrope_section"]
-    indexer = HY4FlashCompressedIndexer(config).float()
+    indexer = HYV4FlashCompressedIndexer(config).float()
     for parameter in indexer.parameters():
         torch.nn.init.normal_(parameter, std=0.5)
     kpool, recall, document = indexer.kpool, indexer.group_topk - 1, 41
@@ -90,9 +90,9 @@ def test_chunked_selection_is_a_brute_force_topk_and_a_sorted_prefix(first_slot:
     plan = indexer.select(
         q_resid,
         hidden,
-        HY4FlashRope(cos[0, first_slot:], sin[0, first_slot:]),
+        HYV4FlashRope(cos[0, first_slot:], sin[0, first_slot:]),
         group_keys,
-        HY4FlashRope(cos[0, : group_keys.shape[0] * kpool : kpool], sin[0, : group_keys.shape[0] * kpool : kpool]),
+        HYV4FlashRope(cos[0, : group_keys.shape[0] * kpool : kpool], sin[0, : group_keys.shape[0] * kpool : kpool]),
         first_slot,
     )
     logits = _brute_force_logits(indexer, q_resid, hidden, group_keys, slots, theta)
@@ -151,7 +151,7 @@ def test_pooled_key_norm_stays_off_the_compiled_core(monkeypatch: pytest.MonkeyP
         return layers._rms_norm_core(hidden_states, weight, eps)
 
     cfg = tiny_text_config()
-    indexer = HY4FlashCompressedIndexer(cfg).float()
+    indexer = HYV4FlashCompressedIndexer(cfg).float()
     documents = [torch.randn(length, indexer.head_dim) for length in (3 * indexer.kpool, 7 * indexer.kpool + 1)]
 
     monkeypatch.setattr(layers, "_rms_norm", recording_core)

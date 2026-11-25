@@ -36,7 +36,7 @@ import torch
 from transformers import AutoTokenizer, BatchFeature, PreTrainedTokenizerFast, ProcessorMixin
 from transformers.utils import cached_file
 
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig
 from nemo_automodel.shared.import_utils import safe_import
 
 _, Image = safe_import("PIL.Image")
@@ -76,7 +76,7 @@ TEXT, IMAGE = 0, 1
 
 
 @dataclass(frozen=True)
-class HY4FlashImageSettings:
+class HYV4FlashImageSettings:
     """Preprocessing constants of the released ``processor_config.json``.
 
     Attributes:
@@ -107,10 +107,10 @@ class ImageProcessorConfig(TypedDict):
     image_std: list[float]
 
 
-def image_settings_from_processor_config(block: ImageProcessorConfig) -> HY4FlashImageSettings:
+def image_settings_from_processor_config(block: ImageProcessorConfig) -> HYV4FlashImageSettings:
     """Preprocessing constants of a checkpoint's ``processor_config.json`` ``image_processor`` block."""
     mean, std = block["image_mean"], block["image_std"]
-    return HY4FlashImageSettings(
+    return HYV4FlashImageSettings(
         patch_size=block["patch_size"],
         merge_size=block["merge_size"],
         min_pixels=block["min_pixels"],
@@ -139,7 +139,7 @@ def smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixe
     return h_bar, w_bar
 
 
-def image_grid(height: int, width: int, settings: HY4FlashImageSettings) -> tuple[int, int]:
+def image_grid(height: int, width: int, settings: HYV4FlashImageSettings) -> tuple[int, int]:
     """Patch grid ``(grid_h, grid_w)`` of an image of the given pixel size."""
     resized_h, resized_w = smart_resize(
         height, width, settings.patch_size * settings.merge_size, settings.min_pixels, settings.max_pixels
@@ -152,7 +152,7 @@ def num_image_tokens(grid_h: int, grid_w: int, merge: int) -> int:
     return (grid_h // merge) * (grid_w // merge + 1)
 
 
-def preprocess_image(image: Image.Image, settings: HY4FlashImageSettings) -> tuple[torch.Tensor, tuple[int, int]]:
+def preprocess_image(image: Image.Image, settings: HYV4FlashImageSettings) -> tuple[torch.Tensor, tuple[int, int]]:
     """Resize, normalize and patchify one image.
 
     Args:
@@ -219,7 +219,7 @@ class ProcessorOptions(TypedDict, total=False):
     max_length: int
 
 
-class HY4FlashProcessor(ProcessorMixin):
+class HYV4FlashProcessor(ProcessorMixin):
     """Expand image placeholders and build vision inputs for the Hy4-flash chat format.
 
     Args:
@@ -235,18 +235,20 @@ class HY4FlashProcessor(ProcessorMixin):
         self,
         tokenizer: PreTrainedTokenizerFast,
         image_token_id: int = 120120,
-        settings: HY4FlashImageSettings | None = None,
+        settings: HYV4FlashImageSettings | None = None,
     ) -> None:
         self.image_token_id = image_token_id
         self.image_token = IMAGE_PAD_TOKEN
-        self.settings = settings or HY4FlashImageSettings()
+        self.settings = settings or HYV4FlashImageSettings()
         known = tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
         if known is not None and known != tokenizer.unk_token_id and known != image_token_id:
             raise ValueError(f"tokenizer image pad id {known} disagrees with image_token_id {image_token_id}")
         super().__init__(tokenizer=tokenizer, chat_template=tokenizer.chat_template)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs: TokenizerOption) -> HY4FlashProcessor:
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str | Path, **kwargs: TokenizerOption
+    ) -> HYV4FlashProcessor:
         """Load the tokenizer, the image token id and the image constants of a checkpoint."""
         loading = {
             key: kwargs[key]
@@ -254,7 +256,7 @@ class HY4FlashProcessor(ProcessorMixin):
             if key in kwargs
         }
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **loading)
-        config = HY4FlashConfig.from_pretrained(pretrained_model_name_or_path, **loading)
+        config = HYV4FlashConfig.from_pretrained(pretrained_model_name_or_path, **loading)
         hub = {key: value for key, value in loading.items() if key != "trust_remote_code"}
         with open(cached_file(pretrained_model_name_or_path, "processor_config.json", **hub)) as handle:
             settings = image_settings_from_processor_config(json.load(handle)["image_processor"])

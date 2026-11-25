@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from nemo_automodel.components.models.hy_v4_flash.processing import HY4FlashProcessor
+from nemo_automodel.components.models.hy_v4_flash.processing import HYV4FlashProcessor
 
 CKPT = os.environ.get("HY4_CKPT_DIR")
 TEMPLATE = (
@@ -76,8 +76,8 @@ class _RecordingTokenizer:
         return "rendered"
 
 
-def _processor(tokenizer: _RecordingTokenizer) -> HY4FlashProcessor:
-    processor = HY4FlashProcessor.__new__(HY4FlashProcessor)
+def _processor(tokenizer: _RecordingTokenizer) -> HYV4FlashProcessor:
+    processor = HYV4FlashProcessor.__new__(HYV4FlashProcessor)
     processor.tokenizer = tokenizer
     return processor
 
@@ -111,7 +111,7 @@ def test_explicit_reasoning_effort_and_generation_prompts_are_left_alone() -> No
 def test_released_processor_config_gives_the_default_image_settings() -> None:
     """The consumed fields of ``processor_config.json`` at tencent/Hy4-flash revision eccd3123 give the defaults."""
     from nemo_automodel.components.models.hy_v4_flash.processing import (
-        HY4FlashImageSettings,
+        HYV4FlashImageSettings,
         image_settings_from_processor_config,
     )
 
@@ -123,6 +123,6 @@ def test_released_processor_config_gives_the_default_image_settings() -> None:
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
     }
-    assert image_settings_from_processor_config(released) == HY4FlashImageSettings()
+    assert image_settings_from_processor_config(released) == HYV4FlashImageSettings()
     changed = image_settings_from_processor_config({**released, "max_pixels": 1048576, "image_mean": [0.1, 0.2, 0.3]})
     assert changed.max_pixels == 1048576 and changed.mean == (0.1, 0.2, 0.3)

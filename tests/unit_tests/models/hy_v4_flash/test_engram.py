@@ -18,17 +18,17 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.hy_v4_flash.engram import (
-    HY4FlashEngramLayer,
-    HY4FlashWeightOnlyNorm,
+    HYV4FlashEngramLayer,
+    HYV4FlashWeightOnlyNorm,
     weighted_rms_norm,
 )
-from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
+from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
 from tests.unit_tests.models.hy_v4_flash.tiny import build_model, pack, random_documents, tiny_text_config
 
 
 def test_engram_fp8_lookup_is_rejected_instead_of_ignored() -> None:
     with pytest.raises(NotImplementedError, match="engram_fp8_embedding"):
-        HY4FlashEngramLayer(tiny_text_config(engram_fp8_embedding=True), 1, dtype=torch.float32)
+        HYV4FlashEngramLayer(tiny_text_config(engram_fp8_embedding=True), 1, dtype=torch.float32)
 
 
 def test_wrong_engram_layer_offset_is_detected_by_the_layer_id_check() -> None:
@@ -36,7 +36,7 @@ def test_wrong_engram_layer_offset_is_detected_by_the_layer_id_check() -> None:
     cfg = tiny_text_config()
     assert cfg.engram_layer_indices == [1, 3]
     with pytest.raises(ValueError, match="has no Engram block"):
-        HY4FlashEngramLayer(cfg, 2, dtype=torch.float32)  # one-based id 3 is not an Engram layer
+        HYV4FlashEngramLayer(cfg, 2, dtype=torch.float32)  # one-based id 3 is not an Engram layer
 
 
 def test_engram_hash_multipliers_follow_a_lookup_table_loaded_after_initialization() -> None:
@@ -48,10 +48,10 @@ def test_engram_hash_multipliers_follow_a_lookup_table_loaded_after_initializati
     """
     from nemo_automodel.components.models.hy_v4_flash.engram import draw_hash_multipliers
 
-    def engram_layers(model: HY4FlashForCausalLM) -> list[HY4FlashEngramLayer]:
+    def engram_layers(model: HYV4FlashForCausalLM) -> list[HYV4FlashEngramLayer]:
         return [layer.engram_layer for layer in model.model.layers if layer.engram_layer is not None]
 
-    def run(model: HY4FlashForCausalLM) -> torch.Tensor:
+    def run(model: HYV4FlashForCausalLM) -> torch.Tensor:
         with torch.no_grad():
             return model(**pack(random_documents((9, 12)))).logits
 
@@ -110,7 +110,7 @@ def test_weighted_rms_norm_equals_torch_rms_norm_bitwise(dtype: torch.dtype, sca
     slices, features = 4, 96
     x = (scale * torch.randn(2, 37, slices, features)).to(dtype)
     weights = [(1 + 0.1 * torch.randn(features)).to(dtype) for _ in range(slices)]
-    ours = torch.nn.ModuleList(HY4FlashWeightOnlyNorm(features, dtype) for _ in range(slices))
+    ours = torch.nn.ModuleList(HYV4FlashWeightOnlyNorm(features, dtype) for _ in range(slices))
     reference = [torch.nn.RMSNorm(features).to(dtype) for _ in range(slices)]
     with torch.no_grad():
         for norm, module, weight in zip(ours, reference, weights):

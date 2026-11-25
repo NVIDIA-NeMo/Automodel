@@ -16,7 +16,7 @@
 
 Semantics follow the transformers reference (PR 50903, ``modeling_hy_v4_flash.py``):
 
-* ``HY4FlashRMSNorm`` casts the normalized activations back to the input dtype *before* the weight multiply.
+* ``HYV4FlashRMSNorm`` casts the normalized activations back to the input dtype *before* the weight multiply.
 * The hyper-connection (iHC) has no Sinkhorn mixing: a sigmoid ``pre`` weight collapses the ``hc_mult`` streams
   and a sigmoid ``post`` weight scatters the sub-layer output back, the old streams passing through unchanged.
 * RoPE rotates interleaved pairs of the trailing ``qk_rope_head_dim`` channels, with the time/height/width
@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor, distribute_tensor
 
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashTextConfig
 
 
 # ----------------------------------------------------------------------------------------- fp32 cores
@@ -140,7 +140,7 @@ def compile_hc_cores() -> None:
     _HC_COMPILED = True
 
 
-class HY4FlashRMSNorm(nn.Module):
+class HYV4FlashRMSNorm(nn.Module):
     """RMSNorm that multiplies the weight after casting back to the activation dtype.
 
     Args:
@@ -173,13 +173,13 @@ class HY4FlashRMSNorm(nn.Module):
         return core(hidden_states, self.weight, self.eps)
 
 
-class HY4FlashHyperConnection(nn.Module):
+class HYV4FlashHyperConnection(nn.Module):
     """iHC site: collapse ``hc_mult`` residual streams to one input and produce the scatter weights.
 
     All parameters are fp32 and the arithmetic runs in fp32 whatever the activation dtype.
     """
 
-    def __init__(self, config: HY4FlashTextConfig) -> None:
+    def __init__(self, config: HYV4FlashTextConfig) -> None:
         super().__init__()
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
@@ -235,10 +235,10 @@ class HY4FlashHyperConnection(nn.Module):
         return _hc_expand(post, output, residual)
 
 
-class HY4FlashHyperHead(nn.Module):
+class HYV4FlashHyperHead(nn.Module):
     """Final collapse of the streams before the output norm."""
 
-    def __init__(self, config: HY4FlashTextConfig) -> None:
+    def __init__(self, config: HYV4FlashTextConfig) -> None:
         super().__init__()
         self.hc_mult = config.hc_mult
         self.eps = config.hc_eps

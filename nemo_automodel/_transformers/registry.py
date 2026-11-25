@@ -322,7 +322,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "HYV4FlashForConditionalGeneration",
-            ("nemo_automodel.components.models.hy_v4_flash.model", "HY4FlashForConditionalGeneration"),
+            ("nemo_automodel.components.models.hy_v4_flash.model", "HYV4FlashForConditionalGeneration"),
         ),
         (
             "HyMT2ForCausalLM",
@@ -471,9 +471,9 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
-    "hy_v4_flash": ("nemo_automodel.components.models.hy_v4_flash.config", "HY4FlashConfig"),
-    "hy_v4_flash_text": ("nemo_automodel.components.models.hy_v4_flash.config", "HY4FlashTextConfig"),
-    "hy_v4_flash_vision": ("nemo_automodel.components.models.hy_v4_flash.config", "HY4FlashVisionConfig"),
+    "hy_v4_flash": ("nemo_automodel.components.models.hy_v4_flash.config", "HYV4FlashConfig"),
+    "hy_v4_flash_text": ("nemo_automodel.components.models.hy_v4_flash.config", "HYV4FlashTextConfig"),
+    "hy_v4_flash_vision": ("nemo_automodel.components.models.hy_v4_flash.config", "HYV4FlashVisionConfig"),
     "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "inkling2": ("nemo_automodel.components.models.inkling2.config", "Inkling2Config"),
@@ -541,7 +541,7 @@ _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
     "kimi_k31": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
     "lfm3_vl": ("nemo_automodel.components.models.lfm3.processing", "Lfm3VlProcessor"),
-    "hy_v4_flash": ("nemo_automodel.components.models.hy_v4_flash.processing", "HY4FlashProcessor"),
+    "hy_v4_flash": ("nemo_automodel.components.models.hy_v4_flash.processing", "HYV4FlashProcessor"),
 }
 
 # model_types whose custom model implementation should win over a transformers

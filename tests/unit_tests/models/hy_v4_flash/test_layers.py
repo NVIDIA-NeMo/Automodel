@@ -16,10 +16,10 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.layers import (
-    HY4FlashHyperConnection,
-    HY4FlashRMSNorm,
+    HYV4FlashHyperConnection,
+    HYV4FlashRMSNorm,
     apply_interleaved_rope,
     inverse_frequencies,
     mrope_cos_sin,
@@ -69,7 +69,7 @@ def test_mrope_interleaves_height_and_width_planes() -> None:
 
 
 def test_rms_norm_casts_before_weight_multiply() -> None:
-    norm = HY4FlashRMSNorm(8, eps=1e-5)
+    norm = HYV4FlashRMSNorm(8, eps=1e-5)
     norm.weight.data.fill_(1.0000001)
     x = torch.randn(3, 8).bfloat16()
     ref = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-5)
@@ -77,8 +77,8 @@ def test_rms_norm_casts_before_weight_multiply() -> None:
 
 
 def test_hyper_connection_collapse_and_expand() -> None:
-    cfg = HY4FlashTextConfig(hidden_size=16, num_hidden_layers=2, layer_types=["sliding_attention"] * 2)
-    hc = HY4FlashHyperConnection(cfg)
+    cfg = HYV4FlashTextConfig(hidden_size=16, num_hidden_layers=2, layer_types=["sliding_attention"] * 2)
+    hc = HYV4FlashHyperConnection(cfg)
     hc.init_weights(cfg.initializer_range)
     with torch.no_grad():  # distinct pre / post scales and biases, so swapping the two groups is visible
         hc.scale.copy_(torch.tensor([0.7, 1.3]))
@@ -98,9 +98,9 @@ def test_hyper_connection_collapse_and_expand() -> None:
 
 def test_fp32_parameter_forward_returns_a_copy_that_survives_freed_parameter_storage() -> None:
     """FSDP frees the unsharded parameter storage when a unit reshards after forward; the result must not alias it."""
-    from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashFP32Parameter
+    from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashFP32Parameter
 
-    holder = HY4FlashFP32Parameter(torch.arange(6.0).reshape(2, 3))
+    holder = HYV4FlashFP32Parameter(torch.arange(6.0).reshape(2, 3))
     out = holder(torch.zeros(1))
     assert out.dtype == torch.float32 and out.requires_grad
     assert out.data_ptr() != holder.weight.data_ptr()

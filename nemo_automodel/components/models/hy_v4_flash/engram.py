@@ -36,7 +36,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashTextConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
 
 
@@ -78,7 +78,7 @@ def build_ngram_tokens(
     return torch.stack(shifted, dim=-1)
 
 
-class HY4FlashWeightOnlyNorm(nn.Module):
+class HYV4FlashWeightOnlyNorm(nn.Module):
     """Holder of an RMSNorm weight whose epsilon is the dtype epsilon (``nn.RMSNorm(eps=None)`` semantics)."""
 
     def __init__(self, size: int, dtype: torch.dtype) -> None:
@@ -103,7 +103,7 @@ def weighted_rms_norm(x: torch.Tensor, norms: nn.ModuleList) -> torch.Tensor:
     return (F.rms_norm(x.float(), (x.shape[-1],)) * weight.float()).to(x.dtype)
 
 
-class HY4FlashEngramLayer(nn.Module):
+class HYV4FlashEngramLayer(nn.Module):
     """One Engram block (decoder layer ``layer_idx``, one-based id ``layer_idx + 1``).
 
     Args:
@@ -115,7 +115,7 @@ class HY4FlashEngramLayer(nn.Module):
 
     def __init__(
         self,
-        config: HY4FlashTextConfig,
+        config: HYV4FlashTextConfig,
         layer_idx: int,
         *,
         process_group: dist.ProcessGroup | None = None,
@@ -166,14 +166,14 @@ class HY4FlashEngramLayer(nn.Module):
         # (storage address, version) of the lookup table the multipliers were drawn for; see ``_lookup_table_state``.
         self._multipliers_drawn_for: tuple[int, int] | None = None
         self.lookup_per_head_norms = nn.ModuleList(
-            HY4FlashWeightOnlyNorm(head_dim, dtype) for _ in range(self.num_heads)
+            HYV4FlashWeightOnlyNorm(head_dim, dtype) for _ in range(self.num_heads)
         )
         self.value_proj = nn.Linear(engram_size, self.hidden_size, dtype=dtype)
         self.key_projs = nn.ModuleList(
             nn.Linear(engram_size, self.hidden_size, dtype=dtype) for _ in range(self.hc_mult)
         )
-        self.norm_key = nn.ModuleList(HY4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
-        self.norm_query = nn.ModuleList(HY4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
+        self.norm_key = nn.ModuleList(HYV4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
+        self.norm_query = nn.ModuleList(HYV4FlashWeightOnlyNorm(self.hidden_size, dtype) for _ in range(self.hc_mult))
         self.unified_pre_gamma = nn.Parameter(torch.ones(self.hidden_size, dtype=dtype))
         self.unified_per_hc_scales = nn.ParameterList(
             nn.Parameter(torch.empty(self.hidden_size, dtype=dtype)) for _ in range(self.hc_mult)

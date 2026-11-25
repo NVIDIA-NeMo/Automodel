@@ -43,14 +43,14 @@ _LAYER_TYPE_ALIASES: dict[str, AttentionType] = {
 }
 
 
-def _model_flops(config: HY4FlashTextConfig | HY4FlashConfig, gbs: int, seq_len: int | None) -> float:
+def _model_flops(config: HYV4FlashTextConfig | HYV4FlashConfig, gbs: int, seq_len: int | None) -> float:
     """Call the FLOPs formula, imported on use because ``flops`` imports this module."""
     from nemo_automodel.components.models.hy_v4_flash.flops import hy_v4_flash_flops
 
     return hy_v4_flash_flops(config, gbs, seq_len)
 
 
-class HY4FlashRopeParameters(TypedDict):
+class HYV4FlashRopeParameters(TypedDict):
     """Rotary parameters of one attention type, as stored in ``rope_parameters``."""
 
     rope_type: Literal["default"]
@@ -63,7 +63,7 @@ class HY4FlashRopeParameters(TypedDict):
 EngramHeadVocabSizes: TypeAlias = dict[str, list[list[int]]]
 
 
-class HY4FlashTextConfig(PretrainedConfig):
+class HYV4FlashTextConfig(PretrainedConfig):
     """Text backbone: hyper-connected gated MLA with SWA / compressed-indexer layers, latent MoE and Engram.
 
     Layer indices in ``engram_layer_ids`` are **one-based**: the reference builds the Engram block of decoder
@@ -77,7 +77,7 @@ class HY4FlashTextConfig(PretrainedConfig):
     attribute_map = {"num_local_experts": "n_routed_experts"}
 
     @staticmethod
-    def flops_formula(config: HY4FlashTextConfig, gbs: int = 1, seq_len: int | None = None) -> float:
+    def flops_formula(config: HYV4FlashTextConfig, gbs: int = 1, seq_len: int | None = None) -> float:
         """Model FLOPs of one step (see ``hy_v4_flash.flops``); picked up by ``get_flops_formula_for_hf_config``."""
         return _model_flops(config, gbs, seq_len)
 
@@ -124,8 +124,8 @@ class HY4FlashTextConfig(PretrainedConfig):
         hc_mult: int = 4,
         hc_magnitude: float = 2.0,
         hc_eps: float = 1e-6,
-        rope_parameters: dict[str, HY4FlashRopeParameters] | None = None,
-        layer_rope_parameters: dict[str, HY4FlashRopeParameters] | None = None,
+        rope_parameters: dict[str, HYV4FlashRopeParameters] | None = None,
+        layer_rope_parameters: dict[str, HYV4FlashRopeParameters] | None = None,
         engram_layer_ids: list[int] | None = None,
         engram_max_ngram_size: int = 3,
         engram_n_head_per_ngram: int = 8,
@@ -360,7 +360,7 @@ class HY4FlashTextConfig(PretrainedConfig):
                     )
 
 
-class HY4FlashVisionConfig(PretrainedConfig):
+class HYV4FlashVisionConfig(PretrainedConfig):
     """Vision tower hyper-parameters (a 27-layer ViT plus the ``rmsnorm_mlp_adapter`` projector)."""
 
     model_type = "hy_v4_flash_vision"
@@ -403,21 +403,21 @@ class HY4FlashVisionConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class HY4FlashConfig(PretrainedConfig):
+class HYV4FlashConfig(PretrainedConfig):
     """Composite image-text configuration (``HYV4FlashForConditionalGeneration``)."""
 
     model_type = "hy_v4_flash"
-    sub_configs = {"text_config": HY4FlashTextConfig, "vision_config": HY4FlashVisionConfig}
+    sub_configs = {"text_config": HYV4FlashTextConfig, "vision_config": HYV4FlashVisionConfig}
 
     @staticmethod
-    def flops_formula(config: HY4FlashConfig, gbs: int = 1, seq_len: int | None = None) -> float:
+    def flops_formula(config: HYV4FlashConfig, gbs: int = 1, seq_len: int | None = None) -> float:
         """Model FLOPs of one step of the text backbone; the vision tower is not counted."""
         return _model_flops(config, gbs, seq_len)
 
     def __init__(
         self,
-        text_config: dict[str, JsonValue] | HY4FlashTextConfig | None = None,
-        vision_config: dict[str, JsonValue] | HY4FlashVisionConfig | None = None,
+        text_config: dict[str, JsonValue] | HYV4FlashTextConfig | None = None,
+        vision_config: dict[str, JsonValue] | HYV4FlashVisionConfig | None = None,
         image_token_id: int = 120120,
         video_token_id: int = 120124,
         image_start_token_id: int = 120118,
@@ -427,11 +427,11 @@ class HY4FlashConfig(PretrainedConfig):
         **kwargs: JsonValue,
     ) -> None:
         if isinstance(text_config, dict):
-            text_config = HY4FlashTextConfig(**{k: v for k, v in text_config.items() if k != "model_type"})
-        self.text_config = text_config if text_config is not None else HY4FlashTextConfig()
+            text_config = HYV4FlashTextConfig(**{k: v for k, v in text_config.items() if k != "model_type"})
+        self.text_config = text_config if text_config is not None else HYV4FlashTextConfig()
         if isinstance(vision_config, dict):
-            vision_config = HY4FlashVisionConfig(**vision_config)
-        self.vision_config = vision_config if vision_config is not None else HY4FlashVisionConfig()
+            vision_config = HYV4FlashVisionConfig(**vision_config)
+        self.vision_config = vision_config if vision_config is not None else HYV4FlashVisionConfig()
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.image_start_token_id = image_start_token_id

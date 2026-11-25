@@ -57,31 +57,31 @@ from nemo_automodel.components.models.common.utils import _has_dtensor_params, c
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.hy_v4_flash.attention import (
-    HY4FlashAttention,
-    HY4FlashDocLayout,
-    HY4FlashRope,
+    HYV4FlashAttention,
+    HYV4FlashDocLayout,
+    HYV4FlashRope,
     causal_prefix_plan,
 )
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
-from nemo_automodel.components.models.hy_v4_flash.engram import HY4FlashEngramLayer, build_ngram_tokens
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig, HYV4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.engram import HYV4FlashEngramLayer, build_ngram_tokens
 from nemo_automodel.components.models.hy_v4_flash.fsdp import PARALLELIZER
 from nemo_automodel.components.models.hy_v4_flash.layers import (
-    HY4FlashHyperConnection,
-    HY4FlashHyperHead,
-    HY4FlashRMSNorm,
+    HYV4FlashHyperConnection,
+    HYV4FlashHyperHead,
+    HYV4FlashRMSNorm,
     compile_hc_cores,
     compile_norm_core,
     inverse_frequencies,
     mrope_cos_sin,
 )
-from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HY4FlashStateDictAdapter
-from nemo_automodel.components.models.hy_v4_flash.vision import HY4FlashVisionTower
+from nemo_automodel.components.models.hy_v4_flash.state_dict_adapter import HYV4FlashStateDictAdapter
+from nemo_automodel.components.models.hy_v4_flash.vision import HYV4FlashVisionTower
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
 
 
-def build_moe_config(text: HY4FlashTextConfig, dtype: torch.dtype) -> MoEConfig:
+def build_moe_config(text: HYV4FlashTextConfig, dtype: torch.dtype) -> MoEConfig:
     """MoE settings of the latent-space sigmoid router (all routed experts run at ``routed_expert_hidden_size``)."""
     return MoEConfig(
         dim=text.hidden_size,
@@ -109,14 +109,14 @@ def build_moe_config(text: HY4FlashTextConfig, dtype: torch.dtype) -> MoEConfig:
     )
 
 
-class HY4FlashCPInputs(TypedDict):
+class HYV4FlashCPInputs(TypedDict):
     """Model-owned context-parallel inputs handed to the training recipe."""
 
     cp_sharder: ContextParallelSharder
 
 
 @dataclass(frozen=True)
-class HY4FlashBatch:
+class HYV4FlashBatch:
     """Flattened-token view of one forward pass, shared by all layers.
 
     Attributes:
@@ -127,8 +127,8 @@ class HY4FlashBatch:
         padding_mask: Bool tensor [batch, sequence], True at padding, or ``None``.
     """
 
-    layout: HY4FlashDocLayout
-    ropes: dict[str, HY4FlashRope]
+    layout: HYV4FlashDocLayout
+    ropes: dict[str, HYV4FlashRope]
     ngram_tokens: torch.Tensor | None
     engram_mask: torch.Tensor | None
     padding_mask: torch.Tensor | None
@@ -201,12 +201,12 @@ def compute_mrope_position_ids(
     return positions.to(mm_token_type_ids.device)
 
 
-class HY4FlashBlock(nn.Module):
+class HYV4FlashBlock(nn.Module):
     """One sandwich-normed, hyper-connected decoder layer."""
 
     def __init__(
         self,
-        config: HY4FlashTextConfig,
+        config: HYV4FlashTextConfig,
         layer_idx: int,
         backend: BackendConfig,
         moe_config: MoEConfig,
@@ -218,7 +218,7 @@ class HY4FlashBlock(nn.Module):
         eps = config.rms_norm_eps
         hidden = config.hidden_size
         self.attention_type = config.attention_types[layer_idx]
-        self.self_attn = HY4FlashAttention(config, layer_idx, backend)
+        self.self_attn = HYV4FlashAttention(config, layer_idx, backend)
         # Recorded here because ``activation_checkpointing: moe`` later replaces ``self.mlp`` with a checkpoint wrapper,
         # which forwards attribute access and calls but is not an instance of ``MoE``.
         self.has_moe = config.mlp_layer_types[layer_idx] == "sparse"
@@ -233,19 +233,19 @@ class HY4FlashBlock(nn.Module):
             )
         else:
             self.mlp = MLP(hidden, config.intermediate_size, backend.linear, dtype=dtype)
-        self.input_layernorm = HY4FlashRMSNorm(hidden, eps, dtype)
-        self.post_self_attn_layernorm = HY4FlashRMSNorm(hidden, eps, dtype)
-        self.post_attention_layernorm = HY4FlashRMSNorm(hidden, eps, dtype)
-        self.post_mlp_layernorm = HY4FlashRMSNorm(hidden, eps, dtype)
-        self.attn_hc = HY4FlashHyperConnection(config)
-        self.ffn_hc = HY4FlashHyperConnection(config)
+        self.input_layernorm = HYV4FlashRMSNorm(hidden, eps, dtype)
+        self.post_self_attn_layernorm = HYV4FlashRMSNorm(hidden, eps, dtype)
+        self.post_attention_layernorm = HYV4FlashRMSNorm(hidden, eps, dtype)
+        self.post_mlp_layernorm = HYV4FlashRMSNorm(hidden, eps, dtype)
+        self.attn_hc = HYV4FlashHyperConnection(config)
+        self.ffn_hc = HYV4FlashHyperConnection(config)
         self.engram_layer = (
-            HY4FlashEngramLayer(config, layer_idx, process_group=engram_process_group, dtype=dtype)
+            HYV4FlashEngramLayer(config, layer_idx, process_group=engram_process_group, dtype=dtype)
             if layer_idx in config.engram_layer_indices
             else None
         )
 
-    def forward(self, streams: torch.Tensor, batch: HY4FlashBatch) -> torch.Tensor:
+    def forward(self, streams: torch.Tensor, batch: HYV4FlashBatch) -> torch.Tensor:
         """Run the layer.
 
         Args:
@@ -270,12 +270,12 @@ class HY4FlashBlock(nn.Module):
         return self.ffn_hc.expand(post, x, streams)
 
 
-class HY4FlashModel(nn.Module):
+class HYV4FlashModel(nn.Module):
     """Embeddings, hyper-connected blocks and the output collapse."""
 
     def __init__(
         self,
-        config: HY4FlashTextConfig,
+        config: HYV4FlashTextConfig,
         backend: BackendConfig,
         moe_config: MoEConfig,
         *,
@@ -286,11 +286,11 @@ class HY4FlashModel(nn.Module):
         dtype = torch.bfloat16
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
-            HY4FlashBlock(config, i, backend, moe_config, engram_process_group=engram_process_group)
+            HYV4FlashBlock(config, i, backend, moe_config, engram_process_group=engram_process_group)
             for i in range(config.num_hidden_layers)
         )
-        self.hc_head = HY4FlashHyperHead(config)
-        self.norm = HY4FlashRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+        self.hc_head = HYV4FlashHyperHead(config)
+        self.norm = HYV4FlashRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
 
     def prepare_batch(
         self,
@@ -300,7 +300,7 @@ class HY4FlashModel(nn.Module):
         packed_seq_ids: torch.Tensor | None,
         image_token_mask: torch.Tensor | None,
         cp_group: dist.ProcessGroup | None = None,
-    ) -> HY4FlashBatch:
+    ) -> HYV4FlashBatch:
         """Build the flattened-token metadata shared by every layer.
 
         Args:
@@ -352,7 +352,7 @@ class HY4FlashModel(nn.Module):
         position = torch.arange(local_start, local_end, device=flat.device)
         window_plan = causal_prefix_plan(position, doc_start, cfg.sliding_window)
         all_rows_nonempty = covered == rows * seq
-        layout = HY4FlashDocLayout(
+        layout = HYV4FlashDocLayout(
             doc_ranges,
             local_start,
             local_end,
@@ -373,7 +373,7 @@ class HY4FlashModel(nn.Module):
                 rope_parameters["mrope_section"],
                 torch.float32,
             )
-            ropes[attention_type] = HY4FlashRope(cos[0], sin[0])
+            ropes[attention_type] = HYV4FlashRope(cos[0], sin[0])
         ngram = engram_mask = None
         if cfg.engram_layer_indices:
             ngram = build_ngram_tokens(global_ids, global_time, cfg.engram_max_ngram_size, cfg.engram_pad_id)
@@ -381,7 +381,7 @@ class HY4FlashModel(nn.Module):
             engram_mask = valid & (input_ids != cfg.engram_pad_id)
             if image_token_mask is not None:
                 engram_mask = engram_mask & ~image_token_mask
-        return HY4FlashBatch(layout, ropes, ngram, engram_mask, None if attention_mask is None else ~valid)
+        return HYV4FlashBatch(layout, ropes, ngram, engram_mask, None if attention_mask is None else ~valid)
 
     def forward(
         self,
@@ -415,13 +415,13 @@ class HY4FlashModel(nn.Module):
         return self.norm(self.hc_head(streams))
 
 
-class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
+class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """Hy4-flash: the decoder stack, the vision tower for image-text inputs, and an fp32 ``lm_head``."""
 
     _owns_cp_attention: bool = True
     # Both paths take document boundaries from the model-owned layout: the shared kernel and its PyTorch twin.
     _packed_cp_attn_backends = ("cudnn", "sdpa")
-    config_class = HY4FlashConfig
+    config_class = HYV4FlashConfig
     base_model_prefix = "model"
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = [
@@ -440,7 +440,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
     # ``parallelizer_utils.fully_shard_across_blocks``): the sinks, whose forward ignores its input, and the indexer's
     # group-pooling modules, which only run for documents longer than ``index_topk``. A cross-block unit stays
     # unsharded for the step, so each costs one all-gather per step (issued on every rank by
-    # ``HY4FlashCompressedIndexer.enter_pooling_units``) instead of one per call.
+    # ``HYV4FlashCompressedIndexer.enter_pooling_units``) instead of one per call.
     _fsdp_shard_across_blocks = [
         "self_attn.sinks_param",
         "self_attn.compressed_indexer.key_value_projection",
@@ -462,13 +462,13 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
     @classmethod
     def from_config(
         cls,
-        config: HY4FlashConfig,
+        config: HYV4FlashConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
         logits_dtype: torch.dtype | None = torch.float32,
-    ) -> HY4FlashForCausalLM:
+    ) -> HYV4FlashForCausalLM:
         """Construct using the NeMo registry's configuration entry point."""
         return cls(
             config,
@@ -480,7 +480,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
 
     def __init__(
         self,
-        config: HY4FlashConfig,
+        config: HYV4FlashConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         *,
@@ -502,13 +502,13 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             compile_hc_cores()
         if self.backend.compile_norm:
             compile_norm_core()
-        self.model = HY4FlashModel(text, self.backend, moe_config, engram_process_group=engram_process_group)
+        self.model = HYV4FlashModel(text, self.backend, moe_config, engram_process_group=engram_process_group)
         self.lm_head = LMHead(text.hidden_size, text.vocab_size, dtype=torch.float32, logits_dtype=logits_dtype)
         vision = config.vision_config
         # ``vit`` is a top-level module, as in the released checkpoint (``vit.*`` keys).
-        self.vit = HY4FlashVisionTower(vision).to(torch.bfloat16) if vision.num_hidden_layers > 0 else None
+        self.vit = HYV4FlashVisionTower(vision).to(torch.bfloat16) if vision.num_hidden_layers > 0 else None
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = HY4FlashStateDictAdapter(config, moe_config, self.backend, dtype=torch.bfloat16)
+            self.state_dict_adapter = HYV4FlashStateDictAdapter(config, moe_config, self.backend, dtype=torch.bfloat16)
         self.image_token_id = config.image_token_id
         self.spatial_merge_size = vision.spatial_merge_size
 
@@ -544,7 +544,7 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             raise ValueError(f"{int(mask.sum())} image placeholder tokens but {features.shape[0]} image features")
         return embedded.masked_scatter(mask.unsqueeze(-1), features)
 
-    def prepare_model_inputs_for_cp(self, batch: dict[str, torch.Tensor], *, num_chunks: int = 1) -> HY4FlashCPInputs:
+    def prepare_model_inputs_for_cp(self, batch: dict[str, torch.Tensor], *, num_chunks: int = 1) -> HYV4FlashCPInputs:
         """Select contiguous packed sharding (documents are never aligned or reordered).
 
         Args:
@@ -725,6 +725,6 @@ class HY4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixi
             cast_model_to_dtype(self, dtype)
 
 
-HY4FlashForCausalLM.parallelizer = PARALLELIZER
-HY4FlashForConditionalGeneration = HY4FlashForCausalLM
-ModelClass = HY4FlashForCausalLM
+HYV4FlashForCausalLM.parallelizer = PARALLELIZER
+HYV4FlashForConditionalGeneration = HYV4FlashForCausalLM
+ModelClass = HYV4FlashForCausalLM

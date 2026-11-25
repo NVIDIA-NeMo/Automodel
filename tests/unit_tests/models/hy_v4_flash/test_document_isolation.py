@@ -27,7 +27,7 @@ import pytest
 import torch
 
 import nemo_automodel.components.models.hy_v4_flash.model as model_module
-from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashBatch
+from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashBatch
 from tests.unit_tests.models.hy_v4_flash.tiny import (
     KPOOL,
     PAD_ID,
@@ -164,14 +164,16 @@ def _leaky_plan(monkeypatch: pytest.MonkeyPatch, width: int) -> None:
 
 def _leaky_indexer_groups(monkeypatch: pytest.MonkeyPatch) -> None:
     # The indexer treats the whole pack as one document: groups are pack-aligned and may come from other documents.
-    original = model_module.HY4FlashModel.prepare_batch
+    original = model_module.HYV4FlashModel.prepare_batch
 
-    def prepare(self: model_module.HY4FlashModel, *args: torch.Tensor, **kwargs: torch.Tensor | None) -> HY4FlashBatch:
+    def prepare(
+        self: model_module.HYV4FlashModel, *args: torch.Tensor, **kwargs: torch.Tensor | None
+    ) -> HYV4FlashBatch:
         batch = original(self, *args, **kwargs)
         layout = dataclasses.replace(batch.layout, doc_ranges=((0, batch.layout.local_end),))
         return dataclasses.replace(batch, layout=layout)
 
-    monkeypatch.setattr(model_module.HY4FlashModel, "prepare_batch", prepare)
+    monkeypatch.setattr(model_module.HYV4FlashModel, "prepare_batch", prepare)
 
 
 def _leaky_engram(monkeypatch: pytest.MonkeyPatch) -> None:

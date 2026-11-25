@@ -19,7 +19,7 @@ import pytest
 from transformers import AutoConfig
 
 import nemo_automodel._transformers.registry  # noqa: F401  (registers the custom configs with AutoConfig)
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig, HYV4FlashTextConfig
 from tests.unit_tests.models.hy_v4_flash.tiny import CPU_BACKEND, tiny_config, tiny_text_config
 
 # ``config.json`` of https://huggingface.co/tencent/Hy4-flash at revision eccd3123eec73f2040f4c9ed0de1883593470510.
@@ -29,13 +29,13 @@ RELEASED = Path(__file__).with_name("released_config.json")
 def test_autoconfig_resolves_the_local_class_from_a_checkpoint_style_config(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps(tiny_config().to_dict()))
     loaded = AutoConfig.from_pretrained(tmp_path)
-    assert type(loaded) is HY4FlashConfig and type(loaded.text_config) is HY4FlashTextConfig
+    assert type(loaded) is HYV4FlashConfig and type(loaded.text_config) is HYV4FlashTextConfig
 
 
 def test_round_trip_keeps_the_per_type_rope_table(tmp_path: Path) -> None:
     cfg = tiny_config()
     cfg.save_pretrained(tmp_path)
-    again = HY4FlashConfig.from_pretrained(tmp_path).text_config
+    again = HYV4FlashConfig.from_pretrained(tmp_path).text_config
     assert again.layer_rope_parameters == cfg.text_config.layer_rope_parameters
     assert again.layer_rope_parameters["sliding_attention"]["rope_theta"] == 1.0e4
     assert again.layer_rope_parameters["indexed_attention"]["rope_theta"] == 1.0e7
@@ -43,7 +43,7 @@ def test_round_trip_keeps_the_per_type_rope_table(tmp_path: Path) -> None:
 
 def test_released_config_semantics() -> None:
     with RELEASED.open() as handle:
-        text = HY4FlashConfig(**json.load(handle)).text_config
+        text = HYV4FlashConfig(**json.load(handle)).text_config
     # config ids are one-based: zero-based layers 1, 11, 21, 31 (confirmed against the weight names)
     assert text.engram_layer_ids == [2, 12, 22, 32] and text.engram_layer_indices == [1, 11, 21, 31]
     assert text.engram_fp8_embedding is False
@@ -64,7 +64,7 @@ def test_released_and_reference_layer_type_spellings_build_the_same_layers(spell
     text = tiny_text_config(num_hidden_layers=3, layer_types=[spelling, "sliding_attention", spelling])
     assert text.attention_types == ["indexed_attention", "sliding_attention", "indexed_attention"]
     assert [text.attention_heads(t) for t in text.attention_types] == [4, 8, 4]
-    again = HY4FlashTextConfig(**text.to_dict())
+    again = HYV4FlashTextConfig(**text.to_dict())
     assert again.attention_types == text.attention_types
     assert again.layer_rope_parameters["indexed_attention"]["rope_theta"] == 1.0e7
 
@@ -102,10 +102,10 @@ def test_settings_the_model_does_not_implement_are_rejected(overrides: dict[str,
 def test_unsupported_backend_choices_are_rejected(field: str, value: str) -> None:
     import dataclasses
 
-    from nemo_automodel.components.models.hy_v4_flash.attention import HY4FlashAttention
+    from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashAttention
 
     with pytest.raises(ValueError, match=f"backend.{field}"):
-        HY4FlashAttention(tiny_text_config(), 0, dataclasses.replace(CPU_BACKEND, **{field: value}))
+        HYV4FlashAttention(tiny_text_config(), 0, dataclasses.replace(CPU_BACKEND, **{field: value}))
 
 
 def test_reduced_depth_keeps_the_released_schedule_prefix() -> None:

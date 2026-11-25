@@ -17,8 +17,8 @@
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig, HY4FlashTextConfig
-from nemo_automodel.components.models.hy_v4_flash.model import HY4FlashForCausalLM
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig, HYV4FlashTextConfig
+from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
 from tests.unit_tests.models.hy_v4_flash.tiny_kwargs import TINY_TEXT_KWARGS
 
 # Token ids the tests draw from (above the special ids, inside the tiny vocabulary) and the padding id.
@@ -30,14 +30,14 @@ CPU_BACKEND = BackendConfig(
 )
 
 
-def tiny_text_config(**overrides: object) -> HY4FlashTextConfig:
+def tiny_text_config(**overrides: object) -> HYV4FlashTextConfig:
     """Six layers: sparse, sparse, swa, swa, swa, sparse; dense MLP first; Engram on layers 1 and 3 (ids 2, 4)."""
-    return HY4FlashTextConfig(**{**TINY_TEXT_KWARGS, **overrides})
+    return HYV4FlashTextConfig(**{**TINY_TEXT_KWARGS, **overrides})
 
 
 def tiny_config(
     *, vision: dict[str, int] | None = None, image_token_id: int = 250, **overrides: object
-) -> HY4FlashConfig:
+) -> HYV4FlashConfig:
     """Composite config around :func:`tiny_text_config`; ``vision`` overrides the tiny vision tower."""
     vision_kwargs = dict(
         hidden_size=32,
@@ -51,7 +51,7 @@ def tiny_config(
         rms_norm_eps=1e-5,
     )
     vision_kwargs.update(vision or {})
-    return HY4FlashConfig(
+    return HYV4FlashConfig(
         text_config=tiny_text_config(**overrides).to_dict(), vision_config=vision_kwargs, image_token_id=image_token_id
     )
 
@@ -63,7 +63,7 @@ DOC_LENGTHS = (1, 2, 3, 21, 22, 23, 37, 5, 41)
 TOLERANCE = dict(rtol=1e-4, atol=2e-5)  # fp32: same arithmetic, only the GEMM batch shapes (summation order) differ
 
 
-def build_model() -> HY4FlashForCausalLM:
+def build_model() -> HYV4FlashForCausalLM:
     torch.manual_seed(0)
     config = tiny_config(
         vision={"num_hidden_layers": 0},
@@ -71,15 +71,15 @@ def build_model() -> HY4FlashForCausalLM:
         compressed_indexer_compress_ratio=KPOOL,
         sliding_window=WINDOW,
     )
-    model = HY4FlashForCausalLM(config, backend=CPU_BACKEND).float()
+    model = HYV4FlashForCausalLM(config, backend=CPU_BACKEND).float()
     model.initialize_weights(dtype=torch.float32)
     return model
 
 
-def build_plain_model() -> HY4FlashForCausalLM:
+def build_plain_model() -> HYV4FlashForCausalLM:
     """The tiny model with its default top-k, pooling ratio and window."""
     torch.manual_seed(0)
-    model = HY4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
+    model = HYV4FlashForCausalLM(tiny_config(vision={"num_hidden_layers": 0}), backend=CPU_BACKEND).float().eval()
     model.initialize_weights(dtype=torch.float32)
     return model
 
@@ -100,7 +100,7 @@ def pack(documents: list[torch.Tensor], padding: int = 0) -> dict[str, torch.Ten
 
 
 def run_packed(
-    model: HY4FlashForCausalLM, documents: list[torch.Tensor], padding: int = 0, **overrides: torch.Tensor
+    model: HYV4FlashForCausalLM, documents: list[torch.Tensor], padding: int = 0, **overrides: torch.Tensor
 ) -> list[torch.Tensor]:
     """Logits of every document of the pack, each of shape [document_tokens, vocab]."""
     batch = {**pack(documents, padding), **overrides}
@@ -108,13 +108,13 @@ def run_packed(
     return list(logits[: sum(map(len, documents))].split([len(d) for d in documents]))
 
 
-def run_alone(model: HY4FlashForCausalLM, document: torch.Tensor) -> torch.Tensor:
+def run_alone(model: HYV4FlashForCausalLM, document: torch.Tensor) -> torch.Tensor:
     """Logits of one unpacked document, of shape [document_tokens, vocab] (the independent oracle)."""
     return model(document[None]).logits[0]
 
 
 def assert_documents_match_alone(
-    model: HY4FlashForCausalLM, documents: list[torch.Tensor], logits: list[torch.Tensor]
+    model: HYV4FlashForCausalLM, documents: list[torch.Tensor], logits: list[torch.Tensor]
 ) -> None:
     """Compare per-document logits (each [document_tokens, vocab]) with every document run alone and unpacked."""
     with torch.no_grad():
@@ -125,7 +125,7 @@ def assert_documents_match_alone(
 
 
 def assert_packed_matches_alone(
-    model: HY4FlashForCausalLM, documents: list[torch.Tensor], padding: int = 0, **overrides: torch.Tensor
+    model: HYV4FlashForCausalLM, documents: list[torch.Tensor], padding: int = 0, **overrides: torch.Tensor
 ) -> None:
     """Run the documents as one pack and compare each with the same document run alone."""
     with torch.no_grad():
