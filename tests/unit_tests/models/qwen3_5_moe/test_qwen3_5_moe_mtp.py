@@ -154,7 +154,8 @@ class TestQwen3_5MoeMTP:
         assert len(out.mtp_per_depth_h) == 1
         assert out.mtp_per_depth_h[0].shape == (1, 4, cfg.text_config.hidden_size)
 
-    def test_mtp_training_enters_modules_in_one_order_for_text_and_media(self):
+    @pytest.mark.parametrize("vision_tower_trainable", [True, False], ids=["trainable_tower", "frozen_tower"])
+    def test_mtp_training_enters_modules_in_one_order_for_text_and_media(self, vision_tower_trainable):
         """Text-only and media batches call ``embed_tokens`` once and enter the wrapped modules in one order.
 
         FSDP2 gathers a module's parameters when it is entered and prefetches in backward by forward call
@@ -165,6 +166,9 @@ class TestQwen3_5MoeMTP:
         cfg.vision_start_token_id, cfg.vision_end_token_id = 7, 8
         model = Qwen3_5MoeForConditionalGeneration(cfg, backend=_backend())
         model.initialize_weights()
+        if not vision_tower_trainable:
+            # With a frozen tower only the MTP half of the forward condition sends text-only batches through it.
+            model.model.visual.requires_grad_(False)
         model.train()
         language_model = model.model.language_model
 
@@ -366,3 +370,33 @@ class TestQwen3_5MoeTextOnlyVisionTower:
         _, outputs = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.bfloat16)
 
         assert [output.dtype for output in outputs] == [logits_dtype or torch.bfloat16]
+
+    @pytest.mark.parametrize("vision_tower_trainable", [True, False], ids=["trainable_tower", "frozen_tower"])
+    def test_text_only_splice_enters_vision_tower_only_when_trainable(self, vision_tower_trainable):
+        """A text-only ``_embed_and_splice_for_cp`` enters a trainable vision tower once and keeps the embeddings."""
+        cfg = _tiny_vl_config()
+        cfg.image_token_id, cfg.video_token_id = 5, 6
+        cfg.vision_start_token_id, cfg.vision_end_token_id = 7, 8
+        model = Qwen3_5MoeForConditionalGeneration(cfg, backend=_backend())
+        model.initialize_weights()
+        if not vision_tower_trainable:
+            model.model.visual.requires_grad_(False)
+        model.train()
+        input_ids = torch.tensor([[10, 11, 12, 13]])
+
+        visual_entries: list[str] = []
+        handle = model.model.visual.register_forward_pre_hook(lambda _module, _args: visual_entries.append("visual"))
+        try:
+            embeds = model._embed_and_splice_for_cp(
+                input_ids,
+                pixel_values=None,
+                pixel_values_videos=None,
+                image_grid_thw=None,
+                video_grid_thw=None,
+            )
+        finally:
+            handle.remove()
+
+        assert len(visual_entries) == (1 if vision_tower_trainable else 0)
+        expected = model.model.language_model.embed_tokens(input_ids)
+        torch.testing.assert_close(embeds, expected)
