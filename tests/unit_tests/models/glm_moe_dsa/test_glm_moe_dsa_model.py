@@ -19,7 +19,7 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, LMHead
 from nemo_automodel.components.models.glm_moe_dsa.model import Block, GlmMoeDsaForCausalLM, GlmMoeDsaModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
@@ -383,7 +383,7 @@ class TestGlmMoeDsaForCausalLM:
         ):
             model = GlmMoeDsaForCausalLM(config, backend=backend_config)
 
-        assert type(model.lm_head) is torch.nn.Linear
+        assert type(model.lm_head) is LMHead  # a torch nn.Linear, not TE's
         assert model.lm_head.weight.shape == (config.vocab_size, config.hidden_size)
 
     def test_initialize_weights_uses_scaled_std_for_lm_head(self, config, backend_config):

@@ -14,15 +14,16 @@
 
 
 import logging
-from contextlib import ContextDecorator, nullcontext
+import types
+from contextlib import AbstractContextManager, ContextDecorator, nullcontext
 from datetime import datetime, timedelta
-from typing import Any
 
 import torch
 import torch.distributed
 import torch.distributed as dist
+from torch.distributed.fsdp import FSDPModule
 
-from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.config import DDPConfig, DistributedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -113,10 +114,20 @@ class FirstRankPerNode(ContextDecorator):
             barrier creation.
     """
 
+    group: dist.ProcessGroup | None
+    _created_pg: bool
+    _node0_group: dist.ProcessGroup | None
+    _first: bool
+    _timeout: timedelta
+
     def __init__(self, group: dist.ProcessGroup | None = None) -> None:
         self.group = group
+        self._created_pg = False
+        self._node0_group = None
+        self._first = True
+        self._timeout = timedelta(hours=10)
 
-    def __enter__(self, timeout=timedelta(hours=10)):
+    def __enter__(self, timeout: timedelta = timedelta(hours=10)) -> bool:
         """
         Create / bootstrap a (distributed) proc. group that rank0 enters first.
 
@@ -145,7 +156,12 @@ class FirstRankPerNode(ContextDecorator):
 
         return self._first
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> bool:
         """
         Tear down the context.
 
@@ -174,11 +190,12 @@ class FirstRankPerNode(ContextDecorator):
                     logger.warning("Barrier timed out during exit, continuing anyway")
                 if exc_type is not None:
                     # Log the exception and make the error visible
+                    exc_info_arg = (exc_type, exc_val, exc_tb) if exc_val is not None else True
                     logger.error(
                         "Exception inside FirstRankPerNode: %s: %s",
                         exc_type.__name__,
                         exc_val,
-                        exc_info=(exc_type, exc_val, exc_tb),
+                        exc_info=exc_info_arg,
                     )
                     raise SystemExit(1) from exc_val
         finally:
@@ -233,7 +250,11 @@ def reduce_loss(
     return loss, denominator
 
 
-def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
+def get_sync_ctx(
+    model: torch.nn.Module,
+    is_optim_step: bool,
+    defer_fsdp_grad_sync: bool,
+) -> AbstractContextManager[None]:
     """
     Get the synchronization context for the model.
 
@@ -250,8 +271,8 @@ def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
     # Use `no_sync` on DDP models when we are *not* on the final micro-batch for
     # this gradient update (i.e., when `is_grad` is False). This avoids an
     # all-reduce for every micro-batch and greatly improves throughput.
-    sync_ctx = nullcontext()
-    if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
+    sync_ctx: AbstractContextManager[None] = nullcontext()
+    if isinstance(model, FSDPModule):
         if defer_fsdp_grad_sync:
             model.set_requires_gradient_sync(is_optim_step)
         else:
@@ -261,7 +282,11 @@ def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
     return sync_ctx
 
 
-def dp_eval_sample_shard(distributed_config: Any, dp_rank: int, dp_size: int) -> tuple | None:
+def dp_eval_sample_shard(
+    distributed_config: DistributedConfig | None,
+    dp_rank: int,
+    dp_size: int,
+) -> tuple[int, int] | None:
     """Return ``(dp_rank, dp_size)`` to shard eval samples across DP ranks, else ``None``.
 
     Only DDP replicates the full model on every rank, so only there can each rank

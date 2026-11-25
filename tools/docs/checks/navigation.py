@@ -74,6 +74,11 @@ def _collect_fern_routes(
 
 def _model_size_key(hf_model_id: str) -> tuple[str, str]:
     (organization, model_name) = hf_model_id.split("/", 1)
+    # Distinct smaller models whose names would otherwise reduce to a sibling's size stem.
+    model_aliases = {("zai-org", "glm-5.3-flash"): "glm-5.3-flash"}
+    alias = model_aliases.get((organization.casefold(), model_name.casefold()))
+    if alias is not None:
+        return (organization.casefold(), alias)
     size_pattern = re.compile("(?i)(?:^|[-_])(?:A?\\d+(?:\\.\\d+)?[BMT])(?=$|[-_])")
     size_matches = list(size_pattern.finditer(model_name))
     if size_matches:
@@ -140,6 +145,7 @@ def _validate_provider_sections(repo_root: Path) -> None:
         "embedding-models": "embedding",
         "reranking-models": "reranker",
         "wam": "wam",
+        "decision-models": "decision",
     }
     offenders: list[str] = []
     navigated_model_pages: list[Path] = []
@@ -336,7 +342,7 @@ def _validate_redirects(repo_root: Path) -> None:
         route
         for route in routes
         if re.fullmatch(
-            "/model-coverage/(?:large-language-models|vision-language-models|multimodal|omni|dllm|diffusion|embedding-models|reranking-models)/[^/]+",
+            "/model-coverage/(?:large-language-models|vision-language-models|multimodal|omni|dllm|diffusion|embedding-models|reranking-models|decision-models)/[^/]+",
             route,
         )
     }

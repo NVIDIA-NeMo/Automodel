@@ -229,6 +229,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "NemotronForDecision",
+            ("nemo_automodel.components.models.nemotron_decision.model", "NemotronForDecision"),
+        ),
+        (
             "Mistral3BidirectionalModel",
             (
                 "nemo_automodel.components.models.ministral_bidirectional.model",

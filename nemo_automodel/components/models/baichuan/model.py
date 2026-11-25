@@ -49,11 +49,11 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 logger = logging.get_logger(__name__)
@@ -257,13 +257,26 @@ class DecoderLayer(nn.Module):
 
 
 class NormHead(nn.Module):
-    def __init__(self, hidden_size, vocab_size, bias=False):
+    def __init__(self, hidden_size: int, vocab_size: int, bias: bool = False, logits_dtype: torch.dtype | None = None):
         super().__init__()
+        self.logits_dtype = logits_dtype
         self.weight = nn.Parameter(torch.empty((vocab_size, hidden_size)))
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.first_flag = True
 
     def forward(self, hidden_states):
+        """Project hidden states with the row-normalized head weight.
+
+        Training normalizes each vocabulary row of the weight to unit L2 norm on every call. The first eval call
+        after training normalizes the stored weight in place, and later eval calls reuse it.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], for example [batch, kept, hidden].
+
+        Returns:
+            Logits of shape [..., vocab], in ``logits_dtype`` when set and otherwise in the weight dtype, which
+            autocast may lower.
+        """
         if self.training:
             norm_weight = F.normalize(self.weight)
             self.first_flag = True
@@ -273,7 +286,7 @@ class NormHead(nn.Module):
             norm_weight = self.weight
         else:
             norm_weight = self.weight
-        return F.linear(hidden_states, norm_weight)
+        return LMHead.linear(hidden_states, norm_weight, logits_dtype=self.logits_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -492,12 +505,12 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BaichuanConfig, **model_kwargs):
+    def __init__(self, config: BaichuanConfig, *, logits_dtype: torch.dtype | None = None):
         warn_deprecated_model_class("BaichuanForCausalLM")
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = BaichuanModel(config)
-        self.lm_head = NormHead(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = NormHead(config.hidden_size, config.vocab_size, bias=False, logits_dtype=logits_dtype)
         self.post_init()
 
     def get_input_embeddings(self):
@@ -533,6 +546,36 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        """Run the backbone and project the kept positions to vocabulary logits.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence].
+            attention_mask: Optional Tensor of shape [batch, past + sequence], 1 at valid tokens and 0 at padding,
+                or a per-query mask of shape [batch, sequence, sequence]; it is combined with the causal mask, and
+                None masks no tokens.
+            position_ids: Optional positions of shape [batch, sequence]; None numbers them from the cached length.
+            past_key_values: Optional cache, either a ``DynamicCache`` or one (key, value) pair per layer, each of
+                shape [batch, heads, past, head_dim].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden] used instead of input_ids.
+            labels: Optional target IDs of shape [batch, sequence] for the shifted next-token cross-entropy, which
+                ignores -100; ``config.z_loss_weight``, when set, adds that weight times the mean squared max logit.
+            use_cache: Whether to return the updated cache; None reads ``config.use_cache``.
+            output_attentions: Passed to the backbone, whose SDPA attention returns no weights.
+            output_hidden_states: Whether the output carries the final hidden states; None reads
+                ``config.output_hidden_states``.
+            return_dict: Whether to return ``CausalLMOutputWithPast`` instead of a tuple.
+            logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
+                Tensor of shape [kept] keeps those positions.
+            **kwargs: Extra batch keys, such as ``padding_mask`` or packed-sequence metadata, which are ignored.
+
+        Returns:
+            CausalLMOutputWithPast, or the matching tuple when ``return_dict`` is False. ``logits`` have shape
+            [batch, kept, vocab], in the head's ``logits_dtype`` when set and otherwise in its weight dtype, which
+            autocast may lower; without a head (``lm_head`` is None) they are the hidden states. ``loss`` is a
+            scalar when labels are given. ``past_key_values``, when caching, hold one (key, value) pair per layer,
+            each of shape [batch, heads, past + sequence, head_dim]. ``hidden_states``, when requested, are the final
+            hidden states of shape [batch, sequence, hidden].
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -555,7 +598,9 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()

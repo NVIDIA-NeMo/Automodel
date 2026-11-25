@@ -44,6 +44,7 @@ from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 
 @pytest.fixture
@@ -527,14 +528,12 @@ class TestForwardShapes:
         batch, seq = 1, 5
         input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
         position_ids = torch.arange(seq).unsqueeze(0)
-        hidden = torch.randn(seq, dense_config.hidden_size)
-        with torch.no_grad(), patch.object(model.model, "forward", return_value=hidden):
-            out = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                output_hidden_states=True,
+        with torch.no_grad():
+            out, layer_inputs = run_with_passthrough_layers(
+                model, input_ids, position_ids=position_ids, qkv_format="thd", output_hidden_states=True
             )
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq, dense_config.hidden_size) for shape in layer_inputs)
         assert out.logits.shape == (batch, seq, dense_config.vocab_size)
         assert out.hidden_states.shape == (batch, seq, dense_config.hidden_size)
 
@@ -551,19 +550,17 @@ class TestForwardShapes:
         batch, seq = 1, 5
         input_ids = torch.randint(0, moe_hf_config.vocab_size, (batch, seq))
         position_ids = torch.arange(seq).unsqueeze(0)
-        hidden = torch.randn(seq, moe_hf_config.hidden_size)
-        with torch.no_grad(), patch.object(model.model, "forward", return_value=hidden):
-            out = model(
-                input_ids,
-                position_ids=position_ids,
-                qkv_format="thd",
-                output_hidden_states=True,
+        with torch.no_grad():
+            out, layer_inputs = run_with_passthrough_layers(
+                model, input_ids, position_ids=position_ids, qkv_format="thd", output_hidden_states=True
             )
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq, moe_hf_config.hidden_size) for shape in layer_inputs)
         assert out.logits.shape == (batch, seq, moe_hf_config.vocab_size)
         assert out.hidden_states.shape == (batch, seq, moe_hf_config.hidden_size)
 
-    # NOTE: these thd-format causal-LM wrapper tests mock the inner model. The
-    # real thd attention path is implemented for TransformerEngine; sdpa cannot
+    # NOTE: these thd-format causal-LM tests replace the decoder layers with the identity.
+    # The real thd attention path is implemented for TransformerEngine; sdpa cannot
     # consume variable-length packed sequences without bshd reshaping.
 
 

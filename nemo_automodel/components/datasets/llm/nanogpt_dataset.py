@@ -363,8 +363,9 @@ class NanogptDataset(IterableDataset):
         if not worker_files:
             worker_files = files.copy()  # fallback-duplication acceptable for small shard counts
 
-        # Handle single file case: split the file among workers
-        split_single_file = len(worker_files) == 1 and total_workers > 1
+        # Split a file among workers only when the dataset is a single shard. A worker that merely ends
+        # up with one shard out of several (e.g. 3 shards over 2 workers) must read all of it.
+        split_single_file = len(files) == 1 and total_workers > 1
         file_start_pos = 0
         file_end_pos = None
 
