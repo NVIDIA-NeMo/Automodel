@@ -29,7 +29,7 @@ selection sized the mask by the local shard instead of the gathered K/V
 (``mask=(8, 8)`` versus ``tensors=(8, 16)``); the CPU unit tests cannot reach
 it because the flex mask is only built on CUDA. The FA4 backend builds its
 membership table and block lists from local queries against global keys. It
-has SM90 kernels only, so other GPUs skip it.
+has SM90 and SM100-family (10.x/11.x) kernels only, so other GPUs skip it.
 
 Run::
 
@@ -121,8 +121,9 @@ def _document_relative_freqs(cu_seqlens: tuple[int, ...], rotary_width: int) -> 
 
 
 def _fa4_supported(device: torch.device) -> bool:
-    """FA4 QSA has SM90 kernels only."""
-    return torch.cuda.get_device_capability(device) == (9, 0)
+    """FA4 QSA has SM90 and SM100-family (10.x/11.x) kernels only."""
+    major, minor = torch.cuda.get_device_capability(device)
+    return (major, minor) == (9, 0) or major in (10, 11)
 
 
 def _check_packed_cp_parity(attn: str, cp_mesh: DeviceMesh, device: torch.device) -> None:
@@ -268,7 +269,9 @@ def main() -> None:
     if _fa4_supported(device):
         backends.append("fa4")
     elif rank == 0:
-        print(f"[skip] FA4 QSA packed CP parity needs an SM90 GPU, got {torch.cuda.get_device_name(device)}")
+        print(
+            f"[skip] FA4 QSA packed CP parity needs SM90 or SM100-family GPUs, got {torch.cuda.get_device_name(device)}"
+        )
     for attn in backends:
         _check_packed_cp_parity(attn, cp_mesh, device)
         torch.cuda.synchronize()

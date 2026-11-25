@@ -28,7 +28,7 @@ from nemo_automodel.shared.import_utils import safe_import
 # Public source checksums, not credentials. Remove this compatibility gate once
 # upstream FA4 advertises initialized unused seqused output/gradient rows.
 _FA4_ORIGINAL_INTERFACE_SHA256 = (
-    "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"  # pragma: allowlist secret
+    "c3895b66051bf09ca3e98f63e0f4c84e608d2300e2024eb315db9d4ee77c8cd0"  # pragma: allowlist secret
 )
 _FA4_PHYSICAL_INTERFACE_SHA256 = (
     "de3781369943fcfa1df9344999c7ad7496bfb607d80e852406e07ebf8e28ed22"  # pragma: allowlist secret

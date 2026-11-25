@@ -30,7 +30,7 @@ _CUDA_AND_TRITON = pytest.mark.skipif(
     not torch.cuda.is_available() or not fa4_qsa.HAVE_TRITON,
     reason="the QSA preprocessing kernels need CUDA and Triton",
 )
-BLOCK_KEYS = pytest.mark.parametrize("forward_keys, backward_keys", [(80, 64)], ids=["sm90"])
+BLOCK_KEYS = pytest.mark.parametrize("forward_keys, backward_keys", [(80, 64), (128, 128)], ids=["sm90", "sm100"])
 
 
 def _reference_kinds(membership: torch.Tensor, block_keys: int) -> torch.Tensor:
@@ -191,6 +191,24 @@ def test_block_lists_distinguish_full_partial_and_empty(forward_keys: int, backw
     assert rfc.tolist() == [[[1, 0]]]
     assert rpi[0, 0, 1, 0] == 0
     assert rfi[0, 0, 0, 0] == 0
+
+
+@pytest.mark.parametrize(
+    "capability, expected",
+    [((9, 0), (80, 64)), ((10, 0), (128, 128)), ((10, 3), (128, 128)), ((10, 7), (128, 128)), ((11, 0), (128, 128))],
+)
+def test_block_keys_match_fa4_tiles_per_architecture(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], expected: tuple[int, int]
+) -> None:
+    monkeypatch.setattr(fa4_qsa.torch.cuda, "get_device_capability", lambda device: capability)
+    assert fa4_qsa._block_keys(torch.device("cuda", 0)) == expected
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (8, 9), (12, 0)])
+def test_block_keys_reject_gpus_without_fa4_qsa(monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]) -> None:
+    monkeypatch.setattr(fa4_qsa.torch.cuda, "get_device_capability", lambda device: capability)
+    with pytest.raises(RuntimeError, match=f"SM90 and SM100-family.*got SM{capability[0]}{capability[1]}"):
+        fa4_qsa._block_keys(torch.device("cuda", 0))
 
 
 def test_preprocess_without_triton_raises_an_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:

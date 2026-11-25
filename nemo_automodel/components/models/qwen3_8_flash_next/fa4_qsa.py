@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM90 QSA using Triton preprocessing and FlashAttention 4.
+"""SM90 and SM100-family QSA using Triton preprocessing and FlashAttention 4.
 
 Optional FA4/CuTe dependencies are loaded on the first CUDA call. The only
 CuTe code owned here is the mask callback compiled into FA4's kernels.
@@ -36,7 +36,7 @@ _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 HAVE_TRITON: bool = bool(_HAVE_TRITON and _HAVE_TRITON_LANGUAGE)
 
-# FA4 QSA query blocks hold 128 rows.
+# FA4 QSA query blocks hold 128 rows on SM90 and on the SM100 family.
 _QUERY_BLOCK = 128
 # Keys each chunk-classification program reads per row (a 128 x 256-byte tile).
 _KEYS_PER_CHUNK_PROGRAM = 256
@@ -234,6 +234,30 @@ if HAVE_TRITON:
         tl.store(full_counts + program, count)
 
 
+def _block_keys(device: torch.device) -> tuple[int, int]:
+    """Return the forward and backward key-block widths of FA4's head_dim=256 QSA kernels.
+
+    FA4 checks block-sparse lists against its KV tiles; query blocks are always 128 rows. SM90
+    runs 128x80 forward and 64x64 backward tiles. The SM100 family runs 128x128 forward tiles and
+    a 2CTA backward whose 64-key tiles must pair up, so both directions use 128 keys there.
+
+    Args:
+        device: CUDA device that runs the attention.
+
+    Returns:
+        Keys per forward block and keys per backward block.
+
+    Raises:
+        RuntimeError: When the device is neither SM90 nor compute capability 10.x/11.x.
+    """
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) == (9, 0):
+        return 80, 64
+    if major in (10, 11):
+        return 128, 128
+    raise RuntimeError(f"FA4 QSA supports SM90 and SM100-family (10.x/11.x) GPUs only; got SM{major}{minor}")
+
+
 def _preprocess(
     routes: torch.Tensor, kv_length: int, forward_block_keys: int, backward_block_keys: int
 ) -> tuple[torch.Tensor, ...]:
@@ -245,8 +269,8 @@ def _preprocess(
             large int64 values, are discarded. routes_per_query may differ between
             calls without compiling new kernels.
         kv_length: Positive number of physical key/value positions.
-        forward_block_keys: Keys per forward block, FA4's forward KV tile width.
-        backward_block_keys: Keys per backward block, FA4's backward KV tile width.
+        forward_block_keys: Keys per forward block (see _block_keys).
+        backward_block_keys: Keys per backward block (see _block_keys).
 
     Returns:
         Uint8 membership [batch, queries, kv_length], with each row padded to a
@@ -342,7 +366,7 @@ def fa4_sparse_gqa_attention(
     *,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Evaluate exact route-set GQA using FA4 on SM90.
+    """Evaluate exact route-set GQA using FA4 on SM90 or SM100-family GPUs.
 
     Duplicate routes select a token once. Invalid IDs are ignored. Empty query
     rows have zero output and query gradients. Routes encode causality,
@@ -386,10 +410,7 @@ def fa4_sparse_gqa_attention(
         raise TypeError("FA4 QSA requires BF16 query, key, and value")
     if not query.is_cuda or any(t.device != query.device for t in (key, value, selected_token_ids)):
         raise ValueError("FA4 QSA requires Q/K/V/routes on the same CUDA device")
-    if torch.cuda.get_device_capability(query.device) != (9, 0):
-        raise RuntimeError("FA4 QSA currently supports SM90 GPUs only")
-    # SM90's head_dim=256 FA4 kernels run 128x80 forward and 64x64 backward tiles.
-    forward_keys, backward_keys = 80, 64
+    forward_keys, backward_keys = _block_keys(query.device)
     padded_keys = ((key.shape[1] + 32) // 32) * 32
     if query.shape[0] * query.shape[1] * padded_keys >= 2**31:
         raise ValueError("FA4 QSA byte mask exceeds int32 indexing limits")
