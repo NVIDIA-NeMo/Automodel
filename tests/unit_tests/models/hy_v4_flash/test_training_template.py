@@ -104,3 +104,23 @@ def test_explicit_reasoning_effort_and_generation_prompts_are_left_alone():
     processor.apply_chat_template(ANSWER_ONLY[:1], add_generation_prompt=True)
     assert tokenizer.calls[0]["reasoning_effort"] == "high"
     assert "reasoning_effort" not in tokenizer.calls[1]  # inference keeps the template's own default
+
+
+def test_released_processor_config_gives_the_default_image_settings() -> None:
+    """``image_processor`` block of ``processor_config.json`` at tencent/Hy4-flash revision eccd3123 (consumed fields)."""
+    from nemo_automodel.components.models.hy_v4_flash.processing import (
+        HY4FlashImageSettings,
+        image_settings_from_processor_config,
+    )
+
+    released = {
+        "patch_size": 16,
+        "merge_size": 2,
+        "min_pixels": 4096,
+        "max_pixels": 4194304,
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+    }
+    assert image_settings_from_processor_config(released) == HY4FlashImageSettings()
+    changed = image_settings_from_processor_config({**released, "max_pixels": 1048576, "image_mean": [0.1, 0.2, 0.3]})
+    assert changed.max_pixels == 1048576 and changed.mean == (0.1, 0.2, 0.3)

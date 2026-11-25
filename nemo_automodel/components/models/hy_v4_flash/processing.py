@@ -24,6 +24,7 @@ the resampling filter, but the reference (and the original implementation) alway
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -32,13 +33,14 @@ from typing import Literal, Required, TypeAlias, TypedDict
 
 import numpy as np
 import torch
-from PIL import Image
 from transformers import AutoTokenizer, BatchFeature, PreTrainedTokenizerFast, ProcessorMixin
+from transformers.utils import cached_file
 
+from nemo_automodel.components.models.hy_v4_flash.config import HY4FlashConfig
 from nemo_automodel.shared.import_utils import safe_import
 
-_HAS_TV, _tv_functional = safe_import("torchvision.transforms.v2.functional")
-_HAS_TV_T, _tv_transforms = safe_import("torchvision.transforms.v2")
+_, Image = safe_import("PIL.Image")
+_, _tv_transforms = safe_import("torchvision.transforms.v2")
 
 ImageSource: TypeAlias = "Image.Image | str | Path | bytes"
 TokenizerOption: TypeAlias = "bool | int | str | list[str] | None"
@@ -53,7 +55,7 @@ class ImageUrl(TypedDict):
 class ChatContentBlock(TypedDict, total=False):
     """One text or image block of a chat message (the Hugging Face multimodal chat format)."""
 
-    type: Required[str]
+    type: Required[Literal["text", "image", "image_url"]]
     text: str
     image: ImageSource
     path: str
@@ -92,6 +94,30 @@ class HY4FlashImageSettings:
     max_pixels: int = 4194304
     mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+
+class ImageProcessorConfig(TypedDict):
+    """The fields of the ``image_processor`` block of the released ``processor_config.json`` that are consumed."""
+
+    patch_size: int
+    merge_size: int
+    min_pixels: int
+    max_pixels: int
+    image_mean: list[float]
+    image_std: list[float]
+
+
+def image_settings_from_processor_config(block: ImageProcessorConfig) -> HY4FlashImageSettings:
+    """Preprocessing constants of a checkpoint's ``processor_config.json`` ``image_processor`` block."""
+    mean, std = block["image_mean"], block["image_std"]
+    return HY4FlashImageSettings(
+        patch_size=block["patch_size"],
+        merge_size=block["merge_size"],
+        min_pixels=block["min_pixels"],
+        max_pixels=block["max_pixels"],
+        mean=(mean[0], mean[1], mean[2]),
+        std=(std[0], std[1], std[2]),
+    )
 
 
 def smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixels: int) -> tuple[int, int]:
@@ -141,7 +167,7 @@ def preprocess_image(image: Image.Image, settings: HY4FlashImageSettings) -> tup
     tensor = torch.from_numpy(rgb.copy()).permute(2, 0, 1)
     grid_h, grid_w = image_grid(tensor.shape[1], tensor.shape[2], settings)
     size = [grid_h * settings.patch_size, grid_w * settings.patch_size]
-    resized = _tv_functional.resize(
+    resized = _tv_transforms.functional.resize(
         tensor, size, interpolation=_tv_transforms.InterpolationMode.BICUBIC, antialias=True
     )
     scaled = resized.float() * (1.0 / 255.0)
@@ -221,14 +247,18 @@ class HY4FlashProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs: TokenizerOption) -> HY4FlashProcessor:
-        """Load the checkpoint tokenizer; the image constants are this class's defaults (the released values)."""
+        """Load the checkpoint's tokenizer, image token id (``config.json``) and image constants (``processor_config.json``)."""
         loading = {
             key: kwargs[key]
             for key in ("cache_dir", "revision", "token", "trust_remote_code", "local_files_only")
             if key in kwargs
         }
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **loading)
-        return cls(tokenizer=tokenizer)
+        config = HY4FlashConfig.from_pretrained(pretrained_model_name_or_path, **loading)
+        hub = {key: value for key, value in loading.items() if key != "trust_remote_code"}
+        with open(cached_file(pretrained_model_name_or_path, "processor_config.json", **hub)) as handle:
+            settings = image_settings_from_processor_config(json.load(handle)["image_processor"])
+        return cls(tokenizer=tokenizer, image_token_id=config.image_token_id, settings=settings)
 
     # ------------------------------------------------------------------ tokenisation
     def __call__(
