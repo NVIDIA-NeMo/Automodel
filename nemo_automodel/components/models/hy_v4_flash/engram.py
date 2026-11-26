@@ -252,10 +252,8 @@ class HYV4FlashEngramLayer(nn.Module):
         emb = self.multi_head_embedding.embedding(rows).to(dtype)  # [B, S, heads, head_dim]
         emb = weighted_rms_norm(emb, self.lookup_per_head_norms)
         emb = emb.flatten(-2)
-        batch, seq = emb.shape[:2]
-        key_weight = torch.cat([m.weight for m in self.key_projs]).to(dtype)
-        key_bias = torch.cat([m.bias for m in self.key_projs]).to(dtype)
-        key = F.linear(emb, key_weight, key_bias).view(batch, seq, self.hc_mult, -1)
+        # One call per projection, so an adapter attached to a key projection takes part in the forward.
+        key = torch.stack([proj(emb) for proj in self.key_projs], dim=2)
         key = weighted_rms_norm(key, self.norm_key)
         query = weighted_rms_norm(streams, self.norm_query)
         logit = (key.float() * query.float()).sum(-1) * self.hidden_size**-0.5

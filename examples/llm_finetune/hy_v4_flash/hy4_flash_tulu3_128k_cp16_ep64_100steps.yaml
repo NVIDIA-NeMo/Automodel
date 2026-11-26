@@ -91,6 +91,10 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
+  tokenizer:
+    pretrained_model_name_or_path: tencent/Hy4-flash
+    revision: eccd3123eec73f2040f4c9ed0de1883593470510  # pragma: allowlist secret (public model commit SHA)
+    tokenizer_backend: nemo_wrapped_auto
   split: train
   shuffle_seed: 1234
   seq_length: 131072

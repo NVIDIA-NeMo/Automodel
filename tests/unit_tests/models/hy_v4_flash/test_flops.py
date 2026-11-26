@@ -38,12 +38,20 @@ def _brute_force(cfg: HYV4FlashConfig, seq_len: int) -> float:
         linear += 2 * 2 * hc * hc * hs
         total += 6 * seq_len * linear
         for i in range(seq_len):
-            keys = min(i + 1, t.sliding_window if kind == "sliding_attention" else t.index_topk)
+            if kind == "sliding_attention":
+                keys = min(i + 1, t.sliding_window)
+            else:
+                closed_groups, offset = divmod(i, t.index_kpool)
+                recalled = min(closed_groups, t.index_topk // t.index_kpool - 1)
+                keys = recalled * t.index_kpool + offset + 1
             total += 6 * heads * ((nope + rope) + v) * keys
             if kind != "sliding_attention":
                 n, d = t.index_n_heads, t.index_head_dim
-                total += 2 * (t.q_lora_rank * n * d + hs * n + hs * d + 2 * d * d)
-                total += 2 * n * d * ((i + 1) // t.index_kpool)
+                total += 2 * hs * d
+                if seq_len > t.index_topk:
+                    total += 2 * (t.q_lora_rank * n * d + hs * n + n * d * (i // t.index_kpool))
+                    if i // t.index_kpool < (seq_len - 1) // t.index_kpool:
+                        total += 4 * d * d
     total += (
         6
         * seq_len

@@ -18,6 +18,7 @@ Without it the Engram ID all-to-all receives corrupted IDs from ranks on another
 exercised in a unit test, so this guards the declaration.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -38,3 +39,21 @@ def test_multi_node_h100_recipe_disables_pxn(recipe: str) -> None:
         ci = yaml.safe_load(handle)["ci"]
     assert ci["cluster_tag"] == "h100" and ci["nodes"] > 1
     assert ci["env_vars"]["NCCL_PXN_DISABLE"] == "1"
+
+
+@pytest.mark.parametrize("recipe", RECIPES)
+def test_every_hub_reference_is_pinned_to_one_commit(recipe: str) -> None:
+    def references(node: object) -> list[dict[str, object]]:
+        if isinstance(node, dict):
+            own = [node] if node.get("pretrained_model_name_or_path") == "tencent/Hy4-flash" else []
+            return own + [found for value in node.values() for found in references(value)]
+        return [found for value in node for found in references(value)] if isinstance(node, list) else []
+
+    with (REPO / recipe).open() as handle:
+        config = yaml.safe_load(handle)
+    if config["dataset"]["_target_"].endswith("ChatDataset"):  # its training ids come from this tokenizer
+        assert config["dataset"]["tokenizer"]["pretrained_model_name_or_path"] == "tencent/Hy4-flash"
+    found = references(config)
+    revisions = {ref.get("revision") for ref in found}
+    # One full commit id for the weights, the config, the processor and the tokenizer: never a moving branch.
+    assert found and len(revisions) == 1 and re.fullmatch(r"[0-9a-f]{40}", str(revisions.pop()))

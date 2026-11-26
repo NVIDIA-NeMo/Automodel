@@ -280,9 +280,10 @@ class HYV4FlashCompressedIndexer(nn.Module):
             if visible == 0:
                 continue
             # Out of place on purpose: selective activation checkpointing caches matmul / bmm results, and a cached
-            # tensor must not be mutated.
-            scores = torch.matmul(query[start:end].float().flatten(0, 1), keys[:visible].T).relu()
-            logits = torch.bmm(head_weights[start:end, None], scores.view(end - start, self.n_heads, visible))[:, 0]
+            # tensor must not be mutated. An outer BF16 autocast would round the fp32 operands before scoring.
+            with torch.autocast(device_type=query.device.type, enabled=False):
+                scores = torch.matmul(query[start:end].float().flatten(0, 1), keys[:visible].T).relu()
+                logits = torch.bmm(head_weights[start:end, None], scores.view(end - start, self.n_heads, visible))[:, 0]
             group = torch.arange(visible, device=device)
             closed = group < own_group[start:end, None]
             logits = logits.masked_fill(~closed, float("-inf"))

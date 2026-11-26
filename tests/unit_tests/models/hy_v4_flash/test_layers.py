@@ -166,3 +166,22 @@ def test_swiglu_clamp_applies_to_routed_experts_and_not_to_the_shared_expert() -
     torch.testing.assert_close(ours, expected, rtol=1e-4, atol=1e-4)
     assert not torch.allclose(ours, shared_clamped, rtol=1e-2, atol=1e-2)
     assert not torch.allclose(ours, routed_unclamped, rtol=1e-2, atol=1e-2)
+
+
+def test_outer_bf16_autocast_does_not_lower_the_fp32_hyper_connection_arithmetic() -> None:
+    from nemo_automodel.components.models.hy_v4_flash.layers import HYV4FlashHyperConnection, HYV4FlashHyperHead
+    from tests.unit_tests.models.hy_v4_flash.conftest import tiny_text_config
+
+    torch.manual_seed(0)
+    config = tiny_text_config()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    streams = torch.randn(2, 9, config.hc_mult, config.hidden_size, device=device).bfloat16()
+    for module in (HYV4FlashHyperConnection(config), HYV4FlashHyperHead(config)):
+        module.init_weights(0.5)
+        module.to(device)
+        with torch.no_grad():
+            plain = module(streams)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                lowered = module(streams)
+        for actual, expected in zip(*((x if isinstance(x, tuple) else (x,)) for x in (lowered, plain))):
+            assert actual.dtype == expected.dtype and torch.equal(actual, expected)

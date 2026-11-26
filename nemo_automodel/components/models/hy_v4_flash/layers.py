@@ -82,7 +82,8 @@ def _hc_collapse_core(
     hc_mult = streams.shape[2]
     wide = streams.float()
     flat = wide.flatten(2)
-    mixes = F.linear(flat, fn) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    with torch.autocast(device_type=streams.device.type, enabled=False):  # an outer BF16 autocast lowers F.linear
+        mixes = F.linear(flat, fn) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
     pre_logits, post_logits = mixes.split(hc_mult, dim=-1)
     pre = torch.sigmoid(pre_logits * scale[0] + base[:hc_mult]) + hc_eps
     post = hc_magnitude * torch.sigmoid(post_logits * scale[1] + base[hc_mult:]) + hc_eps
@@ -247,7 +248,10 @@ class HYV4FlashHyperHead(nn.Module):
         """
         wide = streams.float()
         flat = wide.flatten(2)
-        mixes = F.linear(flat, self.hc_fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        with torch.autocast(device_type=streams.device.type, enabled=False):
+            mixes = F.linear(flat, self.hc_fn.float()) * torch.rsqrt(
+                flat.square().mean(-1, keepdim=True) + self.norm_eps
+            )
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
         return (pre.unsqueeze(-1) * wide).sum(dim=2).to(streams.dtype)
 

@@ -37,7 +37,9 @@ is rejected with an error: training on reasoning traces is not supported.
 - The recipes compile the hyper-connection and norm cores (`compile_hc`, `compile_norm`), so the first step takes
   several minutes longer than the following ones. The cores are compiled with options that keep the eager BF16
   rounding points, so the compiled norm agrees with the eager one on all but a few elements in a million; LoRA and
-  full fine-tuning start within 1.4e-3 of each other in loss. Set `compile_norm: false` for the eager norm.
+  full fine-tuning start within 1.4e-3 of each other in loss. `compile_norm: false` gives the eager norm in a process
+  where no model has enabled the compiled core: the core is shared by every Hy4-flash model of a process, so once
+  one model enables it, existing and later instances use it too.
 
 ## Model Reference
 

@@ -47,6 +47,26 @@ def test_knobs_default_off() -> None:
     assert BackendConfig().compile_norm is False and BackendConfig().compile_hc is False
 
 
+def test_hooks_keep_the_eager_cores_without_the_precision_options(
+    restore_cores: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An Inductor without the options would not reproduce the eager rounding, so nothing is compiled.
+    monkeypatch.setattr(layers, "_compile_options", lambda: None)
+    layers._NORM_COMPILED = layers._HC_COMPILED = False
+    layers._rms_norm, layers._hc_collapse, layers._hc_expand = (
+        layers._rms_norm_core,
+        layers._hc_collapse_core,
+        layers._hc_expand_core,
+    )
+    layers.compile_norm_core()
+    layers.compile_hc_cores()
+    assert layers._rms_norm is layers._rms_norm_core
+    assert (layers._hc_collapse, layers._hc_expand) == (layers._hc_collapse_core, layers._hc_expand_core)
+    norm = HYV4FlashRMSNorm(8, 1e-5, torch.bfloat16)
+    hidden = torch.randn(3, 8, generator=torch.Generator().manual_seed(0)).bfloat16()
+    assert torch.equal(norm(hidden), layers._rms_norm_core(hidden, norm.weight, norm.eps))
+
+
 def test_hooks_are_idempotent(restore_cores: None) -> None:
     layers.compile_hc_cores()
     first = (layers._hc_collapse, layers._hc_expand)
@@ -61,8 +81,19 @@ def test_hooks_are_idempotent(restore_cores: None) -> None:
 @pytest.mark.runtime_budget(
     30, reason="compiles the RMSNorm core and the two hyper-connection cores with torch.compile for one dtype"
 )
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_compiled_cores_reach_modules_built_earlier(restore_cores: None, dtype: torch.dtype) -> None:
+@pytest.mark.parametrize(
+    ("dtype", "device"),
+    [
+        (torch.float32, "cpu"),
+        # The CPU Inductor of the minimum supported PyTorch cannot lower the BF16 cast with the precision options.
+        pytest.param(
+            torch.bfloat16,
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="BF16 compilation runs on the GPU path"),
+        ),
+    ],
+)
+def test_compiled_cores_reach_modules_built_earlier(restore_cores: None, dtype: torch.dtype, device: str) -> None:
     """The hooks the recipes call swap the cores under modules that already exist.
 
     The cores are compiled with Inductor's precision options, which keep the eager cast points: fp32 agrees to
@@ -72,10 +103,11 @@ def test_compiled_cores_reach_modules_built_earlier(restore_cores: None, dtype: 
     config = tiny_text_config()
     connection = HYV4FlashHyperConnection(config)
     connection.init_weights(config.initializer_range)
-    norm = HYV4FlashRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+    connection = connection.to(device)
+    norm = HYV4FlashRMSNorm(config.hidden_size, config.rms_norm_eps, dtype).to(device)
     with torch.no_grad():
         norm.weight.copy_((1 + 0.1 * torch.randn(config.hidden_size)).to(dtype))
-    streams = torch.randn(2, 9, config.hc_mult, config.hidden_size).to(dtype)
+    streams = torch.randn(2, 9, config.hc_mult, config.hidden_size).to(device, dtype)
 
     def run(
         inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,

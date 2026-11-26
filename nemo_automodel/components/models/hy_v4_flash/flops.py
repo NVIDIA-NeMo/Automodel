@@ -17,9 +17,10 @@
 Registered through ``HYV4FlashConfig.flops_formula`` so no shared utility names this model. Counted per token:
 
 * the expanded MLA linears of every layer (the absorbed kernel's extra work is hardware FLOPs, not model FLOPs);
-* the QK^T and PV products over ``min(i + 1, window)`` keys in sliding layers and ``min(i + 1, index_topk)`` keys
-  in sparse layers;
-* the frozen compressed indexer on sparse layers, forward only (2 x MACs: a hard top-k has no gradient);
+* the QK^T and PV products over ``min(i + 1, window)`` keys in sliding layers and, in sparse layers, over the query's
+  own partial pool plus at most ``index_topk / index_kpool - 1`` closed pools;
+* the frozen compressed indexer on sparse layers, forward only (2 x MACs: a hard top-k has no gradient); documents
+  no longer than ``index_topk`` only project their token keys;
 * the MoE router, latent projections, ``top_k`` routed experts and the shared expert (a dense MLP in layer 0);
 * two hyper-connection sites per layer and the head, the Engram projections, and the fp32 ``lm_head``.
 
@@ -54,10 +55,17 @@ def hy_v4_flash_flops(config: HYV4FlashConfig | HYV4FlashTextConfig, gbs: int = 
         if attention_type == "sliding_attention":
             keys = _sum_min_window(seq_len, text.sliding_window)
         else:
-            keys = _sum_min_window(seq_len, text.index_topk)
+            # Each query attends its own partial pool plus at most topk / pool - 1 closed pools.
+            pool = text.index_kpool
+            closed = _sum_min_floor_div(seq_len - 1, pool, None)
+            recalled = _sum_min_floor_div(seq_len - 1, pool, text.index_topk // pool - 1)
+            keys = seq_len * (seq_len + 1) // 2 - pool * (closed - recalled)
             n, d = text.index_n_heads, text.index_head_dim
-            indexer_macs += seq_len * (text.q_lora_rank * n * d + hs * n + hs * d + 2 * d * d)
-            indexer_macs += n * d * _sum_min_floor_div(seq_len, text.index_kpool, None)
+            indexer_macs += seq_len * hs * d  # token keys are projected even on the dense-prefix path
+            if seq_len > text.index_topk:
+                pooled_tokens = ((seq_len - 1) // pool) * pool
+                indexer_macs += seq_len * (text.q_lora_rank * n * d + hs * n)
+                indexer_macs += pooled_tokens * 2 * d * d + n * d * closed
         attention_keys_macs += heads * (qk + value) * keys
         if text.mlp_layer_types[layer] == "sparse":
             macs_per_token += hs * text.n_routed_experts + 2 * hs * text.routed_expert_hidden_size

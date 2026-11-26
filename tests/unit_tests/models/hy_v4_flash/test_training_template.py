@@ -133,3 +133,25 @@ def test_released_processor_config_gives_the_default_image_settings() -> None:
     assert image_settings_from_processor_config(released) == HYV4FlashImageSettings()
     changed = image_settings_from_processor_config({**released, "max_pixels": 1048576, "image_mean": [0.1, 0.2, 0.3]})
     assert changed.max_pixels == 1048576 and changed.mean == (0.1, 0.2, 0.3)
+
+
+def test_system_message_after_the_first_turn_is_rendered() -> None:
+    conversation = [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello!"},
+        {"role": "system", "content": "Speak Spanish."},
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hola."},
+    ]
+    turn = START + "user" + MIDDLE + "Hi" + END + ANSWER
+    released = (
+        HEADER.format(system="")
+        + (turn + "Hello!" + END)
+        + (START + "system" + MIDDLE + "Speak Spanish." + END)
+        + (turn + "Hola." + END)
+    )
+    rendered, spans = render_jinja_template(
+        conversations=[conversation], chat_template=TEMPLATE.read_text(), return_assistant_tokens_mask=True
+    )
+    assert rendered == [released]
+    assert [rendered[0][start:end] for start, end in spans[0]] == ["Hello!" + END, "Hola." + END]

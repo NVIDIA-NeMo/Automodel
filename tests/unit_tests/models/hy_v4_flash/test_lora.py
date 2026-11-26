@@ -75,3 +75,18 @@ def test_adapter_without_dropout_trains_like_the_merged_weight() -> None:
         assert b.grad.abs().sum() > 0 and a.grad.abs().sum() > 0
         torch.testing.assert_close(module.lora_A.weight.grad, a.grad, rtol=2e-3, atol=2e-4)
         torch.testing.assert_close(module.lora_B.weight.grad, b.grad, rtol=2e-3, atol=2e-4)
+
+
+def test_adapters_on_the_engram_projections_receive_gradients() -> None:
+    model = build_model()
+    targets = ["model.layers.*.engram_layer.key_projs.*", "model.layers.*.engram_layer.value_proj"]
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=targets, dim=4, alpha=8, dropout=0.0))
+    adapters = {name: module for name, module in model.named_modules() if isinstance(module, LinearLoRA)}
+    assert sum("key_projs" in name for name in adapters) == 8 and sum("value_proj" in name for name in adapters) == 2
+    with torch.no_grad():
+        for module in adapters.values():  # B starts at zero, which would leave A without a gradient
+            module.lora_B.weight.fill_(0.05)
+    model(_ids()).logits.square().sum().backward()
+    for name, module in adapters.items():
+        for factor in (module.lora_A, module.lora_B):
+            assert factor.weight.grad is not None and factor.weight.grad.abs().sum() > 0, name

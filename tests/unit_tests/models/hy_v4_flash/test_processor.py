@@ -97,3 +97,40 @@ def test_sample_with_reasoning_is_rejected_instead_of_training_on_no_token(field
     sample = {"conversation": [{"role": "user", "content": "what"}, turn]}
     with pytest.raises(ValueError, match="assistant reasoning are not supported"):
         default_collate_fn([sample], _chat_processor())
+
+
+def test_saved_processor_reloads_from_its_own_directory_with_its_image_token_id(tmp_path: Path) -> None:
+    # No model config next to it, or one that names another id: the persisted id of the processor wins.
+    HYV4FlashProcessor(_tokenizer(), image_token_id=IMAGE_TOKEN_ID).save_pretrained(tmp_path)
+    assert HYV4FlashProcessor.from_pretrained(tmp_path, local_files_only=True).image_token_id == IMAGE_TOKEN_ID
+    tiny_config(image_token_id=IMAGE_TOKEN_ID + 1).save_pretrained(tmp_path)
+    assert AutoProcessor.from_pretrained(tmp_path, local_files_only=True).image_token_id == IMAGE_TOKEN_ID
+
+
+@pytest.mark.parametrize("block", ["image_url", "url"])
+def test_image_data_uri_loads_like_the_same_pil_image(block: str) -> None:
+    import base64
+    import io
+
+    pixels = torch.randint(0, 256, (64, 64, 3), generator=torch.Generator().manual_seed(1), dtype=torch.uint8)
+    image = Image.fromarray(pixels.numpy())
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    source = {"type": "image_url", "image_url": {"url": uri}} if block == "image_url" else {"type": "image", "url": uri}
+    tokenizer = _tokenizer()
+    tokenizer.chat_template = (
+        "{% for m in messages %}{% for b in m['content'] %}"
+        "{% if b['type'] == 'image' %}" + IMAGE_PAD_TOKEN + " {% else %}{{ b['text'] }}{% endif %}"
+        "{% endfor %}{% endfor %}"
+    )
+    processor = HYV4FlashProcessor(tokenizer, image_token_id=IMAGE_TOKEN_ID)
+
+    def encode(content: dict[str, object]) -> dict[str, torch.Tensor]:
+        messages = [{"role": "user", "content": [content, {"type": "text", "text": "describe this"}]}]
+        return processor.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
+
+    from_uri, from_pil = encode(source), encode({"type": "image", "image": image})
+    assert from_uri.keys() == from_pil.keys() and "pixel_values" in from_uri
+    for key in from_pil:
+        assert torch.equal(from_uri[key], from_pil[key]), key

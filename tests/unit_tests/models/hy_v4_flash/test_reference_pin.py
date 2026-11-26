@@ -269,6 +269,15 @@ def test_image_text_forward_and_positions_match_the_reference(model: HYV4FlashFo
     )
     _assert_matches(stages, IMAGE_TEXT["stages"])
     torch.testing.assert_close(logits[[0, 10, 23], :4], torch.tensor(IMAGE_TEXT["logits"]), rtol=2e-4, atol=2e-4)
+    # Packing one document must keep the caller's three-plane positions (and needs them for image-text input).
+    inputs = dict(input_ids=ids, pixel_values=uniform("pixels", (24, 48)).float(), image_grid_thw=grid)
+    packing = dict(seq_lens=torch.tensor([[24]]), qkv_format="thd")
+    positions = compute_mrope_position_ids(types, grid, None, 2)
+    with torch.no_grad():
+        packed = model(**inputs, **packing, position_ids=positions).logits[0]
+    torch.testing.assert_close(packed, logits, rtol=1e-4, atol=2e-5)
+    with pytest.raises(ValueError, match="require per-document M-RoPE position_ids"):
+        model(**inputs, **packing)
 
 
 def test_two_frame_positions_match_the_reference() -> None:

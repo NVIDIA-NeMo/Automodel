@@ -9,7 +9,9 @@
 {%- set sys = messages[0]['content'] if messages[0]['role'] == 'system' else '' -%}
 {{- '<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>' ~ sys ~ '<｜reasoning_mode:opensource｜>reasoning_effort:' ~ effort ~ '<｜hy_end:opensource｜>' -}}
 {%- for message in messages -%}
-{%- if message['role'] == 'user' -%}
+{%- if message['role'] == 'system' and not loop.first -%}
+{{- '<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>' ~ message['content'] ~ '<｜hy_end:opensource｜>' -}}
+{%- elif message['role'] == 'user' -%}
 {{- '<｜hy_start:opensource｜>user<｜hy_middle:opensource｜>' ~ message['content'] ~ '<｜hy_end:opensource｜>' -}}
 {%- elif message['role'] == 'assistant' -%}
 {%- if message['reasoning_content'] or message['reasoning'] -%}

@@ -34,6 +34,7 @@ from typing import Literal, Required, TypeAlias, TypedDict
 import numpy as np
 import torch
 from transformers import AutoTokenizer, BatchFeature, PreTrainedTokenizerFast, ProcessorMixin
+from transformers.image_utils import load_image
 from transformers.utils import cached_file
 
 from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig
@@ -181,6 +182,8 @@ def _open_image(value: Image.Image | str | Path | bytes) -> Image.Image:
         import io
 
         return Image.open(io.BytesIO(value))
+    if isinstance(value, str) and value.startswith(("https://", "http://", "data:image/")):
+        return load_image(value)
     return Image.open(value)
 
 
@@ -248,11 +251,15 @@ class HYV4FlashProcessor(ProcessorMixin):
             if key in kwargs
         }
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **loading)
-        config = HYV4FlashConfig.from_pretrained(pretrained_model_name_or_path, **loading)
         hub = {key: value for key, value in loading.items() if key != "trust_remote_code"}
         with open(cached_file(pretrained_model_name_or_path, "processor_config.json", **hub)) as handle:
-            settings = image_settings_from_processor_config(json.load(handle)["image_processor"])
-        return cls(tokenizer=tokenizer, image_token_id=config.image_token_id, settings=settings)
+            processor_config = json.load(handle)
+        # A saved processor carries its image token id; the released processor_config.json leaves it to config.json.
+        image_token_id = processor_config.get("image_token_id")
+        if image_token_id is None:
+            image_token_id = HYV4FlashConfig.from_pretrained(pretrained_model_name_or_path, **loading).image_token_id
+        settings = image_settings_from_processor_config(processor_config["image_processor"])
+        return cls(tokenizer=tokenizer, image_token_id=image_token_id, settings=settings)
 
     def to_dict(self) -> ProcessorConfig:
         """``processor_config.json`` content: the ``image_processor`` block that :meth:`from_pretrained` reads."""
@@ -369,11 +376,11 @@ class HYV4FlashProcessor(ProcessorMixin):
                 blocks = []
                 for block in content:
                     if isinstance(block, dict) and block.get("type") in ("image", "image_url"):
-                        value = block.get("image", block.get("path", block.get("image_url")))
+                        value = block.get("image", block.get("path", block.get("image_url", block.get("url"))))
                         if isinstance(value, dict) and "url" in value:
                             value = value["url"]
                         if value is None:
-                            raise ValueError("image content blocks require an image, path or image_url")
+                            raise ValueError("image content blocks require an image, path, url or image_url")
                         sources.append(value)
                         blocks.append({"type": "image"})
                     else:

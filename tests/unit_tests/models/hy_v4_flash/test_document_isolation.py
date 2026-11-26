@@ -327,3 +327,18 @@ def test_packed_loss_is_the_token_weighted_mean_over_independent_documents() -> 
     with torch.no_grad():
         ignored = model(ids, labels=torch.full_like(ids, -100), seq_lens=torch.tensor([[13, 17]]), qkv_format="thd")
     assert ignored.loss == 0  # nothing supervised: a finite zero, not a division by zero
+
+
+@pytest.mark.parametrize("form", ["seq_lens", "packed_seq_ids"])
+def test_first_token_of_a_document_is_never_a_target_of_the_previous_document(form: str) -> None:
+    model = build_model()
+    ids = torch.randint(*TOKEN_RANGE, (1, 30), generator=torch.Generator().manual_seed(15))
+    labels = torch.full_like(ids, -100)
+    labels[0, 13] = ids[0, 13]  # only the first token of the second document is labelled
+    if form == "seq_lens":
+        inputs = dict(seq_lens=torch.tensor([[13, 17]]), qkv_format="thd")
+    else:
+        documents = torch.tensor([[1] * 13 + [2] * 17])
+        inputs = dict(packed_seq_ids=documents, position_ids=torch.cat([torch.arange(13), torch.arange(17)])[None])
+    with torch.no_grad():
+        assert model(ids, labels=labels, **inputs).loss == 0

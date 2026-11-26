@@ -607,6 +607,8 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
         del loss_mask
         if cp_group is None and self.cp_mesh is not None:
             cp_group = self.cp_mesh.get_group()
+        if pixel_values is not None and cp_group is not None and dist.get_world_size(cp_group) > 1:
+            raise ValueError("Hy4-flash image-text training requires cp_size=1; context parallelism supports text only")
         if attention_mask is None and padding_mask is not None:
             attention_mask = ~padding_mask.bool()
         if qkv_format not in (None, "thd"):
@@ -625,7 +627,15 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
                 minimum_length=input_ids.shape[1],
             )
             input_ids = layout.pack(input_ids, fill=self.config.text_config.pad_token_id or 0)
-            position_ids = layout.position_ids
+            if image_grid_thw is None:
+                position_ids = layout.position_ids
+            elif position_ids is not None and position_ids.ndim == 3:
+                # Image blocks advance the three planes differently: keep the caller's per-document positions.
+                position_ids = layout.pack(position_ids.movedim(0, -1)).movedim(-1, 0)
+            else:
+                raise ValueError(
+                    "packed image-text inputs require per-document M-RoPE position_ids [3, batch, sequence]"
+                )
             packed_seq_ids = layout.sequence_ids
             attention_mask = packed_seq_ids > 0
         rows, seq = input_ids.shape
@@ -661,9 +671,9 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
         loss = None
         if labels is not None:
             targets = labels[:, 1:]
-            if layout is not None:
+            documents = layout.restore(layout.sequence_ids) if layout is not None else packed_seq_ids
+            if documents is not None:
                 # The first token of a packed document is not a target of the previous document's last token.
-                documents = layout.restore(layout.sequence_ids)
                 same_document = (documents[:, 1:] > 0) & (documents[:, 1:] == documents[:, :-1])
                 targets = targets.masked_fill(~same_document, -100)
             loss = F.cross_entropy(

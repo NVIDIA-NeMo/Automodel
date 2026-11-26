@@ -31,6 +31,11 @@ def test_tiny_forward_backward_is_finite() -> None:
     ids = torch.randint(*TOKEN_RANGE, (2, 24))
     out = model(ids, labels=ids)
     assert torch.isfinite(out.logits).all()
+    # What the fused-loss recipes request: one projected position and the full hidden states.
+    last = model(ids, logits_to_keep=1, output_hidden_states=True)
+    assert last.logits.shape == (ids.shape[0], 1, model.config.text_config.vocab_size)
+    assert last.hidden_states.shape[:2] == ids.shape
+    torch.testing.assert_close(last.logits, out.logits[:, -1:], rtol=1e-4, atol=1e-5)
     out.loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
@@ -97,3 +102,16 @@ def test_activation_checkpointing_modes_train_like_the_plain_model(mode: str) ->
     assert plain_grads.keys() == grads.keys() and len(plain_grads) > 0
     for name, grad in plain_grads.items():
         torch.testing.assert_close(grads[name], grad, rtol=1e-5, atol=1e-7, msg=lambda m, name=name: f"{name}: {m}")
+
+
+def test_image_text_under_context_parallelism_is_rejected_before_the_tower_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_automodel.components.models.hy_v4_flash.model as model_module
+
+    model = HYV4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
+    monkeypatch.setattr(model_module.dist, "get_world_size", lambda group: 2)  # a two-rank CP group
+    monkeypatch.setattr(model.vit, "forward", lambda *args: pytest.fail("the vision tower ran"))
+    ids = torch.randint(*TOKEN_RANGE, (1, 24))
+    with pytest.raises(ValueError, match="requires cp_size=1"):
+        model(ids, pixel_values=torch.zeros(24, 48), image_grid_thw=torch.tensor([[1, 4, 6]]), cp_group=object())

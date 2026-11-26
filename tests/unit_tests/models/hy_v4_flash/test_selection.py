@@ -180,3 +180,40 @@ def test_pooling_modules_are_entered_whether_or_not_a_document_needs_selection(l
         for index in range(len(sparse_layers))
         for name in ("key_value_projection", "key_gate_projection", "intra_group_ape", "key_norm")
     ]
+
+
+def test_outer_bf16_autocast_does_not_change_the_selection() -> None:
+    torch.manual_seed(0)
+    config = tiny_text_config()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    indexer = HYV4FlashCompressedIndexer(config)  # BF16 projections, fp32 pooling and scoring, as in the model
+    for parameter in indexer.parameters():
+        torch.nn.init.normal_(parameter, std=0.5)
+    indexer.to(device)
+    kpool, document = indexer.kpool, 257
+    q_resid = torch.randn(document, config.q_lora_rank, device=device).bfloat16()
+    hidden = torch.randn(document, config.hidden_size, device=device).bfloat16()
+    group_keys = indexer.pool_groups(torch.randn(document, config.index_head_dim, device=device).bfloat16())
+    rope = config.layer_rope_parameters["indexed_attention"]
+    cos, sin = mrope_cos_sin(
+        torch.arange(document, device=device).expand(3, 1, -1),
+        inverse_frequencies(config.qk_rope_head_dim, rope["rope_theta"]).to(device),
+        rope["mrope_section"],
+        torch.float32,
+    )
+    groups = group_keys.shape[0] * kpool
+
+    def select() -> torch.Tensor:
+        return indexer.select(
+            q_resid,
+            hidden,
+            HYV4FlashRope(cos[0], sin[0]),
+            group_keys,
+            HYV4FlashRope(cos[0, :groups:kpool], sin[0, :groups:kpool]),
+            0,
+        ).indices
+
+    plain = select()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        lowered = select()
+    assert torch.equal(plain, lowered)
