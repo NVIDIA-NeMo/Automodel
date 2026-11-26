@@ -85,6 +85,16 @@ class TestIsDionOptimizer:
             optimizer_factory = type(name, (), {"__module__": "some.module"})
             assert is_dion_optimizer(optimizer_factory) is True, f"Expected True for {name}"
 
+    def test_returns_false_for_torch_muon(self):
+        # torch.optim.Muon matches dion.Muon by name but is PyTorch's native optimizer.
+        import torch
+
+        from nemo_automodel.components.optim.dion import is_dion_optimizer
+
+        if not hasattr(torch.optim, "Muon"):
+            pytest.skip("torch.optim.Muon needs PyTorch 2.9+")
+        assert is_dion_optimizer(torch.optim.Muon) is False
+
     def test_returns_false_for_non_dion(self):
         from nemo_automodel.components.optim.dion import is_dion_optimizer
 

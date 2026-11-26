@@ -205,8 +205,6 @@ lr_scheduler:
   lr_warmup_steps: 10
   lr_decay_steps: 100
   wd_incr_steps: 100
-mfu:
-  peak_tflops: 989
 validation_dataset: null
 validation_dataloader: null
 ci:

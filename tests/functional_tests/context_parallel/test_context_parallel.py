@@ -80,7 +80,7 @@ class TestContextParallelAttention:
         run_test_script(TEST_FOLDER, CP_DENSE_PACKED_TEST_FILENAME)
 
     def test_cp_qwen3_8_flash_next_packed(self):
-        """Test Qwen3.8-Flash-Next QSA packed THD parity on the flex path with CP=1 vs CP=2."""
+        """Test Qwen3.8-Flash-Next QSA packed THD parity on the flex and FA4 paths with CP=1 vs CP=2."""
         run_test_script(TEST_FOLDER, CP_QWEN3_8_FLASH_NEXT_PACKED_TEST_FILENAME)
 
     def test_cp_qwen3_5_dense_packed(self):

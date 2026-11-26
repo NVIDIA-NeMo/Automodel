@@ -19,6 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 
 
@@ -70,7 +71,7 @@ def test_log_train_metrics_calls_mlflow(monkeypatch):
     monkeypatch.setattr(mlflow, "active_run", lambda: object())
     monkeypatch.setattr(mlflow, "log_metrics", log_metrics_mock)
 
-    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=None)
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=ConfigNode({}))
     # Minimal attributes required by the method
     recipe.dist_env = types.SimpleNamespace(is_main=True)
     recipe.step_scheduler = types.SimpleNamespace(step=7, is_remote_logging_step=True)
@@ -117,7 +118,7 @@ def test_log_val_metrics_calls_mlflow(monkeypatch):
     monkeypatch.setattr(mlflow, "active_run", lambda: object())
     monkeypatch.setattr(mlflow, "log_metrics", log_metrics_mock)
 
-    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=None)
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=ConfigNode({}))
     recipe.dist_env = types.SimpleNamespace(is_main=True)
     recipe.comet_logger = None
     # No JSONL logger passed (None) to keep test minimal
