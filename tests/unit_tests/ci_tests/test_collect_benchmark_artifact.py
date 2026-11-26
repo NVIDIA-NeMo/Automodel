@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from tests.ci_tests.scripts.collect_benchmark_artifact import parse_log
+from tests.ci_tests.scripts.collect_benchmark_artifact import main, parse_log
 
 
 @pytest.mark.parametrize("prefix", ["", "0: 2026-10-13 12:00:00 | INFO | nemo_automodel.recipes.llm.benchmark | "])
@@ -52,3 +54,35 @@ def test_parse_flops_ignores_mtp_and_preserves_legacy_logs(
     parsed = parse_log(str(log))
     assert parsed["results"] == {**expected, "avg_iter_time_seconds": 2.0, "avg_mfu_percent": 4.0}
     assert parsed["metadata"] == {"world_size": 32}
+
+
+@pytest.mark.parametrize(
+    "peak_lines, expected_peak",
+    [
+        (
+            [
+                "MFU peak: 1979 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float8_e4m3fn)",
+                "MFU peak: 1979 TFLOPs/s per device",
+            ],
+            1979.0,
+        ),
+        (["MFU peak: 494.5 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float32 with TF32)"], 494.5),
+        (["MFU peak: unknown"], None),
+    ],
+)
+def test_artifact_records_the_logged_peak_instead_of_the_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peak_lines: list[str], expected_peak: float | None
+) -> None:
+    config = tmp_path / "recipe.yaml"
+    # The recipe ignores benchmark.peak_tflops; the artifact must not report it.
+    config.write_text("benchmark:\n  warmup_steps: 10\n  peak_tflops: 989\n")
+    log = tmp_path / "benchmark.log"
+    log.write_text("\n".join([*peak_lines, "Average MFU: 10.000000% | FLOPs scope: model"]))
+    output = tmp_path / "benchmark_results.json"
+    monkeypatch.setattr(sys, "argv", ["collect", "--config", str(config), "--log", str(log), "--output", str(output)])
+
+    main()
+
+    artifact = json.loads(output.read_text())
+    assert artifact["config"]["peak_tflops"] == expected_peak
+    assert artifact["results"] == {"avg_mfu_percent": 10.0}

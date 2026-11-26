@@ -537,6 +537,37 @@ def test_cudnn_metadata_segments_cp_queries_and_padded_documents() -> None:
     assert metadata.total_key_tokens == 12
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="counts CUDA host synchronizations")
+def test_cudnn_metadata_sizes_segments_without_a_host_synchronization() -> None:
+    """Segment sizing takes no host synchronization beyond the run count, at CP1 and under CP."""
+    import warnings
+
+    device = torch.device("cuda")
+    cu_seqlens = torch.tensor([0, 8, 12, 24], dtype=torch.int32, device=device)
+
+    def synchronizations(query_indices: torch.Tensor | None) -> tuple[int, cudnn_dsa.CudnnDsaPackedMetadata]:
+        cudnn_dsa.prepare_cudnn_dsa_packed_metadata(cu_seqlens, 24, query_indices=query_indices)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                metadata = cudnn_dsa.prepare_cudnn_dsa_packed_metadata(cu_seqlens, 24, query_indices=query_indices)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        return sum("synchroniz" in str(warning.message) for warning in caught), metadata
+
+    # Two host reads are inherent (the packed-summary read and the data-dependent run count); sizing the
+    # segments with ``torch.bincount`` took a third.
+    cp1_syncs, _ = synchronizations(None)
+    head_tail = torch.cat([torch.arange(0, 6), torch.arange(18, 24)]).to(device)
+    head_tail_syncs, metadata = synchronizations(head_tail)
+    assert cp1_syncs <= 2
+    assert head_tail_syncs <= 2
+    # Rank 0 of a head/tail split owns rows 0-5 of document 0 and rows 18-23 of document 2.
+    torch.testing.assert_close(metadata.segment_cu_q.cpu(), torch.tensor([0, 6, 12], dtype=torch.int32))
+
+
 def test_cudnn_metadata_uses_padding_mask_after_thd_absorption() -> None:
     """The runtime padding mask recovers real rows after trailing padding was absorbed."""
     metadata = cudnn_dsa.prepare_cudnn_dsa_packed_metadata(
@@ -796,8 +827,8 @@ def test_cudnn_sparse_attention_compacts_zero_length_rows(
     assert fake_dsa.called
 
 
-def test_cudnn_sparse_attention_all_empty_rows_use_only_dummy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A CP rank containing only padding still produces shape-stable zero gradients."""
+def test_cudnn_sparse_attention_all_empty_rows_skip_the_backward_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CP rank containing only padding gets zero gradients without running the backward kernel."""
     topk_length = torch.zeros(SPARSE_TOKENS, dtype=torch.int32)
     fake_flash_mla = _FakeZeroLengthFlashMla(topk_length)
     fake_dsa = _FakeCompactedSparseDsa(valid_rows=0, dkv_value=0)
@@ -827,7 +858,8 @@ def test_cudnn_sparse_attention_all_empty_rows_use_only_dummy(monkeypatch: pytes
     assert kv_latent.grad is not None
     torch.testing.assert_close(q.grad, torch.zeros_like(q.grad))
     torch.testing.assert_close(kv_latent.grad, torch.zeros_like(kv_latent.grad))
-    assert fake_dsa.called
+    # The SM100 backward rejects size-1 dummy tensors, so the adapter returns zeros without a kernel call.
+    assert not fake_dsa.called
 
 
 def _small_dsa_config() -> GlmMoeDsaConfig:
@@ -952,8 +984,10 @@ def test_cudnn_indexer_layer_gathers_cp_keys(monkeypatch: pytest.MonkeyPatch) ->
     indexer = GlmMoeDsaIndexer(config, backend)
     captured: dict[str, object] = {}
 
-    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object) -> torch.Tensor:
-        assert dim == 0 and cp_group == "cp-group"
+    def fake_gather(
+        tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None, order: object = None
+    ) -> torch.Tensor:
+        assert dim == 0 and cp_group == "cp-group" and order is None  # contiguous layout: no reorder
         return torch.cat((tensor, tensor), dim=0)
 
     def fake_indexer(
@@ -1058,8 +1092,10 @@ def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     gathered: list[tuple[int, ...]] = []
     captured: dict[str, torch.Tensor] = {}
 
-    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object) -> torch.Tensor:
-        assert dim == 0 and cp_group == "cp-group"
+    def fake_gather(
+        tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None, order: object = None
+    ) -> torch.Tensor:
+        assert dim == 0 and cp_group == "cp-group" and order is None  # contiguous layout: no reorder
         gathered.append(tuple(tensor.shape))
         return torch.cat((tensor, tensor), dim=0)
 
@@ -1089,7 +1125,8 @@ def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert result.shape == (4, config.num_attention_heads * config.v_head_dim)
-    assert gathered == [(4, config.kv_lora_rank), (4, config.qk_rope_head_dim)]
+    # One fused gather of the concatenated latent (kv | k_pe) per layer.
+    assert gathered == [(4, config.kv_lora_rank + config.qk_rope_head_dim)]
     assert captured["kv_latent"].shape == (8, 1, config.kv_lora_rank + config.qk_rope_head_dim)
     assert captured["topk_indices"] is topk
 

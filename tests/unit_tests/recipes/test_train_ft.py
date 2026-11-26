@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 
@@ -32,18 +33,26 @@ from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
-from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class, resolve_sdpa_method
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
 )
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MoEParallelizerConfig
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.models.common.utils import (
+    BackendConfig,
+    MoKBackendConfig,
+    TEFp8Config,
+    TENvfp4Config,
+)
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
+from nemo_automodel.recipes import base_recipe
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
@@ -54,15 +63,175 @@ from nemo_automodel.recipes.llm.train_ft import (
     compute_trust_remote_code_from_model,
 )
 
-
-def test_recipe_config_resolves_mfu_settings():
-    config = RecipeConfig(ConfigNode({"mfu": {"device": "h100", "peak_tflops": 1979.0}}))
-
-    assert config.mfu == MFUConfig(device="h100", peak_tflops=1979.0)
+_FP32_BF16_REDUCE = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.bfloat16)
+_FP32_BF16_OUTPUT = MixedPrecisionPolicy(param_dtype=torch.float32, output_dtype=torch.bfloat16)
 
 
-def test_recipe_config_defaults_mfu_settings():
-    assert RecipeConfig(ConfigNode({})).mfu == MFUConfig()
+def _mock_gb200(monkeypatch):
+    """GB200 has a distinct dense peak for every precision: FP32 80, BF16 2500, FP8 5000, FP4 10000."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA GB200")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+
+
+@pytest.mark.parametrize(
+    "raw_config, strategy, sharded, moe_config, ep_size, param_dtype, dtype_kwargs, expected",
+    [
+        # A one-rank CPU mesh only autocasts CPU operations. The LLM recipe adds no CUDA autocast.
+        ({}, FSDP2Config(), False, None, 1, torch.float32, {}, 80.0),
+        ({}, FSDP2Config(), False, None, 1, torch.bfloat16, {}, 2500.0),
+        ({}, FSDP2Config(autocast_dtype=torch.bfloat16), False, None, 1, torch.float32, {}, 80.0),
+        # Sharded FSDP2 computes in the policy's param_dtype, not its reduce_dtype or the storage dtype.
+        ({}, FSDP2Config(), True, None, 1, torch.float32, {}, 2500.0),
+        ({}, FSDP2Config(mp_policy=_FP32_BF16_REDUCE), True, None, 1, torch.bfloat16, {}, 80.0),
+        # DDP and no strategy compute in the storage dtype.
+        ({}, DDPConfig(), True, None, 1, torch.float32, {}, 80.0),
+        ({}, None, False, None, 1, torch.bfloat16, {}, 2500.0),
+        # Expert-parallel experts compute in the MoE policy's param_dtype.
+        ({}, FSDP2Config(), True, MoEParallelizerConfig(mp_policy=_FP32_BF16_OUTPUT), 2, torch.bfloat16, {}, 80.0),
+        ({}, FSDP2Config(), True, MoEParallelizerConfig(mp_policy=_FP32_BF16_OUTPUT), 1, torch.float32, {}, 2500.0),
+        (
+            {},
+            FSDP2Config(),
+            True,
+            MoEParallelizerConfig(mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16)),
+            2,
+            torch.float32,
+            {},
+            80.0,
+        ),
+        # Enabling TorchAO without converting any layer leaves the BF16 peak.
+        ({"fp8": {"enabled": True}}, FSDP2Config(), True, None, 1, torch.bfloat16, {}, 2500.0),
+        ({"fp8": {"enabled": True, "emulate": True}}, FSDP2Config(), True, None, 1, torch.bfloat16, {}, 2500.0),
+        # An explicit compute dtype bypasses the selection.
+        (
+            {"fp8": {"enabled": True}},
+            FSDP2Config(),
+            True,
+            None,
+            1,
+            torch.bfloat16,
+            {"compute_dtype": torch.float32},
+            80.0,
+        ),
+        # The deprecated mfu section is ignored.
+        ({"mfu": {"device": "A100", "peak_tflops": 1}}, FSDP2Config(), True, None, 1, torch.bfloat16, {}, 2500.0),
+    ],
+)
+def test_recipe_mfu_uses_compute_precision(
+    raw_config, strategy, sharded, moe_config, ep_size, param_dtype, dtype_kwargs, expected, monkeypatch
+):
+    _mock_gb200(monkeypatch)
+    monkeypatch.setattr(base_recipe, "fsdp2_sharding_enabled", lambda device_mesh: sharded)
+    model = nn.Linear(32, 32, dtype=param_dtype)
+    model.config = SimpleNamespace(model_type="llama")
+    warning = (
+        pytest.warns(FutureWarning, match="YAML mfu section is deprecated and ignored")
+        if "mfu" in raw_config
+        else nullcontext()
+    )
+    with warning:
+        cfg = RecipeConfig(ConfigNode(raw_config))
+    recipe = SimpleNamespace(
+        cfg=cfg,
+        distributed_config=strategy,
+        moe_parallel_config=moe_config,
+        mesh_context=SimpleNamespace(device_mesh=SimpleNamespace(device_type="cpu"), ep_size=ep_size),
+    )
+
+    calculator = TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model, **dtype_kwargs)
+
+    assert calculator.reference_mfu == expected
+    assert not hasattr(recipe, "mfu_calculator")
+
+
+@pytest.mark.parametrize(
+    "mesh_device, sharded, expected_llm, expected_dllm",
+    [("cpu", False, 80.0, 2500.0), ("cuda", False, 2500.0, 2500.0), ("cuda", True, 80.0, 2500.0)],
+)
+def test_recipe_mfu_tracks_forward_autocast(mesh_device, sharded, expected_llm, expected_dllm, monkeypatch):
+    from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+
+    _mock_gb200(monkeypatch)
+    monkeypatch.setattr(base_recipe, "fsdp2_sharding_enabled", lambda device_mesh: sharded)
+    model = nn.Linear(16, 16, dtype=torch.float32)
+    model.config = SimpleNamespace(model_type="llama")
+
+    for recipe_type, expected in (
+        (TrainFinetuneRecipeForNextTokenPrediction, expected_llm),
+        (DiffusionLMSFTRecipe, expected_dllm),
+    ):
+        recipe = recipe_type.__new__(recipe_type)
+        recipe.cfg = {}
+        recipe.distributed_config = FSDP2Config(mp_policy=_FP32_BF16_REDUCE, autocast_dtype=torch.bfloat16)
+        recipe.mesh_context = SimpleNamespace(device_mesh=SimpleNamespace(device_type=mesh_device), ep_size=1)
+        recipe.moe_parallel_config = None
+        assert recipe._setup_mfu(model, recipe_autocast_dtype=recipe._forward_autocast_dtype).reference_mfu == expected
+
+
+def test_unsharded_cuda_mesh_uses_default_forward_policy(monkeypatch):
+    _mock_gb200(monkeypatch)
+    monkeypatch.setattr(base_recipe, "fsdp2_sharding_enabled", lambda device_mesh: False)
+    assert base_recipe._strategy_compute_dtype(FSDP2Config(), SimpleNamespace(device_type="cuda")) == torch.bfloat16
+
+
+@pytest.mark.parametrize("emulate, expected", [(False, 5000.0), (True, 2500.0)])
+def test_recipe_mfu_uses_converted_torchao_layers(monkeypatch, emulate, expected):
+    float8 = pytest.importorskip("torchao.float8")
+    model = nn.Sequential(nn.Linear(32, 32, dtype=torch.bfloat16))
+    model.config = SimpleNamespace(model_type="llama")
+    float8.convert_to_float8_training(model, config=float8.Float8LinearConfig(emulate=emulate))
+    _mock_gb200(monkeypatch)
+    recipe = SimpleNamespace(
+        cfg={"fp8": {"enabled": True, "emulate": emulate}},
+        distributed_config=None,
+        moe_parallel_config=None,
+        mesh_context=SimpleNamespace(device_mesh=None, ep_size=1),
+    )
+    assert TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model).reference_mfu == expected
+
+
+@pytest.mark.parametrize(
+    "backend_kwargs, expected",
+    [
+        ({"linear": "te", "te_nvfp4": TENvfp4Config()}, 10000.0),
+        ({"linear": "te", "te_fp8": TEFp8Config()}, 5000.0),
+        ({"linear": "te", "te_fp8": TEFp8Config(recipe="mxfp8")}, 5000.0),
+        # MoK runs the routed-expert GEMMs in MXFP8; its precision is unused with another dispatcher.
+        ({"dispatcher": "mok", "mok": MoKBackendConfig(precision="mxfp8")}, 5000.0),
+        ({"dispatcher": "mok", "mok": MoKBackendConfig(precision="bf16")}, 2500.0),
+        ({"dispatcher": "torch", "mok": MoKBackendConfig(precision="mxfp8")}, 2500.0),
+        (None, 2500.0),
+    ],
+)
+def test_recipe_mfu_uses_quantized_training_precision(backend_kwargs, expected, monkeypatch):
+    _mock_gb200(monkeypatch)
+    monkeypatch.setattr(base_recipe, "HAVE_TE", True)
+    monkeypatch.setattr(base_recipe, "fsdp2_sharding_enabled", lambda device_mesh: True)
+    model = nn.Linear(32, 32, dtype=torch.bfloat16)
+    model.config = SimpleNamespace(model_type="llama")
+    model.backend = BackendConfig(**backend_kwargs) if backend_kwargs is not None else None
+    recipe = SimpleNamespace(
+        cfg=RecipeConfig(ConfigNode({})),
+        distributed_config=FSDP2Config(),
+        moe_parallel_config=None,
+        mesh_context=SimpleNamespace(device_mesh=None, ep_size=1),
+    )
+
+    assert TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, model).reference_mfu == expected
+
+
+def test_recipe_mfu_rejects_none_compute_dtype():
+    recipe = SimpleNamespace(
+        cfg=RecipeConfig(ConfigNode({})),
+        distributed_config=None,
+        moe_parallel_config=None,
+        mesh_context=MeshContext(),
+    )
+
+    with pytest.raises(TypeError, match='compute_dtype must be "auto" or a torch.dtype'):
+        TrainFinetuneRecipeForNextTokenPrediction._setup_mfu(recipe, nn.Linear(2, 2), compute_dtype=None)
 
 
 def _build_loader(

@@ -18,6 +18,7 @@ import logging
 import math
 from typing import Any, ClassVar, Protocol
 
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -50,8 +51,17 @@ except Exception as e:  # pragma: no cover - handled at runtime
 logger = logging.getLogger(__name__)
 
 
+# PyTorch's native Muon (``torch.optim.Muon``, PyTorch 2.9+) shares its name with ``dion.Muon``.
+_TORCH_MUON = getattr(torch.optim, "Muon", None)
+
+
 def is_dion_optimizer(optimizer_factory: Any) -> bool:
-    """Return whether an optimizer factory targets a Dion-family optimizer."""
+    """Return whether an optimizer factory targets a Dion-family optimizer.
+
+    PyTorch's native ``torch.optim.Muon`` is not one, although it matches ``dion.Muon`` by name.
+    """
+    if _TORCH_MUON is not None and optimizer_factory is _TORCH_MUON:
+        return False
     name = getattr(optimizer_factory, "__name__", "")
     module = getattr(optimizer_factory, "__module__", "")
     return module.startswith("dion") or name in {"Dion", "Dion2", "Muon", "NorMuon", "Muown"}
