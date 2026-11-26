@@ -65,8 +65,8 @@ def test_hooks_are_idempotent(restore_cores: None) -> None:
 def test_compiled_cores_reach_modules_built_earlier(restore_cores: None, dtype: torch.dtype) -> None:
     """The hooks the recipes call swap the cores under modules that already exist.
 
-    fp32: compiled equals eager to rounding. BF16: the compiled RMSNorm multiplies by the weight in fp32 and rounds
-    once where eager (the reference order) rounds twice, so outputs differ by at most one unit in the last place.
+    The cores are compiled with Inductor's precision options, which keep the eager cast points: fp32 agrees to
+    rounding, and in BF16 the compiled RMSNorm rounds before the weight multiply as eager (the reference order) does.
     """
     torch.manual_seed(0)
     config = tiny_text_config()
@@ -102,10 +102,13 @@ def test_compiled_cores_reach_modules_built_earlier(restore_cores: None, dtype: 
     for actual, expected in zip(compiled[1:], eager[1:]):
         assert actual.dtype == torch.bfloat16
         assert bool(((actual.float() - expected.float()).abs() <= _bf16_spacing(actual, expected)).all())
-    # The single rounding: on the eager collapse output, the compiled norm is the fp32 product rounded once.
+    # Same cast points as eager: the norm and the expand are bit-identical on (nearly) every element. Rounding once
+    # after the fp32 weight multiply, as a compile without the options does, agrees on about three elements in four.
+    assert float((compiled[2] == eager[2]).float().mean()) > 0.995
+    assert float((compiled[3] == eager[3]).float().mean()) > 0.995
     collapsed = eager[1]
     normalized = collapsed.float() * torch.rsqrt(
         collapsed.float().square().mean(-1, keepdim=True) + config.rms_norm_eps
     )
     once = (norm.weight.float() * normalized).to(torch.bfloat16)
-    assert float((norm(collapsed) == once).float().mean()) > 0.99
+    assert float((once == eager[2]).float().mean()) < 0.9

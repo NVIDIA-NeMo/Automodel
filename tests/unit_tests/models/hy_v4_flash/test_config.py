@@ -20,7 +20,13 @@ from transformers import AutoConfig
 
 import nemo_automodel._transformers.registry  # noqa: F401  (registers the custom configs with AutoConfig)
 from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig, HYV4FlashTextConfig
-from tests.unit_tests.models.hy_v4_flash.conftest import CPU_BACKEND, released_config, tiny_config, tiny_text_config
+from tests.unit_tests.models.hy_v4_flash.conftest import (
+    CPU_BACKEND,
+    TINY_TEXT_KWARGS,
+    released_config,
+    tiny_config,
+    tiny_text_config,
+)
 
 
 def test_autoconfig_resolves_the_local_class_from_a_checkpoint_style_config(tmp_path: Path) -> None:
@@ -85,6 +91,7 @@ def test_unsupported_layer_type_is_rejected() -> None:
         ({"attention_bias": True}, "attention_bias=True is not supported"),
         ({"attention_dropout": 0.1}, "attention_dropout must be 0"),
         ({"dtype": "float32"}, "built in bfloat16"),
+        ({"hidden_act": "gelu"}, "silu activation only"),
         ({"rope_parameters": _rope_parameters(rope_type="yarn")}, "rope_type must be 'default'"),
         ({"rope_parameters": _rope_parameters(mrope_interleaved=False)}, "only interleaved M-RoPE"),
     ],
@@ -122,3 +129,16 @@ def test_top_k_of_a_single_group_is_rejected() -> None:
     with pytest.raises(ValueError, match="at least two groups"):
         tiny_text_config(index_topk=2, compressed_indexer_compress_ratio=2)
     assert tiny_text_config(index_topk=4, compressed_indexer_compress_ratio=2).index_topk == 4
+
+
+def test_reference_name_of_the_latent_expert_width_is_accepted() -> None:
+    kwargs = {name: value for name, value in TINY_TEXT_KWARGS.items() if name != "routed_expert_hidden_size"}
+    assert HYV4FlashTextConfig(**kwargs, moe_hidden_size=20).routed_expert_hidden_size == 20
+
+
+def test_engram_config_without_the_fp8_flag_is_rejected() -> None:
+    # The reference reads an absent flag as True (not implemented here); only an explicit False may build Engram.
+    kwargs = {name: value for name, value in TINY_TEXT_KWARGS.items() if name != "engram_fp8_embedding"}
+    with pytest.raises(ValueError, match="engram_fp8_embedding is missing"):
+        HYV4FlashTextConfig(**kwargs)
+    assert HYV4FlashTextConfig(**{**kwargs, "engram_layer_ids": None}).engram_fp8_embedding is False

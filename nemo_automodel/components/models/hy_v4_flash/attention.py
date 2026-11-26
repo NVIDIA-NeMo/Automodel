@@ -38,6 +38,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
+from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
 from nemo_automodel.components.models.hy_v4_flash.config import AttentionType, HYV4FlashTextConfig
 from nemo_automodel.components.models.hy_v4_flash.layers import HYV4FlashRMSNorm, apply_interleaved_rope
@@ -121,31 +122,6 @@ class HYV4FlashRope:
     sin: torch.Tensor
 
 
-class HYV4FlashFP32Parameter(nn.Module):
-    """FP32 parameter holder whose forward returns a copy of its weight and ignores the input.
-
-    Not ``DeepseekV4FP32Parameter``: that holder returns the parameter itself, which an FSDP unit that reshards after
-    forward frees while the caller still uses it.
-
-    A bare parameter on a bf16 module would be cast by the FSDP mixed-precision policy. Holding it in its own module
-    lets the parallelizer give it a dedicated fp32 unit (and one cross-block unit for the sinks); the ignored input
-    argument ties the call to the activation graph so FSDP's pre/post hooks fire.
-    """
-
-    def __init__(self, value: torch.Tensor) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(value.to(torch.float32))
-
-    def forward(self, reference: torch.Tensor) -> torch.Tensor:
-        """Return a copy of the weight (``reference`` only anchors the FSDP hooks).
-
-        The copy is what makes the result safe to use after this call: an FSDP unit that reshards after forward
-        frees the unsharded parameter storage, so the parameter itself must not outlive the forward.
-        """
-        del reference
-        return self.weight.clone()
-
-
 class HYV4FlashCompressedIndexer(nn.Module):
     """Group-pooled lightning indexer. Selection is discrete, so the indexer receives no loss gradient.
 
@@ -173,7 +149,7 @@ class HYV4FlashCompressedIndexer(nn.Module):
         # The released key_norm weight is fp32 and is kept in fp32 here; the reference rounds it to bf16 on load.
         # One call per document, each with that document's group count: keep it off the shape-specialized core.
         self.key_norm = HYV4FlashRMSNorm(self.head_dim, config.rms_norm_eps, torch.float32, static_shape=False)
-        self.intra_group_ape = HYV4FlashFP32Parameter(torch.empty(self.kpool, self.head_dim))
+        self.intra_group_ape = DeepseekV4FP32Parameter(torch.empty(self.kpool, self.head_dim))
         # Queries are scored in chunks so the fp32 [queries, heads, groups] score block stays within this many bytes:
         # one chunk for a 4K document, 256 queries at a time for a 128K one.
         self.score_block_bytes = 2**29
@@ -407,7 +383,7 @@ class HYV4FlashAttention(nn.Module):
             linear, self.num_heads * self.v_dim, hidden, config.attention_bias, dtype=dtype
         )
         self.gate_proj = initialize_linear_module(linear, hidden, self.num_heads * self.v_dim, False, dtype=dtype)
-        self.sinks_param = HYV4FlashFP32Parameter(torch.full((self.num_heads,), config.learnable_sink_init))
+        self.sinks_param = DeepseekV4FP32Parameter(torch.full((self.num_heads,), config.learnable_sink_init))
         self.compressed_indexer = (
             HYV4FlashCompressedIndexer(config) if self.attention_type == "indexed_attention" else None
         )

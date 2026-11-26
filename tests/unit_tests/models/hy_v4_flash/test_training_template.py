@@ -15,6 +15,7 @@
 from pathlib import Path
 
 import pytest
+from jinja2.exceptions import TemplateError
 from transformers.utils.chat_template_utils import render_jinja_template
 
 from nemo_automodel.components.models.hy_v4_flash.processing import HYV4FlashProcessor
@@ -94,9 +95,15 @@ def test_training_render_uses_the_official_sft_reasoning_mode() -> None:
     tokenizer = _RecordingTokenizer()
     processor = _processor(tokenizer)
     processor.apply_chat_template(ANSWER_ONLY)
-    processor.apply_chat_template(WITH_REASONING)
-    processor.apply_chat_template([ANSWER_ONLY, WITH_REASONING])
-    assert [call["reasoning_effort"] for call in tokenizer.calls] == ["no_think", "high", "no_think", "high"]
+    processor.apply_chat_template([ANSWER_ONLY, ANSWER_ONLY])
+    assert [call["reasoning_effort"] for call in tokenizer.calls] == ["no_think"] * 3
+
+
+def test_reasoning_samples_are_rejected_by_the_processor_and_by_the_text_template() -> None:
+    with pytest.raises(ValueError, match="assistant reasoning are not supported"):
+        _processor(_RecordingTokenizer()).apply_chat_template(WITH_REASONING)
+    with pytest.raises(TemplateError, match="assistant reasoning are not supported"):
+        render_jinja_template(conversations=[WITH_REASONING], chat_template=TEMPLATE.read_text())
 
 
 def test_explicit_reasoning_effort_and_generation_prompts_are_left_alone() -> None:

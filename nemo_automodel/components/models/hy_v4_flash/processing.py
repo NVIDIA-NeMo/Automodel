@@ -184,19 +184,22 @@ def _open_image(value: Image.Image | str | Path | bytes) -> Image.Image:
     return Image.open(value)
 
 
-def training_reasoning_effort(messages: Sequence[ChatMessage]) -> Literal["no_think", "high"]:
-    """Reasoning mode of a complete (training) conversation, by the rule of the official fine-tuning scripts.
+def training_reasoning_effort(messages: Sequence[ChatMessage]) -> Literal["no_think"]:
+    """Reasoning mode of a complete (training) conversation: ``"no_think"``, as the official fine-tuning scripts use.
 
-    The released template defaults to ``'high'`` (its inference default). The official SFT code renders a sample
-    without a reasoning field with ``'no_think'``; rendering answer-only data in ``'high'`` mode would train answers
-    after an empty think block.
+    The released template defaults to ``'high'`` (its inference default); rendering answer-only data in that mode
+    would train answers after an empty think block.
 
-    Returns:
-        ``"high"`` when an assistant message has non-empty reasoning, else ``"no_think"``.
+    Raises:
+        ValueError: If an assistant message carries reasoning. Such a turn renders as
+            ``<think>reasoning</think>answer``, which the label builders of the training recipes do not supervise.
     """
     for message in messages:
         if message.get("role") == "assistant" and (message.get("reasoning_content") or message.get("reasoning")):
-            return "high"
+            raise ValueError(
+                "Hy4-flash training samples with assistant reasoning are not supported: the reasoning turn would "
+                "get no supervised token. Remove reasoning_content / reasoning from the sample"
+            )
     return "no_think"
 
 
@@ -400,8 +403,9 @@ class HYV4FlashProcessor(ProcessorMixin):
             add_generation_prompt: Append the assistant header.
             processor_kwargs: Padding / truncation arguments for :meth:`__call__`.
             **kwargs: Extra jinja template variables. Without ``reasoning_effort``, a complete conversation
-                (``add_generation_prompt=False``, the training case) is rendered in the mode
-                :func:`training_reasoning_effort` picks; a generation prompt keeps the template's own default.
+                (``add_generation_prompt=False``, the training case) is rendered in ``no_think`` mode and must not
+                carry assistant reasoning (:func:`training_reasoning_effort`); a generation prompt keeps the
+                template's own default.
 
         Returns:
             Rendered text(s), ``input_ids``, or the full batch.

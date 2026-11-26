@@ -31,8 +31,9 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
 | Advanced | bfloat16, attention=cudnn, linear=torch, experts=torch_mm, dispatcher=hybridep, compile_hc=true, compile_norm=true |
 
-Answer-only samples are rendered in the model's fast-thinking mode (`reasoning_effort=no_think`), as the official
-fine-tuning code does; samples whose assistant turns carry reasoning are rendered in `high` mode.
+Samples are rendered in the model's fast-thinking mode (`reasoning_effort=no_think`), as the official fine-tuning
+code does for answer-only data. A sample whose assistant turn carries reasoning (`reasoning_content` or `reasoning`)
+is rejected with an error: training on reasoning traces is not supported.
 
 ## Launch Requirements
 

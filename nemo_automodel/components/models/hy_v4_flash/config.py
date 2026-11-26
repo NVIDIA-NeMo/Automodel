@@ -91,7 +91,7 @@ class HYV4FlashTextConfig(PretrainedConfig):
         num_hidden_layers: int = 42,
         num_attention_heads: int = 32,
         swa_num_attention_heads: int = 64,
-        hidden_act: str = "silu",
+        hidden_act: Literal["silu"] = "silu",
         max_position_embeddings: int = 1048576,
         initializer_range: float = 0.006,
         rms_norm_eps: float = 1e-5,
@@ -132,7 +132,7 @@ class HYV4FlashTextConfig(PretrainedConfig):
         engram_n_embed_per_ngram: int = 768,
         engram_layer_head_vocab_sizes: EngramHeadVocabSizes | None = None,
         engram_pad_id: int = 120002,
-        engram_fp8_embedding: bool = False,
+        engram_fp8_embedding: bool | None = None,
         engram_seed: int = 0,
         engram_lookup_table_size: int = 120818,
         enable_lm_head_fp32: bool = True,
@@ -148,13 +148,16 @@ class HYV4FlashTextConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.moe_intermediate_size = moe_intermediate_size
-        self.routed_expert_hidden_size = routed_expert_hidden_size
+        # The reference names the routed experts' latent width ``moe_hidden_size``.
+        self.routed_expert_hidden_size = kwargs.pop("moe_hidden_size", routed_expert_hidden_size)
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.swa_num_attention_heads = swa_num_attention_heads
         # MLA expands one K/V per query head, so keys are never grouped.
         kwargs.pop("num_key_value_heads", None)
         self.num_key_value_heads = num_attention_heads
+        if hidden_act != "silu":
+            raise ValueError(f"Hy4-flash implements the released silu activation only, got {hidden_act!r}")
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
@@ -194,7 +197,14 @@ class HYV4FlashTextConfig(PretrainedConfig):
         self.engram_n_embed_per_ngram = engram_n_embed_per_ngram
         self.engram_layer_head_vocab_sizes = engram_layer_head_vocab_sizes
         self.engram_pad_id = engram_pad_id
-        self.engram_fp8_embedding = engram_fp8_embedding
+        # An absent key means True in the reference (an fp8 round trip on lookup), which is not implemented here:
+        # a config with Engram layers has to state False rather than silently differ.
+        if engram_fp8_embedding is None and self.engram_layer_ids:
+            raise ValueError(
+                "engram_fp8_embedding is missing: the reference defaults it to True, which is not implemented; "
+                "set engram_fp8_embedding to false (the released config.json does)"
+            )
+        self.engram_fp8_embedding = bool(engram_fp8_embedding)
         self.engram_seed = engram_seed
         self.engram_lookup_table_size = engram_lookup_table_size
         if not enable_lm_head_fp32:

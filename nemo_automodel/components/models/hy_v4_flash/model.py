@@ -631,6 +631,11 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
         rows, seq = input_ids.shape
         image_mask = input_ids == self.image_token_id
         if position_ids is None:
+            if packed_seq_ids is not None:
+                raise ValueError(
+                    "packed_seq_ids needs document-local position_ids (Engram takes document starts from them); "
+                    "pass seq_lens, or the positions that restart with every document"
+                )
             if image_grid_thw is not None:
                 if mm_token_type_ids is None:
                     mm_token_type_ids = image_mask.long()

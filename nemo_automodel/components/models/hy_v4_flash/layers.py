@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor, distribute_tensor
 
+from nemo_automodel.components.models.glm5_next.optimized_kernels import _compile_options
 from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashTextConfig
 
 
@@ -41,7 +42,9 @@ from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashTextCon
 # so ``torch.compile`` can fuse each into one or two kernels: ``BackendConfig.compile_norm`` wraps the RMSNorm core
 # and ``BackendConfig.compile_hc`` the hyper-connection cores, with the same lazy once-per-process pattern and static
 # shapes as DeepSeek-V4.1's cores. The modules call the module-level dispatchers, so instances built before the hook
-# ran still pick up the compiled core. Compiled numerics are allclose to eager, not bitwise-identical.
+# ran still pick up the compiled core. The cores are compiled with GLM-5-Next's Inductor options, which keep the eager
+# BF16 cast points (the norm rounds before the weight multiply); without those options in the installed PyTorch the
+# eager cores stay.
 def _rms_norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Normalize the last axis in fp32, cast back, then apply the weight (reference order).
 
@@ -111,7 +114,9 @@ def compile_norm_core() -> None:
     global _rms_norm, _NORM_COMPILED
     if _NORM_COMPILED:
         return
-    _rms_norm = torch.compile(_rms_norm_core, dynamic=False)
+    options = _compile_options()
+    if options is not None:
+        _rms_norm = torch.compile(_rms_norm_core, dynamic=False, options=options)
     _NORM_COMPILED = True
 
 
@@ -124,8 +129,10 @@ def compile_hc_cores() -> None:
     global _hc_collapse, _hc_expand, _HC_COMPILED
     if _HC_COMPILED:
         return
-    _hc_collapse = torch.compile(_hc_collapse_core, dynamic=False)
-    _hc_expand = torch.compile(_hc_expand_core, dynamic=False)
+    options = _compile_options()
+    if options is not None:
+        _hc_collapse = torch.compile(_hc_collapse_core, dynamic=False, options=options)
+        _hc_expand = torch.compile(_hc_expand_core, dynamic=False, options=options)
     _HC_COMPILED = True
 
 

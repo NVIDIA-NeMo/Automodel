@@ -58,7 +58,7 @@ model:
     shared_expert_overlap: true
     compile_router_weight: true
     compile_hc: true
-    compile_norm: true  # rounds once where the reference rounds twice in BF16; see the model card
+    compile_norm: true
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

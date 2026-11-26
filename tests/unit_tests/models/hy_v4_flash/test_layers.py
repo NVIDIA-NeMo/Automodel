@@ -98,9 +98,9 @@ def test_hyper_connection_collapse_and_expand() -> None:
 
 def test_fp32_parameter_forward_returns_a_copy_that_survives_freed_parameter_storage() -> None:
     """FSDP frees the unsharded parameter storage when a unit reshards after forward; the result must not alias it."""
-    from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashFP32Parameter
+    from nemo_automodel.components.models.hy_v4_flash.attention import DeepseekV4FP32Parameter
 
-    holder = HYV4FlashFP32Parameter(torch.arange(6.0).reshape(2, 3))
+    holder = DeepseekV4FP32Parameter(torch.arange(6.0).reshape(2, 3))  # the holder of the sinks and the indexer APE
     out = holder(torch.zeros(1))
     assert out.dtype == torch.float32 and out.requires_grad
     assert out.data_ptr() != holder.weight.data_ptr()

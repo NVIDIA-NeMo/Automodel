@@ -16,12 +16,14 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 from PIL import Image
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoProcessor, PreTrainedTokenizerFast
 
 import nemo_automodel._transformers.registry  # noqa: F401  (registers the processor with AutoProcessor)
+from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
 from nemo_automodel.components.models.hy_v4_flash.processing import (
     IMAGE_PAD_TOKEN,
     HYV4FlashImageSettings,
@@ -62,3 +64,36 @@ def test_save_and_reload_keep_settings_template_and_encoding(tmp_path: Path) -> 
     assert before.keys() == after.keys() and "pixel_values" in before
     for key in before:
         assert torch.equal(before[key], after[key]), key
+
+
+# Assistant turns as the released template lays them out: an empty think pair in ``no_think`` mode, the reasoning
+# inside the pair in ``high`` mode (the template's default).
+CHAT_TEMPLATE = (
+    "{% for m in messages %}{% if m['role'] == 'assistant' %}<a> <think> "
+    "{% if reasoning_effort != 'no_think' %}{{ m['reasoning_content'] or m['reasoning'] }} {% endif %}"
+    "</think> {{ m['content'] }} <end> {% else %}<u> {{ m['content'] }} <end> {% endif %}{% endfor %}"
+)
+CHAT_WORDS = ("<u>", "<a>", "<think>", "</think>", "<end>", "u", "XSENTINELMARKERX", "what", "four", "because")
+
+
+def _chat_processor() -> HYV4FlashProcessor:
+    fast = _tokenizer()
+    fast.add_tokens(list(CHAT_WORDS))
+    fast.chat_template = CHAT_TEMPLATE
+    return HYV4FlashProcessor(fast, image_token_id=IMAGE_TOKEN_ID)
+
+
+def test_answer_only_sample_is_supervised_on_the_answer_and_the_end_token() -> None:
+    processor = _chat_processor()
+    sample = {"conversation": [{"role": "user", "content": "what"}, {"role": "assistant", "content": "four"}]}
+    batch = default_collate_fn([sample], processor)
+    supervised = batch["labels"][batch["labels"] != -100]
+    assert processor.tokenizer.convert_ids_to_tokens(supervised.tolist()) == ["four", "<end>"]
+
+
+@pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+def test_sample_with_reasoning_is_rejected_instead_of_training_on_no_token(field: str) -> None:
+    turn = {"role": "assistant", "content": "four", field: "because"}
+    sample = {"conversation": [{"role": "user", "content": "what"}, turn]}
+    with pytest.raises(ValueError, match="assistant reasoning are not supported"):
+        default_collate_fn([sample], _chat_processor())

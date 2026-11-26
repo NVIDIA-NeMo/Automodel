@@ -14,8 +14,9 @@ The text recipe trains on Tulu-3 packed into 131,072-token sequences with contex
 parallelism (EP64) on 8 nodes of 8 H100 GPUs. Conversations are shuffled with a fixed seed before packing, and packed
 documents never attend to each other. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
-Answer-only samples are rendered in the model's fast-thinking mode (`reasoning_effort=no_think`), as the official
-fine-tuning code does; samples whose assistant turns carry reasoning are rendered in `high` mode.
+Samples are rendered in the model's fast-thinking mode (`reasoning_effort=no_think`), as the official fine-tuning
+code does for answer-only data. A sample whose assistant turn carries reasoning (`reasoning_content` or `reasoning`)
+is rejected with an error: training on reasoning traces is not supported.
 
 ## Choose a Workflow
 

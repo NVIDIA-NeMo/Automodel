@@ -213,6 +213,15 @@ def test_positions_that_do_not_restart_per_document_are_detected() -> None:
         assert_packed_matches_alone(model, documents, position_ids=running)
 
 
+def test_document_ids_without_positions_are_rejected() -> None:
+    # Positions running across the row would let Engram's n-grams read the previous document's last tokens.
+    model = build_model()
+    ids = torch.randint(*TOKEN_RANGE, (1, 23), generator=torch.Generator().manual_seed(14))
+    documents = torch.tensor([[1] * 9 + [2] * 14])
+    with pytest.raises(ValueError, match="document-local position_ids"):
+        model(ids, packed_seq_ids=documents)
+
+
 def test_packed_documents_equal_separate_forwards() -> None:
     """Packing must not let documents see each other: packed logits equal each document run alone."""
     model = build_plain_model()

@@ -3,7 +3,8 @@
     It renders byte-identically to the released template with reasoning_effort='no_think' (the official SFT default),
     with one difference: a generation block marks each assistant turn's supervised span, the answer and the
     <hy_end> that follows. The empty <think></think> pair stays outside the span, like the generation prompt.
-    Tools, images and reasoning content are not handled here: use the released template for them. -#}
+    Tools and images are not handled here: use the released template for them. An assistant turn with reasoning
+    is rejected, since its reasoning would not be in the supervised span. -#}
 {%- set effort = reasoning_effort if reasoning_effort is defined else 'no_think' -%}
 {%- set sys = messages[0]['content'] if messages[0]['role'] == 'system' else '' -%}
 {{- '<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>' ~ sys ~ '<｜reasoning_mode:opensource｜>reasoning_effort:' ~ effort ~ '<｜hy_end:opensource｜>' -}}
@@ -11,6 +12,9 @@
 {%- if message['role'] == 'user' -%}
 {{- '<｜hy_start:opensource｜>user<｜hy_middle:opensource｜>' ~ message['content'] ~ '<｜hy_end:opensource｜>' -}}
 {%- elif message['role'] == 'assistant' -%}
+{%- if message['reasoning_content'] or message['reasoning'] -%}
+{{- raise_exception('Hy4-flash training samples with assistant reasoning are not supported: remove reasoning_content / reasoning from the sample') -}}
+{%- endif -%}
 {{- '<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>' -}}
 {%- generation -%}{{- message['content'] ~ '<｜hy_end:opensource｜>' -}}{%- endgeneration -%}
 {%- endif -%}
