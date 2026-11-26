@@ -16,10 +16,12 @@
 
 import copy
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 
 import pytest
 import torch
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.inkling2 import triton_attention
@@ -610,3 +612,50 @@ def test_recompute_reuses_the_recorded_forward(monkeypatch: pytest.MonkeyPatch) 
     assert torch.equal(replayed_out, reference_out)
     for replayed, reference in zip(replayed_grads, reference_grads):
         assert torch.equal(replayed, reference)
+
+
+def _recompute_everything() -> tuple[AbstractContextManager[None], AbstractContextManager[None]]:
+    """Return activation-checkpoint contexts that save no operation."""
+    return create_selective_checkpoint_contexts(lambda ctx, func, *args, **kwargs: CheckpointPolicy.PREFER_RECOMPUTE)
+
+
+@needs_gpu_triton
+@pytest.mark.parametrize("layer", [LOCAL_LAYER, FULL_LAYER])
+def test_recomputation_after_another_microbatch_gives_the_gradients_without_checkpointing(layer: int) -> None:
+    """Two pipeline microbatches are in flight: every forward runs before the first backward.
+
+    Two checkpointed layers share the token layout of a microbatch. When the first microbatch is
+    recomputed, the key ranges that the kernels kept belong to the second one.
+    """
+    torch.manual_seed(layer)
+    module = _attention(layer, "triton").cuda()
+    microbatches = []
+    for seed, documents in ((1, [(90, 96), (50, 54)]), (2, [(40, 40), (110, 110)])):
+        valid, positions = _rows([documents], SEQUENCE)
+        hidden = torch.randn(1, SEQUENCE, 32, generator=torch.Generator().manual_seed(seed)).cuda().requires_grad_(True)
+        microbatches.append((hidden, valid.cuda(), positions.cuda()))
+    weight = torch.randn(1, SEQUENCE, 32, generator=torch.Generator().manual_seed(3)).cuda()
+    parameters = list(module.parameters())
+
+    def gradients(
+        attend: Callable[[AttentionSources, torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> list[tuple[torch.Tensor, ...]]:
+        losses = []
+        for hidden, valid, positions in microbatches:
+            first = attend(AttentionSources(hidden, hidden, hidden), valid, positions)
+            second = attend(AttentionSources(first, first, first), valid, positions)
+            losses.append((second * weight).sum())
+        return [
+            torch.autograd.grad(loss, [hidden, *parameters])
+            for loss, (hidden, _, _) in zip(losses, microbatches, strict=True)
+        ]
+
+    def checkpointed(sources: AttentionSources, valid: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return checkpoint(module, sources, valid, positions, use_reentrant=False, context_fn=_recompute_everything)
+
+    expected = gradients(module)
+    actual = gradients(checkpointed)
+    for got_microbatch, wanted_microbatch in zip(actual, expected, strict=True):
+        assert wanted_microbatch[0].abs().max() > 0
+        for got, wanted in zip(got_microbatch, wanted_microbatch, strict=True):
+            torch.testing.assert_close(got, wanted, rtol=1e-5, atol=1e-6 * wanted.abs().max().clamp_min(1e-6).item())

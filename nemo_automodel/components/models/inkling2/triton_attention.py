@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 
 import torch
 from torch.nn import functional as F
+from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.shared.import_utils import null_decorator
 from nemo_automodel.shared.recompute_replay import RecomputeReplay
@@ -758,7 +759,11 @@ def _layout_ranges(
     entry = _RANGES.get(window)
     if entry is not None and entry[1] == query_offset and all(a is b for a, b in zip(entry[0], layout)):
         return entry[2]
-    ranges = key_ranges(valid, positions, key_valid, key_positions, query_offset, window)
+    # Activation checkpointing replays a layer's operations by their count. With several pipeline
+    # microbatches in flight a layer can find the entry in its forward and miss it in its
+    # recomputation, so the operations of a miss run outside the dispatch modes in both passes.
+    with _disable_current_modes():
+        ranges = key_ranges(valid, positions, key_valid, key_positions, query_offset, window)
     _RANGES[window] = (layout, query_offset, ranges)
     return ranges
 
