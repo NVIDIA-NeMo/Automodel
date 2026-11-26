@@ -30,7 +30,8 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import is_offline_mode, snapshot_download
+from huggingface_hub.errors import IncompleteSnapshotError
 from transformers import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
@@ -373,9 +374,10 @@ def _download_model_weights(
 ) -> None:
     """Download weights at the config's resolved commit, retaining Hub options."""
     if not os.path.isdir(pretrained_model_name_or_path):
-        if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
+        # is_offline_mode() covers every value the Hub honors (HF_HUB_OFFLINE=true, TRANSFORMERS_OFFLINE=1).
+        if is_offline_mode() or os.environ.get("HF_HUB_OFFLINE", "0") == "1":
             logger.info(
-                "HF_HUB_OFFLINE=1: skipping weight download for %s (using cached weights)",
+                "Hub offline mode: skipping weight download for %s (using cached weights)",
                 pretrained_model_name_or_path,
             )
             return
@@ -395,7 +397,16 @@ def _download_model_weights(
                 for key in ("cache_dir", "revision", "token", "local_files_only", "force_download")
                 if key in kwargs
             }
-            snapshot_download(pretrained_model_name_or_path, **download_kwargs)
+            if download_kwargs.get("local_files_only"):
+                # Nothing to download: check the cached snapshot like the later load does.
+                _resolve_model_dir(
+                    pretrained_model_name_or_path,
+                    revision=download_kwargs.get("revision"),
+                    cache_dir=download_kwargs.get("cache_dir"),
+                    subfolder=kwargs.get("subfolder", ""),
+                )
+            else:
+                snapshot_download(pretrained_model_name_or_path, **download_kwargs)
 
 
 def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=None):
@@ -738,6 +749,9 @@ def _check_fp8_dequantize_will_fit(
     )
 
 
+_DOCUMENTATION_FILES = ["README.md", "LICENSE", ".gitattributes"]
+
+
 def _resolve_model_dir(
     pretrained_model_name_or_path: str,
     *,
@@ -745,12 +759,27 @@ def _resolve_model_dir(
     cache_dir: str | None = None,
     subfolder: str = "",
 ) -> str:
-    """Resolve a HF repo id or local path to a local directory with model files."""
+    """Resolve a HF repo id or local path to a local directory with model files.
+
+    Raises:
+        LocalEntryNotFoundError: If the cache holds no snapshot folder for the revision.
+        IncompleteSnapshotError: If the cached snapshot lacks a listed file other than documentation.
+    """
     model_dir = pretrained_model_name_or_path
     if not os.path.isdir(model_dir):
-        model_dir = snapshot_download(
-            pretrained_model_name_or_path, revision=revision, cache_dir=cache_dir, local_files_only=True
-        )
+        try:
+            model_dir = snapshot_download(
+                pretrained_model_name_or_path, revision=revision, cache_dir=cache_dir, local_files_only=True
+            )
+        except IncompleteSnapshotError:
+            # Weight-only downloads (e.g. vLLM's) skip documentation files; every other listed file must be cached.
+            model_dir = snapshot_download(
+                pretrained_model_name_or_path,
+                revision=revision,
+                cache_dir=cache_dir,
+                local_files_only=True,
+                ignore_patterns=_DOCUMENTATION_FILES,
+            )
     return os.path.join(model_dir, subfolder) if subfolder else model_dir
 
 
@@ -1158,6 +1187,8 @@ def __init_model(
     # Default ``True`` keeps existing behavior for every recipe that doesn't set
     # it. Pop here so the flag never reaches HF's ``from_pretrained``.
     restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
+    # A constructor argument of every repo model with an LM head; Hugging Face classes have no such argument.
+    logits_dtype = kwargs.pop("logits_dtype", None)
     process_group = kwargs.pop("_process_group", None)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
@@ -1336,6 +1367,9 @@ def __init_model(
                 kwargs["backend"] = BackendConfig(attn="fa4")
             resolved_backend = kwargs.get("backend")
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+            if logits_dtype is not None:
+                # Passed past the filter so a model without the argument fails; unset keeps the model's default.
+                kwargs["logits_dtype"] = dtype_from_str(logits_dtype)
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 model = model_cls(hf_config, *model_args, **kwargs)
             if is_pretrained_init:
@@ -1559,6 +1593,8 @@ def _init_model(
         *model_args,
         **kwargs,
     )
+    if not is_custom_model and kwargs.get("logits_dtype") is not None:
+        logger.warning("logits_dtype is ignored: %s is a Hugging Face model class.", type(model).__name__)
     if is_custom_model and isinstance(resolved_backend, BackendConfig):
         model_backend = getattr(model, "backend", None)
         if isinstance(model_backend, BackendConfig):
@@ -1690,7 +1726,7 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     """
-    Filter kwargs down to what `model_cls.__init__` explicitly accepts.
+    Filter kwargs down to what `model_cls.__init__` explicitly accepts, warning about the rest.
 
     If the constructor has a `**kwargs` parameter (VAR_KEYWORD) or signature cannot be
     inspected, returns kwargs unchanged.
@@ -1706,6 +1742,8 @@ def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     allowed.discard("self")
     # We pass `config` positionally.
     allowed.discard("config")
+    if ignored := sorted(kwargs.keys() - allowed):
+        logger.warning("%s does not take %s; ignoring them.", model_cls.__name__, ", ".join(ignored))
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 

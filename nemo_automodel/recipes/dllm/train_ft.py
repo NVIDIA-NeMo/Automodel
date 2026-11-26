@@ -35,7 +35,6 @@ Usage::
 from __future__ import annotations
 
 import logging
-import time
 from contextlib import nullcontext
 
 from nemo_automodel.shared.import_utils import safe_import
@@ -67,7 +66,6 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.dllm.strategy import BlockDiffusionStrategy, get_dllm_strategy
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -146,6 +144,10 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
     # (absolute, non-attended fill) for full-sequence dLLMs (llada / nemotron); the
     # DiffusionGemma subclass overrides it to True.
     _response_window_collation: bool = False
+
+    @property
+    def _forward_autocast_dtype(self) -> torch.dtype | None:
+        return getattr(self.distributed_config, "autocast_dtype", None)
 
     def setup(self):
         """Build all training components, then apply dLLM-specific overrides."""
@@ -396,7 +398,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         # Context parallel setup (no labels to pass for dLLM)
         cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
         train_ctx, batch = cp_sharder.shard(batch)
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -407,12 +409,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             else nullcontext()
         )
 
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
+        autocast_dtype = self._forward_autocast_dtype
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx(), sync_ctx, te_ctx, autocast_ctx:
             # Hook for model families that need extra forward inputs derived from
             # the (clean) batch — e.g. block_diffusion builds the block-causal
             # attention masks + canvas position ids here. No-op by default.
@@ -586,37 +588,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
-
-        mfu = None
-        mfu_calculator = getattr(self, "mfu_calculator", None)
-        if batches and mfu_calculator is not None:
-            step_flops = 0.0
-            flops_supported = True
-            for batch in batches:
-                input_ids = batch.get("input_ids")
-                if input_ids is None:
-                    flops_supported = False
-                    break
-                batch_flops = mfu_calculator.get_flops(input_ids)
-                if batch_flops is None:
-                    flops_supported = False
-                    break
-                step_flops += float(batch_flops)
-
-            if flops_supported:
-                step_flops = self._dp_allreduce(
-                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
-                ).item()
-                mfu = calculate_mfu(
-                    step_flops / 1e12,
-                    self.dist_env.world_size,
-                    time_delta,
-                    reference_mfu=mfu_calculator.reference_mfu,
-                )
+        tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
 
         total_loss = torch.sum(torch.stack(loss_buffer))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()
@@ -1183,7 +1155,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         model = self.model_parts[0]
         cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
         train_ctx, batch = cp_sharder.shard(batch)
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -1193,12 +1165,12 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             if is_train
             else nullcontext()
         )
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
+        autocast_dtype = self._forward_autocast_dtype
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx(), sync_ctx, te_ctx, autocast_ctx:
             batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)

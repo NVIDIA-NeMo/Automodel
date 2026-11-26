@@ -210,26 +210,26 @@ def read_load_metadata_with_gloo(checkpoint_cfg: ConfigNode | None) -> bool:
     return enabled
 
 
-def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:
-    """Fail fast on EAGLE-3-only draft knobs set on a recipe that does not support them.
+def raise_if_peft_configured(cfg: Any, recipe_name: str, *, supports_draft_weights: bool = False) -> None:
+    """Fail fast on draft knobs set on a recipe that does not support them.
 
     ``peft:``: the DFlash-family and DSpark drafts register trainable non-LoRA
     modules on the draft itself (Domino's ``prefix_gru``/``embed_proj``, DSpark's
     Markov and confidence heads); LoRA's freeze-everything-but-adapters contract
     would silently freeze them, so reject the config instead of ignoring it.
-    ``recipe_args.draft_weights_path``: only the EAGLE-3 recipe implements the
-    warm-start load; a silently ignored knob would train from random init while
-    the user believes the draft was warm-started.
+    ``recipe_args.draft_weights_path``: a recipe without a warm-start load passes
+    ``supports_draft_weights=False``; a silently ignored knob would train from
+    random init while the user believes the draft was warm-started.
     """
     if cfg.get("peft", None) is not None:
         raise ValueError(
             f"peft is not supported by {recipe_name}; LoRA draft training is only available in the EAGLE-3 recipe."
         )
     recipe_args = cfg.get("recipe_args", None)
-    if recipe_args is not None and recipe_args.get("draft_weights_path", None):
+    if not supports_draft_weights and recipe_args is not None and recipe_args.get("draft_weights_path", None):
         raise ValueError(
             f"recipe_args.draft_weights_path is not supported by {recipe_name}; the draft warm start is only "
-            "available in the EAGLE-3 recipe."
+            "available in the EAGLE-3 and DSpark recipes."
         )
 
 
@@ -294,22 +294,6 @@ def check_resumed_mask_token_id(meta: dict, mask_token_id: int, ckpt_dir: str) -
             f"{int(mask_token_id)}. The draft's mask-slot embedding was learned at the "
             f"checkpoint's id; set recipe_args.mask_token_id={int(saved_mask_token_id)} to resume."
         )
-
-
-def resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
-    """Convert a ``wandb:`` config block into ``wandb.init`` kwargs, or ``None``.
-
-    ``enable`` is the examples' documentation-only opt-in flag (W&B logging is
-    opt-in: example configs ship the block with ``enable: false`` so users start
-    logging by flipping it to ``true`` instead of commenting the block in/out);
-    it is not a real ``wandb.init`` kwarg, so strip it before forwarding the rest
-    (passing it through raises ``TypeError: init() got an unexpected keyword
-    argument 'enable'``). Returns ``None`` when ``enable`` is explicitly ``False``.
-    """
-    kwargs = dict(wandb_cfg)
-    if kwargs.pop("enable", True) is False:
-        return None
-    return kwargs
 
 
 def resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmup_steps: int = 1) -> int:

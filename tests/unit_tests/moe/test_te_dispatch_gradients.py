@@ -57,7 +57,7 @@ def fake_legacy_te(monkeypatch):
     """Exercise Automodel's TE integration on CPU, including coupled autograd outputs."""
 
     class GroupedLinear(torch.nn.Module):
-        def __init__(self, *, num_gemms, in_features, out_features, bias, params_dtype, device):
+        def __init__(self, *, first_expert, num_gemms, in_features, out_features, bias, params_dtype, device):
             super().__init__()
             self.num_gemms = num_gemms
             self.weight = torch.nn.Parameter(torch.randn(out_features, in_features, dtype=params_dtype) * 0.02)
@@ -107,11 +107,12 @@ def fake_legacy_te(monkeypatch):
     state = Mock()
     state.is_fp8_enabled.return_value = False
     te = ModuleType("transformer_engine.pytorch")
-    te.GroupedLinear, te.Fp8Padding, te.Fp8Unpadding = GroupedLinear, Padding, Unpadding
+    te.Fp8Padding, te.Fp8Unpadding = Padding, Unpadding
     quantization = ModuleType("transformer_engine.pytorch.quantization")
     quantization.FP8GlobalStateManager = state
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.quantization", quantization)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._ExpertGroupedLinear", GroupedLinear)
     monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
     monkeypatch.setattr("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", Dispatcher)
     return state

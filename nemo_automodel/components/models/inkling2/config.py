@@ -17,7 +17,7 @@
 import json
 import os
 import re
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypeAlias, TypedDict
 
 from transformers import PretrainedConfig
 
@@ -29,14 +29,41 @@ class Inkling2QuantizationConfig(TypedDict):
     nvfp4_layer_count: int
 
 
-class Inkling2ReleasedQuantizationLabel(TypedDict):
-    """``quantization_config`` of a released ``config.json``: the format name only.
-
-    The expert layout is in ``hf_quant_config.json``; building a model replaces this label with it.
-    """
+class Inkling2ModelOptQuantizationLabel(TypedDict):
+    """ModelOpt label of a released ``config.json``: the format name only."""
 
     quant_method: Literal["modelopt"]
     quant_algo: Literal["NVFP4", "MXFP8"]
+
+
+class Inkling2FP8QuantizationLabel(TypedDict):
+    """Transformers' fine-grained FP8 label, used by ``Inkling-2-Small-MXFP8``.
+
+    ``scale_fmt="ue8m0"`` with ``weight_block_size=[1, 32]`` is MXFP8: one power-of-two scale per 32 inputs.
+    """
+
+    quant_method: Literal["fp8"]
+    activation_scheme: Literal["dynamic"]
+    weight_block_size: list[int]
+    scale_fmt: Literal["ue8m0"]
+    modules_to_not_convert: list[str]
+    # Added by the PEFT loader (``_maybe_dequantize_fp8_for_peft``) to any FP8 label.
+    dequantize: NotRequired[bool]
+
+
+# ``quantization_config`` of a released ``config.json``. The expert layout is in ``hf_quant_config.json``;
+# building a model replaces the label with it.
+Inkling2ReleasedQuantizationLabel: TypeAlias = Inkling2ModelOptQuantizationLabel | Inkling2FP8QuantizationLabel
+
+
+class Inkling2LoopConfig(TypedDict):
+    """Layers ``[core_start, core_end)`` run ``num_passes`` times for every token."""
+
+    core_start: int
+    core_end: int
+    num_passes: int
+    gate_rank: int
+    is_varloop: bool
 
 
 class _ParameterGroup(TypedDict):
@@ -48,11 +75,22 @@ class _ParameterGroup(TypedDict):
 
 _EXPERT_WEIGHT = re.compile(r"model\.llm\.layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)")
 _EXPERT_PROJECTIONS = ("w13_weight", "w2_weight")
+_FP8_LABEL_FIELDS = frozenset(
+    ("quant_method", "activation_scheme", "weight_block_size", "scale_fmt", "modules_to_not_convert")
+)
 
 
 def _is_released_label(
     declaration: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None,
 ) -> bool:
+    if declaration is not None and declaration.get("quant_method") == "fp8":
+        # Every released field, plus the optional ``dequantize`` the PEFT loader may add.
+        return (
+            set(declaration) - {"dequantize"} == _FP8_LABEL_FIELDS
+            and declaration.get("activation_scheme") == "dynamic"
+            and declaration.get("scale_fmt") == "ue8m0"
+            and declaration.get("weight_block_size") == [1, 32]
+        )
     return (
         declaration is not None
         and set(declaration) == {"quant_method", "quant_algo"}
@@ -210,6 +248,7 @@ class Inkling2TextConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         tie_word_embeddings: bool = False,
         quantization_config: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None = None,
+        loop_config: Inkling2LoopConfig | None = None,
         **kwargs: Any,
     ) -> None:
         # Hugging Face owns the open-ended serialized metadata at this boundary.
@@ -287,6 +326,19 @@ class Inkling2TextConfig(PretrainedConfig):
             else _checked_quantization_config(quantization_config, num_hidden_layers)
         )
         self.use_cache = False
+        self.loop_config = loop_config
+        if loop_config is not None:
+            if set(loop_config) != {"core_start", "core_end", "num_passes", "gate_rank", "is_varloop"}:
+                raise ValueError("Unsupported Inkling2 loop_config fields")
+            start, end, block = loop_config["core_start"], loop_config["core_end"], self.n_layers_per_attn_res_block
+            if not 0 <= start < end <= num_hidden_layers or start % block or end % block:
+                raise ValueError("The loop core must cover whole attention residual blocks inside the layer stack")
+            if loop_config["num_passes"] < 2 or loop_config["gate_rank"] <= 0:
+                raise ValueError("Looping requires at least two passes and a positive gate rank")
+            if loop_config["is_varloop"]:
+                raise ValueError("Inkling2 checkpoints with a variable number of passes are not supported")
+            if not attn_res_normalize_values:
+                raise ValueError("Loop messages require attn_res_normalize_values=True")
         if (
             min(
                 hidden_size,
@@ -341,6 +393,12 @@ class Inkling2TextConfig(PretrainedConfig):
             <= 0
         ):
             raise ValueError("Inkling2 epsilon, thresholds, softcaps and initialization scale must be positive")
+
+    @property
+    def loop_core_layers(self) -> range:
+        """Decoder layers that run once per pass; empty without a loop."""
+        loop = self.loop_config
+        return range(0) if loop is None else range(loop["core_start"], loop["core_end"])
 
 
 class Inkling2VisionConfig(PretrainedConfig):
@@ -427,6 +485,8 @@ class Inkling2Config(PretrainedConfig):
             else _checked_quantization_config(quantization_config, self.text_config.num_hidden_layers)
         )
         self.text_config.quantization_config = self.quantization_config
+        if self.text_config.loop_config is not None and self.model_type != "inkling2_loop":
+            raise ValueError("A loop_config requires model_type inkling2_loop")
         kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)
 
@@ -451,4 +511,14 @@ class Inkling2LegacyConfig(Inkling2Config):
     def __init__(self, **kwargs: Any) -> None:
         # Transformers dataclass-wraps subclasses without an explicit initializer.
         # Delegate so nested text/vision dictionaries retain their typed conversion.
+        super().__init__(**kwargs)
+
+
+class Inkling2LoopConfiguration(Inkling2Config):
+    """Released configuration of a checkpoint whose middle layers run several times."""
+
+    model_type = "inkling2_loop"
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Transformers dataclass-wraps subclasses without an explicit initializer.
         super().__init__(**kwargs)

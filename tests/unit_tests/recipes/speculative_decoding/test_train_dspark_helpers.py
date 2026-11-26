@@ -20,11 +20,6 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   fast, and an explicit template overrides whatever the tokenizer carries.
 - ``_resolve_reduced_target_layers``: the ``target_num_hidden_layers``
   diagnostic override is range-checked.
-- ``_resolve_dspark_optimizer_spec`` / ``_build_dspark_optimizer``: the
-  ``optimizer:`` config is normalized into a ``build_optimizer`` spec and built,
-  honoring an explicit ``_target_`` (e.g. TE FusedAdam with
-  ``master_weights``/``exp_avg_dtype``/...) instead of always hardcoding plain
-  ``torch.optim.AdamW``.
 - ``resolve_warmup_steps`` at the DSpark floor: the ratio-derived warmup length
   is floored for short / small-dataset runs, unless the caller opts out with
   ``warmup_ratio<=0``.
@@ -65,10 +60,8 @@ from nemo_automodel.recipes.speculative_decoding.train_dspark import (
     TrainDSparkRecipe,
     _add_accept_rate_per_position,
     _apply_target_chat_template,
-    _build_dspark_optimizer,
     _DSparkMetricWindow,
     _extract_mm_kwargs,
-    _resolve_dspark_optimizer_spec,
     _validate_cached_dspark_manifest,
 )
 
@@ -187,7 +180,9 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
     obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
     obj.cfg = SimpleNamespace(
         get=lambda key, default=None: (
-            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+            ConfigNode({"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1})
+            if key == "checkpoint"
+            else default
         )
     )
     obj.output_dir = tmp_path
@@ -294,102 +289,9 @@ def test_reduced_layers_out_of_range_raises(bad):
         resolve_reduced_target_layers(43, bad)
 
 
-# ---------------------------------------------------------------------------
-# _resolve_dspark_optimizer_spec
-# ---------------------------------------------------------------------------
-
-
 def _opt_cfg(**fields):
-    """A minimal ``optimizer:`` config-node stub: dict-like ``to_dict``/``get``."""
+    """A minimal config-node stub: dict-like ``to_dict``/``get``."""
     return SimpleNamespace(to_dict=lambda: dict(fields), get=lambda k, default=None: fields.get(k, default))
-
-
-def test_optimizer_spec_defaults_to_adamw_when_no_target():
-    target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr=6e-4, warmup_ratio=0.04, min_lr_ratio=0.1))
-    assert target == "torch.optim.AdamW"
-    assert kwargs["lr"] == 6e-4
-    assert kwargs["betas"] == (0.9, 0.95)
-    assert kwargs["weight_decay"] == 0.0
-    assert "warmup_ratio" not in kwargs
-    assert "min_lr_ratio" not in kwargs
-
-
-def test_optimizer_spec_respects_explicit_target_and_extra_kwargs():
-    target, kwargs = _resolve_dspark_optimizer_spec(
-        _opt_cfg(
-            _target_="transformer_engine.pytorch.optimizers.FusedAdam",
-            lr=1e-5,
-            master_weights=True,
-            master_weight_dtype="float32",
-            exp_avg_dtype="float32",
-            exp_avg_sq_dtype="float32",
-            store_param_remainders=True,
-        )
-    )
-    assert target == "transformer_engine.pytorch.optimizers.FusedAdam"
-    assert kwargs["lr"] == 1e-5
-    assert kwargs["master_weights"] is True
-    assert kwargs["master_weight_dtype"] == "float32"
-    assert kwargs["exp_avg_dtype"] == "float32"
-    assert kwargs["exp_avg_sq_dtype"] == "float32"
-    assert kwargs["store_param_remainders"] is True
-
-
-def test_optimizer_spec_preserves_explicit_betas_and_weight_decay():
-    _target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr=6e-4, betas=(0.9, 0.999), weight_decay=0.01))
-    assert kwargs["betas"] == (0.9, 0.999)
-    assert kwargs["weight_decay"] == 0.01
-
-
-def test_optimizer_spec_coerces_lr_to_float():
-    _target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(lr="6e-4"))
-    assert kwargs["lr"] == pytest.approx(6e-4)
-    assert isinstance(kwargs["lr"], float)
-
-
-def test_optimizer_spec_keeps_real_config_node_target_as_string():
-    cfg = ConfigNode({"_target_": "torch.optim.AdamW", "lr": 1e-5})
-    target, _kwargs = _resolve_dspark_optimizer_spec(cfg)
-    assert target == "torch.optim.AdamW"
-
-
-def test_optimizer_spec_does_not_force_betas_onto_explicit_target():
-    # An explicit _target_ for an optimizer with no `betas` kwarg (e.g. SGD)
-    # must not have AdamW's betas/weight_decay defaults forced onto it.
-    target, kwargs = _resolve_dspark_optimizer_spec(_opt_cfg(_target_="torch.optim.SGD", lr=0.1, momentum=0.9))
-    assert target == "torch.optim.SGD"
-    assert "betas" not in kwargs
-    assert "weight_decay" not in kwargs
-    assert kwargs["momentum"] == 0.9
-
-
-# ---------------------------------------------------------------------------
-# _build_dspark_optimizer
-# ---------------------------------------------------------------------------
-
-
-def test_build_optimizer_defaults_to_adamw():
-    model = torch.nn.Linear(4, 4)
-    optimizer = _build_dspark_optimizer(model, _opt_cfg(lr=6e-4))
-    assert isinstance(optimizer, torch.optim.AdamW)
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(6e-4)
-    assert optimizer.param_groups[0]["betas"] == (0.9, 0.95)
-
-
-def test_build_optimizer_respects_explicit_target():
-    model = torch.nn.Linear(4, 4)
-    optimizer = _build_dspark_optimizer(model, _opt_cfg(_target_="torch.optim.SGD", lr=0.1, momentum=0.9))
-    assert isinstance(optimizer, torch.optim.SGD)
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
-    assert optimizer.param_groups[0]["momentum"] == 0.9
-
-
-def test_build_optimizer_only_covers_trainable_params():
-    model = torch.nn.Linear(4, 4)
-    model.bias.requires_grad_(False)
-    optimizer = _build_dspark_optimizer(model, _opt_cfg(lr=6e-4))
-    (params,) = (group["params"] for group in optimizer.param_groups)
-    assert params == [model.weight]
 
 
 # ---------------------------------------------------------------------------
@@ -458,16 +360,6 @@ def test_extract_mm_kwargs_ignores_unrelated_keys():
 # ---------------------------------------------------------------------------
 # GLM-5.2 target config repair + reduced-config forwarding
 # ---------------------------------------------------------------------------
-
-
-def test_optimizer_spec_real_config_node_without_target_defaults_to_adamw():
-    """Regression: ConfigNode.get_as_string raises KeyError for an absent ``_target_``
-    even with a ``None`` default, which crashed every optimizer block omitting it."""
-    cfg = ConfigNode({"lr": 6e-4, "betas": [0.9, 0.95], "weight_decay": 0.0, "warmup_ratio": 0.04})
-    target, kwargs = _resolve_dspark_optimizer_spec(cfg)
-    assert target == "torch.optim.AdamW"
-    assert kwargs["lr"] == 6e-4
-    assert "warmup_ratio" not in kwargs
 
 
 def test_repair_glm_qk_rope_restores_clobbered_value():

@@ -30,7 +30,8 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig
+from torch.utils.data import DataLoader
+from transformers import AutoConfig, PreTrainedConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
@@ -41,10 +42,16 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.loggers import TrackioConfig
+from nemo_automodel.components.speculative.dflash.cached_data import CachedDFlashDataConfig
+from nemo_automodel.components.speculative.dflash.cached_target import DFlashTargetTablesConfig
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec, resolve_dflash_draft_spec
-from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel, resolve_text_config
+from nemo_automodel.components.speculative.dflash.target import (
+    DFlashTargetBatch,
+    HFDFlashTargetModel,
+    resolve_text_config,
+)
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.speculative_decoding._spec_recipe_base import SpecDecodeRecipeBase
@@ -134,6 +141,7 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
 
     def setup(self):
         """Build the target model, DFlash draft, data, optimizer, and trainer module."""
+        train_cache, val_cache = self._validate_cached_inputs()
         self.dist_env = initialize_distributed(
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
             timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 30),
@@ -160,7 +168,10 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        self.target_model = self._build_target_model(recipe_cfg, target_path, draft_spec)
+        self._cached_target_tables = None
+        self.target_model = (
+            self._build_target_model(recipe_cfg, target_path, draft_spec) if train_cache is None else None
+        )
 
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
@@ -174,55 +185,52 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
             recipe_cfg.get("target_layer_ids", None)
             or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
         )
-        self.target_wrapper = self._build_target_wrapper(target_layer_ids)
+        if train_cache is not None and any(
+            type(layer) is not int or not 0 <= layer < num_target_layers for layer in target_layer_ids
+        ):
+            raise ValueError(
+                f"Cached DFlash target_layer_ids must index the target's {num_target_layers} decoder layers"
+            )
+        self.target_wrapper = self._build_target_wrapper(target_layer_ids) if train_cache is None else None
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_text_config.vocab_size)
 
-        # ``packed_sequence_size > 0`` enables sequence packing; the DFlash target,
-        # block mask, anchor sampling, and draft RoPE all consume the block-causal
-        # packing metadata (position_ids / seq_lens / doc_remaining) the loader emits.
-        packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
-        if packed_sequence_size > 0:
-            if getattr(self.target_model, "_owns_packed_attention", False):
-                raise NotImplementedError(
-                    f"Sequence packing (packed_sequence_size>0) is not supported for a "
-                    f"{type(self.target_model).__name__} DFlash target: it declares _owns_packed_attention "
-                    "and consumes its own packing metadata, not the block-causal additive mask the DFlash "
-                    "target wrapper builds, so document boundaries would be silently dropped. "
-                    "Set packed_sequence_size=0."
-                )
-            validate_packing_gates(
-                method="DFlash",
-                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
-                target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
-                micro_batch_size=int(recipe_cfg.micro_batch_size),
+        if train_cache is not None:
+            self._setup_cached_inputs(
+                train_cache=train_cache,
+                val_cache=val_cache,
+                target_config=checkpoint_config,
+                target_layer_ids=target_layer_ids,
             )
-        self.train_dataloader = build_eagle3_dataloader(
-            data_path=recipe_cfg.train_data_path,
-            tokenizer=self.tokenizer,
-            seq_length=recipe_cfg.seq_length,
-            batch_size=recipe_cfg.micro_batch_size,
-            shuffle=True,
-            num_workers=recipe_cfg.get("num_workers", 0),
-            split=recipe_cfg.get("train_split", None),
-            distributed=self.dist_env.world_size > 1,
-            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
-            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
-            packed_sequence_size=packed_sequence_size,
-            dp_mesh=self.dp_mesh,
-        )
-        self.val_dataloader = None
-        if recipe_cfg.get("val_data_path", None):
-            self.val_dataloader = build_eagle3_dataloader(
-                data_path=recipe_cfg.val_data_path,
+        else:
+            # ``packed_sequence_size > 0`` enables sequence packing; the DFlash target,
+            # block mask, anchor sampling, and draft RoPE all consume the block-causal
+            # packing metadata (position_ids / seq_lens / doc_remaining) the loader emits.
+            packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+            if packed_sequence_size > 0:
+                if getattr(self.target_model, "_owns_packed_attention", False):
+                    raise NotImplementedError(
+                        f"Sequence packing (packed_sequence_size>0) is not supported for a "
+                        f"{type(self.target_model).__name__} DFlash target: it declares _owns_packed_attention "
+                        "and consumes its own packing metadata, not the block-causal additive mask the DFlash "
+                        "target wrapper builds, so document boundaries would be silently dropped. "
+                        "Set packed_sequence_size=0."
+                    )
+                validate_packing_gates(
+                    method="DFlash",
+                    cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                    target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
+                    micro_batch_size=int(recipe_cfg.micro_batch_size),
+                )
+            self.train_dataloader = build_eagle3_dataloader(
+                data_path=recipe_cfg.train_data_path,
                 tokenizer=self.tokenizer,
                 seq_length=recipe_cfg.seq_length,
                 batch_size=recipe_cfg.micro_batch_size,
-                shuffle=False,
+                shuffle=True,
                 num_workers=recipe_cfg.get("num_workers", 0),
-                split=recipe_cfg.get("val_split", None),
+                split=recipe_cfg.get("train_split", None),
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
@@ -230,6 +238,23 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
                 packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
+            self.val_dataloader = None
+            if recipe_cfg.get("val_data_path", None):
+                self.val_dataloader = build_eagle3_dataloader(
+                    data_path=recipe_cfg.val_data_path,
+                    tokenizer=self.tokenizer,
+                    seq_length=recipe_cfg.seq_length,
+                    batch_size=recipe_cfg.micro_batch_size,
+                    shuffle=False,
+                    num_workers=recipe_cfg.get("num_workers", 0),
+                    split=recipe_cfg.get("val_split", None),
+                    distributed=self.dist_env.world_size > 1,
+                    shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+                    mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                    mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+                    packed_sequence_size=packed_sequence_size,
+                    dp_mesh=self.dp_mesh,
+                )
 
         draft_cls = self._draft_cls(draft_spec)
         # A single knob drives both the trainer's mask format and the draft's
@@ -270,7 +295,13 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
                 target_layer_ids=target_layer_ids,
                 attention_backend=attention_backend,
             )
-        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # Keep initial weights paired across cached DFlash and MMFlash runs,
+        # without changing the online recipe or its global RNG.
+        init_rng = torch.random.fork_rng(devices=[]) if train_cache is not None else nullcontext()
+        with init_rng:
+            if train_cache is not None:
+                torch.default_generator.manual_seed(int(recipe_cfg.get("shuffle_seed", 42)))
+            self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
@@ -321,6 +352,68 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
             )
             self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
             logger.info("Trackio experiment tracking enabled")
+
+    def _validate_cached_inputs(self) -> tuple[str | None, str | None]:
+        args = self.cfg.recipe_args
+        train_cache, val_cache = args.get("train_cache_path"), args.get("val_cache_path")
+        for name, path in (("train_cache_path", train_cache), ("val_cache_path", val_cache)):
+            if path is not None and (not isinstance(path, str) or not path.strip()):
+                raise ValueError(f"recipe_args.{name} must be a nonempty path")
+        if train_cache is None:
+            if val_cache is not None or args.get("loss_type") == "mmflash":
+                raise ValueError("Cached validation and MMFlash require recipe_args.train_cache_path")
+            return None, None
+        if type(self) is not TrainDFlashRecipe:
+            raise ValueError("Offline feature caches are supported by TrainDFlashRecipe")
+        if args.get("train_data_path") or args.get("val_data_path"):
+            raise ValueError("Use either cache paths or raw data paths for training and validation")
+        if args.get("packed_sequence_size"):
+            raise ValueError("Sequence packing is unavailable with cached DFlash features")
+        if args.get("mask_reasoning_content") or args.get("mask_generation_prompt"):
+            raise ValueError("Cached DFlash uses the loss mask recorded at capture time")
+        if any(int(self.cfg.get(f"distributed.{axis}_size", 1) or 1) > 1 for axis in ("cp", "tp", "pp", "ep")):
+            raise ValueError("Cached DFlash supports only unsharded or data-parallel target tables")
+        return train_cache, val_cache
+
+    def _setup_cached_inputs(
+        self, *, train_cache: str, val_cache: str | None, target_config: PreTrainedConfig, target_layer_ids: list[int]
+    ) -> None:
+        args = self.cfg.recipe_args
+        self.dist_setup = self.device_mesh = self.dp_mesh = self.cp_mesh = None
+        target_text = resolve_text_config(target_config)
+
+        def loader(path: str, *, shuffle: bool) -> DataLoader:
+            return CachedDFlashDataConfig(
+                cache_dir=path,
+                max_seq_len=int(args.seq_length),
+                batch_size=int(args.micro_batch_size),
+                require_visual_score=args.get("loss_type") == "mmflash",
+                shuffle=shuffle,
+                shuffle_seed=int(args.get("shuffle_seed", 42)),
+                num_workers=int(args.get("num_workers", 0)),
+            ).build(
+                target_model_name_or_path=args.target_model_name_or_path,
+                target_layer_ids=target_layer_ids,
+                target_hidden_size=int(target_text.hidden_size),
+                target_vocab_size=int(target_text.vocab_size),
+                block_size=self.block_size,
+                mask_token_id=self.mask_token_id,
+                pad_token_id=(
+                    self.mask_token_id if self.tokenizer.pad_token_id is None else self.tokenizer.pad_token_id
+                ),
+                distributed=self.dist_env.world_size > 1,
+            )
+
+        self.train_dataloader = loader(train_cache, shuffle=True)
+        self.val_dataloader = loader(val_cache, shuffle=False) if val_cache is not None else None
+        self._cached_target_tables = DFlashTargetTablesConfig(
+            embedding_key=args.get("target_embedding_key", "model.embed_tokens.weight"),
+            lm_head_key=args.get("target_lm_head_key", "lm_head.weight"),
+        ).build(args.target_model_name_or_path, config=target_config, device=self.device, dtype=self.compute_dtype)
+        if self.dist_env.is_main:
+            logger.info(
+                "DFlash offline cache: %d training records from %s", len(self.train_dataloader.dataset), train_cache
+            )
 
     def _build_target_model(self, recipe_cfg, target_path: str, draft_spec: DFlashDraftSpec) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.
@@ -483,13 +576,14 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
         # is; stamping it keeps the saved config loadable by the serving runtimes.
         draft_config["model_type"] = "qwen3"
         draft_config["num_hidden_layers"] = draft_num_hidden_layers
-        # The published drafters size their attention independently of the target
+        # The published drafters size their attention and MLP independently of the target
         # (e.g. Qwen3.8-27B: 32 heads / 8 kv / head_dim 128 against a 24 / 4 / 256
         # target). Default to the target's shape and let a recipe override it.
         for draft_key, target_key in (
             ("draft_num_attention_heads", "num_attention_heads"),
             ("draft_num_key_value_heads", "num_key_value_heads"),
             ("draft_head_dim", "head_dim"),
+            ("draft_intermediate_size", "intermediate_size"),
         ):
             override = recipe_cfg.get(draft_key, None)
             if override is not None:
@@ -540,10 +634,11 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
         """Build the trainer wrapper. Subclasses override to swap the wrapper (e.g. Domino)."""
+        tables = getattr(self, "_cached_target_tables", None)
         return DFlashTrainerModule(
             draft_model=self.draft_model,
-            target_lm_head=self.target_model.get_output_embeddings(),
-            target_embed_tokens=self.target_model.get_input_embeddings(),
+            target_lm_head=tables.lm_head if tables is not None else self.target_model.get_output_embeddings(),
+            target_embed_tokens=tables.embed_tokens if tables is not None else self.target_model.get_input_embeddings(),
             mask_token_id=self.mask_token_id,
             block_size=self.block_size,
             attention_backend=attention_backend,
@@ -557,11 +652,39 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
             loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
             dpace_alpha=float(recipe_cfg.get("dpace_alpha", 0.5)),
             prefix_weight_base=float(recipe_cfg.get("prefix_weight_base", 0.9)),
+            mmflash_smoothing=float(recipe_cfg.get("mmflash_smoothing", 0.5)),
+            visual_alpha=float(recipe_cfg.get("visual_alpha", 1.0)),
             sliding_window=self.draft_sliding_window,
+        )
+
+    def _prepare_target_batch(self, batch: dict[str, torch.Tensor]) -> DFlashTargetBatch:
+        """Prepare the trainer inputs from a live forward or the feature cache.
+
+        Args:
+            batch: Token IDs and masks of shape [batch, sequence]. Cached batches
+                supply [batch, sequence, layers * hidden_size] target features and
+                optional [batch, sequence] visual scores.
+
+        Returns:
+            Target features and label metadata aligned to the original tokens.
+        """
+        inputs = dict(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+            **packing_kwargs(batch),
+        )
+        if self.target_wrapper is not None:
+            return self.target_wrapper.generate_batch(**inputs)
+        return DFlashTargetBatch(
+            hidden_states=batch["hidden_states"].to(dtype=self.compute_dtype),
+            visual_score=batch.get("visual_score"),
+            **inputs,
         )
 
     def _run_trainer_step(self, target_batch):
         """Run one trainer-module forward. Subclasses override to inject extra inputs (e.g. lambda_base)."""
+        score = getattr(target_batch, "visual_score", None)
         return self.trainer_module(
             input_ids=target_batch.input_ids,
             hidden_states=target_batch.hidden_states,
@@ -569,6 +692,7 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
             position_ids=target_batch.position_ids,
             seq_lens=target_batch.seq_lens,
             doc_remaining=target_batch.doc_remaining,
+            **({"visual_score": score} if score is not None else {}),
         )
 
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
@@ -632,13 +756,18 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist DFlash meta: global_step, epoch, block_size, and target layers."""
+        layers = (
+            self.target_wrapper.target_layer_ids
+            if self.target_wrapper is not None
+            else self.draft_model.config.dflash_config["target_layer_ids"]
+        )
         self._save_meta(
             path,
             "dflash_meta.pt",
             epoch,
             block_size=self.block_size,
             mask_token_id=self.mask_token_id,
-            target_layer_ids=list(self.target_wrapper.target_layer_ids),
+            target_layer_ids=list(layers),
         )
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
@@ -663,12 +792,7 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                target_batch = self.target_wrapper.generate_batch(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    loss_mask=batch["loss_mask"],
-                    **packing_kwargs(batch),
-                )
+                target_batch = self._prepare_target_batch(batch)
                 try:
                     # Route through the same seam as training so subclass-specific
                     # inputs (Domino's lambda_base, JetSpec's target_logits) are wired.
@@ -740,12 +864,7 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
                 for batch_idx, batch in enumerate(self.train_dataloader):
                     last_batch_idx = batch_idx
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                    target_batch = self.target_wrapper.generate_batch(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        loss_mask=batch["loss_mask"],
-                        **packing_kwargs(batch),
-                    )
+                    target_batch = self._prepare_target_batch(batch)
                     sync_grads = should_sync_grads(
                         pending_micro_batches=pending_micro_batches,
                         grad_accumulation_steps=self.grad_accumulation_steps,

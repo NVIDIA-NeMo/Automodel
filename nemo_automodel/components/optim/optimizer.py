@@ -56,6 +56,7 @@ from nemo_automodel.components.optim.dion import build_dion_optimizer, get_dion_
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.te_patches import apply_fused_adam_empty_shard_patch
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -320,13 +321,31 @@ class FusedAdamConfig(OptimizerConfig):
     def _build_optimizer(
         self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
     ) -> torch.optim.Optimizer:
+        """Build TE FusedAdam over every given parameter.
+
+        Args:
+            params: Flat list of parameters, or list of param-group dicts with a
+                ``"params"`` list. Each parameter is a tensor of arbitrary shape or
+                a ``DTensor`` with an arbitrary global shape; its local shard may
+                have zero elements on this rank and is handed to TE unchanged.
+            foreach: Unused; TE FusedAdam takes no ``foreach`` argument.
+
+        Returns:
+            TE FusedAdam holding ``params`` in the given order and groups.
+        """
         from transformer_engine.pytorch.optimizers import FusedAdam
 
         kwargs = self._constructor_kwargs()
         master_weight_dtype = kwargs.pop("master_weight_dtype", None)
         if master_weight_dtype is not None:
             master_weight_dtype = dtype_from_str(master_weight_dtype)
-        return FusedAdam(_drop_empty_local_shards(params), **kwargs, master_weight_dtype=master_weight_dtype)
+        # Parameters whose local FSDP2 shard is empty stay in the optimizer, so every rank holds the
+        # same parameter list. ``state_dict()`` keys optimizer state by parameter position, and a
+        # checkpoint saved from those keys (PEFT with expert parallelism or quantized parameters)
+        # merges position ``i`` across ranks. The patch keeps empty shards out of TE's native
+        # multi-tensor kernel, which must not receive them.
+        apply_fused_adam_empty_shard_patch()
+        return FusedAdam(params, **kwargs, master_weight_dtype=master_weight_dtype)
 
 
 @dataclass
@@ -914,11 +933,11 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             # trainable parameters, and returns either a flat param list or the
             # per-group dicts.
             params = _trainable_params_or_groups(part, overrides)
-            # TE FusedAdam's multi_tensor_apply faults on zero-numel local shards; see
-            # _drop_empty_local_shards.  Same guard as FusedAdamConfig, for the YAML
-            # ``_target_: transformer_engine...FusedAdam`` escape hatch.
+            # Same as FusedAdamConfig, for the YAML ``_target_: transformer_engine...FusedAdam``
+            # escape hatch: empty local shards stay in the parameter list and the patch keeps
+            # them out of TE's native multi-tensor kernel.
             if _is_te_fused_adam(self.factory):
-                params = _drop_empty_local_shards(params)
+                apply_fused_adam_empty_shard_patch()
             optimizers.append(self.factory(params=params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
@@ -929,6 +948,20 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         *,
         device_mesh: DeviceMesh | None = None,
     ) -> torch.optim.Optimizer:
+        """Build the factory's optimizer over prebuilt parameter groups.
+
+        Args:
+            param_groups: Param-group dicts with a ``"params"`` list and optional
+                per-group options. Each parameter is a tensor of arbitrary shape or
+                a ``DTensor`` with an arbitrary global shape; its local shard may
+                have zero elements on this rank. The groups are handed to the
+                factory unchanged, also when the factory is TE FusedAdam.
+            device_mesh: Mesh of the model; only selects ``foreach`` for factories
+                that accept it.
+
+        Returns:
+            The optimizer the factory builds over ``param_groups``.
+        """
         assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
         foreach = _foreach_for_mesh(device_mesh)
 
@@ -941,7 +974,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             kwargs["foreach"] = foreach
 
         if _is_te_fused_adam(self.factory):
-            param_groups = _drop_empty_local_shards(param_groups)
+            apply_fused_adam_empty_shard_patch()
         return self.factory(params=param_groups, **kwargs)
 
 
@@ -1069,103 +1102,14 @@ def _foreach_for_mesh(device_mesh: DeviceMesh | None) -> bool | None:
     return None
 
 
-def _local_numel(param: torch.Tensor) -> int:
-    """Number of elements of ``param`` owned by this rank.
-
-    Args:
-        param: Parameter tensor of arbitrary shape. For a ``DTensor`` (e.g. an
-            FSDP2 parameter with a dim-0 ``Shard`` placement), the global shape
-            may be non-empty while this rank's local shard holds zero elements;
-            the local (``to_local()``) element count is returned. For a plain
-            tensor, local and global element counts coincide (``numel()``).
-
-    Returns:
-        Element count of the rank-local shard; 0 when this rank owns no slice.
-    """
-    if isinstance(param, DTensor):
-        return param.to_local().numel()
-    return param.numel()
-
-
-def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
-    """Drop parameters whose rank-local shard holds zero elements.
-
-    FSDP2 shards every parameter along dim-0 across the shard group, so any
-    parameter with dim-0 smaller than the group — e.g. the biases, norm
-    weights, or class/position embeddings of a small dense vision tower
-    sharded over a wide mesh — leaves zero-numel local shards on the tail
-    ranks.  TransformerEngine FusedAdam's ``multi_tensor_apply`` kernel has no
-    empty-tensor guard and faults (CUDA misaligned address / illegal memory
-    access) at the first optimizer step.  Dropping locally-empty shards is
-    exact, not an approximation: every element of those parameters lives on
-    other ranks, whose optimizers update them; this rank has nothing to do.
-
-    Args:
-        params: Flat list of parameters, or list of param-group dicts with a
-            ``"params"`` list.  Parameters are plain tensors or ``DTensor``s;
-            a ``DTensor`` parameter carries a non-empty global shape whose
-            dim-0-sharded local shard may be empty on this rank.
-
-    Returns:
-        ``params`` with zero-numel local shards removed.  Param groups keep
-        their other options unchanged.
-
-    Raises:
-        ValueError: If every parameter of the flat list — or of any single
-            param group — is locally empty on this rank.  Neither outcome has
-            a safe representation: dropping a whole group makes
-            ``optimizer.param_groups`` rank-asymmetric (LR/WD schedulers
-            address groups positionally, e.g. ``param_groups[0]``, so ranks
-            would silently schedule different lr/wd for shards other ranks
-            own), while keeping an empty group breaks torch DCP's flattened
-            optimizer-state load, which indexes the first param of each group.
-    """
-    remedy = (
-        "This happens when FSDP2 shards parameters whose dim-0 is smaller than the shard group "
-        "(e.g. tiny biases/norm weights of a small module on a wide mesh). Merge such parameters "
-        "into a group that keeps at least one non-empty local shard on every rank, or shrink the "
-        "sharding mesh so every rank owns at least one element."
-    )
-    params = list(params)
-    dropped = 0
-    if params and isinstance(params[0], dict):
-        filtered: list[Any] = []
-        for idx, group in enumerate(params):
-            kept = [p for p in group["params"] if _local_numel(p) > 0]
-            dropped += len(group["params"]) - len(kept)
-            if not kept:
-                raise ValueError(
-                    f"Every parameter in optimizer param group {idx} has a zero-numel local shard on "
-                    f"this rank; TE FusedAdam cannot hold them (multi_tensor_apply faults on empty "
-                    f"tensors) and the group can be neither dropped nor kept empty. {remedy}"
-                )
-            filtered.append({**group, "params": kept})
-    else:
-        filtered = [p for p in params if _local_numel(p) > 0]
-        dropped = len(params) - len(filtered)
-        if params and not filtered:
-            raise ValueError(
-                f"Every trainable parameter of this model part has a zero-numel local shard on this "
-                f"rank, leaving TE FusedAdam with an empty parameter list. {remedy}"
-            )
-    if dropped:
-        logger.warning(
-            "Dropped %d parameter(s) with zero-numel local shards from TE FusedAdam on this rank: "
-            "TransformerEngine's multi_tensor_apply faults on empty tensors, and every element of "
-            "the dropped parameters is owned (and updated) by other ranks.",
-            dropped,
-        )
-    return filtered
-
-
 def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
     """Return ``True`` if ``factory`` is TransformerEngine's ``FusedAdam`` (or a subclass).
 
     ``functools.partial`` wrappers are unwrapped (iteratively, for nested
     partials) before the identity check, so ``partial(FusedAdam, ...)``
     factories are recognized.  Other wrapper callables (closures, custom
-    factory functions) are opaque and are NOT recognized; such factories must
-    guard against zero-numel local shards themselves.
+    factory functions) are opaque and are NOT recognized; the empty-shard
+    patch is not applied on their behalf.
 
     Identity-based and import-free: TE is an optional dependency, so this never
     imports it.  If TE has not been imported yet, ``factory`` cannot be TE's
@@ -1240,6 +1184,28 @@ def _import_from_path(path: str) -> Any:
         raise ImportError(f"Module {module_name!r} has no attribute {attr!r} (from optimizer path {path!r}).") from e
 
 
+def dion_config_class(target: Callable[..., torch.optim.Optimizer]) -> type[OptimizerConfig] | None:
+    """Return the typed config that performs Dion's parameter grouping for ``target``.
+
+    Args:
+        target: A resolved optimizer class or callable (e.g. YAML ``_target_: dion.Muon``).
+
+    Returns:
+        The config class for a Dion-family ``target``, or ``None`` when ``target`` is not one.
+
+    Raises:
+        TypeError: If ``target`` is a Dion-family optimizer without a typed config.
+    """
+    if not is_dion_optimizer(target):
+        return None
+    dion_config = _DION_CONFIG_FOR.get(getattr(target, "__name__", ""))
+    if dion_config is None:
+        raise TypeError(
+            f"Unsupported dion optimizer {getattr(target, '__name__', target)!r}; supported: {sorted(_DION_CONFIG_FOR)}."
+        )
+    return dion_config
+
+
 def build_optimizer_config(
     target: OptimizerConfig | str | type[OptimizerConfig] | Callable[..., torch.optim.Optimizer],
     kwargs: dict[str, Any] | None = None,
@@ -1286,13 +1252,8 @@ def build_optimizer_config(
     # Dion-family optimizers need parameter grouping; route a resolved dion class
     # (e.g. YAML ``_target_: dion.Muon``) to its typed config rather than the flat-params
     # factory escape hatch, which would lose grouping and leak grouping-only kwargs.
-    if is_dion_optimizer(target):
-        dion_config = _DION_CONFIG_FOR.get(getattr(target, "__name__", ""))
-        if dion_config is None:
-            raise TypeError(
-                f"Unsupported dion optimizer {getattr(target, '__name__', target)!r}; "
-                f"supported: {sorted(_DION_CONFIG_FOR)}."
-            )
+    dion_config = dion_config_class(target)
+    if dion_config is not None:
         return dion_config(**kwargs)
     if callable(target):
         return OptimizerFromFactoryConfig(factory=target, kwargs=kwargs)

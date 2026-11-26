@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import math
+
 import pytest
 import torch
 
@@ -1496,6 +1498,82 @@ def test_parameter_freezing_survives_materialization_with_intrinsic_fp32(tmp_pat
     torch.testing.assert_close(targets[intrinsic], values, rtol=0, atol=0)
     torch.testing.assert_close(targets[bias_name], bias_values, rtol=0, atol=0)
     assert targets[bias_name].dtype == torch.float32
+
+
+@pytest.mark.cpu_only
+def test_random_initialization_of_a_meta_built_model_sets_every_mamba_mixer_parameter():
+    """A model built on the meta device keeps no constructor values; the production initializer supplies them."""
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    backend = BackendConfig(
+        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+    )
+    config = MockNemotronV3Config(
+        torch_dtype="float32", layers_block_type=["mamba", "moe"], mamba_num_heads=8, n_groups=2
+    )
+    with torch.device("meta"):
+        model = NemotronHForCausalLM(config, backend=backend)
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+    mixer = model.model.layers["0"].mixer
+    intermediate = config.mamba_num_heads * config.mamba_head_dim
+    out_bound = 1.0 / math.sqrt(intermediate) / math.sqrt(config.num_hidden_layers)
+    conv_bound = 1.0 / math.sqrt(config.conv_kernel)
+    for name, weight, bound in (
+        ("in_proj.weight", mixer.in_proj.weight, 1.0 / math.sqrt(config.hidden_size)),
+        ("out_proj.weight", mixer.out_proj.weight, out_bound),
+        ("conv1d.weight", mixer.conv1d.weight, conv_bound),
+        ("conv1d.bias", mixer.conv1d.bias, conv_bound),
+    ):
+        # A uniform(-bound, bound) sample: inside the bound, with standard deviation bound / sqrt(3).
+        assert float(weight.detach().abs().max()) <= bound, name
+        assert float(weight.detach().std()) == pytest.approx(bound / math.sqrt(3), rel=0.2), name
+    torch.testing.assert_close(mixer.norm.weight.detach(), torch.ones(intermediate))
+    torch.testing.assert_close(mixer.D.detach(), torch.ones(config.mamba_num_heads))
+    torch.testing.assert_close(mixer.A_log.detach(), torch.log(torch.arange(1, config.mamba_num_heads + 1).float()))
+    step_size = torch.nn.functional.softplus(mixer.dt_bias.detach())
+    assert float(step_size.min()) >= config.time_step_floor
+    assert float(step_size.max()) <= config.time_step_max * 1.001
+
+
+@skip_if_no_mamba
+def test_first_backward_after_random_initialization_reaches_every_mamba_block_parameter():
+    """Zero-filled storage stands in for a fresh allocation; the production initializer must make the block train."""
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    backend = BackendConfig(
+        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+    )
+    config = MockNemotronV3Config(layers_block_type=["mamba", "attention"], mamba_num_heads=8, n_groups=2)
+    model = NemotronHForCausalLM(config, backend=backend).to(torch.bfloat16).cuda()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    Checkpointer.initialize_model_weights(model, torch.device("cuda"))
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 16), device="cuda")
+    logits = model(input_ids).logits
+    assert torch.isfinite(logits).all()
+    logits.float().square().mean().backward()
+
+    mamba_block = dict(model.model.layers["0"].named_parameters())
+    assert set(mamba_block) == {
+        "norm.weight",
+        "mixer.in_proj.weight",
+        "mixer.conv1d.weight",
+        "mixer.conv1d.bias",
+        "mixer._fp32_params.dt_bias",
+        "mixer._fp32_params.A_log",
+        "mixer._fp32_params.D",
+        "mixer.norm.weight",
+        "mixer.out_proj.weight",
+    }
+    for name, parameter in mamba_block.items():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert float(parameter.grad.abs().max()) > 0.0, name
 
 
 @skip_if_no_gpu

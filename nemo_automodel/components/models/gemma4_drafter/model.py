@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import torch
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -63,6 +64,9 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
         head.
         """
 
+        # The ``logits_dtype`` of the head whose weight the HF forward passes in.
+        logits_dtype: torch.dtype | None = None
+
         def forward(self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor) -> torch.Tensor:
             """Score every vocabulary token.
 
@@ -71,9 +75,10 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
                 lm_head_weight: Tied output embedding of shape ``[vocab_size, hidden_size]``.
 
             Returns:
-                Logits of shape ``[batch, seq_len, vocab_size]``, ``hidden_states @ lm_head_weight.T``.
+                Logits of shape ``[batch, seq_len, vocab_size]``, ``hidden_states @ lm_head_weight.T``,
+                in ``logits_dtype`` when it is set.
             """
-            return torch.nn.functional.linear(hidden_states, lm_head_weight)
+            return LMHead.linear(hidden_states, lm_head_weight, logits_dtype=self.logits_dtype)
 
     class Gemma4DrafterForCausalLM(HFCheckpointingMixin, HFGemma4AssistantForCausalLM):
         """NeMo subclass of HuggingFace ``Gemma4AssistantForCausalLM``.
@@ -91,14 +96,16 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
         tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
         _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-        def __init__(self, config: Gemma4AssistantConfig, *args, **kwargs):
+        def __init__(self, config: Gemma4AssistantConfig, *, logits_dtype: torch.dtype | None = None):
             reject_unsupported_tie_word_embeddings(type(self), config)
-            super().__init__(config, *args, **kwargs)
+            super().__init__(config)
+            self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
             if self.masked_embedding is not None:
                 # Reuse the initialized HF centroids and token ordering so the state dict is unchanged.
                 full_vocab_head = Gemma4DrafterFullVocabEmbedder(config)
                 full_vocab_head.centroids = self.masked_embedding.centroids
                 full_vocab_head.token_ordering = self.masked_embedding.token_ordering
+                full_vocab_head.logits_dtype = logits_dtype
                 self.masked_embedding = full_vocab_head
             self.tie_weights()
 

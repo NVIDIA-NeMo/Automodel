@@ -509,6 +509,8 @@ def _patch_peft_prepare_inputs():
         if not getattr(Qwen3ForCausalLM.forward, "__nemo_dtensor_logits_to_keep_patched__", False):
             from transformers.modeling_outputs import CausalLMOutputWithPast
 
+            from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
+
             _orig_forward = Qwen3ForCausalLM.forward
 
             @functools.wraps(_orig_forward)
@@ -536,12 +538,7 @@ def _patch_peft_prepare_inputs():
                     **kwargs,
                 )
 
-                hidden_states = outputs.last_hidden_state
-                if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                    logits = self.lm_head(hidden_states)
-                else:
-                    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                    logits = self.lm_head(hidden_states[:, slice_indices, :])
+                logits = self.lm_head(slice_logits_to_keep(outputs.last_hidden_state, logits_to_keep))
 
                 loss = None
                 if labels is not None:

@@ -17,7 +17,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -609,7 +609,18 @@ class NemotronV3Mamba2Mixer(nn.Module):
         rescale_prenorm_residual: bool = True,
         buffer_device: torch.device | None = None,
     ) -> None:
-        """Initialize Mamba2Mixer weights following NemotronV3 spec."""
+        """Initialize every parameter of the mixer, whatever its storage holds.
+
+        The model factory builds the model on the meta device and materializes it afterwards, so the values
+        the constructors assign are gone when this runs and nothing may be left to a default initialization.
+        Runs with the rest of the random initialization, before any weights are loaded.
+
+        Args:
+            num_hidden_layers: Layer count used to rescale the output projection.
+            rescale_prenorm_residual: Whether to divide the output projection by sqrt(layer count).
+            buffer_device: Device context for the values created here. Every parameter is overwritten in
+                place; a sharded parameter receives this rank's part of the global value.
+        """
 
         def _to_local(tensor):
             """Get local tensor from DTensor or return as-is."""
@@ -617,26 +628,64 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 return tensor.to_local()
             return tensor
 
+        def _local_slice(values: torch.Tensor, parameter: torch.Tensor) -> torch.Tensor:
+            """Cut this rank's part of a per-head vector for a parameter that may be sharded.
+
+            Args:
+                values: Tensor of shape [num_heads] with the value of every head.
+                parameter: Tensor or DTensor of global shape [num_heads].
+
+            Returns:
+                Tensor of the shape of the local shard of ``parameter``, cut from ``values`` without
+                communication; ``values`` itself when ``parameter`` is not a DTensor.
+            """
+            if not isinstance(parameter, DTensor):
+                return values
+            return distribute_tensor(
+                values.to(parameter.to_local().device),
+                parameter.device_mesh,
+                parameter.placements,
+                src_data_rank=None,
+            ).to_local()
+
         with buffer_device:
             # dt_bias: inverse softplus initialization
             # Check _no_reinit flag to avoid re-initializing if called multiple times
             if not getattr(self.dt_bias, "_no_reinit", False):
                 dt_bias_local = _to_local(self.dt_bias)
-                local_num_heads = dt_bias_local.shape[0]
+                # Draw every head and cut this rank's shard. The ranks' random states are equal once a
+                # sharded tensor has been drawn (the embedding is, before the blocks), so drawing only the
+                # local length would give every rank the same values.
                 dt = torch.exp(
-                    torch.rand(local_num_heads, device=dt_bias_local.device)
+                    torch.rand(self.num_heads, device=dt_bias_local.device)
                     * (math.log(self.time_step_max) - math.log(self.time_step_min))
                     + math.log(self.time_step_min)
                 ).clamp(min=self.time_step_floor)
                 inv_dt = dt + torch.log(-torch.expm1(-dt))
-                dt_bias_local.copy_(inv_dt)
+                dt_bias_local.copy_(_local_slice(inv_dt, self.dt_bias))
                 self.dt_bias._no_reinit = True
+
+            # Materialized storage is uninitialized, in practice all-zero. Left alone, the projections, the
+            # convolution, the gated norm, A_log and D stay zero, the mixer returns zeros and no parameter
+            # of the block ever receives a non-zero gradient. Assign what the constructors assign. The
+            # projections are drawn through their ``weight`` parameter, whichever module type they are, and
+            # on the parameter itself rather than on each rank's shard, so the shards of a sharded weight
+            # differ.
+            for projection in (self.in_proj, self.out_proj):
+                # torch.nn.Linear's default: uniform in +-1 / sqrt(fan_in).
+                nn.init.kaiming_uniform_(projection.weight, a=math.sqrt(5))
+            self.conv1d.reset_parameters()
+            nn.init.ones_(self.norm.weight)
+            nn.init.ones_(self.D)
+            # A_log[h] = log(h + 1) for the global head index h: a sharded parameter takes its own slice.
+            a_log_values = torch.log(torch.arange(1, self.num_heads + 1, dtype=torch.float32))
+            _to_local(self.A_log).copy_(_local_slice(a_log_values, self.A_log))
 
             # Mark A_log and D for no weight decay
             self.A_log._no_weight_decay = True
             self.D._no_weight_decay = True
 
-            # Zero biases (don't reinitialize weights - they use default init)
+            # Zero biases
             if self.in_proj.bias is not None:
                 nn.init.zeros_(self.in_proj.bias)
             if self.out_proj.bias is not None:

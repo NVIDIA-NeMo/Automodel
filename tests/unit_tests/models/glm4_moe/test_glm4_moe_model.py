@@ -23,6 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
+from tests.unit_tests.models.passthrough_layers import run_with_passthrough_layers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -388,22 +389,13 @@ class TestGlm4MoeForCausalLM:
 
         batch, seq_len = 1, 5
         input_ids = torch.randint(0, glm_config.vocab_size, (batch, seq_len), device=device)
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
-        with (
-            patch("nemo_automodel.components.models.glm4_moe.model.squeeze_input_for_thd") as mock_squeeze,
-            patch.object(
-                model.model,
-                "forward",
-                return_value=torch.randn(seq_len, glm_config.hidden_size, device=device).to(torch.bfloat16),
-            ),
-        ):
-            mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
-            out = model(input_ids, qkv_format="thd")
+        out, layer_inputs = run_with_passthrough_layers(model, input_ids, position_ids=position_ids, qkv_format="thd")
 
-        logits = out.logits
-        mock_squeeze.assert_called_once()
-        # Output should be unsqueezed back to batch dimension
-        assert logits.shape == (batch, seq_len, glm_config.vocab_size)
+        # The decoder squeezes the packed batch for its layers and restores it on the way out.
+        assert layer_inputs and all(shape == (seq_len, glm_config.hidden_size) for shape in layer_inputs)
+        assert out.logits.shape == (batch, seq_len, glm_config.vocab_size)
 
     def test_initialize_weights_invokes_submodules(self, glm_config, backend_config):
         model = Glm4MoeForCausalLM(glm_config, backend=backend_config)

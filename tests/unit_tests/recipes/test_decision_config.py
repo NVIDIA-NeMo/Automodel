@@ -23,7 +23,16 @@ import yaml
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 
-@pytest.mark.parametrize("filename", ["clm_soc_triage.yaml", "clef_soc_triage_lora.yaml", "clef_soc_triage_heads.yaml"])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "clm_soc_triage.yaml",
+        "clef_soc_triage_lora.yaml",
+        "clef_soc_triage_heads.yaml",
+        "nemotron_decision_soc_triage_lora.yaml",
+        "nemotron_decision_support_routing_lora.yaml",
+    ],
+)
 def test_example_recipe_targets_resolve(filename):
     root = Path(__file__).resolve().parents[3]
     config = yaml.safe_load((root / "examples" / "decision" / filename).read_text())
@@ -347,3 +356,87 @@ def test_clef_training_rejects_disabled_checkpoints_before_training_or_loading_o
     assert observed == []
     assert not (output / "metrics_test.json").exists()
     assert (output / "LOWEST_VAL").is_symlink() == stale_pointer
+
+
+def test_nemotron_decision_selection_prefers_accuracy_then_lower_cross_entropy():
+    from nemo_automodel.recipes.decision.train_nemotron_decision import selection_value
+
+    assert selection_value(9, 0.3) < selection_value(9, 0.4)
+    assert selection_value(9, 1000.0) < selection_value(8, 0.0)  # one more correct row outranks any CE
+    # exact at any validation size: 90,000 vs 89,999 correct of 100,000 rows
+    assert selection_value(90_000, 99.0) < selection_value(89_999, 0.0)
+    assert selection_value(10**9, 99.0) < selection_value(10**9 - 1, 0.0)
+
+
+@pytest.mark.parametrize("batch,world", [(0, 1), (6, 4), (-4, 2)])
+def test_nemotron_decision_rejects_batches_that_do_not_split_over_dp(batch, world):
+    from nemo_automodel.recipes.decision.train_nemotron_decision import TrainNemotronDecisionRecipe
+
+    recipe = TrainNemotronDecisionRecipe.__new__(TrainNemotronDecisionRecipe)
+    recipe.cfg = {"train.global_batch_size": batch}
+    recipe._get_dp_group_size = lambda: world
+    recipe._get_dp_rank = lambda: 0
+    with pytest.raises(ValueError, match="global_batch_size"):
+        recipe._train()
+
+
+def test_nemotron_decision_examples_keep_the_reference_training_contract():
+    root = Path(__file__).resolve().parents[3] / "examples" / "decision"
+    for name in ("nemotron_decision_soc_triage_lora.yaml", "nemotron_decision_support_routing_lora.yaml"):
+        config = yaml.safe_load((root / name).read_text())
+        assert "dlm_paradigm" not in config["model"] and not config["model"].get("trust_remote_code")
+        assert (config["peft"]["dim"], config["peft"]["alpha"], config["peft"]["dropout"]) == (32, 64, 0.0)
+        assert config["optimizer"]["lr"] == 1.0e-4 and config["optimizer"]["betas"] == [0.9, 0.95]
+        assert config["seed"] == 101 and config["train"]["global_batch_size"] == 16
+        assert config["train"]["canonical_fraction"] == 0.5
+        # Plain (soft-)cross-entropy over the options: the shared objective with its extra SFT terms disabled.
+        loss = config["loss"]
+        assert loss["mode"] == "sft" and loss["soft_label_kl_weight"] == 0.0
+        assert (loss["label_smoothing"], loss["brier_weight"], loss["ordinal_weight"]) == (0.0, 0.0, 0.0)
+        assert not any("head" in module or "embed" in module for module in config["peft"]["target_modules"])
+
+
+@pytest.mark.parametrize("soft_label_kl_weight,trained", [(0.0, ["gold", "soft"]), (0.5, ["gold"])])
+def test_nemotron_decision_reads_each_supervised_question_and_counts_unreadable_ones(
+    tmp_path, soft_label_kl_weight, trained
+):
+    from nemo_automodel.components.datasets.decision.records import validate_record
+    from nemo_automodel.components.loss.decision import DecisionLossConfig
+    from nemo_automodel.components.models.nemotron_decision.serving_prompt import DecisionContract
+    from nemo_automodel.recipes.decision.train_nemotron_decision import TrainNemotronDecisionRecipe
+    from tests.unit_tests.models.nemotron_decision.char_tokenizer import MASK, char_tokenizer, write_contract
+
+    record = {
+        "id": "r1",
+        "state": {"alert": "x"},
+        "questions": {
+            "gold": {"type": "noul", "instructions": "Escalate?"},
+            "soft": {"type": "noul", "instructions": "Page?"},
+            "reward": {"type": "noul", "instructions": "Close?"},
+            "unsupervised": {"type": "noul", "instructions": "Notify?"},
+            "unreadable": {"type": "noul"},  # the decision contract needs instructions
+        },
+        "answers": {"gold": "true"},
+        "soft_labels": {"soft": {"true": 0.9, "false": 0.1}},
+        "rewards": {"reward": {"true": 1.0, "false": 0.0}},
+    }
+    validate_record(record)
+    recipe = TrainNemotronDecisionRecipe.__new__(TrainNemotronDecisionRecipe)
+    recipe.tokenizer = char_tokenizer()
+    recipe.contract = DecisionContract.from_pretrained(write_contract(tmp_path / "ckpt"))
+    recipe.mask_token_id = recipe.tokenizer.convert_tokens_to_ids(MASK)
+    recipe.max_tokens = 4096
+    recipe.loss_config = DecisionLossConfig(mode="sft", soft_label_kl_weight=soft_label_kl_weight)
+    recipe.loss_fn = recipe.loss_config.build()
+
+    decisions, skipped = recipe._encode_split([record], train=True)
+    assert [d.prompt.question_id for d in decisions] == trained and skipped == 1
+    for decision in decisions:
+        assert decision.target.option_ids == decision.prompt.labels
+    if "soft" in trained:
+        soft = decisions[trained.index("soft")]
+        assert dict(zip(soft.prompt.labels, soft.target.soft_labels, strict=True)) == pytest.approx(
+            {"true": 0.9, "false": 0.1}
+        )
+    decisions, skipped = recipe._encode_split([record], train=False)
+    assert [d.prompt.question_id for d in decisions] == ["gold", "reward"] and skipped == 1

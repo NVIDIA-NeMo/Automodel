@@ -52,6 +52,10 @@ layer order, so ``collect()`` and ``replay()`` line the per-layer tensors up by
 position. This assumes single-threaded model construction (the norm for recipe
 training); call :meth:`RouterReplay.clear_registry` before building a second
 model in the same process.
+
+A looped model runs some layers several times per forward. Such a layer sets
+:attr:`RouterReplay.visit` before each run, and its tensor gains a leading visit
+dimension, ``[visits, num_tokens, topk]``: one selection per run.
 """
 
 from contextlib import contextmanager
@@ -86,6 +90,8 @@ class RouterReplay:
         self.mode: RouterReplayMode | None = None
         self.recorded_indices: torch.Tensor | None = None
         self.target_indices: torch.Tensor | None = None
+        # Which run of the layer comes next; a model that runs a layer several times per forward sets it.
+        self.visit = 0
         RouterReplay._registry.append(self)
 
     def apply(self, indices: torch.Tensor) -> torch.Tensor:
@@ -102,7 +108,15 @@ class RouterReplay:
         if self.mode == RouterReplayMode.RECORD:
             # Indices are integer selection ids carrying no gradient; detach so the
             # capture never pins the forward graph.
-            self.recorded_indices = indices.detach()
+            recorded = indices.detach()
+            previous = self.recorded_indices
+            if previous is not None and previous.shape[-recorded.dim() :] != recorded.shape:
+                previous = None  # a record of another batch
+            if previous is not None and (self.visit or previous.dim() > recorded.dim()):
+                # One slot per visit, so the activation-checkpoint recompute of a visit rewrites its own.
+                previous = previous.reshape(-1, *recorded.shape)
+                recorded = torch.cat((previous[: self.visit], recorded[None], previous[self.visit + 1 :]))
+            self.recorded_indices = recorded
             return indices
         if self.mode == RouterReplayMode.REPLAY:
             if self.target_indices is None:
@@ -111,6 +125,8 @@ class RouterReplay:
                     "Call RouterReplay.replay(indices) / set_replay_indices(...) with one tensor per MoE layer."
                 )
             target = self.target_indices.to(indices.device)
+            if target.dim() == indices.dim() + 1:
+                target = target[self.visit]
             if target.shape != indices.shape:
                 raise ValueError(
                     f"Replay indices shape {tuple(target.shape)} does not match the current "
@@ -149,7 +165,8 @@ class RouterReplay:
 
         Args:
             all_layers_indices: One ``[num_tokens, topk]`` tensor per MoE layer, in
-                the same order the layers were constructed.
+                the same order the layers were constructed; ``[visits, num_tokens, topk]``
+                for a layer the model runs several times per forward.
 
         Raises:
             ValueError: If the number of tensors does not match the number of
@@ -199,6 +216,8 @@ class RouterReplay:
     @contextmanager
     def record(cls) -> Iterator[None]:
         """Record the top-k selection of every gate for the duration of the block."""
+        for inst in cls._registry:
+            inst.recorded_indices = None
         cls.set_mode(RouterReplayMode.RECORD)
         try:
             yield

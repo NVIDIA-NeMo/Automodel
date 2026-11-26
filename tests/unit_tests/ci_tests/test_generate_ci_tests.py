@@ -34,7 +34,6 @@ pytestmark = pytest.mark.timeout(70)
 def test_llm_benchmark_configs_define_required_benchmark_fields():
     required_fields = {
         "warmup_steps",
-        "peak_tflops",
         "nsys_start",
         "nsys_end",
         "nsys_ranks",

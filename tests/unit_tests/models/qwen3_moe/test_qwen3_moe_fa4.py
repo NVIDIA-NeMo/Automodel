@@ -176,8 +176,8 @@ def test_fa4_thd_decoder_prepares_metadata_once(monkeypatch: pytest.MonkeyPatch,
     inner(torch.arange(6), position_ids=torch.tensor([0, 1, 2, 0, 1, 2]), padding_mask=padding, **kwargs)
 
     first, second = [capture.call_args.kwargs for capture in captures]
-    assert first["padding_mask"] is padding
-    assert first["cu_seqlens_padded"] is kwargs["cu_seqlens_padded"]
+    assert torch.equal(first["padding_mask"], padding)
+    assert torch.equal(first["cu_seqlens_padded"], kwargs["cu_seqlens_padded"])
     if attn != "fa4":
         prepare.assert_not_called()
         assert "_fa4_cu_seqlens" not in first and "packed_token_indices" not in first

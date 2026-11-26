@@ -29,13 +29,14 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRotaryEmbedding as HFQwen3OmniMoeThinkerTextRotaryEmbedding,
 )
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -135,13 +136,26 @@ class Qwen3OmniMoeThinkerTextModel(
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        r"""
-        visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
-            The mask of the visual positions.
-        deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
-            The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
-            The feature is extracted from the different visual encoder layers, and fed to the decoder
-            hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
+        r"""Run the thinker text decoder; packed (THD) input comes back batched.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence], or packed [tokens].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden], or packed [tokens, hidden].
+            position_ids: Optional positions of shape [batch, sequence] or [axes, batch, sequence], with 3
+                multimodal rotary axes (a 4th leading axis is dropped); packed input passes the thinker's
+                squeezed positions.
+            attention_mask: Tensor of shape [batch, sequence], 1 at valid tokens and 0 at padding; the decoder
+                derives the MoE padding mask from it.
+            padding_mask: Ignored; the MoE padding mask is derived from attention_mask.
+            visual_pos_masks: Optional bool mask of shape [batch, sequence, 1], true at visual placeholder tokens;
+                only its [..., 0] slice is read.
+            deepstack_visual_embeds: Optional list with one Tensor of shape [visual_tokens, hidden] per DeepStack
+                level (https://arxiv.org/abs/2406.04334), taken from successive vision-encoder layers; entry i is
+                added to the visual-token hidden states after decoder layer i.
+            **attn_kwargs: Backend metadata, including packed sequence boundaries.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -190,7 +204,8 @@ class Qwen3OmniMoeThinkerTextModel(
                 )
 
         hidden_states = self.norm(hidden_states)
-
+        if hidden_states.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
+            hidden_states = hidden_states.unsqueeze(0)
         return hidden_states
 
     def _deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
@@ -259,7 +274,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         config: Qwen3OmniMoeThinkerConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs,
+        *,
+        logits_dtype: torch.dtype | None = None,
+        moe_overrides: dict | None = None,
     ):
         base_config = config.thinker_config if hasattr(config, "thinker_config") else config
         backend = backend or BackendConfig()
@@ -286,13 +303,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.backend = backend
 
         text_config = base_config.text_config if hasattr(base_config, "text_config") else base_config
-        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
+        self.lm_head = LMHead(
+            text_config.hidden_size, text_config.vocab_size, dtype=model_dtype, logits_dtype=logits_dtype
         )
 
         self.vocab_size = text_config.vocab_size
@@ -350,7 +366,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         """Forward pass with multimodal fusion.
 
         Args:
-            input_ids: Integer token IDs of shape [batch, sequence].
+            input_ids: Integer token IDs of shape [batch, sequence], or packed (THD) IDs of shape [1, tokens],
+                which this method squeezes to [tokens].
             input_features: Audio features of shape [audios, mel_bins, frames].
             pixel_values: Packed image patches of shape [image_patches, patch_features],
                 where patch_features flattens channels, temporal depth, height, and width.
@@ -361,7 +378,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             feature_attention_mask: Valid audio frames of shape [audios, frames].
             audio_feature_lengths: Valid frame counts of shape [audios].
             position_ids: Rotary coordinates of shape [3, batch, sequence].
-            padding_mask: Valid token mask of shape [batch, sequence].
+            padding_mask: Optional bool mask of shape [batch, sequence], or [1, tokens] when packed, true at
+                padding; the decoder ignores it and derives padding from attention_mask.
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
             labels: Target token IDs of shape [batch, sequence].
             output_router_logits: Whether to output router logits
@@ -379,10 +397,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs: Additional attention arguments
 
         Returns:
-            Logits of shape [batch, selected_sequence, vocab] (or [tokens, vocab]
-            for packed input), a dict with scalar loss/aux_loss if labels provided, or a
-            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`
-            carrying hidden states of shape [batch, sequence, hidden] when requested.
+            With labels or ``output_router_logits``, a dict holding ``logits``, a scalar ``loss`` when labels are
+            given, a zero ``aux_loss`` when ``output_router_logits`` is set, and ``hidden_states`` when requested;
+            otherwise a CausalLMOutputWithPast when hidden states are requested, else the logits Tensor.
+            ``logits`` have shape [batch, kept, vocab], or [1, kept, vocab] for packed input, in the head's
+            ``logits_dtype`` when set and otherwise in its weight dtype, which autocast may lower; without a head
+            (``lm_head`` is None) they are the hidden states. ``hidden_states`` are the final hidden states of
+            shape [batch, sequence, hidden], or [1, tokens, hidden] for packed input.
         """
         output_hidden_states = (
             output_hidden_states
@@ -541,11 +562,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs,
         )
 
-        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
-
-        if is_thd and output_hidden_states and hidden.dim() == 2:
-            hidden = hidden.unsqueeze(0)
+        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
 
         # 5. Optionally compute loss/aux outputs
         if labels is not None or output_router_logits:

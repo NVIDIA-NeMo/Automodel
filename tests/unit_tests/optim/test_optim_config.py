@@ -34,7 +34,6 @@ from nemo_automodel.components.optim.optimizer import (
     OptimizerConfig,
     OptimizerFromFactoryConfig,
     ParamGroupOverride,
-    _drop_empty_local_shards,
     build_optimizer,
     build_optimizer_config,
 )
@@ -379,6 +378,26 @@ class TestDionFamilyConfigs:
         assert not isinstance(cfg, OptimizerFromFactoryConfig)
         assert cfg.embed_lr == pytest.approx(1e-4)
         assert cfg.lm_head_lr == pytest.approx(1e-4)
+
+    def test_dion_config_class_lookup(self):
+        from nemo_automodel.components.optim.optimizer import MuonConfig, dion_config_class
+
+        assert dion_config_class(torch.optim.AdamW) is None
+        assert dion_config_class(type("Muon", (), {"__module__": "dion.muon"})) is MuonConfig
+        with pytest.raises(TypeError, match="Unsupported dion optimizer"):
+            dion_config_class(type("Mystery", (), {"__module__": "dion.mystery"}))
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon needs PyTorch 2.9+")
+    def test_torch_muon_target_is_a_plain_factory_not_dion(self):
+        # torch.optim.Muon shares its name with dion.Muon; it must keep its own identity.
+        from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig, build_optimizer_config
+
+        cfg = build_optimizer_config(torch.optim.Muon, {"lr": 1e-3, "momentum": 0.8})
+        assert isinstance(cfg, OptimizerFromFactoryConfig)
+        assert cfg.factory is torch.optim.Muon
+        (opt,) = cfg.build(nn.Linear(4, 4, bias=False))
+        assert type(opt) is torch.optim.Muon
+        assert opt.param_groups[0]["momentum"] == 0.8
 
     def test_build_groups_params_and_strips_grouping_kwargs(self):
         # build() runs Dion grouping and must not splat scalar_*/*_lr into the dion ctor.
@@ -747,63 +766,6 @@ class TestParamGroupOverrides:
         opt = cfg.build(_RouterModel())[0]
         assert len(opt.param_groups) == 2
         assert _groups_by_role(opt)["router"]["lr_mult"] == 0.1
-
-
-def _real_param():
-    return nn.Parameter(torch.zeros(4, 4))
-
-
-def _empty_param():
-    # numel() == 0 stands in for a DTensor whose rank-local shard is empty:
-    # _local_numel returns .numel() for a plain tensor, so a zero-element tensor
-    # exercises the same "locally empty on this rank" path without a real mesh.
-    return nn.Parameter(torch.zeros(0, 4))
-
-
-class TestDropEmptyLocalShards:
-    """CPU coverage for the TE-FusedAdam zero-numel-shard guard, both input shapes.
-
-    ``_drop_empty_local_shards`` guards TransformerEngine ``FusedAdam`` (whose
-    ``multi_tensor_apply`` faults on empty tensors) against FSDP2 params whose
-    rank-local shard is empty. It accepts either a flat param list or the
-    per-group dicts produced by ``param_group_overrides``; the grouped shape is
-    what per-parameter-group LR adds on top of the pre-existing flat guard.
-    """
-
-    def test_flat_list_drops_empty_keeps_real(self):
-        p_real, p_empty = _real_param(), _empty_param()
-        out = _drop_empty_local_shards([p_real, p_empty])
-        assert len(out) == 1 and out[0] is p_real
-
-    def test_flat_list_all_empty_raises(self):
-        with pytest.raises(ValueError, match="zero-numel local shard"):
-            _drop_empty_local_shards([_empty_param(), _empty_param()])
-
-    def test_param_groups_drop_empty_and_preserve_options(self):
-        p0, p1, p_empty = _real_param(), _real_param(), _empty_param()
-        groups = [
-            {"params": [p0, p_empty], "lr_mult": 1.0, "wd_mult": 1.0},
-            {"params": [p1], "lr_mult": 0.1, "wd_mult": 0.0},
-        ]
-        out = _drop_empty_local_shards(groups)
-
-        # Empty shard dropped from group 0; both groups survive with real params.
-        assert len(out) == 2
-        assert len(out[0]["params"]) == 1 and out[0]["params"][0] is p0
-        assert len(out[1]["params"]) == 1 and out[1]["params"][0] is p1
-        # Per-group LR/WD options carried through unchanged.
-        assert out[0]["lr_mult"] == 1.0 and out[0]["wd_mult"] == 1.0
-        assert out[1]["lr_mult"] == 0.1 and out[1]["wd_mult"] == 0.0
-        # Fresh dicts are returned; the input group dicts are not mutated in place.
-        assert groups[0]["params"][0] is p0 and groups[0]["params"][1] is p_empty
-
-    def test_param_group_fully_empty_raises(self):
-        groups = [
-            {"params": [_real_param()], "lr_mult": 1.0},
-            {"params": [_empty_param()], "lr_mult": 0.1},
-        ]
-        with pytest.raises(ValueError, match="param group 1"):
-            _drop_empty_local_shards(groups)
 
 
 class TestGradientSketchConfig:

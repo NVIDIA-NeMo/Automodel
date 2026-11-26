@@ -27,6 +27,7 @@ _HAS_WANDB, wandb = safe_import(
     "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
 )
 
+from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -37,11 +38,10 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
-from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
-from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _strategy_compute_dtype
 from nemo_automodel.recipes.llm.train_ft import (
     _build_tokenizer,
     _get_model_name,
@@ -145,7 +145,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.model_parts = [model]
-        self.mfu_calculator = self.cfg.mfu.build(model=self.model_parts[0])
+        self.mfu_calculator = AutoMFU.from_config(
+            model,
+            compute_dtype=_strategy_compute_dtype(
+                self.distributed_config,
+                self.mesh_context.device_mesh,
+                recipe_autocast_dtype=getattr(self.distributed_config, "autocast_dtype", None),
+            ),
+        )
 
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
 
@@ -322,37 +329,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 scheduler.step(1)
 
         # Calculate throughput (tokens per second)
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
-
-        mfu = None
-        mfu_calculator = getattr(self, "mfu_calculator", None)
-        if batches and mfu_calculator is not None:
-            step_flops = 0.0
-            flops_supported = True
-            for batch in batches:
-                input_ids = batch.get("input_ids")
-                if input_ids is None:
-                    flops_supported = False
-                    break
-                batch_flops = mfu_calculator.get_flops(input_ids)
-                if batch_flops is None:
-                    flops_supported = False
-                    break
-                step_flops += float(batch_flops)
-
-            if flops_supported:
-                step_flops = self._dp_allreduce(
-                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
-                ).item()
-                mfu = calculate_mfu(
-                    step_flops / 1e12,
-                    self.dist_env.world_size,
-                    time_delta,
-                    reference_mfu=mfu_calculator.reference_mfu,
-                )
+        tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
 
         # Global summed loss over every micro-batch and DP rank, divided by the
         # same global label count as the gradient. Dividing by len(batches)

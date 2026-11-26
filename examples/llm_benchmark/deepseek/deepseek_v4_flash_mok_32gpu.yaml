@@ -23,7 +23,6 @@ seed: 1234
 
 benchmark:
   warmup_steps: 5
-  peak_tflops: 2500
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
