@@ -27,10 +27,6 @@ class TestErnie5_5EP2LoRATraining:
     # 30 seconds to stop the ranks. This bound only ends the test when the script does not return; it does not stop
     # the launcher or the ranks.
     @pytest.mark.timeout(900)
-    def test_trains_adapters_only_and_saves_them(self) -> None:
-        run_test_script(TEST_FOLDER, ERNIE5_5_EP2_LORA)
-
-    @pytest.mark.timeout(900)
     def test_trains_adapters_only_and_saves_them_with_hybridep(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ERNIE5_5_DISPATCHER", "hybridep")
         run_test_script(TEST_FOLDER, ERNIE5_5_EP2_LORA)
