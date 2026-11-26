@@ -60,6 +60,9 @@ dataset:
   path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
+  # Text-only data: no fake image. It would add 259 tokens to every document that the
+  # packing length estimate does not count.
+  inject_fake_images: false
   # google/gemma-4-31B (base) ships no chat template; make_tulu3_dataset formats via the
   # processor's tokenizer, so supply the -it template here. The VLM loader pops this key and
   # applies it to processor.chat_template (no manual moving the chat template onto the model dir needed).

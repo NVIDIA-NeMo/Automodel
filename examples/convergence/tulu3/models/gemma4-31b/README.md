@@ -40,8 +40,18 @@ Tulu-3 is pulled straight from the Hub at load time via `make_tulu3_dataset`
 (`allenai/tulu-3-sft-mixture`) — **no pre-filter step**. Unlike the moonlight/qwen LLM paths (which
 pre-filter to `seq_length=2048` to avoid OOM from variable-length batching with a large vocabulary),
 the VLM packed path handles over-length samples at pack time: `packed_sequence.max_length: 2048` +
-`drop_long_samples: true` pack multiple conversations into fixed 2k blocks and drop the ~4% of samples
-that exceed 2k. So there is no meta-JSON / prefilter / cache step to run.
+`drop_long_samples: true` pack multiple conversations into fixed 2k blocks. The data is text-only, so
+the recipe sets `inject_fake_images: false`. Documents are lost at three points (measured on all
+939,343 rows of `allenai/tulu-3-sft-mixture@b14afda6`):
+
+- The packing length estimate (`chars // 3`) drops 42,520 rows (4.5%) as longer than 2k.
+- 10,353 rows pass the estimate but tokenize to more than 2,048 tokens; each is replaced by a random
+  other row.
+- 45,039 of the 896,823 packed documents (5.0%) are cut when a pack is built, because the estimate
+  was too small for them and the pack overflows 2,048 tokens.
+
+842,048 distinct rows (89.6%) are trained in one epoch. So there is no meta-JSON / prefilter / cache
+step to run.
 
 ## Training
 
