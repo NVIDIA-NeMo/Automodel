@@ -18,8 +18,7 @@
 # GBS 512 / seq 4096 / EP8 operating point, so the three performance-summary rows compare directly.
 #
 # Parallelism: 2 nodes x 4 GB200, ep_size=8 == world, tp=pp=cp=1, dp_size=8; lbs=16 gives
-# 512 / (8 * 16) = 4 gradient-accumulation micro-batches. peak_tflops=2500 is the GB200 BF16
-# dense peak (the H100 recipe uses 989).
+# 512 / (8 * 16) = 4 gradient-accumulation micro-batches.
 #
 # Routing knobs that only hold for the benchmark's deterministic balanced gate (fake_balanced_gate
 # with fake_gate_noise 0 and fixed-shape mock batches): benchmark_static_routing caches the
@@ -41,7 +40,6 @@ seed: 1234
 
 benchmark:
   warmup_steps: 10
-  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

@@ -445,6 +445,42 @@ checkpoint:
 | `eagle4.candidate_head.rank`, `eagle4.candidate_head.num_candidates` | EAGLE-4 stage 2: train the low-rank candidate head (requires `draft_weights_path`) |
 | `warmup_ratio` | Fraction of total steps for LR warmup |
 
+### Optimizer and Precision
+
+Standard EAGLE-3 on CUDA stores the draft in BF16. The default optimizer, `torch.optim.AdamW`,
+also stores its Adam moments in BF16. Small updates can round away late in a cosine schedule.
+The recipe warns when Adam or AdamW optimizes trainable BF16 parameters, including BF16 LoRA adapters.
+CPU drafts and CUDA parallel-reconsideration drafts use FP32 storage.
+
+To use Transformer Engine `FusedAdam` with FP32 master weights and moments, add the following keys
+to your existing `optimizer:` block. Keep your `lr`, `betas`, `weight_decay`, `warmup_ratio`, and `min_lr_ratio` settings.
+
+```yaml
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  eps: 1.0e-8
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+```
+
+`optimizer.param_group_overrides` works with the Dion-family optimizers (such as `MuownConfig`), which apply
+the group rules when the optimizer is built. With any other optimizer a non-empty list raises an error, because
+the warmup and cosine schedule of these recipes does not apply `lr_mult` or `wd_mult`; an empty list is ignored.
+
+FP32 master weights and moments increase optimizer memory use and the size of the `optim/` checkpoint.
+See the [mixed-precision training guide](/development/mixed-precision-training).
+
+**Resuming an existing run.** Earlier EAGLE versions could save AdamW state even when the YAML
+selected another optimizer. To resume the full training state, configure the optimizer and settings
+that actually produced the checkpoint. To switch optimizers, start in a fresh checkpoint directory.
+For recipes that support it, set `recipe_args.draft_weights_path` to the consolidated draft weights
+to keep the learned weights and start with fresh optimizer state.
+
 ### Launch Training
 
 **Multi-GPU (8x A100, production):**

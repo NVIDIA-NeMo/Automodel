@@ -379,6 +379,26 @@ class TestDionFamilyConfigs:
         assert cfg.embed_lr == pytest.approx(1e-4)
         assert cfg.lm_head_lr == pytest.approx(1e-4)
 
+    def test_dion_config_class_lookup(self):
+        from nemo_automodel.components.optim.optimizer import MuonConfig, dion_config_class
+
+        assert dion_config_class(torch.optim.AdamW) is None
+        assert dion_config_class(type("Muon", (), {"__module__": "dion.muon"})) is MuonConfig
+        with pytest.raises(TypeError, match="Unsupported dion optimizer"):
+            dion_config_class(type("Mystery", (), {"__module__": "dion.mystery"}))
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon needs PyTorch 2.9+")
+    def test_torch_muon_target_is_a_plain_factory_not_dion(self):
+        # torch.optim.Muon shares its name with dion.Muon; it must keep its own identity.
+        from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig, build_optimizer_config
+
+        cfg = build_optimizer_config(torch.optim.Muon, {"lr": 1e-3, "momentum": 0.8})
+        assert isinstance(cfg, OptimizerFromFactoryConfig)
+        assert cfg.factory is torch.optim.Muon
+        (opt,) = cfg.build(nn.Linear(4, 4, bias=False))
+        assert type(opt) is torch.optim.Muon
+        assert opt.param_groups[0]["momentum"] == 0.8
+
     def test_build_groups_params_and_strips_grouping_kwargs(self):
         # build() runs Dion grouping and must not splat scalar_*/*_lr into the dion ctor.
         pytest.importorskip("dion")

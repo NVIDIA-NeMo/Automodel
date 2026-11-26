@@ -18,6 +18,6 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-# 2-rank packed CP parity for Qwen3.8-Flash-Next QSA on the CUDA flex path
+# 2-rank packed CP parity for Qwen3.8-Flash-Next QSA on the CUDA flex and FA4 paths
 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
     tests/functional_tests/context_parallel/run_qwen3_8_flash_next_packed_cp.py
