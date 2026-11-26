@@ -394,14 +394,27 @@ def max_local_experts_per_rank(moe_modules: Iterable[MoE], ep_size: int) -> int:
     HybridEP keeps one process-global buffer for all layers; layers whose expert counts differ must
     share a buffer allocated for the largest count.
 
+    The count is read where each layer's ``init_token_dispatcher`` reads its own
+    (``experts.config.n_routed_experts // ep_size``), so the maximum cannot disagree with what a layer
+    requests. Only ``GroupedExpertsDeepEP`` and ``GroupedExpertsTE`` build a dispatcher that takes the
+    maximum; layers with other experts are not counted.
+
     Args:
         moe_modules: The MoE layers held by this process (under pipeline parallelism, its stage only).
         ep_size: Expert-parallel group size.
 
     Returns:
-        ``max(n_routed_experts) // ep_size``, or 0 when there is no MoE layer.
+        The largest ``experts.config.n_routed_experts // ep_size``, or 0 when no layer builds such a
+        dispatcher.
     """
-    return max((moe.n_routed_experts // ep_size for moe in moe_modules), default=0)
+    return max(
+        (
+            moe.experts.config.n_routed_experts // ep_size
+            for moe in moe_modules
+            if isinstance(moe.experts, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        ),
+        default=0,
+    )
 
 
 def apply_ep_to_moe(

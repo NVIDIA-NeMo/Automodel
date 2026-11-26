@@ -49,9 +49,16 @@ class DummyExperts:
 
 
 class DummyMoE:
-    def __init__(self, n_routed_experts=8):
-        self.n_routed_experts = n_routed_experts
-        self.experts = DummyExperts()
+    def __init__(self, experts=None):
+        self.experts = experts if experts is not None else DummyExperts()
+
+
+class DummyDispatcherExperts(DummyExperts):
+    """Experts that build a token dispatcher from ``config.n_routed_experts``, like ``GroupedExpertsDeepEP``."""
+
+    def __init__(self, n_routed_experts):
+        super().__init__()
+        self.config = types.SimpleNamespace(n_routed_experts=n_routed_experts)
 
 
 class DummyBlock:
@@ -686,24 +693,64 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
-def test_max_local_experts_per_rank_is_the_largest_layer_per_ep_rank():
+def _dispatcher_moe(n_routed_experts):
+    return DummyMoE(DummyDispatcherExperts(n_routed_experts))
+
+
+def test_max_local_experts_per_rank_is_the_largest_layer_per_ep_rank(monkeypatch):
     """Layers with 240 to 496 routed experts on 8 EP ranks need a buffer for 62 experts per rank."""
-    from nemo_automodel.components.moe.parallelizer import max_local_experts_per_rank
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "GroupedExpertsDeepEP", DummyDispatcherExperts)
+    layers = [_dispatcher_moe(240), _dispatcher_moe(496), _dispatcher_moe(368)]
 
-    layers = [DummyMoE(240), DummyMoE(496), DummyMoE(368)]
+    assert P.max_local_experts_per_rank(layers, ep_size=8) == 62
+    assert P.max_local_experts_per_rank([_dispatcher_moe(64), _dispatcher_moe(64)], ep_size=8) == 8
+    assert P.max_local_experts_per_rank([], ep_size=8) == 0
 
-    assert max_local_experts_per_rank(layers, ep_size=8) == 62
-    assert max_local_experts_per_rank([DummyMoE(64), DummyMoE(64)], ep_size=8) == 8
-    assert max_local_experts_per_rank([], ep_size=8) == 0
+
+def test_max_local_experts_per_rank_counts_te_experts_and_skips_experts_without_a_dispatcher(monkeypatch):
+    """The count comes from the experts that build a dispatcher; a layer without one adds nothing."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DummyTEExperts(DummyDispatcherExperts):
+        pass
+
+    monkeypatch.setattr(P, "GroupedExpertsTE", DummyTEExperts)
+    layers = [DummyMoE(DummyTEExperts(96)), DummyMoE()]
+
+    assert P.max_local_experts_per_rank(layers, ep_size=8) == 12
+    assert P.max_local_experts_per_rank([DummyMoE()], ep_size=8) == 0
+
+
+def test_apply_ep_accepts_a_moe_layer_that_only_has_shardable_experts(monkeypatch):
+    """A layer with no ``n_routed_experts`` and experts with no ``config`` is still made expert parallel.
+
+    ``apply_ep`` needs only ``experts`` whose parameters shard on dim 0; the HSDP replica-sync
+    functional test drives it with such a layer.
+    """
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    moe = DummyMoE()
+    assert not hasattr(moe, "n_routed_experts") and not hasattr(moe.experts, "config")
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(DummyModel([DummyBlock(mlp=moe)]), ep_mesh)
+
+    (call,) = parallelize_module_mock.call_args_list
+    assert call.kwargs["module"] is moe.experts
+    assert call.kwargs["parallelize_plan"].max_num_local_experts == 0
 
 
 def test_apply_ep_gives_every_layer_the_largest_per_rank_expert_count(monkeypatch):
     """Each layer's dispatcher is built with the maximum over all layers, not only its own expert count."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "GroupedExpertsDeepEP", DummyDispatcherExperts)
     parallelize_module_mock = MagicMock()
     monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
-    model = DummyModel([DummyBlock(mlp=DummyMoE(n)) for n in (240, 496, 368)])
+    model = DummyModel([DummyBlock(mlp=_dispatcher_moe(n)) for n in (240, 496, 368)])
     ep_mesh = type("Mesh", (), {"size": lambda self: 8})()
 
     P.apply_ep(model, ep_mesh)
@@ -716,9 +763,10 @@ def test_apply_ep_on_a_uniform_model_passes_the_layers_own_per_rank_count(monkey
     """With one expert count the value equals what each layer requests on its own."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "GroupedExpertsDeepEP", DummyDispatcherExperts)
     parallelize_module_mock = MagicMock()
     monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
-    model = DummyModel([DummyBlock(mlp=DummyMoE(64)) for _ in range(3)])
+    model = DummyModel([DummyBlock(mlp=_dispatcher_moe(64)) for _ in range(3)])
     ep_mesh = type("Mesh", (), {"size": lambda self: 8})()
 
     P.apply_ep(model, ep_mesh)
@@ -754,6 +802,7 @@ def test_apply_ep_excludes_te_owned_experts_from_tp_replica_sync(monkeypatch):
 
     class DummyGroupedExpertsTE:
         def __init__(self):
+            self.config = types.SimpleNamespace(n_routed_experts=8)
             self.init_token_dispatcher = MagicMock()
 
     experts = DummyGroupedExpertsTE()
