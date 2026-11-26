@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -150,41 +151,72 @@ def _run_single_rank(case: str, device_index: int, output_dir: Path) -> None:
             dist.destroy_process_group()
 
 
-@pytest.mark.parametrize(
-    "case,device_index",
-    [
-        ("direct-cuda", 0),
-        ("direct-cuda", 1),
-        ("pretrained-cpu", 0),
-        ("config-cpu", 0),
-        ("pretrained-cpu-no-move", 0),
-        ("config-cpu-no-move", 0),
-        ("pretrained-default", 0),
-        ("config-default", 0),
-        ("pretrained-cuda", 1),
-    ],
-)
-def test_single_rank_gloo_device_train_save_reload(case: str, device_index: int, tmp_path: Path) -> None:
+_CASES = [
+    ("direct-cuda", 0),
+    ("direct-cuda", 1),
+    ("pretrained-cpu", 0),
+    ("config-cpu", 0),
+    ("pretrained-cpu-no-move", 0),
+    ("config-cpu-no-move", 0),
+    ("pretrained-default", 0),
+    ("config-default", 0),
+    ("pretrained-cuda", 1),
+]
+
+
+def _has_cuda_device(device_index: int) -> bool:
+    return torch.cuda.is_available() and torch.cuda.device_count() > device_index
+
+
+@pytest.fixture(scope="module")
+def single_rank_runs(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[tuple[str, int], tuple[subprocess.CompletedProcess[str], Path]]:
+    """Run every case in its own process at the same time.
+
+    The cases are independent single-rank processes and most of their time is interpreter and
+    import start-up, so they overlap instead of running one after another.
+    """
+    runnable = [(case, device_index) for case, device_index in _CASES if _has_cuda_device(device_index)]
+
+    def run(case: str, device_index: int) -> tuple[subprocess.CompletedProcess[str], Path]:
+        output_dir = tmp_path_factory.mktemp(f"{case}-{device_index}")
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), case, str(device_index), str(output_dir)],
+            # These tiny CPU/Gloo cases also run in GPU CI jobs, where the unit-test
+            # launcher does not bound host thread pools. Keep each child bounded.
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"},
+            capture_output=True,
+            text=True,
+            # One case takes about 25 seconds alone; the bound leaves room for all of them starting together.
+            timeout=180,
+            check=False,
+        )
+        return result, output_dir
+
+    if not runnable:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
+        return dict(zip(runnable, pool.map(lambda args: run(*args), runnable), strict=True))
+
+
+@pytest.mark.parametrize("case,device_index", _CASES)
+def test_single_rank_gloo_device_train_save_reload(
+    case: str,
+    device_index: int,
+    single_rank_runs: dict[tuple[str, int], tuple[subprocess.CompletedProcess[str], Path]],
+) -> None:
     """Run public CPU overrides and default CUDA placement on a CUDA host."""
-    if not torch.cuda.is_available() or torch.cuda.device_count() <= device_index:
+    if not _has_cuda_device(device_index):
         pytest.skip(f"requires CUDA device {device_index}")
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), case, str(device_index), str(tmp_path)],
-        # These tiny CPU/Gloo cases also run in GPU CI jobs, where the unit-test
-        # launcher does not bound host thread pools. Keep each child bounded.
-        env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"},
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    result, output_dir = single_rank_runs[(case, device_index)]
     assert result.returncode == 0, result.stdout + result.stderr
-    report = json.loads((tmp_path / "report.json").read_text())
+    report = json.loads((output_dir / "report.json").read_text())
     assert report["status"] == "passed"
     expected = "cpu" if "cpu" in case else f"cuda:{device_index}"
     assert report["parameter_devices"] == [expected]
     assert report["reload_max_abs_error"] == 0
-    print(f"DDP_DEVICE_REPORT={tmp_path / 'report.json'}")
+    print(f"DDP_DEVICE_REPORT={output_dir / 'report.json'}")
 
 
 if __name__ == "__main__":
