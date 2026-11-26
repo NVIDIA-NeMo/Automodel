@@ -95,7 +95,7 @@ if HAVE_TRITON:
         membership_row_stride,
         BLOCK: tl.constexpr,
         ROW_BLOCK: tl.constexpr,
-    ):
+    ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         """Write one query row of the membership table: zeros, then ones at every valid route.
 
         The row is zeroed by this program right before its routes are marked, so its cache lines are still in
@@ -144,7 +144,7 @@ if HAVE_TRITON:
         CHUNK_KEYS: tl.constexpr,
         CHUNKS_PER_PROGRAM: tl.constexpr,
         ROWS: tl.constexpr,
-    ):
+    ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         """Classify 128-query x CHUNK_KEYS-key chunks of the membership table.
 
         Args:
@@ -187,7 +187,7 @@ if HAVE_TRITON:
         SPAN: tl.constexpr,
         BLOCK_COLUMNS: tl.constexpr,
         COLUMN_TILES: tl.constexpr,
-    ):
+    ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         """Merge chunk kinds into FA4 block kinds and write one sorted block list per program.
 
         A list's column c covers query block ``list * LIST_ROW_BLOCK + c * COLUMN_ROW_BLOCK`` and
