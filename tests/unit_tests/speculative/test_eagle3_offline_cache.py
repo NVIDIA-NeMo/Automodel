@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -409,13 +411,11 @@ def test_parser_requires_core_args():
 # ---------------------------------------------------------------------------
 
 
-class _FakeTargetModel:
+class _FakeTargetModel(torch.nn.Module):
     def __init__(self):
+        super().__init__()
         self.config = SimpleNamespace(vocab_size=_VOCAB, hidden_size=_HIDDEN)
-        self._embed = SimpleNamespace(weight=torch.randn(_VOCAB, _HIDDEN))
-
-    def to(self, device):
-        return self
+        self._embed = torch.nn.Embedding(_VOCAB, _HIDDEN)
 
     def get_input_embeddings(self):
         return self._embed
@@ -423,7 +423,11 @@ class _FakeTargetModel:
 
 class _FakeWrapper:
     def __init__(self, model, aux_layer_ids=None):
+        self.model = model
         self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else [0, 1, 2]
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
 
     def generate_batch(self, *, input_ids, attention_mask, loss_mask):
         b, s = input_ids.shape
@@ -471,9 +475,7 @@ def _patch_producer(monkeypatch, *, num_samples, batch_size, seq_len=6):
         remaining -= b
     loader = _FakeLoader(batches, num_samples)
     monkeypatch.setattr(pe, "NeMoAutoTokenizer", SimpleNamespace(from_pretrained=lambda *a, **k: SimpleNamespace()))
-    monkeypatch.setattr(
-        pe, "NeMoAutoModelForCausalLM", SimpleNamespace(from_pretrained=lambda *a, **k: _FakeTargetModel())
-    )
+    monkeypatch.setattr(pe, "AutoModelForCausalLM", SimpleNamespace(from_pretrained=lambda *a, **k: _FakeTargetModel()))
     monkeypatch.setattr(pe, "HFEagle3TargetModel", _FakeWrapper)
     monkeypatch.setattr(pe, "build_eagle3_dataloader", lambda **k: loader)
     monkeypatch.setattr(pe, "build_eagle3_token_mapping", lambda *a, **k: (ids, mask))
@@ -499,6 +501,53 @@ def _producer_argv(out_dir, *, extra=None):
         "6",
     ]
     return argv + (extra or [])
+
+
+@pytest.mark.parametrize("load_fails", [False, True])
+def test_cuda_replica_uses_single_rank_loading(monkeypatch, tmp_path, load_fails):
+    topology = {"WORLD_SIZE": "2", "LOCAL_WORLD_SIZE": "2", "RANK": "1", "LOCAL_RANK": "1"}
+    for key, value in topology.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "eagle3-test")
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    devices = []
+    monkeypatch.setattr(torch.cuda, "set_device", devices.append)
+    replica = _FakeTargetModel()
+    monkeypatch.setattr(replica, "to", lambda device: replica)
+
+    def load_replica(*args, **kwargs):
+        assert all(key not in os.environ for key in topology)
+        assert kwargs["dtype"] == torch.bfloat16
+        if load_fails:
+            raise RuntimeError("target load failed")
+        return replica
+
+    def init_group(*, backend, timeout):
+        assert {key: os.environ[key] for key in topology} == topology
+        assert backend == "nccl"
+
+    monkeypatch.setattr(pe, "NeMoAutoModelForCausalLM", SimpleNamespace(from_pretrained=load_replica))
+    monkeypatch.setattr(pe.dist, "init_process_group", init_group)
+    monkeypatch.setattr(pe, "_precompute", lambda *args, **kwargs: 0)
+    argv = _producer_argv(tmp_path, extra=["--device", "cuda"])
+    if load_fails:
+        with pytest.raises(RuntimeError, match="target load failed"):
+            pe.main(argv)
+    else:
+        assert pe.main(argv) == 0
+    assert {key: os.environ[key] for key in topology} == topology
+    assert devices == [torch.device("cuda:1")]
+
+
+def test_producer_python_entry_ignores_scheduler_ranks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "3")
+    monkeypatch.setenv("RANK", "1")
+    for key in ("LOCAL_WORLD_SIZE", "LOCAL_RANK", "TORCHELASTIC_RUN_ID"):
+        monkeypatch.delenv(key, raising=False)
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    assert existing_shard_indices(str(tmp_path)) == {0, 1, 2}
 
 
 def test_producer_main_writes_full_sharded_cache(monkeypatch, tmp_path):
@@ -545,7 +594,7 @@ def test_producer_main_resume_rejects_changed_config(monkeypatch, tmp_path):
     be silently mixed with shards from the new configuration."""
     _patch_producer(monkeypatch, num_samples=5, batch_size=2)
     assert pe.main(_producer_argv(tmp_path)) == 0
-    manifest_before = read_manifest(str(tmp_path))
+    files_before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in tmp_path.iterdir()}
 
     # Same data, different seq_length: shard contents would no longer line up.
     _patch_producer(monkeypatch, num_samples=5, batch_size=2, seq_len=8)
@@ -553,8 +602,31 @@ def test_producer_main_resume_rejects_changed_config(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="mismatched fields.*seq_length"):
         pe.main(argv)
 
-    # The recorded manifest must be untouched by the refused run.
-    assert read_manifest(str(tmp_path)) == manifest_before
+    # Reject the configuration before replacing any cached artifacts.
+    assert {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in tmp_path.iterdir()} == files_before
+
+
+def test_producer_can_restart_before_the_first_shard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    with monkeypatch.context() as patch:
+        patch.setattr(_FakeWrapper, "generate_batch", Mock(side_effect=RuntimeError("target forward failed")))
+        with pytest.raises(RuntimeError, match="target forward failed"):
+            pe.main(_producer_argv(tmp_path))
+
+    assert not existing_shard_indices(str(tmp_path))
+    assert read_manifest(str(tmp_path))["seq_length"] == 6
+    files_before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2, seq_len=4)
+    argv = _producer_argv(tmp_path, extra=["--seq-length", "4"])
+
+    with pytest.raises(ValueError, match="mismatched fields.*seq_length"):
+        pe.main([*argv, "--resume"])
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == files_before
+
+    assert pe.main(argv) == 0
+    assert read_manifest(str(tmp_path))["seq_length"] == 4
+    assert (tmp_path / "target_embeddings.safetensors").read_bytes() != files_before["target_embeddings.safetensors"]
+    assert CachedEagle3Dataset(str(tmp_path))[0]["input_ids"].shape == (4,)
 
 
 def test_manifest_records_dataset_identity_fields(monkeypatch, tmp_path):

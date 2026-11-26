@@ -24,7 +24,6 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 benchmark:
   warmup_steps: 10
-  peak_tflops: 989
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

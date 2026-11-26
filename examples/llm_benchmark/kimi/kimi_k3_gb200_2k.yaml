@@ -102,7 +102,6 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 
 benchmark:
   warmup_steps: 3
-  peak_tflops: 2500   # GB200 BF16 dense peak (NVL72: 180 PF dense / 72 GPUs), same as the other GB200 configs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

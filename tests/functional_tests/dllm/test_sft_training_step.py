@@ -75,7 +75,6 @@ def test_mdlm_sft_step_corrupts_tokens_and_updates_model() -> None:
     recipe.te_quantization = None
     recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, grad_acc_steps=1)
     recipe.timestamp = time.perf_counter()
-    recipe.mfu_calculator = None
     recipe._get_dp_group_size = lambda include_cp=False: 1
     recipe._get_cp_group_size = lambda: 1
     recipe._dp_allreduce = lambda value, include_cp=False: value
