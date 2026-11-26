@@ -37,7 +37,7 @@ model:
     experts: torch_mm
     dispatcher: hybridep
     gate_precision: float32
-    fake_balanced_gate: true  # benchmark only: random weights route unevenly
+    fake_balanced_gate: false
     fake_gate_noise: 0.0
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -116,3 +116,4 @@ ci:
     SBATCH_SEGMENT_SIZE: '16'
   perf_testing:
     schedule: weekly
+    fake_balanced_gate: true  # random weights route unevenly
