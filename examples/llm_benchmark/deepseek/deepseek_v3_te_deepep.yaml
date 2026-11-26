@@ -112,7 +112,11 @@ optimizer:
 
 
 ci:
+  cluster_tag: h100
+  nproc_per_node: 8
   time: "00:45:00"
   nodes: 32
   env_vars:
     RDZV_TIMEOUT: "900"
+  perf_testing:
+    schedule: nightly
