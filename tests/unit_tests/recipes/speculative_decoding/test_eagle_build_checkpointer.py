@@ -31,6 +31,7 @@ from unittest.mock import patch
 import pytest
 import torch.nn as nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
 from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
@@ -76,9 +77,7 @@ def test_eagle1_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer,
 @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle1_build_checkpointer_user_none_override_falls_back(mock_checkpointer, tmp_path):
     """If user config explicitly sets model_state_dict_keys=None, the fallback restores draft keys."""
-    user_ckpt_cfg = SimpleNamespace(
-        to_dict=lambda: {"model_state_dict_keys": None, "checkpoint_dir": str(tmp_path / "user_ckpt")},
-    )
+    user_ckpt_cfg = ConfigNode({"model_state_dict_keys": None, "checkpoint_dir": str(tmp_path / "user_ckpt")})
     recipe = _bare_recipe_for_checkpointer(TrainEagle1Recipe, tmp_path)
     recipe.cfg = SimpleNamespace(get=lambda key, default=None: user_ckpt_cfg if key == "checkpoint" else default)
 
@@ -108,9 +107,7 @@ def test_eagle3_build_checkpointer_sets_model_state_dict_keys(mock_checkpointer,
 @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
 def test_eagle3_build_checkpointer_user_none_override_falls_back(mock_checkpointer, tmp_path):
     """EAGLE-3: user config model_state_dict_keys=None triggers fallback to draft keys."""
-    user_ckpt_cfg = SimpleNamespace(
-        to_dict=lambda: {"model_state_dict_keys": None, "checkpoint_dir": str(tmp_path / "user_ckpt")},
-    )
+    user_ckpt_cfg = ConfigNode({"model_state_dict_keys": None, "checkpoint_dir": str(tmp_path / "user_ckpt")})
     recipe = _bare_recipe_for_checkpointer(TrainEagle3Recipe, tmp_path)
     recipe.cfg = SimpleNamespace(get=lambda key, default=None: user_ckpt_cfg if key == "checkpoint" else default)
 

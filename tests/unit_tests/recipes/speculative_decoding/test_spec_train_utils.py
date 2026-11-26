@@ -38,7 +38,6 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     optim_steps_per_epoch,
     packing_kwargs,
     read_load_metadata_with_gloo,
-    resolve_wandb_kwargs,
     resolve_warmup_steps,
     should_sync_grads,
     submesh_or_none,
@@ -323,20 +322,3 @@ def test_check_resumed_mask_token_id():
     check_resumed_mask_token_id({"mask_token_id": 5}, 5, "ckpt")
     with pytest.raises(ValueError, match="mask_token_id mismatch"):
         check_resumed_mask_token_id({"mask_token_id": 4}, 5, "ckpt")
-
-
-# ---------------------------------------------------------------------------
-# resolve_wandb_kwargs
-# ---------------------------------------------------------------------------
-
-
-def test_wandb_kwargs_disabled_when_enable_false():
-    assert resolve_wandb_kwargs({"enable": False, "project": "p"}) is None
-
-
-def test_wandb_kwargs_enabled_strips_enable_key():
-    assert resolve_wandb_kwargs({"enable": True, "project": "p", "group": "g"}) == {"project": "p", "group": "g"}
-
-
-def test_wandb_kwargs_defaults_enabled_when_flag_absent():
-    assert resolve_wandb_kwargs({"project": "p"}) == {"project": "p"}
