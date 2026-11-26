@@ -424,8 +424,16 @@ def shard_glm_dsa_packed_cp_batch(
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
     query_layout: QueryLayout = "contiguous",
+    generated_rows: bool = False,
 ):
-    """``ContextParallelSharder.shard_batch`` wrapper for GLM DSA packed CP."""
+    """``ContextParallelSharder.shard_batch`` wrapper for GLM DSA packed CP.
+
+    ``generated_rows`` is set by the model's own sharder: the query rows were just generated for
+    ``query_layout``, so the batch carries them with that layout (``_glm_dsa_shard_rows`` and
+    ``_glm_dsa_shard_layout``) and the model compares layouts instead of reading the rows back from
+    the device. Callers that supply ``glm_dsa_cp_query_indices`` themselves leave it ``False`` and get
+    the value check in :func:`validate_query_rows`.
+    """
     layout = _packed_cp_layout(batch, num_chunks=num_chunks)
     ctx_factory, sharded_batch = make_glm_dsa_packed_cp_batch_and_ctx(
         cp_mesh,
@@ -437,4 +445,7 @@ def shard_glm_dsa_packed_cp_batch(
         seq_lens_padding_value=seq_lens_padding_value,
         query_layout=query_layout,
     )
+    if generated_rows and sharded_batch["cp_size"] > 1:
+        sharded_batch["_glm_dsa_shard_layout"] = query_layout
+        sharded_batch["_glm_dsa_shard_rows"] = sharded_batch.pop("glm_dsa_cp_query_indices")
     return ctx_factory, sharded_batch, layout

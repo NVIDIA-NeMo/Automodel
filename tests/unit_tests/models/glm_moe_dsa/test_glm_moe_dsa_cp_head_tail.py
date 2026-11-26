@@ -183,6 +183,128 @@ def test_pre_sharded_rows_take_their_rank_from_the_cp_group(monkeypatch):
         )
 
 
+def _live_two_rank_group(monkeypatch, rank: int = 1) -> None:
+    """Make the model see a live two-rank CP process group named ``"cp-group"``."""
+    monkeypatch.setattr(glm_model.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(glm_model.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(glm_model.dist, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(glm_model, "glm_dsa_cp_enabled", lambda group: group == "cp-group", raising=False)
+
+
+def test_cp_size_comes_from_a_live_cp_group_when_the_batch_omits_it(monkeypatch):
+    """A batch without ``cp_size`` is not read as CP1: the group's size reaches the gather order and the row check."""
+    model = _model()
+    _live_two_rank_group(monkeypatch)
+    with pytest.raises(ValueError, match="cp_query_layout"):
+        # Rank 1 of 2 owns rows 4..7 under the contiguous layout; these are its head/tail rows.
+        model.model(
+            torch.zeros(4, dtype=torch.long),
+            position_ids=torch.tensor([2, 3, 4, 5]),
+            qkv_format="thd",
+            cu_seqlens=torch.tensor([0, 8], dtype=torch.int32),
+            glm_dsa_cp_query_indices=torch.tensor([2, 3, 4, 5], dtype=torch.int32),
+            _glm_dsa_cp_group="cp-group",
+        )
+
+
+def test_cp_size_that_disagrees_with_the_cp_group_is_rejected(monkeypatch):
+    model = _model()
+    _live_two_rank_group(monkeypatch)
+    with pytest.raises(ValueError, match=r"cp_size must match the CP process group size \(2\)"):
+        model.model(
+            torch.zeros(4, dtype=torch.long),
+            position_ids=torch.tensor([4, 5, 6, 7]),
+            qkv_format="thd",
+            cp_size=4,
+            cu_seqlens=torch.tensor([0, 8], dtype=torch.int32),
+            glm_dsa_cp_query_indices=torch.tensor([4, 5, 6, 7], dtype=torch.int32),
+            _glm_dsa_cp_group="cp-group",
+        )
+
+
+class _Stop(Exception):
+    """Raised by the capture layer to end the forward once the model has prepared the layer inputs."""
+
+
+class _CaptureLayer(torch.nn.Module):
+    def forward(self, **kwargs):
+        raise _Stop(kwargs)
+
+
+def _captured_layer_kwargs(model, **kwargs) -> dict:
+    model.model.layers = torch.nn.ModuleDict({"0": _CaptureLayer()})
+    with pytest.raises(_Stop) as stopped:
+        model.model(
+            torch.zeros(4, dtype=torch.long),
+            position_ids=torch.tensor([4, 5, 6, 7]),
+            qkv_format="thd",
+            cu_seqlens=torch.tensor([0, 8], dtype=torch.int32),
+            _glm_dsa_cp_group="cp-group",
+            **kwargs,
+        )
+    return stopped.value.args[0]
+
+
+def test_sharder_generated_rows_skip_the_value_check_and_reach_the_layers(monkeypatch):
+    model = _model()
+    _live_two_rank_group(monkeypatch)
+
+    def no_value_check(*args, **kwargs):
+        raise AssertionError("rows the model's own sharder generated must not be read back from the device")
+
+    monkeypatch.setattr(glm_model, "validate_query_rows", no_value_check)
+    rows = torch.tensor([4, 5, 6, 7], dtype=torch.int32)
+    seen = _captured_layer_kwargs(model, cp_size=2, _glm_dsa_shard_layout="contiguous", _glm_dsa_shard_rows=rows)
+    assert torch.equal(seen["glm_dsa_cp_query_indices"], rows)
+    assert "_glm_dsa_shard_rows" not in seen and "_glm_dsa_shard_layout" not in seen
+
+
+def test_sharder_and_model_layouts_must_agree(monkeypatch):
+    model = _model()
+    _live_two_rank_group(monkeypatch)
+    with pytest.raises(ValueError, match="disagree on cp_query_layout"):
+        _captured_layer_kwargs(
+            model,
+            cp_size=2,
+            _glm_dsa_shard_layout="head_tail",
+            _glm_dsa_shard_rows=torch.tensor([2, 3, 4, 5], dtype=torch.int32),
+        )
+
+
+def test_explicit_rows_keep_the_value_check(monkeypatch):
+    model = _model()
+    _live_two_rank_group(monkeypatch)
+    with pytest.raises(ValueError, match="cp_query_layout"):
+        _captured_layer_kwargs(model, cp_size=2, glm_dsa_cp_query_indices=torch.tensor([2, 3, 4, 5], dtype=torch.int32))
+
+
+@pytest.mark.parametrize("generated_rows", [False, True])
+def test_only_the_models_own_sharder_hands_its_rows_over_with_the_layout(monkeypatch, generated_rows):
+    sliced = glm_cp._slice_thd_chunk_for_cp(
+        _thd_chunk(),
+        cp_mesh=_FakeMesh(2, 1),
+        cp_group="cp-group",
+        cp_size=2,
+        cp_rank=1,
+        padding_token_id=0,
+        query_layout="head_tail",
+    )
+    monkeypatch.setattr(
+        glm_cp, "make_glm_dsa_packed_cp_batch_and_ctx", lambda *args, **kwargs: (lambda: None, dict(sliced))
+    )
+    batch = {"input_ids": torch.zeros(1, 8, dtype=torch.long)}
+    _, sharded, _ = glm_cp.shard_glm_dsa_packed_cp_batch(
+        _FakeMesh(2, 1), None, batch, query_layout="head_tail", generated_rows=generated_rows
+    )
+    if generated_rows:
+        assert "glm_dsa_cp_query_indices" not in sharded
+        assert sharded["_glm_dsa_shard_layout"] == "head_tail"
+        assert sharded["_glm_dsa_shard_rows"].tolist() == [2, 3, 4, 5]
+    else:
+        assert sharded["glm_dsa_cp_query_indices"].tolist() == [2, 3, 4, 5]
+        assert "_glm_dsa_shard_rows" not in sharded
+
+
 # Three packed documents whose real lengths differ from their padded storage: pad rows at 7, 18, 19 and 23.
 _REAL_CU = torch.tensor([0, 7, 17, 20], dtype=torch.int32)
 _PADDED_CU = torch.tensor([0, 8, 20, 24], dtype=torch.int32)

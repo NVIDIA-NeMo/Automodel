@@ -275,6 +275,15 @@ class GlmMoeDsaModel(nn.Module):
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
+        # The CP process group fixes the size: RoPE, the gather permutation and the cuDNN metadata must all
+        # see it, so a batch that omits ``cp_size`` is not read as CP1 and a wrong one is rejected.
+        cp_group = attn_kwargs.get("_glm_dsa_cp_group")
+        if cp_group is not None and dist.is_available() and dist.is_initialized():
+            group_size = dist.get_world_size(cp_group)
+            if "cp_size" in attn_kwargs and int(attn_kwargs["cp_size"]) != group_size:
+                raise ValueError(f"cp_size must match the CP process group size ({group_size})")
+            attn_kwargs["cp_size"] = group_size
+
         freqs_cis = freqs_cis_from_position_ids(
             position_ids,
             self.freqs.to(position_ids.device),
@@ -301,6 +310,12 @@ class GlmMoeDsaModel(nn.Module):
                 cp_group = attn_kwargs.get("_glm_dsa_cp_group")
                 cp_rank = dist.get_rank(group=cp_group) if glm_dsa_cp_enabled(cp_group) else int(attn_kwargs["cp_rank"])
                 validate_query_rows(layout, cp_rank, cp_size, h.shape[0], query_indices)
+            elif "_glm_dsa_shard_rows" in attn_kwargs:
+                # The model's own sharder generated these rows for its layout; comparing layouts replaces
+                # the device-to-host value check.
+                if attn_kwargs.pop("_glm_dsa_shard_layout") != layout:
+                    raise ValueError("GLM DSA sharder and model disagree on cp_query_layout")
+                attn_kwargs["glm_dsa_cp_query_indices"] = attn_kwargs.pop("_glm_dsa_shard_rows")
             elif order is not None:
                 raise ValueError(
                     "cp_query_layout='head_tail' requires glm_dsa_cp_query_indices in the packed CP batch."
@@ -519,6 +534,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 shard_glm_dsa_packed_cp_batch,
                 num_chunks=int(num_chunks),
                 query_layout=query_layout,
+                generated_rows=True,
             ),
             local_token_global_indices=(
                 round_robin_local_indices if query_layout == "head_tail" else contiguous_local_indices
