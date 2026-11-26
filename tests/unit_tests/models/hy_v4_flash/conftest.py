@@ -14,6 +14,9 @@
 
 """Tiny Hy4-flash configuration with every distinguishing feature enabled (CPU-sized), shared by the tests."""
 
+import math
+import zlib
+
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -99,7 +102,10 @@ def tiny_config(
 
 
 def released_config() -> HYV4FlashConfig:
-    """The fields the model reads from ``config.json`` of tencent/Hy4-flash at revision eccd3123, as released."""
+    """The fields the model reads from ``config.json`` of tencent/Hy4-flash at revision eccd3123, as released.
+
+    The Engram hash moduli are placeholders with the released layout, not the released primes.
+    """
     sparse, window = "deepseek_sparse_attention", "sliding_attention"
     rope = {"mrope_interleaved": True, "mrope_section": [12, 10, 10], "rope_type": "default"}
     text = dict(
@@ -226,3 +232,28 @@ def complex_rotation(x: torch.Tensor, positions: torch.Tensor, theta: float) -> 
         torch.ones_like(angles), angles
     )
     return torch.view_as_real(rotated).reshape(x.shape).float()
+
+
+def uniform(name: str, shape: tuple[int, ...]) -> torch.Tensor:
+    """Float64 values in [-1, 1) that depend only on ``name`` and the flat index: an integer hash, no generator."""
+    x = torch.arange(math.prod(shape), dtype=torch.int64) + zlib.crc32(name.encode())
+    for multiplier, shift in ((2654435761, 15), (2246822519, 13), (3266489917, 16)):
+        x = (x * multiplier) & 0xFFFFFFFF
+        x = x ^ (x >> shift)
+    return (x.double() / 2**31 - 1.0).reshape(shape)
+
+
+def released_weight(name: str, shape: tuple[int, ...]) -> torch.Tensor:
+    """Non-default weight of the released key ``name``: norms near one, vectors small, matrices scaled by fan-in."""
+    values = uniform(name, shape)
+    if "norm" in name and len(shape) == 1:
+        return (1.0 + 0.2 * values).float()
+    if len(shape) < 2:
+        return (0.2 * values).float()
+    return (1.5 / math.sqrt(math.prod(shape[1:])) * values).float()
+
+
+def checksum(x: torch.Tensor) -> tuple[float, float]:
+    """Mean magnitude and a position-weighted sum of ``x`` (any shape), in float64."""
+    x = x.detach().double().flatten()
+    return float(x.abs().mean()), float((x * torch.linspace(-1, 1, x.numel(), dtype=torch.float64)).sum())

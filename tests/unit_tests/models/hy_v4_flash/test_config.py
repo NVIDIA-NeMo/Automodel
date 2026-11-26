@@ -59,6 +59,13 @@ def test_released_config_semantics() -> None:
     assert text.layer_rope_parameters["indexed_attention"]["rope_theta"] == 10000000
 
 
+def test_defaults_are_the_released_schedule_and_rotary_bases() -> None:
+    default, released = HYV4FlashTextConfig(), released_config().text_config
+    assert default.attention_types == released.attention_types
+    assert default.layer_rope_parameters["indexed_attention"]["rope_theta"] == 1.0e7
+    assert default.layer_rope_parameters["sliding_attention"]["rope_theta"] == 1.0e4
+
+
 @pytest.mark.parametrize("spelling", ["deepseek_sparse_attention", "indexed_attention"])
 def test_released_and_reference_layer_type_spellings_build_the_same_layers(spelling: str) -> None:
     # The released config says "deepseek_sparse_attention"; newer transformers base classes rewrite it to

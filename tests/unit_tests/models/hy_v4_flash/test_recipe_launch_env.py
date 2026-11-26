@@ -28,13 +28,8 @@ RECIPES = sorted(str(path.relative_to(REPO)) for path in (REPO / "examples").glo
 
 
 def test_every_recipe_directory_is_covered() -> None:
-    assert {recipe.split("/")[1] for recipe in RECIPES} == {
-        "llm_benchmark",
-        "llm_finetune",
-        "llm_pretrain",
-        "vlm_finetune",
-    }
-    assert len(RECIPES) == 7
+    assert {recipe.split("/")[1] for recipe in RECIPES} == {"llm_finetune", "llm_pretrain", "vlm_finetune"}
+    assert len(RECIPES) == 5
 
 
 @pytest.mark.parametrize("recipe", RECIPES)

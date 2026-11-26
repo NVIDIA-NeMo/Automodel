@@ -23,8 +23,8 @@ is rejected with an error: training on reasoning traces is not supported.
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) on packed 128K sequences, CP16 x EP64 | Use [hy4_flash_tulu3_128k_cp16_ep64_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v4_flash/hy4_flash_tulu3_128k_cp16_ep64_100steps.yaml). |
-| Synthetic throughput benchmark, 4K sequences, EP64 | Use [hy4_flash_4k_ep64_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/hy_v4_flash/hy4_flash_4k_ep64_h100.yaml). |
-| Synthetic throughput benchmark, 128K sequences, CP16 x EP64 | Use [hy4_flash_128k_cp16_ep64_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/hy_v4_flash/hy4_flash_128k_cp16_ep64_h100.yaml). |
+| Synthetic throughput workload (`--benchmark`), 4K sequences, EP64 | Use [hy4_flash_4k_ep64_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/hy_v4_flash/hy4_flash_4k_ep64_h100.yaml). |
+| Synthetic throughput workload (`--benchmark`), 128K sequences, CP16 x EP64 | Use [hy4_flash_128k_cp16_ep64_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/hy_v4_flash/hy4_flash_128k_cp16_ep64_h100.yaml). |
 | Image-text fine-tuning | See the [vision-language model card](/model-coverage/vision-language-models/tencent/Hy4-flash). |
 
 ## Launch Requirements
@@ -35,9 +35,9 @@ is rejected with an error: training on reasoning traces is not supported.
   [issue #3959](https://github.com/NVIDIA-NeMo/Automodel/issues/3959). The recipes set it in `ci.env_vars`.
 - **Point the JIT caches at node-local storage** (`HYBRID_EP_CACHE_DIR`, `TRITON_CACHE_DIR`).
 - The recipes compile the hyper-connection and norm cores (`compile_hc`, `compile_norm`), so the first step takes
-  several minutes longer than the following ones. In BF16 the compiled norm multiplies by the weight in FP32 and
-  rounds once, where the reference rounds to BF16 first; with it on, LoRA and full fine-tuning do not start from the
-  bit-identical forward. Set `compile_norm: false` to keep the reference's rounding.
+  several minutes longer than the following ones. The cores are compiled with options that keep the eager BF16
+  rounding points, so the compiled norm agrees with the eager one on all but a few elements in a million; LoRA and
+  full fine-tuning start within 1.4e-3 of each other in loss. Set `compile_norm: false` for the eager norm.
 
 ## Model Reference
 
