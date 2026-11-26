@@ -1077,7 +1077,7 @@ def test_fa4_original_interface_hash_tracks_the_container_pin() -> None:
     """
     import nemo_automodel.components.attention.utils as utils
 
-    hashed_ref = "3c2c6b31e730fd13e7d6f0d384af22684b24c532"  # pragma: allowlist secret
+    hashed_ref = "b038b4974f26ba3bc8ab3c8b840c60b0432ce39b"  # pragma: allowlist secret
     dockerfile = (Path(__file__).resolve().parents[3] / "docker" / "Dockerfile").read_text(encoding="utf-8")
 
     assert f"ARG FLASH_ATTN_REF={hashed_ref}\n" in dockerfile, (
@@ -1085,11 +1085,11 @@ def test_fa4_original_interface_hash_tracks_the_container_pin() -> None:
         "flash_attn/cute/interface.py at the new ref, then update hashed_ref here."
     )
     assert utils._FA4_ORIGINAL_INTERFACE_SHA256 == (
-        "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"  # pragma: allowlist secret
+        "c3895b66051bf09ca3e98f63e0f4c84e608d2300e2024eb315db9d4ee77c8cd0"  # pragma: allowlist secret
     )
 
 
-@pytest.mark.parametrize("dependency", ["patched", "original", "unknown"])
+@pytest.mark.parametrize("dependency", ["patched", "original", "previous", "unknown"])
 @pytest.mark.parametrize("window", [(-1, 0), (128, 0)])
 def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency: str, window: tuple[int, int]) -> None:
     from torch.utils.checkpoint import checkpoint
@@ -1136,6 +1136,7 @@ def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency:
     sha = {
         "patched": utils._FA4_PHYSICAL_INTERFACE_SHA256,
         "original": utils._FA4_ORIGINAL_INTERFACE_SHA256,
+        "previous": "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646",  # pragma: allowlist secret
         "unknown": None,
     }[dependency]
     with (

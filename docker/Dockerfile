@@ -260,7 +260,9 @@ RUN git clone --filter=blob:none --no-checkout \
 # is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
 # (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
 # Includes #2888: native head_dim=192 SM90 GQA backward postprocessing.
-ARG FLASH_ATTN_REF=3c2c6b31e730fd13e7d6f0d384af22684b24c532
+# Includes #2962/#2968: head_dim=256 runs on the general SM100 kernels, which accept mask_mod and
+# block sparsity (Qwen3.8-Flash-Next FA4 QSA), and #3029: the sm_107 (VR200) SMEM descriptor fix.
+ARG FLASH_ATTN_REF=b038b4974f26ba3bc8ab3c8b840c60b0432ce39b
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=true
 ARG TARGETARCH
