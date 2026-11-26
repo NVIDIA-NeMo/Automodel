@@ -46,7 +46,9 @@ _LAUNCH = (16, 128, 4)
 
 
 @triton.jit
-def _lagged_tile(X, VALID, PREFIX, rows, cols, row_ok, col_ok, b, T, C, lag, first_row, HALO: tl.constexpr):
+def _lagged_tile(
+    X, VALID, PREFIX, rows, cols, row_ok, col_ok, b, T, C, lag, first_row, HALO: tl.constexpr
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Return the masked input ``lag`` positions before ``rows`` in FP32, [positions, channels].
 
     Positions before the sequence read the exchanged history ``PREFIX`` [batch, HALO, channels].
@@ -83,7 +85,7 @@ def _forward_kernel(
     WIDTH: tl.constexpr,
     R: tl.constexpr,
     W: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     b = tl.program_id(2)
     first_row = tl.program_id(0) * R
     rows = first_row + tl.arange(0, R)
@@ -133,7 +135,7 @@ def _backward_kernel(
     WIDTH: tl.constexpr,
     R: tl.constexpr,
     W: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     b = tl.program_id(2)
     tile = tl.program_id(0)
     first_row = tile * R

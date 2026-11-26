@@ -60,7 +60,7 @@ def _gradient_kernel(
     NEED_WEIGHTS: tl.constexpr,
     R: tl.constexpr,
     W: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Differentiate R tokens of the activation, W gate/up pairs at a time, in FP32."""
     rows = tl.program_id(0) * R + tl.arange(0, R)
     row_ok = rows < tokens

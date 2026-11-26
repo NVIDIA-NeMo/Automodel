@@ -69,7 +69,9 @@ def _launch(name: str, q: torch.Tensor) -> tuple[int, int, int, int]:
 
 
 @triton.jit
-def _load_rows(base, rows, offs_d, row_ok, EVEN: tl.constexpr):
+def _load_rows(
+    base, rows, offs_d, row_ok, EVEN: tl.constexpr
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Load a [rows, width] tile; rows past the end read as zero unless the length divides the block."""
     if EVEN:
         return tl.load(base + rows[:, None] + offs_d[None, :])
@@ -77,7 +79,9 @@ def _load_rows(base, rows, offs_d, row_ok, EVEN: tl.constexpr):
 
 
 @triton.jit
-def _profile_rows(offs_m, b, h, G, ROWS, SHIFT, H: tl.constexpr, PW: tl.constexpr, WIDE: tl.constexpr):
+def _profile_rows(
+    offs_m, b, h, G, ROWS, SHIFT, H: tl.constexpr, PW: tl.constexpr, WIDE: tl.constexpr
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Return, per query, the profile offset that plus a key's index addresses the pair's logit.
 
     The rows are ordered by the query position's residue in its block of _ALIGN positions, then
@@ -92,7 +96,9 @@ def _profile_rows(offs_m, b, h, G, ROWS, SHIFT, H: tl.constexpr, PW: tl.constexp
 
 
 @triton.jit
-def _key_blocks(lo, pid_m, T, S, OFF, E, BM: tl.constexpr, BN: tl.constexpr):
+def _key_blocks(
+    lo, pid_m, T, S, OFF, E, BM: tl.constexpr, BN: tl.constexpr
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Return the key blocks of one query block: [first, near) without and [near, end) with relative logits."""
     kb_lo = tl.min(lo, axis=0) // BN
     q_last = tl.minimum(pid_m * BM + BM - 1, T - 1)
@@ -105,7 +111,7 @@ def _key_blocks(lo, pid_m, T, S, OFF, E, BM: tl.constexpr, BN: tl.constexpr):
 @triton.jit
 def _scores(
     q, k, PROF, prof_row, offs_n, lo, hi, E, scale, PRECISION: tl.constexpr, REL: tl.constexpr, DENSE: tl.constexpr
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Return the scores [queries, keys] of one tile and which pairs are allowed.
 
     A query sees the keys from its first key to its own position. With REL the tile holds
@@ -152,7 +158,7 @@ def _forward_tile(
     EVEN_N: tl.constexpr,
     WIDE: tl.constexpr,
     REL: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Fold one key block into the running softmax (base 2) and the value sum."""
     offs_n = kb * BN + tl.arange(0, BN)
     offs_d = tl.arange(0, D)
@@ -201,7 +207,7 @@ def _forward_kernel(
     EVEN_N: tl.constexpr,
     WIDE: tl.constexpr,
     PW: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
     b = pid_bh // H
@@ -313,7 +319,7 @@ def _query_tile(
     EVEN_N: tl.constexpr,
     WIDE: tl.constexpr,
     REL: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Add one key block's share of the query gradient and write its relative-logit gradient."""
     offs_n = kb * BN + tl.arange(0, BN)
     offs_d = tl.arange(0, D)
@@ -367,7 +373,7 @@ def _backward_query_kernel(
     EVEN_N: tl.constexpr,
     WIDE: tl.constexpr,
     PW: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
     b = pid_bh // H
@@ -467,7 +473,7 @@ def _clear_uncovered_kernel(
     BN: tl.constexpr,
     PW: tl.constexpr,
     WIDE: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Zero the profile-gradient columns that the query kernel leaves unwritten.
 
     With the same query blocks, the query kernel writes the columns of the key blocks that it reads
@@ -492,7 +498,9 @@ def _clear_uncovered_kernel(
 
 
 @triton.jit
-def _softmax_term_kernel(GRAD, OUT, DO, DELTA, heads, D: tl.constexpr, R: tl.constexpr):
+def _softmax_term_kernel(
+    GRAD, OUT, DO, DELTA, heads, D: tl.constexpr, R: tl.constexpr
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Per query head: sum(dO * O) in FP32, and dO rounded to the dtype of the products."""
     rows = tl.program_id(0) * R + tl.arange(0, R)
     row_ok = rows < heads
@@ -534,7 +542,7 @@ def _key_tile(
     WIDE: tl.constexpr,
     PW: tl.constexpr,
     REL: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     """Add one query block's share of the key and value gradients."""
     offs_m = qb * BM + tl.arange(0, BM)
     offs_d = tl.arange(0, D)
@@ -590,7 +598,7 @@ def _backward_key_kernel(
     EVEN_N: tl.constexpr,
     WIDE: tl.constexpr,
     PW: tl.constexpr,
-):
+):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
     pid_n = tl.program_id(0)
     pid_bk = tl.program_id(1)
     b = pid_bk // KVH
