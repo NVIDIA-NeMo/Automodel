@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
 from os import PathLike
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
@@ -39,7 +38,12 @@ from nemo_automodel.components.utils.flops_utils import (
 
 logger = logging.getLogger(__name__)
 
-FlopsFormula = Callable[..., float]
+
+class FlopsFormula(Protocol):
+    """Model-FLOPs formula: FLOPs of one optimizer step for ``gbs`` sequences of ``seq_len`` tokens."""
+
+    def __call__(self, config: PretrainedConfig, *, gbs: int = 1, seq_len: int | None = None) -> float: ...
+
 
 # Device theoretical FLOPS (FLOPs/s) adapted from https://github.com/verl-project/verl/blob/main/verl/utils/flops_counter.py#L22-L85
 _DEVICE_FLOPS: dict[str, float] = {
@@ -194,7 +198,8 @@ class AutoMFU:
 
             config = AutoConfig.from_pretrained(str(config), **kwargs)
         else:
-            flops_formula = cls._model_flops_formula(config)
+            if isinstance(config, torch.nn.Module):
+                flops_formula = cls._model_flops_formula(config)
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
         return cls(config, device=device, peak_tflops=peak_tflops, flops_formula=flops_formula)
@@ -288,13 +293,11 @@ class AutoMFU:
             return None
 
     @staticmethod
-    def _unwrap_chain(config_or_model: object):
-        """Yield the object, then each wrapper or config it unwraps to, ending at the config."""
+    def _unwrap_config(config_or_model: object):
         cur = config_or_model
         visited = set()
         while cur is not None and id(cur) not in visited:
             visited.add(id(cur))
-            yield cur
 
             if hasattr(cur, "config"):
                 next_obj = getattr(cur, "config")
@@ -312,27 +315,20 @@ class AutoMFU:
                         break
             if not moved:
                 break
-
-    @staticmethod
-    def _unwrap_config(config_or_model: object):
-        cur = config_or_model
-        for cur in AutoMFU._unwrap_chain(config_or_model):
-            pass
         return cur
 
     @staticmethod
-    def _model_flops_formula(config_or_model: object) -> FlopsFormula | None:
-        """Return the FLOPs formula a model class owns, looking through wrappers, or ``None``.
+    def _model_flops_formula(model: torch.nn.Module) -> FlopsFormula | None:
+        """Return the FLOPs formula a model class names as ``flops_formula``, or ``None``.
 
         A model that can be built from more than one config class (the upstream Transformers
         config and the saved AutoModel config) states its formula once on the model class
-        instead of leaving the choice to whichever config class the caller passed.
+        instead of leaving the choice to whichever config class the caller passed. This is the
+        same class-attribute hook ``get_flops_formula_for_hf_config`` reads from config classes.
+        A wrapper whose class does not carry the attribute falls back to the config's formula.
         """
-        for cur in AutoMFU._unwrap_chain(config_or_model):
-            formula = getattr(type(cur), "flops_formula", None)
-            if callable(formula):
-                return formula
-        return None
+        formula = getattr(type(model), "flops_formula", None)
+        return formula if callable(formula) else None
 
     @staticmethod
     def _ensure_common_config_aliases(config: object) -> None:
