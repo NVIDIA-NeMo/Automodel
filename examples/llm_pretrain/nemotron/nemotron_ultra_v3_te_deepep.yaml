@@ -47,8 +47,6 @@ model:
     dispatcher_equal_token_counts: true  # fixed-length mock batches: every EP rank dispatches the same rows
     dispatcher_hybridep_permute_fusion: true
     dispatcher_recompute_cache: moe_tail
-    shared_expert_overlap: true
-    compile_router_weight: true
     fake_balanced_gate: false
     enable_fsdp_optimizations: false
 checkpoint:
