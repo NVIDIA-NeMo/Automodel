@@ -518,6 +518,108 @@ _ON_CPU_AND_CUDA = pytest.mark.parametrize(
 _IMAGE, _START, _END = 5, 7, 8
 
 
+def _shard_text_units(model, mesh, *, outer_root):
+    """Shard the modules the MoE parallelizer shards: ``embed_tokens``, ``lm_head`` and the text model, in that order.
+
+    ``outer_root`` adds the root over the whole model that ``distributed.moe.wrap_outer_model: true`` creates.
+    """
+    language_model = model.model.language_model
+    fully_shard(language_model.embed_tokens, mesh=mesh)
+    fully_shard(model.lm_head, mesh=mesh)
+    fully_shard(language_model, mesh=mesh)
+    if outer_root:
+        fully_shard(model, mesh=mesh)
+
+
+class TestQwen3_5MoeTextEmbedOrderByFsdpRoot:
+    @pytest.mark.parametrize("mtp_num_hidden_layers", [0, 1], ids=["no-mtp", "mtp"])
+    def test_text_batch_enters_the_text_root_before_embed_tokens_without_an_outer_root(
+        self, mtp_num_hidden_layers, cpu_mesh
+    ):
+        """Without an outer FSDP root the text model is the root of ``embed_tokens`` and has to run first.
+
+        FSDP2 raises when a unit runs before the root that contains it, so the text model embeds inside itself.
+        """
+        model = Qwen3_5MoeForConditionalGeneration(_media_config(mtp_num_hidden_layers), backend=_backend())
+        model.initialize_weights(dtype=torch.float32)
+        _shard_text_units(model, cpu_mesh, outer_root=False)
+        assert not isinstance(model, FSDPModule)
+        assert isinstance(model.model.language_model, FSDPModule)
+        model.train()
+        calls, handles = _record_module_entries(model)
+        try:
+            logits = model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]])).logits
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert logits.shape[:2] == (1, 8)
+        assert calls[:3] == ["language_model", "embed_tokens", "lm_head"]
+        # MTP training embeds the rolled token ids after lm_head, as on the merge base; nothing else runs there.
+        assert set(calls[3:]) == ({"embed_tokens"} if mtp_num_hidden_layers else set())
+
+    @pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+    @pytest.mark.parametrize("mtp_num_hidden_layers", [0, 1], ids=["no-mtp", "mtp"])
+    def test_text_batch_embeds_before_the_text_model_under_an_outer_root(
+        self, mtp_num_hidden_layers, training, cpu_mesh
+    ):
+        """Under an outer FSDP root a text-only batch calls ``embed_tokens`` once, before the text model.
+
+        A media batch has that order in training and in eval, so a text-only batch needs it in both.
+        """
+        model = Qwen3_5MoeForConditionalGeneration(_media_config(mtp_num_hidden_layers), backend=_backend())
+        model.initialize_weights(dtype=torch.float32)
+        _shard_text_units(model, cpu_mesh, outer_root=True)
+        assert isinstance(model, FSDPModule)
+        model.train(training)
+        calls, handles = _record_module_entries(model)
+        try:
+            with torch.set_grad_enabled(training):
+                model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]))
+                text_calls = list(calls)
+                calls.clear()
+                # Four image placeholders for one 2x2-patch image; pixel_values has shape [patches, patch_features].
+                model(
+                    input_ids=torch.tensor([[7, 5, 5, 5, 5, 8, 10, 11]]),
+                    pixel_values=torch.randn(4, 12, dtype=model.lm_head.weight.dtype),
+                    image_grid_thw=torch.tensor([[1, 2, 2]]),
+                    mm_token_type_ids=torch.tensor([[0, 1, 1, 1, 1, 0, 0, 0]]),
+                )
+                media_calls = list(calls)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert text_calls == ["embed_tokens", "language_model", "lm_head"]
+        # The tower is not an FSDP unit here, so only the media batch enters it.
+        assert [name for name in media_calls if name != "visual"] == text_calls
+
+    @pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+    def test_text_batch_with_a_trainable_tower_unit_enters_the_text_root_first_without_an_outer_root(
+        self, training, cpu_mesh
+    ):
+        """Without an outer root a trainable tower that is its own FSDP unit keeps the text root before ``embed_tokens``.
+
+        The tower is not entered there: the embeddings it would be tied to are produced inside the text model.
+        """
+        model = Qwen3_5MoeForConditionalGeneration(_media_config(0), backend=_backend())
+        model.initialize_weights(dtype=torch.float32)
+        fully_shard(model.model.visual, mesh=cpu_mesh)
+        _shard_text_units(model, cpu_mesh, outer_root=False)
+        assert not isinstance(model, FSDPModule)
+        model.train(training)
+        calls, handles = _record_module_entries(model)
+        try:
+            with torch.set_grad_enabled(training):
+                logits = model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]])).logits
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert logits.shape[:2] == (1, 8)
+        assert calls == ["language_model", "embed_tokens", "lm_head"]
+
+
 class TestQwen3_5MoeMediaPositions:
     @_ON_CPU_AND_CUDA
     @pytest.mark.parametrize(

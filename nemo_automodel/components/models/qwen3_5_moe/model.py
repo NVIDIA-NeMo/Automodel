@@ -665,7 +665,11 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
         if input_ids is None and inputs_embeds is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
 
-        if inputs_embeds is None and input_ids is not None:
+        # A text model that is an FSDP unit embeds the token ids itself. On a call through the outer forward
+        # in this file, token ids reach such a text model only when no FSDP root above it has run: the text
+        # model is then the root, and FSDP2 requires a root to run before the units inside it. A caller that
+        # runs this module directly under another FSDP root has to pass inputs_embeds to embed first.
+        if inputs_embeds is None and input_ids is not None and not isinstance(self.language_model, FSDPModule):
             embed_tokens = getattr(self.language_model, "embed_tokens", None)
             if embed_tokens is not None:
                 inputs_embeds = embed_tokens(input_ids)
@@ -1575,6 +1579,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             ignore_index=ignore_index,
         )
 
+    def _language_model_is_fsdp_root(self) -> bool:
+        """Whether the text model is an FSDP unit while this model is not, so no FSDP root runs before it."""
+        return isinstance(self.model.language_model, FSDPModule) and not isinstance(self, FSDPModule)
+
     def _vision_tower_is_trainable(self) -> bool:
         """Whether the vision tower is or contains an FSDP unit and has at least one trainable parameter."""
         visual = getattr(self.model, "visual", None)
@@ -1851,13 +1859,21 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             and pixel_values is None
             and pixel_values_videos is None
             and getattr(self.model.language_model, "embed_tokens", None) is not None
-            and ((self.mtp is not None and self.training) or self._vision_tower_is_trainable())
+            and (
+                isinstance(self, FSDPModule)
+                or (self.mtp is not None and self.training)
+                or self._vision_tower_is_trainable()
+            )
+            and not self._language_model_is_fsdp_root()
         ):
-            # A text-only batch embeds here too, so MTP rolls these embeddings instead of calling
-            # embed_tokens again after lm_head. Media batches call it once (above). FSDP2 prefetches
-            # in backward by forward call order, so a rank that called it again would issue different
-            # all-gathers and deadlock a step that mixes media and text-only ranks. A trainable vision
-            # tower is entered here as well, for the same reason.
+            # A text-only batch that takes this branch embeds here, so MTP rolls these embeddings instead
+            # of calling embed_tokens again after lm_head. Media batches call it once (above). FSDP2
+            # prefetches in backward by forward call order, so a rank that called it again would issue
+            # different all-gathers and deadlock a step that mixes media and text-only ranks. A trainable
+            # vision tower is entered here as well, for the same reason. The branch is skipped when the
+            # text model is the FSDP root of embed_tokens (distributed.moe.wrap_outer_model false),
+            # because a root has to run before its units: the text model then embeds the token ids, MTP
+            # embeds the rolled ids after lm_head, and the tower is not entered.
             inputs_embeds = self._anchor_unused_vision_tower(self.model.language_model.embed_tokens(input_ids))
             input_ids = None
         if cp_size > 1 and inputs_embeds is None and input_ids is not None and not torch.is_floating_point(input_ids):
