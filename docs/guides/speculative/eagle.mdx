@@ -447,13 +447,13 @@ checkpoint:
 
 ### Optimizer and Precision
 
-The draft is stored in BF16, so by default (no `_target_`) the optimizer is `torch.optim.AdamW` with
-BF16 parameters and BF16 Adam moments. Updates smaller than half a BF16 spacing are then rounded away,
-which can stall training late in a cosine schedule or at a small learning rate, and the recipe logs a
-warning. The `optimizer:` block is read like the LLM recipes read theirs: `_target_` and the
-optimizer-specific keys reach the optimizer. For example, Transformer Engine `FusedAdam` with FP32
-master weights and FP32 moments. Add these keys to your existing `optimizer:` block; `lr`, `betas`,
-`weight_decay`, `warmup_ratio` and `min_lr_ratio` stay as they are in your config:
+Standard EAGLE-3 on CUDA stores the draft in BF16. The default optimizer, `torch.optim.AdamW`,
+also stores its Adam moments in BF16. Small updates can round away late in a cosine schedule.
+The recipe warns when Adam or AdamW optimizes trainable BF16 parameters, including BF16 LoRA adapters.
+CPU drafts and CUDA parallel-reconsideration drafts use FP32 storage.
+
+To use Transformer Engine `FusedAdam` with FP32 master weights and moments, add the following keys
+to your existing `optimizer:` block. Keep your `lr`, `betas`, `weight_decay`, `warmup_ratio`, and `min_lr_ratio` settings.
 
 ```yaml
 optimizer:
@@ -468,11 +468,18 @@ optimizer:
   exp_avg_sq_dtype: torch.float32
 ```
 
-`param_group_overrides` is not supported by these recipes (they raise an error), because their
-warmup and cosine schedule does not apply per-group multipliers.
+`optimizer.param_group_overrides` works with the Dion-family optimizers (such as `MuownConfig`), which apply
+the group rules when the optimizer is built. With any other optimizer a non-empty list raises an error, because
+the warmup and cosine schedule of these recipes does not apply `lr_mult` or `wd_mult`; an empty list is ignored.
 
-This costs more optimizer memory and a larger `optim/` checkpoint. See the
-[mixed-precision training guide](/development/mixed-precision-training).
+FP32 master weights and moments increase optimizer memory use and the size of the `optim/` checkpoint.
+See the [mixed-precision training guide](/development/mixed-precision-training).
+
+**Resuming an existing run.** Earlier EAGLE versions could save AdamW state even when the YAML
+selected another optimizer. To resume the full training state, configure the optimizer and settings
+that actually produced the checkpoint. To switch optimizers, start in a fresh checkpoint directory.
+For recipes that support it, set `recipe_args.draft_weights_path` to the consolidated draft weights
+to keep the learned weights and start with fresh optimizer state.
 
 ### Launch Training
 

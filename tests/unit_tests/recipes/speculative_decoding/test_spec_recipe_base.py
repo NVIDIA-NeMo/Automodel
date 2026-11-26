@@ -242,6 +242,38 @@ def test_peft_draft_with_bf16_torch_adam_still_warns(tmp_path, caplog):
     precision_warnings._WARNED_CONTEXTS.discard("optim")
 
 
+def test_dspark_muown_group_rule_keeps_its_lr_and_decay_over_two_steps(tmp_path):
+    """The Muown rule is baked into the group at build time; the LambdaLR must scale it, not double it."""
+    pytest.importorskip("dion")
+    from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe
+
+    module = torch.nn.Sequential(torch.nn.Linear(8, 8))
+    obj, recipe_cfg = _recipe_with_optimizer(
+        TrainDSparkRecipe,
+        {
+            "_target_": "nemo_automodel.components.optim.optimizer.MuownConfig",
+            "lr": 5e-5,
+            "weight_decay": 0.5,
+            "warmup_ratio": 0.5,
+            "param_group_overrides": [{"pattern": "bias", "lr_mult": 0.25, "wd_mult": 0.5}],
+        },
+        module,
+        tmp_path,
+    )
+    obj.train_dataloader = list(range(8))
+    obj._setup_training_state(recipe_cfg)
+
+    bias = next(g for g in obj.optimizer.param_groups if any(p is module[0].bias for p in g["params"]))
+    matrix = next(g for g in obj.optimizer.param_groups if any(p is module[0].weight for p in g["params"]))
+    assert bias["weight_decay"] == pytest.approx(0.25)
+    assert matrix["weight_decay"] == pytest.approx(0.5)
+    for _ in range(2):
+        assert bias["lr"] == pytest.approx(0.25 * matrix["lr"])
+        obj.lr_scheduler.step()
+    assert bias["lr"] == pytest.approx(0.25 * matrix["lr"])
+    assert bias["weight_decay"] == pytest.approx(0.25)
+
+
 def test_eagle3_setup_honors_adamw_eps(tmp_path):
     obj, recipe_cfg = _recipe_with_optimizer(
         _eagle3_cls(), {"lr": 1e-4, "eps": 1e-6, "betas": [0.9, 0.999]}, torch.nn.Linear(2, 2), tmp_path

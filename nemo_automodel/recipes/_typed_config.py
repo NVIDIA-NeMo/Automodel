@@ -44,7 +44,9 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, TypeVar, cast
+
+import torch
 
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
@@ -258,6 +260,14 @@ class DraftCheckpointDefaults:
         return CheckpointingConfig(**kwargs)
 
 
+OptimizerOption: TypeAlias = (
+    float | int | bool | str | torch.dtype | list[float] | tuple[float, ...] | list[dict[str, str | float]] | None
+)
+
+# Optimizer options YAML writes as dtype names (``torch.float32``); the factory route needs real dtypes.
+_OPTIMIZER_DTYPE_KEYS = ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
+
+
 @dataclass(frozen=True)
 class DraftOptimizerSettings:
     """Typed ``optimizer:`` block of the speculative-decoding recipes.
@@ -267,7 +277,7 @@ class DraftOptimizerSettings:
     schedule.
 
     Attributes:
-        optimizer: The optimizer config; build it with ``.build(model, device_mesh=...)``.
+        optimizer: The constructed optimizer config; build it with ``.build(model, device_mesh=...)``.
         peak_lr: The block's ``lr``, the peak of the schedule.
         warmup_ratio: Fraction of the optimizer steps used for LR warmup.
         min_lr_ratio: Final LR as a fraction of ``peak_lr``.
@@ -282,34 +292,63 @@ class DraftOptimizerSettings:
     def from_config(cls, node: "ConfigNode") -> "DraftOptimizerSettings":
         """Parse an ``optimizer:`` block without modifying it.
 
+        The target and its options are resolved here: an ``OptimizerConfig`` subclass or a Dion class
+        is constructed from the options, and any other optimizer callable (``torch.optim.*``,
+        Transformer Engine ``FusedAdam``) becomes an ``OptimizerFromFactoryConfig`` that holds the
+        class itself and its options, with dtype names already turned into dtypes.
+
         Without a ``_target_`` the optimizer is ``torch.optim.AdamW`` with ``betas=(0.9, 0.95)`` and
         ``weight_decay=0.0`` unless the block sets them; with one, no AdamW defaults are added.
 
-        Raises:
-            ValueError: If the block sets ``param_group_overrides``; the warmup + cosine ``LambdaLR`` does not
-                apply its ``lr_mult`` / ``wd_mult``.
+        ``param_group_overrides`` is a no-op when empty. The draft recipes schedule with a warmup + cosine
+        ``LambdaLR``, which does not apply ``lr_mult`` / ``wd_mult``; only the Dion-family configs bake the
+        multipliers into the group's LR and weight decay, so a non-empty list with any other optimizer
+        raises ``ValueError``.
         """
-        import torch
+        from nemo_automodel.components.optim.optimizer import (
+            Dion2Config,
+            DionConfig,
+            MuonConfig,
+            MuownConfig,
+            NorMuonConfig,
+            OptimizerConfig,
+            OptimizerFromFactoryConfig,
+            dion_config_class,
+        )
+        from nemo_automodel.shared.utils import dtype_from_str
 
-        from nemo_automodel.components.optim.optimizer import build_optimizer_config
-
-        kwargs = _as_dict(node)
-        if "param_group_overrides" in kwargs:
-            raise ValueError(
-                "optimizer.param_group_overrides is not supported by the speculative-decoding recipes: "
-                "their warmup + cosine LambdaLR does not apply lr_mult / wd_mult."
-            )
-        target = kwargs.pop("_target_", None)
-        warmup_ratio = float(kwargs.pop("warmup_ratio", 0.05))
-        min_lr_ratio = float(kwargs.pop("min_lr_ratio", 0.1))
-        kwargs["lr"] = float(kwargs["lr"])
+        options = _as_dict(node)
+        target = options.pop("_target_", None)
+        warmup_ratio = float(options.pop("warmup_ratio", 0.05))
+        min_lr_ratio = float(options.pop("min_lr_ratio", 0.1))
+        options["lr"] = float(options["lr"])
+        overrides = options.get("param_group_overrides")
+        if not overrides:
+            options.pop("param_group_overrides", None)
         if target is None:
             target = torch.optim.AdamW
-            kwargs.setdefault("betas", (0.9, 0.95))
-            kwargs.setdefault("weight_decay", 0.0)
+            options.setdefault("betas", (0.9, 0.95))
+            options.setdefault("weight_decay", 0.0)
+
+        if isinstance(target, type) and issubclass(target, OptimizerConfig):
+            optimizer = target(**options)
+        elif (dion_config := dion_config_class(target)) is not None:
+            optimizer = dion_config(**options)
+        else:
+            for key in _OPTIMIZER_DTYPE_KEYS:
+                if isinstance(options.get(key), str):
+                    options[key] = dtype_from_str(options[key])
+            optimizer = OptimizerFromFactoryConfig(factory=target, kwargs=options)
+
+        if overrides and not isinstance(optimizer, (DionConfig, Dion2Config, MuonConfig, MuownConfig, NorMuonConfig)):
+            raise ValueError(
+                "optimizer.param_group_overrides is not supported by the speculative-decoding recipes with this "
+                "optimizer: their warmup + cosine LambdaLR does not apply lr_mult / wd_mult (only the Dion-family "
+                "optimizers bake the multipliers into the group's LR and weight decay)."
+            )
         return cls(
-            optimizer=build_optimizer_config(target, kwargs),
-            peak_lr=kwargs["lr"],
+            optimizer=optimizer,
+            peak_lr=options["lr"],
             warmup_ratio=warmup_ratio,
             min_lr_ratio=min_lr_ratio,
         )
