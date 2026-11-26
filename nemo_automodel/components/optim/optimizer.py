@@ -1184,6 +1184,28 @@ def _import_from_path(path: str) -> Any:
         raise ImportError(f"Module {module_name!r} has no attribute {attr!r} (from optimizer path {path!r}).") from e
 
 
+def dion_config_class(target: Callable[..., torch.optim.Optimizer]) -> type[OptimizerConfig] | None:
+    """Return the typed config that performs Dion's parameter grouping for ``target``.
+
+    Args:
+        target: A resolved optimizer class or callable (e.g. YAML ``_target_: dion.Muon``).
+
+    Returns:
+        The config class for a Dion-family ``target``, or ``None`` when ``target`` is not one.
+
+    Raises:
+        TypeError: If ``target`` is a Dion-family optimizer without a typed config.
+    """
+    if not is_dion_optimizer(target):
+        return None
+    dion_config = _DION_CONFIG_FOR.get(getattr(target, "__name__", ""))
+    if dion_config is None:
+        raise TypeError(
+            f"Unsupported dion optimizer {getattr(target, '__name__', target)!r}; supported: {sorted(_DION_CONFIG_FOR)}."
+        )
+    return dion_config
+
+
 def build_optimizer_config(
     target: OptimizerConfig | str | type[OptimizerConfig] | Callable[..., torch.optim.Optimizer],
     kwargs: dict[str, Any] | None = None,
@@ -1230,13 +1252,8 @@ def build_optimizer_config(
     # Dion-family optimizers need parameter grouping; route a resolved dion class
     # (e.g. YAML ``_target_: dion.Muon``) to its typed config rather than the flat-params
     # factory escape hatch, which would lose grouping and leak grouping-only kwargs.
-    if is_dion_optimizer(target):
-        dion_config = _DION_CONFIG_FOR.get(getattr(target, "__name__", ""))
-        if dion_config is None:
-            raise TypeError(
-                f"Unsupported dion optimizer {getattr(target, '__name__', target)!r}; "
-                f"supported: {sorted(_DION_CONFIG_FOR)}."
-            )
+    dion_config = dion_config_class(target)
+    if dion_config is not None:
         return dion_config(**kwargs)
     if callable(target):
         return OptimizerFromFactoryConfig(factory=target, kwargs=kwargs)

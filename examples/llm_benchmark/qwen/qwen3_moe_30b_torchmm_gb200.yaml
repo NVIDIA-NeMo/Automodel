@@ -18,7 +18,6 @@
 # Same lbs16/GBS512/ep8/2N/attn:te operating point.
 #
 # GB200 deltas vs the generic qwen3_moe_30b_te_deepep.yaml:
-#   - peak_tflops: 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
 #   - num_nodes/ci.nodes: 1 -> 2  (2 nodes x 4 GB200 = 8 GPUs)
 #   - local_batch_size: 4 -> 16
 #
@@ -33,7 +32,6 @@ seed: 1234
 
 benchmark:
   warmup_steps: 10
-  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

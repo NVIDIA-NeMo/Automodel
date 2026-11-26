@@ -15,7 +15,7 @@
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
@@ -89,7 +89,6 @@ def mock_config(monkeypatch):
     config = ConfigNamespace(
         benchmark=SimpleNamespace(
             warmup_steps=10,
-            peak_tflops=989,
             nsys_start=-1,
             nsys_end=-1,
             nsys_ranks=[],
@@ -147,7 +146,7 @@ def mock_recipe(mock_config, monkeypatch):
         # Set benchmark-specific attributes
         recipe._bench_steps = 30
         recipe._bench_warmup_steps = 10
-        recipe._bench_peak_tflops = 989
+        recipe.mfu_calculator = SimpleNamespace(reference_mfu=989)
         recipe._bench_nsys_start = -1
         recipe._bench_nsys_end = -1
         recipe._bench_nsys_ranks = []
@@ -193,14 +192,20 @@ class TestBenchmarkingRecipeInitialization:
         ):
             assert instruction in notices[0]
 
-    def test_init_extracts_benchmark_params(self, mock_config):
+    @pytest.mark.parametrize("peak_tflops", [None, 989])
+    def test_init_extracts_benchmark_params(self, mock_config, peak_tflops):
         """Test that __init__ correctly extracts benchmarking parameters from benchmark section."""
+        if peak_tflops is not None:
+            mock_config.benchmark.peak_tflops = peak_tflops
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
-            recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+            if peak_tflops is None:
+                recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+            else:
+                with pytest.warns(FutureWarning, match=r"benchmark\.peak_tflops is deprecated"):
+                    recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
 
             assert recipe._bench_steps == 30  # from step_scheduler.max_steps
             assert recipe._bench_warmup_steps == 10  # from benchmark.warmup_steps
-            assert recipe._bench_peak_tflops == 989  # from benchmark.peak_tflops
             assert recipe._bench_nsys_start == -1  # from benchmark.nsys_start
             assert recipe._bench_nsys_end == -1  # from benchmark.nsys_end
             assert recipe._bench_nsys_ranks == []  # from benchmark.nsys_ranks
@@ -505,9 +510,14 @@ class TestBenchmarkingRecipeRunBenchmark:
             )
         )
 
-        with patch("torch.distributed.barrier"):
+        mock_recipe.cfg.benchmark.peak_tflops = 1
+        with (
+            patch("torch.distributed.barrier"),
+            patch.object(mock_recipe, "_log_benchmark_summary") as log_summary,
+        ):
             mock_recipe.run_benchmark()
 
+            log_summary.assert_called_once_with(30, 10, 989, 0, elapsed_steps=ANY)
             for model_part in mock_recipe.model_parts:
                 model_part.train.assert_called_once()
 
@@ -858,9 +868,14 @@ class TestBenchmarkingRecipeJSONOutput:
 
             assert recipe._bench_json_output_path is None
 
-    @pytest.mark.parametrize("scope", ["model", "text"])
+    @pytest.mark.parametrize("scope, peak_tflops", [("model", 989), ("text", 989), ("model", float("inf"))])
     def test_log_benchmark_summary_creates_json_file(
-        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, tmp_path: Path, scope: str
+        self,
+        mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
+        tmp_path: Path,
+        scope: str,
+        peak_tflops: float,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Test that benchmark summary is written to JSON file."""
         json_file = tmp_path / "benchmark_summary.json"
@@ -876,10 +891,16 @@ class TestBenchmarkingRecipeJSONOutput:
             "iteration_warmup": mock_timer,
         }
 
-        with patch("torch.distributed.barrier"):
+        with (
+            patch("torch.distributed.barrier"),
+            caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"),
+        ):
             mock_recipe._log_benchmark_summary(
-                steps=30, warmup_steps=10, peak_tflops=989, rank=0, elapsed_steps=[1.0] * 10 + [0.5] * 20
+                steps=30, warmup_steps=10, peak_tflops=peak_tflops, rank=0, elapsed_steps=[1.0] * 10 + [0.5] * 20
             )
+
+        # The CI artifact collector reads the peak from this line.
+        assert ("MFU peak: 989 TFLOPs/s per device" if peak_tflops == 989 else "MFU peak: unknown") in caplog.text
 
         # Verify JSON file was created
         assert json_file.exists()
@@ -894,7 +915,7 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["total_steps"] == 30
         assert summary_data["warmup_steps"] == 10
         assert summary_data["training_steps"] == 20
-        assert summary_data["peak_tflops"] == 989
+        assert summary_data["peak_tflops"] == (989 if peak_tflops == 989 else None)
         assert summary_data["world_size"] == 8
         assert summary_data["tflops_total"] == mock_recipe.tflops
         assert summary_data["tflops_per_gpu"] == mock_recipe.tflops / 8
@@ -902,7 +923,9 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["local_batch_size"] == 4
         assert summary_data["seq_len"] == 2048
         assert summary_data["avg_iter_time_seconds"] == pytest.approx(10.0 / 20)
-        assert summary_data["avg_mfu_percent"] == pytest.approx(mock_recipe.tflops / (8 * (10.0 / 20) * 989) * 100)
+        assert summary_data["avg_mfu_percent"] == pytest.approx(
+            mock_recipe.tflops / (8 * (10.0 / 20) * peak_tflops) * 100
+        )
 
     @pytest.mark.parametrize("warmup_steps", [2, 5])
     def test_all_warmup_steps_have_no_measured_training_time(self, mock_recipe, tmp_path, warmup_steps):

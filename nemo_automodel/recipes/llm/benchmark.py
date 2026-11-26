@@ -14,7 +14,9 @@
 
 import json
 import logging
+import math
 import pathlib
+import warnings
 from contextlib import closing
 
 import torch
@@ -135,7 +137,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Store benchmarking-specific parameters from benchmark section
         bench_cfg = cfg.benchmark
         self._bench_warmup_steps = bench_cfg.warmup_steps
-        self._bench_peak_tflops = bench_cfg.peak_tflops
+        if getattr(bench_cfg, "peak_tflops", None) is not None:
+            warnings.warn(
+                "benchmark.peak_tflops is deprecated and ignored. MFU uses the detected device and training precision.",
+                FutureWarning,
+                stacklevel=2,
+            )
         self._bench_nsys_start = bench_cfg.nsys_start
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
@@ -370,7 +377,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         nsys_end = self._bench_nsys_end
         nsys_ranks = self._bench_nsys_ranks
 
-        peak_tflops = self._bench_peak_tflops
+        peak_tflops = self.mfu_calculator.reference_mfu
 
         # Set models to training mode
         for mp in self.model_parts:
@@ -558,6 +565,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     else f" (all {steps} iterations)"
                 )
             )
+            reported_peak = peak_tflops if math.isfinite(peak_tflops) else None
+            logger.info(
+                f"MFU peak: {reported_peak:g} TFLOPs/s per device" if reported_peak is not None else "MFU peak: unknown"
+            )
             logger.info(f"{'=' * 60}\n")
 
             # Prepare summary data
@@ -573,7 +584,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "flops_scope": self._bench_flops_scope,
                 "tflops_total": self.tflops,
                 "tflops_per_gpu": self.tflops / self.dist_env.world_size,
-                "peak_tflops": peak_tflops,
+                "peak_tflops": reported_peak,
                 "world_size": self.dist_env.world_size,
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
                 "local_batch_size": self.cfg.get("step_scheduler.local_batch_size"),
@@ -596,8 +607,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         ["Training Time (s)", iter_time],
                         ["Avg Iteration Time (s)", avg_iter_time],
                         ["Avg MFU (%)" if self._bench_flops_scope == "model" else "Avg text-backbone MFU (%)", mfu],
-                        ["TFLOPs/GPU/s", peak_tflops * mfu / 100],
-                        ["Peak TFLOPs", peak_tflops],
+                        ["TFLOPs/GPU/s", self.tflops / (self.dist_env.world_size * avg_iter_time)],
+                        ["Peak TFLOPs", reported_peak],
                         ["World Size", self.dist_env.world_size],
                         ["Global Batch Size", self.cfg.step_scheduler.global_batch_size],
                         ["Local Batch Size", self.cfg.get("step_scheduler.local_batch_size")],

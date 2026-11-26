@@ -28,7 +28,6 @@ benchmark:
   nsys_end: -1
   nsys_ranks: []
   nsys_start: -1
-  peak_tflops: 989
   warmup_steps: 7
 checkpoint:
   checkpoint_dir: outputs/step5-full92-mock-h100/checkpoints
