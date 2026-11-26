@@ -176,6 +176,9 @@ def export_quantized(*, released: str | Path, trained: str | Path, out: str | Pa
     released, trained, out = Path(released), Path(trained), Path(out)
     if out.exists():
         raise FileExistsError(f"{out} already exists")
+    partial = out.with_name(f".{out.name}.partial")
+    if partial.exists():
+        raise FileExistsError(f"{partial} is left from an interrupted export; remove it and run again")
     released_map, trained_map = _weight_map(released), _weight_map(trained)
     metadata = {
         weight + suffix
@@ -197,7 +200,6 @@ def export_quantized(*, released: str | Path, trained: str | Path, out: str | Pa
     adapter = Inkling2StateDictAdapter(Inkling2TextConfig.from_pretrained(released))
     shards = sorted(set(released_map.values()))
     kept_experts = encoded_experts = kept_tensors = converted_tensors = released_only = 0
-    partial = out.with_name(f".{out.name}.partial")
     partial.mkdir(parents=True)
     try:
         with ExitStack() as stack:
@@ -217,9 +219,8 @@ def export_quantized(*, released: str | Path, trained: str | Path, out: str | Pa
                         update = sources[trained_map[key]].get_tensor(key)
                         if _EXPERT.fullmatch(key) and value.dtype in (torch.uint8, torch.float8_e4m3fn):
                             names = [key, *(key + suffix for suffix in _NVFP4_METADATA if key + suffix in released_map)]
-                            written, encoded = _export_experts(
-                                adapter, {name: source.get_tensor(name) for name in names}, key, update
-                            )
+                            projection = {key: value, **{name: source.get_tensor(name) for name in names[1:]}}
+                            written, encoded = _export_experts(adapter, projection, key, update)
                             tensors.update(written)
                             encoded_experts += encoded
                             kept_experts += value.shape[0] - encoded

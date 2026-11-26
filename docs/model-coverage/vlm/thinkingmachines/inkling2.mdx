@@ -268,9 +268,10 @@ The output has the released tensor names, dtypes, shapes, and shards. The
 that training left unchanged keep their released bytes. Changed experts are
 quantized again with round-to-nearest, the rule the release declares, and the
 other tensors are cast to their released dtype. A text-only save takes the
-vision tower from the release. The export reads one tensor at a time and holds
-one output shard in memory. Use it for serving only, and resume training from
-the floating-point checkpoint.
+vision tower from the release. The export builds and writes one output shard at
+a time. It takes the consolidated save of a full fine-tune; a LoRA run saves
+only the adapter, which is not an input to the export. Use it for serving only,
+and resume training from the floating-point checkpoint.
 
 ## Packed Context Parallelism
 

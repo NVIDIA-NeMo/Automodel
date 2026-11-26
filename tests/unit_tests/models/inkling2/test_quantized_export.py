@@ -17,13 +17,16 @@
 import json
 import math
 import struct
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import torch
 from safetensors import safe_open
+from safetensors.torch import save_file
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.models.inkling2 import quantization, quantized_export
 from nemo_automodel.components.models.inkling2.config import Inkling2Config
 from nemo_automodel.components.models.inkling2.model import Inkling2ForCausalLM
 from nemo_automodel.components.models.inkling2.quantization import quantize_mxfp8_experts, quantize_nvfp4_experts
@@ -223,10 +226,24 @@ def test_encoders_reject_inputs_the_layout_cannot_hold(case: str) -> None:
             quantize_mxfp8_experts(weight)
 
 
-def write_released(folder: Path, checkpoint: dict[str, torch.Tensor]) -> Path:
+def write_sharded(folder: Path, tensors: dict[str, torch.Tensor], shard_of: Callable[[str], str]) -> None:
+    """Write ``tensors`` into the shard files that ``shard_of`` names, with their SafeTensors index."""
+    weight_map = {key: shard_of(key) for key in tensors}
+    for shard in sorted(set(weight_map.values())):
+        group = {key: value.contiguous() for key, value in tensors.items() if weight_map[key] == shard}
+        save_file(group, str(folder / shard), metadata={"format": "pt"})
+    (folder / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+
+
+def write_released(
+    folder: Path, checkpoint: dict[str, torch.Tensor], shard_of: Callable[[str], str] | None = None
+) -> Path:
     """Write a released two-layer checkpoint: NVFP4 layer 0, MXFP8 layer 1, sidecar and extra files."""
     folder.mkdir(parents=True)
-    write_checkpoint(checkpoint, folder)
+    if shard_of is None:
+        write_checkpoint(checkpoint, folder)
+    else:
+        write_sharded(folder, checkpoint, shard_of)
     write_released_checkpoint_metadata(folder, nvfp4_layers=[0], mxfp8_layers=[1])
     (folder / "tokenizer_config.json").write_text(json.dumps({"model_max_length": 64}))
     # Inkling releases ship tiktoken/tokenizer.model; hidden entries like .cache/ are not part of the release.
@@ -333,6 +350,57 @@ def test_changed_experts_are_encoded_and_the_others_keep_their_bytes(tmp_path: P
     assert torch.equal(exported[W2_MXFP8 + "_scale"][3:4], exponents)
 
 
+def by_layer(key: str) -> str:
+    """Released shards: layer 0 in the first file, everything else in the second."""
+    return "model-00001-of-00002.safetensors" if ".layers.0." in key else "model-00002-of-00002.safetensors"
+
+
+def test_sharded_export_in_small_chunks_matches_the_single_shard_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shards are written one by one from trained tensors spread over other shards, and chunked updates land."""
+    model, checkpoint, _ = mixed_fixture()
+    trained = floating_export(model, checkpoint)
+    torch.manual_seed(3)
+    trained[W13][2] += 0.01 * torch.randn_like(trained[W13][2])
+    trained[W2_MXFP8][3] *= 1.5
+    single = tmp_path / "single"
+    export_quantized(
+        released=write_released(tmp_path / "released", checkpoint),
+        trained=write_trained(tmp_path / "trained", trained),
+        out=single,
+    )
+    # One expert per decode and encode chunk, so the changed experts 2 and 3 are written at a nonzero offset.
+    monkeypatch.setattr(quantized_export, "_DECODE_ELEMENTS", 1)
+    monkeypatch.setattr(quantization, "_CHUNK_ELEMENTS", 1)
+    sharded_release = write_released(tmp_path / "released_sharded", checkpoint, by_layer)
+    sharded_trained = tmp_path / "trained_sharded"
+    sharded_trained.mkdir()
+    write_sharded(sharded_trained, trained, lambda key: f"part-{len(key) % 3}.safetensors")
+    out = tmp_path / "sharded"
+    summary = export_quantized(released=sharded_release, trained=sharded_trained, out=out)
+    assert (summary.kept_experts, summary.encoded_experts) == (14, 2)
+    expected = released_tensors(single)
+    for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"):
+        with safe_open(str(out / shard), framework="pt") as handle:
+            assert handle.metadata() == {"format": "pt"}
+            for key in handle.keys():
+                assert by_layer(key) == shard, key
+                assert_same_bytes(handle.get_tensor(key), expected.pop(key), key)
+    assert not expected
+    index = "model.safetensors.index.json"
+    assert (out / index).read_bytes() == (sharded_release / index).read_bytes()
+    # A block scale stored in another shard than its expert weight is rejected before anything is written.
+    apart = write_released(
+        tmp_path / "released_apart",
+        checkpoint,
+        lambda key: "b.safetensors" if key == W13 + "_scale" else "a.safetensors",
+    )
+    with pytest.raises(ValueError, match="stored apart"):
+        export_quantized(released=apart, trained=sharded_trained, out=tmp_path / "apart")
+    assert not (tmp_path / "apart").exists() and not (tmp_path / ".apart.partial").exists()
+
+
 def test_fully_trained_export_reloads_through_the_released_loader(tmp_path: Path) -> None:
     model, checkpoint, _ = mixed_fixture()
     released = write_released(tmp_path / "released", checkpoint)
@@ -403,7 +471,7 @@ def test_text_only_export_copies_the_vision_tower(tmp_path: Path) -> None:
     assert_same_bytes(exported["model.visual.proj_in.weight"], checkpoint["model.visual.proj_in.weight"], "visual")
 
 
-@pytest.mark.parametrize("case", ["missing", "unknown", "expert_shape", "tensor_shape", "out_exists"])
+@pytest.mark.parametrize("case", ["missing", "unknown", "expert_shape", "tensor_shape", "out_exists", "partial_left"])
 def test_mismatched_inputs_are_rejected_without_output(tmp_path: Path, case: str) -> None:
     model, checkpoint, _ = mixed_fixture()
     released = write_released(tmp_path / "released", checkpoint)
@@ -422,10 +490,14 @@ def test_mismatched_inputs_are_rejected_without_output(tmp_path: Path, case: str
     elif case == "tensor_shape":
         trained["model.llm.norm.weight"] = torch.zeros(3)
         match = "model.llm.norm.weight"
-    else:
+    elif case == "out_exists":
         out.mkdir()
         error, match = FileExistsError, "already exists"
+    else:
+        # A killed export leaves its hidden work directory; the next run names it instead of failing in mkdir.
+        (tmp_path / ".out.partial").mkdir()
+        error, match = FileExistsError, "interrupted export"
     with pytest.raises(error, match=match):
         export_quantized(released=released, trained=write_trained(tmp_path / "trained", trained), out=out)
     assert out.exists() == (case == "out_exists")
-    assert not any(p.name.endswith(".partial") for p in tmp_path.iterdir())
+    assert (tmp_path / ".out.partial").exists() == (case == "partial_left")

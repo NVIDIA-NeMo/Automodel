@@ -112,7 +112,8 @@ The output has the released tensor names, dtypes, shapes, and shards, with the r
 left unchanged keep their released bytes, and changed experts are quantized again with
 round-to-nearest, the rule the release declares. Refer to
 [Inkling-2-Small](/model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small#export-for-serving)
-for details. Use the export for serving only, and resume training from the floating-point checkpoint.
+for details. The export takes the consolidated save of a full fine-tune, not a LoRA adapter. Use the
+export for serving only, and resume training from the floating-point checkpoint.
 
 ## Model Reference
 
