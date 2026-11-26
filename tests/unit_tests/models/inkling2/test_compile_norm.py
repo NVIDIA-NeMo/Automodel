@@ -17,11 +17,12 @@
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from functools import partial
 
 import pytest
 import torch
 from torch import nn
-from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+from torch._dynamo.eval_frame import _debug_get_cache_entry_list, reset_code
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.inkling2 import layers
@@ -202,6 +203,35 @@ def test_compile_norm_rebinds_the_chains_once(restore_chains: None) -> None:
     # A second model shares the first one's compiled chains.
     Inkling2ForCausalLM(config, backend=backend(True))
     assert all(vars(layers)[name] is rebound[name] for name in CHAINS)
+
+
+def test_depth_mixture_compiles_the_variants_of_a_48_layer_model(
+    restore_chains: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One chain holds more than 64 variants: the chains raise at the limit instead of running eagerly.
+
+    A 48-layer model mixes 0 to 23 completed blocks, and every count is one variant of the chain
+    in each class of calls; the three classes here differ in gradient mode and value normalization.
+    Dynamo alone traces and guards the variants; no kernel is generated.
+    """
+    monkeypatch.setattr(torch, "compile", partial(torch.compile, backend="eager"))
+    layers.compile_cores()
+    norm = nn.RMSNorm(8, eps=1e-6)
+    blocks = [torch.randn(1, 2, 8, generator=torch.Generator().manual_seed(seed)) for seed in range(24)]
+    code = layers._mix_normalize_core.__code__
+    # Start from an empty cache, and leave none of these variants to the tests that follow.
+    reset_code(code)
+    try:
+        with layers.compile_variants():
+            for gradients, normalize_values in ((True, False), (False, False), (True, True)):
+                query = ResidualQuery(8, 1, normalize_values=normalize_values)
+                with torch.set_grad_enabled(gradients):
+                    for count in range(len(blocks)):
+                        (mixed,) = query(ResidualState(tuple(blocks[:count]), blocks[-1]), (norm,))
+                        assert mixed.shape == (1, 2, 8) and torch.isfinite(mixed).all()
+        assert len(_debug_get_cache_entry_list(code)) == 3 * len(blocks)
+    finally:
+        reset_code(code)
 
 
 @needs_gpu

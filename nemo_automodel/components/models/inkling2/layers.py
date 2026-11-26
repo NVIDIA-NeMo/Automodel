@@ -438,7 +438,9 @@ _clip = _clip_core
 _scaled_clip = _scaled_clip_core
 _CORES_COMPILED = False
 _ACTIVATION_COMPILED = False
-_CORE_VARIANTS = 64
+# The depth mixture alone compiles one variant per source count (half the depth) for every class of
+# batch shape and gradient mode a process runs.
+_CORE_VARIANTS = 4096
 
 
 def _compiled(core: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
@@ -502,9 +504,9 @@ def compile_activation() -> None:
 def compile_variants() -> AbstractContextManager[None]:
     """Allow a compiled chain more variants than dynamo's default recompile limit.
 
-    One chain serves several source counts, query counts, storage dtypes and gradient
-    modes. Past the limit dynamo would stop compiling a variant, and activation
-    checkpointing needs the forward and its recomputation to run the same kernels.
+    One chain serves several source counts, query counts, storage dtypes, batch shapes and
+    gradient modes. The chains are compiled with ``fullgraph=True``, so a chain that reaches
+    the limit raises ``FailOnRecompileLimitHit`` instead of running eagerly.
     """
     if not _CORES_COMPILED:
         return nullcontext()
