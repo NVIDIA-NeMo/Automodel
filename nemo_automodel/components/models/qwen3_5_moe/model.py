@@ -578,8 +578,10 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             **kwargs: Text metadata, including ``cu_seqlens`` of shape
                 [batch, max_documents + 1] or [documents + 1], integer
                 ``max_seqlen``, and ``packed_token_indices`` of shape [batch,
-                sequence] or [tokens]. Image/video-prefixed metadata retains
-                the inherited HF precomputed-vision contract.
+                sequence] or [tokens]. ``mm_token_type_ids`` of shape [batch,
+                sequence] marks each token as text (0), image (1), or video (2).
+                Image/video-prefixed metadata retains the inherited HF
+                precomputed-vision contract.
 
         Returns:
             Model output with ``last_hidden_state`` of shape [batch, sequence,
