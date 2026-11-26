@@ -94,6 +94,14 @@ class PipelineConfig:
             Other schedules are ignored with a warning. Defaults to False.
         pp_recv_buffer_pool_slack (int): Extra buffer sets beyond the 1F1B
             in-flight depth when pp_recv_buffer_pool is enabled. Defaults to 2.
+        pp_p2p_per_edge (bool): Give each directed pipeline rank edge its own
+            communicator by setting PyTorch's
+            ``torch.distributed.config.pipeline_per_edge_p2p`` before the stages
+            are built. Otherwise every stage send and receive shares the
+            pipeline process group's communicator, so the traffic to the
+            previous and the next stage is serialized. The option is set only
+            while the stages are constructed. Requires a PyTorch build that has
+            it (the 26.11 base image does). Defaults to False.
     """
 
     pp_schedule: str | None = "1f1b"
@@ -112,6 +120,7 @@ class PipelineConfig:
     pp_seq_len: int | None = None
     pp_recv_buffer_pool: bool = False
     pp_recv_buffer_pool_slack: int = 2
+    pp_p2p_per_edge: bool = False
 
     def __post_init__(self) -> None:
         """Validate the recv-buffer-pool knobs."""

@@ -173,6 +173,29 @@ native lowered communication schedule, full backward actions, and the
 APIs keep stock buffers with a warning; unsupported lifetimes are rejected
 before pooling is installed.
 
+### Per-Edge Pipeline Communicators (`pp_p2p_per_edge`)
+
+PyTorch 2.15 sends every stage's activations and gradients through one
+communicator per pipeline process group, so the sends to the next stage and the
+receives from the previous one run in a single NCCL queue. `pp_p2p_per_edge: true`
+enables PyTorch's `torch.distributed.config.pipeline_per_edge_p2p` while the
+stages are built: each directed rank edge gets its own two-rank communicator,
+created and preconnected before the first step, and the traffic to different
+peers overlaps again. It changes which communicator carries each transfer, not
+the values sent.
+
+```yaml
+distributed:
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_p2p_per_edge: true  # default false
+```
+
+On 32 H100 nodes, Kimi K2 with `interleaved1f1b` over eight stages ran at 985
+tokens/s/GPU with the option and 597 without it. The option needs a PyTorch
+build that provides `pipeline_per_edge_p2p`, such as the one in the 26.11 base
+container; older builds fail when the option is enabled.
+
 ### Model Patching Flags
 
 AutoPipeline splits a model by deep-copying it per stage and pruning away modules that do not belong to that stage. Many Hugging Face models assume the full module tree is present and return `ModelOutput` objects; after pruning, their original `forward()` often breaks (or returns objects that are awkward to pipeline).
