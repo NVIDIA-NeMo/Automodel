@@ -19,9 +19,12 @@ from __future__ import annotations
 import pytest
 import torch
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.inkling2 import layers, triton_activation
-from nemo_automodel.components.models.inkling2.layers import capped_swiglu
+from nemo_automodel.components.models.inkling2.layers import Inkling2MoE, capped_swiglu
 from nemo_automodel.components.models.inkling2.triton_activation import capped_swiglu_gradient
+
+from .test_reference import tiny_config
 
 needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="The kernel runs on CUDA")
 
@@ -134,3 +137,23 @@ def test_activation_uses_the_kernel_only_with_compiled_chains(monkeypatch: pytes
         assert len(calls) == expected_calls
         assert _close(pairs.grad, wanted_gate_up, torch.float32)
         torch.testing.assert_close(weight.grad.double(), wanted_weights, rtol=1e-4, atol=1e-5)
+
+
+@needs_gpu
+@pytest.mark.parametrize("compiled", [False, True])
+def test_experts_without_a_routed_token_differentiate(compiled: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rank whose tokens are all padding still runs its expert projections, on one zero row."""
+    monkeypatch.setattr(layers, "_ACTIVATION_COMPILED", compiled)
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch", experts="torch_mm", dispatcher="torch")
+    torch.manual_seed(0)
+    moe = Inkling2MoE(tiny_config(), backend, dtype=torch.float32).cuda()
+    with torch.no_grad():
+        moe.init_weights(torch.device("cuda"), init_std=0.3)
+    x = torch.randn(1, 3, 16, device="cuda", requires_grad=True)
+    out = moe(x, padding_mask=torch.ones(1, 3, dtype=torch.bool, device="cuda"))
+    (out * torch.randn_like(out)).sum().backward()
+    # No token reaches an expert: the output is zero, and so is every gradient through the experts.
+    assert torch.count_nonzero(out) == 0
+    assert x.grad is not None and torch.count_nonzero(x.grad) == 0
+    gradients = [parameter.grad for parameter in moe.experts.parameters()]
+    assert gradients and all(gradient is not None and torch.count_nonzero(gradient) == 0 for gradient in gradients)

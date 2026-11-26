@@ -687,8 +687,9 @@ class _CappedSwiGLU(torch.autograd.Function):
         gate_up, weights = ctx.saved_tensors
         gate_softcap, up_softcap = ctx.caps
         # With the compiled chains on a CUDA device the derivative is one Triton pass over the inputs.
+        # Experts without a routed token pass one row without the token axis, which the kernel does not take.
         differentiate = _swiglu_grad_core
-        if gate_up.is_cuda and _ACTIVATION_COMPILED and _HAVE_TRITON:
+        if gate_up.is_cuda and gate_up.ndim == 2 and _ACTIVATION_COMPILED and _HAVE_TRITON:
             differentiate = _one_pass_swiglu_gradient
         grad_gate_up, grad_weights = differentiate(
             gate_up, weights, grad_output, gate_softcap, up_softcap, ctx.needs_input_grad[1]
