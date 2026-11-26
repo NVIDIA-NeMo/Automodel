@@ -24,6 +24,7 @@ seed: 1234
 
 benchmark:
   warmup_steps: 10
+  peak_tflops: 989  # EXPERIMENT ONLY: automodel-ci still requires this deprecated key
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
@@ -112,3 +113,5 @@ ci:
   nodes: 32
   env_vars:
     HF_HUB_OFFLINE: "0"
+  perf_testing:
+    schedule: nightly

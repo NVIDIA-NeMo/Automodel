@@ -24,6 +24,7 @@ seed: 1234
 
 benchmark:
   warmup_steps: 2
+  peak_tflops: 989  # EXPERIMENT ONLY: automodel-ci still requires this deprecated key
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
@@ -117,3 +118,5 @@ ci:
   nodes: 32
   env_vars:
     RDZV_TIMEOUT: "900"
+  perf_testing:
+    schedule: nightly
