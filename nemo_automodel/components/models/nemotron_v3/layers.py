@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import torch
@@ -26,6 +27,7 @@ from nemo_automodel.components.attention.utils import (
     preprocess_args_and_kwargs_for_attn,
 )
 from nemo_automodel.components.models.common import (
+    HAVE_TE,
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -267,6 +269,46 @@ class _MambaProjectionConfig(Protocol):
     """Parameter dtype of the model; a Transformer Engine projection is built in it."""
 
 
+@dataclass(kw_only=True)
+class NemotronV3BackendConfig(BackendConfig):
+    """Backend choices of the NemotronV3 Mamba mixer, on top of the shared ones.
+
+    A model built with the shared ``BackendConfig`` runs with the defaults of both fields.
+
+    Attributes:
+        mamba_linear: Linear implementation of the Mamba mixer's input and output projections.
+            ``"torch"`` keeps ``torch.nn.Linear`` with the output projection applied inside the scan
+            kernel. ``"te"`` builds both as Transformer Engine linears: the output projection then runs
+            as a module after the scan kernel and ``te_fp8`` / ``te_nvfp4`` quantize both GEMMs.
+        mamba_norm_backward_grid_scale: Number of programs of the gated-RMSNorm backward kernel in the
+            Mamba training scan, as a multiple of the number mamba_ssm launches (about one per streaming
+            multiprocessor, each looping over thousands of rows). 1 runs mamba_ssm's own backward. Above
+            1 the scan runs through ``mamba_scan.split_conv1d_scan``: the same kernels in the same order,
+            with shorter row loops for this one. The output is unchanged; of the gradients only the norm
+            weight's changes, in its float32 summation order. Not used with context parallelism.
+    """
+
+    mamba_linear: Literal["torch", "te"] = "torch"
+    mamba_norm_backward_grid_scale: int = 1
+
+    def __post_init__(self) -> None:
+        if self.mamba_linear not in ("torch", "te"):
+            raise ValueError(f"Unsupported mamba_linear={self.mamba_linear!r}; expected 'torch' or 'te'.")
+        if self.mamba_linear == "te" and not HAVE_TE:
+            raise ValueError("mamba_linear='te' requires Transformer Engine")
+        if isinstance(self.mamba_norm_backward_grid_scale, bool) or not isinstance(
+            self.mamba_norm_backward_grid_scale, int
+        ):
+            raise ValueError(
+                f"mamba_norm_backward_grid_scale must be an integer, got {self.mamba_norm_backward_grid_scale!r}"
+            )
+        if self.mamba_norm_backward_grid_scale < 1:
+            raise ValueError(
+                f"mamba_norm_backward_grid_scale must be at least 1, got {self.mamba_norm_backward_grid_scale!r}"
+            )
+        super().__post_init__()
+
+
 class NemotronV3Mamba2Mixer(nn.Module):
     """Mamba2 mixer for NemotronV3 (training-only, uses CUDA kernels).
 
@@ -275,7 +317,8 @@ class NemotronV3Mamba2Mixer(nn.Module):
 
     Requires mamba_ssm and causal_conv1d packages.
 
-    The input and output projections follow ``backend.mamba_linear``. With ``"torch"`` (the default) both
+    The input and output projections follow ``mamba_linear`` of :class:`NemotronV3BackendConfig`; a mixer
+    given the shared ``BackendConfig`` runs with the defaults of that class. With ``"torch"`` (the default) both
     are ``torch.nn.Linear`` and the training path applies the output projection inside the scan kernel.
     With ``"te"`` both are Transformer Engine linears, the output projection runs as a module after the
     scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize both GEMMs like every other TE linear.
@@ -296,8 +339,13 @@ class NemotronV3Mamba2Mixer(nn.Module):
     def __init__(self, config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.layer_idx = layer_idx
-        mamba_linear = backend.mamba_linear if backend is not None else "torch"
-        self.norm_backward_grid_scale = backend.mamba_norm_backward_grid_scale if backend is not None else 1
+        if isinstance(backend, NemotronV3BackendConfig):
+            mamba_linear = backend.mamba_linear
+            self.norm_backward_grid_scale = backend.mamba_norm_backward_grid_scale
+        else:
+            # The shared ``BackendConfig`` has no Mamba field: the defaults apply.
+            mamba_linear = "torch"
+            self.norm_backward_grid_scale = 1
         # Set by ``NemotronV3ForCausalLM`` through ``mamba_scan_ac_exempt_blocks``.
         self.scan_ac_exempt = False
 
@@ -365,7 +413,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         """Build one Mamba projection of shape ``[out_features, in_features]``.
 
         Args:
-            mamba_linear: ``BackendConfig.mamba_linear``.
+            mamba_linear: ``NemotronV3BackendConfig.mamba_linear``.
             in_features: Width of the projection input.
             out_features: Width of the projection output.
             config: Model configuration; ``use_bias`` and ``torch_dtype`` are read.

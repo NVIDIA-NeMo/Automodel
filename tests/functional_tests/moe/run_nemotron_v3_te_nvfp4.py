@@ -109,7 +109,7 @@ model:
     pad_token_id: 0
     dtype: bfloat16
   backend:
-    _target_: nemo_automodel.components.models.common.BackendConfig
+    _target_: nemo_automodel.components.models.nemotron_v3.layers.NemotronV3BackendConfig
     attn: te
     linear: te
     mamba_linear: te

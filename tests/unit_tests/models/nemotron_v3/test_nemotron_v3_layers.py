@@ -26,6 +26,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3 import layers as nemotron_layers
 from nemo_automodel.components.models.nemotron_v3.layers import (
     NemotronV3Attention,
+    NemotronV3BackendConfig,
     NemotronV3Block,
     NemotronV3Mamba2Mixer,
 )
@@ -970,14 +971,14 @@ def test_mamba_scan_size_limit_is_the_largest_32_bit_offset():
         _check_mamba_scan_size(torch.empty(1, 2**31, 1, device="meta"))
 
 
-# ``BackendConfig.mamba_linear``: the Mamba projections as ``torch.nn.Linear`` or Transformer Engine linears.
+# ``NemotronV3BackendConfig.mamba_linear``: the Mamba projections as ``torch.nn.Linear`` or Transformer Engine linears.
 #
 # The comparison of an output projection applied after the scan kernel with the one applied inside it, on the
 # real kernel, is in ``tests/functional_tests/kernel_parity/test_nemotron_v3_mamba_scan.py``.
 
 
-def _mamba_linear_backend(mamba_linear: str) -> BackendConfig:
-    return BackendConfig(
+def _mamba_linear_backend(mamba_linear: str) -> NemotronV3BackendConfig:
+    return NemotronV3BackendConfig(
         attn="sdpa",
         linear="torch",
         rms_norm="torch",
@@ -989,9 +990,12 @@ def _mamba_linear_backend(mamba_linear: str) -> BackendConfig:
 
 @pytest.mark.cpu_only
 def test_default_backend_keeps_torch_projections():
-    assert BackendConfig(attn="sdpa", linear="torch", experts="torch", dispatcher="torch").mamba_linear == "torch"
+    # The shared config has no Mamba field; a mixer built with it uses the defaults of the model's config.
+    shared = BackendConfig(attn="sdpa", linear="torch", experts="torch", dispatcher="torch")
+    assert _backend().mamba_linear == "torch"
     for mixer in (
         NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0),
+        NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=shared),
         NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=_mamba_linear_backend("torch")),
     ):
         assert type(mixer.in_proj) is nn.Linear
@@ -1168,7 +1172,7 @@ def test_other_masks_reach_mamba_layers(model_and_masks, mask):
     assert mamba_mask is mask
 
 
-# ``BackendConfig.mamba_norm_backward_grid_scale`` and the mixer's ``scan_ac_exempt`` on a CPU stand-in.
+# ``NemotronV3BackendConfig.mamba_norm_backward_grid_scale`` and the mixer's ``scan_ac_exempt`` on a CPU stand-in.
 #
 # Which scan the mixer runs, how often an output projection that saves its input after computing (as a
 # Transformer Engine linear does) runs under a non-reentrant activation checkpoint, and what context
@@ -1176,8 +1180,10 @@ def test_other_masks_reach_mamba_layers(model_and_masks, mask):
 # ``tests/functional_tests/kernel_parity/test_nemotron_v3_mamba_scan.py``.
 
 
-def _backend(**mamba: int | float | bool | str) -> BackendConfig:
-    return BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch", **mamba)
+def _backend(**mamba: int | float | bool | str) -> NemotronV3BackendConfig:
+    return NemotronV3BackendConfig(
+        attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch", **mamba
+    )
 
 
 @pytest.mark.cpu_only
