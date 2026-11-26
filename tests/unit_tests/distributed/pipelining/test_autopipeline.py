@@ -1351,3 +1351,89 @@ def _pp_fsdp_eval_seq_len_reset_worker(rank: int, world_size: int, init_file: st
 def test_update_seq_len_pp_fsdp_eval_with_rank_local_resets_gloo(tmp_path: Path):
     """PP2 x DP-shard2 FSDP2 evaluation with an unwrapped stage root finishes and matches the reference."""
     mp.spawn(_pp_fsdp_eval_seq_len_reset_worker, args=(4, str(tmp_path / "process-group")), nprocs=4, join=True)
+
+
+def _install_fake_dist_config(monkeypatch) -> types.ModuleType:
+    """Replace ``torch.distributed.config`` with a module that has only the per-edge option.
+
+    Older PyTorch builds have no ``torch.distributed.config``; newer ones read it at stage
+    construction. The fake keeps the option's value and its ``patch`` restore semantics.
+    """
+    import contextlib
+    import sys
+
+    fake = types.ModuleType("torch.distributed.config")
+    fake.pipeline_per_edge_p2p = False
+
+    @contextlib.contextmanager
+    def patch(**changes):
+        saved = {name: getattr(fake, name) for name in changes}
+        for name, value in changes.items():
+            setattr(fake, name, value)
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                setattr(fake, name, value)
+
+    fake.patch = patch
+    monkeypatch.setitem(sys.modules, "torch.distributed.config", fake)
+    monkeypatch.setattr(torch.distributed, "config", fake, raising=False)
+    return fake
+
+
+class TestAutoPipelinePerEdgeP2P:
+    """``pp_p2p_per_edge`` reaches the stages that ``build`` constructs, and only them."""
+
+    def _build(self, monkeypatch, fake_config, **kwargs) -> list:
+        import nemo_automodel.components.distributed.pipelining.functional as fn
+
+        _patch_autopipeline_monkey(monkeypatch)
+        seen = []
+
+        class RecordingStage(DummyPipelineStage):
+            def __init__(self, *args, **stage_kwargs):
+                super().__init__(*args, **stage_kwargs)
+                seen.append(fake_config.pipeline_per_edge_p2p if fake_config is not None else None)
+
+        monkeypatch.setattr(fn, "PipelineStage", RecordingStage)
+        model = DummyQwenForCausalLM(num_layers=4)
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
+        ap = AutoPipeline(
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=generate_hf_model_fqn_per_model_part(
+                num_stages=2,
+                num_layers=4,
+                include_embeddings=True,
+                include_lm_head=True,
+                include_rotary_emb=True,
+                fqn_prefix="model.",
+            ),
+            device=torch.device("cpu"),
+            **kwargs,
+        )
+        ap.build(model, loss_fn=lambda logits, targets: torch.tensor(0.0))
+        return seen
+
+    def test_enabled_stages_are_built_with_per_edge_p2p_and_option_is_restored(self, monkeypatch):
+        fake_config = _install_fake_dist_config(monkeypatch)
+
+        seen = self._build(monkeypatch, fake_config, pp_p2p_per_edge=True)
+
+        assert seen == [True]
+        assert fake_config.pipeline_per_edge_p2p is False
+
+    def test_disabled_does_not_touch_torch_distributed_config(self, monkeypatch):
+        import sys
+
+        # A None entry makes any import of the module raise ImportError, as on PyTorch builds without it.
+        monkeypatch.setitem(sys.modules, "torch.distributed.config", None)
+
+        seen = self._build(monkeypatch, None)
+
+        assert seen == [None]

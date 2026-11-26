@@ -41,3 +41,11 @@ class TestPipelineConfigPpSeqLen:
         d = config.to_dict()
         assert "pp_seq_len" in d
         assert d["pp_seq_len"] is None
+
+
+class TestPipelineConfigP2PPerEdge:
+    def test_per_edge_p2p_is_off_by_default(self):
+        assert PipelineConfig().pp_p2p_per_edge is False
+
+    def test_per_edge_p2p_set_via_constructor(self):
+        assert PipelineConfig(pp_p2p_per_edge=True).pp_p2p_per_edge is True

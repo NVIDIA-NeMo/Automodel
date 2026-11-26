@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -39,6 +40,31 @@ from nemo_automodel.components.distributed.pipelining.runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def per_edge_p2p_context(enabled: bool) -> AbstractContextManager:
+    """Context in which new pipeline stages give each directed rank edge its own communicator.
+
+    ``PipelineStage`` reads PyTorch's ``torch.distributed.config.pipeline_per_edge_p2p`` when it is
+    constructed, and the schedule then creates one two-rank child communicator per directed edge and
+    preconnects it before the first step. Without it, PyTorch 2.15 sends every stage's activations and
+    gradients through the pipeline process group's single communicator, so the traffic to the previous
+    and the next stage is serialized and an interleaved 1F1B step loses the overlap it had under
+    PyTorch 2.14. The option is patched only for the duration of the context, and
+    ``torch.distributed.config`` is imported only when the option is requested because older PyTorch
+    builds do not have it.
+
+    Args:
+        enabled: Whether stages constructed inside the context use per-edge communicators.
+
+    Returns:
+        A context manager that patches the option, or a no-op context when ``enabled`` is False.
+    """
+    if not enabled:
+        return nullcontext()
+    import torch.distributed.config as dist_config
+
+    return dist_config.patch(pipeline_per_edge_p2p=True)
 
 
 @dataclass
@@ -89,6 +115,8 @@ class AutoPipeline:
         # P2P recv-buffer pooling (see components.distributed.pipelining.recv_buffer_pool)
         pp_recv_buffer_pool: bool = False,
         pp_recv_buffer_pool_slack: int = 2,
+        # One communicator per directed pipeline rank edge (see per_edge_p2p_context)
+        pp_p2p_per_edge: bool = False,
     ):
         # Validation
         if pp_schedule_csv is None and pp_schedule is None:
@@ -124,6 +152,7 @@ class AutoPipeline:
         self.pp_seq_len = pp_seq_len
         self.pp_recv_buffer_pool = pp_recv_buffer_pool
         self.pp_recv_buffer_pool_slack = pp_recv_buffer_pool_slack
+        self.pp_p2p_per_edge = pp_p2p_per_edge
 
         self.pp_mesh: DeviceMesh = self.world_mesh[pp_axis_name]
 
@@ -154,34 +183,36 @@ class AutoPipeline:
 
         validate_hf_model_for_pipeline_support(model)
 
-        pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
-            model,
-            world_mesh=self.world_mesh,
-            moe_mesh=self.moe_mesh,
-            pp_axis_name=self.pp_axis_name,
-            dp_axis_names=self.dp_axis_names,
-            cp_axis_name=self.cp_axis_name,
-            tp_axis_name=self.tp_axis_name,
-            ep_axis_name=self.ep_axis_name,
-            ep_shard_axis_names=self.ep_shard_axis_names,
-            layers_per_stage=self.layers_per_stage,
-            pipeline_parallel_schedule_csv=self.pp_schedule_csv,
-            pipeline_parallel_schedule=self.pp_schedule,
-            microbatch_size=self.pp_microbatch_size,
-            local_batch_size=self.pp_batch_size,
-            device=self.device,
-            loss_fn=loss_fn,
-            parallelize_fn=parallelize_fn,
-            module_fqns_per_model_part=self.module_fqns_per_model_part,
-            patch_inner_model=self.patch_inner_model,
-            patch_causal_lm_model=self.patch_causal_lm_model,
-            scale_grads=self.scale_grads_in_schedule,
-            round_to_pp_multiple=self.round_virtual_stages_to_pp_multiple,
-            patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
-            reduce_grad_per_microbatch=not self.defer_fsdp_grad_sync,
-            seq_len=self.pp_seq_len,
-            tensor_dtype=self.dtype,
-        )
+        # PipelineStage reads the per-edge option when pipeline_model constructs it.
+        with per_edge_p2p_context(self.pp_p2p_per_edge):
+            pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
+                model,
+                world_mesh=self.world_mesh,
+                moe_mesh=self.moe_mesh,
+                pp_axis_name=self.pp_axis_name,
+                dp_axis_names=self.dp_axis_names,
+                cp_axis_name=self.cp_axis_name,
+                tp_axis_name=self.tp_axis_name,
+                ep_axis_name=self.ep_axis_name,
+                ep_shard_axis_names=self.ep_shard_axis_names,
+                layers_per_stage=self.layers_per_stage,
+                pipeline_parallel_schedule_csv=self.pp_schedule_csv,
+                pipeline_parallel_schedule=self.pp_schedule,
+                microbatch_size=self.pp_microbatch_size,
+                local_batch_size=self.pp_batch_size,
+                device=self.device,
+                loss_fn=loss_fn,
+                parallelize_fn=parallelize_fn,
+                module_fqns_per_model_part=self.module_fqns_per_model_part,
+                patch_inner_model=self.patch_inner_model,
+                patch_causal_lm_model=self.patch_causal_lm_model,
+                scale_grads=self.scale_grads_in_schedule,
+                round_to_pp_multiple=self.round_virtual_stages_to_pp_multiple,
+                patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
+                reduce_grad_per_microbatch=not self.defer_fsdp_grad_sync,
+                seq_len=self.pp_seq_len,
+                tensor_dtype=self.dtype,
+            )
 
         if self.pp_recv_buffer_pool:
             from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
