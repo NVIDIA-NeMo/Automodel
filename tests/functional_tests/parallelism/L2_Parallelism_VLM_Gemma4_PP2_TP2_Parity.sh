@@ -13,7 +13,7 @@
 # limitations under the License.
 
 #!/bin/bash
-# Pipeline-parallel parity for the Gemma4 31B VLM recipe.
+# Pipeline-parallel and tensor-parallel parity for the Gemma4 31B VLM recipe.
 #
 # Runs the Gemma4 31B proxy twice with the same seed and data order -- once on a
 # single rank, once at pp_size=2 -- and asserts both follow the same loss and
@@ -22,10 +22,19 @@
 #
 # Covers the gap from PR #2983 (commit 00f40419).
 #
+# The TP leg runs the same proxy at tp_size=2. The real gemma4_31b recipes run tp_size=4,
+# and their attention layout is unusual: `attention_k_eq_v`, a `global_head_dim` that
+# differs from `head_dim`, and `num_global_key_value_heads` != `num_key_value_heads`. The
+# proxy preserves all three so TP shards the same structure it shards in production.
+#
 # Required CI environment:
 #   * `$TEST_DATA_DIR/hf_gemma4_e4b_2l/` -- staged Gemma4 processor (already
 #     required by L2_HF_Transformer_VLM_Gemma4_Joint_Drafter.sh).
 #   * `$HF_CACHE/mini_cord_v2/` -- the standard VLM mini dataset.
+
+# The PP2 and TP2 legs share one proxy checkpoint and one single-rank baseline (both use
+# global_batch_size 4, so each step accumulates two micro-batches), instead of building
+# and running them twice. Each leg keeps its own tolerances.
 
 set -xeuo pipefail
 
@@ -37,6 +46,7 @@ LOG_FILE="$RUN_DIR/pp2.log"
 PROXY_CKPT="$RUN_DIR/proxy"
 cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
+source tests/functional_tests/parallelism/parity_legs.sh
 
 # Build the randomly-initialized proxy checkpoint. Both runs load the same
 # weights, which is what makes the two loss trajectories comparable at all.
@@ -59,7 +69,7 @@ COMMON_ARGS=(
 )
 
 # --- Baseline: single rank, no parallelism ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=1 --nnodes=1 -m coverage run \
+start_leg baseline env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=1 --nnodes=1 -m coverage run \
     examples/vlm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/baseline" \
@@ -68,7 +78,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=1 --nnod
     --distributed.pp_size 1
 
 # --- Pipeline parallel: 2 ranks, pp_size=2 ---
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
+start_leg pp2 env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/vlm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --checkpoint.checkpoint_dir "$RUN_DIR/pp2" \
@@ -76,8 +86,21 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.cp_size 1 \
     --distributed.pp_size 2 \
     --distributed.pipeline.pp_schedule 1f1b \
-    --distributed.pipeline.pp_microbatch_size 1 \
-    2>&1 | tee "$LOG_FILE"
+    --distributed.pipeline.pp_microbatch_size 1
+
+# --- Tensor parallel: 2 ranks, tp_size=2 ---
+# FSDP2Manager skips parallelization at world_size 1, so the baseline runs unwrapped
+# while the tp2 run gets FSDP2's default bf16 MixedPrecisionPolicy; hence the looser
+# gradient-norm bound.
+start_leg tp2 env TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 -m coverage run \
+    examples/vlm_finetune/finetune.py \
+    "${COMMON_ARGS[@]}" \
+    --checkpoint.checkpoint_dir "$RUN_DIR/tp2" \
+    --distributed.tp_size 2 \
+    --distributed.cp_size 1 \
+    --distributed.pp_size 1
+
+wait_legs
 
 # Guard against the `_precompute_stage_shapes` bug from PR #2983. Assert the
 # static path positively as well: if the precompute is skipped outright, the
@@ -99,5 +122,12 @@ python tests/functional_tests/parallelism/compare_parallel_parity.py \
     "$RUN_DIR/baseline/training.jsonl" \
     "$RUN_DIR/pp2/training.jsonl" \
     --axis pp \
+    --loss-tol 0.05 \
+    --grad-norm-rtol 0.20
+
+python tests/functional_tests/parallelism/compare_parallel_parity.py \
+    "$RUN_DIR/baseline/training.jsonl" \
+    "$RUN_DIR/tp2/training.jsonl" \
+    --axis tp \
     --loss-tol 0.05 \
     --grad-norm-rtol 0.20

@@ -154,5 +154,5 @@ def test_native_model_flops_survive_config_round_trip(tmp_path):
     expected = model_flops(config, gbs=1, seq_len=128)
     for candidate in (config, AutoConfig.from_pretrained(tmp_path)):
         model = GlmMoeDsaForCausalLM.from_config(candidate, backend=backend)
-        meter = AutoMFU.from_config(model, peak_tflops=100)
+        meter = AutoMFU.from_config(model)
         assert meter.get_flops((1, 128)) == expected

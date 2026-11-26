@@ -77,6 +77,34 @@ def _to_host_preserving_sharing(state_dict: dict[str, torch.Tensor]) -> dict[str
     return host_state_dict
 
 
+def _copy_views_to_own_storage(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Replace every tensor that is non-contiguous or covers only part of its storage by a contiguous copy.
+
+    A state-dict adapter may return views of the model's weights, such as transposed slices of a grouped
+    expert tensor or slices of one vector. ``save_torch_state_dict`` takes tensors in one storage for names
+    of the same data: it fails on such views, or drops one when another tensor covers the whole storage.
+    The checkpointer's ``_materialize_to_hf_views_for_save`` copies only non-contiguous tensors, which is
+    enough for its storage writer but not for this one, which also refuses a contiguous slice of a storage.
+
+    Args:
+        state_dict: Mapping of names to dense CPU tensors of arbitrary shape, dtype, and stride. Tensors
+            may share storage. The mapping is emptied, so that it keeps no reference to a view that has
+            been copied.
+
+    Returns:
+        The same names in the same order. A contiguous tensor that covers its whole storage is returned
+        unchanged, so tied weights still share one storage. Every other tensor is a contiguous copy in a
+        new storage. Input tensors are not mutated.
+    """
+    copied = {}
+    for key in list(state_dict):
+        tensor = state_dict.pop(key)
+        if not (tensor.is_contiguous() and tensor.nbytes == tensor.untyped_storage().nbytes()):
+            tensor = tensor.clone(memory_format=torch.contiguous_format)
+        copied[key] = tensor
+    return copied
+
+
 @torch.no_grad()
 def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Fold a model's LoRA updates and convert its state to canonical HF layout.
@@ -91,6 +119,8 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         Canonical Hugging Face state mapping on host memory. Every tensor
         retains the dtype of the corresponding model weight; model-family
         adapters may split grouped tensors into canonical per-expert tensors.
+        Every tensor is contiguous and covers its whole storage; only tied
+        weights share one.
     """
     _require_no_packed_expert_storage(model, "Merged PEFT export")
     state_dict = dict(model.state_dict())
@@ -154,7 +184,7 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             quantization=False,
         )
 
-    return state_dict
+    return _copy_views_to_own_storage(state_dict)
 
 
 @torch.no_grad()

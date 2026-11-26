@@ -80,7 +80,7 @@ Full-length mock sequences; no padding.
 | [Qwen3 MoE 30B](https://github.com/NVIDIA-NeMo/Automodel/blob/4efe60c457798d92d891a3391e5e0455b72f18d1/examples/llm_benchmark/qwen/qwen3_moe_30b_te_bf16_gb200.yaml) | Mock, balanced routing | 8 | 512 | 16 | 16 | 4 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + HybridEP | 9.505 | 634.49 | 220,637 | 27,579.59 |
 
 - Full-length mock sequences; balanced MoE routing; 10 warmup and 20 measured steps.
-- TFLOPs derive from MFU and the 2,500 TFLOPs/s GB200 BF16 dense peak set in the recipe; the H100 BF16 rows use 989.
+- TFLOPs derive from MFU and the 2,500 TFLOPs/s GB200 dense BF16 peak; the H100 BF16 rows use 989.
 
 ### GPU: NVIDIA H100 80GB, Precision: FP8
 
@@ -101,7 +101,7 @@ TE current scaling; 10 warmup and 20 measured steps.
 | [GPT-OSS 120B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml) | Mock, balanced routing | 32 | 1280 | 8 | 8 | 5 | 4096 | 1 | 1 | 1 | 16 | - | 32 | TE MXFP8 + HybridEP | 7.840 | 681.95 | 668,735 | 20,897.96 |
 
 - TE MXFP8 block scaling; 10 warmup and 20 measured steps, except Qwen3 MoE 235B (two warmup and three measured steps).
-- FP8 and MXFP8 token rates count full sequences; TFLOPs derive from MFU and the configured peak.
+- FP8 and MXFP8 token rates count full sequences; TFLOPs derive from MFU and the 5,000 TFLOPs/s GB200 dense FP8 peak.
 
 ## Image Generation Performance
 
