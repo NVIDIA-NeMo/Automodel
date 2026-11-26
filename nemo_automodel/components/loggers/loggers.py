@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
 if TYPE_CHECKING:
+    from mlflow.entities import Run as MlflowRun
     from wandb.sdk.wandb_run import Run
 
     from nemo_automodel.components.loggers.comet_utils import CometLogger
@@ -345,7 +346,7 @@ class MLflowConfig:
     description: str | None = None
     flatten_depth: int | None = 1
 
-    def build(self, checkpoint_dir: str | None = None, run_config: Mapping[str, Any] | None = None) -> Any:
+    def build(self, checkpoint_dir: str | None = None, run_config: Mapping[str, Any] | None = None) -> MlflowRun | None:
         """Initialise MLflow on rank 0 and start (or resume) a run.
 
         Installs a ``sys.excepthook`` so crashed jobs report as FAILED rather
