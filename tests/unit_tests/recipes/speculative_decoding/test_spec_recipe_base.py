@@ -26,6 +26,7 @@ import yaml
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig
 from nemo_automodel.recipes.speculative_decoding import _spec_recipe_base
 from nemo_automodel.recipes.speculative_decoding._spec_recipe_base import SpecDecodeRecipeBase
 
@@ -325,70 +326,12 @@ def test_fp32_draft_with_torch_adam_does_not_warn(tmp_path, caplog):
     assert _torch_adam_warnings(caplog) == []
 
 
-def test_resolve_spec_defaults_to_adamw_when_no_target():
-    target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
-        ConfigNode({"lr": 6e-4, "warmup_ratio": 0.04, "min_lr_ratio": 0.1})
-    )
-    assert target is torch.optim.AdamW
-    assert kwargs == {"lr": 6e-4, "betas": (0.9, 0.95), "weight_decay": 0.0}
-
-
-def test_resolve_spec_respects_explicit_target_and_extra_kwargs():
-    pytest.importorskip("transformer_engine")
-    target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
-        ConfigNode(
-            {
-                "_target_": "transformer_engine.pytorch.optimizers.FusedAdam",
-                "lr": 1e-5,
-                "master_weights": True,
-                "master_weight_dtype": "torch.float32",
-                "exp_avg_dtype": "torch.float32",
-                "exp_avg_sq_dtype": "torch.float32",
-                "store_param_remainders": True,
-                "warmup_ratio": 0.04,
-            }
-        )
-    )
-    assert target.__name__ == "FusedAdam"
-    assert kwargs == {
-        "lr": 1e-5,
-        "master_weights": True,
-        "master_weight_dtype": "torch.float32",
-        "exp_avg_dtype": "torch.float32",
-        "exp_avg_sq_dtype": "torch.float32",
-        "store_param_remainders": True,
-    }
-
-
-def test_resolve_spec_preserves_explicit_betas_and_weight_decay_and_coerces_lr():
-    _target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
-        ConfigNode({"lr": "6e-4", "betas": [0.9, 0.999], "weight_decay": 0.01})
-    )
-    assert kwargs["lr"] == pytest.approx(6e-4) and isinstance(kwargs["lr"], float)
-    assert list(kwargs["betas"]) == [0.9, 0.999]
-    assert kwargs["weight_decay"] == 0.01
-
-
-def test_resolve_spec_does_not_force_adamw_defaults_onto_explicit_target():
-    target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
-        ConfigNode({"_target_": "torch.optim.SGD", "lr": 0.1, "momentum": 0.9})
-    )
-    assert target is torch.optim.SGD
-    assert kwargs == {"lr": 0.1, "momentum": 0.9}
-
-
-def test_resolve_spec_rejects_param_group_overrides():
-    with pytest.raises(ValueError, match="optimizer.param_group_overrides is not supported"):
-        SpecDecodeRecipeBase._resolve_optimizer_spec(
-            ConfigNode({"lr": 1.0e-3, "param_group_overrides": [{"pattern": "bias", "lr_mult": 0.0}]})
-        )
-
-
 def test_build_draft_optimizer_builds_sgd_for_an_explicit_target():
     obj = _Recipe.__new__(_Recipe)
     obj.trainer_module = torch.nn.Linear(4, 4)
     obj.dp_mesh = None
-    optimizer = obj._build_draft_optimizer(ConfigNode({"_target_": "torch.optim.SGD", "lr": 0.1, "momentum": 0.9}))
+    config = OptimizerFromFactoryConfig(factory=torch.optim.SGD, kwargs={"lr": 0.1, "momentum": 0.9})
+    optimizer = obj._build_draft_optimizer(config)
     assert isinstance(optimizer, torch.optim.SGD)
     assert optimizer.param_groups[0]["momentum"] == 0.9
 

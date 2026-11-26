@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -151,6 +151,63 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
             return model_config
         return model_config.get("pretrained_model_name_or_path", None)
     return None
+
+
+@dataclass(frozen=True)
+class DraftOptimizerSettings:
+    """Typed ``optimizer:`` block of the speculative-decoding recipes.
+
+    The draft recipes keep the LR-schedule keys in the same block as the optimizer, so the block is split
+    here: ``optimizer`` owns construction, and the schedule values go to the recipe's warmup + cosine
+    schedule.
+
+    Attributes:
+        optimizer: The optimizer config; build it with ``.build(model, device_mesh=...)``.
+        peak_lr: The block's ``lr``, the peak of the schedule.
+        warmup_ratio: Fraction of the optimizer steps used for LR warmup.
+        min_lr_ratio: Final LR as a fraction of ``peak_lr``.
+    """
+
+    optimizer: "OptimizerConfig"
+    peak_lr: float
+    warmup_ratio: float
+    min_lr_ratio: float
+
+    @classmethod
+    def from_config(cls, node: "ConfigNode") -> "DraftOptimizerSettings":
+        """Parse an ``optimizer:`` block without modifying it.
+
+        Without a ``_target_`` the optimizer is ``torch.optim.AdamW`` with ``betas=(0.9, 0.95)`` and
+        ``weight_decay=0.0`` unless the block sets them; with one, no AdamW defaults are added.
+
+        Raises:
+            ValueError: If the block sets ``param_group_overrides``; the warmup + cosine ``LambdaLR`` does not
+                apply its ``lr_mult`` / ``wd_mult``.
+        """
+        import torch
+
+        from nemo_automodel.components.optim.optimizer import build_optimizer_config
+
+        kwargs = _as_dict(node)
+        if "param_group_overrides" in kwargs:
+            raise ValueError(
+                "optimizer.param_group_overrides is not supported by the speculative-decoding recipes: "
+                "their warmup + cosine LambdaLR does not apply lr_mult / wd_mult."
+            )
+        target = kwargs.pop("_target_", None)
+        warmup_ratio = float(kwargs.pop("warmup_ratio", 0.05))
+        min_lr_ratio = float(kwargs.pop("min_lr_ratio", 0.1))
+        kwargs["lr"] = float(kwargs["lr"])
+        if target is None:
+            target = torch.optim.AdamW
+            kwargs.setdefault("betas", (0.9, 0.95))
+            kwargs.setdefault("weight_decay", 0.0)
+        return cls(
+            optimizer=build_optimizer_config(target, kwargs),
+            peak_lr=kwargs["lr"],
+            warmup_ratio=warmup_ratio,
+            min_lr_ratio=min_lr_ratio,
+        )
 
 
 class RecipeConfig:

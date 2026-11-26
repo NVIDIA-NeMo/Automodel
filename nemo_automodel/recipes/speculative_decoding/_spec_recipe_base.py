@@ -28,7 +28,7 @@ import logging
 import os
 import pathlib
 from types import SimpleNamespace
-from typing import Callable, ClassVar, TypeAlias
+from typing import ClassVar
 
 import torch
 import torch.distributed as dist
@@ -42,9 +42,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
-from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
-from nemo_automodel.components.optim.optimizer import OptimizerConfig, build_optimizer_config
+from nemo_automodel.components.optim.optimizer import OptimizerConfig
+from nemo_automodel.recipes._typed_config import DraftOptimizerSettings
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     make_warmup_cosine_schedule,
@@ -54,11 +54,6 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Values an ``optimizer:`` block can carry into the optimizer constructor (floats such as ``lr`` / ``eps``,
-# ints, bools such as ``master_weights``, dtype strings, ``betas`` sequences, or an explicit null).
-OptimizerKwarg: TypeAlias = float | int | bool | str | list[float] | tuple[float, ...] | None
-OptimizerTarget: TypeAlias = type[OptimizerConfig] | Callable[..., torch.optim.Optimizer]
 
 
 def _step_cadence_hit(every: int | None, step: int) -> bool:
@@ -84,62 +79,12 @@ class SpecDecodeRecipeBase(BaseRecipe):
     # Floor on the ratio-derived LR warmup length (see ``resolve_warmup_steps``).
     min_warmup_steps: ClassVar[int] = 1
 
-    @staticmethod
-    def _resolve_optimizer_spec(opt_cfg: ConfigNode) -> tuple[OptimizerTarget, dict[str, OptimizerKwarg]]:
-        """Normalize the recipe's ``optimizer:`` config into a ``build_optimizer_config`` spec.
+    def _build_draft_optimizer(self, config: OptimizerConfig) -> torch.optim.Optimizer:
+        """Build the draft optimizer from its typed config.
 
-        Reads an optional ``_target_`` (a dotted import path such as
-        ``transformer_engine.pytorch.optimizers.FusedAdam``, which ``ConfigNode`` has
-        already resolved to the class or callable) plus whatever other fields the config
-        carries -- ``lr``/``betas``/``weight_decay`` and any optimizer-specific kwargs
-        (``eps``, ``master_weights``, ``master_weight_dtype``, ``exp_avg_dtype``,
-        ``exp_avg_sq_dtype``, ``store_param_remainders``, ...) -- and returns the
-        ``(target, kwargs)`` pair that ``build_optimizer_config`` normalizes into an
-        ``OptimizerConfig``. ``warmup_ratio`` and ``min_lr_ratio`` belong to the LR
-        schedule and are dropped.
-
-        Absent an explicit ``_target_``, this defaults to plain ``torch.optim.AdamW``
-        with ``betas=(0.9, 0.95)`` and ``weight_decay=0.0`` unless the config sets them
-        (the previous hard-coded behavior, so configs that do not select an optimizer
-        are unaffected). Those two AdamW-shaped defaults are only injected in that
-        no-``_target_`` case: forcing them onto an arbitrary explicit ``_target_`` would
-        break optimizers that do not accept a ``betas`` kwarg (e.g. plain SGD).
-
-        Args:
-            opt_cfg: The ``optimizer:`` config node.
-
-        Returns:
-            The ``(target, kwargs)`` pair for ``build_optimizer_config``.
-
-        Raises:
-            ValueError: If ``param_group_overrides`` is set; the warmup + cosine
-                ``LambdaLR`` does not apply its ``lr_mult`` / ``wd_mult``.
+        The build warns when a torch Adam is paired with BF16-stored trainable parameters.
         """
-        kwargs = dict(opt_cfg.to_dict())
-        if "param_group_overrides" in kwargs:
-            raise ValueError(
-                "optimizer.param_group_overrides is not supported by the speculative-decoding recipes: "
-                "their warmup + cosine LambdaLR does not apply lr_mult / wd_mult."
-            )
-        target = kwargs.pop("_target_", None)
-        kwargs.pop("warmup_ratio", None)
-        kwargs.pop("min_lr_ratio", None)
-        kwargs["lr"] = float(kwargs["lr"])
-        if target is None:
-            target = torch.optim.AdamW
-            kwargs.setdefault("betas", (0.9, 0.95))
-            kwargs.setdefault("weight_decay", 0.0)
-        return target, kwargs
-
-    def _build_draft_optimizer(self, opt_cfg: ConfigNode) -> torch.optim.Optimizer:
-        """Build the draft optimizer through ``build_optimizer_config`` from the ``optimizer:`` config.
-
-        ``_target_`` and the optimizer-specific keys take effect (see
-        :meth:`_resolve_optimizer_spec`), and the build warns when a torch
-        Adam is paired with BF16-stored trainable parameters, LoRA adapters included.
-        """
-        target, kwargs = self._resolve_optimizer_spec(opt_cfg)
-        return build_optimizer_config(target, kwargs).build(self.trainer_module, device_mesh=self.dp_mesh)[0]
+        return config.build(self.trainer_module, device_mesh=self.dp_mesh)[0]
 
     def _setup_training_state(self, recipe_cfg) -> None:
         """Build the optimizer and LR schedule, read the loop / checkpoint cadence knobs,
@@ -156,9 +101,9 @@ class SpecDecodeRecipeBase(BaseRecipe):
         Args:
             recipe_cfg: The ``recipe_args`` config node.
         """
-        opt_cfg = self.cfg.optimizer
-        self.peak_lr = float(opt_cfg.lr)
-        self.optimizer = self._build_draft_optimizer(opt_cfg)
+        settings = DraftOptimizerSettings.from_config(self.cfg.optimizer)
+        self.peak_lr = settings.peak_lr
+        self.optimizer = self._build_draft_optimizer(settings.optimizer)
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs
@@ -178,10 +123,8 @@ class SpecDecodeRecipeBase(BaseRecipe):
         self.total_optim_steps = max(
             1, self.num_epochs * optim_steps_per_epoch(self.num_batches_per_epoch, self.grad_accumulation_steps)
         )
-        self.warmup_steps = resolve_warmup_steps(
-            float(opt_cfg.get("warmup_ratio", 0.05)), self.total_optim_steps, self.min_warmup_steps
-        )
-        self.min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
+        self.warmup_steps = resolve_warmup_steps(settings.warmup_ratio, self.total_optim_steps, self.min_warmup_steps)
+        self.min_lr_ratio = settings.min_lr_ratio
         # Warmup + cosine: drafts trained from scratch diverge under a flat LR
         # once AdamW's second-moment estimates have settled.
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
