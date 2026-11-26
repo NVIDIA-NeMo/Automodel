@@ -24,7 +24,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     unwrap_checkpoint_wrapper,
 )
 from nemo_automodel.components.moe.parallelizer import apply_ac
-from nemo_automodel.components.utils.model_utils import FreezeConfig
+from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector
 from tests.unit_tests.models.ernie5_5.test_lora import _install_lora, _recipe_targets
 from tests.unit_tests.models.ernie5_5.test_mtp_training_local import OWNED_PARAMETERS, batch, model
 
@@ -142,6 +142,7 @@ def test_training_forward_rejects_a_frozen_mtp_parameter_and_accepts_the_full_mo
 
 
 def test_training_forward_rejects_lora_adapters() -> None:
+    """LoRA alone freezes the MTP tensors, so the frozen-parameter message is raised first."""
     candidate = model()
     _install_lora(candidate, PeftConfig(target_modules=_recipe_targets(), dim=2, alpha=4))
     trainable = {name for name, parameter in candidate.named_parameters() if parameter.requires_grad}
@@ -152,8 +153,53 @@ def test_training_forward_rejects_lora_adapters() -> None:
     assert all(repr(name) in str(caught.value) for name in frozen)
 
 
+def test_training_forward_rejects_lora_adapters_with_trainable_mtp_tensors() -> None:
+    """LoRA is rejected as such, also when a freeze configuration unfreezes the eight MTP tensors."""
+    candidate = model()
+    _install_lora(candidate, PeftConfig(target_modules=_recipe_targets(), dim=2, alpha=4))
+    _apply_trainability_policy(
+        candidate,
+        peft_enabled=True,
+        freeze_config=FreezeConfig(unfreeze_modules=[ModuleSelector(path="mtp")]),
+        strict=True,
+    )
+    trainable = {name for name, parameter in candidate.named_parameters() if parameter.requires_grad}
+    assert OWNED_PARAMETERS <= trainable
+    adapters = [name for name in trainable if "lora_" in name]
+    assert adapters and trainable == OWNED_PARAMETERS | set(adapters)
+    tokens, _ = batch()
+    message = (
+        r"full-parameter training only: LoRA \(peft\) is not supported with Ernie5_5MTPForCausalLM; "
+        rf"found {len(adapters)} adapter tensors, first: \S*lora_"
+    )
+    with pytest.raises(ValueError, match=message):
+        candidate(tokens)
+    # Evaluation computes the main logits only and is not restricted.
+    assert candidate.eval()(tokens).mtp_per_depth_logits is None
+
+
+def test_training_forward_accepts_a_frozen_decoder_with_trainable_mtp_tensors() -> None:
+    """Without adapters, freezing everything except the MTP tensors is not rejected."""
+    candidate = model()
+    _apply_trainability_policy(
+        candidate,
+        peft_enabled=False,
+        freeze_config=FreezeConfig(
+            freeze_modules=[ModuleSelector(glob="*")], unfreeze_modules=[ModuleSelector(glob="*mtp*")]
+        ),
+        strict=True,
+    )
+    assert {name for name, parameter in candidate.named_parameters() if parameter.requires_grad} == OWNED_PARAMETERS
+    output = candidate(batch()[0])
+    assert output.mtp_per_depth_logits[0].shape == (1, 8, 32)
+
+
 def test_trainable_mtp_guard_leaves_logits_and_gradients_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With the check disabled, the same model gives bit-identical outputs and gradients."""
+    """With the check disabled, the same model gives bit-identical outputs and gradients.
+
+    Disabling the method removes both of its conditions, the frozen-parameter
+    check and the adapter-name scan.
+    """
     guarded, unguarded = model(), model()
     unguarded.load_state_dict(guarded.state_dict())
     tokens, _ = batch()

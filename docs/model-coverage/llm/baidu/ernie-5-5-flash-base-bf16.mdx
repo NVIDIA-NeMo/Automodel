@@ -349,9 +349,13 @@ Context, pipeline, and tensor parallelism are rejected during parallelization.
 LoRA and routing replay are unsupported for this MTP variant. The first
 training forward rejects any configuration that freezes an MTP-owned
 parameter, including the default LoRA configuration, which freezes every base
-parameter. This check is not a general detector for PEFT or decoder-only
-freezing. Activation checkpointing can cover the other decoder blocks; the
-shared last block is excluded because it is entered twice per forward.
+parameter. It also rejects any model that carries LoRA adapter tensors, also
+when a `freeze_config` unfreezes the MTP tensors next to the adapters. Adapter
+tensors are recognized by `lora_` in the parameter name, which holds for the
+LoRA and DoRA adapters that NeMo AutoModel installs. The check does not detect
+frozen decoder parameters without adapters. Activation checkpointing can cover
+the other decoder blocks; the shared last block is excluded because it is
+entered twice per forward.
 With multiple micro-batches, reused parameters can also undergo multiple
 gradient reductions, adding synchronization and BF16 rounding relative to
 one invocation. The DSA indexers and both decoder and MTP router correction

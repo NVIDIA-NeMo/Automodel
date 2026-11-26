@@ -167,7 +167,8 @@ class Ernie5_5MTPForCausalLM(Ernie5_5_MoeForCausalLM):
     auxiliary CE sums by the same global main-token count, preserving the
     configured auxiliary coefficient per token. Packed inputs, CP, PP, LoRA
     and KV caching are unsupported. Training is rejected if an MTP-owned
-    parameter is frozen (including the default LoRA configuration).
+    parameter is frozen (including the default LoRA configuration) or the
+    model carries LoRA adapter tensors.
     """
 
     _keep_in_fp32_modules_strict = [
@@ -249,7 +250,8 @@ class Ernie5_5MTPForCausalLM(Ernie5_5_MoeForCausalLM):
 
         Raises:
             ValueError: If KV caching, CP, padded or multi-document inputs are requested, or the model is in
-                training mode and a DSA indexer parameter requires gradients or an MTP-owned parameter does not.
+                training mode and a DSA indexer parameter requires gradients, an MTP-owned parameter does not,
+                or the model carries LoRA adapter tensors.
             TypeError: If packing metadata such as seq_lens or packed_seq_ids is supplied.
         """
         if use_cache or self.cp_mesh is not None:
@@ -271,20 +273,30 @@ class Ernie5_5MTPForCausalLM(Ernie5_5_MoeForCausalLM):
         )
 
     def _require_trainable_mtp(self) -> None:
-        """Reject training while an MTP-owned parameter is frozen.
+        """Reject training while an MTP-owned parameter is frozen or the model carries LoRA adapters.
 
         Training is rejected if an MTP-owned parameter is frozen (including the default LoRA configuration,
-        which freezes every base parameter). This is not a general detector for PEFT or for frozen decoder
-        parameters. Only ``requires_grad`` is read; no tensor value is touched.
+        which freezes every base parameter), and if any parameter name of the model contains ``lora_``, the
+        test the framework's trainability policy uses for adapter tensors. The second condition also covers
+        LoRA combined with a freeze configuration that unfreezes the MTP tensors. Frozen decoder parameters
+        without adapters are not detected. Only ``requires_grad`` and parameter names are read; no tensor
+        value is touched.
 
         Raises:
-            ValueError: If a parameter registered under ``mtp`` does not require gradients.
+            ValueError: If a parameter registered under ``mtp`` does not require gradients, or a parameter
+                name of the model contains ``lora_``.
         """
         frozen = [f"mtp.{name}" for name, parameter in self.mtp.named_parameters() if not parameter.requires_grad]
         if frozen:
             raise ValueError(
                 "ERNIE 5.5 MTP supports full-parameter training only: LoRA (peft) and a freeze_config that "
                 f"freezes the MTP tensors are not supported with Ernie5_5MTPForCausalLM; frozen: {frozen}"
+            )
+        adapters = [name for name, _ in self.named_parameters() if "lora_" in name]
+        if adapters:
+            raise ValueError(
+                "ERNIE 5.5 MTP supports full-parameter training only: LoRA (peft) is not supported with "
+                f"Ernie5_5MTPForCausalLM; found {len(adapters)} adapter tensors, first: {adapters[0]}"
             )
 
     def _forward_mtp(
