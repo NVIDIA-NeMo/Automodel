@@ -240,6 +240,71 @@ def dequantize_checkpoint_weight(
     return output
 
 
+def engram_checkpoint_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    """Expose logical checkpoint rows without gathering owner storage.
+
+    Args:
+        tensor: Table of global shape [padded_rows, channels], either a
+            complete local tensor or a DTensor with placement Shard(0) on
+            a one-dimensional owner mesh. Each owner stores equal rows.
+        rows: Logical checkpoint row count of the table.
+
+    Returns:
+        Aliasing view of shape [rows, channels]. A DTensor preserves its
+        mesh and row placement; its final local shards may be short or empty.
+    """
+    if not is_dtensor(tensor):
+        if tensor.shape[0] < rows:
+            raise ValueError("Owner-local Engram storage must be represented as a global row-sharded DTensor")
+        return tensor[:rows]
+    if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
+        raise ValueError("Engram checkpoint tables require Shard(0) on a one-dimensional owner mesh")
+    local = tensor.to_local()
+    start = tensor.device_mesh.get_local_rank() * math.ceil(tensor.shape[0] / tensor.device_mesh.size())
+    valid_rows = max(0, min(local.shape[0], rows - start))
+    channels = tensor.shape[1]
+    return DTensor.from_local(
+        local[:valid_rows],
+        tensor.device_mesh,
+        tensor.placements,
+        shape=torch.Size((rows, channels)),
+        stride=(channels, 1),
+    )
+
+
+def restore_engram_padding(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    """Restore equal owner storage after reading logical checkpoint rows.
+
+    Args:
+        tensor: Table of global shape [rows, channels], optionally a DTensor
+            with placement Shard(0) on a one-dimensional owner mesh and
+            uneven local shape [local_rows, channels].
+        rows: Logical checkpoint row count of the table.
+
+    Returns:
+        Tensor unchanged for a local table. Distributed tables have global
+        shape [ceil(rows / owners) * owners, channels] and equal local row
+        counts. Unpadded shards alias input storage; added rows are zero.
+    """
+    if not is_dtensor(tensor):
+        return tensor
+    if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
+        raise ValueError("Engram checkpoint tables require Shard(0) on a one-dimensional owner mesh")
+    owners = tensor.device_mesh.size()
+    local_rows = math.ceil(rows / owners)
+    local = tensor.to_local()
+    if local.shape[0] < local_rows:
+        local = torch.nn.functional.pad(local, (0, 0, 0, local_rows - local.shape[0]))
+    channels = tensor.shape[1]
+    return DTensor.from_local(
+        local,
+        tensor.device_mesh,
+        tensor.placements,
+        shape=torch.Size((local_rows * owners, channels)),
+        stride=(channels, 1),
+    )
+
+
 class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Convert released V4.1 checkpoint layouts for DCP loading and export.
 
@@ -367,68 +432,12 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         return self._from_hf_w_merged_experts(converted, device_mesh)
 
     def _engram_checkpoint_tensor(self, tensor: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """Expose logical checkpoint rows without gathering owner storage.
-
-        Args:
-            tensor: Table of global shape [padded_rows, channels], either a
-                complete local tensor or a DTensor with placement Shard(0) on
-                a one-dimensional owner mesh. Each owner stores equal rows.
-            layer_id: Decoder layer identifying the logical checkpoint row count.
-
-        Returns:
-            Aliasing view of shape [rows, channels]. A DTensor preserves its
-            mesh and row placement; its final local shards may be short or empty.
-        """
-        rows = self._engram_rows[layer_id]
-        if not is_dtensor(tensor):
-            if tensor.shape[0] < rows:
-                raise ValueError("Owner-local Engram storage must be represented as a global row-sharded DTensor")
-            return tensor[:rows]
-        if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
-            raise ValueError("Engram checkpoint tables require Shard(0) on a one-dimensional owner mesh")
-        local = tensor.to_local()
-        start = tensor.device_mesh.get_local_rank() * math.ceil(tensor.shape[0] / tensor.device_mesh.size())
-        valid_rows = max(0, min(local.shape[0], rows - start))
-        channels = tensor.shape[1]
-        return DTensor.from_local(
-            local[:valid_rows],
-            tensor.device_mesh,
-            tensor.placements,
-            shape=torch.Size((rows, channels)),
-            stride=(channels, 1),
-        )
+        """Apply :func:`engram_checkpoint_rows` with the logical row count of decoder layer ``layer_id``."""
+        return engram_checkpoint_rows(tensor, self._engram_rows[layer_id])
 
     def _restore_engram_padding(self, tensor: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """Restore equal owner storage after reading logical checkpoint rows.
-
-        Args:
-            tensor: Table of global shape [rows, channels], optionally a DTensor
-                with placement Shard(0) on a one-dimensional owner mesh and
-                uneven local shape [local_rows, channels].
-            layer_id: Decoder layer identifying the logical checkpoint row count.
-
-        Returns:
-            Tensor unchanged for a local table. Distributed tables have global
-            shape [ceil(rows / owners) * owners, channels] and equal local row
-            counts. Unpadded shards alias input storage; added rows are zero.
-        """
-        if not is_dtensor(tensor):
-            return tensor
-        if tensor.device_mesh.ndim != 1 or tensor.placements != (Shard(0),):
-            raise ValueError("Engram checkpoint tables require Shard(0) on a one-dimensional owner mesh")
-        owners = tensor.device_mesh.size()
-        local_rows = math.ceil(self._engram_rows[layer_id] / owners)
-        local = tensor.to_local()
-        if local.shape[0] < local_rows:
-            local = torch.nn.functional.pad(local, (0, 0, 0, local_rows - local.shape[0]))
-        channels = tensor.shape[1]
-        return DTensor.from_local(
-            local,
-            tensor.device_mesh,
-            tensor.placements,
-            shape=torch.Size((local_rows * owners, channels)),
-            stride=(channels, 1),
-        )
+        """Apply :func:`restore_engram_padding` with the logical row count of decoder layer ``layer_id``."""
+        return restore_engram_padding(tensor, self._engram_rows[layer_id])
 
     def _dequantize(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Dequantize paired weights and require scales for retained packed tensors.
