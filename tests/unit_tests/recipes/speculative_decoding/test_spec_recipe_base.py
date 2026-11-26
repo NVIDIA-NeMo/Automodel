@@ -227,7 +227,7 @@ def test_file_form_target_builds(tmp_path, monkeypatch):
     assert isinstance(obj.optimizer, torch.optim.AdamW)
 
 
-def test_peft_draft_does_not_warn_about_bf16_torch_adam(tmp_path, caplog):
+def test_peft_draft_with_bf16_torch_adam_still_warns(tmp_path, caplog):
     from nemo_automodel.components.optim import precision_warnings
 
     precision_warnings._WARNED_CONTEXTS.discard("optim")
@@ -237,7 +237,7 @@ def test_peft_draft_does_not_warn_about_bf16_torch_adam(tmp_path, caplog):
     obj.peft_config = SimpleNamespace()
     with caplog.at_level(logging.WARNING):
         obj._setup_training_state(recipe_cfg)
-    assert _torch_adam_warnings(caplog) == []
+    assert len(_torch_adam_warnings(caplog)) == 1
     precision_warnings._WARNED_CONTEXTS.discard("optim")
 
 
@@ -334,6 +334,7 @@ def test_resolve_spec_defaults_to_adamw_when_no_target():
 
 
 def test_resolve_spec_respects_explicit_target_and_extra_kwargs():
+    pytest.importorskip("transformer_engine")
     target, kwargs = SpecDecodeRecipeBase._resolve_optimizer_spec(
         ConfigNode(
             {

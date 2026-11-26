@@ -136,13 +136,10 @@ class SpecDecodeRecipeBase(BaseRecipe):
 
         ``_target_`` and the optimizer-specific keys take effect (see
         :meth:`_resolve_optimizer_spec`), and the build warns when a torch
-        Adam is paired with BF16-stored trainable parameters (LoRA drafts are exempt).
+        Adam is paired with BF16-stored trainable parameters, LoRA adapters included.
         """
         target, kwargs = self._resolve_optimizer_spec(opt_cfg)
-        is_peft = getattr(self, "peft_config", None) is not None
-        return build_optimizer_config(target, kwargs).build(
-            self.trainer_module, device_mesh=self.dp_mesh, is_peft=is_peft
-        )[0]
+        return build_optimizer_config(target, kwargs).build(self.trainer_module, device_mesh=self.dp_mesh)[0]
 
     def _setup_training_state(self, recipe_cfg) -> None:
         """Build the optimizer and LR schedule, read the loop / checkpoint cadence knobs,
