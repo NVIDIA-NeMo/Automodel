@@ -148,9 +148,6 @@ clip_grad_norm:
   backend: te  # avoids gradient-sized temporaries for the Engram owner shards
   max_norm: 1.0
 
-mfu:
-  peak_tflops: 989
-
 wandb:
   enable: false
   entity: Nemo-automodel
