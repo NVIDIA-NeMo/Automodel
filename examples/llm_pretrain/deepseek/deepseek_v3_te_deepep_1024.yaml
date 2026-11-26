@@ -50,6 +50,7 @@ distributed:
   activation_checkpointing: true
   pipeline:
     pp_schedule: interleaved1f1b
+    pp_p2p_per_edge: true  # one NCCL communicator per directed stage edge (PyTorch 2.15)
     pp_microbatch_size: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
