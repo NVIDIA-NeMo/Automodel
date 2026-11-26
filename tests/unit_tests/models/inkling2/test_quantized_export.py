@@ -229,6 +229,11 @@ def write_released(folder: Path, checkpoint: dict[str, torch.Tensor]) -> Path:
     write_checkpoint(checkpoint, folder)
     write_released_checkpoint_metadata(folder, nvfp4_layers=[0], mxfp8_layers=[1])
     (folder / "tokenizer_config.json").write_text(json.dumps({"model_max_length": 64}))
+    # Inkling releases ship tiktoken/tokenizer.model; hidden entries like .cache/ are not part of the release.
+    (folder / "tiktoken").mkdir()
+    (folder / "tiktoken/tokenizer.model").write_bytes(b"tiktoken ranks")
+    (folder / "tiktoken/.lock").write_bytes(b"")
+    (folder / ".cache").mkdir()
     return folder
 
 
@@ -289,8 +294,11 @@ def test_unchanged_training_save_exports_the_released_bytes(tmp_path: Path, dtyp
     assert set(exported) == set(checkpoint)
     for key, value in checkpoint.items():
         assert_same_bytes(exported[key], value, key)
-    for name in ("config.json", "hf_quant_config.json", "model.safetensors.index.json", "tokenizer_config.json"):
+    names = ["config.json", "hf_quant_config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+    for name in [*names, "tiktoken/tokenizer.model"]:
         assert (out / name).read_bytes() == (released / name).read_bytes(), name
+    assert sorted(p.name for p in out.iterdir()) == sorted([*names, "model.safetensors", "tiktoken"])
+    assert [p.name for p in (out / "tiktoken").iterdir()] == ["tokenizer.model"]
     assert sorted(p.name for p in tmp_path.iterdir()) == ["exported", "released", "saved"]
 
 

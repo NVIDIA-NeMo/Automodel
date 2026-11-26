@@ -263,14 +263,14 @@ uv run python -m nemo_automodel.components.models.inkling2.quantized_export \
 ```
 
 The output has the released tensor names, dtypes, shapes, and shards. The
-`config.json`, `hf_quant_config.json`, `mtp.safetensors`, tokenizer, and other
-top-level files are copied from the release. Experts that training left
-unchanged keep their released bytes. Changed experts are quantized again with
-round-to-nearest, the rule the release declares, and the other tensors are cast
-to their released dtype. A text-only save takes the vision tower from the
-release. The export reads one tensor at a time and holds one output shard in
-memory. Use it for serving only, and resume training from the floating-point
-checkpoint.
+`config.json`, `hf_quant_config.json`, `mtp.safetensors`, tokenizer files
+(`tiktoken/` included), and other files are copied from the release. Experts
+that training left unchanged keep their released bytes. Changed experts are
+quantized again with round-to-nearest, the rule the release declares, and the
+other tensors are cast to their released dtype. A text-only save takes the
+vision tower from the release. The export reads one tensor at a time and holds
+one output shard in memory. Use it for serving only, and resume training from
+the floating-point checkpoint.
 
 ## Packed Context Parallelism
 

@@ -17,7 +17,7 @@
 Training saves Inkling2 with floating-point experts (for example ``<step>/model/consolidated``). Serving
 runtimes that read the released ``hf_quant_config.json`` load NVFP4 or MXFP8 experts only. This module rewrites
 such a floating export with the released tensor names, dtypes, shapes and shards, packed NVFP4/MXFP8 experts,
-and the released ``config.json``, ``hf_quant_config.json`` and other top-level files::
+and the released ``config.json``, ``hf_quant_config.json`` and other files, such as ``tiktoken/``::
 
     python -m nemo_automodel.components.models.inkling2.quantized_export \\
         --released /path/to/Inkling-2-Mini \\
@@ -238,8 +238,13 @@ def export_quantized(*, released: str | Path, trained: str | Path, out: str | Pa
                 save_file(tensors, str(partial / shard), metadata=shard_metadata)
                 logger.info("Wrote %s (%d tensors)", shard, len(tensors))
         # Names, dtypes and shapes match the release, so its index and metadata files describe the export as is.
+        # Subdirectories such as ``tiktoken/`` are copied too; symlinks (a Hub cache snapshot) are followed.
         for path in sorted(released.iterdir()):
-            if path.is_file() and path.name not in shards and not path.name.startswith("."):
+            if path.name in shards or path.name.startswith("."):
+                continue
+            if path.is_dir():
+                shutil.copytree(path, partial / path.name, ignore=shutil.ignore_patterns(".*"))
+            elif path.is_file():
                 shutil.copyfile(path, partial / path.name)
         partial.rename(out)
     except BaseException:
