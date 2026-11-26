@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.fsdp import fully_shard
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
@@ -72,6 +76,16 @@ def _backend():
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=True,
     )
+
+
+@pytest.fixture
+def cpu_mesh() -> Iterator[DeviceMesh]:
+    """One-rank CPU mesh: ``fully_shard`` on it makes a module a real FSDP unit inside this process."""
+    dist.init_process_group("gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        yield init_device_mesh("cpu", (1,))
+    finally:
+        dist.destroy_process_group()
 
 
 class TestQwen3_5MoeMTP:
@@ -155,24 +169,29 @@ class TestQwen3_5MoeMTP:
         assert len(out.mtp_per_depth_h) == 1
         assert out.mtp_per_depth_h[0].shape == (1, 4, cfg.text_config.hidden_size)
 
-    @pytest.mark.parametrize("vision_tower_trainable", [True, False], ids=["trainable_tower", "frozen_tower"])
-    def test_mtp_training_enters_modules_in_one_order_for_text_and_media(self, vision_tower_trainable):
+    @pytest.mark.parametrize("tower", ["fsdp_unit_trainable_tower", "plain_trainable_tower", "frozen_tower"])
+    def test_mtp_training_enters_modules_in_one_order_for_text_and_media(self, tower, cpu_mesh):
         """Text-only and media batches call ``embed_tokens`` once and enter the wrapped modules in one order.
 
         FSDP2 gathers a module's parameters when it is entered and prefetches in backward by forward call
-        order, so ranks that enter these modules in different orders issue different collectives.
+        order, so ranks that enter these modules in different orders issue different collectives. A text-only
+        batch enters the vision tower only when the tower is a trainable FSDP unit.
         """
         cfg = _tiny_vl_config(mtp_num_hidden_layers=1)
         cfg.image_token_id, cfg.video_token_id = 5, 6
         cfg.vision_start_token_id, cfg.vision_end_token_id = 7, 8
         model = Qwen3_5MoeForConditionalGeneration(cfg, backend=_backend())
         model.initialize_weights()
-        if not vision_tower_trainable:
-            # With a frozen tower only the MTP half of the forward condition sends text-only batches through it.
+        if tower == "frozen_tower":
             model.model.visual.requires_grad_(False)
+        elif tower == "fsdp_unit_trainable_tower":
+            fully_shard(model.model.visual, mesh=cpu_mesh)
+        # Unless the tower is a trainable FSDP unit, only the MTP half of the forward condition embeds
+        # text-only batches before the language model.
         model.train()
         language_model = model.model.language_model
 
+        visual_entries: list[str] = []
         calls: list[str] = []
         watched = {
             "embed_tokens": language_model.embed_tokens,
@@ -184,9 +203,13 @@ class TestQwen3_5MoeMTP:
             module.register_forward_pre_hook(lambda _module, _args, name=name: calls.append(name))
             for name, module in watched.items()
         ]
+        handles.append(
+            model.model.visual.register_forward_pre_hook(lambda _module, _args: visual_entries.append("visual"))
+        )
         try:
             model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]))
             text_calls = list(calls)
+            text_visual_entries = len(visual_entries)
             calls.clear()
 
             # Four image placeholders for one 2x2-patch image; pixel_values has shape [patches, patch_features].
@@ -202,6 +225,7 @@ class TestQwen3_5MoeMTP:
 
         assert text_calls == ["embed_tokens", "language_model", "lm_head", "mtp"]
         assert media_calls == text_calls
+        assert text_visual_entries == (1 if tower == "fsdp_unit_trainable_tower" else 0)
 
     def test_text_only_mtp_matches_the_token_id_reference(self):
         """Rolling the backbone embeddings gives MTP the inputs that re-embedding rolled token IDs would.
@@ -270,13 +294,16 @@ class TestQwen3_5MoeTextOnlyVisionTower:
     @pytest.mark.parametrize(
         ("mtp_num_hidden_layers", "training"), [(0, True), (1, True), (1, False)], ids=["no-mtp", "mtp", "mtp-eval"]
     )
-    def test_trainable_tower_is_entered_in_one_order_for_text_and_media(self, mtp_num_hidden_layers, training):
-        """With a trainable vision tower, text-only and media batches enter the wrapped modules in one order.
+    def test_trainable_tower_is_entered_in_one_order_for_text_and_media(
+        self, mtp_num_hidden_layers, training, cpu_mesh
+    ):
+        """With a trainable vision tower under FSDP, text-only and media batches enter the wrapped modules in one order.
 
         A trainable tower is its own FSDP unit, so a rank that skipped it would skip its collectives.
         """
         model = Qwen3_5MoeForConditionalGeneration(_media_config(mtp_num_hidden_layers), backend=_backend())
         model.initialize_weights()
+        fully_shard(model.model.visual, mesh=cpu_mesh)
         model.train(training)
         calls, handles = _record_module_entries(model)
         try:
@@ -314,7 +341,27 @@ class TestQwen3_5MoeTextOnlyVisionTower:
 
         assert calls == ["embed_tokens", "language_model", "lm_head"]
 
-    def test_text_only_step_gives_the_tower_zero_gradients_and_unchanged_logits(self):
+    @pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+    def test_trainable_tower_outside_fsdp_is_not_entered_for_text(self, training):
+        """Without FSDP nothing is a separate unit, so a text-only batch leaves a trainable tower alone."""
+        model = Qwen3_5MoeForConditionalGeneration(_media_config(0), backend=_backend())
+        model.initialize_weights()
+        model.train(training)
+        assert all(param.requires_grad for param in model.model.visual.parameters())
+        calls, handles = _record_module_entries(model)
+        try:
+            with torch.set_grad_enabled(training):
+                logits = model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]])).logits
+                if training:
+                    logits.float().square().mean().backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert calls == ["embed_tokens", "language_model", "lm_head"]
+        assert all(param.grad is None for param in model.model.visual.parameters())
+
+    def test_text_only_step_gives_the_tower_zero_gradients_and_unchanged_logits(self, cpu_mesh):
         """Entering the trainable tower changes neither the logits nor the language-model gradients."""
         input_ids = torch.randint(1, 64, (2, 8), generator=torch.Generator().manual_seed(0))
 
@@ -323,6 +370,8 @@ class TestQwen3_5MoeTextOnlyVisionTower:
             model = Qwen3_5MoeForConditionalGeneration(_media_config(0), backend=_backend())
             model.initialize_weights()
             model.model.visual.requires_grad_(tower_trainable)
+            if tower_trainable:
+                fully_shard(model.model.visual, mesh=cpu_mesh)
             model.train()
             logits = model(input_ids=input_ids).logits
             logits.float().square().mean().backward()
@@ -372,9 +421,15 @@ class TestQwen3_5MoeTextOnlyVisionTower:
 
         assert [output.dtype for output in outputs] == [logits_dtype or torch.bfloat16]
 
-    @pytest.mark.parametrize("vision_tower_trainable", [True, False], ids=["trainable_tower", "frozen_tower"])
-    def test_text_only_splice_enters_vision_tower_only_when_trainable(self, vision_tower_trainable):
-        """A text-only ``_embed_and_splice_for_cp`` enters a trainable vision tower once and keeps the embeddings."""
+    @pytest.mark.parametrize(
+        ("fsdp_unit", "vision_tower_trainable"),
+        [(True, True), (False, True), (True, False), (False, False)],
+        ids=["fsdp_unit_trainable_tower", "plain_trainable_tower", "fsdp_unit_frozen_tower", "plain_frozen_tower"],
+    )
+    def test_text_only_splice_enters_vision_tower_only_as_a_trainable_fsdp_unit(
+        self, fsdp_unit, vision_tower_trainable, cpu_mesh
+    ):
+        """A text-only ``_embed_and_splice_for_cp`` enters a trainable FSDP-unit tower once and keeps the embeddings."""
         cfg = _tiny_vl_config()
         cfg.image_token_id, cfg.video_token_id = 5, 6
         cfg.vision_start_token_id, cfg.vision_end_token_id = 7, 8
@@ -382,6 +437,8 @@ class TestQwen3_5MoeTextOnlyVisionTower:
         model.initialize_weights()
         if not vision_tower_trainable:
             model.model.visual.requires_grad_(False)
+        if fsdp_unit:
+            fully_shard(model.model.visual, mesh=cpu_mesh)
         model.train()
         input_ids = torch.tensor([[10, 11, 12, 13]])
 
@@ -398,9 +455,10 @@ class TestQwen3_5MoeTextOnlyVisionTower:
         finally:
             handle.remove()
 
-        assert len(visual_entries) == (1 if vision_tower_trainable else 0)
+        assert len(visual_entries) == (1 if fsdp_unit and vision_tower_trainable else 0)
         expected = model.model.language_model.embed_tokens(input_ids)
         torch.testing.assert_close(embeds, expected)
+
 
 _ON_CPU_AND_CUDA = pytest.mark.parametrize(
     "device",

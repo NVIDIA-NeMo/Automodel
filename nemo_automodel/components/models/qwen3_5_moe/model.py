@@ -22,6 +22,7 @@ from typing import Any, Union
 
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import FSDPModule
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
@@ -1549,14 +1550,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
     def _vision_tower_is_trainable(self) -> bool:
-        """Whether any vision-tower parameter is trainable (the tower is then its own FSDP unit)."""
+        """Whether the vision tower is its own FSDP unit with at least one trainable parameter."""
         visual = getattr(self.model, "visual", None)
-        return visual is not None and any(param.requires_grad for param in visual.parameters())
+        return isinstance(visual, FSDPModule) and any(param.requires_grad for param in visual.parameters())
 
     def _anchor_unused_vision_tower(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         """Tie text-only embeddings to a trainable vision tower without changing their values.
 
-        A trainable tower is its own FSDP unit. A rank whose batch has no media would skip the
+        Under FSDP2 a trainable tower is its own FSDP unit. A rank whose batch has no media would skip the
         tower's all-gather and its gradient reduction while ranks with media issue both, and the
         step deadlocks. Encoding one blank image and adding zero times its features makes every
         rank enter the tower once and gives the tower's parameters a zero gradient on this rank.
@@ -1566,7 +1567,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         Returns:
             Embeddings of shape ``[batch, sequence, hidden]`` with the same values. The input
-            tensor itself is returned when the tower is absent or fully frozen.
+            tensor itself is returned when the tower is absent, fully frozen, or not an FSDP unit.
         """
         if not self._vision_tower_is_trainable():
             return inputs_embeds
