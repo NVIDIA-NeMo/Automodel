@@ -662,3 +662,63 @@ def test_model_parallelizer_rejects_tp_above_kv_head_count(monkeypatch, tp_size)
 
     with pytest.raises(ValueError, match=r"supports TP1 or TP2.*tp_size=[48]"):
         model.parallelizer._apply(model, _Mesh())
+
+
+def _grid_sample_position_oracle(table: torch.Tensor, side: int, grid_thw: list[list[int]]) -> torch.Tensor:
+    """Independent position-table read: `F.grid_sample` on `meshgrid(pos_h, pos_w, indexing="xy")`.
+
+    Mirrors the reference trainer's construction (bilinear, ``align_corners=False``, zero padding). ``"xy"``
+    indexing makes the first grid coordinate (the table's width axis) follow the patch *height* axis, so patch
+    (h, w) reads the table at (w, h). Output rows are row-major over the ``(w, h)`` sample grid, repeated per frame.
+    """
+    import torch.nn.functional as F
+
+    chunks = []
+    for t, h, w in grid_thw:
+        pos_h = (torch.arange(h, dtype=torch.float32) + 0.5) / h * 2 - 1
+        pos_w = (torch.arange(w, dtype=torch.float32) + 0.5) / w * 2 - 1
+        xx, yy = torch.meshgrid(pos_h, pos_w, indexing="xy")
+        sample_grid = torch.stack([xx, yy], dim=-1)[None]  # (1, w, h, 2)
+        source = table.t().reshape(1, -1, side, side)
+        sampled = F.grid_sample(source, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        chunks.append(sampled[0].flatten(1).t().repeat(t, 1))
+    return torch.cat(chunks)
+
+
+def _vision_encoder_embeddings_before_ln_pre(grid_thw: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Run the vision encoder and capture ``conv(pixels) + position`` as it enters ``ln_pre``."""
+    from nemo_automodel.components.models.muse_glimmer.vision import MuseGlimmerVisionEncoder
+
+    torch.manual_seed(7)
+    config = _tiny_config(has_vision=True, vision_pos_emb_grid_h=8, vision_pos_emb_grid_w=8)
+    encoder = MuseGlimmerVisionEncoder(config).eval()
+    side = config.vision_config.pos_emb_height
+    encoder.positional_embedding_vlm.data.normal_()
+    n_patches = sum(t * h * w for t, h, w in grid_thw)
+    pixel_values = torch.randn(n_patches, config.vision_config.patch_temporal * 3 * config.vision_config.patch_size**2)
+
+    captured = []
+    handle = encoder.ln_pre.register_forward_pre_hook(lambda _module, args: captured.append(args[0].detach()))
+    with torch.no_grad():
+        encoder(pixel_values, torch.tensor(grid_thw))
+        conv = encoder.conv1_linear(pixel_values)
+    handle.remove()
+    expected_pos = _grid_sample_position_oracle(encoder.positional_embedding_vlm.detach(), side, grid_thw)
+    return captured[0], conv.flatten(-2).reshape(n_patches, -1) + expected_pos, side
+
+
+@pytest.mark.parametrize(
+    "grid_hw",
+    [(8, 8), (16, 16), (12, 20), (20, 12), (8, 28)],
+    ids=["square_8x8", "square_16x16", "wide_12x20", "tall_20x12", "wide_8x28"],
+)
+def test_vision_position_table_read_swaps_height_and_width_on_non_square_grids(grid_hw):
+    h, w = grid_hw
+    actual, expected, _ = _vision_encoder_embeddings_before_ln_pre([[1, h, w]])
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_vision_position_table_read_swaps_height_and_width_for_mixed_multi_image_batch():
+    grid_thw = [[1, 12, 20], [1, 20, 12], [1, 8, 8], [2, 8, 12]]
+    actual, expected, _ = _vision_encoder_embeddings_before_ln_pre(grid_thw)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)

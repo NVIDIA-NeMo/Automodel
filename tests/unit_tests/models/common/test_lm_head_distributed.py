@@ -22,14 +22,13 @@ Tensor parallelism also covers a vocabulary the mesh does not divide evenly, and
 and weight layouts that must be redistributed, such as an input sharded on the sequence.
 """
 
-import os
-import socket
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from pathlib import Path
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -44,12 +43,6 @@ _WORLD_SIZE = 2
 _HIDDEN = 32
 _VOCAB = 96
 _LR = 0.5
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _full(tensor: torch.Tensor) -> torch.Tensor:
@@ -322,10 +315,8 @@ def _check_fsdp_head_casts_its_own_input(weight: torch.Tensor, hidden: torch.Ten
         plain(hidden)
 
 
-def _worker(rank: int, port: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
+def _worker(rank: int, init_file: str) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=_WORLD_SIZE)
     try:
         generator = torch.Generator().manual_seed(0)
         weight = torch.randn(_VOCAB, _HIDDEN, generator=generator) * 0.1
@@ -347,5 +338,5 @@ def _worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_tensor_parallel_and_fsdp2_match_the_unsharded_head():
-    mp.spawn(_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
+def test_tensor_parallel_and_fsdp2_match_the_unsharded_head(tmp_path: Path):
+    mp.spawn(_worker, args=(str(tmp_path / "process-group"),), nprocs=_WORLD_SIZE, join=True)
