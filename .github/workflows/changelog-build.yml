@@ -20,6 +20,10 @@ on:
 jobs:
   changelog:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout branch
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -81,9 +85,11 @@ jobs:
 
       - name: Create or update label
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
         with:
           script: |
-            const labelName = '${{ inputs.release-branch }}';
+            const labelName = process.env.RELEASE_BRANCH;
             const labelColor = '0366d6'; // Blue color
             const labelDescription = `Release ${labelName}`;
 

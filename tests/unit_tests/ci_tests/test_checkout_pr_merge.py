@@ -20,6 +20,7 @@ alone cannot see the rule but GitHub's test merge commit can. ``gh`` is replaced
 by a stub that replays canned ``pulls/<N>`` lookups.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -223,3 +224,104 @@ def test_static_check_jobs_check_out_the_merge_before_running(job_name):
     assert merge_step["if"] == "startsWith(github.ref, 'refs/heads/pull-request/')"
     assert merge_step["env"] == {"GH_TOKEN": "${{ github.token }}"}
     assert workflow["permissions"]["pull-requests"] == "read"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "valid",
+        "stale-head",
+        "stale-base",
+        "wrong-pr-parent",
+        "single-parent",
+        "extra-parent",
+        "closed",
+        "pending",
+        "main",
+        "queue",
+        "deployment",
+    ],
+)
+@pytest.mark.parametrize("builder", ["workflow", "composite"])
+def test_container_build_resolves_only_the_vetted_revision(tmp_path: Path, case: str, builder: str) -> None:
+    """Pin PR images to the exact GitHub test merge and preserve the event SHA for other revisions."""
+    if builder == "workflow":
+        workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
+        jobs = workflow["jobs"]
+        resolver = jobs["cicd-compute-build-matrix"]["steps"][0]
+        assert jobs["cicd-compute-build-matrix"]["outputs"]["sha"] == "${{ steps.revision.outputs.sha }}"
+        assert "needs.cicd-compute-build-matrix.result == 'success'" in jobs["cicd-container-build"]["if"]
+        for name in ("cicd-container-build", "cicd-unit-tests", "cicd-e2e-tests", "cicd-e2e-tests-gb200", "Coverage"):
+            checkout = jobs[name]["steps"][0]["with"]
+            assert checkout["ref"] == "${{ needs.cicd-compute-build-matrix.outputs.sha }}"
+            assert checkout["persist-credentials"] is False
+            if name != "cicd-container-build":
+                assert "needs.cicd-container-build.result == 'success'" in jobs[name]["if"]
+    else:
+        action = yaml.safe_load((ROOT / ".github/actions/build-container/action.yml").read_text())
+        install_gh, resolver, checkout, *_ = action["runs"]["steps"]
+        assert install_gh["name"] == "Install GH CLI"
+        assert checkout["with"]["ref"] == "${{ steps.revision.outputs.sha }}"
+        assert checkout["with"]["persist-credentials"] is False
+    assert resolver["id"] == "revision"
+
+    head, base, merge, other = (c * 40 for c in "abcd")
+    pr = {
+        "state": "closed" if case == "closed" else "open",
+        "head": {"sha": other if case == "stale-head" else head},
+        "base": {"sha": base},
+        "merge_commit_sha": None if case == "pending" else merge,
+    }
+    parents = {
+        "stale-base": [other, head],
+        "wrong-pr-parent": [base, other],
+        "single-parent": [head],
+        "extra-parent": [base, head, other],
+    }.get(case, [base, head])
+    ref = {"main": "main", "queue": "gh-readonly-queue/main/pr-7-test", "deployment": "deploy-release/test"}.get(
+        case, "pull-request/7"
+    )
+    output = tmp_path / "outputs"
+    fixture = """
+gh() {
+  [[ "$1" == api && "$3" == --jq && $# == 4 ]] || return 1
+  case "$2" in
+    repos/example/repo/pulls/7) jq -r "$4" <<< "$PR_JSON" ;;
+    "repos/example/repo/git/commits/$MERGE_SHA") jq -r "$4" <<< "$COMMIT_JSON" ;;
+    *) return 1 ;;
+  esac
+}
+"""
+    env = {
+        "PATH": os.environ["PATH"],
+        "GITHUB_REF": f"refs/heads/{ref}",
+        "GITHUB_SHA": head,
+        "GITHUB_REPOSITORY": "example/repo",
+        "GITHUB_OUTPUT": str(output),
+        "MERGE_SHA": merge,
+        "PR_JSON": json.dumps(pr),
+        "COMMIT_JSON": json.dumps({"parents": [{"sha": parent} for parent in parents]}),
+    }
+    result = subprocess.run(["bash"], input=fixture + resolver["run"], text=True, env=env, capture_output=True)
+    if case in {"valid", "main", "queue", "deployment"}:
+        assert result.returncode == 0, result.stderr
+        assert output.read_text().splitlines() == (
+            [f"sha={merge}", "pr_number=7", f"base={base}"]
+            if case == "valid"
+            else [f"sha={head}", "pr_number=", "base="]
+        )
+    else:
+        assert result.returncode != 0
+        assert not output.exists()
+
+
+def test_container_action_builds_without_caller_credentials() -> None:
+    """Keep the deprecated input compatible and omit credentials from the caller's Dockerfile."""
+    action = yaml.safe_load((ROOT / ".github/actions/build-container/action.yml").read_text())
+    assert action["inputs"]["PAT"]["required"] is False
+    assert "deprecationMessage" in action["inputs"]["PAT"]
+    steps = action["runs"]["steps"]
+    assert "inputs.PAT" not in json.dumps(steps)
+    build = next(step["with"] for step in steps if step["name"] == "Build and push")
+    assert build["context"] == "."
+    assert not {"secrets", "secret-envs", "secret-files", "ssh"} & build.keys()

@@ -35,7 +35,7 @@ jobs:
       actions: read
       contents: read
       pull-requests: read
-    if: github.repository == 'NVIDIA-NeMo/Automodel'
+    if: github.repository == 'NVIDIA-NeMo/Automodel' && github.ref == 'refs/heads/main'
     strategy:
       matrix:
         branch: [main, others, workflow_dispatch]
@@ -299,7 +299,10 @@ jobs:
               if not deployments:
                   print(f"Failed to fetch pending deployments for run {workflow_id}")
                   exit(1)
-              deployment = deployments[0]
+              deployment = next((item for item in deployments if item["environment"]["name"] == "test"), None)
+              if deployment is None:
+                  print(f"Workflow run {workflow_id} has no pending test deployment")
+                  continue
               environment_id = deployment["environment"]["id"]
 
               # Approve the deployment
