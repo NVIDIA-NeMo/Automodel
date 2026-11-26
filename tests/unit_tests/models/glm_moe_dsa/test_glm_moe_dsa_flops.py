@@ -139,3 +139,20 @@ def test_registry_selects_the_model_formula_and_generic_formula_overcounts():
     # The generic MLA+MoE formula counts an indexer on every layer (including MTP) at 6 FLOPs/MAC
     # over a full square score matrix, an MTP layer the model does not run, and S x topk pairs.
     assert mla_moe_flops(config, gbs=1, seq_len=12) > model_flops(config, gbs=1, seq_len=12)
+
+
+def test_native_model_flops_survive_config_round_trip(tmp_path):
+    from transformers import AutoConfig
+
+    from nemo_automodel._transformers.mfu import AutoMFU
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
+
+    config = _config()
+    config.save_pretrained(tmp_path)
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    expected = model_flops(config, gbs=1, seq_len=128)
+    for candidate in (config, AutoConfig.from_pretrained(tmp_path)):
+        model = GlmMoeDsaForCausalLM.from_config(candidate, backend=backend)
+        meter = AutoMFU.from_config(model, peak_tflops=100)
+        assert meter.get_flops((1, 128)) == expected

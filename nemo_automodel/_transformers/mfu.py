@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from os import PathLike
 from typing import TYPE_CHECKING, Any
@@ -37,6 +38,8 @@ from nemo_automodel.components.utils.flops_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+FlopsFormula = Callable[..., float]
 
 # Device theoretical FLOPS (FLOPs/s) adapted from https://github.com/verl-project/verl/blob/main/verl/utils/flops_counter.py#L22-L85
 _DEVICE_FLOPS: dict[str, float] = {
@@ -132,6 +135,7 @@ class AutoMFU:
         config: PretrainedConfig,
         device: str | None = None,
         peak_tflops: float | None = None,
+        flops_formula: FlopsFormula | None = None,
     ) -> None:
         """Initialize AutoMFU with a model config.
 
@@ -139,9 +143,11 @@ class AutoMFU:
             config: HuggingFace PretrainedConfig object
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
+            flops_formula: Optional model-owned FLOPs formula. It takes precedence over the formula
+                selected from the config class.
         """
         self.config = config
-        self.flops_formula = get_flops_formula_for_hf_config(config)
+        self.flops_formula = flops_formula or get_flops_formula_for_hf_config(config)
         self.reference_mfu = (
             _validate_peak_tflops(peak_tflops)
             if peak_tflops is not None
@@ -182,14 +188,16 @@ class AutoMFU:
             AutoMFU instance
         """
         config = config_or_path_or_model
+        flops_formula = None
         if isinstance(config, (str, PathLike)):
             from transformers import AutoConfig
 
             config = AutoConfig.from_pretrained(str(config), **kwargs)
         else:
+            flops_formula = cls._model_flops_formula(config)
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
-        return cls(config, device=device, peak_tflops=peak_tflops)
+        return cls(config, device=device, peak_tflops=peak_tflops, flops_formula=flops_formula)
 
     @classmethod
     def from_pretrained(
@@ -280,11 +288,13 @@ class AutoMFU:
             return None
 
     @staticmethod
-    def _unwrap_config(config_or_model: object):
+    def _unwrap_chain(config_or_model: object):
+        """Yield the object, then each wrapper or config it unwraps to, ending at the config."""
         cur = config_or_model
         visited = set()
         while cur is not None and id(cur) not in visited:
             visited.add(id(cur))
+            yield cur
 
             if hasattr(cur, "config"):
                 next_obj = getattr(cur, "config")
@@ -302,7 +312,27 @@ class AutoMFU:
                         break
             if not moved:
                 break
+
+    @staticmethod
+    def _unwrap_config(config_or_model: object):
+        cur = config_or_model
+        for cur in AutoMFU._unwrap_chain(config_or_model):
+            pass
         return cur
+
+    @staticmethod
+    def _model_flops_formula(config_or_model: object) -> FlopsFormula | None:
+        """Return the FLOPs formula a model class owns, looking through wrappers, or ``None``.
+
+        A model that can be built from more than one config class (the upstream Transformers
+        config and the saved AutoModel config) states its formula once on the model class
+        instead of leaving the choice to whichever config class the caller passed.
+        """
+        for cur in AutoMFU._unwrap_chain(config_or_model):
+            formula = getattr(type(cur), "flops_formula", None)
+            if callable(formula):
+                return formula
+        return None
 
     @staticmethod
     def _ensure_common_config_aliases(config: object) -> None:

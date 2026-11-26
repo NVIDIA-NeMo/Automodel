@@ -46,6 +46,7 @@ from nemo_automodel.components.models.glm_moe_dsa.cp import (
     shard_glm_dsa_packed_cp_batch,
     validate_query_rows,
 )
+from nemo_automodel.components.models.glm_moe_dsa.flops import model_flops
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA, glm_dsa_indexer_replay
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
@@ -394,6 +395,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # microbatch (GLM-5.3: 4096 x 154880 fp32 = 2.4 GiB each on an 80 GB H100).
     _pp_return_hidden_states_supported: bool = True
     _pp_return_hidden_states: bool = False
+    # The model is built from either the upstream Transformers config or the saved AutoModel config; the
+    # model class names its FLOPs formula so both inputs report the same sparse-attention count.
+    flops_formula = staticmethod(model_flops)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
