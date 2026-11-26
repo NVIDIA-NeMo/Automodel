@@ -250,10 +250,12 @@ and `checkpoint.restore_from` restores training state.
 
 Training saves the experts in floating point. Serving runtimes that read
 `hf_quant_config.json` expect the released expert layout instead: NVFP4 in
-layers 0-39 and MXFP8 in layers 40-47. To write a fine-tuned model in that
-layout, pass the released checkpoint and a consolidated save (written with
-`checkpoint.save_consolidated`, or by the `model/consolidate.sh` helper; see
-[Checkpointing](/development/checkpointing)):
+layers 0-39 and MXFP8 in layers 40-47 for `Inkling-2-Small`, MXFP8 in every
+layer for `Inkling-2-Small-MXFP8`. The export writes the layout of the release
+passed as `--released`, so pass the checkpoint the run started from; with
+another release, every expert is quantized again. Pass it with a consolidated
+save (written with `checkpoint.save_consolidated`, or by the
+`model/consolidate.sh` helper; see [Checkpointing](/development/checkpointing)):
 
 ```bash
 uv run python -m nemo_automodel.components.models.inkling2.quantized_export \
