@@ -22,6 +22,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
+from torch.utils._python_dispatch import _disable_current_modes
 
 from .config import Inkling2TextConfig
 from .context_parallel import convolution_prefix, gather_preceding
@@ -53,10 +54,14 @@ def _preceding_reach(valid: torch.Tensor, positions: torch.Tensor, mesh: DeviceM
     cached = _REACH.get("reach")
     if cached is not None and cached[0]() is valid and cached[1]() is positions:
         return cached[2]
-    first = valid.long().argmax(dim=1, keepdim=True)
-    start = torch.where(valid.gather(1, first), positions.gather(1, first), 0).max()
-    dist.all_reduce(start, op=dist.ReduceOp.MAX, group=mesh.get_group())
-    reach = int(start)
+    # Activation checkpointing replays a layer's operations by their count. With several pipeline
+    # microbatches in flight a layer can find the entry in its forward and miss it in its
+    # recomputation, so the operations of a miss run outside the dispatch modes in both passes.
+    with _disable_current_modes():
+        first = valid.long().argmax(dim=1, keepdim=True)
+        start = torch.where(valid.gather(1, first), positions.gather(1, first), 0).max()
+        dist.all_reduce(start, op=dist.ReduceOp.MAX, group=mesh.get_group())
+        reach = int(start)
     _REACH["reach"] = (weakref.ref(valid), weakref.ref(positions), reach)
     return reach
 
@@ -79,11 +84,13 @@ def _key_layout(
     cached = _KEY_LAYOUTS.get(halo)
     if cached is not None and cached[0]() is valid and cached[1]() is positions:
         return cached[2], cached[3]
-    layout = torch.stack((positions, valid.long()), dim=-1)
-    count = min(halo, layout.shape[1])
-    prefix = gather_preceding(layout[:, -count:], mesh, halo, differentiable=False)
-    layout = torch.cat((prefix, layout), dim=1)
-    key_positions, key_valid = layout[..., 0], layout[..., 1].bool()
+    # A miss runs outside the dispatch modes, for the reason given in _preceding_reach.
+    with _disable_current_modes():
+        layout = torch.stack((positions, valid.long()), dim=-1)
+        count = min(halo, layout.shape[1])
+        prefix = gather_preceding(layout[:, -count:], mesh, halo, differentiable=False)
+        layout = torch.cat((prefix, layout), dim=1)
+        key_positions, key_valid = layout[..., 0], layout[..., 1].bool()
     for stale in [key for key, entry in _KEY_LAYOUTS.items() if entry[0]() is not valid or entry[1]() is not positions]:
         del _KEY_LAYOUTS[stale]
     _KEY_LAYOUTS[halo] = (weakref.ref(valid), weakref.ref(positions), key_positions, key_valid)
