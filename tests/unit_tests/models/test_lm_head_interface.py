@@ -18,10 +18,11 @@ The loader passes ``model.logits_dtype`` to the constructor of repo models witho
 argument, so each class is built on the meta device with it.
 """
 
+import gc
 import importlib
 import sys
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict
 
 import pytest
@@ -167,6 +168,19 @@ def _default_config(model_cls: type[nn.Module]) -> PretrainedConfig:
         hint = typing.get_type_hints(model_cls.__init__, globalns=vars(sys.modules[model_cls.__module__]))["config"]
         config_cls = next(arg for arg in (hint, *typing.get_args(hint)) if isinstance(arg, type))
     return config_cls()
+
+
+@pytest.fixture(autouse=True)
+def release_built_model() -> Iterator[None]:
+    """Collect the model of a case when the case ends.
+
+    Transformer Engine linears allocate their weights on CUDA even under the meta device, and a
+    dead model is freed only by a cyclic collection.
+    """
+    yield
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # Two modules may register classes of the same name, so each case is a (module, class name) pair.
