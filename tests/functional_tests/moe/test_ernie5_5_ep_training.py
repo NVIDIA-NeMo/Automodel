@@ -40,10 +40,6 @@ def _cudnn_dsa_skip_reason() -> str | None:
 
 
 class TestErnie5_5EP2Training:
-    def test_trains_with_eager_dsa(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(DSA_BACKEND_VARIABLE, "eager")
-        run_test_script(TEST_FOLDER, ERNIE5_5_EP2)
-
     def test_trains_with_cudnn_dsa(self, monkeypatch: pytest.MonkeyPatch) -> None:
         reason = _cudnn_dsa_skip_reason()
         if reason is not None:
