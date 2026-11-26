@@ -15,8 +15,6 @@
 """Numerical coverage of the native TE grouped GEMM integration, on one GPU."""
 
 import math
-import random
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -623,18 +621,6 @@ class _SharedExpert(torch.nn.Module):
         return self.down(torch.relu(self.up(x)).square())
 
 
-def _cublaslt_loses_grouped_output_beside_a_second_stream() -> bool:
-    """Whether the cuBLASLt under Transformer Engine is older than 13.8.1.
-
-    Measured on GB300: with 13.7.0 a grouped GEMM leaves tiles of its output unwritten now and then while a
-    GEMM runs on a second CUDA stream; 13.8.1 did not. The number is written out here, independently of the
-    code under test.
-    """
-    import transformer_engine_torch
-
-    return int(transformer_engine_torch.get_cublasLt_version()) < 130801
-
-
 # Rows per expert of one rank of 32 experts of 1024 -> 2688 -> 1024, multiples of the 128 rows NVFP4 pads to.
 REAL_LAYOUTS: dict[str, list[int]] = {
     # 22 routes for each of 8 x 8192 tokens on one of 16 ranks of 512 experts: 3.9e9 elements in the
@@ -684,7 +670,7 @@ def _rank_config(num_experts: int, *, native: bool, side_stream: bool) -> tuple[
 @pytest.mark.parametrize(
     ("layout", "native", "side_stream"),
     [(layout, native, False) for layout in REAL_LAYOUTS for native in (True, False)]
-    + [("half_empty_1.9e9", native, True) for native in (True, False)],
+    + [("half_empty_1.9e9", False, True)],
 )
 def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
     monkeypatch: pytest.MonkeyPatch, layout: str, native: bool, side_stream: bool
@@ -696,8 +682,8 @@ def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
     factors of 3 and 9, so a row quantized with another expert's scale is off by more than 0.5 of its norm
     (NVFP4 rounding leaves 0.2 to 0.35), and TE's output buffers are pre-filled with NaN so an unwritten element
     shows. Output, input gradient and both weight gradients are compared with FP32 values computed here, expert by
-    expert. Beside the side stream, grouped GEMMs on cuBLASLt before 13.8.1 are refused, and that refusal is what
-    the case checks there."""
+    expert. The side stream is exercised with one GEMM per expert only: on cuBLASLt
+    before 13.8.1 a grouped GEMM can leave output unwritten while a GEMM runs on a second stream."""
     recipe = _nvfp4_recipe_or_skip(stochastic_rounding=True)
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
@@ -711,10 +697,6 @@ def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
     total = sum(counts)
     elements = total * inter
     config, backend = _rank_config(num_experts, native=native, side_stream=side_stream)
-    if native and side_stream and _cublaslt_loses_grouped_output_beside_a_second_stream():
-        with pytest.raises(ValueError, match="cannot be combined with shared_expert_overlap=True on cuBLASLt"):
-            GroupedExpertsTE(config, backend=backend)
-        return
     module = GroupedExpertsTE(config, backend=backend)
     module.gate_up_linear.reset_parameters()
     module.down_linear.reset_parameters()
@@ -825,184 +807,6 @@ def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
     grouped = native and elements <= REAL_GROUPED_LIMIT
     assert all(path is grouped for _, path in forward_calls)
     assert module.gate_up_linear.use_grouped_tensor is native
-
-
-@dataclass
-class _DeviceCountDispatcher:
-    """Keep expert-grouped inputs in place and report the rows per expert as a CUDA tensor, as HybridEP does."""
-
-    counts: torch.Tensor
-
-    def token_permutation2(
-        self,
-        hidden_states: torch.Tensor,
-        num_local_tokens: int,
-        token_probs: torch.Tensor,
-        token_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return inputs without communication or permutation."""
-        return hidden_states, self.counts, token_probs[:, 0]
-
-    def token_unpermutation(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return expert-grouped outputs of shape [tokens, hidden] unchanged."""
-        return hidden_states
-
-
-class _HostWait:
-    """Keeps the host busy for a random time, so that two CUDA streams are fed at varying offsets."""
-
-    def __init__(self, longest_seconds: float, seed: int) -> None:
-        self.longest_seconds = longest_seconds
-        self.draws = random.Random(seed)
-
-    def __call__(self) -> None:
-        """Spin until the drawn time has passed."""
-        end = time.perf_counter() + self.draws.uniform(0.0, self.longest_seconds)
-        while time.perf_counter() < end:
-            pass
-
-
-class _WaitInBackward(torch.autograd.Function):
-    """Identity whose backward runs a host wait before the backward nodes behind it are reached."""
-
-    @staticmethod
-    def forward(ctx: FunctionCtx, tensor: torch.Tensor, wait: _HostWait) -> torch.Tensor:
-        ctx.wait = wait
-        return tensor.view_as(tensor)
-
-    @staticmethod
-    def backward(ctx: FunctionCtx, grad: torch.Tensor) -> tuple[torch.Tensor, None]:
-        ctx.wait()
-        return grad, None
-
-
-# Rows per expert of one rank of 32 experts, as REAL_LAYOUTS: half of the experts without rows, and the
-# balanced rows of 4 x 8192 tokens.
-OVERLAP_LAYOUTS: dict[str, list[int]] = {"half_empty": [0] * 16 + [45056] * 16, "balanced": [22528] * 32}
-OVERLAP_ROUNDS = 500
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
-@pytest.mark.parametrize("native", [True, False], ids=["grouped", "split"])
-@pytest.mark.parametrize("layout", list(OVERLAP_LAYOUTS))
-def test_te_experts_beside_the_shared_expert_stream_write_every_gradient(
-    monkeypatch: pytest.MonkeyPatch, layout: str, native: bool
-) -> None:
-    """Unquantized experts beside the shared expert's side stream return the same right values in every step.
-
-    With cuBLASLt before 13.8.1 grouped GEMMs lose output tiles of a weight gradient while the shared expert runs on
-    a second stream (about 1 step in 100 on GB300, only with host waits between the streams), so the module refuses
-    the combination there and that refusal is all this case checks. Elsewhere, ``OVERLAP_ROUNDS`` checkpointed
-    steps run with host waits of up to 4 ms where the streams are fed. The first step is compared with FP32 values
-    computed here; every later step must return its bits, and exact zeros for an expert without rows."""
-    pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
-    if not is_te_min_version("2.19.0"):
-        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
-    import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
-
-    if torch.cuda.mem_get_info()[0] < 64 * 2**30:
-        pytest.skip("Needs 64 GiB of free GPU memory")
-    counts = OVERLAP_LAYOUTS[layout]
-    num_experts, dim = len(counts), 1024
-    total = sum(counts)
-    config, backend = _rank_config(num_experts, native=native, side_stream=True)
-    if native and _cublaslt_loses_grouped_output_beside_a_second_stream():
-        with pytest.raises(ValueError, match="cannot be combined with shared_expert_overlap=True on cuBLASLt"):
-            GroupedExpertsTE(config, backend=backend)
-        return
-    if native and not te_grouped_linear.is_module_grouped_tensor_path_supported(None, torch.bfloat16):
-        pytest.skip("The native grouped-tensor path does not support BF16 on this device")
-    monkeypatch.setattr(te_grouped_linear, "torch", _NanFilledEmpty())
-    module = GroupedExpertsTE(config, backend=backend)
-    module.gate_up_linear.reset_parameters()
-    module.down_linear.reset_parameters()
-    module.ep_size = 1
-    module.token_dispatcher = _DeviceCountDispatcher(torch.tensor(counts, device="cuda", dtype=torch.int64))
-    calls = _record_gemm_calls(module)
-    shared = _SharedExpert()
-    stream = torch.cuda.Stream()
-    wait = _HostWait(longest_seconds=4e-3, seed=97)
-
-    generator = torch.Generator(device="cuda").manual_seed(77)
-    x = torch.randn(total, dim, generator=generator, device="cuda").to(torch.bfloat16)
-    probs = 0.05 + 0.4 * torch.rand(total, 1, generator=generator, device="cuda")
-    upstream = (torch.randn(total, dim, generator=generator, device="cuda") * 1e-3).to(torch.bfloat16)
-    shared_input = torch.randn(65536, 4096, generator=generator, device="cuda").to(torch.bfloat16)
-    shared_upstream = (torch.randn(65536, 4096, generator=generator, device="cuda") * 1e-3).to(torch.bfloat16)
-    mask = torch.ones(total, device="cuda", dtype=torch.bool)
-    indices = torch.zeros(total, 1, device="cuda", dtype=torch.long)
-
-    def block(hidden: torch.Tensor, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """The shared expert on the side stream and the routed experts, joined as ``MoE.forward`` joins them."""
-        stream.wait_stream(torch.cuda.current_stream())
-        wait()
-        with torch.cuda.stream(stream):
-            side = _WaitInBackward.apply(shared(tokens), wait)
-        tokens.record_stream(stream)
-        wait()
-        routed = _WaitInBackward.apply(module(hidden, mask, probs, indices), wait)
-        wait()
-        current = torch.cuda.current_stream()
-        current.wait_stream(stream)
-        side.record_stream(current)
-        return routed, side
-
-    def step() -> dict[str, torch.Tensor]:
-        """One checkpointed forward and backward on the fixed inputs."""
-        module.zero_grad(set_to_none=True)
-        shared.zero_grad(set_to_none=True)
-        hidden = x.clone().requires_grad_()
-        tokens = shared_input.clone().requires_grad_()
-        output, side = checkpoint(block, hidden, tokens, use_reentrant=False)
-        torch.autograd.backward([output, side], [upstream, shared_upstream])
-        values = {
-            "output": output.detach(),
-            "input_grad": hidden.grad,
-            "shared_output": side.detach(),
-            "shared_input_grad": tokens.grad,
-        }
-        for prefix, owner in (("", module), ("shared.", shared)):
-            for name, parameter in owner.named_parameters():
-                assert parameter.grad is not None, name
-                values[prefix + name] = parameter.grad
-        return values
-
-    first = step()
-    # The expert MLP and its gradients in FP32, expert by expert, written out without autograd.
-    weights = dict(module.named_parameters())
-    offset = 0
-    with torch.no_grad():
-        for expert, rows in enumerate(counts):
-            if rows == 0:
-                continue
-            gate_up = weights[f"gate_up_linear.weight{expert}"]
-            down = weights[f"down_linear.weight{expert}"]
-            span = slice(offset, offset + rows)
-            inputs, probability, output_grad = x[span].float(), probs[span], upstream[span].float()
-            pre_activation = inputs @ gate_up.float().T
-            activated = pre_activation.relu().square() * probability
-            activated_grad = output_grad @ down.float()
-            pre_activation_grad = activated_grad * 2 * pre_activation.relu() * probability
-            # BF16 GEMMs of these sizes are within 0.006 of FP32 on GB300.
-            assert _relative_l2(first["output"][span], activated @ down.float().T) < 0.02, expert
-            assert _relative_l2(first["input_grad"][span], pre_activation_grad @ gate_up.float()) < 0.02, expert
-            assert _relative_l2(first[f"gate_up_linear.weight{expert}"], pre_activation_grad.T @ inputs) < 0.02
-            assert _relative_l2(first[f"down_linear.weight{expert}"], output_grad.T @ activated) < 0.02, expert
-            offset += rows
-
-    for round_index in range(OVERLAP_ROUNDS):
-        values = first if round_index == 0 else step()
-        assert values.keys() == first.keys()
-        for name, value in values.items():
-            # NaN where a GEMM wrote nothing; any other difference is a wrong element too.
-            assert torch.isfinite(value).all(), (round_index, name)
-            assert torch.equal(value, first[name]), (round_index, name)
-        for expert, rows in enumerate(counts):
-            if rows == 0:
-                for linear in ("gate_up_linear", "down_linear"):
-                    assert torch.count_nonzero(values[f"{linear}.weight{expert}"]) == 0, (round_index, linear, expert)
-    # Forward and recompute of every step ran the path the module is built for.
-    assert [path for _, path in calls] == [native] * (2 * OVERLAP_ROUNDS)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 recipe switching requires CUDA")

@@ -91,7 +91,7 @@
 #   - 16 GB300 with forced balanced routing, which only a benchmark has (backend.fake_balanced_gate and
 #     backend.dispatcher_equal_token_counts, with one micro-batch of 8, no resharding after the forward and
 #     13 Mamba scans out of checkpointing; measured with te_grouped_tensor: true next to
-#     shared_expert_overlap, before the experts refused that pair): 4.67 s per step (14,025 tokens/s/GPU),
+#     shared_expert_overlap): 4.67 s per step (14,025 tokens/s/GPU),
 #     peak 260 GiB.
 #   - This file on 4 GB300 with 128 of the 512 experts (ep4): 6.19 s per step (10,585 tokens/s/GPU), peak
 #     198 GiB; with local_batch_size: 8, 5.86 s per step (11,187 tokens/s/GPU), peak 238 GiB. From the fifth
@@ -194,7 +194,7 @@ model:
     experts: te
     # One GEMM per expert. With the learned gate it was the faster setting on 4 GB300: 10,585 against 10,368
     # tokens/s/GPU for te_grouped_tensor: true (one grouped GEMM per expert projection), both measured with
-    # the shared expert on a side stream, before the experts refused that pair.
+    # the shared expert on a side stream.
     te_grouped_tensor: false
     dispatcher: hybridep
     dispatcher_num_sms: 64
@@ -202,8 +202,8 @@ model:
     dispatcher_recompute_cache: combine
     # The shared expert runs on the main stream. shared_expert_overlap: true moves it to a second CUDA stream
     # during dispatch and combine. With cuBLASLt before 13.8.1 a grouped GEMM can leave part of a weight
-    # gradient unwritten while GEMMs run on a second stream, so the experts refuse te_grouped_tensor together
-    # with it there. With one GEMM per expert the pair is accepted, and 7,106 checked passes on cuBLASLt
+    # gradient unwritten while GEMMs run on a second stream, so te_grouped_tensor is not to be used together
+    # with it there. With one GEMM per expert, 7,106 checked passes on cuBLASLt
     # 13.7.0 lost no output; that excludes a rate above 0.04% per pass and no lower one, against 75,600
     # passes per rank in the 900 steps of this file, so the side stream is off. It can be turned on from
     # cuBLAS 13.8.1 on.

@@ -16,65 +16,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.moe.layers import MLP, _clamped_swiglu_act, _relu2_act
+from nemo_automodel.components.moe.layers import _clamped_swiglu_act
 
 pytestmark = pytest.mark.timeout(600)  # one inductor graph compiles on the CPU
-
-
-def test_compiled_relu2_matches_the_eager_chain():
-    """The fused ReLU-squared returns the eager ``F.relu(up).pow(2)`` values and gradients in bfloat16."""
-    torch.manual_seed(9)
-    up = (torch.randn(6, 8) * 3).to(torch.bfloat16).requires_grad_(True)
-    grad = torch.randn(6, 8).to(torch.bfloat16)
-
-    out = _relu2_act(up)
-    out.backward(grad)
-
-    up_e = up.detach().clone().requires_grad_(True)
-    ref = F.relu(up_e).pow(2)
-    ref.backward(grad)
-
-    assert out.dtype == torch.bfloat16
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
-    torch.testing.assert_close(up.grad.float(), up_e.grad.float(), rtol=1e-2, atol=1e-2)
-    negative = up.detach().float() < 0
-    assert negative.any()
-    assert torch.all(out.float()[negative] == 0)
-    assert torch.all(up.grad.float()[negative] == 0)
-    assert torch.any(up.grad.float()[~negative] != 0)
-
-
-def test_relu2_mlp_keeps_the_eager_chain_on_cpu(monkeypatch):
-    """CPU inputs never enter the compiled island; the non-gated MLP output is the eager chain's."""
-    import nemo_automodel.components.moe.layers as layers
-
-    def fail(up: torch.Tensor) -> torch.Tensor:
-        """Stand-in for the compiled island that must stay unused."""
-        raise AssertionError("the compiled ReLU-squared must not run for CPU inputs")
-
-    monkeypatch.setattr(layers, "_relu2_act", fail)
-    torch.manual_seed(2)
-    mlp = MLP(dim=8, inter_dim=16, backend="torch", dtype=torch.float32, activation="relu2")
-    x = torch.randn(4, 8)
-    expected = mlp.down_proj(F.relu(mlp.up_proj(x)).pow(2))
-    torch.testing.assert_close(mlp(x), expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused ReLU-squared runs for CUDA inputs")
-def test_relu2_mlp_uses_the_fused_activation_on_cuda():
-    """On CUDA the non-gated MLP output and input gradient match the eager chain in bfloat16."""
-    torch.manual_seed(4)
-    mlp = MLP(dim=64, inter_dim=128, backend="torch", dtype=torch.bfloat16, activation="relu2").cuda()
-    x = torch.randn(32, 64, device="cuda").to(torch.bfloat16).requires_grad_(True)
-    out = mlp(x)
-    out.float().sum().backward()
-
-    x_e = x.detach().clone().requires_grad_(True)
-    ref = mlp.down_proj(F.relu(mlp.up_proj(x_e)).pow(2))
-    ref.float().sum().backward()
-
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
-    torch.testing.assert_close(x.grad.float(), x_e.grad.float(), rtol=2e-2, atol=1e-3)
 
 
 def _eager(gate, up, limit):

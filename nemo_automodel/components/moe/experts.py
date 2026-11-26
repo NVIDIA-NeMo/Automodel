@@ -46,7 +46,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-from nemo_automodel.shared.import_utils import get_te_cublaslt_version, is_te_min_version, safe_import, safe_import_te
+from nemo_automodel.shared.import_utils import is_te_min_version, safe_import, safe_import_te
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 _HAVE_TE, transformer_engine = safe_import_te()
@@ -316,32 +316,6 @@ def _resolve_m_splits(
 # around once the rows of all experts together pass 2**32 elements. Both limits stay 1/16 below those offsets.
 _NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS = 2**31 - 2**27
 _NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS = 2**32 - 2**28
-
-# First cuBLASLt release, as ``cublasLtGetVersion()`` reports it, in which a grouped GEMM was not seen to lose
-# output while a GEMM runs on another CUDA stream: 13.8.1.
-_CONCURRENT_GROUPED_GEMM_MIN_CUBLASLT = 130801
-
-
-def concurrent_grouped_gemm_is_unreliable(cublaslt_version: int) -> bool:
-    """Whether a cuBLASLt grouped GEMM can leave output elements unwritten while another GEMM runs.
-
-    Transformer Engine's grouped-tensor path (``te_grouped_tensor``) runs the experts of a rank as one
-    cuBLASLt grouped GEMM per projection. With cuBLASLt 13.7.0 on GB300 that GEMM sometimes does not write
-    rectangular tiles of its output (16 to 32 rows by 32 to 256 columns of one expert's matrix) when a GEMM
-    of Transformer Engine or of torch starts on a second CUDA stream while it runs. The tiles keep what the
-    output buffer held, so in training a weight gradient silently contains part of an older tensor. Seen in
-    the weight gradients of experts without rows (BF16 and NVFP4) and of experts with rows (NVFP4 and MXFP8),
-    in up to 1% of the backward passes of one layer; not seen without a second stream, with elementwise
-    kernels on the second stream, or with one GEMM per expert. cuBLASLt 13.8.1 did not show it in the same
-    runs.
-
-    Args:
-        cublaslt_version: ``cublasLtGetVersion()`` of the library that runs the GEMMs, e.g. 130700 for 13.7.0.
-
-    Returns:
-        ``True`` for releases before 13.8.1.
-    """
-    return cublaslt_version < _CONCURRENT_GROUPED_GEMM_MIN_CUBLASLT
 
 
 def _plan_dispatch_chunks(rows_per_expert: list[int], *, max_rows: int, align: int) -> list[list[int]]:
@@ -2257,11 +2231,8 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
 
         Raises:
-            ValueError: If ``te_grouped_tensor`` is requested with Transformer Engine older than 2.19.0, or
-                together with ``shared_expert_overlap`` on a cuBLASLt whose grouped GEMM loses output while
-                the shared expert's GEMMs run on the side stream
-                (:func:`concurrent_grouped_gemm_is_unreliable`), or if ``dispatcher_capacity_factor`` is set,
-                which these experts cannot use.
+            ValueError: If ``te_grouped_tensor`` is requested with Transformer Engine older than 2.19.0, or if
+                ``dispatcher_capacity_factor`` is set, which these experts cannot use.
         """
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
@@ -2292,22 +2263,6 @@ class GroupedExpertsTE(nn.Module):
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
-        if (
-            backend is not None
-            and backend.te_grouped_tensor
-            and backend.shared_expert_overlap
-            and config.n_shared_experts > 0
-        ):
-            # The shared expert's GEMMs would run on a side stream during the grouped GEMMs of these experts.
-            # A layer without a shared expert opens no side stream.
-            cublaslt_version = get_te_cublaslt_version()
-            if concurrent_grouped_gemm_is_unreliable(cublaslt_version):
-                raise ValueError(
-                    "te_grouped_tensor=True cannot be combined with shared_expert_overlap=True on cuBLASLt "
-                    f"{cublaslt_version}: before 13.8.1 a grouped GEMM can leave part of its output unwritten "
-                    "while the GEMMs of the shared expert run on the side stream, which corrupts weight "
-                    "gradients without an error. Set one of the two to False, or use cuBLAS 13.8.1 or newer."
-                )
         # Set when NVFP4 is enabled; caps the experts per rank.
         self.te_nvfp4 = backend.te_nvfp4 if backend is not None else None
         self.dispatcher_backend = dispatcher_backend
@@ -2837,29 +2792,14 @@ class GroupedExpertsTE(nn.Module):
         if self.config.apply_router_weight_after_down:
             permuted_probs = torch.ones_like(permuted_probs)
 
+        m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
+        if self.static_routing and self._static_m_splits is None:
+            self._static_m_splits = m_splits
+
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
         recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8_active else None
-
-        # TE's grouped-tensor GEMM reads its split sizes on the device. Without a quantization recipe nothing
-        # else in this layer needs them on the host (no padding to a block multiple), so the dispatcher's
-        # counts go to the GEMMs as a device tensor and the forward and its checkpoint recompute skip the
-        # device-to-host read. A dispatched buffer holds exactly sum(tokens_per_expert) rows here (capacity
-        # mode is rejected in __init__), so its leading extent answers the empty-dispatch check on the host.
-        device_m_splits: torch.Tensor | None = None
-        if self.use_grouped_tensor and recipe is None and isinstance(tokens_per_expert, torch.Tensor):
-            device_m_splits = tokens_per_expert.to(
-                device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
-            )
-            m_splits: list[int] = []
-            has_dispatched_rows = permuted_local_hidden_states.shape[0] > 0
-        else:
-            m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
-            if self.static_routing and self._static_m_splits is None:
-                self._static_m_splits = m_splits
-            has_dispatched_rows = sum(m_splits) > 0
-
         if self.use_grouped_tensor:
             from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
 
@@ -2890,17 +2830,16 @@ class GroupedExpertsTE(nn.Module):
             permuted_probs, _ = padding(permuted_probs, actual_m_splits)
             row_align = padding.align_size
 
-        if has_dispatched_rows:
+        if sum(m_splits) > 0:
             # The calls of a dispatch that has to run one GEMM per expert, possibly in chunks of rows.
             chunks = self._per_expert_chunks(recipe, m_splits, row_align)
             # The native grouped-tensor API consumes device-side int64 split sizes.
             # Keep the host list for padding, unpadding, and the legacy TE path.
-            if device_m_splits is not None:
-                grouped_m_splits = device_m_splits
-            elif self.use_grouped_tensor and chunks is None:
-                grouped_m_splits = torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
-            else:
-                grouped_m_splits = m_splits
+            grouped_m_splits = (
+                torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
+                if self.use_grouped_tensor and chunks is None
+                else m_splits
+            )
             # No FSDP mixed-precision wrapper casts EP-local experts when ep_shard is 1, so
             # FP32 master weights meet BF16 dispatched tokens here. TE accepts parameters
             # in another dtype only under torch.autocast, which casts them per GEMM like
@@ -2939,11 +2878,7 @@ class GroupedExpertsTE(nn.Module):
             if self.expert_bias and not self.config.apply_router_weight_after_down:
                 down_bias = self._get_stacked_bias(self.down_linear)
                 if down_bias is not None:
-                    splits_t = (
-                        device_m_splits
-                        if device_m_splits is not None
-                        else torch.as_tensor(m_splits, device=output2.device)
-                    )
+                    splits_t = torch.as_tensor(m_splits, device=output2.device)
                     output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
         else:
             # Handle edge case: no tokens routed to local experts

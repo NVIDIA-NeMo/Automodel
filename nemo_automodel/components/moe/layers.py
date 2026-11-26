@@ -109,12 +109,7 @@ class MLP(nn.Module):
             torch.Tensor: Output tensor after MLP computation.
         """
         if not self.is_gated:
-            up = self.up_proj(x)
-            if x.is_cuda:
-                # One fused kernel per direction instead of clamp + pow forward and three elementwise
-                # kernels backward, each a full pass over the [tokens, inter_dim] activation.
-                return self.down_proj(_relu2_act(up))
-            return self.down_proj(F.relu(up).pow(2))
+            return self.down_proj(F.relu(self.up_proj(x)).pow(2))
         if self.swiglu_limit > 0.0:
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
@@ -149,23 +144,6 @@ def _clamped_swiglu_act(gate: torch.Tensor, up: torch.Tensor, limit: float) -> t
     gate_f = gate.float().clamp(max=limit)
     up_f = up.float().clamp(min=-limit, max=limit)
     return (F.silu(gate_f) * up_f).to(gate.dtype)
-
-
-@torch.compile(fullgraph=True)
-def _relu2_act(up: torch.Tensor) -> torch.Tensor:
-    """ReLU-squared on the up projection of a non-gated MLP.
-
-    Same arithmetic as the eager ``F.relu(up).pow(2)`` of ``MLP.forward``; inductor fuses each direction into one
-    kernel. Shape policy as for ``_clamped_swiglu_act``: the first token count compiles a static graph, the second
-    recompiles once with a symbolic row count and every later shape reuses it. CPU inputs keep the eager chain.
-
-    Args:
-        up: Tensor of shape [..., inter_dim], with arbitrary leading dimensions.
-
-    Returns:
-        Tensor of the same shape and dtype as ``up``.
-    """
-    return F.relu(up).pow(2)
 
 
 class FakeBalancedGate(nn.Module):

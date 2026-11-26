@@ -57,10 +57,10 @@
 #     mamba_norm_backward_grid_scale: 8 and FusedLinearCrossEntropy, as in the BF16 file.
 # shared_expert_overlap (the shared expert on a second CUDA stream) is off, as in the BF16 file: with cuBLASLt
 # before 13.8.1 a grouped GEMM can leave part of a weight gradient unwritten while GEMMs run on a second
-# stream, whatever the routing, so the experts refuse te_grouped_tensor together with it on such a library.
+# stream, whatever the routing, so this file does not use te_grouped_tensor together with it.
 # On one node with 128 of the 512 experts (ep4, measured with reshard_after_forward: false), two
 # runs each: these backend settings 13,327 and 13,323 tokens/s/GPU; the side stream with one GEMM per expert 13,326 and
-# 13,323; both together, before they were refused, 13,399 and 13,421. This file takes the grouped GEMMs
+# 13,323; both together 13,399 and 13,421. This file takes the grouped GEMMs
 # because nvidia-smi then peaks 11 GiB lower (247 against 258 GiB).
 # Expert dispatch: the rows routed to the 32 experts of a rank hold 3.88e9 elements at this micro-batch, more
 # than one grouped NVFP4 quantization handles, so the NVFP4 expert projections run one GEMM per expert (rank 0
