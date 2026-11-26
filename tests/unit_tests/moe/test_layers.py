@@ -45,7 +45,7 @@ SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 @pytest.mark.parametrize("upstream", [-1.0, 0.0, 1.0])
 def test_sqrt_softplus_stable_matches_float64_reference(dtype: torch.dtype, upstream: float) -> None:
     values = torch.tensor(
-        [-200.0, -120.0, -110.0, -100.0, -80.0, -21.0, -20.0, -19.0, 0.0, 20.0, 100.0],
+        [-200.0, -120.0, -110.0, -100.0, -80.0, -21.0, -20.0, -19.0, 0.0, 20.0, 100.0, 200.0],
         dtype=dtype,
         requires_grad=True,
     )
@@ -59,6 +59,12 @@ def test_sqrt_softplus_stable_matches_float64_reference(dtype: torch.dtype, upst
     assert torch.isfinite(values.grad).all()
     torch.testing.assert_close(output.double(), reference, rtol=2e-6, atol=1e-43)
     torch.testing.assert_close(values.grad, reference_grad.to(dtype), rtol=2e-6, atol=1e-43)
+
+
+@pytest.mark.cpu_only
+def test_sqrt_softplus_stable_keeps_original_expression_from_threshold_up() -> None:
+    values = torch.linspace(-20.0, 40.0, 6001, dtype=torch.float32)
+    torch.testing.assert_close(sqrt_softplus_stable(values), F.softplus(values).sqrt(), rtol=0.0, atol=0.0)
 
 
 @pytest.mark.cpu_only
