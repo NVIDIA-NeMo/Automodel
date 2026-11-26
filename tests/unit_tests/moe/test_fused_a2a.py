@@ -31,11 +31,9 @@ def _restore_buffer():
     saved_hybridep = fused_a2a._hybrid_ep_buffer
     saved_hybridep_signature = fused_a2a._hybrid_ep_runtime_signature
     saved_hybridep_capacity = fused_a2a._hybrid_ep_initialized_capacity
-    saved_hybridep_max_local_experts = fused_a2a._hybrid_ep_max_local_experts
     try:
         yield
     finally:
-        fused_a2a._hybrid_ep_max_local_experts = saved_hybridep_max_local_experts
         fused_a2a._buffer = saved
         fused_a2a._hybrid_ep_buffer = saved_hybridep
         fused_a2a._hybrid_ep_runtime_signature = saved_hybridep_signature
@@ -497,6 +495,7 @@ def test_hybridep_first_dispatch_presizes_buffer_to_max_tokens_per_rank(
         None,
         None,
         max_tokens_per_rank,
+        None,
     )
 
     assert recorded == {"seq_len": expected_seq_len, "hidden_dim": 4}
@@ -506,8 +505,8 @@ def test_hybridep_first_dispatch_presizes_buffer_to_max_tokens_per_rank(
 def test_hybridep_dispatch_backward_returns_one_gradient_per_forward_input(monkeypatch, max_tokens_per_rank):
     """Backward through ``HybridEPDispatch`` must work when every forward argument is passed.
 
-    ``hybrid_ep_dispatch`` always forwards all 16 arguments (``max_tokens_per_rank`` included), so
-    autograd expects 16 gradients from ``backward``; a shorter tuple fails every backward, whether
+    ``hybrid_ep_dispatch`` always forwards all 17 arguments (``max_local_experts`` included), so
+    autograd expects 17 gradients from ``backward``; a shorter tuple fails every backward, whether
     or not the option is set.
     """
 
@@ -524,7 +523,7 @@ def test_hybridep_dispatch_backward_returns_one_gradient_per_forward_input(monke
     routing_map = torch.tensor([[True, False], [False, True]])
     probs = torch.randn(2, 2, requires_grad=True)
 
-    # Same positional call as the ``hybrid_ep_dispatch`` wrapper: all 16 forward inputs.
+    # Same positional call as the ``hybrid_ep_dispatch`` wrapper: all 17 forward inputs.
     dispatched_hidden, dispatched_probs, _, _, _ = fused_a2a.HybridEPDispatch.apply(
         hidden,
         routing_map,
@@ -542,6 +541,7 @@ def test_hybridep_dispatch_backward_returns_one_gradient_per_forward_input(monke
         None,
         None,
         max_tokens_per_rank,
+        None,
     )
     (dispatched_hidden.sum() + dispatched_probs.sum()).backward()
 
@@ -720,37 +720,93 @@ def test_hybridep_combine_without_cache_flag_ignores_the_bound_cache():
     assert buffer.combines == 1
 
 
-def _init_hybridep_buffer_with_local_experts(monkeypatch, num_local_experts: int) -> mock.Mock:
+def _dispatch_layer(num_local_experts: int, max_local_experts: int | None) -> None:
+    """Run one HybridEP dispatch as a layer with ``num_local_experts`` experts per rank, on the shared buffer."""
+    hidden = torch.randn(2, 4)
+    routing_map = torch.tensor([[True, False], [False, True]])
+    probs = torch.randn(2, 2)
+    # Same positional order as the ``hybrid_ep_dispatch`` wrapper; ``max_local_experts`` is the last input.
+    fused_a2a.HybridEPDispatch.apply(
+        hidden,
+        routing_map,
+        probs,
+        None,
+        num_local_experts,
+        20,
+        21,
+        None,
+        None,
+        None,
+        None,
+        False,
+        None,
+        None,
+        None,
+        None,
+        max_local_experts,
+    )
+
+
+@pytest.mark.parametrize("max_local_experts,expected", [(None, 30), (62, 62), (16, 30)])
+def test_hybridep_first_dispatch_allocates_for_max_local_experts(monkeypatch, max_local_experts, expected):
+    """The first dispatch allocates for max(own experts, max_local_experts); None or a smaller value leaves it unchanged."""
+
+    class FakeHybridEPBuffer:
+        def dispatch_with_permute(self, **kwargs):
+            return kwargs["hidden"], kwargs["probs"], None, torch.tensor([1, 1]), ("handle",)
+
+    allocated = []
+
+    def fake_init(group, hidden_dim, seq_len, num_local_experts, *args, **kwargs):
+        allocated.append(num_local_experts)
+        fused_a2a._hybrid_ep_buffer = FakeHybridEPBuffer()
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    monkeypatch.setattr(fused_a2a, "init_hybrid_ep_buffer", fake_init)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+    _dispatch_layer(30, max_local_experts)
+
+    assert allocated == [expected]
+
+
+def test_hybridep_layers_with_different_expert_counts_allocate_the_buffer_once(monkeypatch):
+    """Every layer passes the same maximum, so the first layer sizes the buffer and later layers reuse it."""
+
+    class FakeHybridEPBuffer:
+        def dispatch_with_permute(self, **kwargs):
+            return kwargs["hidden"], kwargs["probs"], None, torch.tensor([1, 1]), ("handle",)
+
+    allocated = []
+
+    def fake_init(group, hidden_dim, seq_len, num_local_experts, *args, **kwargs):
+        allocated.append(num_local_experts)
+        fused_a2a._hybrid_ep_buffer = FakeHybridEPBuffer()
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    monkeypatch.setattr(fused_a2a, "init_hybrid_ep_buffer", fake_init)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+    for num_local_experts in (30, 62, 46):
+        _dispatch_layer(num_local_experts, 62)
+
+    assert allocated == [62]
+
+
+def test_init_hybridep_buffer_allocates_the_requested_local_experts(monkeypatch):
+    """``init_hybrid_ep_buffer`` sizes the buffer for exactly the expert count it is given."""
     buffer = mock.Mock()
     monkeypatch.setattr(fused_a2a, "HybridEPBuffer", buffer, raising=False)
     monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+
     fused_a2a.init_hybrid_ep_buffer(
         group=mock.Mock(),
         hidden_dim=64,
         seq_len=128,
-        num_local_experts=num_local_experts,
+        num_local_experts=62,
         num_sms_dispatch_api=20,
         num_sms_combine_api=20,
         fp8_dispatch=False,
     )
-    return buffer
-
-
-def test_init_hybridep_buffer_covers_largest_registered_layer(monkeypatch):
-    """Layers with different expert counts share one buffer, sized for the largest of them."""
-    monkeypatch.setattr(fused_a2a, "_hybrid_ep_max_local_experts", 0)
-    for num_local_experts in (30, 62, 46):
-        fused_a2a.note_hybrid_ep_local_experts(num_local_experts)
-
-    buffer = _init_hybridep_buffer_with_local_experts(monkeypatch, 30)
 
     assert buffer.call_args.kwargs["num_local_experts"] == 62
-
-
-def test_init_hybridep_buffer_keeps_requested_local_experts_without_registrations(monkeypatch):
-    """Models with one expert count per layer allocate exactly what the layer asks for."""
-    monkeypatch.setattr(fused_a2a, "_hybrid_ep_max_local_experts", 0)
-
-    buffer = _init_hybridep_buffer_with_local_experts(monkeypatch, 16)
-
-    assert buffer.call_args.kwargs["num_local_experts"] == 16

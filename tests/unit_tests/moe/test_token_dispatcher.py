@@ -490,6 +490,76 @@ def test_flex_dispatcher_forwards_max_tokens_per_rank_for_both_sharing_modes(mon
         assert MoEFlexTokenDispatcher.shared_hybridep_manager is None
 
 
+@pytest.mark.parametrize("share_token_dispatcher", [True, False])
+def test_flex_dispatcher_forwards_max_num_local_experts_for_both_sharing_modes(monkeypatch, share_token_dispatcher):
+    """The model-wide maximum must reach the HybridEP manager whether or not dispatchers are shared."""
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", Mock())
+    config = TokenDispatcherConfig(
+        moe_flex_dispatcher_backend="hybridep", num_moe_experts=8, moe_share_token_dispatcher=share_token_dispatcher
+    )
+    group = Mock()
+    group.size.return_value = 4
+
+    dispatcher = MoEFlexTokenDispatcher(2, [0, 1], config, group, max_num_local_experts=62)
+
+    assert dispatcher._comm_manager.num_local_experts == 2
+    assert dispatcher._comm_manager.max_num_local_experts == 62
+
+
+@pytest.mark.parametrize("max_num_local_experts,expected", [(None, 30), (62, 62), (16, 30)])
+def test_hybridep_manager_buffer_expert_count_is_never_below_its_own(max_num_local_experts, expected):
+    """Without a model-wide maximum (or with a smaller one) the manager asks for its own expert count."""
+    with patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=30,
+            num_experts=240,
+            router_topk=2,
+            max_num_local_experts=max_num_local_experts,
+        )
+
+    assert manager.max_num_local_experts == expected
+
+
+def test_hybridep_manager_forwards_max_num_local_experts_to_dispatch(monkeypatch):
+    """The dispatch call carries the maximum, as it does ``max_tokens_per_rank``."""
+    import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+    with patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None):
+        manager = _HybridEPManager(
+            group=None, num_local_experts=2, num_experts=8, router_topk=2, max_num_local_experts=62
+        )
+    seen = []
+
+    def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+        seen.append((kwargs["num_local_experts"], kwargs["max_local_experts"]))
+        token_rows = routing_map.nonzero(as_tuple=False)[:, 0]
+        return x[token_rows], probs[routing_map], None, routing_map.sum(dim=0), "runtime-handle"
+
+    monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+    monkeypatch.setattr(td, "hybrid_ep_combine", lambda x, **kwargs: x.reshape(5, manager.router_topk, 4).sum(dim=1))
+    manager.initialize_runtime(num_tokens=5, hidden_dim=4, dtype=torch.float32, device=torch.device("cpu"))
+
+    assert seen == [(2, 62)]
+
+
+def test_runtime_signature_is_the_same_for_layers_sharing_the_largest_expert_count():
+    """The pipeline runtime signature names the buffer's expert count, so layers sharing the maximum agree on it."""
+    with patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None):
+        small, large = (
+            _HybridEPManager(group=None, num_local_experts=n, num_experts=8, router_topk=2, max_num_local_experts=62)
+            for n in (30, 62)
+        )
+        own = _HybridEPManager(group=None, num_local_experts=30, num_experts=8, router_topk=2)
+
+    def signature(manager):
+        return HybridEPPipelineRuntimeInitializer(manager, 4, torch.float32).signature
+
+    assert signature(small) == signature(large)
+    assert signature(small) != signature(own)
+
+
 class TestIndicesToMultihot:
     """Tests for _HybridEPManager._indices_to_multihot."""
 
@@ -1230,17 +1300,3 @@ def test_hybridep_first_capacity_dispatch_backward(
     torch.testing.assert_close(values.grad, values.detach().cos(), rtol=0, atol=0)
     assert manager._hybridep_capacity == 8
     assert transport.call_count == (2 if checkpointed else 1)
-
-
-def test_hybrid_ep_manager_registers_its_local_expert_count_for_buffer_sizing(monkeypatch):
-    """Managers of differently sized MoE layers leave the largest per-rank expert count registered."""
-    monkeypatch.setattr(fused_a2a, "_hybrid_ep_max_local_experts", 0)
-
-    with patch(
-        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
-        new=lambda *a, **kw: None,
-    ):
-        for num_local_experts in (30, 62, 46):
-            _HybridEPManager(group=None, num_local_experts=num_local_experts, num_experts=496, router_topk=2)
-
-    assert fused_a2a._hybrid_ep_max_local_experts == 62

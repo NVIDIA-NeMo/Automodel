@@ -49,7 +49,8 @@ class DummyExperts:
 
 
 class DummyMoE:
-    def __init__(self):
+    def __init__(self, n_routed_experts=8):
+        self.n_routed_experts = n_routed_experts
         self.experts = DummyExperts()
 
 
@@ -575,7 +576,7 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
             super().__init__()
             self.dispatch_called_with = None
 
-        def init_token_dispatcher(self, ep_mesh):
+        def init_token_dispatcher(self, ep_mesh, max_num_local_experts=None):
             self.dispatch_called_with = ep_mesh
 
         # override register_parameter to avoid strict type checks
@@ -685,6 +686,67 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_max_local_experts_per_rank_is_the_largest_layer_per_ep_rank():
+    """Layers with 240 to 496 routed experts on 8 EP ranks need a buffer for 62 experts per rank."""
+    from nemo_automodel.components.moe.parallelizer import max_local_experts_per_rank
+
+    layers = [DummyMoE(240), DummyMoE(496), DummyMoE(368)]
+
+    assert max_local_experts_per_rank(layers, ep_size=8) == 62
+    assert max_local_experts_per_rank([DummyMoE(64), DummyMoE(64)], ep_size=8) == 8
+    assert max_local_experts_per_rank([], ep_size=8) == 0
+
+
+def test_apply_ep_gives_every_layer_the_largest_per_rank_expert_count(monkeypatch):
+    """Each layer's dispatcher is built with the maximum over all layers, not only its own expert count."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    model = DummyModel([DummyBlock(mlp=DummyMoE(n)) for n in (240, 496, 368)])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 8})()
+
+    P.apply_ep(model, ep_mesh)
+
+    plans = [call.kwargs["parallelize_plan"] for call in parallelize_module_mock.call_args_list]
+    assert [plan.max_num_local_experts for plan in plans] == [62, 62, 62]
+
+
+def test_apply_ep_on_a_uniform_model_passes_the_layers_own_per_rank_count(monkeypatch):
+    """With one expert count the value equals what each layer requests on its own."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    model = DummyModel([DummyBlock(mlp=DummyMoE(64)) for _ in range(3)])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 8})()
+
+    P.apply_ep(model, ep_mesh)
+
+    plans = [call.kwargs["parallelize_plan"] for call in parallelize_module_mock.call_args_list]
+    assert [plan.max_num_local_experts for plan in plans] == [8, 8, 8]
+
+
+def test_expert_parallel_hands_the_maximum_to_the_deepep_experts_dispatcher(monkeypatch):
+    """ExpertParallel passes its model-wide maximum to the experts' ``init_token_dispatcher``."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "distribute_tensor", lambda param, mesh, placements: MagicMock())
+    monkeypatch.setattr(P, "Shard", lambda dim: object())
+
+    class FakeDeepEPExperts:
+        init_token_dispatcher = MagicMock()
+
+        def named_parameters(self, recurse=False):
+            return iter(())
+
+    monkeypatch.setattr(P, "GroupedExpertsDeepEP", FakeDeepEPExperts)
+    device_mesh = type("Mesh", (), {"ndim": 1})()
+
+    P.ExpertParallel(62)._partition_fn("experts", FakeDeepEPExperts(), device_mesh)
+
+    FakeDeepEPExperts.init_token_dispatcher.assert_called_once_with(ep_mesh=device_mesh, max_num_local_experts=62)
+
+
 def test_apply_ep_excludes_te_owned_experts_from_tp_replica_sync(monkeypatch):
     """TE's plain local expert tensors remain owned by the folded EP mesh."""
     P = _import_parallelizer_with_stubs(monkeypatch)
@@ -710,7 +772,7 @@ def test_apply_ep_excludes_te_owned_experts_from_tp_replica_sync(monkeypatch):
 
     P.apply_ep(model, ep_mesh, moe_mesh=moe_mesh)
 
-    experts.init_token_dispatcher.assert_called_once_with(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+    experts.init_token_dispatcher.assert_called_once_with(ep_mesh=ep_mesh, moe_mesh=moe_mesh, max_num_local_experts=4)
     exclude_mock.assert_called_once_with(experts)
 
 

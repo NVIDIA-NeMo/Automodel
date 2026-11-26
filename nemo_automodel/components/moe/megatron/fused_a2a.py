@@ -565,17 +565,6 @@ _hybrid_ep_buffer = None
 _hybrid_ep_runtime_signature: tuple[int | torch.dtype | torch.device | None, ...] | None = None
 _hybrid_ep_initialized_capacity = 0
 
-# The buffer is process-global, but the per-rank expert count can differ between MoE layers.
-# Growing it at a later layer reallocates the buffer and invalidates handles saved for
-# activation-checkpoint recompute, so allocate for the largest count any layer registered.
-_hybrid_ep_max_local_experts = 0
-
-
-def note_hybrid_ep_local_experts(num_local_experts: int) -> None:
-    """Record a layer's per-rank expert count so the first allocation covers every layer."""
-    global _hybrid_ep_max_local_experts
-    _hybrid_ep_max_local_experts = max(_hybrid_ep_max_local_experts, int(num_local_experts))
-
 
 def get_hybrid_ep_initialized_capacity(signature: tuple[int | torch.dtype | torch.device | None, ...]) -> int:
     """Return process-global initialized capacity after validating the resource signature.
@@ -736,7 +725,7 @@ def init_hybrid_ep_buffer(
         group=group,
         hidden_dim=hidden_dim,
         max_num_of_tokens_per_rank=seq_len,
-        num_local_experts=max(int(num_local_experts), _hybrid_ep_max_local_experts),
+        num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
@@ -777,6 +766,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_blocks_permute: int | None = None,
         num_blocks_unpermute: int | None = None,
         max_tokens_per_rank: int | None = None,
+        max_local_experts: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
         """Dispatch hidden states using compact indices or a dense routing map.
 
@@ -803,6 +793,10 @@ class HybridEPDispatch(torch.autograd.Function):
             max_tokens_per_rank: Optional per-rank token capacity for the process-global buffer
                 allocated on the first dispatch (``max(tokens, max_tokens_per_rank)``); later
                 dispatches up to that size then never reallocate the buffer.
+            max_local_experts: Optional largest per-rank expert count over every MoE layer that
+                shares the process-global buffer. The first dispatch allocates for
+                ``max(num_local_experts, max_local_experts)``, so a later layer with more experts
+                does not reallocate the buffer and invalidate handles saved for recompute.
 
         Returns:
             Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
@@ -818,12 +812,15 @@ class HybridEPDispatch(torch.autograd.Function):
                 # Size the buffer for the largest micro-batch up front: HybridEP's runtime
                 # reallocation for a larger batch re-creates the inter-node queue pairs.
                 seq_len = max(int(seq_len), int(max_tokens_per_rank))
+            buffer_local_experts = num_local_experts
+            if max_local_experts is not None:
+                buffer_local_experts = max(num_local_experts, max_local_experts)
             fp8_dispatch = False
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
                 seq_len,
-                num_local_experts,
+                buffer_local_experts,
                 num_sms_dispatch_api,
                 num_sms_combine_api,
                 fp8_dispatch,
@@ -937,12 +934,13 @@ class HybridEPDispatch(torch.autograd.Function):
             # The backward combine is the last HybridEP kernel variant compiled in a training step.
             _jit_stored = True
             store_hybrid_ep_jit_cache()
-        # One entry per forward input (16, ``max_tokens_per_rank`` included): autograd rejects a
+        # One entry per forward input (17, ``max_local_experts`` included): autograd rejects a
         # shorter tuple whenever the wrapper passes every argument.
         return (
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -1059,6 +1057,7 @@ if HAVE_HYBRIDEP:
         num_blocks_permute: int | None = None,
         num_blocks_unpermute: int | None = None,
         max_tokens_per_rank: int | None = None,
+        max_local_experts: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
         """Dispatch tokens through HybridEP while retaining dense probability layout.
 
@@ -1081,6 +1080,9 @@ if HAVE_HYBRIDEP:
             max_tokens_per_rank: Optional per-rank token capacity for the process-global buffer
                 allocated on the first dispatch (``max(tokens, max_tokens_per_rank)``); later
                 dispatches up to that size then never reallocate the buffer.
+            max_local_experts: Optional largest per-rank expert count over every MoE layer sharing
+                the process-global buffer; the first dispatch allocates for
+                ``max(num_local_experts, max_local_experts)``.
 
         Returns:
             Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
@@ -1105,6 +1107,7 @@ if HAVE_HYBRIDEP:
             num_blocks_permute,
             num_blocks_unpermute,
             max_tokens_per_rank,
+            max_local_experts,
         )
 
     def hybrid_ep_combine(
