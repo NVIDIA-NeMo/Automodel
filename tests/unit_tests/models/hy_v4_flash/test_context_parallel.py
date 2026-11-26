@@ -127,8 +127,12 @@ def four_ranks(tmp_path_factory: pytest.TempPathFactory) -> _RankResults:
     processes = [
         context.Process(target=_worker, args=(rank, str(tmp_path / "init"), paths[rank])) for rank in range(WORLD)
     ]
-    for process in processes:
-        process.start()
+    # Other test modules set TORCH_COMPILE_DISABLE at collection time. A spawned worker would inherit it before it
+    # imports torch, and the fullgraph-compiled clamped SwiGLU of the experts cannot run with Dynamo disabled.
+    with pytest.MonkeyPatch.context() as worker_env:
+        worker_env.delenv("TORCH_COMPILE_DISABLE", raising=False)
+        for process in processes:
+            process.start()
     for process in processes:
         process.join(timeout=400)
         assert process.exitcode == 0
