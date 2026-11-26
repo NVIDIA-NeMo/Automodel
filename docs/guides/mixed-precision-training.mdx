@@ -246,6 +246,29 @@ The automatic warning about torch Adam/AdamW with trainable bf16 parameters curr
 
 </Warning>
 
+## FP32 Logits
+
+Set `model.logits_dtype` to choose the dtype of the language-model head's logits independently of the model dtype, for example `float32` to match vLLM's `head_dtype: float32` rollouts in reinforcement learning:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+  logits_dtype: float32
+```
+
+`logits_dtype` is a constructor argument of every NeMo AutoModel model class that has a language-model head, and the model builds its head with it. Hugging Face model classes have no such argument, so with `force_hf`, or for an architecture without a NeMo AutoModel implementation, the setting is ignored with a warning.
+
+The head's GEMM reads the hidden states and the weight in the head's compute dtype (bf16 by default), accumulates in fp32 and writes fp32 logits, so no logit is rounded to bf16; `mp_policy.output_dtype: float32` instead upcasts logits already rounded to bf16. The backward casts the logits gradient to the compute dtype. On the single-rank autocast path described above, the compute dtype is the weight's storage dtype: with fp32 parameters, the head's forward and backward GEMMs run in fp32. Parameters, optimizer state, checkpoints and tied embeddings are unchanged, and fp32 logits take twice the memory of bf16 logits. DeepSeek-V4, DeepSeek-V4.1, Flint, Inkling2, Mistral Large 4, DiffusionGemma, HY-MT2, Beam with a logit softcap, and Muse Spark with `use_fp32_for_output` return fp32 logits by default, as their reference implementations do; set `logits_dtype` to change it.
+
+| Configuration | Status |
+| --- | --- |
+| FSDP2, including tied embeddings; tensor parallelism, with or without sequence parallelism; pipeline parallelism | Supported. Keep an outer FSDP `mp_policy.output_dtype` of `null` or `float32`; pipeline stages declare the head's logits dtype. |
+| HSDP, context parallelism, FSDP2 combined with tensor parallelism, and QAT | Not yet validated |
+| LoRA on the language-model head | Rejected at setup, because the adapter replaces the head's projection; leave the head out with `exclude_modules: ['*.lm_head']`. |
+| `MaskedCrossEntropy` and `ChunkedCrossEntropy` | Supported. Each chunk calls the head's own projection, including Inkling2's softcap and vocabulary mask. |
+| `FusedLinearCrossEntropy` | `impl: cce` computes fp32 logits from bf16 or fp16 operands; `impl: torch_compile` rounds logits to the compute dtype. |
+
 ## Example Configs
 
 - [`examples/llm_pretrain/llama3_70b_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml): TE FusedAdam example. This keeps model storage and training checkpoints in bf16 while using fp32 master weights and optimizer state.

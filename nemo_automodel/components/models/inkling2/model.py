@@ -33,6 +33,7 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import (
     HFCheckpointingMixin,
 )
+from nemo_automodel.components.models.common.lm_head import slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -230,6 +231,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         *,
         backend: BackendConfig | None = None,
         revision: str | None = None,
+        logits_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Build the text decoder from a text or a released image/text configuration.
 
@@ -239,6 +241,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 path carries over so the loader finds the weights, and no vision tower is built.
             backend: Kernel selection; None selects the eager Torch reference.
             revision: Resolved Hub revision of the checkpoint, for the sidecar read.
+            logits_dtype: Dtype of the returned logits, FP32 by default; the projection, softcap and
+                padded-vocabulary mask run in FP32 before the cast.
         """
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -308,9 +312,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.norm: nn.Module | None = initialize_rms_norm_module(
             "torch", config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.lm_head: Inkling2LMHead | None = Inkling2LMHead(
-            config.hidden_size, config.vocab_size, bias=False, dtype=dtype
-        )
+        self.lm_head: Inkling2LMHead | None = Inkling2LMHead(config, dtype=dtype, logits_dtype=logits_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Inkling2StateDictAdapter(
                 config, experts_alias_state_dict=self.backend.experts != "te"
@@ -454,7 +456,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     seq_len,
                     width,
                     device="meta",
-                    dtype=dtype if self._pp_return_hidden_states else torch.float32,
+                    dtype=dtype if self._pp_return_hidden_states else self.lm_head.logits_dtype,
                 ),
             )
         return inputs, outputs
@@ -529,8 +531,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 are already aligned by the caller and are never shifted here.
 
         Returns:
-            FP32 logits of shape [batch, kept_sequence, vocab], softcapped before
-            unused vocabulary rows are set to negative infinity. When output_hidden_states
+            Logits of shape [batch, kept_sequence, vocab] in the head's logits_dtype, softcapped
+            before unused vocabulary rows are set to negative infinity. When output_hidden_states
             is true, return CausalLMOutputWithPast with these logits and full final
             hidden_states of shape [batch, sequence, hidden]. No input is mutated.
             Non-final pipeline stages return the residual history/layout tuple;
@@ -610,13 +612,10 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if isinstance(logits_to_keep, int):
                 if logits_to_keep < 0:
                     raise ValueError("logits_to_keep must be nonnegative")
-                selected = hidden if logits_to_keep == 0 else hidden[:, -logits_to_keep:]
-            else:
-                if logits_to_keep.ndim != 1 or logits_to_keep.dtype != torch.int64:
-                    raise ValueError("logits_to_keep indices must be int64 [kept_sequence]")
-                selected = hidden[:, logits_to_keep]
-            # The common head helper casts logits to the head/input dtype; this
-            # model's projection and output remain FP32 even with BF16 weights.
+            elif logits_to_keep.ndim != 1 or logits_to_keep.dtype != torch.int64:
+                raise ValueError("logits_to_keep indices must be int64 [kept_sequence]")
+            selected = slice_logits_to_keep(hidden, logits_to_keep)
+            # The head projects in FP32 even with BF16 weights and returns its logits_dtype.
             logits = self._project_logits(selected)
             if output_hidden_states:
                 # Automodel's loss contract consumes the final tensor here; HF
@@ -638,8 +637,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         Returns:
             Non-final stage history/layout as documented by _pipeline_boundary_metas;
-            otherwise hidden states [batch, sequence, hidden] or FP32 logits
-            [batch, sequence, vocab]. Packed history owns fresh storage and retains autograd.
+            otherwise hidden states [batch, sequence, hidden] or logits [batch, sequence,
+            vocab] in the head's logits_dtype. Packed history owns fresh storage and retains autograd.
         """
         state = self._run_layers(state, valid, positions)
         if self.lm_head is None:
@@ -691,19 +690,14 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         return state
 
     def _project_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Apply the callable head, logit softcap and unused-vocabulary mask.
+        """Call the head, which applies the logit softcap and unused-vocabulary mask.
 
         Args:
             hidden: Compute-dtype tensor of shape [batch, sequence, hidden].
 
         Returns:
-            FP32 logits [batch, sequence, vocab]; unused vocabulary rows are
-            negative infinity. The input is unchanged.
+            Logits [batch, sequence, vocab] in the head's logits_dtype; unused vocabulary
+            rows are negative infinity. The input is unchanged.
         """
         assert self.lm_head is not None
-        logits = self.lm_head(hidden)
-        cap = self.text_config.final_logit_softcapping
-        logits = cap * torch.tanh(logits / cap)
-        return logits.masked_fill(
-            torch.arange(self.vocab_size, device=logits.device) >= self.text_config.unpadded_vocab_size, float("-inf")
-        )
+        return self.lm_head(hidden)

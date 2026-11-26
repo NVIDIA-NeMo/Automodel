@@ -288,6 +288,8 @@ def build_bagel_from_hf_backbones(
 
     torch_dtype = model_cfg.get("torch_dtype", "float32")
     torch_dtype = dtype_from_str(torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
+    logits_dtype = model_cfg.get("logits_dtype")
+    logits_dtype = dtype_from_str(logits_dtype) if isinstance(logits_dtype, str) else logits_dtype
     original_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch_dtype)
@@ -297,9 +299,9 @@ def build_bagel_from_hf_backbones(
             from nemo_automodel.components.utils.model_utils import init_empty_weights
 
             with no_init_weights(), init_empty_weights():
-                model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
+                model = BagelForUnifiedMultimodal(bagel_config, backend=backend, logits_dtype=logits_dtype)
         else:
-            model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
+            model = BagelForUnifiedMultimodal(bagel_config, backend=backend, logits_dtype=logits_dtype)
     finally:
         torch.set_default_dtype(original_dtype)
 

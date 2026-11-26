@@ -150,7 +150,7 @@ class KimiK25VLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -952,14 +952,21 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         LOGGER.info(f"Model config has {num_layers} layers")
 
         config.torch_dtype = torch_dtype
-        model = cls.from_config(config, torch_dtype=torch_dtype, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
         model.name_or_path = pretrained_model_name_or_path
         cast_model_to_dtype(model, torch_dtype)
 
         LOGGER.info(f"Model created with dtype={torch_dtype}. Weights loaded by DCP via adapter.")
         return model
 
-    def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
+    def __init__(
+        self,
+        config: KimiK25VLConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        *,
+        logits_dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -968,8 +975,11 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         self.model = KimiK25VLModel(config, moe_config=moe_config, backend=self.backend)
         self.moe_config = self.model.moe_config
 
-        self.model.language_model.lm_head = initialize_linear_module(
-            self.backend.linear, config.text_config.hidden_size, config.text_config.vocab_size, bias=False
+        self.model.language_model.lm_head = LMHead(
+            config.text_config.hidden_size,
+            config.text_config.vocab_size,
+            dtype=torch.bfloat16,
+            logits_dtype=logits_dtype,
         )
 
         self.vocab_size = config.text_config.vocab_size
@@ -1098,7 +1108,9 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
             **kwargs,
         )
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         loss = None
         if labels is not None and self.lm_head is not None:

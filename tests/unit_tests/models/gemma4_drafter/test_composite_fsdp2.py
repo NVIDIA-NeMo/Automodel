@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import importlib
 import os
-import socket
 import traceback
 
 import pytest
@@ -62,16 +61,7 @@ def _gemma4_assistant_available() -> bool:
 _HAS_GEMMA4_ASSISTANT = _gemma4_assistant_available()
 
 
-def _free_port() -> int:
-    """Pick a free localhost TCP port for the rendezvous endpoint."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def _fsdp2_worker(rank: int, world_size: int, port: int, result_path: str):
+def _fsdp2_worker(rank: int, world_size: int, init_file: str, result_path: str):
     """Body of each FSDP rank.
 
     Runs to completion or writes a traceback to ``result_path`` so the parent
@@ -79,8 +69,6 @@ def _fsdp2_worker(rank: int, world_size: int, port: int, result_path: str):
     creation, CUDA context) are torn down before return.
     """
     try:
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(port)
         os.environ["RANK"] = str(rank)
         os.environ["LOCAL_RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -89,7 +77,7 @@ def _fsdp2_worker(rank: int, world_size: int, port: int, result_path: str):
         device = torch.device(f"cuda:{rank}")
         dtype = torch.bfloat16
 
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        dist.init_process_group(backend="nccl", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
 
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.fsdp import fully_shard
@@ -262,7 +250,7 @@ def test_gemma4_with_drafter_fsdp2_2gpu(tmp_path):
     """Spawn 2 NCCL ranks, FSDP2-wrap each sub-module, run joint
     forward + backward, and validate gradients on both sides."""
     world_size = 2
-    port = _free_port()
+    init_file = str(tmp_path / "process-group")
     result_path = str(tmp_path / "result")
 
     # ``mp.spawn`` returns when all workers exit; non-zero exit raises a
@@ -270,7 +258,7 @@ def test_gemma4_with_drafter_fsdp2_2gpu(tmp_path):
     # traceback is visible.
     mp.spawn(
         _fsdp2_worker,
-        args=(world_size, port, result_path),
+        args=(world_size, init_file, result_path),
         nprocs=world_size,
         join=True,
     )

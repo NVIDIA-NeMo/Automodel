@@ -484,6 +484,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # disabled default keeps _forward_backward_step working if setup() is skipped
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
+    # Standard next-token training does not enter a recipe-level autocast context.
+    _forward_autocast_dtype: torch.dtype | None = None
     domain_mixture = None
     # Tokens per pack when sequence packing is on; setup() sets it.
     pack_size = None
@@ -933,7 +935,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
-        self.mfu_calculator = self.cfg.mfu.build(model=self.model_parts[0])
+        self.mfu_calculator = self._setup_mfu(self.model_parts[0], recipe_autocast_dtype=self._forward_autocast_dtype)
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
@@ -1568,10 +1570,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
 
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        num_label_tokens = torch.tensor(
-            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+        # All three counts are needed as Python integers. Reduce and read them in one
+        # transfer so the later counts do not add more collectives and device syncs.
+        # The second count is the number of tokens in the batch, excluding any tail padding,
+        # and the third is the number of packs (one per row) when packing.
+        token_counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
+            ],
+            dtype=torch.long,
         )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        num_label_tokens, num_tokens_in_batch, num_packs = self._dp_allreduce(token_counts).tolist()
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1611,16 +1622,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
-
-        # Number of tokens in the batch, excluding any tail padding, and of packs (one per row) when packing.
-        token_counts = torch.tensor(
-            [
-                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
-            ],
-            dtype=torch.long,
-        )
-        num_tokens_in_batch, num_packs = self._dp_allreduce(token_counts).tolist()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 

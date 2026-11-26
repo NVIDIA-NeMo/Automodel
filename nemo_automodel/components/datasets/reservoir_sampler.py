@@ -15,10 +15,13 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, Iterable, Iterator
+from collections.abc import Iterable, Iterator
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
 
 
-class ReservoirSampler:
+class ReservoirSampler(Generic[T]):
     """Streaming shuffle with a fixed-size buffer.
 
     This is a bounded-memory shuffling wrapper for streaming datasets/iterables.
@@ -33,7 +36,7 @@ class ReservoirSampler:
     yielded.
     """
 
-    def __init__(self, iterator: Iterable[Dict[str, Any]], buffer_size: int, seed: int | None = None):
+    def __init__(self, iterator: Iterable[T], buffer_size: int, seed: int | None = None) -> None:
         """
         Reservoir sampler is a sampler that samples items from an iterator using a buffer.
         It is used to sample items from an iterator in a way that is memory efficient.
@@ -52,14 +55,14 @@ class ReservoirSampler:
         self._seed = seed
         self._iterable = iterator
 
-    def __iter__(self) -> Iterator[Dict[str, Any]]:
+    def __iter__(self) -> Iterator[T]:
         """
         Iterate over the iterator and sample items from the buffer.
         """
         rng = random.Random(self._seed)
         it = iter(self._iterable)
 
-        buffer: list[Dict[str, Any] | None] = []
+        buffer: list[T] = []
         for item in it:
             buffer.append(item)
             if len(buffer) == self._buffer_size:
@@ -76,13 +79,14 @@ class ReservoirSampler:
                 buffer[new_pos] = next(it)
             except StopIteration:
                 yield evicted_item
-                buffer[new_pos] = None
+                # Drop the yielded slot; the remaining items keep their order.
+                del buffer[new_pos]
                 break
             else:
                 yield evicted_item
 
         # handle tail
-        yield from filter(lambda x: x is not None, buffer)
+        yield from buffer
 
     def __len__(self) -> int:
         """
@@ -90,7 +94,7 @@ class ReservoirSampler:
         """
         raise RuntimeError("__len__ is not supported with ReservoirSampler.")
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> T:
         """
         No getitem method is supported with ReservoirSampler.
         """
