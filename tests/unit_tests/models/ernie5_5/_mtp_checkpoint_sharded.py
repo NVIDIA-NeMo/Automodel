@@ -56,6 +56,12 @@ PHASES = {
     "failure_agreement": ("n_finisher", "n_comparison"),
     "diagnostic": ("p1", "n_expert"),
 }
+# Phase groups each layout runs, in order.
+LAYOUT_GROUPS = {
+    "ep_shard_ep": ("roundtrip", "value_mismatch", "failure_agreement"),
+    "ep": ("roundtrip", "value_mismatch", "failure_agreement"),
+    "embed2d": ("diagnostic",),
+}
 PHASE_NAMES = {
     "p1": "p1_clean_load",
     "p2": "p2_export_objects",
@@ -234,25 +240,26 @@ def shard_files_report(directory: Path) -> dict:
     return report
 
 
-def worker(rank: int, world_size: int, rendezvous: str, output_dir: str, layout: str, phase_group: str) -> None:
+def worker(rank: int, world_size: int, rendezvous: str, output_dir: str, layouts: tuple[str, ...]) -> None:
     torch.set_num_threads(1)
-    result: dict = {"rank": rank}
+    result: dict = {"rank": rank, "layouts": {layout: {} for layout in layouts}}
     output = Path(output_dir) / f"rank{rank}.json"
 
-    def phase(name: str, function) -> None:
+    def phase(layout: str, name: str, function) -> None:
+        records = result["layouts"][layout]
         try:
-            result[name] = {"status": "ok", **function()}
+            records[name] = {"status": "ok", **function()}
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as error:  # noqa: BLE001
-            result[name] = {
+            records[name] = {
                 "status": "exception",
                 "type": type(error).__name__,
                 "message": str(error).strip()[-400:],
                 "trace_tail": traceback.format_exc().splitlines()[-8:],
             }
         output.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
-        print(f"RANK {rank} PHASE {name}: {result[name]['status']}", flush=True)
+        print(f"RANK {rank} LAYOUT {layout} PHASE {name}: {records[name]['status']}", flush=True)
 
     dist.init_process_group(
         "gloo",
@@ -267,7 +274,7 @@ def worker(rank: int, world_size: int, rendezvous: str, output_dir: str, layout:
         source = Ernie5_5MTPForCausalLM(rc.tiny_config("bfloat16", HEADS), rc.backend())
         rc.fill(source, 71)
         reference = root / "ref"
-        wanted = PHASES[phase_group]
+        wanted = {short for layout in layouts for group in LAYOUT_GROUPS[layout] for short in PHASES[group]}
         if rank == 0:
             rc.write_reference(reference, source)
             if "n_dense" in wanted:
@@ -279,8 +286,11 @@ def worker(rank: int, world_size: int, rendezvous: str, output_dir: str, layout:
             if "n_missing" in wanted:
                 rc.write_reference(root / "ref_missing", source, mutate=rc.drop(lambda name: name == MISSING))
         dist.barrier()
-        meshes = make_meshes(layout)
-        holder: dict = {}
+        # The phase functions below read ``meshes``, ``holder`` and ``work`` when
+        # they are called; the loop at the end binds them for each layout. Every
+        # phase builds its own model and adapter, or continues the clean load of
+        # p1 in the same layout, so the layouts and their phase groups run back
+        # to back in one process group.
 
         def p1_clean_load() -> dict:
             model, adapter, expected, stats = build(source, meshes)
@@ -335,21 +345,21 @@ def worker(rank: int, world_size: int, rendezvous: str, output_dir: str, layout:
                 is_async=False,
                 model_save_format="safetensors",
                 model_repo_id=str(reference),
-                checkpoint_dir=str(root / "save_run"),
+                checkpoint_dir=str(work / "save_run"),
             ).build(rank, 0, 0)
             report: dict = {}
             try:
-                checkpointer.save_model(model, str(root / "saved"), is_final_checkpoint=True)
+                checkpointer.save_model(model, str(work / "saved"), is_final_checkpoint=True)
                 dist.barrier()
                 with torch.no_grad():
                     for value in model.state_dict().values():
                         local(value).zero_()
-                checkpointer.load_model(model, model_path=str(root / "saved" / "model"), is_init_step=False)
+                checkpointer.load_model(model, model_path=str(work / "saved" / "model"), is_init_step=False)
             finally:
                 checkpointer.close()
             report["local_state_after_resume_load"] = local_difference(model, expected)
             if rank == 0:
-                report["per_rank_files"] = shard_files_report(root / "saved" / "model")
+                report["per_rank_files"] = shard_files_report(work / "saved" / "model")
             return report
 
         def p4_consolidated_export() -> dict:
@@ -360,16 +370,16 @@ def worker(rank: int, world_size: int, rendezvous: str, output_dir: str, layout:
                 is_async=False,
                 model_save_format="safetensors",
                 model_repo_id=str(reference),
-                checkpoint_dir=str(root / "final_run"),
+                checkpoint_dir=str(work / "final_run"),
             ).build(rank, 0, 0)
             try:
-                checkpointer.save_model(model, str(root / "saved_final"), is_final_checkpoint=True)
+                checkpointer.save_model(model, str(work / "saved_final"), is_final_checkpoint=True)
                 dist.barrier()
             finally:
                 checkpointer.close()
             if rank != 0:
                 return {}
-            consolidated_dir = root / "saved_final" / "model" / "consolidated"
+            consolidated_dir = work / "saved_final" / "model" / "consolidated"
             consolidated = rc.read_safetensors(consolidated_dir)
             reference_tensors = rc.read_safetensors(reference)
             config = json.loads((consolidated_dir / "config.json").read_text())
@@ -496,9 +506,14 @@ def worker(rank: int, world_size: int, rendezvous: str, output_dir: str, layout:
             "n_comparison": n_comparison_fails_on_one_rank,
             "p9": p9_key_plan_after_sharding,
         }
-        for short in wanted:
-            phase(PHASE_NAMES[short], table[short])
-            dist.barrier()
+        for layout in layouts:
+            meshes = make_meshes(layout)
+            holder: dict = {}
+            work = root / layout
+            for group in LAYOUT_GROUPS[layout]:
+                for short in PHASES[group]:
+                    phase(layout, PHASE_NAMES[short], table[short])
+                    dist.barrier()
     finally:
         dist.destroy_process_group()
 
@@ -674,28 +689,36 @@ def evaluate(merged: dict, phase_group: str) -> list[str]:
     return failures
 
 
-def run(root: Path, layout: str, phase_group: str) -> dict:
-    """Run one bounded phase group on four fresh Gloo ranks.
+def run(root: Path, layouts: tuple[str, ...] = tuple(LAYOUT_GROUPS)) -> dict[str, dict]:
+    """Run the phase groups of the given layouts on four fresh Gloo ranks.
 
     The two production-shaped layouts each run every positive, value-mismatch
     and error-agreement phase. The 2D embedding diagnostic needs only a clean
     load and subset-owner expert mismatch to exercise all-axis agreement.
+    Starting the ranks costs far more than the phases, so one process group
+    runs all layouts in order, each with its own meshes and save directory.
+
+    Returns:
+        For each layout, the per-rank phase records under ``ranks``, in the
+        form ``evaluate`` reads.
     """
-    if layout not in ("ep_shard_ep", "ep", "embed2d") or phase_group not in PHASES:
-        raise ValueError("Unknown checkpoint layout or phase group")
-    if (layout == "embed2d") != (phase_group == "diagnostic"):
-        raise ValueError("The 2D embedding layout requires its dedicated diagnostic group")
+    if not layouts or any(layout not in LAYOUT_GROUPS for layout in layouts):
+        raise ValueError("Unknown checkpoint layout")
     root.mkdir(parents=True, exist_ok=True)
     rank_dir = root / "ranks"
     rank_dir.mkdir()
     mp.spawn(
         worker,
-        args=(WORLD, str(root / "rendezvous"), str(rank_dir), layout, phase_group),
+        args=(WORLD, str(root / "rendezvous"), str(rank_dir), tuple(layouts)),
         nprocs=WORLD,
         join=True,
     )
-    merged = {"ranks": {str(rank): json.loads((rank_dir / f"rank{rank}.json").read_text()) for rank in range(WORLD)}}
-    failures = evaluate(merged, phase_group)
+    records = {rank: json.loads((rank_dir / f"rank{rank}.json").read_text()) for rank in range(WORLD)}
+    merged = {
+        layout: {"ranks": {str(rank): records[rank]["layouts"][layout] for rank in range(WORLD)}} for layout in layouts
+    }
+    failures = {
+        layout: {group: evaluate(merged[layout], group) for group in LAYOUT_GROUPS[layout]} for layout in layouts
+    }
     (root / "REPORT.json").write_text(json.dumps({"failures": failures, **merged}, indent=2) + "\n")
-    assert not failures, "\n".join(failures)
     return merged

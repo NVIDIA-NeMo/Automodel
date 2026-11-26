@@ -25,10 +25,12 @@ from safetensors.torch import save_file
 from torch.distributed.checkpoint.api import CheckpointException
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.models.ernie5_5.config import mtp_decoder_config
+from nemo_automodel.components.models.ernie5_5.model import Ernie5_5_MoeForCausalLM
 from nemo_automodel.components.models.ernie5_5.mtp_checkpoint_adapter import (
     Ernie5_5MTPCheckpointAdapter,
 )
-from tests.unit_tests.models.ernie5_5.test_mtp_training_local import model
+from tests.unit_tests.models.ernie5_5.test_mtp_training_local import _released_owned_tensors, backend, config, model
 from tests.unit_tests.models.ernie5_5.test_state_dict_adapter import _read_safetensors
 
 pytestmark = pytest.mark.cpu_only
@@ -98,6 +100,13 @@ def write_checkpoint(directory: Path, source, *, drop: str | None = None) -> dic
         del values["model.layers.2.e_proj.weight"]
     elif drop == "mtp_layer":
         values = {name: value for name, value in values.items() if not name.startswith("model.layers.2.")}
+    elif drop == "shared_copies":
+        # Keep the nine tensors the MTP layer owns; every other tensor under
+        # model.layers.2 is a copy of the last decoder block.
+        owned = _released_owned_tensors(source).keys()
+        values = {
+            name: value for name, value in values.items() if not name.startswith("model.layers.2.") or name in owned
+        }
     directory.mkdir(parents=True)
     save_file(values, str(directory / "model.safetensors"))
     (directory / "model.safetensors.index.json").write_text(
@@ -222,6 +231,45 @@ def test_real_checkpointer_refuses_missing_required_tensors(tmp_path: Path, drop
         checkpointer.close()
 
 
+def test_checkpoint_without_shared_copies_is_refused_by_mtp_and_loaded_by_the_decoder_class(tmp_path: Path) -> None:
+    """A checkpoint that stores the shared body once loads as decoder-only, not through the MTP class."""
+    checkpoint = tmp_path / "hf"
+    source, target = candidate(seed=7), candidate(seed=88)
+    stored = write_checkpoint(checkpoint, source, drop="shared_copies")
+    assert {name for name in stored if name.startswith("model.layers.2.")} == set(_released_owned_tensors(source))
+    assert len(stored) == 147 - 49
+
+    def checkpointer(cache: str):
+        return CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="",
+            model_save_format="safetensors",
+            model_repo_id=str(checkpoint),
+            model_cache_dir=str(tmp_path / cache),
+            save_consolidated=False,
+        ).build(0, 0, 0)
+
+    loader = checkpointer("cache_mtp")
+    try:
+        with pytest.raises(CheckpointException, match=r"Missing key in checkpoint state_dict: model\.layers\.2\."):
+            loader.load_model(target, model_path=str(checkpoint), is_init_step=True)
+    finally:
+        loader.close()
+
+    torch.manual_seed(5)
+    decoder = Ernie5_5_MoeForCausalLM(mtp_decoder_config(config()), backend())
+    decoder.initialize_weights()
+    loader = checkpointer("cache_decoder")
+    try:
+        loader.load_model(decoder, model_path=str(checkpoint), is_init_step=True)
+    finally:
+        loader.close()
+    assert_same(
+        decoder.state_dict(),
+        {name: value for name, value in source.state_dict().items() if not name.startswith("mtp.")},
+    )
+
+
 @pytest.mark.parametrize("dtype,consolidate", [("float32", False), ("bfloat16", "final")])
 def test_real_checkpointer_base_save_and_fresh_resume(
     tmp_path: Path, caplog, dtype: str, consolidate: bool | str
@@ -267,6 +315,19 @@ def test_real_checkpointer_base_save_and_fresh_resume(
         checkpointer.close()
 
 
+@pytest.fixture(scope="module")
+def four_rank_records(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
+    """Run all sharded layouts once on four ranks and share the records between the cases below.
+
+    Starting four ranks costs far more than the phases themselves, so the
+    seven layout and phase-group cases share one process group instead of
+    starting one each. Every case still checks its own phase group.
+    """
+    from tests.unit_tests.models.ernie5_5 import _mtp_checkpoint_sharded
+
+    return _mtp_checkpoint_sharded.run(tmp_path_factory.mktemp("four_rank"))
+
+
 @pytest.mark.parametrize(
     "layout,phase_group",
     [
@@ -277,12 +338,14 @@ def test_real_checkpointer_base_save_and_fresh_resume(
     + [("embed2d", "diagnostic")],
 )
 def test_four_rank_sharded_checkpoint_load_save_and_failure_agreement(
-    tmp_path: Path, layout: str, phase_group: str
+    four_rank_records: dict[str, dict], layout: str, phase_group: str
 ) -> None:
     """Exercise a bounded set of real sharded Checkpointer contracts on four ranks."""
     from tests.unit_tests.models.ernie5_5 import _mtp_checkpoint_sharded
 
-    _mtp_checkpoint_sharded.run(tmp_path / f"{layout}_{phase_group}", layout, phase_group)
+    assert phase_group in _mtp_checkpoint_sharded.LAYOUT_GROUPS[layout]
+    failures = _mtp_checkpoint_sharded.evaluate(four_rank_records[layout], phase_group)
+    assert not failures, "\n".join(failures)
 
 
 @pytest.mark.parametrize("error_kind", ["runtime", "checkpoint"])

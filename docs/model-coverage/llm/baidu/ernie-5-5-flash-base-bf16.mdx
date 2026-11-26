@@ -315,9 +315,18 @@ behavior.
 The last decoder block is reused for MTP. It is registered once and has one
 optimizer owner per physical parameter. MTP owns eight additional trainable
 tensors and its own persistent router correction bias. Released checkpoints
-store copies of the shared body under the MTP layer prefix; loading checks
-that these copies agree with the decoder body after conversion to the
-destination dtype. Export writes the released alias layout again.
+store copies of the shared body under the MTP layer prefix, and the MTP class
+requires them. A checkpoint loaded through `Ernie5_5MTPForCausalLM` must hold,
+under the MTP layer prefix, the nine MTP-owned tensors and a copy of every
+tensor of the last decoder block except its router correction bias, as the
+released checkpoint does. Loading checks that these copies agree with the
+decoder body after conversion to the destination dtype. A checkpoint that
+stores the shared body only once, under the decoder layer, is rejected at
+load with a missing-key error (`Missing key in checkpoint state_dict`); the
+decoder-only class, selected with `num_nextn_predict_layers: 0`, loads such a
+checkpoint. Deduplicated exports, which store the shared body once, are not
+currently supported by this MTP loader. Export writes the released alias
+layout again.
 
 The auxiliary targets are the next depth's labels, with document-tail and
 ignored targets excluded. Both main and auxiliary cross-entropy sums use
@@ -337,9 +346,12 @@ with one unpadded document per row and no packing metadata; its forward
 method rejects padding and KV caching and does not accept `seq_lens` or
 `packed_seq_ids`.
 Context, pipeline, and tensor parallelism are rejected during parallelization.
-LoRA and routing replay are unsupported for this MTP variant. Activation
-checkpointing can cover the other decoder blocks; the shared last block
-is excluded because it is entered twice per forward.
+LoRA and routing replay are unsupported for this MTP variant. The first
+training forward rejects any configuration that freezes an MTP-owned
+parameter, including the default LoRA configuration, which freezes every base
+parameter. This check is not a general detector for PEFT or decoder-only
+freezing. Activation checkpointing can cover the other decoder blocks; the
+shared last block is excluded because it is entered twice per forward.
 With multiple micro-batches, reused parameters can also undergo multiple
 gradient reductions, adding synchronization and BF16 rounding relative to
 one invocation. The DSA indexers and both decoder and MTP router correction

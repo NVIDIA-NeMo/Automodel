@@ -166,7 +166,8 @@ class Ernie5_5MTPForCausalLM(Ernie5_5_MoeForCausalLM):
     existing computation and MultiMax. The SFT recipe divides both main and
     auxiliary CE sums by the same global main-token count, preserving the
     configured auxiliary coefficient per token. Packed inputs, CP, PP, LoRA
-    and KV caching are unsupported.
+    and KV caching are unsupported. Training is rejected if an MTP-owned
+    parameter is frozen (including the default LoRA configuration).
     """
 
     _keep_in_fp32_modules_strict = [
@@ -247,7 +248,8 @@ class Ernie5_5MTPForCausalLM(Ernie5_5_MoeForCausalLM):
             that constructor argument is None.
 
         Raises:
-            ValueError: If KV caching, CP, padded or multi-document inputs are requested.
+            ValueError: If KV caching, CP, padded or multi-document inputs are requested, or the model is in
+                training mode and a DSA indexer parameter requires gradients or an MTP-owned parameter does not.
             TypeError: If packing metadata such as seq_lens or packed_seq_ids is supplied.
         """
         if use_cache or self.cp_mesh is not None:
@@ -255,6 +257,7 @@ class Ernie5_5MTPForCausalLM(Ernie5_5_MoeForCausalLM):
         self._validate_single_document(input_ids, attention_mask, padding_mask, position_ids)
         if self.training:
             self._require_frozen_indexers()
+            self._require_trainable_mtp()
         enabled = self.training
         callback = partial(self._forward_mtp, input_ids=input_ids) if enabled else None
         # The normal inner-module call is required: its FSDP unit owns the
@@ -266,6 +269,23 @@ class Ernie5_5MTPForCausalLM(Ernie5_5_MoeForCausalLM):
             mtp_per_depth_logits=auxiliary,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
         )
+
+    def _require_trainable_mtp(self) -> None:
+        """Reject training while an MTP-owned parameter is frozen.
+
+        Training is rejected if an MTP-owned parameter is frozen (including the default LoRA configuration,
+        which freezes every base parameter). This is not a general detector for PEFT or for frozen decoder
+        parameters. Only ``requires_grad`` is read; no tensor value is touched.
+
+        Raises:
+            ValueError: If a parameter registered under ``mtp`` does not require gradients.
+        """
+        frozen = [f"mtp.{name}" for name, parameter in self.mtp.named_parameters() if not parameter.requires_grad]
+        if frozen:
+            raise ValueError(
+                "ERNIE 5.5 MTP supports full-parameter training only: LoRA (peft) and a freeze_config that "
+                f"freezes the MTP tensors are not supported with Ernie5_5MTPForCausalLM; frozen: {frozen}"
+            )
 
     def _forward_mtp(
         self, streams: torch.Tensor, inputs: Ernie5_5AttentionInputs, *, input_ids: torch.Tensor

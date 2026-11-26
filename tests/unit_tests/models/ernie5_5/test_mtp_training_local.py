@@ -52,6 +52,21 @@ def test_mtp_decoder_config_validates_earlier_decoder_schedule_entries(invalid_r
     assert source.compress_ratios[0] == invalid_ratio
 
 
+@pytest.mark.parametrize("change", ["last_decoder_block_hca", "mtp_entry_hca", "last_decoder_block_dense"])
+def test_mtp_decoder_config_requires_the_last_block_to_be_dsa_and_moe(change: str) -> None:
+    """Reject a schedule the layer plan accepts but whose last decoder block cannot be the shared MTP body."""
+    source = config()
+    if change == "last_decoder_block_hca":
+        source.compress_ratios = [-2, 128, -2]
+    elif change == "mtp_entry_hca":
+        source.compress_ratios = [-2, -2, 128]
+    else:
+        source.first_k_dense_replace = 2
+    with pytest.raises(ValueError, match="The shared MTP body must be the last DSA/MoE decoder block"):
+        mtp_decoder_config(source)
+    assert source.num_nextn_predict_layers == 1 and source.mtp_shared_last_layer
+
+
 def config(dtype: str = "float32") -> Ernie5_5Config:
     """Return two tiny DSA blocks, dense then MoE, and one shared MTP depth."""
     return Ernie5_5Config(
@@ -296,6 +311,56 @@ def test_hf_mtp_hyperconnection_names_match_released_spelling() -> None:
     )
     with pytest.raises(ValueError, match="exactly cover"):
         candidate.state_dict_adapter.from_hf(canonical)
+
+
+def _released_owned_tensors(candidate: Ernie5_5MTPForCausalLM) -> dict[str, torch.Tensor]:
+    """Return the nine MTP-owned tensors under their literal released names and layouts.
+
+    The fixture has two decoder layers, so the MTP layer is ``model.layers.2``.
+    The released head projection is [streams * hidden, streams], the transpose
+    of the native parameter.
+    """
+    mtp = candidate.mtp
+    return {
+        "model.layers.2.enorm.weight": mtp.enorm.weight,
+        "model.layers.2.hnorm.weight": mtp.hnorm.weight,
+        "model.layers.2.e_proj.weight": mtp.e_proj.weight,
+        "model.layers.2.h_proj.weight": mtp.h_proj.weight,
+        "model.layers.2.hc_head_fn": mtp.hyper_head.hc_fn.T,
+        "model.layers.2.hc_head_base": mtp.hyper_head.hc_base,
+        "model.layers.2.hc_head_scale": mtp.hyper_head.hc_scale,
+        "model.layers.2.shared_head.norm.weight": mtp.final_norm.weight,
+        "model.layers.2.block_sparse_moe.e_score_correction_bias": mtp.router_state.e_score_correction_bias,
+    }
+
+
+def test_owned_mtp_tensors_use_the_literal_released_names_in_both_directions() -> None:
+    """Pin the nine released names independently of the adapter's own name table.
+
+    Every other expected checkpoint in these tests is produced by that table, so
+    exchanged or misspelled entries would agree with themselves in a round trip.
+    """
+    torch.manual_seed(3)
+    source = model(seed=7)
+    with torch.no_grad():
+        for parameter in source.mtp.parameters():
+            parameter.copy_(torch.randn_like(parameter))
+        source.mtp.router_state.e_score_correction_bias.copy_(torch.randn(4))
+    released = _released_owned_tensors(source)
+    assert len(released) == 9
+    exported = source.state_dict_adapter.to_hf(source.state_dict())
+    for name, value in released.items():
+        torch.testing.assert_close(exported[name], value, rtol=0, atol=0, msg=name)
+
+    # Incoming direction: a mapping whose nine MTP entries are written by hand
+    # under the released names, loaded into a model built from another seed.
+    target = model(seed=88)
+    incoming = dict(target.state_dict_adapter.to_hf(target.state_dict()))
+    written = {name: torch.randn_like(value) for name, value in released.items()}
+    incoming.update(written)
+    target.load_state_dict(target.state_dict_adapter.from_hf(incoming), strict=True)
+    for name, value in _released_owned_tensors(target).items():
+        torch.testing.assert_close(value, written[name], rtol=0, atol=0, msg=name)
 
 
 def _nonidentity_model(dtype: str = "float32") -> Ernie5_5MTPForCausalLM:
