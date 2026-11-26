@@ -2397,10 +2397,9 @@ def gemma4_prefix_collate_fn(
     """Collate function for Gemma4 models with thinking-channel prefix.
 
     Wraps ``default_collate_fn`` and injects ``<|channel>thought\\n<channel|>``
-    after every ``<|turn>model\\n`` marker before labels are built.  The injected
-    tokens are automatically masked to -100 by ``build_labels_from_template``
-    (which only unmasks tokens inside assistant turns), so the model sees its
-    expected thinking prefix without being penalised for it.
+    after every ``<|turn>model\\n`` marker before labels are built.  The model
+    then sees its expected thinking prefix.  The injected tokens are supervised
+    like the answer that follows them; see :func:`gemma4_inject_thinking_prefix`.
     """
 
     def _inject(batch, proc):
