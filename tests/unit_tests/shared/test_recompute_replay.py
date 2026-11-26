@@ -16,6 +16,8 @@
 from contextlib import contextmanager
 
 import pytest
+import torch
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
 
@@ -135,3 +137,28 @@ def test_checkpoint_context_fn_without_inner_contexts() -> None:
         assert channel.current() is not None and channel.current()[1] == "record"
     with recompute_ctx:
         assert channel.current() is not None and channel.current()[1] == "replay"
+
+
+def test_retained_graph_replays_the_original_record_on_every_backward() -> None:
+    channel: RecomputeReplay[float] = RecomputeReplay("test")
+    modes: list[str] = []
+
+    def block(x: torch.Tensor) -> torch.Tensor:
+        bound = channel.current()
+        assert bound is not None
+        recorder, mode = bound
+        modes.append(mode)
+        if mode == "record":
+            recorder.record(3.0)
+            return x * x * 3.0
+        taken = recorder.take()
+        assert taken == 3.0
+        return x * x * taken
+
+    x = torch.arange(1.0, 4.0, requires_grad=True)
+    y = checkpoint(block, x, use_reentrant=False, context_fn=channel.checkpoint_context_fn(None))
+    for retain in (True, True, False):
+        (grad,) = torch.autograd.grad(y.sum(), x, retain_graph=retain)
+        torch.testing.assert_close(grad, 6.0 * x.detach())
+    # One recorded forward, then a replay that took the record on each of the three backward passes.
+    assert modes == ["record", "replay", "replay", "replay"]
