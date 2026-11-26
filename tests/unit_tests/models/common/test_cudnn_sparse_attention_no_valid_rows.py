@@ -20,8 +20,10 @@ import torch
 from nemo_automodel.components.models.common import cudnn_sparse_attention as csa
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not csa.is_cudnn_sparse_attention_available(),
-    reason="requires the cuDNN DSA and FlashMLA kernels",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 9
+    or not csa.is_cudnn_sparse_attention_available(),
+    reason="requires an SM90+ GPU and the cuDNN DSA and FlashMLA kernels",
 )
 
 _HEAD_DIM, _VALUE_DIM, _HEADS, _TOPK = 576, 512, 8, 64

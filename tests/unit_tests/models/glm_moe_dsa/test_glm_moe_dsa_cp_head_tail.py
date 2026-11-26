@@ -356,7 +356,10 @@ def test_replayed_head_tail_gather_permutes_the_gradient_back_before_the_reduce_
     torch.testing.assert_close(replayed_local.grad, rank_order_weights[: total // 2] + rank_order_weights[total // 2 :])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or not is_cudnn_dsa_available(), reason="cuDNN DSA kernels")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9 or not is_cudnn_dsa_available(),
+    reason="requires an SM90+ GPU and the cuDNN DSA kernels",
+)
 def test_cudnn_indexer_head_tail_queries_select_the_same_keys_as_the_full_sequence():
     from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import cudnn_indexer_topk
 
