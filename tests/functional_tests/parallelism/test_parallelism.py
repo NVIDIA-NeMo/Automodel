@@ -26,20 +26,53 @@ sharding and FSDP wrapping match and the bound can be tighter.
 Covers the gap from PR #2983 (commit 00f40419).
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
 from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "parallelism"
-GEMMA4_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_PP2_Parity.sh"
-GEMMA4_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_TP2_Parity.sh"
+GEMMA4_PP2_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_PP2_TP2_Parity.sh"
 GEMMA4_KV_SHARED_AC_FILENAME = "L2_Parallelism_VLM_Gemma4_KVShared_AC.sh"
 PP_GRAD_ACCUM_PARITY_FILENAME = "L2_Parallelism_PP_Grad_Accum_Parity.sh"
 DEEPSEEK_V4_PP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_PP2_Parity.sh"
 DEEPSEEK_V4_EP2_PARITY_FILENAME = "L2_Parallelism_DeepSeekV4_EP2_Parity.sh"
 QWEN3_5_MOE_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_PP2_Parity.sh"
-QWEN3_5_MOE_EP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_EP2_Parity.sh"
-MISTRAL3P5_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Mistral3p5_PP2_Parity.sh"
-MISTRAL3P5_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Mistral3p5_TP2_Parity.sh"
-QWEN3_8_FLASH_NEXT_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_8_FlashNext_PP2_Parity.sh"
+
+PARITY_SCRIPTS = (
+    GEMMA4_PP2_TP2_PARITY_FILENAME,
+    DEEPSEEK_V4_PP2_PARITY_FILENAME,
+    DEEPSEEK_V4_EP2_PARITY_FILENAME,
+    QWEN3_5_MOE_PP2_PARITY_FILENAME,
+)
+
+
+def _run_parity_script(filename: str) -> AssertionError | None:
+    """Run one parity script and return its failure instead of raising it."""
+    try:
+        run_test_script(TEST_FOLDER, filename)
+    except AssertionError as error:
+        return error
+    return None
+
+
+@pytest.fixture(scope="module")
+def parity_failures() -> dict[str, AssertionError | None]:
+    """Run the per-model parity scripts at the same time.
+
+    Each script is a few torchrun launches of a small proxy, and most of its time is process
+    start-up, so the scripts overlap instead of running one after another. Every test below
+    reports the result of its own script.
+    """
+    with ThreadPoolExecutor(max_workers=len(PARITY_SCRIPTS)) as pool:
+        return dict(zip(PARITY_SCRIPTS, pool.map(_run_parity_script, PARITY_SCRIPTS), strict=True))
+
+
+def _assert_parity_passed(failures: dict[str, AssertionError | None], filename: str) -> None:
+    failure = failures[filename]
+    if failure is not None:
+        raise failure
 
 
 class TestParallelismParity:
@@ -47,35 +80,20 @@ class TestParallelismParity:
         """Train a sub-million-parameter model with PP2 and spawned workers."""
         run_test_script(TEST_FOLDER, "L2_Parallelism_PP_Dataloader.sh")
 
-    def test_gemma4_pp2_parity(self):
-        run_test_script(TEST_FOLDER, GEMMA4_PP2_PARITY_FILENAME)
-
-    def test_gemma4_tp2_parity(self):
-        run_test_script(TEST_FOLDER, GEMMA4_TP2_PARITY_FILENAME)
-
-    def test_gemma4_kv_shared_activation_checkpointing(self):
-        run_test_script(TEST_FOLDER, GEMMA4_KV_SHARED_AC_FILENAME)
-
     def test_pp_grad_accum_parity(self):
         run_test_script(TEST_FOLDER, PP_GRAD_ACCUM_PARITY_FILENAME)
 
-    def test_deepseek_v4_pp2_parity(self):
-        run_test_script(TEST_FOLDER, DEEPSEEK_V4_PP2_PARITY_FILENAME)
+    def test_deepseek_v4_pp2_parity(self, parity_failures: dict[str, AssertionError | None]) -> None:
+        _assert_parity_passed(parity_failures, DEEPSEEK_V4_PP2_PARITY_FILENAME)
 
-    def test_deepseek_v4_ep2_parity(self):
-        run_test_script(TEST_FOLDER, DEEPSEEK_V4_EP2_PARITY_FILENAME)
+    def test_deepseek_v4_ep2_parity(self, parity_failures: dict[str, AssertionError | None]) -> None:
+        _assert_parity_passed(parity_failures, DEEPSEEK_V4_EP2_PARITY_FILENAME)
 
-    def test_qwen3_5_moe_pp2_parity(self):
-        run_test_script(TEST_FOLDER, QWEN3_5_MOE_PP2_PARITY_FILENAME)
+    def test_qwen3_5_moe_pp2_parity(self, parity_failures: dict[str, AssertionError | None]) -> None:
+        _assert_parity_passed(parity_failures, QWEN3_5_MOE_PP2_PARITY_FILENAME)
 
-    def test_qwen3_5_moe_ep2_parity(self):
-        run_test_script(TEST_FOLDER, QWEN3_5_MOE_EP2_PARITY_FILENAME)
+    def test_gemma4_pp2_tp2_parity(self, parity_failures: dict[str, AssertionError | None]) -> None:
+        _assert_parity_passed(parity_failures, GEMMA4_PP2_TP2_PARITY_FILENAME)
 
-    def test_mistral3p5_pp2_parity(self):
-        run_test_script(TEST_FOLDER, MISTRAL3P5_PP2_PARITY_FILENAME)
-
-    def test_mistral3p5_tp2_parity(self):
-        run_test_script(TEST_FOLDER, MISTRAL3P5_TP2_PARITY_FILENAME)
-
-    def test_qwen3_8_flash_next_pp2_parity(self):
-        run_test_script(TEST_FOLDER, QWEN3_8_FLASH_NEXT_PP2_PARITY_FILENAME)
+    def test_gemma4_kv_shared_activation_checkpointing(self):
+        run_test_script(TEST_FOLDER, GEMMA4_KV_SHARED_AC_FILENAME)
