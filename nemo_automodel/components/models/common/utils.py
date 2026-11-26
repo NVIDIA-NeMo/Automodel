@@ -734,9 +734,9 @@ class BackendConfig:
         cp_query_layout: Which global query positions each context-parallel rank owns for models
             whose attention gathers K/V inside the model (GLM-5.x DSA). ``"contiguous"`` (default):
             rank r keeps tokens ``[r * T/cp, (r + 1) * T/cp)``. ``"head_tail"``: the sequence is cut
-            into ``2 * cp`` chunks and rank r keeps chunks r and ``2 * cp - 1 - r``, so the causal
-            (quadratic) indexer work is the same on every rank; the top-k sparse attention is uniform
-            per query either way. Needs the padded sequence divisible by ``2 * cp``.
+            into ``2 * cp`` chunks and rank r keeps chunks r and ``2 * cp - 1 - r``. This balances
+            causal indexer work for a single unpadded document. With packed documents or padding,
+            the split depends on the document boundaries. The padded length must be divisible by ``2 * cp``.
         benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
             with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
             permuted token counts) is identical for every microbatch. Skips the

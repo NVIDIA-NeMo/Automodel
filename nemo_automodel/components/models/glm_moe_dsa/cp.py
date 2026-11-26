@@ -42,8 +42,9 @@ glm_dsa_gather_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("GLM DSA 
 
 # Which global query positions a CP rank owns. "contiguous": rank r keeps tokens
 # [r * T/cp, (r + 1) * T/cp). "head_tail": the sequence is cut into 2 * cp chunks and rank r keeps
-# chunks r and 2 * cp - 1 - r, so the causal (quadratic) indexer work is the same on every rank;
-# the top-k sparse attention itself is uniform per query and does not care.
+# chunks r and 2 * cp - 1 - r, which balances the causal (quadratic) indexer work for a single unpadded
+# document (packed documents or padding make it depend on the document boundaries); the top-k sparse
+# attention itself is uniform per query and does not care.
 QueryLayout = Literal["contiguous", "head_tail"]
 QUERY_LAYOUTS: tuple[QueryLayout, ...] = ("contiguous", "head_tail")
 
