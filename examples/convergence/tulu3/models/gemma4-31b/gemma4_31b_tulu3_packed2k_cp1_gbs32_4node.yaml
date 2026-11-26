@@ -70,7 +70,8 @@ dataset:
   chat_template: examples/convergence/tulu3/models/gemma4-31b/chat_template.jinja
 
 # 2k sequence packing (multiple conversations per sample); the gemma4 hook injects
-# the thinking prefix and the packer masks it out of the loss.
+# the thinking prefix after every model turn marker. Its four tokens are supervised;
+# the generation prompt at evaluation already ends with the prefix.
 packed_sequence:
   pretokenize: true
   max_length: 2048
