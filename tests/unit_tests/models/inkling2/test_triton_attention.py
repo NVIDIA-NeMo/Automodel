@@ -263,6 +263,162 @@ def test_backward_writes_every_element_of_its_buffers(layer: int, kind: str, mon
     _assert_matches(actual, reference, torch.float32)
 
 
+def _shifted_layout(
+    kind: str, window: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Return a layout whose rows start with padding and a first document at a chosen position.
+
+    A row is (padding, first position, document lengths): the documents follow the padding without
+    gaps, and the first one starts at the given position, as a document does whose earlier tokens
+    are not in the row.
+
+    Returns:
+        Query validity and positions [batch, sequence], key validity and positions
+        [batch, key_sequence], the document number of every key [batch, key_sequence] (-1 for
+        padding and for an empty halo slot) and the query offset. ``cp_first_shard`` is the first
+        rank of a CP split: ``window`` empty halo slots precede its shard.
+    """
+    rows = {
+        "from_zero": [(5, 0, [100]), (40, 0, [80, 20])],
+        # Positions equal to the column index, and a first position that is neither zero nor the column.
+        "left_padded": [(5, 5, [100]), (40, 3, [80, 20])],
+        "cp_first_shard": [(2, 3, [120]), (0, 7, [60, 90])],
+    }[kind]
+    valid = torch.zeros(len(rows), SEQUENCE, dtype=torch.bool)
+    positions = torch.zeros(len(rows), SEQUENCE, dtype=torch.long)
+    document = torch.full((len(rows), SEQUENCE), -1)
+    for row, (padding, first_position, lengths) in enumerate(rows):
+        start = padding
+        for number, length in enumerate(lengths):
+            valid[row, start : start + length] = True
+            positions[row, start : start + length] = torch.arange(length) + (first_position if number == 0 else 0)
+            document[row, start : start + length] = number
+            start += length
+        assert start <= SEQUENCE
+    if kind != "cp_first_shard":
+        return valid, positions, valid, positions, document, 0
+    halo = torch.zeros(len(rows), window, dtype=torch.long)
+    return (
+        valid,
+        positions,
+        torch.cat((halo.bool(), valid), dim=1),
+        torch.cat((halo, positions), dim=1),
+        torch.cat((halo - 1, document), dim=1),
+        window,
+    )
+
+
+def _visible_keys(key_document: torch.Tensor, row: int, column: int, window: int | None) -> list[int]:
+    """Return the key columns a query at a global column sees: its own document, causal, within the window.
+
+    Args:
+        key_document: Document number of every key [batch, key_sequence], -1 where there is no token.
+        row: Batch row of the query.
+        column: Global key column of the query.
+        window: Largest number of keys a query sees, or None.
+    """
+    own = int(key_document[row, column])
+    if own < 0:
+        return []
+    oldest = 0 if window is None else max(0, column - (window - 1))
+    return [key for key in range(oldest, column + 1) if int(key_document[row, key]) == own]
+
+
+@pytest.mark.parametrize("window", [None, WINDOW])
+@pytest.mark.parametrize("kind", ["from_zero", "left_padded", "cp_first_shard"])
+def test_key_ranges_hold_exactly_the_keys_of_each_query(kind: str, window: int | None) -> None:
+    valid, positions, key_valid, key_positions, key_document, query_offset = _shifted_layout(kind, WINDOW)
+    first, last = triton_attention.key_ranges(valid, positions, key_valid, key_positions, query_offset, window)
+    for row in range(valid.shape[0]):
+        last_query = [-1] * key_valid.shape[1]
+        for query in range(valid.shape[1]):
+            column = query + query_offset
+            visible = _visible_keys(key_document, row, column, window)
+            assert list(range(int(first[row, query]), column + 1)) == visible, (row, query)
+            for key in visible:
+                last_query[key] = query
+        assert last[row].tolist() == last_query, row
+
+
+def _from_the_definition(key_document: torch.Tensor) -> Callable[[Inkling2Attention, Case], torch.Tensor]:
+    """Return the attention written out per query in FP64, with the documents given by number.
+
+    Args:
+        key_document: Document number of every key [batch, key_sequence], -1 where there is no token.
+
+    Returns:
+        A function of a module and a case that gives the context [batch, sequence, heads, head_dim]:
+        over the keys of the query's own document up to the query (inside the window in a local
+        layer), the softmax of the scaled QK product plus the relative logit of the distance,
+        with one more zero-valued entry for the sink.
+    """
+
+    def attend(module: Inkling2Attention, case: Case) -> torch.Tensor:
+        q, k, v, sink = (tensor.double().cpu() for tensor in (case.q, case.k, case.v, case.sink))
+        # The relative logits are rounded to the input dtype before they enter the softmax.
+        by_distance = (case.r @ case.table).double().cpu()
+        extent = by_distance.shape[-1]
+        groups = module.heads // module.kv_heads
+        contexts = []
+        for row in range(q.shape[0]):
+            for query in range(q.shape[1]):
+                column = query + case.query_offset
+                visible = _visible_keys(key_document, row, column, module.window if module.is_local else None)
+                if not visible:
+                    contexts.append(q.new_zeros(module.heads, module.head_dim))
+                    continue
+                keys = torch.tensor(visible)
+                scores = torch.einsum("hd,nhd->nh", q[row, query], k[row, keys].repeat_interleave(groups, dim=1))
+                distance = column - keys
+                relative = by_distance[row, query][:, distance.clamp(max=extent - 1)].T * (distance < extent)[:, None]
+                logits = torch.cat((scores * module.head_dim**-0.5 + relative, sink[row, query][None]))
+                weights = logits.softmax(0)[:-1]
+                contexts.append(torch.einsum("nh,nhd->hd", weights, v[row, keys].repeat_interleave(groups, dim=1)))
+        return torch.stack(contexts).view(*q.shape).to(case.q.device)
+
+    return attend
+
+
+def _shifted_case(module: Inkling2Attention, kind: str, dtype: torch.dtype) -> tuple[Case, torch.Tensor]:
+    """Return a case of a shifted layout with random keys in every slot, and its key documents."""
+    valid, positions, key_valid, key_positions, key_document, query_offset = _shifted_layout(kind, module.window)
+    batch, sequence = valid.shape
+    generator = torch.Generator().manual_seed(11)
+
+    def leaf(*shape: int, scale: float = 1.0) -> torch.Tensor:
+        return (scale * torch.randn(*shape, generator=generator)).to("cuda", dtype).requires_grad_(True)
+
+    case = Case(
+        q=leaf(batch, sequence, module.heads, module.head_dim),
+        k=leaf(batch, key_valid.shape[1], module.kv_heads, module.head_dim),
+        v=leaf(batch, key_valid.shape[1], module.kv_heads, module.head_dim),
+        r=leaf(batch, sequence, module.heads, module.d_rel),
+        table=leaf(module.d_rel, module.rel_extent, scale=0.5),
+        sink=leaf(batch, sequence, module.heads),
+        valid=valid.cuda(),
+        positions=positions.cuda(),
+        key_valid=key_valid.cuda(),
+        key_positions=key_positions.cuda(),
+        query_offset=query_offset,
+    )
+    return case, key_document
+
+
+@needs_gpu_triton
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("kind", ["from_zero", "left_padded", "cp_first_shard"])
+@pytest.mark.parametrize("layer", [LOCAL_LAYER, FULL_LAYER])
+def test_kernels_attend_only_the_tokens_of_a_document_that_starts_at_a_nonzero_position(
+    layer: int, kind: str, dtype: torch.dtype
+) -> None:
+    """Padding and empty halo slots before a row's first document hold no key, whatever its first position."""
+    module = _attention(layer, "eager")
+    case, key_document = _shifted_case(module, kind, dtype)
+    expected = _evaluate(_from_the_definition(key_document), module, case)
+    assert expected["sink"].abs().max() > 0 and expected["table"].abs().max() > 0
+    _assert_matches(_evaluate(_kernel, module, case), expected, dtype)
+
+
 def test_launch_shapes_fit_the_profile_layout() -> None:
     """The kernels that read whole tiles keep them inside one layout block and inside the rows."""
     launches = (triton_attention._LAUNCH["forward"], triton_attention._LAUNCH["query"], triton_attention._LAUNCH_FP32)

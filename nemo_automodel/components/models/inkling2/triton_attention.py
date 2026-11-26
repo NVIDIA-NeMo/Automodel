@@ -719,14 +719,18 @@ def key_ranges(
         ``last`` int32 [batch, key_sequence]: the last local query that sees each key, or -1.
         A document is a run of valid tokens whose positions increase by one, so the keys
         between a query's document start and the query itself are exactly its own document.
+        A row's first document may start at a nonzero position without its earlier tokens
+        (after left padding, or after the empty halo of the first CP rank); its range starts
+        at the first key of the query's run of valid keys.
     """
     sequence, keys = valid.shape[1], key_valid.shape[1]
     column = torch.arange(sequence, device=valid.device) + query_offset
-    first = (column - positions).clamp_min(0)
+    key_column = torch.arange(keys, device=valid.device)
+    run_start = torch.where(key_valid, 0, key_column + 1).cummax(1).values
+    first = torch.maximum((column - positions).clamp_min(0), run_start[:, query_offset : query_offset + sequence])
     if window is not None:
         first = torch.maximum(first, column - (window - 1))
     first = torch.where(valid, first, column + 1)
-    key_column = torch.arange(keys, device=valid.device)
     origin = key_column - key_positions
     ends_run = torch.ones_like(key_valid)
     ends_run[:, :-1] = ~key_valid[:, 1:] | (origin[:, 1:] != origin[:, :-1])
