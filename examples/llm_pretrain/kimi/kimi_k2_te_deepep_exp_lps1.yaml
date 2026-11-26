@@ -4,12 +4,12 @@
 # Synthetic pretraining counterpart of examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml
 # Fixed-length mock tokens; runtime tuning is canonical. GPU validation is pending.
 
-# EXPERIMENT ONLY (perf-gap A/B on Core Models); not for merge. LBS 16 (GA 1).
+# EXPERIMENT ONLY (perf-gap A/B on Core Models); not for merge. LBS 16 + layers_per_stage 1.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 512
-  local_batch_size: 16
+  local_batch_size: 16  # one 16-microbatch PP schedule per step (GA 1)
   ckpt_every_steps: 1000
   val_every_steps: null
   num_epochs: null
@@ -29,7 +29,7 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2
+    layers_per_stage: 1
 dist_env:
   backend: nccl
   timeout_minutes: 10
