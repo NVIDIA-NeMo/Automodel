@@ -213,7 +213,8 @@ def _forward_backward(model, inputs: dict, loss_weights: torch.Tensor) -> tuple[
 
 def _relative_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
     scale = reference.float().abs().max().clamp_min(1e-6)
-    return float((actual.float() - reference.float()).abs().max() / scale)
+    error = (actual.float() - reference.float()).abs().max() / scale
+    return torch.nan_to_num(error, nan=torch.inf, posinf=torch.inf).item()
 
 
 def _log(rank: int, started: float, message: str) -> None:
@@ -381,8 +382,9 @@ def _parity_worker(rank: int, port: int) -> None:
     not torch.cuda.is_available()
     or not is_cudnn_dsa_available()
     or not dist.is_nccl_available()
-    or torch.cuda.device_count() < _WORLD_SIZE,
-    reason="requires the cuDNN DSA kernels, NCCL and at least two CUDA devices",
+    or torch.cuda.device_count() < _WORLD_SIZE
+    or any(torch.cuda.get_device_capability(rank)[0] < 9 for rank in range(_WORLD_SIZE)),
+    reason="requires the cuDNN DSA kernels, NCCL and two SM90+ GPUs",
 )
 def test_cp2_contiguous_and_head_tail_match_the_single_process_model() -> None:
     mp.spawn(_parity_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
