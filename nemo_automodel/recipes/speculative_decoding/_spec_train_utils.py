@@ -296,22 +296,6 @@ def check_resumed_mask_token_id(meta: dict, mask_token_id: int, ckpt_dir: str) -
         )
 
 
-def resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
-    """Convert a ``wandb:`` config block into ``wandb.init`` kwargs, or ``None``.
-
-    ``enable`` is the examples' documentation-only opt-in flag (W&B logging is
-    opt-in: example configs ship the block with ``enable: false`` so users start
-    logging by flipping it to ``true`` instead of commenting the block in/out);
-    it is not a real ``wandb.init`` kwarg, so strip it before forwarding the rest
-    (passing it through raises ``TypeError: init() got an unexpected keyword
-    argument 'enable'``). Returns ``None`` when ``enable`` is explicitly ``False``.
-    """
-    kwargs = dict(wandb_cfg)
-    if kwargs.pop("enable", True) is False:
-        return None
-    return kwargs
-
-
 def resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmup_steps: int = 1) -> int:
     """Return the LR warmup length in optimizer steps.
 

@@ -242,7 +242,7 @@ The default `peft.lora_dtype: null` inherits the base layer dtype when adapters 
 On a single-rank FSDP2 setup, parameters remain unsharded and mixed LoRA submodules are cast to the compute dtype, so `peft.lora_dtype: float32` does not guarantee fp32 adapter storage or optimizer moments there.
 
 <Warning>
-The automatic warning about torch Adam/AdamW with trainable bf16 parameters currently skips PEFT runs. Absence of this warning does not mean your adapters or their optimizer state are fp32. Check `peft.lora_dtype` and the actual trainable parameter dtypes; use `peft.lora_dtype: float32` to request fp32 adapter storage with torch Adam/AdamW on multi-rank FSDP2 runs.
+The automatic warning about torch Adam/AdamW with trainable bf16 parameters currently skips PEFT runs, except in the speculative-decoding (EAGLE) recipes, which warn for BF16 LoRA drafts too. Absence of this warning does not mean your adapters or their optimizer state are fp32. Check `peft.lora_dtype` and the actual trainable parameter dtypes; use `peft.lora_dtype: float32` to request fp32 adapter storage with torch Adam/AdamW on multi-rank FSDP2 runs.
 
 </Warning>
 

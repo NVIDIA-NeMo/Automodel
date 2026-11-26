@@ -15,8 +15,6 @@
 # Benchmarking config for GPT-OSS 120B Te Deepep, tuned for GB200.
 #
 # GB200-specific deltas vs the generic gptoss_120b_te_deepep.yaml:
-#   - peak_tflops: 2500  (GB200 BF16 dense peak; the generic recipe uses the
-#     H100 989 value, which inflates the reported MFU on Blackwell)
 #   - local_batch_size: 4, GBS=512 (GA=4), activation_checkpointing=true.
 #     Checkpointing preserves headroom for backward and lazy Adam-state materialization;
 #     FusedLinearCrossEntropy separately removes the full-vocabulary logits allocation.
@@ -31,7 +29,6 @@ seed: 1234
 
 benchmark:
   warmup_steps: 10
-  peak_tflops: 2500  # GB200 BF16 dense peak TFLOPs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

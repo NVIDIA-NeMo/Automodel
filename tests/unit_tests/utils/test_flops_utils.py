@@ -15,9 +15,10 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_automodel._transformers import mfu as mfu_module
-from nemo_automodel._transformers.mfu import AutoMFU, MFUConfig, get_device_flops
+from nemo_automodel._transformers.mfu import AutoMFU, get_device_flops
 from nemo_automodel.components.utils import flops_utils
 
 
@@ -331,9 +332,21 @@ def test_calculate_mfu_warns_for_legacy_default_reference():
     assert actual_mfu == 100.0
 
 
-def test_automfu_h100_reference_uses_dense_bf16_peak():
+@pytest.fixture(autouse=True)
+def _unset_cublas_tf32_override(monkeypatch):
+    """FP32 peaks read NVIDIA_TF32_OVERRIDE, which tests/unit_tests/models/beam/conftest.py sets to 0 session-wide."""
+    monkeypatch.delenv("NVIDIA_TF32_OVERRIDE", raising=False)
+
+
+def _mock_cuda_device(monkeypatch, name):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: name)
+
+
+def test_automfu_h100_reference_uses_dense_bf16_peak(monkeypatch):
     """Test AutoMFU's H100 dense-BF16 training convention."""
-    h100_tflops = get_device_flops(unit="T", device_name="H100")
+    _mock_cuda_device(monkeypatch, "NVIDIA H100 80GB HBM3")
+    h100_tflops = get_device_flops(unit="T")
 
     assert h100_tflops == 989.0
 
@@ -345,8 +358,9 @@ def test_automfu_h100_reference_uses_dense_bf16_peak():
         ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 503.8),
     ],
 )
-def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expected_tflops):
-    assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
+def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expected_tflops, monkeypatch):
+    _mock_cuda_device(monkeypatch, device_name)
+    assert get_device_flops(unit="T") == expected_tflops
 
 
 @pytest.mark.parametrize(
@@ -358,13 +372,26 @@ def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expec
         ("NVIDIA GB300", 2500.0),
     ],
 )
-def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expected_tflops):
-    assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
+def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expected_tflops, monkeypatch):
+    _mock_cuda_device(monkeypatch, device_name)
+    assert get_device_flops(unit="T") == expected_tflops
 
 
-def test_get_device_flops_recognizes_vr200():
-    """VR200 reports "NVIDIA VR NVL72"; an unknown name would make every step log MFU 0."""
-    assert get_device_flops(unit="T", device_name="NVIDIA VR NVL72") == 4000.0
+@pytest.mark.parametrize(
+    "dtype, fp32_precision, expected",
+    [
+        (torch.bfloat16, "ieee", 4000.0),
+        (torch.float8_e4m3fn, "ieee", 17500.0),
+        (torch.float4_e2m1fn_x2, "ieee", 35000.0),
+        (torch.float32, "tf32", 2000.0),
+        (torch.float32, "ieee", 130.0),
+    ],
+)
+def test_get_device_flops_recognizes_vr200(dtype, fp32_precision, expected, monkeypatch):
+    """VR200 reports "NVIDIA VR NVL72"; a missing entry would make every step log MFU 0."""
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", fp32_precision)
+    _mock_cuda_device(monkeypatch, "NVIDIA VR NVL72")
+    assert get_device_flops(dtype=dtype) == expected
 
 
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):
@@ -373,7 +400,11 @@ def test_get_device_flops_detects_current_cuda_device(monkeypatch):
     monkeypatch.setattr(
         mfu_module.torch.cuda,
         "get_device_name",
-        lambda device: "NVIDIA H100 80GB HBM3" if device == 3 else "unexpected",
+        lambda device=None: (
+            "NVIDIA H100 80GB HBM3"
+            if (torch.cuda.current_device() if device is None else device) == 3
+            else "unexpected"
+        ),
     )
 
     assert get_device_flops(unit="T") == 989.0
@@ -381,24 +412,130 @@ def test_get_device_flops_detects_current_cuda_device(monkeypatch):
 
 def test_automfu_defaults_to_detected_device_peak(monkeypatch):
     monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    monkeypatch.setattr(mfu_module, "get_device_flops", lambda *, unit, device_name: 989.0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA H100 80GB HBM3")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
     calculator = AutoMFU(SimpleNamespace())
 
     assert calculator.reference_mfu == 989.0
 
 
-def test_automfu_accepts_precision_peak_override(monkeypatch):
+@pytest.mark.parametrize(
+    "name, dtype, expected",
+    [
+        ("NVIDIA RTX 5880 Ada Generation", torch.bfloat16, 277.1),
+        ("NVIDIA RTX 5880 Ada Generation", torch.float8_e4m3fn, 554.2),
+        ("AMD Instinct MI300X", torch.bfloat16, float("inf")),
+        ("Ascend910", torch.bfloat16, float("inf")),
+        ("Ascend 910B", torch.bfloat16, float("inf")),
+        ("NVIDIA H100 80GB HBM3", torch.float16, 989.0),
+        ("NVIDIA H100 80GB HBM3", torch.float8_e4m3fn, 1979.0),
+        ("NVIDIA H100 PCIe", torch.float8_e4m3fn, 1513.0),
+        ("NVIDIA H100 NVL", torch.bfloat16, 835.5),
+        ("NVIDIA H100 80GB HBM3 MIG 1g.10gb", torch.bfloat16, float("inf")),
+        ("NVIDIA H100 80GB HBM3", torch.float8_e5m2, 1979.0),
+        ("NVIDIA H200", torch.float8_e4m3fn, 1979.0),
+        ("NVIDIA H200 NVL", torch.float8_e4m3fn, 1670.5),
+        ("NVIDIA GB200", torch.float8_e4m3fn, 5000.0),
+        ("NVIDIA GB200", torch.float4_e2m1fn_x2, 10000.0),
+        ("NVIDIA GB300", torch.float8_e4m3fn, 5000.0),
+        ("NVIDIA GB300", torch.float4_e2m1fn_x2, 15000.0),
+        ("NVIDIA B200", torch.float8_e4m3fn, 4500.0),
+        ("NVIDIA B200", torch.float4_e2m1fn_x2, 9000.0),
+        ("NVIDIA B300 SXM6 AC", torch.float4_e2m1fn_x2, 13500.0),
+        ("NVIDIA L40S", torch.float8_e4m3fn, 733.0),
+        ("NVIDIA A100", torch.float8_e4m3fn, float("inf")),
+    ],
+)
+def test_get_device_flops_selects_dense_peak_by_dtype(name, dtype, expected, monkeypatch):
+    _mock_cuda_device(monkeypatch, name)
+    assert get_device_flops(dtype=dtype) == expected
+
+
+@pytest.mark.parametrize(
+    "name, precision, expected",
+    [
+        ("H100", "ieee", 67.0),
+        ("H100", "tf32", 494.5),
+        ("NVIDIA A100-SXM4-80GB", "ieee", 19.5),
+        ("NVIDIA A100-SXM4-80GB", "tf32", 156.0),
+    ],
+)
+def test_get_device_flops_uses_cuda_fp32_matmul_policy(monkeypatch, name, precision, expected):
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", precision)
+
+    _mock_cuda_device(monkeypatch, name)
+    assert get_device_flops(dtype=torch.float32) == expected
+
+
+def test_get_device_flops_honors_cublas_disable_tf32(monkeypatch):
+    _mock_cuda_device(monkeypatch, "H100")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "tf32")
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+    assert get_device_flops(dtype=torch.float32) == 67.0
+
+
+@pytest.mark.parametrize("unit, expected", [("P", 0.989), ("t", 989.0), ("G", 989_000.0)])
+def test_get_device_flops_converts_units(monkeypatch, unit, expected):
+    _mock_cuda_device(monkeypatch, "NVIDIA H100 80GB HBM3")
+    assert get_device_flops(unit) == pytest.approx(expected)
+    with pytest.raises(ValueError, match="Unsupported unit"):
+        get_device_flops("X")
+
+
+@pytest.mark.parametrize("dtype_map", [{"": "bfloat16", "vision_config": "float32"}, {"vision_config": "bfloat16"}, {}])
+def test_automfu_saved_composite_dtype(monkeypatch, tmp_path, dtype_map):
+    from transformers import AutoConfig, Qwen3_5Config
+
+    Qwen3_5Config(dtype=dtype_map).save_pretrained(tmp_path)
+    loaded = AutoConfig.from_pretrained(tmp_path)
+    assert loaded.dtype == dtype_map
+    _mock_cuda_device(monkeypatch, "H100")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+    expected_dtype = getattr(torch, dtype_map[""]) if "" in dtype_map else torch.get_default_dtype()
+    for source in (tmp_path, loaded):
+        assert AutoMFU.from_pretrained(source).reference_mfu == get_device_flops(dtype=expected_dtype)
+        assert AutoMFU.from_pretrained(source, compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
+
+
+def test_automfu_infers_matrix_dtype_and_honors_compute_dtype(monkeypatch):
     monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    monkeypatch.setattr(
-        mfu_module,
-        "get_device_flops",
-        lambda **kwargs: pytest.fail("explicit peak must bypass device lookup"),
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+    # The BF16 matrix holds the most matrix elements (4096). FP32 has more matrix tensors (3, 48 elements)
+    # and more elements overall once the 1-D LayerNorm parameters (10000) count.
+    model = torch.nn.Sequential(
+        torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16),
+        *(torch.nn.Linear(4, 4, bias=False) for _ in range(3)),
+        torch.nn.LayerNorm(5000),
     )
+    model.config = SimpleNamespace(dtype=torch.float32)
+    _mock_cuda_device(monkeypatch, "H100")
+    assert AutoMFU.from_config(model).reference_mfu == 989.0
+    assert AutoMFU.from_config(model, compute_dtype=torch.float8_e4m3fn).reference_mfu == 1979.0
 
-    calculator = AutoMFU(SimpleNamespace(), peak_tflops=1979.0)
 
-    assert calculator.reference_mfu == 1979.0
+@pytest.mark.parametrize("storage_dtype", [torch.uint8, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("plain_weight", [False, True])
+def test_automfu_counts_packed_matrices_at_compute_precision(monkeypatch, storage_dtype, plain_weight):
+    bnb = pytest.importorskip("bitsandbytes")
+    packed = bnb.nn.Linear4bit(64, 64, bias=False, compute_dtype=torch.bfloat16, quant_storage=storage_dtype)
+    model = torch.nn.Sequential(packed.to("cpu"), torch.nn.Linear(32, 64, bias=False))
+    if plain_weight:
+        packed.weight = torch.nn.Parameter(packed.weight.data, requires_grad=False)
+    else:
+        # Device moves may recreate Params4bit without its optional back-reference.
+        packed.weight.module = None
+    model.config = SimpleNamespace(dtype=torch.float32)
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    _mock_cuda_device(monkeypatch, "H100")
+    assert AutoMFU.from_config(model).reference_mfu == 989.0
+
+
+@pytest.mark.parametrize("override", [{"device": "H100"}, {"peak_tflops": 1979.0}])
+def test_automfu_rejects_device_and_peak_overrides(override):
+    with pytest.raises(TypeError, match="detected device and built-in peak"):
+        AutoMFU.from_config(SimpleNamespace(), **override)
 
 
 def test_automfu_warns_and_reports_zero_for_unknown_device(monkeypatch, caplog):
@@ -408,31 +545,47 @@ def test_automfu_warns_and_reports_zero_for_unknown_device(monkeypatch, caplog):
         lambda config: lambda config, gbs, seq_len: 1e12,
     )
 
+    _mock_cuda_device(monkeypatch, "NVIDIA Example GPU")
     with caplog.at_level("WARNING", logger=mfu_module.__name__):
-        calculator = AutoMFU(SimpleNamespace(), device="NVIDIA Example GPU")
+        calculator = AutoMFU(SimpleNamespace())
 
     assert calculator.reference_mfu == float("inf")
-    assert "MFU will be reported as 0%" in caplog.text
+    assert "NVIDIA Example GPU with torch.bfloat16; MFU will be reported as 0%" in caplog.text
     assert calculator((1, 1), time_delta=1.0, world_size=1) == 0.0
 
 
-@pytest.mark.parametrize("peak_tflops", [0.0, -1.0, float("inf"), float("nan")])
-def test_automfu_rejects_invalid_precision_peak(monkeypatch, peak_tflops):
+@pytest.mark.parametrize(
+    "dtype, fp32_precision, expected",
+    [
+        (torch.bfloat16, "tf32", "MFU peak: 989 TFLOPs/s per device (NVIDIA H100 80GB HBM3, bfloat16)"),
+        (torch.float32, "tf32", "MFU peak: 494.5 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float32 with TF32)"),
+        (torch.float32, "ieee", "MFU peak: 67 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float32)"),
+        (torch.float8_e4m3fn, "tf32", "MFU peak: 1979 TFLOPs/s per device (NVIDIA H100 80GB HBM3, float8_e4m3fn)"),
+    ],
+)
+def test_automfu_logs_the_peak_it_divides_by(dtype, fp32_precision, expected, monkeypatch, caplog):
     monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", fp32_precision)
+    _mock_cuda_device(monkeypatch, "NVIDIA H100 80GB HBM3")
 
-    with pytest.raises(ValueError, match="finite value greater than zero"):
-        AutoMFU(SimpleNamespace(), peak_tflops=peak_tflops)
+    with caplog.at_level("INFO", logger=mfu_module.__name__):
+        AutoMFU(SimpleNamespace(), compute_dtype=dtype)
+
+    assert [record.getMessage() for record in caplog.records] == [expected]
 
 
-def test_mfu_config_builds_calculator(monkeypatch):
-    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    model_config = SimpleNamespace()
-    model = SimpleNamespace(config=model_config)
+def test_automfu_without_formula_preserves_the_calculator_interface(monkeypatch):
+    # A config without the transformer fallback's dimensions has no usable formula.
+    config = SimpleNamespace()
+    model = torch.nn.Module()
+    model.config = config
+    _mock_cuda_device(monkeypatch, "H100")
+    calculator = AutoMFU.from_config(model)
 
-    calculator = MFUConfig(device="h100", peak_tflops=1979.0).build(model=model)
-
-    assert calculator.config is model_config
-    assert calculator.reference_mfu == 1979.0
+    assert calculator.config is config
+    assert calculator.reference_mfu == 989.0
+    assert calculator.get_flops(torch.ones(1, 2, dtype=torch.long)) is None
+    assert calculator((1, 2), time_delta=1.0, world_size=1) is None
 
 
 def test_optional_field_set_to_none_uses_its_default():
