@@ -36,8 +36,7 @@ help.
 Only EAGLE-3 is supported. EAGLE-1/2 supervise on the *full*-vocab target
 distribution, which the recipe keeps on the online path only.
 
-Typical usage (single device; large MoE targets that need sharding must use the
-online path instead):
+Typical usage:
 
     python -m nemo_automodel.components.speculative.precompute_eagle3 \\
         --target-model meta-llama/Llama-3.1-8B-Instruct \\
@@ -47,6 +46,8 @@ online path instead):
         --batch-size 4 --shard-size 256 --dtype bf16
 
 Then point the recipe at it: ``recipe_args.cached_target_path: /data/eagle3_cache/...``.
+On one node, launch with ``torchrun --standalone --nproc-per-node=2 -m`` in
+place of ``python -m`` and use a dense target that fits on each device.
 """
 
 from __future__ import annotations
@@ -55,9 +56,17 @@ import argparse
 import logging
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import nullcontext
+from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
+from huggingface_hub.utils import WeakFileLock
+from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
+from transformers.dynamic_module_utils import HF_MODULES_CACHE
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -69,13 +78,16 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     is_compressed,
     manifest_path,
     read_manifest,
+    validate_eagle3_shard,
+    validate_target_embeddings,
     write_manifest,
     write_shard,
     write_target_embeddings,
 )
 from nemo_automodel.components.datasets.llm.offline_cache import (
-    dataloader_from_sample,
-    resume_start_sample,
+    dataloader_for_sample_range,
+    partition_cache_shards,
+    sync_cache_phase,
     write_cache_shards,
 )
 from nemo_automodel.components.speculative.eagle import HFEagle3TargetModel
@@ -142,97 +154,124 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing_shards: set[int]) -> None:
-    """Refuse to ``--resume`` into a cache produced with a different configuration.
-
-    Every manifest field shapes the shard contents or their addressing: the
-    ``target_probs`` columns follow ``selected_token_ids``, tensor shapes follow
-    ``seq_length`` / ``dtype``, and shard addressing follows the dataset sample
-    order. That order is not captured by ``num_samples`` or the frequency-based
-    ``selected_token_ids`` (both order-invariant), so the dataset-identity fields
-    ``input_data`` / ``split`` / ``shuffle_seed`` are recorded explicitly. Shards
-    from a mismatched run are indistinguishable by shape alone, so without this
-    check a resume after changing e.g. ``--shuffle-seed`` would keep the old
-    shards and bless them with the new manifest, silently interleaving two
-    orderings and corrupting the supervision that training reads back.
-    """
-    if existing_shards:
-        resume_start_sample(existing_shards, int(manifest["shard_size"]))
+    """Check the manifest and shard numbering before any cache file is written."""
     if not os.path.exists(manifest_path(cache_dir)):
         if existing_shards:
             raise ValueError(
                 f"--resume was requested for {cache_dir}, but its manifest is missing, so the existing "
-                "shards cannot be verified against the current configuration. Delete the directory and "
-                "start fresh."
+                "shards cannot be verified. Use a fresh output directory."
             )
+    else:
+        recorded = read_manifest(cache_dir)
+        recorded.pop("format_version", None)
+        if recorded != manifest:
+            mismatched = sorted(
+                k
+                for k in recorded.keys() | manifest.keys()
+                if k not in recorded or k not in manifest or recorded[k] != manifest[k]
+            )
+            raise ValueError(
+                f"The manifest at {cache_dir} does not match the current configuration "
+                f"(mismatched fields: {mismatched}). Re-run with the original settings or use a fresh output directory."
+            )
+
+    shard_size = int(manifest["shard_size"])
+    num_shards = (int(manifest["num_samples"]) + shard_size - 1) // shard_size
+    unexpected = sorted(index for index in existing_shards if index >= num_shards)
+    if unexpected:
+        raise ValueError(f"{cache_dir} has shard indices outside the manifest's {num_shards} shards: {unexpected}.")
+
+
+def _missing_shard_runs(
+    num_shards: int, existing: set[int], *, world_size: int, rank: int
+) -> Iterator[tuple[int, int]]:
+    """Partition the ordered missing shards and coalesce each rank's consecutive indices."""
+    missing = [index for index in range(num_shards) if index not in existing]
+    offset, _, count = partition_cache_shards(len(missing), shard_size=1, world_size=world_size, rank=rank)
+    if count == 0:
         return
-    recorded = read_manifest(cache_dir)
-    recorded.pop("format_version", None)
-    if recorded != manifest:
-        mismatched = sorted(k for k in recorded.keys() | manifest.keys() if recorded.get(k) != manifest.get(k))
-        raise ValueError(
-            f"--resume was requested for {cache_dir}, but the recorded manifest does not match the current "
-            f"run configuration (mismatched fields: {mismatched}). Existing shards would be silently "
-            "inconsistent with newly written ones. Re-run with the original settings, or delete the "
-            "directory and start fresh."
-        )
+
+    start = previous = missing[offset]
+    for index in missing[offset + 1 : offset + count]:
+        if index != previous + 1:
+            yield start, previous + 1
+            start = index
+        previous = index
+    yield start, previous + 1
 
 
-def _run(args: argparse.Namespace) -> int:
-    """Load the target, scan the dataset once, and write the sharded cache. Returns an exit code."""
-    _validate_args(args)
+def _precompute(
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+    target_wrapper: HFEagle3TargetModel,
+    tokenizer: PreTrainedTokenizerBase,
+    existing: set[int],
+) -> int:
     cache_dtype = DTYPE_MAP[args.dtype]
-
-    # Probe for pre-existing shards regardless of ``--resume`` so the
-    # clobber guard can actually fire; only treat them as skippable when
-    # resuming.
-    present = existing_shard_indices(args.output_dir)
-    if present and not args.resume:
-        raise ValueError(f"{args.output_dir} already has shards; pass --resume to continue or use a fresh dir.")
-    existing = present if args.resume else set()
-    if existing:
+    distributed = dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    world_size = dist.get_world_size() if distributed else 1
+    if distributed:
+        shard_indices = [sorted(existing)]
+        dist.broadcast_object_list(shard_indices, src=0)
+        existing = set(shard_indices[0])
+    if rank == 0 and existing:
         logger.info("Resume: %d shard(s) already present, will be skipped.", len(existing))
 
-    device = torch.device(args.device)
-    compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    tokenizer = NeMoAutoTokenizer.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)
-    target_model = NeMoAutoModelForCausalLM.from_pretrained(
-        args.target_model, trust_remote_code=args.trust_remote_code, torch_dtype=compute_dtype
-    ).to(device)
-    target_wrapper = HFEagle3TargetModel(target_model, aux_layer_ids=args.aux_layer_ids)
+    # Partition the ordered dataset without DistributedSampler's padded rows.
+    with sync_cache_phase("EAGLE-3 cache input preparation"):
+        dataloader = build_eagle3_dataloader(
+            data_path=args.input_data,
+            tokenizer=tokenizer,
+            seq_length=args.seq_length,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            split=args.split,
+            distributed=False,
+            shuffle_seed=args.shuffle_seed,
+            mask_reasoning_content=args.mask_reasoning_content,
+            mask_generation_prompt=args.mask_generation_prompt,
+        )
+        num_samples = len(dataloader.dataset)
+        first_shard, first_sample, local_samples = partition_cache_shards(
+            num_samples, args.shard_size, world_size, rank
+        )
+        local_shards = (local_samples + args.shard_size - 1) // args.shard_size
+        local_loader = (
+            dataloader_for_sample_range(dataloader, start=first_sample, end=first_sample + local_samples)
+            if distributed
+            else dataloader
+        )
+        target_vocab_size = int(target_wrapper.model.config.vocab_size)
+        embeddings = target_wrapper.get_input_embeddings().weight
+        aux_layer_ids = list(target_wrapper.aux_layer_ids)
+        aux_hidden_dim = int(target_wrapper.model.config.hidden_size) * len(aux_layer_ids)
+        special_token_ids = [
+            getattr(tokenizer, name, None) for name in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
+        ]
+    if distributed:
+        layout = (
+            num_samples,
+            target_vocab_size,
+            tuple(embeddings.shape),
+            aux_layer_ids,
+            aux_hidden_dim,
+            special_token_ids,
+        )
+        layouts = [None] * world_size
+        dist.all_gather_object(layouts, layout)
+        if any(other != layout for other in layouts):
+            raise ValueError(f"EAGLE-3 target or dataset layout differs across ranks: {layouts}")
 
-    # The draft seeds its embed_tokens from the target embeddings; the offline
-    # training path never loads the target, so store them alongside the cache.
-    write_target_embeddings(args.output_dir, target_model.get_input_embeddings().weight)
-
-    # No shuffle: the cache order is fixed so sample i lives in shard i // shard_size.
-    dataloader = build_eagle3_dataloader(
-        data_path=args.input_data,
-        tokenizer=tokenizer,
-        seq_length=args.seq_length,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        split=args.split,
-        distributed=False,
-        shuffle_seed=args.shuffle_seed,
-        mask_reasoning_content=args.mask_reasoning_content,
-        mask_generation_prompt=args.mask_generation_prompt,
-    )
-    num_samples = len(dataloader.dataset)
-    target_vocab_size = int(target_model.config.vocab_size)
-
-    special_token_ids = [
-        getattr(tokenizer, name, None) for name in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
-    ]
+    # Count every owned row, including the shards that a resume will reuse.
     selected_token_ids, selected_token_mask = build_eagle3_token_mapping(
-        dataloader,
+        local_loader,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=args.draft_vocab_size,
         special_token_ids=special_token_ids,
     )
-    selected_token_ids = selected_token_ids.to(device)
-    selected_token_mask = selected_token_mask.to(device)
-
     manifest = {
         "target_model": args.target_model,
         "target_vocab_size": target_vocab_size,
@@ -242,67 +281,150 @@ def _run(args: argparse.Namespace) -> int:
         "num_samples": num_samples,
         "shard_size": args.shard_size,
         "target_probs_topk": args.target_probs_topk,
-        "aux_hidden_dim": int(target_model.config.hidden_size) * len(target_wrapper.aux_layer_ids),
-        "aux_layer_ids": list(target_wrapper.aux_layer_ids),
-        "selected_token_ids": selected_token_ids.cpu().tolist(),
-        # Dataset-identity fields. Shards are addressed by sample position, but
-        # num_samples and the frequency-based selected_token_ids are both
-        # order-invariant, so a resume that changed the sample ordering (a
-        # different --shuffle-seed, or an equally-sized --input-data / --split
-        # slice) would otherwise produce a byte-identical manifest and silently
-        # interleave shards from two different orderings.
+        "aux_hidden_dim": aux_hidden_dim,
+        "aux_layer_ids": aux_layer_ids,
+        "selected_token_ids": selected_token_ids.tolist(),
         "input_data": str(args.input_data),
         "split": args.split,
         "shuffle_seed": int(args.shuffle_seed),
-        # These shape the cached loss_mask/position_mask; the trainer refuses a
-        # cache whose values differ from its own settings.
         "mask_reasoning_content": bool(args.mask_reasoning_content),
         "mask_generation_prompt": bool(args.mask_generation_prompt),
     }
-    if args.resume:
-        _ensure_resume_compatible(args.output_dir, manifest, existing)
-    # Written before the shard loop (every field is already known here) so an
-    # interrupted run leaves a manifest behind for the resume check above. An
-    # incomplete cache still cannot be trained on: CachedEagle3Dataset verifies
-    # the shard count against ``num_samples`` before serving any sample.
-    write_manifest(args.output_dir, manifest)
 
-    logger.info(
-        "Precomputing EAGLE-3 cache: %d samples, shard_size=%d, draft_vocab=%d, dtype=%s -> %s",
-        num_samples,
-        args.shard_size,
-        selected_token_ids.numel(),
-        args.dtype,
-        args.output_dir,
-    )
+    has_manifest = has_embeddings = False
+    with sync_cache_phase("EAGLE-3 cache validation"):
+        if rank == 0 and args.resume:
+            has_manifest = os.path.exists(manifest_path(args.output_dir))
+            _ensure_resume_compatible(args.output_dir, manifest, existing)
+            if existing:
+                has_embeddings = validate_target_embeddings(args.output_dir, shape=embeddings.shape)
+        for index in range(first_shard, first_shard + local_shards):
+            if index in existing:
+                validate_eagle3_shard(args.output_dir, shard_index=index, manifest=manifest)
+        selected_token_ids = selected_token_ids.to(device)
+        selected_token_mask = selected_token_mask.to(device)
 
-    start_sample = resume_start_sample(existing, args.shard_size) if existing else 0
-    dataloader = dataloader_from_sample(dataloader, start_sample)
+    with sync_cache_phase("EAGLE-3 cache metadata publication"):
+        if rank == 0:
+            if not has_manifest:
+                write_manifest(args.output_dir, manifest)
+            # With no committed shards, regenerate embeddings even if a prior
+            # run was interrupted between publishing the manifest and embeddings.
+            if not has_embeddings:
+                write_target_embeddings(args.output_dir, embeddings)
 
-    def _compute_from_batch(batch):
+    # Writers may finish at very different times after a sparse resume. Close
+    # the group together so torchrun can supervise independent shard writes.
+    if distributed:
+        dist.destroy_process_group()
+
+    def _compute_from_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Capture the on-disk tensors for this batch.
+
+        Args:
+            batch: Input IDs, attention and loss masks of shape [batch, sequence].
+
+        Returns:
+            IDs and masks of shape [batch, sequence], auxiliary states of shape
+            [batch, sequence, aux_hidden], position mask of shape [batch, sequence, 1],
+            and full or top-k probabilities of shape [batch, sequence, vocab or topk].
+        """
         with torch.no_grad():
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             target_batch = target_wrapper.generate_batch(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                loss_mask=batch["loss_mask"],
+                input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], loss_mask=batch["loss_mask"]
             )
             return _compute_batch_cache(
                 target_batch, selected_token_ids, selected_token_mask, cache_dtype, args.target_probs_topk
             )
 
-    write_cache_shards(
-        dataloader=dataloader,
-        output_dir=args.output_dir,
-        shard_size=args.shard_size,
-        start_shard_index=start_sample // args.shard_size,
-        compute_batch=_compute_from_batch,
-        write_shard_fn=write_shard,
-        logger=logger,
-    )
+    num_shards = (num_samples + args.shard_size - 1) // args.shard_size
+    for start, end in _missing_shard_runs(num_shards, existing, world_size=world_size, rank=rank):
+        start_sample = start * args.shard_size
+        end_sample = min(end * args.shard_size, num_samples)
+        logger.info(
+            "Rank %d/%d: precomputing samples [%d, %d) from shard %d in %s",
+            rank,
+            world_size,
+            start_sample,
+            end_sample,
+            start,
+            args.output_dir,
+        )
+        loader = local_loader
+        if start != first_shard or end != first_shard + local_shards:
+            loader = dataloader_for_sample_range(dataloader, start=start_sample, end=end_sample)
+        write_cache_shards(
+            dataloader=loader,
+            output_dir=args.output_dir,
+            shard_size=args.shard_size,
+            start_shard_index=start,
+            compute_batch=_compute_from_batch,
+            write_shard_fn=write_shard,
+            logger=logger,
+        )
 
-    logger.info("Done. Cache written to %s", args.output_dir)
+    logger.info("Rank %d finished its cache shard writes in %s", rank, args.output_dir)
     return 0
+
+
+def _run(args: argparse.Namespace) -> int:
+    """Load a target replica and run the cache producer under Python or torchrun."""
+    _validate_args(args)
+    # Some schedulers set rank variables for ordinary Python commands.
+    is_torchrun_worker = "LOCAL_RANK" in os.environ and "TORCHELASTIC_RUN_ID" in os.environ
+    world_size = int(os.environ.get("WORLD_SIZE", "1")) if is_torchrun_worker else 1
+    rank = int(os.environ["RANK"]) if world_size > 1 else 0
+    device = torch.device(args.device)
+    if world_size > 1:
+        if int(os.environ["LOCAL_WORLD_SIZE"]) != world_size:
+            raise ValueError("Distributed EAGLE-3 precompute requires a single-node torchrun launch.")
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+            torch.cuda.set_device(device)
+        elif device.type != "cpu":
+            raise ValueError("Distributed EAGLE-3 precompute requires --device cuda or --device cpu.")
+
+    existing = existing_shard_indices(args.output_dir) if rank == 0 else set()
+    if existing and not args.resume:
+        raise ValueError(f"{args.output_dir} already has shards; pass --resume to continue or use a fresh dir.")
+
+    # Load an independent replica before initializing the process group, so
+    # the target loader can read its checkpoint locally.
+    # Transformers copies trusted code into a shared cache during the load.
+    loader_lock = (
+        WeakFileLock(Path(HF_MODULES_CACHE) / ".automodel-eagle3-precompute.lock")
+        if world_size > 1 and args.trust_remote_code
+        else nullcontext()
+    )
+    with loader_lock:
+        tokenizer = NeMoAutoTokenizer.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)
+        factory = AutoModelForCausalLM if device.type == "cpu" else NeMoAutoModelForCausalLM
+        compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        launcher_env = {}
+        if world_size > 1 and device.type == "cuda":
+            # NeMo consults the launcher topology even without a process
+            # group. Use the original single-process weight-loading path for
+            # every replica so resumes can freely change the world size.
+            launcher_env = {
+                name: os.environ.pop(name) for name in ("WORLD_SIZE", "RANK", "LOCAL_WORLD_SIZE", "LOCAL_RANK")
+            }
+        try:
+            model = factory.from_pretrained(
+                args.target_model, trust_remote_code=args.trust_remote_code, dtype=compute_dtype
+            ).to(device)
+        finally:
+            os.environ.update(launcher_env)
+    model.requires_grad_(False)
+    target_wrapper = HFEagle3TargetModel(model, aux_layer_ids=args.aux_layer_ids)
+
+    if world_size > 1:
+        dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo", timeout=timedelta(minutes=30))
+    try:
+        return _precompute(args, device=device, target_wrapper=target_wrapper, tokenizer=tokenizer, existing=existing)
+    finally:
+        if world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -359,7 +481,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "setting must match it.",
     )
     parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--resume", action="store_true", help="Skip shard indices already present in --output-dir.")
+    parser.add_argument("--resume", action="store_true", help="Validate the cache and fill missing global shards.")
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -370,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
     return _run(args)
 

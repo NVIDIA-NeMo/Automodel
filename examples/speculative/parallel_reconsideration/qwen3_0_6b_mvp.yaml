@@ -1,0 +1,47 @@
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-0.6B
+  train_data_path: /path/to/ultrachat_train.jsonl
+  output_dir: ./outputs/qwen3_0_6b_parallel_reconsideration
+  seq_length: 512
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 10
+  ttt_steps: 3
+  draft_vocab_size: 8192
+  aux_layer_ids: [1, 14, 26]
+  freeze_embeddings: true
+  fc_norm: true
+  norm_output: true
+  draft_gradient_checkpointing: true
+  parallel_reconsideration:
+    max_reconsiderations: 2
+    balance_beta: 0.01
+  trust_remote_code: false
+  shuffle_seed: 0
+  log_every_steps: 10
+  max_grad_norm: 0.5
+  save_checkpoint_every_epoch: true
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  warmup_ratio: 0.015
+  min_lr_ratio: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/qwen3_0_6b_parallel_reconsideration/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as HFQwen3_5ForCausalLM
@@ -24,6 +25,7 @@ from nemo_automodel.components.models.qwen3_5.model import (
     Qwen3_5ForConditionalGeneration,
     build_mtp_config_from_hf,
 )
+from tests.unit_tests.models.passthrough_layers import passthrough_layers
 
 
 def _tiny_config(**kwargs):
@@ -237,3 +239,90 @@ class TestQwen3_5VLMMTPModel:
         assert len(out.mtp_per_depth_h) == 1
         assert out.mtp_per_depth_h[0].shape == (1, 5, cfg.text_config.hidden_size)
         assert out.mtp_loss_scaling_factor == 0.2
+
+    def test_vlm_packed_forward_keeps_a_batch_axis(self):
+        cfg = _tiny_vlm_config()
+        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend())
+        tokens = 6
+        # Two packed documents of 3 tokens; M-RoPE positions are [axes, batch, tokens].
+        positions = torch.arange(3).repeat(2).expand(3, 1, tokens)
+
+        with passthrough_layers(model.model.language_model.layers.values()) as layer_inputs:
+            out = model(
+                input_ids=torch.randint(1, 50, (1, tokens)),
+                position_ids=positions,
+                qkv_format="thd",
+                cu_seqlens=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+                max_seqlen=torch.tensor([3]),
+            )
+
+        assert layer_inputs == [(tokens, cfg.text_config.hidden_size)] * cfg.text_config.num_hidden_layers
+        assert out.logits.shape == (1, tokens, cfg.text_config.vocab_size)
+
+    @pytest.mark.parametrize("logits_dtype", [None, torch.float32])
+    def test_vlm_stage_metas_declare_the_head_logits_dtype(self, logits_dtype):
+        model = Qwen3_5ForConditionalGeneration(_tiny_vlm_config(), backend=_backend(), logits_dtype=logits_dtype)
+
+        _, outputs = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=6, dtype=torch.bfloat16
+        )
+
+        assert [output.dtype for output in outputs] == [logits_dtype or torch.bfloat16]
+
+class TestQwen3_5MTPFlashAttentionPaddedMask:
+    _input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 0, 0]], dtype=torch.long)
+    _attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]], dtype=torch.long)
+
+    def test_vlm_padded_mask_with_flash_attention_backbone_config(self):
+        cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend())
+        model.model.language_model.config._attn_implementation = "flash_attention_2"
+        model.train()
+
+        out = model(input_ids=self._input_ids, attention_mask=self._attention_mask)
+
+        assert out.mtp_per_depth_h is not None
+        assert out.mtp_per_depth_h[0].shape == (2, 6, cfg.text_config.hidden_size)
+
+    def test_causal_lm_padded_mask_with_flash_attention_backbone_config(self):
+        cfg = _tiny_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForCausalLM(cfg, backend=_backend())
+        model.model.config._attn_implementation = "flash_attention_2"
+        model.train()
+
+        out = model(input_ids=self._input_ids, attention_mask=self._attention_mask)
+
+        assert out.mtp_per_depth_h is not None
+        assert out.mtp_per_depth_h[0].shape == (2, 6, cfg.hidden_size)
+
+    def test_causal_lm_mtp_receives_4d_mask_with_flash_attention_backbone_config(self, monkeypatch):
+        cfg = _tiny_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForCausalLM(cfg, backend=_backend())
+        model.model.config._attn_implementation = "flash_attention_2"
+        model.train()
+        captured = {}
+        mtp_forward = model.mtp.forward
+
+        def _capture(*args, **kwargs):
+            """Capture the mask while running the real MTP forward.
+
+            Args:
+                *args: MTP hidden states of shape `[batch, sequence, hidden]`.
+                **kwargs: MTP keyword arguments from the text-only model: `input_ids` of shape
+                    `[batch, sequence]`, `embed_fn`, `rotary_emb`, `position_ids` of shape
+                    `[3, batch, sequence]` (rotary axes, split from the default 4-axis ids),
+                    and `attention_mask` of shape `[batch, 1, sequence, sequence]`.
+
+            Returns:
+                List of per-depth hidden-state tensors of shape `[batch, sequence, hidden]`,
+                returned unchanged from the real forward.
+            """
+            captured["attention_mask"] = kwargs["attention_mask"]
+            return mtp_forward(*args, **kwargs)
+
+        monkeypatch.setattr(model.mtp, "forward", _capture)
+
+        model(input_ids=self._input_ids, attention_mask=self._attention_mask)
+
+        assert model.model.config._attn_implementation == "flash_attention_2"
+        assert captured["attention_mask"].shape == (2, 1, 6, 6)

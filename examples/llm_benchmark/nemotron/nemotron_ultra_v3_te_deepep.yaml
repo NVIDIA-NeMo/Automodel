@@ -32,7 +32,6 @@ seed: 1234
 
 benchmark:
   warmup_steps: 2
-  peak_tflops: 989  # H100 dense bf16 peak TFLOPs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

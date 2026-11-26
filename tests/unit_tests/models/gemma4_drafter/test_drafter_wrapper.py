@@ -196,6 +196,16 @@ class TestDrafterClassStructure:
         hidden = torch.randn(2, 3, cfg.text_config.hidden_size)
         torch.testing.assert_close(model.masked_embedding(hidden, model.lm_head.weight), model.lm_head(hidden))
 
+    def test_ordered_head_returns_the_logits_dtype(self):
+        from nemo_automodel.components.models.gemma4_drafter.model import Gemma4DrafterForCausalLM
+
+        cfg = _make_ordered_drafter_config()
+        model = Gemma4DrafterForCausalLM(cfg, logits_dtype=torch.float64)
+        hidden = torch.randn(2, 3, cfg.text_config.hidden_size)
+
+        # The Hugging Face forward scores the ordered head with the LM head's weight, not through the LM head.
+        assert model.masked_embedding(hidden, model.lm_head.weight).dtype == torch.float64
+
 
 def _make_ordered_drafter_config():
     """Tiny drafter config with the ordered-embedding head (4 clusters of 16 tokens, one picked per position)."""

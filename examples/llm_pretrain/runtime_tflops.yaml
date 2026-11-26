@@ -16,8 +16,8 @@
 # excluded. LoRA/frozen weights are not adjusted, and packed inputs retain the
 # estimator's dense-shape approximation. This Llama formula discounts causal
 # attention like Megatron; TorchTitan counts the full attention square.
-# Unsupported formulas yield null metrics. No hardware-peak value is required
-# for TFLOPs/s; mfu.peak_tflops only overrides the theoretical peak used for MFU.
+# Unsupported formulas yield null metrics. TFLOPs/s needs no hardware-peak value;
+# the MFU peak is selected from the device and the training dtype.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 42
 

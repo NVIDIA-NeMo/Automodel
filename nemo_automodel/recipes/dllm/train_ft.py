@@ -146,6 +146,10 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
     # DiffusionGemma subclass overrides it to True.
     _response_window_collation: bool = False
 
+    @property
+    def _forward_autocast_dtype(self) -> torch.dtype | None:
+        return getattr(self.distributed_config, "autocast_dtype", None)
+
     def setup(self):
         """Build all training components, then apply dLLM-specific overrides."""
         # Diffusion-LM training expects the user-specified ``torch_dtype`` to
@@ -395,7 +399,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         # Context parallel setup (no labels to pass for dLLM)
         cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
         train_ctx, batch = cp_sharder.shard(batch)
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -406,12 +410,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             else nullcontext()
         )
 
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
+        autocast_dtype = self._forward_autocast_dtype
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx(), sync_ctx, te_ctx, autocast_ctx:
             # Hook for model families that need extra forward inputs derived from
             # the (clean) batch — e.g. block_diffusion builds the block-causal
             # attention masks + canvas position ids here. No-op by default.
@@ -1157,7 +1161,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         model = self.model_parts[0]
         cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
         train_ctx, batch = cp_sharder.shard(batch)
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -1167,12 +1171,12 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             if is_train
             else nullcontext()
         )
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
+        autocast_dtype = self._forward_autocast_dtype
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx(), sync_ctx, te_ctx, autocast_ctx:
             batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)

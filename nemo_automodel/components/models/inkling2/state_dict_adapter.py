@@ -107,13 +107,17 @@ def _expert_amax_storage(template: torch.Tensor) -> torch.Tensor:
     )
 
 
+# Destination elements decoded per step: bounds the FP32 temporaries to a few hundred megabytes.
+_DECODE_ELEMENTS = 1 << 26
+
+
 @dataclass(frozen=True)
 class _QuantizedProjection:
     """Source [experts, output, input] tensors and a matching floating destination view.
 
     The destination aliases model storage, potentially a noncontiguous transpose.
     Packed FP4 has input/2 columns, scales have input/16 or input/32 columns.
-    Only one expert and at most 128 output rows are expanded at a time.
+    A bounded number of experts is expanded at a time.
     """
 
     destination: torch.Tensor
@@ -153,31 +157,35 @@ class _QuantizedProjection:
             ):
                 raise ValueError("NVFP4 outer scales must be finite, with nonnegative amax and positive denominator")
             outer = amax / denominator
+        # One packed byte holds two FP4 codes, low nibble first; bit 3 of a code is its sign.
+        codes = torch.arange(256, device=weight.device)
+        codes = torch.stack((codes & 15, codes >> 4), -1)
         magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=weight.device, dtype=torch.float32)
-        for expert in range(destination.shape[0]):
-            for start in range(0, destination.shape[1], 128):
-                packed = weight[expert, start : start + 128]
-                scales = scale[expert, start : start + 128]
-                if fp4:
-                    codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2).long()
-                    decoded = magnitudes[codes & 7] * torch.where(codes < 8, 1, -1)
-                    multiplier = scales.float()
-                    if not torch.isfinite(multiplier).all() or torch.any(multiplier < 0):
-                        raise ValueError("NVFP4 block scales must be finite and nonnegative")
-                else:
-                    if torch.any(scales == 255):
-                        raise ValueError("MXFP8 scale byte 255 encodes NaN")
-                    decoded = packed.float()
-                    if not torch.isfinite(decoded).all():
-                        raise ValueError("MXFP8 weights must be finite")
-                    multiplier = torch.exp2(scales.float() - 127)
-                decoded = (decoded.reshape(*decoded.shape[:-1], -1, block) * multiplier.unsqueeze(-1)).flatten(-2)
-                if outer is not None:
-                    decoded = decoded * outer[expert]
-                converted = decoded.to(destination.dtype)
-                if not torch.isfinite(converted).all():
-                    raise ValueError("Decoded expert weights overflow the destination dtype")
-                destination[expert, start : start + 128].copy_(converted)
+        byte_values = magnitudes[codes & 7] * torch.where(codes < 8, 1, -1)
+        # Whole experts are decoded together, about _DECODE_ELEMENTS destination elements at a time.
+        step = max(1, _DECODE_ELEMENTS // (destination.shape[1] * destination.shape[2]))
+        for start in range(0, destination.shape[0], step):
+            packed = weight[start : start + step]
+            scales = scale[start : start + step]
+            if fp4:
+                decoded = byte_values[packed.int()].flatten(-2)
+                multiplier = scales.float()
+                if not torch.isfinite(multiplier).all() or torch.any(multiplier < 0):
+                    raise ValueError("NVFP4 block scales must be finite and nonnegative")
+            else:
+                if torch.any(scales == 255):
+                    raise ValueError("MXFP8 scale byte 255 encodes NaN")
+                decoded = packed.float()
+                if not torch.isfinite(decoded).all():
+                    raise ValueError("MXFP8 weights must be finite")
+                multiplier = torch.exp2(scales.float() - 127)
+            decoded = (decoded.reshape(*decoded.shape[:-1], -1, block) * multiplier.unsqueeze(-1)).flatten(-2)
+            if outer is not None:
+                decoded = decoded * outer[start : start + step, None, None]
+            converted = decoded.to(destination.dtype)
+            if not torch.isfinite(converted).all():
+                raise ValueError("Decoded expert weights overflow the destination dtype")
+            destination[start : start + step].copy_(converted)
 
 
 def _needs_layout_buffer(name: str, tensor: torch.Tensor) -> bool:
@@ -327,6 +335,8 @@ class Inkling2StateDictAdapter(StateDictAdapter):
             "embed_norm.weight": "embed_norm.weight",
             "norm.weight": "norm.weight",
             "lm_head.weight": "unembed.weight",
+            "message_queries.weight": "middle_cycle_cross_pass_queries",
+            "message_kv_queries.weight": "middle_cycle_cross_pass_kv_queries",
         }
         if fqn in roots:
             return [("model.llm." + roots[fqn], tensor)]
@@ -366,7 +376,7 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         suffix = suffix.replace(".weight_proj.weight", ".weight_proj")
         suffix = suffix.replace("mlp.gate.e_score_correction_bias", "mlp.gate.bias")
         allowed = re.fullmatch(
-            r"(attn\.(wo_ud\.(weight|bias)|q_l2_clip\.scale|rel_l2_clip\.scale|rel_logits_proj\.proj|[kv]_sconv\.(weight|static_w|weight_proj))|mlp\.gate\.(weight|bias)|mlp_norm\.weight|(?:attn|mlp)_sconv\.weight)",
+            r"(attn\.(wo_ud\.(weight|bias)|q_l2_clip\.scale|rel_l2_clip\.scale|rel_logits_proj\.proj|[kv]_sconv\.(weight|static_w|weight_proj))|mlp\.gate\.(weight|bias)|mlp_norm\.weight|(?:attn|mlp)_sconv\.weight|controllers\.(attn|k|v|mlp)\.(down|gain|forget)_weight)",
             suffix,
         )
         if allowed is None:
@@ -520,6 +530,8 @@ class Inkling2StateDictAdapter(StateDictAdapter):
             "embed_norm.weight": "embed_norm.weight",
             "norm.weight": "norm.weight",
             "unembed.weight": "lm_head.weight",
+            "middle_cycle_cross_pass_queries": "message_queries.weight",
+            "middle_cycle_cross_pass_kv_queries": "message_kv_queries.weight",
         }
         projections = ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "attn_sink_proj")
         for key, value in hf_state_dict.items():

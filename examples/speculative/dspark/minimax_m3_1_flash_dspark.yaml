@@ -4,7 +4,8 @@
 # layers (FFN 12288, window 4096), target features from layers 3/17/31/45/59,
 # block size 7, a rank-256 Markov head, and noise token 200058. The recipe rejects
 # settings that disagree with it. The trainable weights start from a fresh
-# initialization; only the frozen embedding and LM head are copied from the target.
+# initialization, or from recipe_args.draft_weights_path; the frozen embedding and
+# LM head are copied from the target.
 # A local target_model_name_or_path must include the dspark/ folder, or the recipe
 # logs a warning and builds the MiniMax M3 draft instead.
 #
@@ -45,6 +46,9 @@ recipe_args:
   val_data_path: /path/to/open-perfectblend-direct-clean
   val_split: "train[:4096]"
   output_dir: ./outputs/dspark_minimax_m3_1_flash
+  # Start from the released draft, for example for a fine-tuned target. Also set
+  # optimizer.warmup_ratio above 0, since Adam starts with empty moments:
+  # draft_weights_path: /path/to/MiniMax-M3.1-Flash/dspark
   seq_length: 4096
   micro_batch_size: 1
   grad_accumulation_steps: 16

@@ -102,9 +102,12 @@ reproduces: a sliding window over the context (`draft_sliding_window`, which als
 keeps the flex `BlockMask` sparse on long sequences) and a different attention
 shape (`draft_num_attention_heads` and the related head-size fields). See `qwen3_8_27b_dflash2.yaml`.
 
-Training logs `train/loss`, `train/accuracy`, and `train/accept_len`. Setting
-`recipe_args.val_data_path` adds globally reduced `val_loss`, `val_accuracy`,
-and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
+Training logs `train/loss`, `train/accuracy`, and `train/accept_len`. Set
+`recipe_args.val_data_path` for online data or `recipe_args.val_cache_path` for
+cached features to log globally reduced `val_loss`, `val_accuracy`, and
+`val_accept_len`. MMFlash training divides the weighted loss sum by the batch
+size. Validation divides it by the number of sequences with at least one kept
+block. A top-level `wandb:` block uploads these metrics to Weights & Biases.
 
 ## Key Config Fields
 
@@ -115,13 +118,18 @@ and `val_accept_len`; adding a top-level `wandb:` block uploads all of them.
 | `block_size` | tokens drafted in parallel per block (paper: 16) |
 | `num_anchors` | blocks sampled per sequence per step |
 | `loss_decay_gamma` | block-position decay; `null` disables it |
-| `loss_type` | `dflash` (fixed anchor) or `variable_prefix` |
+| `loss_type` | `dflash` (fixed anchor), `variable_prefix` (D2SD), or `mmflash` (cached visual-score objective) |
+| `train_cache_path` | training directory with `manifest.json` and precomputed feature tensors (required for `mmflash`) |
+| `val_cache_path` | optional validation cache directory when `train_cache_path` is set |
+| `mmflash_smoothing` | confidence floor in `[0, 1]` for the MMFlash prefix weights (default `0.5`) |
+| `visual_alpha` | scale of the MMFlash visual weight boost (default `1.0`). Setting it to `0.0` retains the prefix weights |
 | `target_layer_ids` | target feature layers fed to the draft (defaults to an even spread) |
 | `mask_token_id` | reserved token id filling non-anchor block positions (required) |
 | `attention_backend` | `flex_attention` (GPU main path) or `sdpa` (portable fallback) |
 | `packed_sequence_size` | enables sequence packing when greater than 0 |
 | `draft_sliding_window` | bounds how far back a block reads the context; unset attends over the whole prefix |
 | `draft_num_attention_heads` / `draft_num_key_value_heads` / `draft_head_dim` | size the draft's attention independently of the target's |
+| `draft_intermediate_size` | Qwen3-style draft MLP width (defaults to the target's intermediate size) |
 | `output_multiplier` / `final_logit_softcapping` | the target's logit transform, applied in both training and decoding; identity unless set |
 | `input_embedding_scale` | scales the embedded draft block; identity unless set |
 | `conv_kernel_size` / `conv_group_size` | DFlash 2 convolution taps and channels per dynamic correction |

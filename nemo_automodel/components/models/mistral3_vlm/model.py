@@ -43,11 +43,11 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
@@ -142,7 +142,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, *, logits_dtype: torch.dtype | None = None):
         reject_unsupported_tie_word_embeddings(type(self), config)
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
@@ -165,6 +165,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
+        self.lm_head = LMHead.from_linear(self.lm_head, logits_dtype=logits_dtype)
         apply_pixtral_forward_backport(self.model.vision_tower)
         self.tie_weights()
         self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
@@ -188,6 +189,18 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             if "inv_freq" in getattr(sub, "_buffers", {}):
                 sub._mistral3_fp8_rotary_reinit_done = False
                 sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
+
+    def set_output_embeddings(self, new_embeddings: torch.nn.Module) -> None:
+        """Install the output head; a plain ``nn.Linear``, as a vocabulary resize builds, keeps the logits dtype.
+
+        Args:
+            new_embeddings: Output head with weight of shape [vocab, hidden].
+        """
+        self.lm_head = (
+            new_embeddings
+            if isinstance(new_embeddings, LMHead)
+            else LMHead.from_linear(new_embeddings, logits_dtype=self.lm_head.logits_dtype)
+        )
 
     def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the active text embedding when requested."""
@@ -266,7 +279,9 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # Final hidden states fed to lm_head (single [B, S, H] tensor).
         hidden_states = outputs[0]
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = (
+            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        )
 
         loss = None
         if labels is not None:

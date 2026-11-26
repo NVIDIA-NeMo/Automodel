@@ -484,6 +484,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # disabled default keeps _forward_backward_step working if setup() is skipped
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
+    # Standard next-token training does not enter a recipe-level autocast context.
+    _forward_autocast_dtype: torch.dtype | None = None
     domain_mixture = None
     # Tokens per pack when sequence packing is on; setup() sets it.
     pack_size = None
@@ -760,18 +762,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp = None
 
         from nemo_automodel.components.moe.mok_experts import enable_mok_mxfp8_optimizer_step_cache
+        from nemo_automodel.components.optim.nvfp4_resident_adam import enable_nvfp4_fused_adam_step
 
         enable_mok_mxfp8_optimizer_step_cache(self.model_parts, self.optimizer)
+        enable_nvfp4_fused_adam_step(self.model_parts, self.optimizer)
 
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
-        # Extract TE FP8 config from model backend (set after model construction)
-        self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
-        if self.te_fp8 is not None:
-            # Modules named in te_fp8.exclude_fqns (lm_head by default) run outside the FP8 autocast.
+        # Extract the TE quantization config (te_fp8 or te_nvfp4) from model backend (set after model construction)
+        self.te_quantization = (
+            self.model_parts[0].backend.te_quantization if hasattr(self.model_parts[0], "backend") else None
+        )
+        if self.te_quantization is not None:
+            # Modules named in its exclude_fqns (lm_head by default) run outside the TE autocast.
             for part in self.model_parts:
-                self.te_fp8.exclude_modules(part)
+                self.te_quantization.exclude_modules(part)
 
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
@@ -929,7 +935,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
-        self.mfu_calculator = self.cfg.mfu.build(model=self.model_parts[0])
+        self.mfu_calculator = self._setup_mfu(self.model_parts[0], recipe_autocast_dtype=self._forward_autocast_dtype)
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
@@ -1312,10 +1318,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # forward is enqueued and would cancel the batch's non_blocking prefetch
             # once per microbatch.
             loss_weights = self.domain_mixture.loss_weights(dataset_ids, labels, validate_range=False)
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
 
         if self.pp_enabled:
-            with train_ctx(), fp8_ctx:
+            with train_ctx(), te_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1379,7 +1385,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx, fp8_ctx:
+            with train_ctx(), sync_ctx, te_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1566,10 +1572,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
 
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        num_label_tokens = torch.tensor(
-            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+        # All three counts are needed as Python integers. Reduce and read them in one
+        # transfer so the later counts do not add more collectives and device syncs.
+        # The second count is the number of tokens in the batch, excluding any tail padding,
+        # and the third is the number of packs (one per row) when packing.
+        token_counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
+            ],
+            dtype=torch.long,
         )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        num_label_tokens, num_tokens_in_batch, num_packs = self._dp_allreduce(token_counts).tolist()
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1609,16 +1624,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
-
-        # Number of tokens in the batch, excluding any tail padding, and of packs (one per row) when packing.
-        token_counts = torch.tensor(
-            [
-                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
-            ],
-            dtype=torch.long,
-        )
-        num_tokens_in_batch, num_packs = self._dp_allreduce(token_counts).tolist()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
