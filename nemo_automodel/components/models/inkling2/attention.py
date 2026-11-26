@@ -250,7 +250,14 @@ class Inkling2Attention(nn.Module):
             # A query sees keys of its own document only, and a local query at most window - 1
             # of them, so only that many keys of the preceding ranks are exchanged, in whole
             # windows to keep the query offset block-aligned.
-            reach = self.window - 1 if self.is_local else _preceding_reach(valid, positions, self.cp_mesh)
+            if self.is_local:
+                reach = self.window - 1
+            elif self.flex is not None:
+                # FlexAttention is compiled for one key length: a full layer exchanges whole shards,
+                # so that the length does not follow the documents of each batch.
+                reach = (self.cp_mesh.size() - 1) * sequence
+            else:
+                reach = _preceding_reach(valid, positions, self.cp_mesh)
             halo = self.window * max(1, -(-reach // self.window))
             count = min(halo, sequence)
             kv_tail = torch.stack((k[:, -count:], v[:, -count:]), dim=2)

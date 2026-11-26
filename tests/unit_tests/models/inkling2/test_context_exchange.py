@@ -94,3 +94,33 @@ def test_recomputation_after_another_microbatch_gives_the_gradients_without_chec
         assert wanted_microbatch[0].abs().max() > 0
         for got, wanted in zip(got_microbatch, wanted_microbatch, strict=True):
             torch.testing.assert_close(got, wanted, rtol=1e-6, atol=1e-7 * wanted.abs().max().clamp_min(1e-6).item())
+
+
+def test_flex_full_layer_attends_one_key_length_whatever_the_documents(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FlexAttention is compiled for one key length, so a full layer's keys must not follow the batch.
+
+    The shard's first document starts at another position in every batch. The compiled kernel
+    needs CUDA; the eager arithmetic stands in for it and records the keys it is given.
+    """
+    config = tiny_config()
+    layer = next(index for index in range(config.num_hidden_layers) if index not in config.local_layer_ids)
+    torch.manual_seed(0)
+    module = Inkling2Attention(config, layer, dtype=torch.float32, backend="flex")
+    module.reset_parameters(0.3)
+    module.setup_cp_attention(SimpleNamespace(size=lambda: 1, get_local_rank=lambda: 0, get_group=lambda: None))
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, op, group: None)
+    key_lengths = []
+
+    def record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **layout: torch.Tensor | int) -> torch.Tensor:
+        """Record the key length of q [batch, sequence, heads, head_dim] against k, v [batch, key_sequence, ...]."""
+        key_lengths.append(k.shape[1])
+        return module._eager(q, k, v, **layout)
+
+    assert module.flex is not None
+    monkeypatch.setattr(module.flex, "forward", record)
+    valid = torch.ones(BATCH, SEQUENCE, dtype=torch.bool)
+    for first_position in (0, 9, 30):
+        hidden = torch.randn(BATCH, SEQUENCE, 16, generator=torch.Generator().manual_seed(first_position))
+        positions = first_position + torch.arange(SEQUENCE).repeat(BATCH, 1)
+        assert torch.isfinite(module(AttentionSources(hidden, hidden, hidden), valid, positions)).all()
+    assert len(key_lengths) == 3 and len(set(key_lengths)) == 1
