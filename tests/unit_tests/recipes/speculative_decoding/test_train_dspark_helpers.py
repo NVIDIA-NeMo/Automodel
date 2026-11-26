@@ -180,7 +180,9 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
     obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
     obj.cfg = SimpleNamespace(
         get=lambda key, default=None: (
-            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+            ConfigNode({"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1})
+            if key == "checkpoint"
+            else default
         )
     )
     obj.output_dir = tmp_path

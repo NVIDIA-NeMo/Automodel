@@ -44,7 +44,7 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, cast
 
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
@@ -151,6 +151,111 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
             return model_config
         return model_config.get("pretrained_model_name_or_path", None)
     return None
+
+
+class SwanLabOptions(TypedDict, total=False):
+    """The ``wandb.swanlab:`` sub-block (see ``SwanLabConfig``)."""
+
+    mode: str
+    workspace: str
+    log_dir: str
+    upload_to_wandb: bool
+
+
+class WandbInitKwargs(TypedDict, total=False):
+    """Keyword set of ``wandb.init`` that a ``wandb:`` block can carry.
+
+    A TypedDict does not reject other keys at run time: every key of the block except ``enable`` is
+    forwarded to ``wandb.init`` as written.
+    """
+
+    project: str
+    entity: str
+    name: str
+    group: str
+    job_type: str
+    tags: list[str]
+    notes: str
+    mode: str
+    dir: str
+    id: str
+    resume: str | bool
+    swanlab: SwanLabOptions
+
+
+@dataclass(frozen=True)
+class DraftWandbSettings:
+    """Typed ``wandb:`` block of the speculative-decoding recipes.
+
+    Attributes:
+        init_kwargs: Keywords for ``wandb.init`` (the block without ``enable``).
+        run_config: The full resolved config recorded as the run's ``config``.
+    """
+
+    init_kwargs: WandbInitKwargs
+    run_config: dict[str, Any]
+
+    @classmethod
+    def from_config(cls, raw: "ConfigNode") -> "DraftWandbSettings | None":
+        """Parse the top-level ``wandb:`` block of ``raw``; ``None`` when it is absent or ``enable: false``.
+
+        ``enable`` is the examples' opt-in flag, not a ``wandb.init`` keyword, so it is dropped.
+        """
+        node = raw.get("wandb", None)
+        if node is None:
+            return None
+        kwargs = _as_dict(node)
+        if kwargs.pop("enable", True) is False:
+            return None
+        return cls(init_kwargs=cast(WandbInitKwargs, kwargs), run_config=raw.to_dict())
+
+
+@dataclass(frozen=True)
+class DraftCheckpointDefaults:
+    """Runtime values the draft recipes derive for the checkpointer; the YAML ``checkpoint:`` block overrides them.
+
+    Attributes:
+        checkpoint_dir: Directory the checkpoints go to.
+        model_repo_id: Repo id or path of the target the draft belongs to.
+        model_cache_dir: Hugging Face hub cache directory.
+        save_consolidated: Whether to export a consolidated HF checkpoint (``False`` for LoRA drafts).
+        is_peft: Whether the draft is trained with LoRA.
+        model_state_dict_keys: State-dict keys of the draft, used to diff the consolidated export.
+    """
+
+    checkpoint_dir: str
+    model_repo_id: str
+    model_cache_dir: str
+    save_consolidated: bool
+    is_peft: bool
+    model_state_dict_keys: list[str]
+
+    def resolve(self, node: "ConfigNode | None") -> "CheckpointingConfig":
+        """Build the :class:`CheckpointingConfig`: these defaults, then the user's block over them.
+
+        ``restore_from`` is read separately at load time, so it is not a config field. A key that
+        ``CheckpointingConfig`` does not have raises ``TypeError``. A ``model_state_dict_keys: null`` in
+        the block falls back to the draft's keys.
+        """
+        from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+        kwargs = {
+            "enabled": True,
+            "checkpoint_dir": self.checkpoint_dir,
+            "model_save_format": "safetensors",
+            "model_repo_id": self.model_repo_id,
+            "model_cache_dir": self.model_cache_dir,
+            "save_consolidated": self.save_consolidated,
+            "is_peft": self.is_peft,
+            "model_state_dict_keys": self.model_state_dict_keys,
+        }
+        if node is not None:
+            user = _as_dict(node)
+            user.pop("restore_from", None)
+            kwargs.update(user)
+        if kwargs["model_state_dict_keys"] is None:
+            kwargs["model_state_dict_keys"] = self.model_state_dict_keys
+        return CheckpointingConfig(**kwargs)
 
 
 @dataclass(frozen=True)

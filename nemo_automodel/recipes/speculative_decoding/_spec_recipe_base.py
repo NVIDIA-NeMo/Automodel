@@ -36,7 +36,6 @@ from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint.checkpointing import (
-    CheckpointingConfig,
     load_torch_ckpt,
     save_config,
     save_losses,
@@ -44,12 +43,11 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.optim.optimizer import OptimizerConfig
-from nemo_automodel.recipes._typed_config import DraftOptimizerSettings
+from nemo_automodel.recipes._typed_config import DraftCheckpointDefaults, DraftOptimizerSettings, DraftWandbSettings
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
-    resolve_wandb_kwargs,
     resolve_warmup_steps,
 )
 
@@ -140,18 +138,16 @@ class SpecDecodeRecipeBase(BaseRecipe):
         sets ``enable: false`` (see ``resolve_wandb_kwargs``).
         """
         self.wandb_run = None
-        wandb_cfg = self.cfg.get("wandb", None)
-        if not self.dist_env.is_main or wandb_cfg is None:
+        if not self.dist_env.is_main:
             return
-        wandb_kwargs = resolve_wandb_kwargs(wandb_cfg.to_dict())
-        if wandb_kwargs is None:
+        settings = DraftWandbSettings.from_config(self.cfg)
+        if settings is None:
             return
         suppress_wandb_log_messages()
-        self.wandb_run = init_wandb_run(wandb_kwargs, self.cfg.to_dict(), default_name=default_name)
+        self.wandb_run = init_wandb_run(settings.init_kwargs, settings.run_config, default_name=default_name)
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the draft checkpointer using the same plumbing as the standard recipes."""
-        ckpt_cfg = self.cfg.get("checkpoint", None)
         default_dir = str(self.output_dir / "checkpoints")
         # The draft is built directly and bypasses ``apply_model_infrastructure``,
         # which is where ``_pre_shard_hf_state_dict_keys`` would normally be
@@ -161,24 +157,15 @@ class SpecDecodeRecipeBase(BaseRecipe):
         # LoRA drafts save/load adapter-only checkpoints; the consolidated
         # full-draft export does not apply to them.
         is_peft = getattr(self, "peft_config", None) is not None
-        ckpt_kwargs = dict(
-            enabled=True,
+        defaults = DraftCheckpointDefaults(
             checkpoint_dir=default_dir,
-            model_save_format="safetensors",
             model_repo_id=str(target_path),
             model_cache_dir=hf_constants.HF_HUB_CACHE,
             save_consolidated=not is_peft,
             is_peft=is_peft,
             model_state_dict_keys=draft_state_dict_keys,
         )
-        if ckpt_cfg is not None:
-            user_cfg = ckpt_cfg.to_dict() if hasattr(ckpt_cfg, "to_dict") else dict(ckpt_cfg)
-            user_cfg.pop("restore_from", None)
-            ckpt_kwargs.update(user_cfg)
-        if ckpt_kwargs.get("model_state_dict_keys") is None:
-            ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
-
-        self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
+        self.checkpoint_config = defaults.resolve(self.cfg.get("checkpoint", None))
         # The draft is never tp- or cp-sharded (it is replicated, or FSDP2-sharded only
         # over dp), so key the checkpoint shard on the dp coordinate, which tp/cp peers
         # share, rather than the global rank. Without a mesh the global rank is used.
