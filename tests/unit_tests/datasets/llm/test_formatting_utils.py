@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 
 import pytest
@@ -363,12 +364,86 @@ def test_format_chat_template_generation_block_uses_direct_assistant_mask():
     assert tok._ROLE_TOKEN not in out["labels"]  # role-header/scaffolding tokens are not
 
 
+GEMMA4_CODERFORGE_TEMPLATE = (
+    Path(__file__).parents[4] / "examples/long_context_validation/gemma4_31B/gemma4_coderforge_chat_template.jinja"
+)
+
+
+def _render_gemma4_coderforge(messages):
+    """Render ``messages`` with the shipped CoderForge template; return the text and its supervised spans."""
+    from transformers.utils.chat_template_utils import render_jinja_template
+
+    rendered, spans = render_jinja_template(
+        conversations=[messages],
+        chat_template=GEMMA4_CODERFORGE_TEMPLATE.read_text(),
+        return_assistant_tokens_mask=True,
+        bos_token="<bos>",
+    )
+    text = rendered[0]
+    return text, [text[start:end] for start, end in spans[0]]
+
+
 def test_shipped_gemma4_coderforge_template_has_generation_block():
     # Guard the shipped artifact: the recipe/validate/check_masking point ChatDataset
     # at this file, and it must trip the generation-keyword path (GENERATION_REGEX)
     # with balanced tags, or ChatDataset silently falls back to the guarded builder.
-    template = (
-        Path(__file__).parents[4] / "examples/long_context_validation/gemma4_31B/gemma4_coderforge_chat_template.jinja"
-    ).read_text()
+    template = GEMMA4_CODERFORGE_TEMPLATE.read_text()
     assert formatting_utils.GENERATION_REGEX.search(template) is not None
     assert template.count("{% generation %}") == template.count("{% endgeneration %}") >= 1
+
+
+def test_shipped_gemma4_coderforge_template_supervises_only_model_spans():
+    # ChatDataset stores tool-call arguments as JSON strings; NeMoAutoTokenizer decodes them for
+    # Gemma4 with tool_call_arguments_as_dicts before rendering. The result must be the native
+    # Gemma4 tool format (tool results inside the model turn), and only model output plus the
+    # <|tool_response> stop token after the tool calls is supervised, never the tool payloads,
+    # role headers, or non-model turns. The expected text is the upstream google/gemma-4-31B-it
+    # template's rendering of the same conversation.
+    from nemo_automodel._transformers.tokenization.tool_call_arguments import tool_call_arguments_as_dicts
+
+    def call(i, cmd):
+        return {"id": f"c{i}", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"cmd": cmd})}}
+
+    messages = [
+        {"role": "system", "content": "You are an agent."},
+        {"role": "user", "content": "Fix the bug."},
+        {"role": "assistant", "content": "", "reasoning_content": "Look first.", "tool_calls": [call(0, "ls")]},
+        {"role": "tool", "tool_call_id": "c0", "content": "a.py"},
+        {"role": "assistant", "content": "", "tool_calls": [call(1, "cat a.py")]},
+        {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "print(1)"}]},
+        {"role": "assistant", "content": "Done."},
+    ]
+    text, supervised = _render_gemma4_coderforge(tool_call_arguments_as_dicts(messages))
+
+    assert text == (
+        "<bos><|turn>system\nYou are an agent.<turn|>\n<|turn>user\nFix the bug.<turn|>\n<|turn>model\n"
+        "<|channel>thought\nLook first.\n<channel|>"
+        '<|tool_call>call:bash{cmd:<|"|>ls<|"|>}<tool_call|>'
+        '<|tool_response>response:bash{value:<|"|>a.py<|"|>}<tool_response|>'
+        '<|tool_call>call:bash{cmd:<|"|>cat a.py<|"|>}<tool_call|>'
+        '<|tool_response>response:bash{value:<|"|>print(1)<|"|>}<tool_response|>'
+        "Done.<turn|>\n"
+    )
+    assert supervised == [
+        '<|channel>thought\nLook first.\n<channel|><|tool_call>call:bash{cmd:<|"|>ls<|"|>}<tool_call|>',
+        "<|tool_response>",
+        '<|tool_call>call:bash{cmd:<|"|>cat a.py<|"|>}<tool_call|>',
+        "<|tool_response>",
+        "Done.<turn|>\n",
+    ]
+
+    # Without the decoding the template refuses the JSON strings instead of rendering a non-native format.
+    with pytest.raises(Exception, match="must be a JSON object"):
+        _render_gemma4_coderforge(messages)
+
+
+def test_shipped_gemma4_coderforge_template_supervises_dangling_tool_call_stop_token():
+    # A trajectory that ends on a tool call (no tool result yet) closes the model turn with the
+    # <|tool_response> stop token, which the model generates and so must be supervised.
+    messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "bash", "arguments": {}}}]},
+    ]
+    text, supervised = _render_gemma4_coderforge(messages)
+    assert text == "<bos><|turn>user\ngo<turn|>\n<|turn>model\n<|tool_call>call:bash{}<tool_call|><|tool_response>"
+    assert supervised == ["<|tool_call>call:bash{}<tool_call|>", "<|tool_response>"]

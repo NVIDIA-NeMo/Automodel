@@ -153,8 +153,10 @@ def clean_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             for i, call in enumerate(tool_calls):
                 fn = call.get("function") or {}
                 args = fn.get("arguments")
-                if args is None:
-                    args = ""
+                if args is None or args == "":
+                    # NeMoAutoTokenizer only decodes JSON-object strings, and the Gemma4 template raises on
+                    # any other string, so a call without arguments needs "{}" rather than "".
+                    args = "{}"
                 elif not isinstance(args, str):
                     args = json.dumps(args)
                 cleaned.append(
@@ -316,6 +318,11 @@ def analyzed_cache_path(cache_dir: str | None, dataset_id: str, split: str, mode
     """Deterministic path for the analyzed (parsed + clean + n_tokens) JSONL cache."""
     ds_name = dataset_id.replace("/", "_")
     model_short = model.rstrip("/").split("/")[-1]
+    # Key on the template's contents, not its path: n_tokens depends on the rendering, so editing the
+    # template in place must not reuse a cache measured with the old one.
+    if chat_template and os.path.isfile(chat_template):
+        with open(chat_template, "rb") as f:
+            chat_template = hashlib.md5(f.read()).hexdigest()
     config_hash = hashlib.md5(f"{dataset_id}|{split}|{model}|{chat_template}".encode()).hexdigest()[:8]
     fname = f"{ds_name}_{split}_{model_short}_{config_hash}_analyzed.jsonl"
     return os.path.join(_cache_root(cache_dir), "analyzed", fname)
@@ -436,10 +443,11 @@ def main() -> None:
         logger.info("Reusing analyzed cache: %s (use --force_analyze to rebuild)", analyzed_path)
         lengths = read_analyzed_jsonl(analyzed_path)
     else:
-        from transformers import AutoTokenizer
+        from nemo_automodel import NeMoAutoTokenizer
 
         logger.info("Loading tokenizer: %s", args.model)
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        # Same loader as the recipe, so lengths are measured on the rendering training sees.
+        tokenizer = NeMoAutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         if args.chat_template:
             from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 

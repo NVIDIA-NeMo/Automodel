@@ -62,20 +62,31 @@ higher-length pass is a cheap re-filter (no re-tokenization) that emits a new
   **no `chat_template.jinja`** — copy it from `google/gemma-4-31B-it` into the base
   checkpoint dir before running data prep or training (the tokenizer is identical).
 - **Assistant masking uses `gemma4_coderforge_chat_template.jinja`** (in this
-  directory), a copy of the stock Gemma4 template with every assistant turn's body
-  wrapped in `{% generation %}...{% endgeneration %}`. The recipe, `validate_data.py`,
-  and `check_masking.py` point `chat_template` at it, so
+  directory), a copy of the upstream `google/gemma-4-31B-it` template (revision in
+  its header) with the model-generated spans wrapped in
+  `{% generation %}...{% endgeneration %}`: thinking, tool calls, the
+  `<|tool_response>` stop token the model emits after its calls, content, and the
+  closing `<turn|>`. Tool response payloads stay masked. The recipe,
+  `validate_data.py`, and `check_masking.py` point `chat_template` at it, so
   `apply_chat_template(return_assistant_tokens_mask=True)` returns the assistant
   mask directly (one `apply_chat_template` call per sample). The rendered token
-  stream is byte-identical to the stock template.
+  stream is byte-identical to the upstream template.
   The stock Gemma4 template has **no `{% generation %}` block**, so `ChatDataset`
   would fall back to `_build_multiturn_assistant_mask` — an O(turns) per-sample
   re-tokenization that #3024's prefix-consistency guard rejects for multi-turn
   conversations whose rendered prefixes are not exact token prefixes of the full
   render. The generation-block template is the supported path.
-- The stop token the model must learn is **`<turn|>` (id 106)**, listed in
+- **Tool calls use the native Gemma4 format** (`call:name{key:<|"|>value<|"|>}`,
+  tool results inside the model turn). The template requires `arguments` as a
+  mapping while the cache stores JSON strings, so the recipe and all three data
+  scripts load the tokenizer with `NeMoAutoTokenizer`, which decodes them for
+  Gemma4 (`transformers.AutoTokenizer` would hand the template strings, and it
+  raises). `prefilter.sh` measures `n_tokens` with this template by default.
+- The stop tokens the model must learn are **`<turn|>` (id 106)** and, after its
+  tool calls, **`<|tool_response>` (id 50)**, both listed in
   `generation_config.eos_token_id=[1,106,50]` — **not** the tokenizer
-  `eos_token_id` (1 = `<eos>`). `validate_data.py` checks 106.
+  `eos_token_id` (1 = `<eos>`). CoderForge trajectories end on a `finish` tool
+  call, so their final supervised token is 50. `validate_data.py` accepts either.
 - CoderForge messages use a union schema (`tool_calls: null` on plain turns);
   the preprocessor strips those, and the cache is **JSONL** (Parquet's Arrow
   struct unification would re-add the null keys and break `ChatDataset`).

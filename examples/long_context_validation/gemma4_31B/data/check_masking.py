@@ -31,8 +31,7 @@ For a few samples it reports:
 import argparse
 import os
 
-from transformers import AutoTokenizer
-
+from nemo_automodel import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
 GEMMA4 = "/path/to/checkpoints/hf_gemma4_31b"
@@ -67,12 +66,12 @@ def main():
     ap.add_argument(
         "--chat-template",
         default=_DEFAULT_CHAT_TEMPLATE,
-        help="Chat template with {% generation %} blocks for direct assistant masking. "
+        help="Chat template with {%% generation %%} blocks for direct assistant masking. "
         "Empty string uses the tokenizer's own template (the prefix-arithmetic fallback).",
     )
     args = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained(GEMMA4)
+    tok = NeMoAutoTokenizer.from_pretrained(GEMMA4)
     ds = ChatDataset(
         path_or_dataset_id=args.jsonl,
         tokenizer=tok,

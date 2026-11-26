@@ -77,7 +77,7 @@ def test_wrapped_tokenizer_survives_copies():
         assert args == ("x",) and kwargs == {"tokenize": False}
 
 
-@pytest.mark.parametrize("model_type", ["beam", "deepseek_v41", "nemotron_h"])
+@pytest.mark.parametrize("model_type", ["beam", "deepseek_v41", "gemma4", "gemma4_unified", "nemotron_h"])
 def test_registered_for_models_whose_templates_need_dict_arguments(model_type: str) -> None:
     assert TokenizerRegistry.get_custom_tokenizer_cls(model_type) is DictToolArgumentsTokenizer
 

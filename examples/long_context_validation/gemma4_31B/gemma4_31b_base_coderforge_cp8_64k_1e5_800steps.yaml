@@ -76,7 +76,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: /path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    # NeMoAutoTokenizer hands the Gemma4 template tool-call arguments as dicts (it raises on JSON strings).
+    _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: google/gemma-4-31B
   split: train
   seq_length: 65536
