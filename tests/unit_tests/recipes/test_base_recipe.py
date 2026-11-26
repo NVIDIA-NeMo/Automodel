@@ -454,6 +454,17 @@ def test_step_throughput_counts_context_parallel_flops_once(monkeypatch):
     assert mfu == pytest.approx(2.0)
 
 
+def test_step_throughput_with_null_calculator_keeps_token_rate(monkeypatch):
+    recipe = BaseRecipe()
+    recipe.timestamp = 10.0
+    monkeypatch.setattr(time, "perf_counter", lambda: 12.0)
+
+    tps, mfu = recipe._step_throughput([{"input_ids": torch.ones(1, 8, dtype=torch.long)}], num_tokens_in_batch=16)
+
+    assert tps == 8.0
+    assert mfu is None
+
+
 def test_optimizer_checkpoint_part_ids_use_global_pipeline_stage_indices(tmp_path):
     recipe_inst = _ToyRecipe(tmp_path)
     recipe_inst.pp = SimpleNamespace(
