@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -400,3 +401,74 @@ class TestQwen3_5MoeTextOnlyVisionTower:
         assert len(visual_entries) == (1 if vision_tower_trainable else 0)
         expected = model.model.language_model.embed_tokens(input_ids)
         torch.testing.assert_close(embeds, expected)
+
+_ON_CPU_AND_CUDA = pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")),
+    ],
+)
+
+# Token ids of ``_media_config``: image placeholder, vision start, vision end.
+_IMAGE, _START, _END = 5, 7, 8
+
+
+class TestQwen3_5MoeMediaPositions:
+    @_ON_CPU_AND_CUDA
+    def test_first_pipeline_stage_decodes_a_media_batch_with_the_later_stages_positions(self, device):
+        """Every layer of a media batch split into two pipeline stages gets the same positions.
+
+        The last stage receives hidden states only and builds sequential positions, so the first stage
+        (no ``lm_head``) decodes with them as well: the staged logits equal the unsplit model run on
+        sequential positions.
+        """
+        cfg = _media_config(0)
+        cfg.text_config.num_hidden_layers = 2
+        cfg.text_config.layer_types = ["full_attention", "full_attention"]
+        model = Qwen3_5MoeForConditionalGeneration(cfg, backend=_backend())
+        model.initialize_weights()
+        model.to(device).eval()
+
+        # Split as the pipeline splitter does: copy the model, drop the other stage's layers, and set the
+        # modules a stage does not own to None. Layer 0 goes with the embeddings, layer 1 with the head.
+        first, last = copy.deepcopy(model), copy.deepcopy(model)
+        del first.model.language_model.layers["1"]
+        first.model.language_model.norm = None
+        first.lm_head = None
+        del last.model.language_model.layers["0"]
+        last.model.language_model.embed_tokens = None
+
+        # One 2 x 2 image: its M-RoPE positions (1, 1..2, 1..2) are not sequential.
+        input_ids = torch.tensor([[_START, _IMAGE, _IMAGE, _IMAGE, _IMAGE, _END, 10, 11]], device=device)
+        media = dict(
+            pixel_values=torch.randn(4, 12, device=device, dtype=model.lm_head.weight.dtype),
+            image_grid_thw=torch.tensor([[1, 2, 2]], device=device),
+            mm_token_type_ids=(input_ids == _IMAGE).long(),
+            attention_mask=torch.ones_like(input_ids),
+        )
+        # position_ids has shape [axes, batch, sequence].
+        sequential = torch.arange(8, device=device).expand(3, 1, 8)
+
+        layer_positions = []
+        layers = [*first.model.language_model.layers.values(), *last.model.language_model.layers.values()]
+        handles = [
+            layer.register_forward_pre_hook(
+                lambda _module, _args, kwargs: layer_positions.append(kwargs["position_ids"]), with_kwargs=True
+            )
+            for layer in layers
+        ]
+        try:
+            with torch.no_grad():
+                stage_hidden = first(input_ids=input_ids, **media).logits
+                staged_logits = last(stage_hidden).logits
+                unsplit_logits = model(input_ids=input_ids, position_ids=sequential, **media).logits
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert len(layer_positions) == 2
+        for positions in layer_positions:
+            assert positions.tolist() == sequential.tolist()
+        assert torch.isfinite(staged_logits).all()
+        torch.testing.assert_close(staged_logits, unsplit_logits, rtol=0, atol=0)

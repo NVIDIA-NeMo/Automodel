@@ -1879,6 +1879,18 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 for media_key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"):
                     kwargs.pop(media_key, None)
 
+        if (
+            position_ids is None
+            and self.lm_head is None
+            and input_ids is not None
+            and not torch.is_floating_point(input_ids)
+            and input_ids.ndim == 2
+            and (pixel_values is not None or pixel_values_videos is not None)
+        ):
+            # First pipeline stage of a media batch: later stages receive hidden states only and decode with
+            # sequential positions, so decode this stage's layers with the same ones.
+            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device)
+            position_ids = position_ids.view(1, 1, -1).expand(3, input_ids.shape[0], -1)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
