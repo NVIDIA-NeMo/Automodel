@@ -1574,24 +1574,29 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
     def _vision_tower_is_trainable(self) -> bool:
-        """Whether the vision tower is its own FSDP unit with at least one trainable parameter."""
+        """Whether the vision tower is or contains an FSDP unit and has at least one trainable parameter."""
         visual = getattr(self.model, "visual", None)
-        return isinstance(visual, FSDPModule) and any(param.requires_grad for param in visual.parameters())
+        if visual is None:
+            return False
+        return any(isinstance(module, FSDPModule) for module in visual.modules()) and any(
+            param.requires_grad for param in visual.parameters()
+        )
 
     def _anchor_unused_vision_tower(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         """Tie text-only embeddings to a trainable vision tower without changing their values.
 
-        Under FSDP2 a trainable tower is its own FSDP unit. A rank whose batch has no media would skip the
-        tower's all-gather and its gradient reduction while ranks with media issue both, and the
-        step deadlocks. Encoding one blank image and adding zero times its features makes every
-        rank enter the tower once and gives the tower's parameters a zero gradient on this rank.
+        Under FSDP2 a trainable tower is its own FSDP unit (MoE parallelizer) or its blocks are FSDP
+        units (dense parallelizer). A rank whose batch has no media would skip those units' all-gathers
+        and gradient reductions while ranks with media issue them, and the step deadlocks. Encoding one
+        blank image and adding zero times its features makes every rank enter the tower once and gives
+        the tower's parameters a zero gradient on this rank.
 
         Args:
             inputs_embeds: Text embeddings of shape ``[batch, sequence, hidden]``.
 
         Returns:
             Embeddings of shape ``[batch, sequence, hidden]`` with the same values. The input
-            tensor itself is returned when the tower is absent, fully frozen, or not an FSDP unit.
+            tensor itself is returned when the tower is absent, fully frozen, or holds no FSDP unit.
         """
         if not self._vision_tower_is_trainable():
             return inputs_embeds

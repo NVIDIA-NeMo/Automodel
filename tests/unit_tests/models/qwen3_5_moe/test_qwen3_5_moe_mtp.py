@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import FSDPModule, fully_shard
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
@@ -361,6 +361,51 @@ class TestQwen3_5MoeTextOnlyVisionTower:
 
         assert calls == ["embed_tokens", "language_model", "lm_head"]
         assert all(param.grad is None for param in model.model.visual.parameters())
+
+    @pytest.mark.parametrize(
+        ("mtp_num_hidden_layers", "training"), [(0, True), (1, True), (1, False)], ids=["no-mtp", "mtp", "mtp-eval"]
+    )
+    def test_tower_whose_blocks_are_fsdp_units_is_entered_for_text(self, mtp_num_hidden_layers, training, cpu_mesh):
+        """A trainable tower whose blocks are the FSDP units is entered by a text-only batch, as by a media batch.
+
+        The dense FSDP2 parallelizer shards every vision block on its own and leaves the rest of the tower in
+        the root unit, so a rank that skipped the tower would skip the blocks' collectives.
+        """
+        model = Qwen3_5MoeForConditionalGeneration(_media_config(mtp_num_hidden_layers), backend=_backend())
+        model.initialize_weights()
+        for block in model.model.visual.blocks:
+            fully_shard(block, mesh=cpu_mesh)
+        assert not isinstance(model.model.visual, FSDPModule)
+        assert all(isinstance(block, FSDPModule) for block in model.model.visual.blocks)
+        model.train(training)
+        calls, handles = _record_module_entries(model)
+        block_entries: list[int] = []
+        handles.extend(
+            block.register_forward_pre_hook(lambda _module, _args, index=index: block_entries.append(index))
+            for index, block in enumerate(model.model.visual.blocks)
+        )
+        try:
+            with torch.set_grad_enabled(training):
+                model(input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]))
+                text_calls, text_block_entries = list(calls), list(block_entries)
+                calls.clear()
+                block_entries.clear()
+                # Four image placeholders for one 2x2-patch image; pixel_values has shape [patches, patch_features].
+                model(
+                    input_ids=torch.tensor([[7, 5, 5, 5, 5, 8, 10, 11]]),
+                    pixel_values=torch.randn(4, 12, dtype=model.lm_head.weight.dtype),
+                    image_grid_thw=torch.tensor([[1, 2, 2]]),
+                    mm_token_type_ids=torch.tensor([[0, 1, 1, 1, 1, 0, 0, 0]]),
+                )
+                media_calls, media_block_entries = list(calls), list(block_entries)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert media_block_entries == list(range(len(model.model.visual.blocks)))
+        assert text_block_entries == media_block_entries
+        assert text_calls == ["embed_tokens", "visual", "language_model", "lm_head"]
+        assert media_calls == text_calls
 
     def test_text_only_step_gives_the_tower_zero_gradients_and_unchanged_logits(self, cpu_mesh):
         """Entering the trainable tower changes neither the logits nor the language-model gradients."""
