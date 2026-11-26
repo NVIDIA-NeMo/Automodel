@@ -56,9 +56,10 @@ def sqrt_softplus_stable(scores: torch.Tensor) -> torch.Tensor:
         FP32 tensor of shape [...] on the input device, without mutating scores.
     """
     values = scores.float()
-    regular = F.softplus(values.clamp(min=-20.0)).sqrt()
-    negative = (0.5 * values.clamp(max=-20.0)).exp()
-    return torch.where(values < -20.0, negative, regular)
+    is_tail = values < -20.0
+    regular = F.softplus(torch.where(is_tail, -20.0, values)).sqrt()
+    negative = (0.5 * torch.where(is_tail, values, -20.0)).exp()
+    return torch.where(is_tail, negative, regular)
 
 
 class MLP(nn.Module):

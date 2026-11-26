@@ -63,8 +63,14 @@ def test_sqrt_softplus_stable_matches_float64_reference(dtype: torch.dtype, upst
 
 @pytest.mark.cpu_only
 def test_sqrt_softplus_stable_keeps_original_expression_from_threshold_up() -> None:
-    values = torch.linspace(-20.0, 40.0, 6001, dtype=torch.float32)
-    torch.testing.assert_close(sqrt_softplus_stable(values), F.softplus(values).sqrt(), rtol=0.0, atol=0.0)
+    values = torch.linspace(-20.0, 40.0, 6001, dtype=torch.float32, requires_grad=True)
+    reference_values = values.detach().clone().requires_grad_()
+    output = sqrt_softplus_stable(values)
+    reference = F.softplus(reference_values).sqrt()
+    torch.testing.assert_close(output, reference, rtol=0.0, atol=0.0)
+    output_grad = torch.autograd.grad(output.sum(), values)[0]
+    reference_grad = torch.autograd.grad(reference.sum(), reference_values)[0]
+    torch.testing.assert_close(output_grad, reference_grad, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.cpu_only
