@@ -210,7 +210,7 @@ def prepare_cudnn_dsa_packed_metadata(
         global_queries[1:] != global_queries[:-1] + 1
     )
     segment_ids = segment_start.to(torch.int64).cumsum(0).sub(1)
-    query_counts = torch.bincount(segment_ids)
+    _, query_counts = torch.unique_consecutive(segment_ids, return_counts=True)
     segment_cu_q64 = torch.nn.functional.pad(query_counts.cumsum(0), (1, 0))
     segment_documents = safe_document_ids.index_select(0, segment_cu_q64[:-1])
     segment_query_starts = global_queries.index_select(0, segment_cu_q64[:-1])

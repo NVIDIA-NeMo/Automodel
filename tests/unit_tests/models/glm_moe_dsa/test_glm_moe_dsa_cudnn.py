@@ -537,6 +537,37 @@ def test_cudnn_metadata_segments_cp_queries_and_padded_documents() -> None:
     assert metadata.total_key_tokens == 12
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="counts CUDA host synchronizations")
+def test_cudnn_metadata_sizes_segments_without_a_host_synchronization() -> None:
+    """Segment sizing takes no host synchronization beyond the run count, at CP1 and under CP."""
+    import warnings
+
+    device = torch.device("cuda")
+    cu_seqlens = torch.tensor([0, 8, 12, 24], dtype=torch.int32, device=device)
+
+    def synchronizations(query_indices: torch.Tensor | None) -> tuple[int, cudnn_dsa.CudnnDsaPackedMetadata]:
+        cudnn_dsa.prepare_cudnn_dsa_packed_metadata(cu_seqlens, 24, query_indices=query_indices)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                metadata = cudnn_dsa.prepare_cudnn_dsa_packed_metadata(cu_seqlens, 24, query_indices=query_indices)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        return sum("synchroniz" in str(warning.message) for warning in caught), metadata
+
+    # Two host reads are inherent (the packed-summary read and the data-dependent run count); sizing the
+    # segments with ``torch.bincount`` took a third.
+    cp1_syncs, _ = synchronizations(None)
+    head_tail = torch.cat([torch.arange(0, 6), torch.arange(18, 24)]).to(device)
+    head_tail_syncs, metadata = synchronizations(head_tail)
+    assert cp1_syncs <= 2
+    assert head_tail_syncs <= 2
+    # Rank 0 of a head/tail split owns rows 0-5 of document 0 and rows 18-23 of document 2.
+    torch.testing.assert_close(metadata.segment_cu_q.cpu(), torch.tensor([0, 6, 12], dtype=torch.int32))
+
+
 def test_cudnn_metadata_uses_padding_mask_after_thd_absorption() -> None:
     """The runtime padding mask recovers real rows after trailing padding was absorbed."""
     metadata = cudnn_dsa.prepare_cudnn_dsa_packed_metadata(
