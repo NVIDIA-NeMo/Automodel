@@ -62,6 +62,11 @@ def parse_log(log_path: str) -> dict:
     if m:
         results["tflops_total"] = float(m.group(1))
 
+    # The recipe detects the peak from the device and the training precision.
+    m = re.search(r"MFU peak:\s+([\d.]+)\s+TFLOPs/s", content)
+    if m:
+        results["peak_tflops"] = float(m.group(1))
+
     m = re.search(r"TFLOPS multiplier for PEFT:.*?=\s+([\d.]+)", content)
     if m:
         results["peft_tflops_multiplier"] = float(m.group(1))
@@ -99,7 +104,6 @@ def parse_config(config_path: str) -> dict:
     benchmark = cfg.get("benchmark", {})
     config["num_nodes"] = benchmark.get("num_nodes")
     config["warmup_steps"] = benchmark.get("warmup_steps")
-    config["peak_tflops"] = benchmark.get("peak_tflops")
 
     step = cfg.get("step_scheduler", {})
     config["global_batch_size"] = step.get("global_batch_size")
@@ -145,6 +149,7 @@ def main():
 
     log_data = parse_log(args.log)
     config_data = parse_config(args.config)
+    config_data["peak_tflops"] = log_data["results"].pop("peak_tflops", None)
 
     # Merge trainable/total params into peft section if present
     if config_data.get("peft") and "trainable_params" in log_data["results"]:

@@ -17,12 +17,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from huggingface_hub import save_torch_state_dict
 from safetensors.torch import load_file, save_file
 from torch import nn
 from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, PretrainedConfig
 
 from nemo_automodel import export_merged_peft_checkpoint
-from nemo_automodel._transformers.peft_export import _merge_and_get_hf_state_dict, _to_host_preserving_sharing
+from nemo_automodel._transformers.peft_export import (
+    _copy_views_to_own_storage,
+    _merge_and_get_hf_state_dict,
+    _to_host_preserving_sharing,
+)
 from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
@@ -69,6 +74,44 @@ def test_host_transfer_preserves_shared_views(device):
     if device == "cuda":
         host["slice"].fill_(-1)
         torch.testing.assert_close(base, torch.arange(24, dtype=torch.float32, device=device).reshape(4, 6))
+
+
+def test_views_are_copied_to_own_storage_and_whole_tensors_are_kept(tmp_path):
+    """Views into a shared storage become tensors the Hub writer accepts; tied weights stay one tensor."""
+    grouped = torch.arange(48, dtype=torch.float32).reshape(2, 4, 6)
+    scale = torch.arange(3, dtype=torch.float32)
+    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    state_dict = {
+        "weight": weight,
+        "tied_weight": weight,
+        "experts.0": grouped[0].T,
+        "experts.1": grouped[1].T,
+        "alpha_pre": scale[0:1],
+        "alpha_post": scale[1:2],
+        "empty": torch.empty(0),
+        "scalar": torch.tensor(3.0),
+    }
+    views = ("experts.0", "experts.1", "alpha_pre", "alpha_post")
+    expected = {key: tensor.clone() for key, tensor in state_dict.items()}
+
+    consumed = dict(state_dict)
+    copied = _copy_views_to_own_storage(consumed)
+
+    assert not consumed
+    assert list(copied) == list(state_dict)
+    for key, tensor in state_dict.items():
+        if key in views:
+            assert copied[key].is_contiguous()
+            assert copied[key].untyped_storage().nbytes() == copied[key].nbytes
+        else:
+            assert copied[key] is tensor
+        torch.testing.assert_close(copied[key], expected[key], rtol=0, atol=0)
+
+    save_torch_state_dict(copied, tmp_path, shared_tensors_to_discard=["tied_weight"])
+    stored = load_file(tmp_path / "model.safetensors")
+    assert stored.keys() == state_dict.keys() - {"tied_weight"}
+    for key, tensor in stored.items():
+        torch.testing.assert_close(tensor, expected[key], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
