@@ -1430,6 +1430,13 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         ``input_ids`` and media stay in the batch for the forward, while
         ``mm_token_type_ids`` is consumed here (only ``get_rope_index`` needs it).
 
+        The loader gives a text-only sample a fake image, masks its vision tokens
+        (``attention_mask`` 0) and keeps its grid in ``image_grid_thw``. The
+        position walk skips masked tokens, so it is given the grids of the
+        attended images only: a masked image takes no positions and every
+        attended image is laid out on its own grid. The batch keeps all grids for
+        the vision tower.
+
         Args:
             batch: The full-sequence batch. Tensor fields consumed here are
                 ``input_ids`` of shape ``[batch, sequence]``, optional
@@ -1486,7 +1493,17 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                         mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == image_token_id, 1)
                     if video_token_id is not None:
                         mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == video_token_id, 2)
-                rope_kwargs["mm_token_type_ids"] = mm_token_type_ids.to(device=input_ids.device)
+                mm_token_type_ids = mm_token_type_ids.to(device=input_ids.device)
+                rope_kwargs["mm_token_type_ids"] = mm_token_type_ids
+                if image_grid_thw is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+                    # get_rope_index drops masked tokens but takes the grids in order, so the grid of a masked
+                    # fake image would go to the next image. Walk with the grids of the attended images only.
+                    is_image = mm_token_type_ids == 1
+                    # First token of every image run, shape [batch, sequence]; row-major order is the grid order.
+                    run_starts = is_image & ~nn.functional.pad(is_image, (1, 0))[:, :-1]
+                    run_attended = attention_mask.bool()[run_starts]
+                    if run_attended.numel() == image_grid_thw.shape[0] and not bool(run_attended.all()):
+                        rope_kwargs["image_grid_thw"] = image_grid_thw[run_attended]
             position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
             self.model.rope_deltas = rope_deltas
 
