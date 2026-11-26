@@ -1390,8 +1390,7 @@ def test_checkpoint_exempt_scan_state_is_refused_with_context_parallelism(monkey
             mixer(x)
 
 
-# Activation checkpointing of NemotronV3 MoE blocks: MoE-only mode (``mlp`` aliases ``mixer``) and the weight-tied MTP
-# block.
+# Activation checkpointing of NemotronV3 MoE blocks in MoE-only mode (``mlp`` aliases ``mixer``).
 
 
 def _moe_checkpointing_backend() -> BackendConfig:
@@ -1451,106 +1450,3 @@ def test_moe_only_keeps_loss_and_gradients() -> None:
     assert all(grad.abs().sum() > 0 for name, grad in ref_grads.items() if ".experts." in name)
     for name, grad in grads.items():
         assert torch.equal(grad, ref_grads[name.replace("._checkpoint_wrapped_module", "")]), name
-
-
-MTP_DEPTHS = 2
-
-
-def _model() -> tuple[NemotronHForCausalLM, ModelMockNemotronV3Config]:
-    """Two backbone blocks and one physical ``[attention, moe]`` MTP depth that runs ``MTP_DEPTHS`` times."""
-    config = ModelMockNemotronV3Config(
-        layers_block_type=["attention", "moe"],
-        num_nextn_predict_layers=1,
-        mtp_hybrid_override_pattern="*E",
-        torch_dtype="float32",
-    )
-    backend = _moe_checkpointing_backend()
-    torch.manual_seed(0)
-    model = NemotronHForCausalLM(
-        config,
-        backend=backend,
-        num_nextn_predict_layers=MTP_DEPTHS,
-        mtp_use_repeated_layer=True,
-    ).to(torch.float32)
-    # The constructor leaves the routed-expert weights at zero; without this the expert gradients would be zero too.
-    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
-    model.train()
-    return model, config
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("experts_rank_local", [False, True])
-def test_the_moe_block_of_a_repeated_mtp_depth_is_checkpointed_with_rank_local_experts(
-    experts_rank_local: bool,
-) -> None:
-    """Rank-local experts: checkpointed like the other blocks. Otherwise (FSDP-sharded experts, or a caller without
-    expert parallelism, which is the default of ``apply_ac``) the block keeps its activations."""
-    model, config = _model()
-    apply_ac(
-        model,
-        hidden_size=config.hidden_size,
-        num_experts=config.n_routed_experts,
-        experts_rank_local=experts_rank_local,
-    )
-    assert [isinstance(block, CheckpointWrapper) for block in model.mtp.layers] == [True, experts_rank_local]
-
-    # MoE-only mode wraps the MoE child of a block, not the block.
-    moe_only, config = _model()
-    apply_ac(
-        moe_only,
-        moe_only=True,
-        hidden_size=config.hidden_size,
-        num_experts=config.n_routed_experts,
-        experts_rank_local=experts_rank_local,
-    )
-    attention_block, moe_block = moe_only.mtp.layers
-    assert not isinstance(attention_block, CheckpointWrapper) and not isinstance(moe_block, CheckpointWrapper)
-    assert isinstance(moe_block.mixer, CheckpointWrapper) is experts_rank_local
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("moe_only", [False, True])
-def test_checkpointing_the_repeated_mtp_moe_block_keeps_loss_and_gradients(moe_only: bool) -> None:
-    """One CPU forward/backward over the backbone and both MTP depths: loss and gradients are bitwise equal."""
-    reference, config = _model()
-    kept = copy.deepcopy(reference)
-    apply_ac(kept, moe_only=moe_only, hidden_size=config.hidden_size, num_experts=config.n_routed_experts)
-    checkpointed = copy.deepcopy(reference)
-    apply_ac(
-        checkpointed,
-        moe_only=moe_only,
-        hidden_size=config.hidden_size,
-        num_experts=config.n_routed_experts,
-        experts_rank_local=True,
-    )
-
-    input_ids = torch.randint(0, config.vocab_size, (2, 8), generator=torch.Generator().manual_seed(3))
-
-    def loss_and_grads(model: NemotronHForCausalLM) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        out = model(input_ids)
-        assert len(out.mtp_per_depth_h) == MTP_DEPTHS
-        targets = input_ids.reshape(-1)
-        loss = torch.nn.functional.cross_entropy(out.logits.reshape(-1, out.logits.shape[-1]), targets)
-        for depth_hidden in out.mtp_per_depth_h:
-            depth_logits = model.lm_head(depth_hidden)
-            loss = loss + 0.3 * torch.nn.functional.cross_entropy(
-                depth_logits.reshape(-1, depth_logits.shape[-1]), targets
-            )
-        loss.backward()
-        grads = {
-            name.replace("._checkpoint_wrapped_module", ""): param.grad.clone()
-            for name, param in model.named_parameters()
-            if param.grad is not None
-        }
-        return loss.detach(), grads
-
-    ref_loss, ref_grads = loss_and_grads(reference)
-    mtp_expert_grads = [grad for name, grad in ref_grads.items() if name.startswith("mtp.") and ".experts." in name]
-    assert mtp_expert_grads and all(grad.abs().sum() > 0 for grad in mtp_expert_grads)
-
-    for model in (kept, checkpointed):
-        loss, grads = loss_and_grads(model)
-        assert torch.equal(loss, ref_loss)
-        assert set(grads) == set(ref_grads)
-        for name, grad in grads.items():
-            assert torch.equal(grad, ref_grads[name]), name

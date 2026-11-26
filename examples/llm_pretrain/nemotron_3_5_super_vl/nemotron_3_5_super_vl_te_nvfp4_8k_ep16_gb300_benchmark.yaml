@@ -47,18 +47,19 @@
 # map on FineWeb; its header describes the map and the NVFP4 size requirements in full.
 #
 # What makes the step fast, each measured on this workload:
-#   - One micro-batch of 8 sequences per rank under full-block activation checkpointing. It covers the
-#     weight-tied MTP MoE block as well: ep_size covers all 16 ranks, so FSDP does not shard the experts.
-#   - model.mamba_scan_ac_exempt_blocks: 13 keeps the scan state of the first 13 Mamba blocks, so their
+#   - One micro-batch of 8 sequences per rank under full-block activation checkpointing; the MoE block of the
+#     weight-tied MTP head keeps its activations for both depths.
+#   - model.mamba_scan_ac_exempt_blocks: 4 keeps the scan state of the first 4 Mamba blocks, so their
 #     recompute in the backward pass skips the scan: about 1.5 GiB per block.
-#   - reshard_after_forward: false (FSDP and MoE) keeps the unsharded parameters between forward and backward.
+#   - reshard_after_forward: true (FSDP and MoE) frees the unsharded parameters after the forward pass, which
+#     makes room for the micro-batch of 8.
 #   - te_grouped_tensor, dispatcher_num_sms: 64, dispatcher_recompute_cache: combine,
 #     mamba_norm_backward_grid_scale: 8 and FusedLinearCrossEntropy, as in the BF16 file.
 # shared_expert_overlap (the shared expert on a second CUDA stream) is off, as in the BF16 file: with cuBLASLt
 # before 13.8.1 a grouped GEMM can leave part of a weight gradient unwritten while GEMMs run on a second
 # stream, whatever the routing, so the experts refuse te_grouped_tensor together with it on such a library.
-# On one node with 128 of the 512 experts (ep4, 4 instead of 13 Mamba blocks keeping their scan state), two
-# runs each: this file 13,327 and 13,323 tokens/s/GPU; the side stream with one GEMM per expert 13,326 and
+# On one node with 128 of the 512 experts (ep4, measured with reshard_after_forward: false), two
+# runs each: these backend settings 13,327 and 13,323 tokens/s/GPU; the side stream with one GEMM per expert 13,326 and
 # 13,323; both together, before they were refused, 13,399 and 13,421. This file takes the grouped GEMMs
 # because nvidia-smi then peaks 11 GiB lower (247 against 258 GiB).
 # Expert dispatch: the rows routed to the 32 experts of a rank hold 3.88e9 elements at this micro-batch, more
@@ -75,7 +76,7 @@
 #   model TFLOPs/s/GPU = mfu / 100 x 2500.
 # tps counts 8191 label positions per sequence, the FLOPs all 8192 tokens.
 #
-# Environment: GB300 (per GPU the step peaked at 250 GiB of 277 GiB in nvidia-smi and at 239 GiB allocated by
+# Environment: GB300 (per GPU the step peaked at 262 GiB of 277 GiB in nvidia-smi and at 250 GiB allocated by
 # torch), Transformer Engine 2.19 or newer, PYTORCH_ALLOC_CONF=expandable_segments:True in every rank.
 # NEMO_HYBRIDEP_JIT_CACHE=<directory> keeps the compiled HybridEP kernels between launches: a shorter start,
 # the same step time.
@@ -83,12 +84,10 @@
 # It changes the quantized values (the loss of the first step differs in the fourth digit); its effect on
 # convergence was not studied.
 #
-# Measured with this file on 16 GB300 (Transformer Engine 2.19.0, cuBLASLt 13.7.0) with `--benchmark`, over 20
+# Measured with these settings on 16 GB300 (Transformer Engine 2.19.0, cuBLASLt 13.7.0) with `--benchmark`, over 20
 # steps after 6 warm-up steps, the model config read from a local copy of the Hub config. Seconds per optimizer
 # step, tokens/s/GPU counting all 8192 tokens of a sequence, and model TFLOPs/s/GPU as logged:
-#   - default arithmetic, two runs: 4.944 and 4.943 s, 13,255 and 13,258 tokens/s/GPU, 1,135 and 1,136;
-#   - NVTE_USE_FAST_MATH=1, two runs: 4.696 and 4.693 s, 13,956 and 13,966 tokens/s/GPU, 1,195 and 1,196;
-#   - without the te_nvfp4 block (BF16 GEMMs), one run: 5.708 s, 11,482 tokens/s/GPU, 984.
+#   - default arithmetic, one run: 5.045 s, 12,989 tokens/s/GPU, 1,113.
 #
 # Launch on 4 nodes x 4 GPUs: on every node, from the repository root (26 steps, the first 6 are warm-up):
 #   torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=<first node>:<port> \
@@ -126,8 +125,8 @@ model:
   # Two prediction depths through the one MTP block of the checkpoint.
   num_nextn_predict_layers: 2
   mtp_use_repeated_layer: true
-  # The first 13 Mamba blocks keep their scan state through activation checkpointing.
-  mamba_scan_ac_exempt_blocks: 13
+  # The first 4 Mamba blocks keep their scan state through activation checkpointing.
+  mamba_scan_ac_exempt_blocks: 4
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
@@ -178,10 +177,10 @@ distributed:
   ep_size: 16
   sequence_parallel: false
   activation_checkpointing: true
-  reshard_after_forward: false
+  reshard_after_forward: true
   defer_fsdp_grad_sync: false
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
   multimodal:
     frozen_sharding: replicate
 

@@ -190,7 +190,7 @@ distributed:
    `combine` skips the recomputed unpermute, barrier, and combine all-to-all; `moe_tail` additionally builds the down projection's autograd node without running its GEMM (torch grouped-GEMM experts without expert bias, router weight applied inside the activation). Gradients are unchanged. On DeepSeek-V4.1-Flash at 16 GB200 nodes (EP64, 4k sequences, local batch 2) the step time dropped by 1.4 % (`combine`) and 3.9 % (`moe_tail`) for +3.2 GiB of peak allocated memory (40 MoE layers × 80 MiB).
 
    With `activation_checkpointing: moe` the cache is installed only for MoE layers with a latent back-projection (`moe_latent_size`, for example Nemotron 3): that projection saves the combine output for its backward, so the recompute of the MoE-only region would run the combine again. Other MoE-only regions end at the combine and need no cache.
-4. **Blocks that keep their activations (Nemotron 3)**: Under block checkpointing, a Nemotron 3 model keeps the activations of the Mamba blocks one setting selects and, depending on the expert layout, of the MoE block of a weight-tied MTP head. Gradients are unchanged by both.
+4. **Blocks that keep their activations (Nemotron 3)**: Under block checkpointing, a Nemotron 3 model keeps the activations of the Mamba blocks one setting selects. Gradients are unchanged.
 
 ```yaml
 model:
@@ -200,7 +200,6 @@ distributed:
 ```
 
    - `model.mamba_scan_ac_exempt_blocks` selects the first N Mamba blocks in layer order (`all` for every one). The recompute of such a block ends after its input projection: the scan kernels and the output projection run once per step instead of twice. The block keeps its scan output and what its output projection saves, about 2 hidden-size activations per token plus the saved input of the output projection.
-   - The MoE block of a weight-tied MTP head (`mtp_use_repeated_layer: true`) is recomputed once per MTP depth when it is checkpointed. No setting selects that; the expert layout decides. The block is checkpointed like the other blocks when the experts are rank-local: expert parallelism is on and `ep_size` equals the number of ranks of a pipeline stage (`dp_size` × `cp_size` × `tp_size`), so every rank owns its experts and FSDP does not shard them. With a smaller `ep_size` FSDP shards the experts and cannot unshard them again for the second recompute, so the block keeps its activations for every MTP depth. It also keeps them without expert parallelism (`ep_size: 1`). With `activation_checkpointing: moe` the same rule applies to the MoE sub-block of that block. Rank 0 logs which of the two happened.
 
    `mamba_scan_ac_exempt_blocks` is not supported with context parallelism (`cp_size` above 1): the context-parallel Mamba scan has no path that keeps this state, and the model stops with an error instead of recomputing it.
 

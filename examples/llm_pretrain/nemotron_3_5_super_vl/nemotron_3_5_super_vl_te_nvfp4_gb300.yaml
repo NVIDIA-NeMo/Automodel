@@ -64,11 +64,12 @@
 # Memory settings. The 8 sequences of a rank run as two micro-batches of 4, because of the learned gate: it
 # gives some ranks several times the rows of others, and the rows a rank receives decide its memory. On
 # 16 GB300 one micro-batch of 8 peaked at 276.5 GiB of 276.6 GiB on two GPUs, two micro-batches of 4 at
-# 215 GiB (measured, below). With forced balanced routing one micro-batch of 8 fits (260 GiB). Also in use:
+# 228 GiB (measured, below). With forced balanced routing one micro-batch of 8 fits (the benchmark file in
+# this directory). Also in use:
 #   - the master weights are stored as remainders (see above),
-#   - the weight-tied MTP MoE block is checkpointed like the other blocks. No key selects that: ep_size
-#     covers all 16 ranks, so every rank owns its experts and FSDP does not shard them (rank 0 logs it),
 #   - the loss is FusedLinearCrossEntropy, which does not keep the logits of the three heads.
+# The MoE block of the weight-tied MTP head keeps its activations for both prediction depths; every other
+# block is checkpointed.
 # distributed.defer_fsdp_grad_sync is false so that no unsharded gradient copy is held between the two
 # micro-batches.
 # Every memory figure in this header was taken with PYTORCH_ALLOC_CONF=expandable_segments:True in every rank
@@ -78,7 +79,10 @@
 # Measured on mock tokens with NVTE_USE_FAST_MATH=1 and 2 learning-rate warm-up steps instead of 100, 26
 # steps of which the last 20 are timed. Loss and gradient norm were finite in every step of every run. All
 # of these runs had the shared expert on a side stream (backend.shared_expert_overlap: true), which this file
-# no longer sets; the step time of the file as written is under "Trained on FineWeb" below.
+# no longer sets; the step time of the file as written is under "Trained on FineWeb" below. They also
+# checkpointed the MoE block of the MTP head, which is no longer done. On FineWeb (16 GB300, 40 steps from
+# random initialization, default arithmetic, 2 warm-up steps, one run each) this file peaked at 215 GiB and took
+# 10.43 s per step over steps 11-40 with that block checkpointed, and at 228 GiB with 10.04 s as it runs now.
 #   - This file on 16 GB300 with the 512-expert model: 9.38 s per step (6,983 tokens/s/GPU), peak 215 GiB.
 #     On rank 0, 295 of 2,048 dispatches ran in chunks; the largest held 2,623,232 rows.
 #   - The same with local_batch_size: 8: 9.01 s per step (7,276 tokens/s/GPU), peak 276.5 GiB. The largest
@@ -128,6 +132,8 @@
 #     the busiest GPU 205.6 GiB (nvidia-smi) against 212.5 GiB.
 #   - Figure, tables and limits: docs/model-coverage/omni/nvidia/nemotron-3-5-super-vl.mdx, section "NVFP4
 #     Pretraining on GB300".
+#   - These runs also checkpointed the MoE block of the MTP head (see above), which changes the step time
+#     and the peak memory, not the computation.
 #   - Not run: the 900-step schedule and the single data file of this file as written, validation,
 #     checkpointing, and training with NVTE_USE_FAST_MATH=1 beyond 26 steps.
 #

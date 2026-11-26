@@ -136,8 +136,7 @@ def _model_parallelizer_checkpointing_worker(rank: int, rendezvous: str) -> None
         model = NemotronHForCausalLM(config, backend=backend, num_nextn_predict_layers=2, mtp_use_repeated_layer=True)
         PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=True)
         assert all(isinstance(block, CheckpointWrapper) for block in model.model.layers.values())
-        # Without expert parallelism the experts are not rank-local: the MoE block of a weight-tied MTP depth
-        # keeps its activations.
+        # The MoE block of a weight-tied MTP depth keeps its activations.
         assert [isinstance(block, CheckpointWrapper) for block in model.mtp.layers] == [True, False]
     finally:
         dist.destroy_process_group()
