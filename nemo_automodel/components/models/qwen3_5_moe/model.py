@@ -612,6 +612,30 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             for key in ("cu_seqlens", "max_seqlen"):
                 if key in kwargs:
                     kwargs[f"_text_{key}"] = kwargs.pop(key)
+            mm_token_type_ids = kwargs.get("mm_token_type_ids")
+            if (
+                position_ids is None
+                and input_ids_for_super is not None
+                and mm_token_type_ids is not None
+                and image_grid_thw is not None
+                and isinstance(attention_mask, torch.Tensor)
+                and attention_mask.ndim == 2
+            ):
+                # The loader masks the vision tokens of an injected fake image (attention_mask 0) and leaves its
+                # grid in image_grid_thw. The HF position walk drops masked tokens, so it would hand that grid to
+                # the next image. When an image is masked, walk with the grids of the attended images only.
+                is_image = mm_token_type_ids == 1
+                # First token of every image run, shape [batch, sequence]; row-major order is the grid order.
+                run_starts = is_image & ~nn.functional.pad(is_image, (1, 0))[:, :-1]
+                run_attended = attention_mask.bool()[run_starts]
+                if run_attended.numel() == image_grid_thw.shape[0] and not bool(run_attended.all()):
+                    position_ids, self.rope_deltas = self.get_rope_index(
+                        input_ids_for_super,
+                        mm_token_type_ids=mm_token_type_ids,
+                        image_grid_thw=image_grid_thw[run_attended],
+                        video_grid_thw=video_grid_thw,
+                        attention_mask=attention_mask,
+                    )
             return super().forward(
                 input_ids=input_ids_for_super,
                 attention_mask=attention_mask,

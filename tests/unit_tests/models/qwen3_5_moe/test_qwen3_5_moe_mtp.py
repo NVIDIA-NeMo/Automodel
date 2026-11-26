@@ -28,6 +28,7 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
 
+from nemo_automodel.components.datasets.vlm.fake_image import mask_fake_vision_tokens_single
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
 from tests.unit_tests.models.passthrough_layers import passthrough_layers
@@ -473,6 +474,82 @@ _IMAGE, _START, _END = 5, 7, 8
 
 
 class TestQwen3_5MoeMediaPositions:
+    @_ON_CPU_AND_CUDA
+    @pytest.mark.parametrize(
+        ("real_grid", "real_first", "expected"),
+        [
+            # 1 x 4 image: four tokens like the fake image's 2 x 2, laid out differently.
+            ((1, 4), False, [[0, 1, 1, 1, 1, 5, 6, 7], [0, 1, 1, 1, 1, 5, 6, 7], [0, 1, 2, 3, 4, 5, 6, 7]]),
+            # 2 x 3 image: six tokens, so the fake image's grid does not even fit.
+            ((2, 3), False, [[0, 1, 1, 1, 1, 1, 1, 4], [0, 1, 1, 1, 2, 2, 2, 4], [0, 1, 2, 3, 1, 2, 3, 4]]),
+            # Control: with the real row first, its grid is the next one in any walk.
+            ((1, 4), True, [[0, 1, 1, 1, 1, 5, 6, 7], [0, 1, 1, 1, 1, 5, 6, 7], [0, 1, 2, 3, 4, 5, 6, 7]]),
+        ],
+        ids=["same_token_count", "other_token_count", "real_row_first"],
+    )
+    def test_fake_image_row_leaves_the_next_rows_grid_in_place(self, device, real_grid, real_first, expected):
+        """A text-only row with the loader's masked fake image keeps text positions and shifts no real image's grid.
+
+        ``expected`` is written out from the M-RoPE definition: text tokens count up on the temporal, height
+        and width axes together; an image of ``height x width`` tokens that starts at position ``s`` takes
+        ``(s, s + row, s + column)``; the text after it resumes at ``s + max(height, width)``.
+        """
+        cfg = _media_config(0)
+        model = Qwen3_5MoeForConditionalGeneration(cfg, backend=_backend())
+        model.initialize_weights()
+        model.to(device).eval()
+
+        # The pretokenized loader gives a text-only sample a fake image (here 2 x 2) and masks its vision tokens.
+        fake_row = {
+            "input_ids": torch.tensor([_START, _IMAGE, _IMAGE, _IMAGE, _IMAGE, _END, 10, 11]),
+            "attention_mask": torch.ones(8, dtype=torch.long),
+        }
+        mask_fake_vision_tokens_single(
+            fake_row,
+            SimpleNamespace(
+                image_token_id=_IMAGE,
+                video_token_id=cfg.video_token_id,
+                vision_start_token_id=_START,
+                vision_end_token_id=_END,
+            ),
+        )
+        assert fake_row["attention_mask"].tolist() == [0, 0, 0, 0, 0, 0, 1, 1]
+
+        height, width = real_grid
+        image_tokens = height * width
+        real_ids = torch.tensor([_START, *[_IMAGE] * image_tokens, _END, *[12, 13][: 6 - image_tokens]])
+        rows = [
+            (fake_row["input_ids"], fake_row["attention_mask"], (2, 2)),
+            (real_ids, torch.ones(8, dtype=torch.long), real_grid),
+        ]
+        if real_first:
+            rows.reverse()
+        real_row = 0 if real_first else 1
+        input_ids = torch.stack([ids for ids, _, _ in rows]).to(device)
+
+        decoder_positions = []
+        handle = model.model.language_model.register_forward_pre_hook(
+            lambda _module, _args, kwargs: decoder_positions.append(kwargs["position_ids"]), with_kwargs=True
+        )
+        try:
+            with torch.no_grad():
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask=torch.stack([mask for _, mask, _ in rows]).to(device),
+                    # One row of in_channels * temporal_patch_size * patch_size**2 features per image token.
+                    pixel_values=torch.randn(4 + image_tokens, 12, device=device, dtype=model.lm_head.weight.dtype),
+                    image_grid_thw=torch.tensor([[1, *grid] for _, _, grid in rows], device=device),
+                    mm_token_type_ids=(input_ids == _IMAGE).long(),
+                )
+        finally:
+            handle.remove()
+
+        assert out.logits.shape == (2, 8, cfg.text_config.vocab_size)
+        # position_ids has shape [axes, batch, sequence].
+        assert decoder_positions[0][:, real_row].tolist() == expected
+        # The masked fake image takes no positions: the two text tokens of its row count from zero.
+        assert decoder_positions[0][:, 1 - real_row, 6:].tolist() == [[0, 1]] * 3
+
     @_ON_CPU_AND_CUDA
     def test_first_pipeline_stage_decodes_a_media_batch_with_the_later_stages_positions(self, device):
         """Every layer of a media batch split into two pipeline stages gets the same positions.
