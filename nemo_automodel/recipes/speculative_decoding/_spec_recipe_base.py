@@ -36,18 +36,18 @@ from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint.checkpointing import (
-    CheckpointingConfig,
     load_torch_ckpt,
     save_config,
     save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.optim.optimizer import OptimizerConfig
+from nemo_automodel.recipes._typed_config import DraftCheckpointDefaults, DraftOptimizerSettings, DraftWandbSettings
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
-    resolve_wandb_kwargs,
     resolve_warmup_steps,
 )
 
@@ -77,14 +77,12 @@ class SpecDecodeRecipeBase(BaseRecipe):
     # Floor on the ratio-derived LR warmup length (see ``resolve_warmup_steps``).
     min_warmup_steps: ClassVar[int] = 1
 
-    def _build_draft_optimizer(self, opt_cfg) -> torch.optim.Optimizer:
-        """Build the draft optimizer (AdamW over the trainable parameters)."""
-        return torch.optim.AdamW(
-            [p for p in self.trainer_module.parameters() if p.requires_grad],
-            lr=self.peak_lr,
-            betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
-            weight_decay=opt_cfg.get("weight_decay", 0.0),
-        )
+    def _build_draft_optimizer(self, config: OptimizerConfig) -> torch.optim.Optimizer:
+        """Build the draft optimizer from its typed config.
+
+        The build warns when a torch Adam is paired with BF16-stored trainable parameters.
+        """
+        return config.build(self.trainer_module, device_mesh=self.dp_mesh)[0]
 
     def _setup_training_state(self, recipe_cfg) -> None:
         """Build the optimizer and LR schedule, read the loop / checkpoint cadence knobs,
@@ -101,9 +99,9 @@ class SpecDecodeRecipeBase(BaseRecipe):
         Args:
             recipe_cfg: The ``recipe_args`` config node.
         """
-        opt_cfg = self.cfg.optimizer
-        self.peak_lr = float(opt_cfg.lr)
-        self.optimizer = self._build_draft_optimizer(opt_cfg)
+        settings = DraftOptimizerSettings.from_config(self.cfg.optimizer)
+        self.peak_lr = settings.peak_lr
+        self.optimizer = self._build_draft_optimizer(settings.optimizer)
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
         self.num_epochs = recipe_cfg.num_epochs
@@ -123,10 +121,8 @@ class SpecDecodeRecipeBase(BaseRecipe):
         self.total_optim_steps = max(
             1, self.num_epochs * optim_steps_per_epoch(self.num_batches_per_epoch, self.grad_accumulation_steps)
         )
-        self.warmup_steps = resolve_warmup_steps(
-            float(opt_cfg.get("warmup_ratio", 0.05)), self.total_optim_steps, self.min_warmup_steps
-        )
-        self.min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
+        self.warmup_steps = resolve_warmup_steps(settings.warmup_ratio, self.total_optim_steps, self.min_warmup_steps)
+        self.min_lr_ratio = settings.min_lr_ratio
         # Warmup + cosine: drafts trained from scratch diverge under a flat LR
         # once AdamW's second-moment estimates have settled.
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -142,18 +138,16 @@ class SpecDecodeRecipeBase(BaseRecipe):
         sets ``enable: false`` (see ``resolve_wandb_kwargs``).
         """
         self.wandb_run = None
-        wandb_cfg = self.cfg.get("wandb", None)
-        if not self.dist_env.is_main or wandb_cfg is None:
+        if not self.dist_env.is_main:
             return
-        wandb_kwargs = resolve_wandb_kwargs(wandb_cfg.to_dict())
-        if wandb_kwargs is None:
+        settings = DraftWandbSettings.from_config(self.cfg)
+        if settings is None:
             return
         suppress_wandb_log_messages()
-        self.wandb_run = init_wandb_run(wandb_kwargs, self.cfg.to_dict(), default_name=default_name)
+        self.wandb_run = init_wandb_run(settings.init_kwargs, settings.run_config, default_name=default_name)
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the draft checkpointer using the same plumbing as the standard recipes."""
-        ckpt_cfg = self.cfg.get("checkpoint", None)
         default_dir = str(self.output_dir / "checkpoints")
         # The draft is built directly and bypasses ``apply_model_infrastructure``,
         # which is where ``_pre_shard_hf_state_dict_keys`` would normally be
@@ -163,24 +157,15 @@ class SpecDecodeRecipeBase(BaseRecipe):
         # LoRA drafts save/load adapter-only checkpoints; the consolidated
         # full-draft export does not apply to them.
         is_peft = getattr(self, "peft_config", None) is not None
-        ckpt_kwargs = dict(
-            enabled=True,
+        defaults = DraftCheckpointDefaults(
             checkpoint_dir=default_dir,
-            model_save_format="safetensors",
             model_repo_id=str(target_path),
             model_cache_dir=hf_constants.HF_HUB_CACHE,
             save_consolidated=not is_peft,
             is_peft=is_peft,
             model_state_dict_keys=draft_state_dict_keys,
         )
-        if ckpt_cfg is not None:
-            user_cfg = ckpt_cfg.to_dict() if hasattr(ckpt_cfg, "to_dict") else dict(ckpt_cfg)
-            user_cfg.pop("restore_from", None)
-            ckpt_kwargs.update(user_cfg)
-        if ckpt_kwargs.get("model_state_dict_keys") is None:
-            ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
-
-        self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
+        self.checkpoint_config = defaults.resolve(self.cfg.get("checkpoint", None))
         # The draft is never tp- or cp-sharded (it is replicated, or FSDP2-sharded only
         # over dp), so key the checkpoint shard on the dp coordinate, which tp/cp peers
         # share, rather than the global rank. Without a mesh the global rank is used.

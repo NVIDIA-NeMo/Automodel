@@ -55,6 +55,18 @@ AutoModel PEFT-v5 grouped-expert merge::
         --output-dir merged_model/ \
         --automodel-native-export
 
+The native export builds the model with ``BackendConfig(linear="torch")``; the other backend fields keep
+the defaults of the machine. A model that rejects those defaults needs ``--backend FIELD=VALUE ...`` and
+the dtype it supports. ERNIE 5.5, for a base checkpoint whose ``config.json`` declares no MTP layer::
+
+    python tools/merge_lora.py \
+        --base-model /path/to/ernie5_5_base \
+        --adapter-path checkpoints/adapter/ \
+        --output-dir merged_model/ \
+        --automodel-native-export \
+        --dtype bfloat16 \
+        --backend attn=sdpa experts=torch dispatcher=torch
+
 Embedding / non-CausalLM model merge (auto-detected from adapter task_type)::
 
     python tools/merge_lora.py \
@@ -77,7 +89,7 @@ import gc
 import json
 import logging
 import os
-from dataclasses import fields
+from dataclasses import asdict, fields
 from typing import TYPE_CHECKING
 
 import torch
@@ -136,8 +148,16 @@ def _merge_automodel_lora(
     trust_remote_code: bool,
     model_class: str | None,
     save_tokenizer: bool,
+    backend_overrides: list[str],
 ) -> None:
-    """Merge an AutoModel-native causal-LM adapter through its state-dict adapter."""
+    """Merge an AutoModel-native causal-LM adapter through its state-dict adapter.
+
+    The model is built with ``BackendConfig(linear="torch")``. ``backend_overrides`` holds ``FIELD=VALUE``
+    items that replace string-valued fields of that backend, for models that reject the machine's defaults.
+
+    Raises:
+        ValueError: If the device, the model class, or a backend override is not supported.
+    """
     if device == "cpu":
         raise ValueError("AutoModel PEFT merged export requires a CUDA device; --device=cpu is not supported")
     if model_class not in (None, "AutoModelForCausalLM"):
@@ -151,12 +171,25 @@ def _merge_automodel_lora(
     from nemo_automodel import NeMoAutoModelForCausalLM, export_merged_peft_checkpoint
     from nemo_automodel.components.models.common import BackendConfig
 
+    backend_fields = {"linear": "torch"}
+    # The option carries strings, so it may set only the fields whose value is a string.
+    defaults = asdict(BackendConfig(**backend_fields))
+    string_fields = {name for name, value in defaults.items() if isinstance(value, str)}
+    for item in backend_overrides:
+        name, separator, value = item.partition("=")
+        if not separator or not value or name not in string_fields:
+            raise ValueError(
+                f"--backend expects FIELD=VALUE with a string-valued BackendConfig field, got {item!r}; "
+                f"the string-valued fields are {sorted(string_fields)}"
+            )
+        backend_fields[name] = value
+
     peft_config = _load_automodel_peft_config(adapter_path)
     logger.info("Loading base model with AutoModel PEFT topology: %s", base_model)
     model = NeMoAutoModelForCausalLM.from_pretrained(
         base_model,
         peft_config=peft_config,
-        backend=BackendConfig(linear="torch"),
+        backend=BackendConfig(**backend_fields),
         torch_dtype=torch_dtype,
         trust_remote_code=trust_remote_code,
         use_liger_kernel=False,
@@ -475,6 +508,17 @@ def parse_args() -> argparse.Namespace:
         help="Restore and merge an AutoModel PEFT-v5 grouped-expert adapter through its state-dict adapter.",
     )
     parser.add_argument(
+        "--backend",
+        nargs="+",
+        default=[],
+        metavar="FIELD=VALUE",
+        help=(
+            "With --automodel-native-export: string-valued BackendConfig fields that replace the defaults of the "
+            "machine, for models that reject them (ERNIE 5.5: attn=sdpa experts=torch dispatcher=torch, "
+            "with --dtype bfloat16)."
+        ),
+    )
+    parser.add_argument(
         "--dtype",
         choices=["float16", "bfloat16", "float32"],
         default="float16",
@@ -524,8 +568,11 @@ def main():
             trust_remote_code=args.trust_remote_code,
             model_class=args.model_class,
             save_tokenizer=not args.no_save_tokenizer,
+            backend_overrides=args.backend,
         )
         return
+    if args.backend:
+        raise ValueError("--backend requires --automodel-native-export")
 
     merge_lora(
         base_model=args.base_model,

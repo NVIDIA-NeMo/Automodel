@@ -68,7 +68,6 @@ from nemo_automodel.components.models.deepseek_v41.dspark_target import (
     dspark_packed_forward as deepseek_v41_dspark_packed_forward,
 )
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
-from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
@@ -197,54 +196,6 @@ class _DraftArgs(dict):
             return self[key]
         except KeyError as exc:  # pragma: no cover - defensive
             raise AttributeError(key) from exc
-
-
-def _resolve_dspark_optimizer_spec(opt_cfg) -> tuple[str, dict]:
-    """Normalize the recipe's ``optimizer:`` config into a ``build_optimizer`` spec.
-
-    Reads an optional ``_target_`` (a registry short name such as ``"fused_adam"``
-    or a dotted import path, e.g. ``transformer_engine.pytorch.optimizers.FusedAdam``)
-    plus whatever other fields the config carries -- ``lr``/``betas``/``weight_decay``
-    and any optimizer-specific kwargs (``master_weights``, ``master_weight_dtype``,
-    ``exp_avg_dtype``, ``exp_avg_sq_dtype``, ``store_param_remainders``, ...) -- and
-    returns the ``(target, kwargs)`` tuple that ``build_optimizer`` resolves via its
-    registry / dotted-import-path / ``OptimizerFromFactoryConfig`` escape hatch.
-
-    Absent an explicit ``_target_``, this defaults to plain ``torch.optim.AdamW``
-    with its prior ``betas``/``weight_decay`` defaults (matching the previous
-    hardcoded behavior, so existing DSpark configs are unaffected). Those two
-    AdamW-shaped defaults are only injected in that no-``_target_`` case: forcing
-    them onto an arbitrary explicit ``_target_`` would break optimizers that do
-    not accept a ``betas`` kwarg (e.g. plain SGD).
-    """
-    kwargs = dict(opt_cfg.to_dict())
-    # ConfigNode resolves ``_target_`` to the callable in ``to_dict``; recover the original
-    # import-path string via ``get_as_string``. Only call it when the key is actually
-    # present: ``ConfigNode.get_as_string`` raises ``KeyError`` for an absent key even
-    # with an explicit ``None`` default (a ``None`` default is never returned), which
-    # crashed every DSpark config whose ``optimizer:`` block omits ``_target_``.
-    target = kwargs.pop("_target_", None)
-    if target is not None and hasattr(opt_cfg, "get_as_string"):
-        target = opt_cfg.get_as_string("_target_")
-    kwargs.pop("warmup_ratio", None)
-    kwargs.pop("min_lr_ratio", None)
-    kwargs["lr"] = float(kwargs["lr"])
-    if target is None:
-        target = "torch.optim.AdamW"
-        kwargs.setdefault("betas", (0.9, 0.95))
-        kwargs.setdefault("weight_decay", 0.0)
-    return target, kwargs
-
-
-def _build_dspark_optimizer(trainer_module, opt_cfg, device_mesh=None) -> torch.optim.Optimizer:
-    """Build the DSpark trainer's optimizer from its ``optimizer:`` config.
-
-    Thin wrapper around ``build_optimizer`` so ``TrainDSparkRecipe._build_draft_optimizer`` has a
-    single, unit-testable call site (``build_optimizer`` itself needs no
-    distributed environment for a non-pipelined single-part model like the
-    DSpark draft, so this is testable with a plain CPU module).
-    """
-    return build_optimizer(trainer_module, _resolve_dspark_optimizer_spec(opt_cfg), device_mesh=device_mesh)[0]
 
 
 def _validate_cached_dspark_manifest(
@@ -1249,10 +1200,6 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             trackio_cfg.name = trackio_cfg.name or "dspark_" + str(target_path).rstrip("/").split("/")[-1]
             self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
             logger.info("Trackio experiment tracking enabled")
-
-    def _build_draft_optimizer(self, opt_cfg) -> torch.optim.Optimizer:
-        """Build the configurable DSpark optimizer (see ``_build_dspark_optimizer``)."""
-        return _build_dspark_optimizer(self.trainer_module, opt_cfg, device_mesh=self.dp_mesh)
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:

@@ -349,8 +349,12 @@ class MuseGlimmerVisionEncoder(nn.Module):
         target_dtype = self.conv1_linear.weight.dtype
         patch_embeds = self.conv1_linear(pixel_values.to(dtype=target_dtype))
         embeddings = patch_embeds.flatten(-2).squeeze(-1).reshape(batch_sequence_len, -1)
+        # Patch (h, w) reads the position table at (w, h): the reference trainer passes
+        # `meshgrid(pos_h, pos_w, indexing="xy")` to `grid_sample`, which takes the first coordinate as width.
+        # Same fix as huggingface/transformers#50847; only matters when h != w. Patch order, window index and
+        # RoPE positions below keep using the unswapped `grid_thw`.
         bilinear_indices, bilinear_weights = get_vision_bilinear_indices_and_weights(
-            grid_thw,
+            grid_thw[:, [0, 2, 1]],
             num_grid_per_side=self.config.pos_emb_height,
             spatial_merge_size=1,
         )
