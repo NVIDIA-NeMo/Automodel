@@ -51,8 +51,8 @@ inputs:
     required: false
     default: "false"
   PAT:
-    description: "GitHub Personal Access Token"
-    required: true
+    description: "Deprecated token input"
+    required: false
   container-image:
     description: "Container image to use for test"
     required: true
