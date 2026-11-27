@@ -825,6 +825,75 @@ def _pad_cp_buffers_to_divisor(
     return cp_buffers, new_no_restore
 
 
+def move_masked_tokens_behind_attended(
+    batch: dict[str, torch.Tensor],
+    *,
+    loss_mask: torch.Tensor | None = None,
+    extra_seq_buffers: dict[str, int] | None = None,
+) -> torch.Tensor | None:
+    """Reorder each row so that every masked token follows every attended token.
+
+    Round-robin CP attention is causal only: its backends take no padding mask, so
+    the round-robin sharders drop ``attention_mask``. A masked token that sits in
+    front of attended tokens (the fake image of a text-only VLM row, left padding)
+    would then be attended. Behind them it is out of reach of causal attention,
+    like right padding. Attended tokens keep their order and their
+    ``position_ids``; masked tokens keep their order among themselves. A batch
+    whose masked tokens already come last, or whose ``attention_mask`` is not
+    [batch, sequence], is left untouched.
+
+    Args:
+        batch: Full-sequence batch, reordered in place. ``attention_mask`` is
+            [batch, sequence] with 0 on masked tokens. The sequence axis of
+            ``input_ids``, ``labels``, ``padding_mask`` and ``mm_token_type_ids``
+            ([batch, sequence]), ``inputs_embeds`` ([batch, sequence, hidden]) and
+            ``position_ids`` ([batch, sequence] or [axes, batch, sequence]) follows
+            the same order.
+        loss_mask: Optional per-token mask of shape [batch, sequence] that is
+            sharded with the batch.
+        extra_seq_buffers: Additional batch keys mapped to their sequence axis;
+            the batch axis is the one before it.
+
+    Returns:
+        ``loss_mask`` in the new token order, or None when none was given.
+    """
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is None or attention_mask.ndim != 2:
+        return loss_mask
+    masked = attention_mask == 0
+    if not bool((masked[:, :-1] & ~masked[:, 1:]).any()):
+        # No masked token is directly followed by an attended one: they already come last.
+        return loss_mask
+    # A stable sort on "is masked" keeps the order inside both groups.
+    new_order = torch.argsort(masked.to(torch.int8), dim=1, stable=True)
+
+    def reorder(tensor: torch.Tensor, seq_dim: int) -> torch.Tensor:
+        """Apply ``new_order`` along the sequence axis.
+
+        Args:
+            tensor: Tensor of shape [..., batch, sequence, ...].
+            seq_dim: Index of the sequence axis; the batch axis is the one before it.
+
+        Returns:
+            Tensor of the same shape with every row's tokens in the new order.
+        """
+        index_shape = [1] * tensor.ndim
+        index_shape[seq_dim - 1 : seq_dim + 1] = new_order.shape
+        return torch.take_along_dim(tensor, new_order.reshape(index_shape), dim=seq_dim)
+
+    seq_dims = dict.fromkeys(
+        ("input_ids", "inputs_embeds", "labels", "attention_mask", "padding_mask", "mm_token_type_ids"), 1
+    )
+    position_ids = batch.get("position_ids")
+    if position_ids is not None:
+        seq_dims["position_ids"] = position_ids.ndim - 1
+    seq_dims.update(extra_seq_buffers or {})
+    for key, seq_dim in seq_dims.items():
+        if batch.get(key) is not None:
+            batch[key] = reorder(batch[key], seq_dim)
+    return None if loss_mask is None else reorder(loss_mask, 1)
+
+
 def shard_batch_load_balanced(
     cp_mesh,
     tp_mesh,

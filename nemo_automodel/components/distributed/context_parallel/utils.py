@@ -24,7 +24,9 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ShardLayout,
     THDBatchConsumer,
     identity_local_indices,
+    move_masked_tokens_behind_attended,
     round_robin_local_indices,
+    shard_batch_aux_only,
     shard_batch_identity,
     shard_batch_load_balanced,
 )
@@ -405,6 +407,10 @@ def _prepare_cp_sharder(
         device_mesh: The full device mesh (``cp``/``tp`` submeshes are read).
         batch: The full-sequence batch. Model hook updates are merged in place;
             :meth:`ContextParallelSharder.shard` performs the actual sharding.
+            When the round-robin sharder that drops ``attention_mask`` is used, a
+            mask of shape [batch, sequence] with a masked token in front of an
+            attended one reorders the batch in place (see
+            :func:`move_masked_tokens_behind_attended`).
         padding_token_id: Pad sentinel for ``input_ids``.
         num_chunks: THD chunk count, forwarded to the hook and TE sharding.
         loss_mask: Optional per-token mask forwarded to the batch sharding.
@@ -466,6 +472,16 @@ def _prepare_cp_sharder(
         model=model,
         extra_seq_buffers=extra_seq_buffers,
     )
+    # shard_batch_aux_only and the generic round-robin sharder drop attention_mask (their
+    # attention is causal only), so no masked token may stay in front of an attended one.
+    # A model that pairs the round-robin layout with its own batch sharder handles its mask itself.
+    drops_attention_mask = cp_sharder is None or cp_sharder.shard_batch is shard_batch_aux_only
+    if (
+        effective_cp_size > 1
+        and drops_attention_mask
+        and strategy.local_token_global_indices is round_robin_local_indices
+    ):
+        loss_mask = move_masked_tokens_behind_attended(batch, loss_mask=loss_mask, extra_seq_buffers=extra_seq_buffers)
     return ContextParallelSharder(
         device_mesh=device_mesh,
         shard_batch=strategy.shard_batch,
