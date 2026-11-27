@@ -32,19 +32,52 @@ configuration, and the build/helper/manifest scripts. Update the readable image
 tag and its digest together. A changed fingerprint rebuilds the wheelhouse;
 there is no older-key fallback.
 
+## Release branches and cherry-picks
+
+Pushes to `main` and release branches matching `r0.<minor>.0` populate shared
+wheelhouse and container caches. Copied PRs read their actual target branch from
+PR metadata. Source-validation selection compares a PR with that target's merge
+base, so historical differences between a release and main do not trigger an
+unnecessary source installation. Direct main/release pushes compare with the
+pre-push commit. Missing history still enables source validation.
+
+GitHub's Actions cache on a copied `pull-request/<number>` push can read main's
+cache but cannot read a sibling release branch's cache. After an Actions cache
+miss, the wheelhouse job therefore looks for a release artifact whose name
+contains the exact cache key. It checks the originating branch, repository,
+event, and installation workflow before selecting its immutable artifact/run
+IDs. The producer downloads that artifact and forwards its original provenance;
+pip and UV consumers download the same artifact directly. PRs never publish to
+the shared release scope or copy a reused archive into a new full artifact.
+
+A release run publishes the archive once per fingerprint with 30-day retention.
+If the archive expires while its Actions cache survives, the next release run
+republishes from cache without compilation. If both are missing, normal cold
+build behavior applies. Deletion/expiry after selection fails the download;
+API/verification errors fail the job rather than silently authorizing a rebuild.
+The small provenance artifact is still transferred on every wheelhouse run.
+
+Rollout requires backporting these workflow/scripts to each active release
+branch and completing a first producer run there. Main-only changes cannot
+populate a cache for an older release checkout. Subsequent compatible cherry-pick
+PRs reuse that release's artifacts/images. Producer runs are not cancelled by
+newer pushes to main or a release branch; PR supersession remains enabled.
+
 ## Verification before installation
 
 1. A fresh build writes a manifest containing the compatibility fingerprint and
    SHA-256 of every wheel. The build job signs this manifest with GitHub's build
    provenance attestation action. The wheels, manifest, and signature bundle are
-   cached together; only `main` saves the shared cache.
+   cached together; only `main` and release branches save shared caches.
 2. Cache hits preserve the original signature. The verifier requires the exact
    repository and `install-test.yml` signer. Cached manifests must originate
-   from `refs/heads/main`; fresh builds must match the current source ref and
-   source/workflow commit.
+   from `refs/heads/main` or the selected release target. Fresh builds must match
+   the current source ref and source/workflow commit. Other releases and PR
+   builders are never accepted for reused wheelhouses.
 3. On a cache hit, pip and UV restore the producer's exact cache key directly;
-   the producer skips uploading the full wheelhouse artifact. Fresh builds
-   still upload an artifact, which consumers download by ID. Both paths pass
+   the producer skips uploading the full wheelhouse artifact, except when a
+   release needs to seed or refresh its shared archive. Fresh builds still
+   upload an artifact, which consumers download by ID. All paths pass
    the small manifest/signature artifact through the provenance verifier.
    Before installing any wheel, consumers check the verified manifest digest,
    expected build fingerprint, complete wheel set, and every wheel's SHA-256.
@@ -78,9 +111,13 @@ application and test changes reuse the matching image. Keep any new dependency
 `COPY` inputs in the key's file list. The build receives the same pinned base
 digest and arguments used to compute the key.
 
-Only `main` writes the canonical image scope. Other branches read their own
-scope or `main` and publish misses to their own scope, so release branches can
-reuse their builds even without a matching Actions UV cache. Registry access
+Each branch writes its own image scope. Cherry-pick PRs look up their own image,
+then their release target's image, then main's image, always using the exact
+fingerprint and platform. Other PRs look up their own image then main's. Main
+never reads PR/release images. On a miss the PR publishes only to its own scope.
+BuildKit uses the first available donor in the same order, never a mixture of
+donors. Release branches also save their Actions UV cache for subsequent direct
+release builds; copied PRs reuse the registry images/layers instead. Registry access
 uses the existing CI registry permissions; this is not the attested
 installation-wheelhouse artifact. Missing images build normally, while registry
 authentication and network failures stop the job instead of starting an

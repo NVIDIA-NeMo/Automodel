@@ -9,10 +9,12 @@ source_build=false
 if [[ ${GITHUB_EVENT_NAME} == schedule || ${FORCE_SOURCE_BUILD:-false} == true ]]; then
   source_build=true
 else
-  if [[ ${GITHUB_REF_NAME} == main ]]; then
+  if [[ ${GITHUB_REF_NAME} == main || ${GITHUB_REF_NAME} =~ ^r0\.[0-9]+\.0$ ]]; then
     base=${BEFORE_SHA:-HEAD^}
   else
-    base=$(git merge-base HEAD origin/main || true)
+    base_branch=${BASE_BRANCH:-main}
+    git check-ref-format "refs/heads/${base_branch}"
+    base=$(git merge-base HEAD "refs/remotes/origin/${base_branch}" || true)
   fi
   # Missing history must enable coverage, not silently skip it.
   if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then

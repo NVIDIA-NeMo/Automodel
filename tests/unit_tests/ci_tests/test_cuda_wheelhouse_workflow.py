@@ -179,7 +179,7 @@ def test_provenance_gate_requires_correct_identity_and_success(
             "GITHUB_REF": "refs/heads/pull-request/1",
             "GITHUB_SHA": "a" * 40,
             "WHEELHOUSE_DIR": str(tmp_path),
-            "WHEELHOUSE_CACHE_HIT": str(cache_hit).lower(),
+            "WHEELHOUSE_REUSED": str(cache_hit).lower(),
         },
         check=False,
     )
@@ -196,3 +196,165 @@ def test_provenance_gate_requires_correct_identity_and_success(
     else:
         assert result.returncode != 0
         assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("branch", "target", "release", "writer"),
+    [
+        ("main", "", "", "true"),
+        ("r0.7.0", "", "r0.7.0", "true"),
+        ("r0.10.0", "", "r0.10.0", "true"),
+        ("pull-request/1", "r0.7.0", "r0.7.0", "false"),
+        ("pull-request/1", "main", "", "false"),
+        ("pull-request/1", "feature/base", "", "false"),
+        ("pull-request/1", "r0.7.0-rc1", "", "false"),
+        ("r0.7.0-rc1", "", "", "false"),
+        ("r0.7.1", "", "", "false"),
+        ("deploy-release/r0.7.0", "", "", "false"),
+    ],
+)
+def test_cache_scope_limits_writers_and_uses_actual_pr_target(
+    tmp_path: Path, branch: str, target: str, release: str, writer: str
+) -> None:
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", ".github/scripts/select-ci-cache-scope.sh"],
+        env={
+            **os.environ,
+            "GITHUB_REF_NAME": branch,
+            "GITHUB_REF": f"refs/heads/{branch}",
+            "PR_BASE_REF": target,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=True,
+    )
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values == {
+        "base_branch": target or release or "main",
+        "release_branch": release,
+        "cache_writer": writer,
+    }
+
+
+@pytest.mark.parametrize("target", ["", "../main", "main\ncache_writer=true"])
+def test_copied_pr_requires_valid_target_metadata(tmp_path: Path, target: str) -> None:
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", ".github/scripts/select-ci-cache-scope.sh"],
+        env={
+            **os.environ,
+            "GITHUB_REF_NAME": "pull-request/1",
+            "GITHUB_REF": "refs/heads/pull-request/1",
+            "PR_BASE_REF": target,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("branch", "base_branch", "path", "expected"),
+    [
+        ("pull-request/1", "r0.7.0", "README.md", ["wheelhouse"]),
+        ("pull-request/1", "r0.7.0", "pyproject.toml", ["wheelhouse", "source"]),
+        ("pull-request/1", "main", "README.md", ["wheelhouse", "source"]),
+        ("pull-request/1", "r0.6.0", "README.md", ["wheelhouse", "source"]),
+        ("r0.7.0", "r0.7.0", "README.md", ["wheelhouse"]),
+        ("r0.7.0", "r0.7.0", "pyproject.toml", ["wheelhouse", "source"]),
+    ],
+)
+@pytest.mark.runtime_budget(15, reason="Constructs release Git history and runs the real Bash source-mode selector")
+def test_cherry_pick_source_selection_ignores_historical_release_divergence(
+    tmp_path: Path, branch: str, base_branch: str, path: str, expected: list[str]
+) -> None:
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "base")
+    _git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (tmp_path / "pyproject.toml").write_text("historical release configuration\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "-c", "commit.gpgsign=false", "commit", "-qm", "release diverges")
+    before = _git(tmp_path, "rev-parse", "HEAD")
+    _git(tmp_path, "update-ref", "refs/remotes/origin/r0.7.0", before)
+    (tmp_path / path).write_text("cherry-picked change\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "-c", "commit.gpgsign=false", "commit", "-qm", "cherry-pick")
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", str(_MODE_SCRIPT)],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GITHUB_EVENT_NAME": "push",
+            "GITHUB_REF_NAME": branch,
+            "BASE_BRANCH": base_branch,
+            "BEFORE_SHA": before,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=True,
+    )
+    assert json.loads(output.read_text().split("=", 1)[1]) == expected
+
+
+@pytest.mark.parametrize(
+    ("signer", "release", "reused", "accepted"),
+    [
+        ("main", "r0.7.0", True, True),
+        ("r0.7.0", "r0.7.0", True, True),
+        ("r0.6.0", "r0.7.0", True, False),
+        ("pull-request/2", "r0.7.0", True, False),
+        ("r0.7.0", "", True, False),
+        ("r0.7.0", "r0.7.0", False, False),
+        ("pull-request/1", "r0.7.0", False, True),
+    ],
+)
+def test_release_provenance_accepts_only_main_or_target_release(
+    tmp_path: Path, signer: str, release: str, reused: bool, accepted: bool
+) -> None:
+    gh = tmp_path / "gh"
+    gh.write_text(
+        f"#!{sys.executable}\nimport os, sys\n"
+        "ref = sys.argv[sys.argv.index('--source-ref') + 1]\n"
+        "sys.exit(0 if ref == 'refs/heads/' + os.environ['SIGNER'] else 1)\n"
+    )
+    gh.chmod(0o755)
+    (tmp_path / "manifest.json").write_text('{"wheels":{}}\n')
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", str(_VERIFY_SCRIPT)],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "SIGNER": signer,
+            "RELEASE_BRANCH": release,
+            "WHEELHOUSE_REUSED": str(reused).lower(),
+            "GITHUB_REPOSITORY": "NVIDIA-NeMo/Automodel",
+            "GITHUB_REF": "refs/heads/pull-request/1",
+            "GITHUB_SHA": "a" * 40,
+            "WHEELHOUSE_DIR": str(tmp_path),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+    )
+    assert (result.returncode == 0) == accepted
+    assert output.exists() == accepted
+
+
+@pytest.mark.parametrize("tag", ["main", "r0.7.0"])
+def test_tags_do_not_become_canonical_cache_writers(tmp_path: Path, tag: str) -> None:
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", ".github/scripts/select-ci-cache-scope.sh"],
+        env={
+            **os.environ,
+            "GITHUB_REF": f"refs/tags/{tag}",
+            "GITHUB_REF_NAME": tag,
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=True,
+    )
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values == {"base_branch": "main", "release_branch": "", "cache_writer": "false"}
