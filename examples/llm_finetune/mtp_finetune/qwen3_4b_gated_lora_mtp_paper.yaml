@@ -25,6 +25,8 @@ step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
   max_steps: 50000
+  # Derive enough epochs to reach max_steps rather than stopping at the default ten.
+  num_epochs: null
   ckpt_every_steps: 1000
   val_every_steps: 1000
 

@@ -22,6 +22,7 @@ are all checked against first principles.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -29,17 +30,38 @@ from typing import Literal
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules, lora_token_gate
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.config.loader import load_yaml_config
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig, GatedMTPSampler
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 _VOCAB = 64
 _MASK_IDS = [62, 63]
 _SCALING = 0.5
+
+
+@pytest.mark.cpu_only
+def test_paper_recipe_reaches_max_steps_beyond_ten_epochs() -> None:
+    """A short dataset must repeat until the paper recipe's update budget is reached."""
+    path = Path(__file__).resolve().parents[3] / "examples/llm_finetune/mtp_finetune/qwen3_4b_gated_lora_mtp_paper.yaml"
+    config = RecipeConfig(load_yaml_config(path))
+    loader = DataLoader(list(range(16)), batch_size=1)
+    scheduler = replace(config.step_scheduler, max_steps=23, preemption_signal=None).build(
+        loader, dp_group_size=1, local_batch_size=1
+    )
+    completed = []
+    for epoch in scheduler.epochs:
+        scheduler.set_epoch(epoch)
+        for _ in scheduler:
+            completed.append(scheduler.step)
+    assert completed == list(range(23))
+    assert scheduler.step == 23
 
 
 def _build_lora_model() -> Qwen3ForCausalLM:
