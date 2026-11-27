@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,7 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.addons import (
     ConsolidatedHFAddon,
+    PeftAddon,
     _check_modules_to_save_cover_exported_tensors,
     _extract_modules_to_save,
     _extract_target_modules,
@@ -785,6 +787,30 @@ def test_hf_peft_config_lists_the_largest_fully_trained_modules():
 def test_lora_only_hf_peft_config_has_no_modules_to_save():
     """Adapters without modules trained in full keep the previous adapter_config.json."""
     assert "modules_to_save" not in _get_hf_peft_config(_PEFT, ModelState(_peft_model([]), is_peft=True))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mask_ids", [None, [63, 61, 62]])
+def test_peft_export_round_trips_invocation_tokens(tmp_path, mask_ids):
+    """Both PEFT and AutoModel recover the ordered gate IDs from an actual export."""
+    import json
+
+    from peft import PeftConfig as HFPeftConfig
+
+    config = replace(_PEFT, alora_invocation_tokens=mask_ids)
+    PeftAddon().pre_save(
+        model_path=str(tmp_path),
+        model_state=ModelState(_peft_model([]), is_peft=True),
+        peft_config=config,
+        original_model_path=None,
+    )
+
+    loaded = HFPeftConfig.from_pretrained(tmp_path)
+    assert loaded.alora_invocation_tokens == mask_ids
+    restored = PeftConfig(**load_automodel_peft_config_dict(str(tmp_path)))
+    assert restored.alora_invocation_tokens == mask_ids
+    exported = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert ("alora_invocation_tokens" in exported) == (mask_ids is not None)
 
 
 def test_modules_to_save_split_combined_projections_and_follow_adapter_renames():

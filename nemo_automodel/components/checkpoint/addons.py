@@ -381,6 +381,8 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     }
     if target_parameters:
         config["target_parameters"] = target_parameters
+    if peft_config.alora_invocation_tokens is not None:
+        config["alora_invocation_tokens"] = list(peft_config.alora_invocation_tokens)
     modules_to_save = _extract_modules_to_save(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
     if modules_to_save:
         config["modules_to_save"] = modules_to_save

@@ -695,6 +695,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
+            if self.cfg.gated_mtp is not None:
+                self.peft_config = replace(
+                    self.peft_config, alora_invocation_tokens=list(self.cfg.gated_mtp.mask_token_ids)
+                )
 
         # Checkpoint config (model-derived fields are filled in by RecipeConfig)
         checkpoint_config = self.cfg.checkpoint
