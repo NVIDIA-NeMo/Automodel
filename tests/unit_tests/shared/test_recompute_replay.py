@@ -17,9 +17,14 @@ from contextlib import contextmanager
 
 import pytest
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint
 
-from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
+from nemo_automodel.shared.recompute_replay import (
+    RecomputeReplay,
+    RecomputeReplayRecorder,
+    ReenterableContext,
+    replayable_selective_checkpoint_contexts,
+)
 
 
 def test_recorder_replays_in_order_then_reports_misses() -> None:
@@ -162,3 +167,52 @@ def test_retained_graph_replays_the_original_record_on_every_backward() -> None:
         torch.testing.assert_close(grad, 6.0 * x.detach())
     # One recorded forward, then a replay that took the record on each of the three backward passes.
     assert modes == ["record", "replay", "replay", "replay"]
+
+
+def test_reenterable_context_builds_a_fresh_inner_context_per_entry() -> None:
+    entries: list[int] = []
+
+    @contextmanager
+    def once():
+        entries.append(len(entries))
+        yield
+
+    context = ReenterableContext(once)
+    for _ in range(3):
+        with context:
+            pass
+    assert entries == [0, 1, 2]
+
+
+def test_nested_contexts_survive_a_split_input_and_weight_backward() -> None:
+    """A split backward (input pass, then weight pass) recomputes the region twice through every context."""
+    channel: RecomputeReplay[float] = RecomputeReplay("test")
+    recomputes: list[str] = []
+    weight = torch.nn.Parameter(torch.tensor([0.5, -1.0, 2.0]))
+
+    def policy(ctx, func, *args, **kwargs):
+        return CheckpointPolicy.MUST_SAVE if func == torch.ops.aten.sin.default else CheckpointPolicy.PREFER_RECOMPUTE
+
+    def inner_context_fn():
+        forward_context, recompute_context = replayable_selective_checkpoint_contexts(policy)
+
+        @contextmanager
+        def recompute():
+            recomputes.append("enter")
+            with recompute_context:
+                yield
+
+        return forward_context, ReenterableContext(recompute)
+
+    def block(x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(x) * weight * x
+
+    x = torch.arange(1.0, 4.0, requires_grad=True)
+    y = checkpoint(block, x, use_reentrant=False, context_fn=channel.checkpoint_context_fn(inner_context_fn))
+    (dx,) = torch.autograd.grad(y.sum(), x, retain_graph=True)
+    (dw,) = torch.autograd.grad(y.sum(), weight)
+
+    xd = x.detach()
+    torch.testing.assert_close(dx, weight.detach() * (torch.cos(xd) * xd + torch.sin(xd)))
+    torch.testing.assert_close(dw, torch.sin(xd) * xd)
+    assert recomputes == ["enter", "enter"]
