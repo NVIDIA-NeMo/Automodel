@@ -931,3 +931,76 @@ def test_modules_to_save_must_cover_the_exported_full_weights():
         _check_modules_to_save_cover_exported_tensors(["model.norm"], exported)
     with pytest.raises(ValueError, match="entries without tensors: \\['lm_head'\\]"):
         _check_modules_to_save_cover_exported_tensors(["model.norm_f", "lm_head"], exported)
+
+
+@pytest.mark.cpu_only
+def test_mtp_mask_rows_round_trip_through_native_and_peft_loaders(tmp_path, single_rank_process_group):
+    """The resize-first PEFT path and native resume restore trained mask rows and draft logits."""
+    from copy import deepcopy
+
+    from peft import PeftModel
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+
+    from nemo_automodel.components._peft.lora import lora_token_gate
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+    base = Qwen3ForCausalLM(
+        Qwen3Config(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            tie_word_embeddings=True,
+        )
+    ).eval()
+    trained, resumed = deepcopy(base), deepcopy(base)
+    ids = [12, 10]
+    peft = PeftConfig(target_modules=["*q_proj"], dim=2, alpha=4, alora_invocation_tokens=ids)
+    for model in (trained, resumed):
+        apply_lora_to_linear_modules(model, peft)
+    frozen_rows = base.get_input_embeddings().weight.detach().clone()
+    with torch.no_grad():
+        trained.get_input_embeddings().weight[ids] += 0.15
+        for name, param in trained.named_parameters():
+            if "lora_B" in name:
+                param.fill_(0.125)
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(8)}, unk_token="token0")),
+        unk_token="token0",
+    )
+    checkpointer = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        is_peft=True,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+    checkpointer.save_model(trained, str(tmp_path / "saved"), peft_config=peft, tokenizer=tokenizer)
+    path = tmp_path / "saved" / "model"
+    checkpointer.load_model(resumed, str(path))
+    assert len(tokenizer) == 8
+    exported = AutoTokenizer.from_pretrained(path)
+    assert len(exported) == 16
+    assert exported.convert_tokens_to_ids(["<|automodel_mtp_mask_1|>", "<|automodel_mtp_mask_2|>"]) == ids
+
+    base.resize_token_embeddings(len(exported))
+    external = PeftModel.from_pretrained(base, path).eval()
+    intact = [i for i in range(16) if i not in ids]
+    inputs = torch.tensor([[1, 2, *ids]])
+    gate = torch.tensor([[False, False, True, True]])
+    with torch.inference_mode():
+        with lora_token_gate(trained, gate):
+            expected = trained(inputs).logits
+        with lora_token_gate(resumed, gate):
+            torch.testing.assert_close(resumed(inputs).logits, expected, atol=0, rtol=0)
+        torch.testing.assert_close(external(inputs).logits, expected, atol=1e-6, rtol=1e-5)
+        rows = trained.get_input_embeddings().weight[ids]
+        torch.testing.assert_close(external.get_input_embeddings()(torch.tensor(ids)), rows, atol=0, rtol=0)
+        torch.testing.assert_close(external.get_output_embeddings().weight[ids], rows, atol=0, rtol=0)
+        torch.testing.assert_close(resumed.get_input_embeddings().weight[intact], frozen_rows[intact], atol=0, rtol=0)
+    checkpointer.close()
