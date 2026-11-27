@@ -692,11 +692,18 @@ def checkpoint_moe_block(
 
 
 def _moe_child(block: nn.Module) -> tuple[str, MoE] | None:
-    """Return the attribute name and module of the block's MoE sub-block, if any."""
+    """Return the registered child name and module of the block's MoE sub-block, if any.
+
+    The MoE is found through ``moe``/``mlp``, which can be a property over the registered child
+    (Nemotron V3 blocks expose ``mlp`` for their ``mixer``); the returned name is the one the
+    module is registered under, so the caller can replace it.
+    """
     for name in ("moe", "mlp"):
         module = getattr(block, name, None)
         if isinstance(module, MoE):
-            return name, module
+            for child_name, child in block.named_children():
+                if child is module:
+                    return child_name, module
     return None
 
 
