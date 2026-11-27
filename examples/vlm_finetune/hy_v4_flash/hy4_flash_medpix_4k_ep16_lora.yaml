@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Hy4-flash LoRA on MedPix-VQA (unpacked, 4K tokens), EP64 on 8 H100 nodes x 8 GPUs. Adapter targets, rank and alpha
+# Hy4-flash LoRA on MedPix-VQA (unpacked, 4K tokens), EP16 on 2 H100 nodes x 8 GPUs. Adapter targets, rank and alpha
 # follow the model's official finetune guide (MLA projections, rank 64, alpha 128, learning rate 2e-4).
 # Launch requirements (NCCL_PXN_DISABLE=1 on multi-node InfiniBand H100 systems, JIT cache placement): see the
 # Hy4-flash model card, docs/model-coverage/llm/tencent/hy4-flash.mdx.
@@ -20,7 +20,7 @@
 recipe: FinetuneRecipeForVLM
 seed: 1234
 step_scheduler:
-  global_batch_size: 64
+  global_batch_size: 64  # 16 ranks x local batch 1 x gradient accumulation 4
   local_batch_size: 1
   ckpt_every_steps: 1000
   save_checkpoint_every_epoch: false
@@ -88,7 +88,7 @@ distributed:
   tp_size: 1
   pp_size: 1
   cp_size: 1
-  ep_size: 64
+  ep_size: 16
   sequence_parallel: false
   activation_checkpointing: true
   defer_fsdp_grad_sync: false
@@ -110,7 +110,7 @@ freeze_config:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: ../checkpoints/hy4_flash_medpix_4k_ep64_lora
+  checkpoint_dir: ../checkpoints/hy4_flash_medpix_4k_ep16_lora
   model_save_format: safetensors
   save_consolidated: false
 
@@ -167,7 +167,7 @@ wandb:
   enable: false
   entity: Nemo-automodel
   project: hy4_flash
-  name: hy4_flash_medpix_4k_ep64_lora
+  name: hy4_flash_medpix_4k_ep16_lora
   mode: online
   dir: ../logs/wandb
 
@@ -175,7 +175,7 @@ ci:
   nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
-  nodes: 8
+  nodes: 2
   time: "01:00:00"
   nproc_per_node: 8
   env_vars:
