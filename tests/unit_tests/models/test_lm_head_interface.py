@@ -178,8 +178,8 @@ def release_built_model() -> Iterator[None]:
     dead model is freed only by a cyclic collection.
     """
     yield
-    gc.collect()
     if torch.cuda.is_available():
+        gc.collect()
         torch.cuda.empty_cache()
 
 
