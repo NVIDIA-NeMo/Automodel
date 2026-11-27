@@ -14,6 +14,7 @@
 
 """Key exchange of Inkling2 attention under context parallelism with activation checkpointing."""
 
+import itertools
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
@@ -23,13 +24,14 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.models.inkling2 import context_parallel
 from nemo_automodel.components.models.inkling2.attention import AttentionSources, Inkling2Attention
 
 from .test_reference import tiny_config
 
 pytestmark = pytest.mark.cpu_only
 
-BATCH, SEQUENCE = 2, 12
+BATCH, SEQUENCE, RANKS = 2, 12, 4
 Attend = Callable[[AttentionSources, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
@@ -124,3 +126,67 @@ def test_flex_full_layer_attends_one_key_length_whatever_the_documents(monkeypat
         positions = first_position + torch.arange(SEQUENCE).repeat(BATCH, 1)
         assert torch.isfinite(module(AttentionSources(hidden, hidden, hidden), valid, positions)).all()
     assert len(key_lengths) == 3 and len(set(key_lengths)) == 1
+
+
+def _gather_from_earlier_ranks(sent: list[list[torch.Tensor]], rank: int) -> Callable[..., torch.Tensor]:
+    """Return the ``gather_sequence`` of one CP rank when the ranks run one after another in one process.
+
+    Args:
+        sent: Per collective of a forward, the shards [batch, count, ...] of the ranks that ran before.
+        rank: The rank that runs now; its shard is appended to every collective.
+
+    Returns:
+        A gather whose result [batch, ranks * count, ...] holds zeros for the ranks after this one.
+    """
+    collective = itertools.count()
+
+    def gather(value: torch.Tensor, mesh: SimpleNamespace, *, differentiable: bool) -> torch.Tensor:
+        index = next(collective)
+        if index == len(sent):
+            sent.append([])
+        assert len(sent[index]) == rank
+        sent[index].append(value)
+        later = [torch.zeros_like(value)] * (mesh.size() - rank - 1)
+        return torch.cat((*sent[index], *later), dim=1)
+
+    return gather
+
+
+def test_flex_full_layer_on_four_ranks_matches_one_rank_holding_the_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full flex layer exchanges the shards of every preceding rank, not only of the nearest one.
+
+    Each row holds a document that starts more than one shard before the last rank, so the queries
+    there attend keys of several preceding shards. A rank reads only what the ranks before it sent,
+    so the ranks run in order in this process. The expected output is the same layer without a CP
+    mesh on the whole sequence. The eager arithmetic stands in for the compiled kernel, which needs CUDA.
+    """
+    config = tiny_config()
+    layer = next(index for index in range(config.num_hidden_layers) if index not in config.local_layer_ids)
+    torch.manual_seed(0)
+    module = Inkling2Attention(config, layer, dtype=torch.float32, backend="flex")
+    module.reset_parameters(0.3)
+    assert module.flex is not None
+    monkeypatch.setattr(module.flex, "forward", module._eager)
+    total = RANKS * SEQUENCE
+    hidden = torch.randn(BATCH, total, 16, generator=torch.Generator().manual_seed(4))
+    valid = torch.ones(BATCH, total, dtype=torch.bool)
+    positions = torch.arange(total).repeat(BATCH, 1)
+    # Row 0: documents of 5 and 43 tokens. Row 1: documents of 15 and 30 tokens, then padding.
+    positions[0, 5:] -= 5
+    positions[1, 15:] -= 15
+    valid[1, total - 3 :] = False
+    positions[1, total - 3 :] = 0
+    # The first token of these shards is more than one shard into its document.
+    assert positions[0, 2 * SEQUENCE] > SEQUENCE and (positions[:, 3 * SEQUENCE] > SEQUENCE).all()
+    with torch.no_grad():
+        expected = module(AttentionSources(hidden, hidden, hidden), valid, positions)
+        sent: list[list[torch.Tensor]] = []
+        for rank in range(RANKS):
+            shard = slice(rank * SEQUENCE, (rank + 1) * SEQUENCE)
+            mesh = SimpleNamespace(size=lambda: RANKS, get_local_rank=lambda rank=rank: rank, get_group=lambda: None)
+            module.setup_cp_attention(mesh)
+            monkeypatch.setattr(context_parallel, "gather_sequence", _gather_from_earlier_ranks(sent, rank))
+            local = hidden[:, shard]
+            actual = module(AttentionSources(local, local, local), valid[:, shard], positions[:, shard])
+            assert expected[:, shard].abs().max() > 0
+            torch.testing.assert_close(actual, expected[:, shard], rtol=1e-5, atol=1e-6)
