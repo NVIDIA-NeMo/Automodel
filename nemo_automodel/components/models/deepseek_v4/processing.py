@@ -400,7 +400,8 @@ class DeepseekV4VisionProcessor(ProcessorMixin):
         truncation = bool(kwargs.pop("truncation", False))
         max_length = kwargs.pop("max_length", None)
         kwargs.pop("return_dict", None)
-        tokenized = self.tokenizer(texts, add_special_tokens=False, padding=False, **kwargs)
+        kwargs.setdefault("add_special_tokens", False)
+        tokenized = self.tokenizer(texts, padding=False, **kwargs)
 
         expanded_ids: list[list[int]] = []
         expanded_types: list[list[int]] = []
