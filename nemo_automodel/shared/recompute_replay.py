@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from typing import Generic, TypeVar
 
 __all__ = ["RecomputeReplay", "RecomputeReplayRecorder"]
@@ -88,6 +88,23 @@ class RecomputeReplayRecorder(Generic[T]):
 
     def __len__(self) -> int:
         return len(self._records)
+
+
+class _ReplayScope(ExitStack):
+    """Recompute context that opens a fresh replay scope on every entry.
+
+    ``torch.utils.checkpoint`` enters the recompute context once per backward pass over the same
+    graph, and a ``@contextmanager`` object cannot be entered twice. Each entry here builds a new
+    scope, which rewinds the recorder again.
+    """
+
+    def __init__(self, make_scope: Callable[[], AbstractContextManager]) -> None:
+        super().__init__()
+        self._make_scope = make_scope
+
+    def __enter__(self) -> _ReplayScope:
+        self.enter_context(self._make_scope())
+        return self
 
 
 class _Binding(threading.local):
@@ -181,6 +198,6 @@ class RecomputeReplay(Generic[T]):
                     if mode == "record":
                         recorder.on_record_exit()
 
-            return scoped("record", forward_context), scoped("replay", recompute_context)
+            return scoped("record", forward_context), _ReplayScope(lambda: scoped("replay", recompute_context))
 
         return wrapped_context_fn

@@ -73,7 +73,6 @@ def _make_recipe(model, dp_size, allreduce):
     recipe.max_grad_norm = 1.0
     recipe.device_mesh = None
     recipe.timestamp = 0.0
-    recipe.mfu_calculator = None
     recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
     recipe._get_dp_group_size = lambda include_cp=False: dp_size
     recipe._get_cp_group_size = lambda: 1

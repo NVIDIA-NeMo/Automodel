@@ -1,0 +1,26 @@
+{#- Training chat template for Hy4-flash (tencent/Hy4-flash, chat_template.jinja at revision
+    eccd3123eec73f2040f4c9ed0de1883593470510), restricted to plain text system / user / assistant turns.
+    It renders byte-identically to the released template with reasoning_effort='no_think' (the official SFT default),
+    with one difference: a generation block marks each assistant turn's supervised span, the answer and the
+    <hy_end> that follows. The empty <think></think> pair stays outside the span, like the generation prompt.
+    Tools and images are not handled here: use the released template for them. An assistant turn with reasoning
+    is rejected, since its reasoning would not be in the supervised span. -#}
+{%- set effort = reasoning_effort if reasoning_effort is defined else 'no_think' -%}
+{%- set sys = messages[0]['content'] if messages[0]['role'] == 'system' else '' -%}
+{{- '<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>' ~ sys ~ '<｜reasoning_mode:opensource｜>reasoning_effort:' ~ effort ~ '<｜hy_end:opensource｜>' -}}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' and not loop.first -%}
+{{- '<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>' ~ message['content'] ~ '<｜hy_end:opensource｜>' -}}
+{%- elif message['role'] == 'user' -%}
+{{- '<｜hy_start:opensource｜>user<｜hy_middle:opensource｜>' ~ message['content'] ~ '<｜hy_end:opensource｜>' -}}
+{%- elif message['role'] == 'assistant' -%}
+{%- if message['reasoning_content'] or message['reasoning'] -%}
+{{- raise_exception('Hy4-flash training samples with assistant reasoning are not supported: remove reasoning_content / reasoning from the sample') -}}
+{%- endif -%}
+{{- '<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>' -}}
+{%- generation -%}{{- message['content'] ~ '<｜hy_end:opensource｜>' -}}{%- endgeneration -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>' -}}
+{%- endif -%}

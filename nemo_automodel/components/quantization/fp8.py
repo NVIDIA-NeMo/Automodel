@@ -309,6 +309,16 @@ def apply_fp8_to_model(
         return model
 
 
+def uses_hardware_fp8(model: nn.Module) -> bool:
+    """Return whether TorchAO converted a layer to native FP8 compute."""
+    if not HAVE_TORCHAO:
+        return False
+
+    from torchao.float8.float8_linear import Float8Linear
+
+    return any(isinstance(layer, Float8Linear) and not layer.config.emulate for layer in model.modules())
+
+
 def verify_fp8_conversion(model: nn.Module) -> _FP8ConversionStats:
     """
     Verify that FP8 conversion was successful by counting converted modules.

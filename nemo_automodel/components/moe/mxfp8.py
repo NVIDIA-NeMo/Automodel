@@ -148,6 +148,23 @@ def _mxfp8_grouped_mm_or_none():
     return None
 
 
+def uses_native_mxfp8_experts(model: torch.nn.Module) -> bool:
+    """Whether the built model has routed experts that will dispatch the MXFP8 grouped GEMM."""
+    from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
+    from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
+
+    # The LoRA forwards implement their own ordinary grouped GEMMs for the base and adapter weights.
+    return (
+        any(
+            isinstance(module, (GroupedExperts, GroupedExpertsDeepEP))
+            and module.use_mxfp8
+            and not isinstance(module, (GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA))
+            for module in model.modules()
+        )
+        and _mxfp8_grouped_mm_or_none() is not None
+    )
+
+
 def _default_grouped_mm(A, B, offs):
     """Fallback grouped GEMM (plain ``torch._grouped_mm``) used when MXFP8 is off."""
     return torch._grouped_mm(A, B, offs=offs)
