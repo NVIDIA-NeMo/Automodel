@@ -24,7 +24,7 @@ import logging
 import math
 from collections import Counter
 from os import PathLike, getenv
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import torch
 
@@ -39,6 +39,13 @@ from nemo_automodel.components.utils.flops_utils import (
 from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
+
+
+class FlopsFormula(Protocol):
+    """Model-FLOPs formula: FLOPs of one optimizer step for ``gbs`` sequences of ``seq_len`` tokens."""
+
+    def __call__(self, config: PretrainedConfig, *, gbs: int = 1, seq_len: int | None = None) -> float: ...
+
 
 _Precision = Literal["fp32", "tf32", "fp16", "fp8", "fp4"]
 
@@ -189,12 +196,15 @@ class AutoMFU:
         config: PretrainedConfig | None = None,
         *,
         compute_dtype: torch.dtype | None = None,
+        flops_formula: FlopsFormula | None = None,
     ) -> None:
         """Initialize AutoMFU with a model config.
 
         Args:
             config: Hugging Face configuration. Omit it for a null calculator.
             compute_dtype: Training compute dtype. Defaults to the model config dtype, then BF16.
+            flops_formula: Optional model-owned FLOPs formula. It takes precedence over the formula
+                selected from the config class.
         """
         self.config = config
         self.flops_formula = None
@@ -202,7 +212,7 @@ class AutoMFU:
         if config is None:
             return
 
-        self.flops_formula = get_flops_formula_for_hf_config(config)
+        self.flops_formula = flops_formula or get_flops_formula_for_hf_config(config)
         if self.flops_formula is transformer_flops and not all(
             hasattr(config, attr)
             for attr in ("hidden_size", "num_hidden_layers", "num_attention_heads", "intermediate_size", "vocab_size")
@@ -258,6 +268,7 @@ class AutoMFU:
             raise TypeError("AutoMFU uses the detected device and built-in peak FLOPS table")
 
         config = config_or_path_or_model
+        flops_formula = None
         if isinstance(config, (str, PathLike)):
             from transformers import AutoConfig
 
@@ -265,9 +276,11 @@ class AutoMFU:
         else:
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
-            if compute_dtype is None and isinstance(config_or_path_or_model, torch.nn.Module):
-                compute_dtype = _model_matrix_dtype(config_or_path_or_model)
-        return cls(config, compute_dtype=compute_dtype)
+            if isinstance(config_or_path_or_model, torch.nn.Module):
+                flops_formula = cls._model_flops_formula(config_or_path_or_model)
+                if compute_dtype is None:
+                    compute_dtype = _model_matrix_dtype(config_or_path_or_model)
+        return cls(config, compute_dtype=compute_dtype, flops_formula=flops_formula)
 
     @classmethod
     def from_pretrained(
@@ -370,6 +383,19 @@ class AutoMFU:
             if not moved:
                 break
         return cur
+
+    @staticmethod
+    def _model_flops_formula(model: torch.nn.Module) -> FlopsFormula | None:
+        """Return the FLOPs formula a model class names as ``flops_formula``, or ``None``.
+
+        A model that can be built from more than one config class (the upstream Transformers
+        config and the saved AutoModel config) states its formula once on the model class
+        instead of leaving the choice to whichever config class the caller passed. This is the
+        same class-attribute hook ``get_flops_formula_for_hf_config`` reads from config classes.
+        A wrapper whose class does not carry the attribute falls back to the config's formula.
+        """
+        formula = getattr(type(model), "flops_formula", None)
+        return formula if callable(formula) else None
 
     @staticmethod
     def _ensure_common_config_aliases(config: object) -> None:
