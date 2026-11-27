@@ -298,7 +298,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         """
         from transformers import PretrainedConfig
 
-        from nemo_automodel.components.utils.flops_utils import nemotronh_mtp_flops
+        from nemo_automodel.components.utils.flops_utils import _nemotronh_mtp_flops
 
         for mp in self.model_parts:
             mtp_cfg = getattr(mp, "mtp_config", None)
@@ -316,7 +316,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     )
                 continue
             try:
-                flops = nemotronh_mtp_flops(
+                flops = _nemotronh_mtp_flops(
                     config,
                     global_batch_size,
                     seq_len,

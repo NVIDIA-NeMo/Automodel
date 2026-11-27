@@ -24,7 +24,7 @@ import logging
 import math
 from dataclasses import dataclass
 from os import PathLike
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -87,43 +87,6 @@ _CONFIG_ALIAS_ATTRS = (
 )
 
 
-@runtime_checkable
-class SupportsModelFlops(Protocol):
-    """A model that counts the model FLOPs of its own training step.
-
-    For models whose executed work the Hugging Face config does not describe on its own:
-    a head whose depth is chosen when the model is built, or a composite model that runs
-    only its language model on text batches.
-    """
-
-    def model_flops(self, *, gbs: int, seq_len: int) -> float:
-        """Count the model FLOPs of the forward and backward pass over one training batch.
-
-        Args:
-            gbs: Number of sequences in the batch.
-            seq_len: Tokens per sequence.
-
-        Returns:
-            Model FLOPs for ``gbs`` sequences of ``seq_len`` tokens.
-        """
-        ...
-
-
-class _FlopsFormula(Protocol):
-    """A FLOPs formula as the calculator calls it."""
-
-    def __call__(self, config: PretrainedConfig, gbs: int, seq_len: int) -> float: ...
-
-
-def _model_flops_formula(model: SupportsModelFlops) -> _FlopsFormula:
-    """Return the FLOPs count of ``model`` with the call signature of a config formula."""
-
-    def formula(config: PretrainedConfig, gbs: int, seq_len: int) -> float:
-        return model.model_flops(gbs=gbs, seq_len=seq_len)
-
-    return formula
-
-
 def get_device_flops(unit: str = "T", device_name: str | None = None) -> float:
     """Get theoretical device FLOPS in a requested unit.
 
@@ -169,7 +132,6 @@ class AutoMFU:
         config: PretrainedConfig,
         device: str | None = None,
         peak_tflops: float | None = None,
-        model: SupportsModelFlops | None = None,
     ) -> None:
         """Initialize AutoMFU with a model config.
 
@@ -177,11 +139,9 @@ class AutoMFU:
             config: HuggingFace PretrainedConfig object
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
-            model: Optional model that counts the FLOPs of its own training step. Its count
-                is used instead of the formula selected from ``config``.
         """
         self.config = config
-        self.flops_formula = get_flops_formula_for_hf_config(config) if model is None else _model_flops_formula(model)
+        self.flops_formula = get_flops_formula_for_hf_config(config)
         self.reference_mfu = (
             _validate_peak_tflops(peak_tflops)
             if peak_tflops is not None
@@ -213,8 +173,6 @@ class AutoMFU:
         Args:
             config_or_path_or_model: Either a PretrainedConfig object, a model object
                 (the .config attribute will be extracted), or a model ID/local path.
-                A model object that counts its own FLOPs (:class:`SupportsModelFlops`)
-                supplies the FLOPs instead of the formula selected from its config.
             device: Optional device name override. By default, infer the current device.
             peak_tflops: Optional peak TFLOPs/s override for the training precision.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
@@ -223,9 +181,6 @@ class AutoMFU:
         Returns:
             AutoMFU instance
         """
-        # The one place that asks an arbitrary model object whether it counts its own FLOPs: this factory
-        # accepts any model, and only models whose config does not describe the executed work implement it.
-        model = config_or_path_or_model if isinstance(config_or_path_or_model, SupportsModelFlops) else None
         config = config_or_path_or_model
         if isinstance(config, (str, PathLike)):
             from transformers import AutoConfig
@@ -234,7 +189,7 @@ class AutoMFU:
         else:
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
-        return cls(config, device=device, peak_tflops=peak_tflops, model=model)
+        return cls(config, device=device, peak_tflops=peak_tflops)
 
     @classmethod
     def from_pretrained(
@@ -382,8 +337,7 @@ class MFUConfig:
         """Build the calculator for an initialized model.
 
         Args:
-            model: Model that counts its own FLOPs, or whose Hugging Face configuration
-                selects the FLOPs formula.
+            model: Model whose Hugging Face configuration supplies the FLOPs formula.
 
         Returns:
             The configured MFU calculator.

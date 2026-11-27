@@ -44,9 +44,9 @@
 # 12,565 and 12,566.
 #
 # Reported figures. Every step logs `tps <tokens/s>(<tokens/s per GPU>/gpu)` and `mfu <percent>`. The model
-# FLOPs behind mfu are those of the language model for the tokens of the step: its 88 layers, lm_head and the
-# two MTP depths, 85.66 GFLOPs per token at this sequence length (75.87 without the MTP head); the vision tower
-# is not counted. mfu.peak_tflops is the dense BF16 peak of a GB300, so
+# FLOPs behind mfu are those of the backbone of the language model for the tokens of the step: its 88 layers
+# and lm_head, 75.87 GFLOPs per token at this sequence length. The MTP head (9.78 GFLOPs per token more for its
+# two depths) and the vision tower are not counted. mfu.peak_tflops is the dense BF16 peak of a GB300, so
 #   model TFLOPs/s/GPU = mfu / 100 x 2500.
 # tps counts 8191 label positions per sequence, the FLOPs all 8192 tokens.
 #
@@ -58,7 +58,7 @@
 # Measured with this file on 16 GB300 (Transformer Engine 2.19.0, cuBLASLt 13.7.0) with `--benchmark`, over 20
 # steps after 6 warm-up steps, the model config read from a local copy of the Hub config. Two runs: 5.302 and
 # 5.297 s per optimizer step, 12,360 and 12,373 tokens/s/GPU counting all 8192 tokens of a sequence, and
-# 1,059 and 1,060 model TFLOPs/s/GPU as logged.
+# 938 and 939 model TFLOPs/s/GPU (tokens/s/GPU times 75.87 GFLOPs per token).
 #
 # Launch on 4 nodes x 4 GPUs: on every node, from the repository root (26 steps, the first 6 are warm-up):
 #   torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=<first node>:<port> \

@@ -20,12 +20,7 @@ from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHCon
 
 from nemo_automodel._transformers import mfu as mfu_module
 from nemo_automodel._transformers.mfu import AutoMFU, MFUConfig, get_device_flops
-from nemo_automodel.components.models.nemotron_omni.model import (
-    NemotronOmniConfig,
-    NemotronOmniForConditionalGeneration,
-)
-from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-from nemo_automodel.components.models.nemotron_v3.mtp import build_mtp_config_from_hf
+from nemo_automodel.components.models.nemotron_omni.model import NemotronOmniConfig
 from nemo_automodel.components.utils import flops_utils
 
 
@@ -443,67 +438,6 @@ def test_mfu_config_builds_calculator(monkeypatch):
     assert calculator.reference_mfu == 1979.0
 
 
-class _CountsItsOwnFlops:
-    """Model that counts seven FLOPs per token; its config selects no formula."""
-
-    def __init__(self) -> None:
-        self.config = SimpleNamespace()
-        self.calls: list[tuple[int, int]] = []
-
-    def model_flops(self, *, gbs: int, seq_len: int) -> float:
-        self.calls.append((gbs, seq_len))
-        return 7.0 * gbs * seq_len
-
-
-def test_automfu_takes_the_flops_of_a_model_that_counts_its_own(monkeypatch):
-    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-    model = _CountsItsOwnFlops()
-
-    calculator = MFUConfig(peak_tflops=1979.0).build(model=model)
-
-    assert calculator.config is model.config
-    assert calculator.get_flops((2, 16)) == 224.0
-    assert calculator.get_flops(torch.zeros((3, 8), dtype=torch.long)) == 168.0
-    assert model.calls == [(2, 16), (3, 8)]
-    # 224 FLOPs in 1e-12 s on one device are 224 TFLOPs/s.
-    assert calculator((2, 16), time_delta=1e-12, world_size=1) == pytest.approx(100 * 224.0 / 1979.0)
-
-
-def test_automfu_prefers_the_model_count_over_the_config_formula(monkeypatch):
-    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: lambda config, gbs, seq_len: 1.0)
-
-    calculator = AutoMFU.from_config(_CountsItsOwnFlops(), peak_tflops=1979.0)
-
-    assert calculator.get_flops((1, 4)) == 28.0
-
-
-def test_automfu_keeps_the_config_formula_for_a_model_without_its_own_count(monkeypatch):
-    monkeypatch.setattr(
-        mfu_module,
-        "get_flops_formula_for_hf_config",
-        lambda config: lambda config, gbs, seq_len: 5.0 * gbs * seq_len,
-    )
-
-    calculator = AutoMFU.from_config(SimpleNamespace(config=SimpleNamespace()), peak_tflops=1979.0)
-
-    assert calculator.get_flops((2, 3)) == 30.0
-
-
-def test_automfu_reports_no_flops_when_the_model_count_fails(monkeypatch):
-    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
-
-    class _CannotCount:
-        config = SimpleNamespace()
-
-        def model_flops(self, *, gbs: int, seq_len: int) -> float:
-            raise ValueError("unsupported layer")
-
-    calculator = AutoMFU.from_config(_CannotCount(), peak_tflops=1979.0)
-
-    assert calculator.get_flops((2, 16)) is None
-    assert calculator((2, 16), time_delta=1.0, world_size=1) is None
-
-
 def test_optional_field_set_to_none_uses_its_default():
     """An explicit ``None`` in an optional field behaves like the field being absent."""
     with_none = _llama2_cfg()
@@ -538,12 +472,9 @@ def test_mla_moe_flops_accepts_alternate_ffn_field_names():
 
 
 # Model FLOPs of a text-only training step of Nemotron 3.5 Super VL.
-#
-# A text batch runs the language model only: 88 layers (40 Mamba, 40 MoE, 8 attention),
-# ``lm_head`` and the MTP depths the model was built with. The recipe takes the count from
-# the model (``MFUConfig.build(model=...)``), because the checkpoint config is a composite
-# without a FLOPs formula and keeps one MTP depth where training runs two through one
-# shared block.
+# A text batch runs the language model only. ``nemotronh_vl_flops``, registered for the config
+# class of the checkpoint, counts its backbone: 88 layers (40 Mamba, 40 MoE, 8 attention) and
+# ``lm_head``. An MTP head is not counted, as for the Nemotron 3 language model on its own.
 #
 # The expected values are derived in this file from the layer shapes of ``llm_config`` in
 # ``nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16``, not from the FLOPs helpers. A
@@ -582,14 +513,11 @@ ATTENTION_CORE = 2 * (SEQ_LEN // 2) * 32 * 128  # scores and weighted values ove
 ATTENTION = ATTENTION_PROJ + ATTENTION_CORE
 
 LM_HEAD = HIDDEN * VOCAB
-MTP_FUSION = 2 * HIDDEN * HIDDEN  # [embedding, hidden state] -> hidden
 
 BACKBONE_FLOPS_PER_TOKEN = (
     6 * (NUM_MAMBA * (MAMBA_IN_PROJ + MAMBA_OUT_PROJ) + NUM_MOE * MOE + NUM_ATTENTION * ATTENTION + LM_HEAD)
     + 21 * NUM_MAMBA * MAMBA_SCAN_STATE
 )
-# One MTP depth: the fusion projection, one attention and one MoE block, and lm_head for its loss.
-MTP_DEPTH_FLOPS_PER_TOKEN = 6 * (MTP_FUSION + ATTENTION + MOE + LM_HEAD)
 
 
 def _llm_config(**overrides: int) -> NemotronHConfig:
@@ -620,75 +548,37 @@ def _llm_config(**overrides: int) -> NemotronHConfig:
     return NemotronHConfig(**fields)
 
 
-def _language_model(config: NemotronHConfig, *, mtp_depths: int, shared_mtp_block: bool = True) -> NemotronHForCausalLM:
-    """Build the language model without its weights: the attributes its FLOPs count reads."""
-    model = NemotronHForCausalLM.__new__(NemotronHForCausalLM)
-    # nn.Module.__setattr__ needs the module machinery; bypass it for a model without weights.
-    object.__setattr__(model, "config", config)
-    object.__setattr__(
-        model,
-        "mtp_config",
-        build_mtp_config_from_hf(config, num_nextn_predict_layers=mtp_depths, use_repeated_layer=shared_mtp_block),
-    )
-    return model
-
-
-def _vl_model(llm_config: NemotronHConfig, *, mtp_depths: int) -> NemotronOmniForConditionalGeneration:
-    """Build the vision-language model without its weights, around the language model above."""
-    model = NemotronOmniForConditionalGeneration.__new__(NemotronOmniForConditionalGeneration)
-    # A RADIO ViT-H tower: 32 layers of width 1280 that a text batch never runs.
-    vision_config = {"hidden_size": 1280, "num_hidden_layers": 32, "num_attention_heads": 16, "patch_size": 16}
-    object.__setattr__(model, "config", NemotronOmniConfig(llm_config=llm_config, vision_config=vision_config))
-    object.__setattr__(model, "language_model", _language_model(llm_config, mtp_depths=mtp_depths))
-    return model
-
-
 @pytest.mark.cpu_only
 def test_derivation_covers_the_layers_of_the_checkpoint():
     assert len(LAYER_PATTERN) == 88
     assert [LAYER_PATTERN.count(symbol) for symbol in "ME*"] == [NUM_MAMBA, NUM_MOE, NUM_ATTENTION]
     assert BACKBONE_FLOPS_PER_TOKEN == 75_874_959_360
-    assert MTP_DEPTH_FLOPS_PER_TOKEN == 4_891_607_040
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("mtp_depths", [0, 2])
-def test_language_model_counts_backbone_and_the_mtp_depths_it_runs(mtp_depths):
-    model = _language_model(_llm_config(), mtp_depths=mtp_depths)
+@pytest.mark.parametrize("config_class_name", ["NemotronH_Omni_Reasoning_V3_Config", "NemotronOmniConfig"])
+def test_recipe_calculator_counts_the_language_model_of_the_vl_model(config_class_name):
+    """The recipe builds its calculator from the VL model; a text batch counts the backbone of its language model.
 
-    flops = model.model_flops(gbs=1, seq_len=SEQ_LEN)
-
-    assert flops == SEQ_LEN * (BACKBONE_FLOPS_PER_TOKEN + mtp_depths * MTP_DEPTH_FLOPS_PER_TOKEN)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("mtp_depths", [0, 2])
-def test_recipe_calculator_counts_the_language_model_of_the_vl_model(mtp_depths):
-    """The recipe builds its calculator from the VL model; a text batch then counts the language model only."""
-    calculator = MFUConfig(peak_tflops=2500.0).build(model=_vl_model(_llm_config(), mtp_depths=mtp_depths))
+    The checkpoint brings its own config class, ``NemotronH_Omni_Reasoning_V3_Config``; the formula is found by
+    that name and by the name of this repository's ``NemotronOmniConfig``.
+    """
+    config_class = type(config_class_name, (NemotronOmniConfig,), {})
+    # A RADIO ViT-H tower: 32 layers of width 1280 that a text batch never runs.
+    vision_config = {"hidden_size": 1280, "num_hidden_layers": 32, "num_attention_heads": 16, "patch_size": 16}
+    config = config_class(llm_config=_llm_config(), vision_config=vision_config)
+    assert flops_utils.get_flops_formula_for_hf_config(config) is flops_utils.nemotronh_vl_flops
+    calculator = MFUConfig(peak_tflops=2500.0).build(model=SimpleNamespace(config=config))
     input_ids = torch.zeros((8, SEQ_LEN), dtype=torch.long)
 
-    flops = calculator.get_flops(input_ids)
-
-    assert flops == 8 * SEQ_LEN * (BACKBONE_FLOPS_PER_TOKEN + mtp_depths * MTP_DEPTH_FLOPS_PER_TOKEN)
-
-
-@pytest.mark.cpu_only
-def test_two_mtp_depths_cost_the_same_with_and_without_a_shared_block():
-    config = _llm_config()
-
-    shared = _language_model(config, mtp_depths=2, shared_mtp_block=True).model_flops(gbs=1, seq_len=SEQ_LEN)
-    separate = _language_model(config, mtp_depths=2, shared_mtp_block=False).model_flops(gbs=1, seq_len=SEQ_LEN)
-
-    assert shared == separate == SEQ_LEN * (BACKBONE_FLOPS_PER_TOKEN + 2 * MTP_DEPTH_FLOPS_PER_TOKEN)
+    assert calculator.get_flops(input_ids) == 8 * SEQ_LEN * BACKBONE_FLOPS_PER_TOKEN
 
 
 @pytest.mark.cpu_only
 def test_one_routed_expert_fewer_per_token_lowers_the_count_by_that_expert():
     """A wrong expert top-k does not go unnoticed: each routed expert is 6 x 2 x 1024 x 2688 FLOPs per token."""
-    model = _language_model(_llm_config(num_experts_per_tok=TOP_K - 1), mtp_depths=2)
+    config = NemotronOmniConfig(llm_config=_llm_config(num_experts_per_tok=TOP_K - 1))
 
-    flops = model.model_flops(gbs=1, seq_len=SEQ_LEN)
+    flops = flops_utils.get_flops_formula_for_hf_config(config)(config, gbs=1, seq_len=SEQ_LEN)
 
-    expected = SEQ_LEN * (BACKBONE_FLOPS_PER_TOKEN + 2 * MTP_DEPTH_FLOPS_PER_TOKEN)
-    assert expected - flops == SEQ_LEN * 6 * EXPERT * (NUM_MOE + 2)
+    assert SEQ_LEN * BACKBONE_FLOPS_PER_TOKEN - flops == SEQ_LEN * 6 * EXPERT * NUM_MOE

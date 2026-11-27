@@ -1002,22 +1002,6 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     def compute_mtp_in_eval(self, value: bool) -> None:
         self.language_model.compute_mtp_in_eval = value
 
-    def model_flops(self, *, gbs: int, seq_len: int) -> float:
-        """Count the model FLOPs of the forward and backward pass over one text batch.
-
-        A text batch runs the language model only, so this is its count: the backbone, the
-        MTP depths it was built with and ``lm_head``. The vision and sound encoders and their
-        projectors are not counted; they do not run on a batch without media.
-
-        Args:
-            gbs: Number of sequences in the batch.
-            seq_len: Tokens per sequence.
-
-        Returns:
-            Model FLOPs for ``gbs`` text sequences of ``seq_len`` tokens.
-        """
-        return self.language_model.model_flops(gbs=gbs, seq_len=seq_len)
-
     def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100):
         """Globally ordered MTP future-token inputs/targets, prepared before CP sharding.
 

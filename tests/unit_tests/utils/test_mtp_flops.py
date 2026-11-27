@@ -24,7 +24,7 @@ Fixtures use ``gbs=2, seq=4`` -> ``num_tokens = gbs * seq = 8``, ``hidden_size H
   * eh_proj / depth    = 6 * num_tokens * (2H) * H              = 6*8*16*8          = 6144
   * lm_head / depth    = 6 * num_tokens * H * V                 = 6*8*8*32          = 12288
 
-``nemotronh_mtp_flops`` returns, for N depths:
+``_nemotronh_mtp_flops`` returns, for N depths:
     block * (N if use_repeated_layer else 1) + N * eh_proj + N * lm_head
 where ``block`` is the summed per-sublayer FLOPs of ``mtp_block_types``.
 """
@@ -34,7 +34,7 @@ import types
 from nemo_automodel.components.utils.flops_utils import (
     _nemotronh_mlp_layer_flops,
     _nemotronh_moe_layer_flops,
-    nemotronh_mtp_flops,
+    _nemotronh_mtp_flops,
 )
 
 GBS, SEQ = 2, 4  # num_tokens = 8
@@ -69,29 +69,29 @@ def test_per_block_and_fusion_baselines():
 def test_mtp_repeated_single_block():
     # ['mlp'], N=2, repeated: block = 18432*2 = 36864; +eh*2 (12288) +lm*2 (24576) = 73728
     cfg = _mlp_cfg()
-    assert nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp"], True) == 73728
+    assert _nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp"], True) == 73728
 
 
 def test_repeated_equals_unrolled():
     """The repeated layer's compute is N x: 1 physical depth run N times == N physical depths run once."""
     cfg = _mlp_cfg()
-    repeated = nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp"], True)
-    unrolled = nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp", "mlp"], False)
+    repeated = _nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp"], True)
+    unrolled = _nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp", "mlp"], False)
     assert repeated == unrolled == 73728
 
 
 def test_mtp_repeated_two_sublayer_depth():
     # ['mlp','mlp'] (2 sublayers/depth), N=2, repeated: block = (2*18432)*2 = 73728; +eh*2 +lm*2 = 110592
     cfg = _mlp_cfg()
-    assert nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp", "mlp"], True) == 110592
+    assert _nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp", "mlp"], True) == 110592
 
 
 def test_eh_proj_and_lm_head_scale_with_n():
     """eh_proj + lm_head are per-depth: dropping the block isolates them at N*(eh+lm)."""
     cfg = _mlp_cfg()
     # N=1, no block (empty) -> 0 (guarded); use a zero-flop check via difference instead:
-    n1 = nemotronh_mtp_flops(cfg, GBS, SEQ, 1, ["mlp"], True)
-    n2 = nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp"], True)
+    n1 = _nemotronh_mtp_flops(cfg, GBS, SEQ, 1, ["mlp"], True)
+    n2 = _nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["mlp"], True)
     # going 1 -> 2 depths (repeated) adds exactly one more (block + eh + lm)
     assert n2 - n1 == _ONE_MLP + _EH_PER_DEPTH + _LM_PER_DEPTH
 
@@ -101,10 +101,10 @@ def test_mtp_moe_block_counts_latent():
     # latent MoE block (hand-derived): routed 4608 + shared 7680 + gate 6144 + latent_proj 3072 = 21504
     assert _nemotronh_moe_layer_flops(cfg, GBS, SEQ) == 21504
     # ['moe'], N=2, repeated: 21504*2 + eh*2 + lm*2 = 43008 + 12288 + 24576 = 79872
-    assert nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["moe"], True) == 79872
+    assert _nemotronh_mtp_flops(cfg, GBS, SEQ, 2, ["moe"], True) == 79872
 
 
 def test_mtp_disabled_returns_zero():
     cfg = _mlp_cfg()
-    assert nemotronh_mtp_flops(cfg, GBS, SEQ, 0, ["mlp"], True) == 0
-    assert nemotronh_mtp_flops(cfg, GBS, SEQ, 2, [], True) == 0
+    assert _nemotronh_mtp_flops(cfg, GBS, SEQ, 0, ["mlp"], True) == 0
+    assert _nemotronh_mtp_flops(cfg, GBS, SEQ, 2, [], True) == 0

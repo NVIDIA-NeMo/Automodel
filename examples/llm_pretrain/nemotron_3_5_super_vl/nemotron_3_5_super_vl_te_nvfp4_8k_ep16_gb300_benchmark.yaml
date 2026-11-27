@@ -68,9 +68,10 @@
 # high precision (layers 74-87 and the MTP block) keep the grouped GEMM.
 #
 # Reported figures. Every step logs `tps <tokens/s>(<tokens/s per GPU>/gpu)` and `mfu <percent>`. The model
-# FLOPs behind mfu are those of the language model for the tokens of the step: its 88 layers, lm_head and the
-# two MTP depths, 85.66 GFLOPs per token at this sequence length (75.87 without the MTP head); the vision tower
-# is not counted, and the count does not depend on the precision. mfu.peak_tflops is the dense BF16 peak of a
+# FLOPs behind mfu are those of the backbone of the language model for the tokens of the step: its 88 layers
+# and lm_head, 75.87 GFLOPs per token at this sequence length. The MTP head (9.78 GFLOPs per token more for its
+# two depths) and the vision tower are not counted, and the count does not depend on the precision.
+# mfu.peak_tflops is the dense BF16 peak of a
 # GB300, as in the BF16 file, although the GEMMs here mix NVFP4, MXFP8 and BF16: read mfu as a rate, not as a
 # utilization of the NVFP4 peak.
 #   model TFLOPs/s/GPU = mfu / 100 x 2500.
@@ -86,8 +87,9 @@
 #
 # Measured with these settings on 16 GB300 (Transformer Engine 2.19.0, cuBLASLt 13.7.0) with `--benchmark`, over 20
 # steps after 6 warm-up steps, the model config read from a local copy of the Hub config. Seconds per optimizer
-# step, tokens/s/GPU counting all 8192 tokens of a sequence, and model TFLOPs/s/GPU as logged:
-#   - default arithmetic, one run: 5.045 s, 12,989 tokens/s/GPU, 1,113.
+# step, tokens/s/GPU counting all 8192 tokens of a sequence, and model TFLOPs/s/GPU (tokens/s/GPU times 75.87
+# GFLOPs per token):
+#   - default arithmetic, one run: 5.045 s, 12,989 tokens/s/GPU, 986.
 #
 # Launch on 4 nodes x 4 GPUs: on every node, from the repository root (26 steps, the first 6 are warm-up):
 #   torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=<first node>:<port> \
