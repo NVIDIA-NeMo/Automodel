@@ -695,6 +695,21 @@ class NemotronV3Mamba2Mixer(nn.Module):
             if rescale_prenorm_residual:
                 self.out_proj.weight /= math.sqrt(num_hidden_layers)
 
+            # EXPERIMENT ONLY (perf-gap A/B; not for merge): reproduce the pre-#4920 dead Mamba mixers
+            # (in_proj, conv1d, gated norm weight, out_proj, A_log and D all-zero) to time the April workload.
+            with torch.no_grad():
+                for param in (
+                    self.in_proj.weight,
+                    self.out_proj.weight,
+                    self.conv1d.weight,
+                    self.norm.weight,
+                    self.A_log,
+                    self.D,
+                ):
+                    param.zero_()
+                if self.conv1d.bias is not None:
+                    self.conv1d.bias.zero_()
+
 
 class NemotronV3Block(nn.Module):
     """NemotronV3 decoder block (training-only, simplified).
