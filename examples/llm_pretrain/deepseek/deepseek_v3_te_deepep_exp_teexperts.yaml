@@ -82,6 +82,7 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
+  foreach: false  # TE expert params are plain tensors, the rest DTensor
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1234
