@@ -2,19 +2,17 @@ name: Community Bot
 
 on:
   issues:
-    types: [opened, edited, reopened, closed, deleted]
+    types: [opened, edited, reopened, closed]
   issue_comment:
     types: [created, edited, deleted]
 
-permissions:
-  issues: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   community-bot:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_community_bot.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
-    with:
-      community_project_id: ${{ vars.COMMUNITY_PROJECT_ID }}
-      app-id: ${{ vars.BOT_ID }}
+    permissions:
+      issues: write
+      pull-requests: write
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_community_label.yml@0472fc397f9d6de36d928cae2aa270d91eb2c71d
     secrets:
-      BOT_KEY: ${{ secrets.BOT_KEY }}
+      NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}

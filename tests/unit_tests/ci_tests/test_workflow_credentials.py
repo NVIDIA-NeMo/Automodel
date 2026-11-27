@@ -28,15 +28,17 @@ def test_limit_legacy_secrets_to_existing_integrations() -> None:
     """Keep the human queue reviewer and external integrations out of build and test jobs."""
     permitted = {
         "PAT": {("cicd-approve-test-queue.yml", "approve-queue")},
-        "BOT_KEY": {("community-bot.yml", "community-bot")},
         "NVIDIA_MANAGEMENT_ORG_PAT": {
             ("cicd-main.yml", "pre-flight"),
             ("cicd-approve-test-queue.yml", "approve-queue"),
+            ("community-bot.yml", "community-bot"),
         },
         "NVSKILLS_CI_DISPATCH_TOKEN": {("request-nvskills-ci.yml", "request")},
     }
     for file in WORKFLOWS.glob("*.y*ml"):
-        for name, job in yaml.safe_load(file.read_text())["jobs"].items():
+        workflow = yaml.safe_load(file.read_text())
+        assert not re.search(r"\b(?:BOT_KEY|BOT_ID)\b", str(workflow), re.IGNORECASE), file.name
+        for name, job in workflow["jobs"].items():
             assert job.get("secrets") != "inherit", (file.name, name)
             for secret in re.findall(r"\bsecrets\.(\w+)", str(job)):
                 if secret in permitted:
