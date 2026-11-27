@@ -1722,8 +1722,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             torch.cuda.synchronize()
             _exp_prof.__exit__(None, None, None)
             _exp_os.makedirs(_exp_dir, exist_ok=True)
-            _exp_prof.export_chrome_trace(_exp_os.path.join(_exp_dir, f"trace_rank{_exp_dist.get_rank()}.json.gz"))
-            print(f"EXP_TRACE rank={_exp_dist.get_rank()} written", flush=True)
+            _exp_path = _exp_os.path.join(_exp_dir, f"trace_rank{_exp_dist.get_rank()}.json.gz")
+            _exp_prof.export_chrome_trace(_exp_path)
+            from nemo_automodel.recipes.llm._exp_trace_summary import summarize as _exp_summarize
+
+            for _exp_line in _exp_summarize(_exp_path, _exp_dist.get_rank()):
+                print(_exp_line, flush=True)
         # fix reporting_loss, tps across ranks
 
         metrics = {
