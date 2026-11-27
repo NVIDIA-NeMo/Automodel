@@ -91,4 +91,10 @@ def summarize(path: str, rank: int) -> list[str]:
         f"EXP_TRACE rank={rank} gaps>2ms total={total_gap:.3f}s n={len(gaps)} top: "
         + "; ".join(f"{g / 1e3:.0f}ms@{t:.2f}s {b}->{a}" for g, t, b, a in gaps[:12])
     )
+    per_kernel = {}
+    for e in kernels:
+        n = re.sub(r"<.*", "", e["name"])[:70]
+        per_kernel[n] = per_kernel.get(n, 0) + e["dur"]
+    for n, d in sorted(per_kernel.items(), key=lambda x: -x[1])[:30]:
+        lines.append(f"EXP_TRACE rank={rank} kernel {d / 1e3:9.1f}ms {n}")
     return lines
