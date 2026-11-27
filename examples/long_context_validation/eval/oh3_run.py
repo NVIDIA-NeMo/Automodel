@@ -449,8 +449,10 @@ def chat(endpoint, model, messages, max_tokens):
     if _stop_ids:
         payload["stop_token_ids"] = _stop_ids
     # chat_template_kwargs {enable_thinking}: MODEL-DEPENDENT. gemma4: the default add_generation_prompt
-    # injects a `<|channel>thought` channel CoderForge never used -> base-SFT needs enable_thinking=true
-    # (skips it), -it needs false (Google-tuned to tool-call after the channel). Qwen3: controls its
+    # injects a `<|channel>thought` channel CoderForge never used -> base-SFT checkpoints trained with the
+    # pre-native CoderForge template need enable_thinking=true (skips it); checkpoints trained with the
+    # current template need false (true appends `<|channel>thought\n` after every tool result), and so
+    # does -it (Google-tuned to tool-call after the channel). Qwen3: controls its
     # native <think> mode. OH3_ENABLE_THINKING = "1"|"0" -> send true/false; "none" -> omit the kwarg
     # entirely (for models whose template doesn't accept it).
     _et = os.environ.get("OH3_ENABLE_THINKING", "1")
