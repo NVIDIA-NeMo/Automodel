@@ -39,6 +39,7 @@ model:
     dispatcher: hybridep
     dispatcher_equal_token_counts: true  # fixed-length mock batches: every EP rank dispatches the same rows
     dispatcher_hybridep_permute_fusion: true
+    dispatcher_hybridep_compact_routing: true
     dispatcher_recompute_cache: moe_tail
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
