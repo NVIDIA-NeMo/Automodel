@@ -319,14 +319,6 @@ class TEQuantizationConfig(ABC):
             )
         return excluded
 
-    def prepare_modules(self, model: nn.Module) -> None:
-        """Apply the per-module settings of this config to ``model``; idempotent.
-
-        Args:
-            model: Model (or pipeline stage) whose modules are inspected by qualified name.
-        """
-        self.exclude_modules(model)
-
     @abstractmethod
     def build_recipe(self) -> "Recipe | None":
         """Return the Transformer Engine recipe; ``None`` when Transformer Engine is not installed."""
@@ -485,18 +477,22 @@ class TENvfp4Config(TEQuantizationConfig):
             )
         return recipe_cls(**self.recipe_kwargs())
 
-    def prepare_modules(self, model: nn.Module) -> None:
+    def exclude_modules(self, model: nn.Module) -> list[str]:
         """Apply ``exclude_fqns`` or ``precision_map``, whichever the config sets, to ``model``; idempotent.
 
         Args:
             model: Model (or pipeline stage) whose modules are inspected by qualified name.
 
+        Returns:
+            Qualified names of the modules that ``exclude_fqns`` excludes; empty with a precision map.
+
         Raises:
             ValueError: If ``precision_map`` rejects the model.
         """
-        super().prepare_modules(model)
+        excluded = super().exclude_modules(model)
         if self.precision_map is not None:
             self.precision_map.prepare(model)
+        return excluded
 
 
 @dataclass(kw_only=True)
@@ -1333,26 +1329,7 @@ def _make_lazy_te_patcher():
                 is_first_microbatch = get_is_first_microbatch()
             return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
 
-        def _patched_grouped_linear_forward(
-            self: TEGroupedLinear,
-            inp: torch.Tensor,
-            m_splits: torch.Tensor | list[int],
-            is_first_microbatch: bool | None = None,
-            out: torch.Tensor | None = None,
-        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-            """``GroupedLinear.forward`` with the weight-cache flag of the current micro-batch.
-
-            Args:
-                self: The grouped linear.
-                inp: Rows of all groups, ``[rows, in_features]``, the rows of a group consecutive.
-                m_splits: Rows per group, ``[num_gemms]``: a list, or an int64 tensor on the device of
-                    ``inp`` for the grouped-tensor path.
-                is_first_microbatch: Weight-cache flag; None takes the process-wide flag.
-                out: Buffer that receives the output, ``[rows, out_features]``, or None to allocate one.
-
-            Returns:
-                What ``GroupedLinear.forward`` returns: the output, ``[rows, out_features]``.
-            """
+        def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None, out=None):
             if is_first_microbatch is None:
                 is_first_microbatch = get_is_first_microbatch()
             return _original_grouped_linear_forward(

@@ -557,7 +557,7 @@ class TestTENvfp4PrecisionMap:
                 torch.testing.assert_close(model.mlp(x), expected)
             assert entered == [(False, None), (True, None), (True, "MXFP8BlockScaling")]
 
-    def test_prepare_modules_hands_the_model_to_the_map(self):
+    def test_exclude_modules_hands_the_model_to_the_map(self):
         prepared = []
 
         class _Recording:
@@ -565,7 +565,7 @@ class TestTENvfp4PrecisionMap:
                 prepared.append(model)
 
         model = nn.Linear(2, 2)
-        TENvfp4Config(precision_map=_Recording(), exclude_fqns=()).prepare_modules(model)
+        assert TENvfp4Config(precision_map=_Recording(), exclude_fqns=()).exclude_modules(model) == []
         assert prepared == [model]
 
     def test_plan_rejects_inconsistent_scopes(self):

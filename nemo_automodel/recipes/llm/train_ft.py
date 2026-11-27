@@ -775,7 +775,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.te_quantization is not None:
             # Modules named in its exclude_fqns (lm_head by default) run outside the TE autocast.
             for part in self.model_parts:
-                self.te_quantization.prepare_modules(part)
+                self.te_quantization.exclude_modules(part)
 
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()

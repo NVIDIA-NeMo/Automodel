@@ -363,7 +363,7 @@ class NemotronV3PrecisionMap:
     def prepare(self, model: nn.Module) -> None:
         """Give every Transformer Engine GEMM module of ``model`` the forward of its precision; idempotent.
 
-        ``TENvfp4Config.prepare_modules`` calls this for ``te_nvfp4.precision_map``.
+        ``TENvfp4Config.exclude_modules`` calls this for ``te_nvfp4.precision_map``.
 
         Args:
             model: Model (or pipeline stage) whose modules are inspected by qualified name.
