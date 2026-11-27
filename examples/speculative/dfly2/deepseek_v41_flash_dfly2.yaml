@@ -1,0 +1,133 @@
+# DFly2 draft training for DeepSeek-V4.1-Flash.
+#
+# The draft follows the released AngelSlim/DS-V4.1-Flash-DFly2-B6 layout: three
+# latent-MQA + MoE + mHC draft layers, each paired with one of the target's
+# ratio-1 sparse-attention layers 28/32/36. A draft layer reads that layer's own
+# keys (its sliding window plus the shared 1:1 global latents) at the slots the
+# layer attends from the row before the anchor, so the served draft shares the
+# target's KV cache and indexer. Blocks of 6 slots draft 5 tokens; the target's
+# last hidden state is fused into the anchor slot, and a hidden correction with
+# an attentive correction adjusts every slot before the frozen LM head.
+#
+# The draft layers start from their paired target layers (attention, norms and
+# mHC mixes); the routed experts start fresh. Set recipe_args.draft_weights_path
+# to warm-start every draft weight from the released checkpoint instead. Use
+# restore_from below to resume an AutoModel DFly2 training checkpoint.
+#
+# The frozen 40-layer target and its 384 experts are sharded with EP/FSDP2; the
+# draft is independently FSDP2-sharded and is the only trainable model. TP, PP,
+# CP, sequence packing, image inputs, and the precomputed or remote target
+# backends are not supported by the DFly2 training path.
+#
+# This is a production-scale configuration. Adapt the node count, EP size,
+# accumulation, data paths, and checkpoint path to the cluster. EP size must
+# divide the target's 384 routed experts.
+#
+# Launch the same command on every node and vary --node-rank:
+#   torchrun --nnodes=16 --node-rank=0 --nproc_per_node=4 \
+#     --master-addr=<NODE0_IP> --master-port=29500 \
+#     -m nemo_automodel.recipes.speculative_decoding.train_dfly2 \
+#     -c examples/speculative/dfly2/deepseek_v41_flash_dfly2.yaml
+
+recipe: TrainDFly2Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+wandb:
+  enable: false            # opt-in: flip to true to log this run (needs W&B credentials)
+  project: deepseek-v41-dfly2
+  tags: [dfly2, deepseek-v41-flash, hybridep]
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    lm_head_precision: float32
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+
+recipe_args:
+  target_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+  # Or a local path to a downloaded V4.1-Flash checkpoint:
+  # target_model_name_or_path: /path/to/DeepSeek-V4.1-Flash
+  # Start every draft weight from the released DFly2 draft:
+  # draft_weights_path: /path/to/DS-V4.1-Flash-DFly2-B6
+  train_data_path: /path/to/open-perfectblend-regenerated
+  train_split: "train[4096:]"
+  val_data_path: /path/to/open-perfectblend-regenerated
+  val_split: "train[:4096]"
+  output_dir: ./outputs/dfly2_deepseek_v41_flash
+  seq_length: 32768
+  micro_batch_size: 1
+  grad_accumulation_steps: 8
+  num_workers: 2
+  num_epochs: 3
+  ckpt_every_steps: 500
+  save_checkpoint_every_epoch: true
+
+  # --- chat template ---
+  # The released chat_template.jinja plus {% generation %} loss spans, defaulting
+  # to chat mode. For thinking-mode data, uncomment chat_template_kwargs.
+  chat_template: examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja
+  # chat_template_kwargs: {thinking_mode: thinking}
+
+  # --- released DFly2 architecture ---
+  # One draft layer per paired ratio-1 target layer.
+  target_layer_ids: [28, 32, 36]
+  block_size: 6
+  num_anchors: 512
+  mask_token_id: 128799
+  freeze_embeddings: true
+  # The sparse kernel reads each query's key list directly; SDPA would build a
+  # dense mask over the whole 32K-row context.
+  draft_attn_backend: tilelang
+
+  # --- objective: D-PACE-weighted LK distillation + confidence ---
+  dpace_alpha: 0.5
+  lk_eta: 3.0
+  # The released draft has no confidence head; a positive weight adds one, trained
+  # on detached backbone states (confidence_head_stop_gradient).
+  confidence_head_alpha: 0.0
+
+  # --- frozen DeepSeek V4.1 target backend ---
+  target_attn_backend: tilelang
+  target_dispatcher: hybridep
+  target_experts: torch_mm
+  target_enable_fsdp_optimizations: true
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 5.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dfly2_deepseek_v41_flash/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+  dequantize_base_checkpoint: true
+  # restore_from: LATEST
+
+ci:
+  nemo_ci_schedule: skipped
+  cluster_tag: h100

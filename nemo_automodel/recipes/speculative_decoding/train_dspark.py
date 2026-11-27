@@ -25,6 +25,7 @@ plumbing -- and trains the draft with the three-term DSpark objective.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -854,12 +855,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             if self.dist_env.is_main:
                 logger.info("DSpark REMOTE target: %d server(s) at %s.", len(remote_urls), remote_urls)
         elif self.target_model is not None:
-            self.target_wrapper = HFDSparkTargetModel(
-                self.target_model,
-                target_layer_ids=target_layer_ids,
-                cp_mesh=self.cp_mesh,
-                packed_forward=target_packed_forward,
-            )
+            self.target_wrapper = self._build_target_wrapper(target_layer_ids, target_packed_forward)
         else:
             self.target_wrapper = None
 
@@ -1013,7 +1009,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 confidence_head_with_markov=bool(recipe_cfg.get("confidence_head_with_markov", True)),
                 confidence_head_stop_gradient=bool(recipe_cfg.get("confidence_head_stop_gradient", False)),
             )
-            draft_model = target_config.build_dspark_draft(margs)
+            draft_model = self._build_model_owned_draft(target_config, margs)
         elif is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_kimi_k3_target:
             # Gemma4, DeepSeek V4, GLM-5.2, and Kimi K3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.
@@ -1111,13 +1107,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         # the separately constructed trainable draft must be wrapped explicitly.
         apply_draft_activation_checkpointing(self.draft_model, activation_checkpointing)
 
-        trainer_module = DSparkTrainerModule(
-            self.draft_model,
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
-            ce_loss_alpha=float(recipe_cfg.get("ce_loss_alpha", 0.1)),
-            l1_loss_alpha=float(recipe_cfg.get("l1_loss_alpha", 0.9)),
-            confidence_head_alpha=confidence_head_alpha,
-        ).to(self.device)
+        trainer_module = self._build_trainer_module(recipe_cfg, confidence_head_alpha).to(self.device)
         # Multi-GPU strategy: FSDP2 (default) shards the draft per block, or DDP.
         self.parallel_strategy = "ddp"
         if self.dist_env.world_size > 1:
@@ -1138,9 +1128,9 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 fp32_compute_module_names = tuple(
                     getattr(trainer_module.draft_model, "_keep_in_fp32_modules_strict", ())
                 )
-                for layer in trainer_module.draft_model.layers:
+                for unit in self._draft_fsdp_units(trainer_module.draft_model):
                     fully_shard_by_dtype(
-                        layer,
+                        unit,
                         mesh=draft_mesh,
                         mp_policy=mp_policy,
                         offload_policy=None,
@@ -1200,6 +1190,36 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             trackio_cfg.name = trackio_cfg.name or "dspark_" + str(target_path).rstrip("/").split("/")[-1]
             self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
             logger.info("Trackio experiment tracking enabled")
+
+    def _build_target_wrapper(
+        self, target_layer_ids: list[int], target_packed_forward: Callable[..., object] | None
+    ) -> HFDSparkTargetModel:
+        """Wrap the loaded frozen target for online feature capture."""
+        return HFDSparkTargetModel(
+            self.target_model,
+            target_layer_ids=target_layer_ids,
+            cp_mesh=self.cp_mesh,
+            packed_forward=target_packed_forward,
+        )
+
+    def _build_model_owned_draft(self, target_config: ModelOwnedDSparkProvider, margs: _DraftArgs) -> torch.nn.Module:
+        """Build the draft owned by the target's model package."""
+        return target_config.build_dspark_draft(margs)
+
+    def _build_trainer_module(self, recipe_cfg, confidence_head_alpha: float) -> torch.nn.Module:
+        """Build the training wrapper that runs the draft and computes its objective."""
+        return DSparkTrainerModule(
+            self.draft_model,
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
+            ce_loss_alpha=float(recipe_cfg.get("ce_loss_alpha", 0.1)),
+            l1_loss_alpha=float(recipe_cfg.get("l1_loss_alpha", 0.9)),
+            confidence_head_alpha=confidence_head_alpha,
+        )
+
+    @staticmethod
+    def _draft_fsdp_units(draft_model: torch.nn.Module) -> list[torch.nn.Module]:
+        """Return the draft modules that each get their own dtype-uniform FSDP2 units."""
+        return list(draft_model.layers)
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:

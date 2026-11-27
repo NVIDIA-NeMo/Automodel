@@ -1115,6 +1115,9 @@ navigation:
           - page: "Train a DSpark Drafter for Speculative Decoding"
             path: ../../guides/speculative/dspark.mdx
             slug: dspark-speculative-decoding
+          - page: "Train a DFly2 Drafter for Speculative Decoding"
+            path: ../../guides/speculative/dfly2.mdx
+            slug: dfly2-speculative-decoding
           - page: "Finetune a Model's Native MTP Head for Speculative Decoding"
             path: ../../guides/speculative/mtp.mdx
             slug: mtp-speculative-decoding
