@@ -75,6 +75,43 @@ def test_guardwords_uses_only_the_current_mirror(tmp_path: Path, current_head: b
     }
 
 
+@pytest.mark.parametrize("file", ["cicd-approve-test-queue.yml", "dependabot.yml"])
+@pytest.mark.parametrize("team", ["", "S123"])
+def test_failure_alert_routes_to_ci_channel(file: str, team: str, tmp_path: Path) -> None:
+    """Report the failing workflow and run, mentioning the team only when configured."""
+    caller = yaml.safe_load((WORKFLOWS / file).read_text())
+    notify = caller["jobs"]["notify"]
+    assert notify["if"] == "failure()"
+    assert notify["permissions"] == {}
+    assert notify["secrets"] == {
+        "SLACK_CI_CHANNEL_WEBHOOK": "${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}",
+        "SLACK_TEAM_GROUP_ID": "${{ secrets.SLACK_TEAM_GROUP_ID }}",
+    }
+    called = yaml.safe_load((WORKFLOWS / Path(notify["uses"]).name).read_text())
+    compose, send = called["jobs"]["notify"]["steps"]
+    assert called["permissions"] == {}
+    assert compose["env"]["SLACK_TEAM_GROUP_ID"] == "${{ secrets.SLACK_TEAM_GROUP_ID }}"
+    assert re.fullmatch(r"NVIDIA-NeMo/FW-CI-templates/\.github/actions/send-slack-alert@[0-9a-f]{40}", send["uses"])
+    assert send["with"] == {
+        "message": "${{ steps.alert.outputs.message }}",
+        "webhook": "${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}",
+    }
+    output = tmp_path / "output"
+    env = {
+        "PATH": os.environ["PATH"],
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "example/model",
+        "GITHUB_RUN_ID": "17",
+        "GITHUB_WORKFLOW": caller["name"],
+        "SLACK_TEAM_GROUP_ID": team,
+    }
+    subprocess.run(["bash", "-eu", "-c", compose["run"]], check=True, env=env)
+    mention = " cc <!subteam^S123>" if team else ""
+    link = f"<https://github.com/example/model/actions/runs/17|{caller['name']}>"
+    assert output.read_text() == f"message={link} failed.{mention}\n"
+
+
 @pytest.mark.parametrize(
     ("file", "name", "target"),
     [
