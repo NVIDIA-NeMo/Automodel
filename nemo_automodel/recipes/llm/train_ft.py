@@ -1282,14 +1282,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         train_ctx, batch = cp_sharder.shard(batch)
         mtp_per_depth_targets = None
         if mtp_cp_inputs is not None:
+            # The MTP streams were built before the sharder was resolved, which can reorder the batch.
             batch["mtp_per_depth_input_ids"] = tuple(
-                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
+                cp_sharder.shard_token_tensor(cp_sharder.apply_token_order(ids), seq_dim=1, fill=0)
+                for ids in mtp_cp_inputs.input_ids
             )
             batch["mtp_per_depth_position_ids"] = tuple(
-                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
+                cp_sharder.shard_token_tensor(cp_sharder.apply_token_order(ids), seq_dim=1, fill=0)
+                for ids in mtp_cp_inputs.position_ids
             )
             mtp_per_depth_targets = tuple(
-                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
+                cp_sharder.shard_token_tensor(cp_sharder.apply_token_order(targets), seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
         # Preserve effective document IDs before model-kwarg filtering. The

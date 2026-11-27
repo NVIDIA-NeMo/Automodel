@@ -476,7 +476,9 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
     monkeypatch.setattr(
         recipe_module,
         "ContextParallelSharder",
-        lambda model, mesh, batch, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+        lambda model, mesh, batch, **kwargs: SimpleNamespace(
+            shard=lambda actual: (nullcontext, actual), restore_token_order=lambda logits: logits
+        ),
     )
     materialized = []
     monkeypatch.setattr(
@@ -501,7 +503,9 @@ def test_llm_teacher_pp_updates_stage_shapes_for_variable_length_waves(monkeypat
     monkeypatch.setattr(
         llm_kd,
         "ContextParallelSharder",
-        lambda model, mesh, batch, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+        lambda model, mesh, batch, **kwargs: SimpleNamespace(
+            shard=lambda actual: (nullcontext, actual), restore_token_order=lambda logits: logits
+        ),
     )
     monkeypatch.setattr(llm_kd, "materialize_teacher_logits", lambda logits, **kwargs: logits)
 

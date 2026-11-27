@@ -605,13 +605,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 logits = getattr(output, "logits", output).detach()
         if logits is None:
             return None
-        if self.pp_enabled:
-            return logits
-        return materialize_teacher_logits(
-            logits,
-            device_mesh=self.device_mesh,
-            sequence_length=sequence_length,
-        )
+        if not self.pp_enabled:
+            logits = materialize_teacher_logits(
+                logits,
+                device_mesh=self.device_mesh,
+                sequence_length=sequence_length,
+            )
+        # The student pairs these logits with its own batch, which is in the loader's token order.
+        return cp_sharder.restore_token_order(logits)
 
     def _run_teacher_worker(self) -> None:
         """Serve teacher forwards until the student mesh broadcasts stop."""
