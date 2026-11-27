@@ -1,0 +1,159 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Hy4-flash SFT on Tulu-3 with 128K-token packed sequences.
+# 8 nodes x 8 H100 80GB; BF16; CP16, EP64, TP1, PP1 (DP4). The global batch is 4 packs and the local batch 1: each
+# data-parallel replica trains one 128K pack per step and every pack is split over 16 context-parallel ranks.
+# Tulu-3 conversations are shuffled with a fixed seed (shuffle_seed) BEFORE packing, then packed in order into THD
+# sequences of 131072 tokens; the packs keep that order (dataloader shuffle: false), so all CP/parallelism
+# configurations can reuse the same frozen packs. Packed documents never attend to each other.
+# Launch requirements (NCCL_PXN_DISABLE=1 on multi-node InfiniBand H100 systems, JIT cache placement): see the
+# Hy4-flash model card, docs/model-coverage/llm/tencent/hy4-flash.mdx.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+nvtx: false
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 1
+  max_steps: 100
+  num_epochs: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 1000
+  log_remote_every_steps: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: tencent/Hy4-flash
+  revision: eccd3123eec73f2040f4c9ed0de1883593470510  # pragma: allowlist secret (public model commit SHA)
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: cudnn
+    linear: torch
+    rms_norm: torch
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: float32
+    rope_fusion: false
+    shared_expert_overlap: true
+    compile_router_weight: true
+    compile_hc: true
+    compile_norm: true
+    dispatcher_equal_token_counts: true  # packed CP synchronizes physical lengths across EP ranks
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 16
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: true  # one micro-batch per step here, so deferring changes nothing
+  enable_compile: false
+  reshard_after_forward: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+    lm_head_precision: float32
+    ignore_router_for_ac: true
+freeze_config:
+  freeze_modules:
+    - path: vit
+  freeze_language_model: false
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/hy4_flash_tulu3_128k_cp16_ep64_100steps/
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  ignore_index: -100
+  impl: torch_compile
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  tokenizer:
+    pretrained_model_name_or_path: tencent/Hy4-flash
+    revision: eccd3123eec73f2040f4c9ed0de1883593470510  # pragma: allowlist secret (public model commit SHA)
+    tokenizer_backend: nemo_wrapped_auto
+  split: train
+  shuffle_seed: 1234
+  seq_length: 131072
+  truncation: true
+  padding: do_not_pad
+  chat_template: examples/llm_finetune/hy_v4_flash/hy4_flash_training_chat_template.jinja
+packed_sequence:
+  packed_sequence_size: 131072
+  packing_strategy: thd
+  pad_to_multiple_of: 64
+  max_packs: 400  # max_steps * global_batch_size
+  num_proc: 1
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  num_workers: 0
+  shuffle: false
+  drop_last: true
+  pin_memory: true
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  lr: 5.0e-06
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: hy4_flash
+  name: hy4_flash_tulu3_128k_cp16_ep64_100steps
+  dir: logs/hy4_flash_tulu3_128k_cp16_ep64_100steps/wandb  # pragma: allowlist secret (a log directory path)
+  tags: [hy4-flash, tulu3, packed128k, cp16, ep64]
+moe_metrics:
+  enabled: true
+  mode: brief
+clip_grad_norm:
+  backend: te  # avoids gradient-sized temporaries for the Engram owner shards
+  max_norm: 1.0
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 10
+  lr_decay_steps: 100
+  wd_incr_steps: 100
+validation_dataset: none
+validation_dataloader: none
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: h100
+  recipe_owner: HuiyingLi
+  nodes: 8
+  time: "01:00:00"
+  max_steps: 2
+  nproc_per_node: 8
+  env_vars:
+    NCCL_PXN_DISABLE: "1"
