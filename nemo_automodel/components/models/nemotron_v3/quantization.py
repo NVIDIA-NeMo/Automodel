@@ -37,6 +37,7 @@ from nemo_automodel.components.models.common.te_precision import (
     TE_PRECISIONS,
     TEModulePrecision,
     TEPrecision,
+    TEPrecisionMap,
     TEPrecisionPlan,
 )
 from nemo_automodel.components.models.common.utils import _EXCLUDED_FORWARD_ATTR, _forward_outside_fp8
@@ -212,7 +213,7 @@ def apply_precision_plan(model: nn.Module, plan: TEPrecisionPlan) -> None:
 
 
 @dataclass(frozen=True, kw_only=True)
-class NemotronV3PrecisionMap:
+class NemotronV3PrecisionMap(TEPrecisionMap):
     """Precision of every Transformer Engine GEMM of a Nemotron 3 language model, by module class.
 
     Set as ``te_nvfp4.precision_map``. It covers a language model built from Mamba, attention and MoE blocks

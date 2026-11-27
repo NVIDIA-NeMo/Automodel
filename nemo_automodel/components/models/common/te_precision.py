@@ -22,8 +22,9 @@ model and never interprets module names of a model family itself.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 if TYPE_CHECKING:
     from torch import nn
@@ -123,9 +124,14 @@ class TEPrecisionPlan:
         return "\n".join(lines)
 
 
-class TEPrecisionMap(Protocol):
-    """Model-owned rule that gives every Transformer Engine GEMM module of a model its precision."""
+class TEPrecisionMap(ABC):
+    """Base class of the rules that give every Transformer Engine GEMM module of a model its precision.
 
+    A model family subclasses it with the module classes it knows, e.g. ``NemotronV3PrecisionMap``; an
+    instance is set as ``te_nvfp4.precision_map``.
+    """
+
+    @abstractmethod
     def prepare(self, model: nn.Module) -> None:
         """Give every Transformer Engine GEMM module of ``model`` the forward of its precision; idempotent.
 

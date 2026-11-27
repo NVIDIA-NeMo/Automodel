@@ -24,7 +24,7 @@ import pytest
 import torch
 from torch import nn
 
-from nemo_automodel.components.models.common.te_precision import TEModulePrecision, TEPrecisionPlan
+from nemo_automodel.components.models.common.te_precision import TEModulePrecision, TEPrecisionMap, TEPrecisionPlan
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
@@ -560,7 +560,7 @@ class TestTENvfp4PrecisionMap:
     def test_exclude_modules_hands_the_model_to_the_map(self):
         prepared = []
 
-        class _Recording:
+        class _Recording(TEPrecisionMap):
             def prepare(self, model: nn.Module) -> None:
                 prepared.append(model)
 
