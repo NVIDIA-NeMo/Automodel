@@ -670,6 +670,25 @@ def _fail_on_leaked_process_group():
         )
 
 
+# The start method this pytest process had before any test ran; None means not chosen yet.
+_SESSION_START_METHOD = multiprocessing.get_start_method(allow_none=True)
+
+
+@pytest.fixture(autouse=True)
+def _restore_multiprocessing_start_method():
+    """Put the process-wide multiprocessing start method back after every test.
+
+    Building a ``ParallelAwareDataloader`` switches a process that has not chosen a start method
+    to ``spawn``, and the first worker started from the default context fixes it to the platform
+    default. Either choice outlives the test, so how a later test starts its dataloader workers
+    depended on which tests ran before it in the same pytest process. After a leaked ``spawn``
+    every worker re-imports torch, and tests that take a fraction of a second with ``fork`` take
+    tens of seconds each.
+    """
+    yield
+    multiprocessing.set_start_method(_SESSION_START_METHOD, force=True)
+
+
 @pytest.fixture(autouse=True)
 def _kill_leaked_child_processes(request: pytest.FixtureRequest):
     """Kill worker processes a test left behind, so a hung worker cannot stall the session.
