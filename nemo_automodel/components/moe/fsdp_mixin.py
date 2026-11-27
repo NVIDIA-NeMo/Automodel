@@ -14,17 +14,52 @@
 # limitations under the License.
 
 import logging
+import os
+import uuid
+from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
 import torch
 from torch.distributed.fsdp import FSDPModule, fully_shard
-from torch.distributed.pipelining._backward import stage_backward, stage_backward_input, stage_backward_weight
+from torch.distributed.pipelining._backward import (
+    stage_backward,
+    stage_backward_input,
+    stage_backward_weight,
+)
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.distributed.multimodal_fsdp import iter_multimodal_modules
 from nemo_automodel.components.models.common.utils import get_is_optim_step
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _one_graph_task_for_checkpoint_recompute() -> Iterator[None]:
+    """Report one graph-task id to activation checkpointing for every ``autograd.grad`` call inside.
+
+    EXPERIMENT. PyTorch's ``stage_backward_weight`` runs one ``autograd.grad`` per parameter group,
+    each a new graph task, and a non-reentrant checkpoint recomputes its region once per graph task
+    that unpacks it: a checkpointed block with N parameter groups is recomputed N times in the weight
+    pass. With one id for the whole weight pass the first group recomputes the block and the others
+    read the tensors it stored (each saved tensor is still unpacked once). One ``autograd.grad`` over
+    all groups is not equivalent: a group's intermediate also feeds the intermediates below it.
+    """
+    fake_gid = uuid.uuid4().int >> 65
+    real = torch._C._current_graph_task_id
+    torch._C._current_graph_task_id = lambda: fake_gid
+    try:
+        yield
+    finally:
+        torch._C._current_graph_task_id = real
+
+
+def stage_backward_weight_one_recompute(
+    weights: Iterator[torch.nn.Parameter], param_groups: list[dict[str, Any]]
+) -> tuple[torch.Tensor | None, ...]:
+    """``stage_backward_weight`` that recomputes each checkpointed region once (see above)."""
+    with _one_graph_task_for_checkpoint_recompute():
+        return stage_backward_weight(weights, param_groups)
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
@@ -340,7 +375,11 @@ def patched_backward_maybe_with_nosync(
             )
         elif backward_type == "weight":
             return lambda: (
-                stage_backward_weight(self.submod.parameters(), bwd_kwargs["param_groups"]),
+                (
+                    stage_backward_weight_one_recompute
+                    if os.environ.get("EXP_ZB_SINGLE_W", "0") == "1"
+                    else stage_backward_weight
+                )(self.submod.parameters(), bwd_kwargs["param_groups"]),
                 None,
             )
         else:
