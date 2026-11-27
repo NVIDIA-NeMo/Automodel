@@ -369,7 +369,7 @@ GEMMA4_CODERFORGE_TEMPLATE = (
 )
 
 
-def _render_gemma4_coderforge(messages):
+def _render_gemma4_coderforge(messages, **template_kwargs):
     """Render ``messages`` with the shipped CoderForge template; return the text and its supervised spans."""
     from transformers.utils.chat_template_utils import render_jinja_template
 
@@ -378,6 +378,7 @@ def _render_gemma4_coderforge(messages):
         chat_template=GEMMA4_CODERFORGE_TEMPLATE.read_text(),
         return_assistant_tokens_mask=True,
         bos_token="<bos>",
+        **template_kwargs,
     )
     text = rendered[0]
     return text, [text[start:end] for start, end in spans[0]]
@@ -447,3 +448,35 @@ def test_shipped_gemma4_coderforge_template_supervises_dangling_tool_call_stop_t
     text, supervised = _render_gemma4_coderforge(messages)
     assert text == "<bos><|turn>user\ngo<turn|>\n<|turn>model\n<|tool_call>call:bash{}<tool_call|><|tool_response>"
     assert supervised == ["<|tool_call>call:bash{}<tool_call|>", "<|tool_response>"]
+
+
+def test_shipped_gemma4_coderforge_template_keeps_text_with_its_own_call():
+    # OpenHands writes an assistant message's text before its tool call, and the serving loop sends it
+    # back that way. The text is trained in the same model output as its own call, not after the call's
+    # tool result, and the prompt for the next step ends exactly where the training text continues.
+    def call(i, cmd):
+        return {"id": f"c{i}", "type": "function", "function": {"name": "bash", "arguments": {"cmd": cmd}}}
+
+    messages = [
+        {"role": "user", "content": "Fix the bug."},
+        {"role": "assistant", "content": "Look first:", "tool_calls": [call(0, "ls")]},
+        {"role": "tool", "tool_call_id": "c0", "content": "a.py"},
+        {"role": "assistant", "content": "Clean up:", "tool_calls": [call(1, "rm t.py")]},
+    ]
+    text, supervised = _render_gemma4_coderforge(messages)
+
+    assert text == (
+        "<bos><|turn>user\nFix the bug.<turn|>\n<|turn>model\n"
+        'Look first:<|tool_call>call:bash{cmd:<|"|>ls<|"|>}<tool_call|>'
+        '<|tool_response>response:bash{value:<|"|>a.py<|"|>}<tool_response|>'
+        'Clean up:<|tool_call>call:bash{cmd:<|"|>rm t.py<|"|>}<tool_call|><|tool_response>'
+    )
+    assert supervised == [
+        'Look first:<|tool_call>call:bash{cmd:<|"|>ls<|"|>}<tool_call|>',
+        "<|tool_response>",
+        'Clean up:<|tool_call>call:bash{cmd:<|"|>rm t.py<|"|>}<tool_call|>',
+        "<|tool_response>",
+    ]
+
+    prompt, _ = _render_gemma4_coderforge(messages[:3], add_generation_prompt=True, enable_thinking=False)
+    assert text.startswith(prompt) and prompt.endswith("<tool_response|>")

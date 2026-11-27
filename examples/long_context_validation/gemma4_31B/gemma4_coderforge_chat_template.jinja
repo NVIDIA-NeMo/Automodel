@@ -6,9 +6,14 @@
   `apply_chat_template(..., return_assistant_tokens_mask=True)` returns the assistant loss mask directly.
   Supervised: the thinking channel and tool calls, the leading `<|tool_response>` stop token after the
   tool calls, the turn content, and the closing `<turn|>` (or the dangling `<|tool_response>`). Masked:
-  role headers, tool response payloads, and every non-model turn. With the generation tags removed, the
-  rendered text is byte-identical to upstream. Tool-call arguments must be mappings (upstream raises on
-  strings); load the tokenizer with NeMoAutoTokenizer, which decodes them for Gemma4.
+  role headers, tool response payloads, and every non-model turn.
+
+  CoderForge order change: an assistant message that has tool calls renders its text before the calls
+  (thinking, text, calls), because OpenHands writes the text for the call it precedes and the serving loop
+  sends messages back in that shape. Upstream renders the text after the tool results, which would train it
+  as the lead-in to the next call. With the generation tags removed, every other message renders
+  byte-identically to upstream. Tool-call arguments must be mappings (upstream raises on strings);
+  NeMoAutoTokenizer and the VLM dataloader decode JSON-string arguments for Gemma4.
 -#}
 {#
   Template: Google Gemma 4 Canonical Chat Template
@@ -247,13 +252,45 @@
 
     {%- endif -%}
 
-    {#- [CoderForge] thinking + tool calls are captured so a model turn can emit them in a generation block -#}
+    {#- [CoderForge] a model message with tool calls renders its text before the calls (see the header) -#}
+    {%- set captured_content -%}
+    {%- if message.get('content') is string -%}
+        {%- if role == 'model' -%}
+            {{- strip_thinking(message['content']) -}}
+        {%- else -%}
+            {{- message['content'] | trim -}}
+        {%- endif -%}
+    {%- elif message.get('content') is sequence -%}
+        {%- for item in message['content'] -%}
+            {%- if item.get('type') == 'text' -%}
+                {%- if role == 'model' -%}
+                    {{- strip_thinking(item['text']) -}}
+                {%- else -%}
+                    {{- item['text'] | trim -}}
+                {%- endif -%}
+            {%- elif item.get('type') in ['image', 'image_url'] -%}
+                {{- '<|image|>' -}}
+            {%- elif item.get('type') in ['audio', 'input_audio'] -%}
+                {{- '<|audio|>' -}}
+            {%- elif item.get('type') == 'video' -%}
+                {{- '<|video|>' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {%- endset -%}
+    {%- set content_before_calls = role == 'model' and message.get('tool_calls') -%}
+
+    {#- [CoderForge] thinking, text and tool calls are captured so a model turn can emit them in a generation block -#}
     {%- set captured_calls -%}
     {#- Render reasoning/reasoning_content as thinking channel -#}
     {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
     {%- set thinking_gate = (loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls')) -%}
     {%- if thinking_text and thinking_gate -%}
         {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
+    {%- endif -%}
+
+    {%- if content_before_calls -%}
+        {{- captured_content -}}
     {%- endif -%}
 
             {%- if message.get('tool_calls') -%}
@@ -353,34 +390,9 @@
 
             {#- [CoderForge] content and the turn close are captured so a model turn can emit them in a generation block -#}
             {%- set captured_tail -%}
-            {%- set captured_content -%}
-            {%- if message.get('content') is string -%}
-                {%- if role == 'model' -%}
-                    {{- strip_thinking(message['content']) -}}
-                {%- else -%}
-                    {{- message['content'] | trim -}}
-                {%- endif -%}
-            {%- elif message.get('content') is sequence -%}
-                {%- for item in message['content'] -%}
-                    {%- if item.get('type') == 'text' -%}
-                        {%- if role == 'model' -%}
-                            {{- strip_thinking(item['text']) -}}
-                        {%- else -%}
-                            {{- item['text'] | trim -}}
-                        {%- endif -%}
-                    {%- elif item.get('type') in ['image', 'image_url'] -%}
-                        {{- '<|image|>' -}}
-                    {%- elif item.get('type') in ['audio', 'input_audio'] -%}
-                        {{- '<|audio|>' -}}
-                    {%- elif item.get('type') == 'video' -%}
-                        {{- '<|video|>' -}}
-                    {%- endif -%}
-                {%- endfor -%}
-            {%- endif -%}
-            {%- endset -%}
-
-            {{- captured_content -}}
-            {%- set has_content = captured_content | trim | length > 0 -%}
+            {%- set tail_content = '' if content_before_calls else captured_content -%}
+            {{- tail_content -}}
+            {%- set has_content = tail_content | trim | length > 0 -%}
 
         {#- Forward-scan: find next non-tool message role for continuation detection -#}
         {%- set next_nt = namespace(role=None, found=false) -%}

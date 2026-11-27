@@ -323,7 +323,8 @@ def analyzed_cache_path(cache_dir: str | None, dataset_id: str, split: str, mode
     if chat_template and os.path.isfile(chat_template):
         with open(chat_template, "rb") as f:
             chat_template = hashlib.md5(f.read()).hexdigest()
-    config_hash = hashlib.md5(f"{dataset_id}|{split}|{model}|{chat_template}".encode()).hexdigest()[:8]
+    # "dict-args": caches written before tool-call arguments were decoded for the template are stale.
+    config_hash = hashlib.md5(f"{dataset_id}|{split}|{model}|{chat_template}|dict-args".encode()).hexdigest()[:8]
     fname = f"{ds_name}_{split}_{model_short}_{config_hash}_analyzed.jsonl"
     return os.path.join(_cache_root(cache_dir), "analyzed", fname)
 

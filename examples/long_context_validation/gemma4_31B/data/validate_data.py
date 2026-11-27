@@ -87,7 +87,8 @@ def parse_args() -> argparse.Namespace:
         "--terminator_window",
         type=int,
         default=2,
-        help="Stop token must appear within this many trailing supervised tokens (turns end with <turn|> then newline).",
+        help="Stop token must appear within this many trailing supervised tokens (turns end with <turn|> then newline), "
+        "and the last supervised token within this many tokens of the sequence end.",
     )
     parser.add_argument("--num-samples", type=int, default=0, help="Number of samples to check (0 = all)")
     return parser.parse_args()
@@ -133,9 +134,13 @@ def validate(
         )
 
         tail = supervised_ids[-terminator_window:] if supervised_ids else []
+        # A <|tool_response> follows every tool call, so a row cut inside a (masked) tool result still ends its
+        # supervised labels on a stop token. Also require the supervision to reach the end of the sequence.
+        last_real = max((j for j in range(len(input_ids)) if input_ids[j] != pad_token_id), default=-1)
+        last_supervised = max((j for j in range(len(labels)) if labels[j] != -100), default=-1)
         record(
             "final_turn_terminated",
-            any(t in tail for t in stop_token_ids),
+            any(t in tail for t in stop_token_ids) and last_real - last_supervised <= terminator_window,
             f"sample {i}: final supervised tokens {tail} lack a terminator {stop_token_ids} (possible mid-turn truncation)",
         )
 
