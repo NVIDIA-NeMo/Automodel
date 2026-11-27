@@ -1,0 +1,62 @@
+---
+title: "Hy4-flash"
+description: "Use NeMo AutoModel to fine-tune Hy4-flash for VLM workflows with checked-in image-text-to-text recipes for full fine-tuning and LoRA, and documented distributed settings."
+slug: model-coverage/vision-language-models/tencent/Hy4-flash
+---
+
+[Hy4-flash](https://huggingface.co/tencent/Hy4-flash) is a vision-language Mixture-of-Experts model from Tencent. Its 42-layer decoder carries four hyper-connection streams, multi-head latent attention that alternates between sparse layers (a compressed indexer keeps 2,048 keys per query) and sliding-window layers (512 tokens), a latent MoE with 512 routed experts (16 active) plus one shared expert on layers 1-41, and Engram n-gram memory on four layers. The Hugging Face configuration declares the `HYV4FlashForConditionalGeneration` architecture.
+
+## Fine-Tune Hy4-flash
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipes and
+their declared topology below before choosing a local or cluster launcher.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node runs.
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Full fine-tuning on MedPix-VQA | Use [hy4_flash_medpix_4k_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep64.yaml). |
+| LoRA fine-tuning on MedPix-VQA | Use [hy4_flash_medpix_4k_ep64_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep64_lora.yaml). |
+| Text fine-tuning on long packed sequences | See the [language model card](/model-coverage/large-language-models/tencent/Hy4-flash). |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 nodes x 8 H100 80GB |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=64 |
+| Nodes | 8 |
+| Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
+| Advanced | bfloat16, attention=cudnn, linear=torch, experts=torch_mm, dispatcher=hybridep, compile_hc=true, compile_norm=true |
+
+Samples are rendered in the model's fast-thinking mode (`reasoning_effort=no_think`), as the official fine-tuning
+code does for answer-only data. A sample whose assistant turn carries reasoning (`reasoning_content` or `reasoning`)
+is rejected with an error: training on reasoning traces is not supported.
+
+## Launch Requirements
+
+The multi-node launch requirements (`NCCL_PXN_DISABLE=1`, JIT cache placement, and the compiled cores) are on
+the [language model card](/model-coverage/large-language-models/tencent/Hy4-flash#launch-requirements).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `HYV4FlashForConditionalGeneration` |
+| Parameters | 219B total / 11B activated |
+| Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
+
+### Available Models
+
+| Model | HF ID |
+|---|---|
+| Hy4-flash | [`tencent/Hy4-flash`](https://huggingface.co/tencent/Hy4-flash) |
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
