@@ -29,7 +29,7 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2
+    layers_per_stage: 1
   moe:
     reshard_after_forward: false
     wrap_outer_model: false
@@ -52,6 +52,7 @@ model:
     dispatcher: hybridep
     dispatcher_equal_token_counts: true  # fixed-length mock batches: every EP rank dispatches the same rows
     dispatcher_hybridep_permute_fusion: true
+    dispatcher_hybridep_compact_routing: true
     dispatcher_recompute_cache: moe_tail
     shared_expert_overlap: true
     compile_router_weight: true
