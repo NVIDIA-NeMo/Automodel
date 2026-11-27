@@ -215,6 +215,8 @@ def test_depth_mixture_compiles_the_variants_of_a_48_layer_model(
     Dynamo alone traces and guards the variants; no kernel is generated.
     """
     monkeypatch.setattr(torch, "compile", partial(torch.compile, backend="eager"))
+    # compile_utils sets the limit to 256 at import; start below the 72 variants in every session.
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
     layers.compile_cores()
     norm = nn.RMSNorm(8, eps=1e-6)
     blocks = [torch.randn(1, 2, 8, generator=torch.Generator().manual_seed(seed)) for seed in range(24)]
