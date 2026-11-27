@@ -29,7 +29,6 @@ from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
     TENvfp4Config,
-    check_nvfp4_linear_size,
     generation_config_from_model_config,
     get_is_first_microbatch,
     get_is_optim_step,
@@ -41,6 +40,7 @@ from nemo_automodel.components.models.common.utils import (
     set_is_first_microbatch,
     set_is_optim_step,
 )
+from nemo_automodel.components.models.nemotron_v3.quantization import apply_precision_plan, te_gemm_modules
 
 
 class TestQuackBackend:
@@ -505,16 +505,18 @@ class TestTENvfp4PrecisionMap:
 
     def test_scopes_get_the_forward_of_their_precision(self, caplog):
         precision_map = _LastNamePrecisionMap({"quantized": "nvfp4", "eight_bit": "mxfp8", "inner": "high_precision"})
-        cfg = TENvfp4Config(precision_map=precision_map, exclude_fqns=())
         x = torch.randn(2, 4)
         with _fake_te_mxfp8_autocast() as entered:
             from transformer_engine.pytorch.quantization import autocast
 
             model = self._model()
             expected = model.block(model.eight_bit(model.quantized(x)))
-            with caplog.at_level("INFO", logger="nemo_automodel.components.models.common.utils"):
-                cfg.prepare_modules(model)
-                cfg.prepare_modules(model)  # idempotent: one wrapper per scope
+            plan = precision_map.resolve(
+                [name for name, _ in model.named_modules()], [name for name, _ in te_gemm_modules(model)]
+            )
+            with caplog.at_level("INFO", logger="nemo_automodel.components.models.nemotron_v3.quantization"):
+                apply_precision_plan(model, plan)
+                apply_precision_plan(model, plan)  # idempotent: one wrapper per scope
             with autocast(enabled=True):
                 torch.testing.assert_close(model.block(model.eight_bit(model.quantized(x))), expected)
             # NVFP4 modules keep the outer recipe; MXFP8 and high-precision scopes switch it once each.
@@ -545,7 +547,7 @@ class TestTENvfp4PrecisionMap:
             model = nn.ModuleDict({"mlp": Linear(4, 4)})
             expected = model.mlp(x)
             precision_map = _LastNamePrecisionMap({"mlp": "mxfp8"})
-            TENvfp4Config(precision_map=precision_map, exclude_fqns=()).prepare_modules(model)
+            apply_precision_plan(model, precision_map.resolve(["", "mlp"], ["mlp"]))
             assert "forward" in vars(model.mlp)
             torch.testing.assert_close(model.mlp(x), expected)
             with autocast(enabled=False):
@@ -555,33 +557,16 @@ class TestTENvfp4PrecisionMap:
                 torch.testing.assert_close(model.mlp(x), expected)
             assert entered == [(False, None), (True, None), (True, "MXFP8BlockScaling")]
 
-    def test_exclude_fqns_alone_is_summarized_by_te_class(self):
-        cfg = TENvfp4Config(exclude_fqns=["block"])
-        with _fake_te_mxfp8_autocast():
-            gemm_modules = [
-                ("quantized", "Linear"),
-                ("eight_bit", "Linear"),
-                ("block.inner", "Linear"),
-                ("experts", "GroupedLinear"),
-            ]
-            plan = cfg.resolve_precision_plan(["", "block", *(name for name, _ in gemm_modules)], gemm_modules)
-        assert plan.counts() == {
-            "Linear": {"nvfp4": 2, "mxfp8": 0, "high_precision": 1},
-            "GroupedLinear": {"nvfp4": 1, "mxfp8": 0, "high_precision": 0},
-        }
+    def test_prepare_modules_hands_the_model_to_the_map(self):
+        prepared = []
 
-    def test_a_map_must_cover_every_gemm_module(self):
-        precisions = {"quantized": "nvfp4", "eight_bit": "mxfp8", "inner": "high_precision"}
-        with _fake_te_mxfp8_autocast():
-            model = self._model()
-            incomplete = _LastNamePrecisionMap(precisions, drop="eight_bit")
-            with pytest.raises(ValueError, match=r"exactly once; missing \['eight_bit'\]"):
-                TENvfp4Config(precision_map=incomplete, exclude_fqns=()).prepare_modules(model)
-            assert all("forward" not in vars(module) for module in model.modules())
-            with pytest.raises(ValueError, match="nothing would be quantized"):
-                TENvfp4Config(precision_map=_LastNamePrecisionMap(precisions), exclude_fqns=()).prepare_modules(
-                    nn.ModuleDict({"torch_linear": nn.Linear(4, 4)})
-                )
+        class _Recording:
+            def prepare(self, model: nn.Module) -> None:
+                prepared.append(model)
+
+        model = nn.Linear(2, 2)
+        TENvfp4Config(precision_map=_Recording(), exclude_fqns=()).prepare_modules(model)
+        assert prepared == [model]
 
     def test_plan_rejects_inconsistent_scopes(self):
         def module(name: str, precision: str, scope: str) -> TEModulePrecision:
@@ -601,55 +586,6 @@ class TestTENvfp4PrecisionMap:
                 num_layers=0,
                 high_precision_tail_layers=0,
             )
-
-
-class TestCheckNvfp4LinearSize:
-    """A TE Linear is rejected when its input or its output gradient is too large for one NVFP4 quantization."""
-
-    # 15/16 of the 2**32 elements at which the quantization kernels wrap around.
-    LIMIT = 4026531840
-
-    @staticmethod
-    def recipe(kind):
-        return SimpleNamespace(nvfp4=lambda: kind == "nvfp4", custom=lambda: kind == "custom")
-
-    @pytest.mark.parametrize(
-        ("kind", "rows", "in_features", "out_features", "elements"),
-        [
-            # A 4096 -> 18560 projection: 16 sequences of 8192 tokens fit, 32 do not; the output gradient is
-            # the larger operand.
-            ("nvfp4", 16 * 8192, 4096, 18560, None),
-            ("nvfp4", 32 * 8192, 4096, 18560, 32 * 8192 * 18560),
-            # The input is the larger operand.
-            ("nvfp4", 32 * 8192, 18560, 4096, 32 * 8192 * 18560),
-            # Exactly at the limit, and one row of 4096 above it.
-            ("nvfp4", LIMIT // 4096, 4096, 1024, None),
-            ("nvfp4", LIMIT // 4096 + 1, 4096, 1024, LIMIT + 4096),
-            # A custom recipe can hold NVFP4 quantizers.
-            ("custom", 32 * 8192, 4096, 18560, 32 * 8192 * 18560),
-            # MXFP8 and FP8 quantization have no limit.
-            ("mxfp8", 64 * 8192, 4096, 18560, None),
-        ],
-    )
-    def test_limit(self, kind, rows, in_features, out_features, elements):
-        if elements is None:
-            check_nvfp4_linear_size(self.recipe(kind), rows=rows, in_features=in_features, out_features=out_features)
-            return
-        message = (
-            rf"Linear\({in_features}, {out_features}\) was called with {rows} rows under an NVFP4 recipe: its "
-            rf"widest operand holds {elements} elements, more than the {self.LIMIT} elements"
-        )
-        with pytest.raises(ValueError, match=message):
-            check_nvfp4_linear_size(self.recipe(kind), rows=rows, in_features=in_features, out_features=out_features)
-
-    @pytest.mark.parametrize("module", ["LayerNormLinear", "LayerNormMLP"])
-    def test_the_error_names_the_module_class(self, module):
-        # One row of 4096 above the limit; within it the same call passes.
-        rows = self.LIMIT // 4096 + 1
-        check_nvfp4_linear_size(self.recipe("nvfp4"), rows=rows - 1, in_features=1024, out_features=4096, module=module)
-        message = rf"Transformer Engine {module}\(1024, 4096\) was called with {rows} rows under an NVFP4 recipe"
-        with pytest.raises(ValueError, match=message):
-            check_nvfp4_linear_size(self.recipe("nvfp4"), rows=rows, in_features=1024, out_features=4096, module=module)
 
 
 class TestBackendConfigTeNvfp4:

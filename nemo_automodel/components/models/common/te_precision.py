@@ -15,15 +15,18 @@
 """Precision of every Transformer Engine GEMM module of a model that trains under a quantized autocast.
 
 A :class:`TEPrecisionMap` is owned by a model family: it knows the family's module names and turns the names
-of a model's modules into a :class:`TEPrecisionPlan` for its Transformer Engine GEMM modules. ``TENvfp4Config`` applies the
-plan and logs its summary; it never interprets module names of a model family itself.
+of a model's modules into a :class:`TEPrecisionPlan` for its Transformer Engine GEMM modules and
+gives every module the forward of its precision (:meth:`TEPrecisionMap.prepare`). ``TENvfp4Config`` hands it the
+model and never interprets module names of a model family itself.
 """
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
+
+if TYPE_CHECKING:
+    from torch import nn
 
 TEPrecision: TypeAlias = Literal["nvfp4", "mxfp8", "high_precision"]
 """How the GEMMs of a module run inside the NVFP4 autocast: under the NVFP4 recipe, under Transformer Engine's
@@ -123,15 +126,11 @@ class TEPrecisionPlan:
 class TEPrecisionMap(Protocol):
     """Model-owned rule that gives every Transformer Engine GEMM module of a model its precision."""
 
-    def resolve(self, module_names: Sequence[str], gemm_module_names: Collection[str]) -> TEPrecisionPlan:
-        """Assign a precision to every Transformer Engine GEMM module.
+    def prepare(self, model: nn.Module) -> None:
+        """Give every Transformer Engine GEMM module of ``model`` the forward of its precision; idempotent.
 
         Args:
-            module_names: Qualified names of all modules of the model, in ``named_modules`` order.
-            gemm_module_names: The names among them that are Transformer Engine GEMM modules.
-
-        Returns:
-            Plan with exactly one entry per GEMM module.
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
 
         Raises:
             ValueError: If a GEMM module is not one the map knows, or the map quantizes a module that is not

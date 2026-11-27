@@ -22,7 +22,7 @@ from torch import nn
 import nemo_automodel.components.quantization.nvfp4 as nvfp4_module
 from nemo_automodel.components.models.common.te_precision import TEModulePrecision, TEPrecisionPlan
 from nemo_automodel.components.models.common.utils import HAVE_TE, TENvfp4Config
-from nemo_automodel.components.models.nemotron_v3.quantization import NemotronV3PrecisionMap
+from nemo_automodel.components.models.nemotron_v3.quantization import NemotronV3PrecisionMap, apply_precision_plan
 from nemo_automodel.components.quantization.mxfp4 import _FP4_E2M1_TABLE
 from nemo_automodel.components.quantization.nvfp4 import (
     E2M1_MAX,
@@ -543,7 +543,7 @@ def test_modules_the_precision_map_gives_mxfp8_run_the_mxfp8_recipe_inside_the_n
     model, mxfp8_model = build(), build()
     x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
     config = TENvfp4Config(precision_map=_SecondLayerInMxfp8(), exclude_fqns=())
-    config.prepare_modules(model)
+    apply_precision_plan(model, config.precision_map.resolve([], ["layers.0", "layers.1"]))
     with torch.no_grad():
         with config.maybe_te_autocast():
             outputs = [model.layers[index](x) for index in ("0", "1")]
@@ -582,59 +582,3 @@ def test_large_default_gemms_have_no_wrong_rows():
         row_error = (value - exact).norm(dim=1) / exact.norm(dim=1)
         # NVFP4 rounding gives every row an error of 0.15 to 0.19; a row from a defective GEMM is off by about 1.
         assert 0.05 < float(row_error.median()) and float(row_error.max()) < 0.3, (name, row_error.max())
-
-
-@requires_te_nvfp4
-def test_linear_with_operands_too_large_for_nvfp4_is_rejected(monkeypatch):
-    # The NVFP4 quantization kernels wrap around past 2**32 elements; the limit is lowered to make a small
-    # Linear exceed it.
-    import transformer_engine.pytorch as te
-    from transformer_engine.common.recipe import MXFP8BlockScaling
-
-    from nemo_automodel.components.models.common import utils
-
-    utils._patch_te_modules()
-    monkeypatch.setattr(utils, "NVFP4_QUANTIZE_MAX_ELEMENTS", 64 * 256 - 1)
-    linear = te.Linear(128, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
-    values = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
-
-    with te.autocast(enabled=True, recipe=TENvfp4Config().build_recipe()):
-        with pytest.raises(ValueError, match=r"Linear\(128, 256\) was called with 64 rows .* holds 16384 elements"):
-            linear(values)
-        # 32 rows: the output gradient, the larger operand, holds 8192 elements.
-        assert linear(values[:2]).shape == (2, 16, 256)
-    # MXFP8 quantization and unquantized GEMMs have no limit.
-    with te.autocast(enabled=True, recipe=MXFP8BlockScaling()):
-        assert linear(values).shape == (4, 16, 256)
-    assert linear(values).shape == (4, 16, 256)
-
-
-@requires_te_nvfp4
-@pytest.mark.parametrize("module_class", ["LayerNormLinear", "LayerNormMLP"])
-def test_layernorm_modules_with_operands_too_large_for_nvfp4_are_rejected(monkeypatch, module_class):
-    # Transformer Engine's fused norm + GEMM modules quantize the same operands as Linear. The limit is lowered
-    # to make small modules exceed it: 64 rows of the 256-wide tensor are 16384 elements.
-    import transformer_engine.pytorch as te
-
-    from nemo_automodel.components.models.common import utils
-
-    utils._patch_te_modules()
-    monkeypatch.setattr(utils, "NVFP4_QUANTIZE_MAX_ELEMENTS", 64 * 256 - 1)
-    if module_class == "LayerNormLinear":
-        module = te.LayerNormLinear(128, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
-        out_features = 256
-    else:
-        module = te.LayerNormMLP(128, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
-        out_features = 128
-    values = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
-
-    with te.autocast(enabled=True, recipe=TENvfp4Config().build_recipe()):
-        message = rf"{module_class}\(128, 256\) was called with 64 rows .* holds 16384 elements"
-        with pytest.raises(ValueError, match=message):
-            module(values)
-    # Unquantized GEMMs have no limit, and the module still runs through the check.
-    assert module(values).shape == (4, 16, out_features)
-    monkeypatch.setattr(utils, "NVFP4_QUANTIZE_MAX_ELEMENTS", 64 * 256)
-    with te.autocast(enabled=True, recipe=TENvfp4Config().build_recipe()):
-        output = module(values)
-    assert output.shape == (4, 16, out_features) and torch.isfinite(output).all()

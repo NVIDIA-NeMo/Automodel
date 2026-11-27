@@ -22,17 +22,26 @@ that Transformer Engine does not quantize: it runs in the model dtype under ever
 
 from __future__ import annotations
 
+import logging
 import re
+import types
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
+import torch
+from torch import nn
+
+from nemo_automodel.components.models.common import utils as common_utils
 from nemo_automodel.components.models.common.te_precision import (
     TE_PRECISIONS,
     TEModulePrecision,
     TEPrecision,
     TEPrecisionPlan,
 )
+from nemo_automodel.components.models.common.utils import _EXCLUDED_FORWARD_ATTR, _forward_outside_fp8
+
+logger = logging.getLogger(__name__)
 
 NemotronV3ModuleClass: TypeAlias = Literal[
     "mamba_in_proj",
@@ -99,6 +108,107 @@ def _is_expert_container(module: str) -> bool:
     """Whether ``module``, a name relative to its block, is the routed-expert container of an MoE mixer."""
     match = _MIXER_MODULE.match(module)
     return match is not None and match["module"] == "experts"
+
+
+_MXFP8_FORWARD_ATTR = "_te_mxfp8_forward"
+"""Instance attribute holding the forward a module had before a precision plan routed it to MXFP8."""
+
+
+def _forward_in_mxfp8(module: nn.Module, *args: Any, **kwargs: Any) -> Any:
+    """Run ``module``'s forward under Transformer Engine's MXFP8 recipe where it would run a quantized recipe.
+
+    Bound per instance by :func:`apply_precision_plan` for the scopes a plan gives MXFP8. The forward the
+    module had before is looked up on the instance at call time, so the binding stays valid after
+    ``copy.deepcopy``. MXFP8 replaces the recipe of an enclosing Transformer Engine autocast.
+    Outside one (a forward that the caller runs in high precision, such as generation) and inside a disabled
+    one the module runs in the model dtype like every other module.
+
+    Args:
+        module: The module whose forward runs. Any module can be routed, so the arguments and the result are
+            those of its forward and carry no type of their own here.
+        *args: Positional arguments of that forward, passed on unchanged.
+        **kwargs: Keyword arguments of that forward, passed on unchanged.
+
+    Returns:
+        What that forward returns.
+    """
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+    from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+    installed = vars(module).get(_MXFP8_FORWARD_ATTR)
+    if not FP8GlobalStateManager.is_fp8_enabled():
+        if installed is not None:
+            return installed(*args, **kwargs)
+        return type(module).forward(module, *args, **kwargs)
+    with te_autocast(enabled=True, recipe=MXFP8BlockScaling()):
+        if installed is not None:
+            return installed(*args, **kwargs)
+        return type(module).forward(module, *args, **kwargs)
+
+
+def _bind_forward(module: nn.Module, wrapper: types.FunctionType, saved_attr: str) -> None:
+    """Make ``wrapper`` the instance forward of ``module`` and keep the instance forward it replaces.
+
+    Args:
+        module: Module whose calls go through ``wrapper`` afterwards.
+        wrapper: Function called as ``wrapper(module, *args, **kwargs)``.
+        saved_attr: Instance attribute that receives the instance forward ``module`` had, if it had one.
+    """
+    installed = vars(module).get("forward")
+    if isinstance(installed, types.MethodType) and installed.__func__ is wrapper:
+        return
+    if installed is not None:
+        setattr(module, saved_attr, installed)
+    module.forward = types.MethodType(wrapper, module)
+
+
+def te_gemm_modules(model: nn.Module) -> list[tuple[str, str]]:
+    """List the Transformer Engine modules of ``model`` that run GEMMs and can therefore run quantized.
+
+    Args:
+        model: Model (or pipeline stage) to inspect.
+
+    Returns:
+        ``(qualified name, Transformer Engine class name)`` of every ``Linear``, ``GroupedLinear``,
+        ``LayerNormLinear`` and ``LayerNormMLP``, in ``named_modules`` order; empty without Transformer Engine.
+    """
+    if not common_utils.HAVE_TE:
+        return []
+    from transformer_engine.pytorch import GroupedLinear, LayerNormLinear, LayerNormMLP, Linear
+
+    # Transformer Engine has no registry of its GEMM modules; these are the classes that quantize operands.
+    gemm_classes = (GroupedLinear, LayerNormLinear, LayerNormMLP, Linear)
+    found: list[tuple[str, str]] = []
+    for name, module in model.named_modules():
+        gemm_class = next((cls for cls in gemm_classes if isinstance(module, cls)), None)
+        if gemm_class is not None:
+            found.append((name, gemm_class.__name__))
+    return found
+
+
+def apply_precision_plan(model: nn.Module, plan: TEPrecisionPlan) -> None:
+    """Give every scope of ``plan`` the forward of its precision and log the plan on rank 0; idempotent.
+
+    A scope that does not run NVFP4 gets an instance ``forward``: outside the Transformer Engine autocast for
+    high precision, under the MXFP8 recipe for MXFP8 (:func:`_forward_in_mxfp8`).
+
+    Args:
+        model: Model (or pipeline stage) that holds the modules of the plan.
+        plan: Precision of its Transformer Engine GEMM modules.
+    """
+    modules = dict(model.named_modules())
+    for scope, precision in plan.scopes().items():
+        if precision == "high_precision":
+            _bind_forward(modules[scope], _forward_outside_fp8, _EXCLUDED_FORWARD_ATTR)
+        elif precision == "mxfp8":
+            _bind_forward(modules[scope], _forward_in_mxfp8, _MXFP8_FORWARD_ATTR)
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        logger.info(
+            "te_nvfp4: Transformer Engine GEMM modules by precision (high_precision = outside the "
+            "quantized autocast, in the model dtype)\n%s",
+            plan.summary(),
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -249,3 +359,26 @@ class NemotronV3PrecisionMap:
         return TEPrecisionPlan(
             modules=tuple(modules), num_layers=num_layers, high_precision_tail_layers=self.high_precision_tail_layers
         )
+
+    def prepare(self, model: nn.Module) -> None:
+        """Give every Transformer Engine GEMM module of ``model`` the forward of its precision; idempotent.
+
+        ``TENvfp4Config.prepare_modules`` calls this for ``te_nvfp4.precision_map``.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+
+        Raises:
+            ValueError: If the model has no Transformer Engine GEMM module, or :meth:`resolve` rejects it.
+        """
+        if not common_utils.HAVE_TE:
+            return
+        gemm_modules = te_gemm_modules(model)
+        if not gemm_modules:
+            raise ValueError(
+                "te_nvfp4.precision_map is set but the model has no Transformer Engine GEMM module "
+                "(backend.linear='te' or backend.experts='te' with an expert-parallel dispatcher): "
+                "nothing would be quantized"
+            )
+        plan = self.resolve([name for name, _ in model.named_modules()], [name for name, _ in gemm_modules])
+        apply_precision_plan(model, plan)
