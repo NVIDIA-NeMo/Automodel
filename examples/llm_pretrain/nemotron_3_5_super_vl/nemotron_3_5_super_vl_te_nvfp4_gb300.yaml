@@ -22,10 +22,11 @@
 # The text recipe is used on purpose: it runs the Transformer Engine autocast, the VLM finetune recipe does
 # not. The vision tower and projector are frozen and never run on text batches.
 #
-# Precision by module (te_nvfp4.precision_map), the layout published for this model family: Nemotron 3 Super
-# technical report, arXiv 2604.12374, section 2.2 "Precision by Layer Type"; the NVFP4 recipe itself is
-# described in arXiv 2509.25149. The language model has 88 layers: 40 Mamba, 40 MoE, 8 attention. Counts are
-# Transformer Engine GEMM modules on one rank.
+# Precision by module is fixed in NemotronSuperNvfp4Config (the `_target_` of te_nvfp4) and has no setting.
+# It is the layout published for this model family: Nemotron 3 Super technical report, arXiv 2604.12374,
+# section 2.2 "Precision by Layer Type"; the NVFP4 recipe itself is described in arXiv 2509.25149. The
+# language model has 88 layers: 40 Mamba, 40 MoE, 8 attention. Counts are Transformer Engine GEMM modules on
+# one rank.
 #   NVFP4, layers 0-73: Mamba input projection (34), routed experts (2 x 33), shared expert (2 x 33).
 #     Transformer Engine defaults: 16x16 block scales on weights, 1x16 on activations and gradients,
 #     random Hadamard transform on the operands of the weight-gradient GEMM, stochastic rounding of gradients.
@@ -38,8 +39,8 @@
 # master weight as the BF16 parameter plus its 16 low bits instead of a second FP32 copy: the same FP32
 # values, 2 bytes less per parameter. Rank 0 logs the resulting module counts once at startup ("te_nvfp4:
 # Transformer Engine GEMM modules by precision": 166 NVFP4, 34 MXFP8, 163 high precision).
-# Both `_target_` keys of the te_nvfp4 block are required: without them the block stays a plain mapping and
-# the run stops at startup.
+# The `_target_` of the te_nvfp4 block selects this layout. Without it the block is the generic te_nvfp4,
+# which has no layout: every Transformer Engine GEMM runs NVFP4.
 #
 # Hardware and software: Blackwell GPUs with NVFP4 kernels (validated on GB300 only), Transformer Engine 2.19
 # or newer. NVFP4 grouped GEMMs take at most 64 experts per rank, so the 512 experts need ep_size >= 8.
@@ -187,8 +188,8 @@ model:
     _target_: nemo_automodel.components.models.nemotron_v3.layers.NemotronV3BackendConfig
     attn: te
     linear: te
-    # The Mamba input and output projections as Transformer Engine linears, so that the precision map below
-    # can quantize them. With the default (torch) the map stops the run at startup.
+    # The Mamba input and output projections as Transformer Engine linears, so that te_nvfp4 below can
+    # quantize them. With the default (torch) the run stops at startup.
     mamba_linear: te
     rms_norm: te
     experts: te
@@ -214,21 +215,9 @@ model:
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     te_nvfp4:
-      _target_: nemo_automodel.components.models.common.TENvfp4Config
+      # NVFP4 with the precision layout of the header; the layout is fixed in this class.
+      _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronSuperNvfp4Config
       row_scaled_activation: false
-      # Empty next to a precision map, which keeps modules in high precision itself. The list defaults to
-      # lm_head, a torch linear in this model: it runs in BF16 with or without the entry.
-      exclude_fqns: []
-      precision_map:
-        _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
-        high_precision_tail_layers: 14
-        mamba_in_proj: nvfp4
-        mamba_out_proj: mxfp8
-        routed_experts: nvfp4
-        shared_experts: nvfp4
-        attention: high_precision
-        latent_proj: high_precision
-        mtp: high_precision
 
 distributed:
   strategy: fsdp2

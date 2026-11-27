@@ -19,7 +19,7 @@ import os
 import types
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Mapping
+from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
@@ -31,7 +31,6 @@ from torch.distributed.tensor.experimental import register_sharding
 from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 
-from nemo_automodel.components.models.common.te_precision import TEPrecisionMap
 from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -406,17 +405,12 @@ class TENvfp4Config(TEQuantizationConfig):
     """Operands of the backward GEMMs: quantized to NVFP4, the original floating-point operands, or the
     dequantized forward operands. With ``"quantized"``, ``row_scaled_activation`` and ``four_over_six`` on
     activations only work with frozen weights."""
-    precision_map: TEPrecisionMap | None = None
-    """Model-owned map that gives every Transformer Engine GEMM module its precision (NVFP4, MXFP8 or high
-    precision) by module class and decoder layer, e.g. ``NemotronV3PrecisionMap``. Not together with
-    ``exclude_fqns``: a config with a map sets that list to empty and keeps modules in high precision
-    through the map."""
     resident_weights: bool = False
     """Hold the expert weights as NVFP4 tensors: an NVFP4 checkpoint fills them unchanged and they are saved
     in the same form. Training them needs Transformer Engine ``FusedAdam`` with ``master_weights=True``."""
 
     def __post_init__(self) -> None:
-        """Normalize ``exclude_fqns``; reject options Transformer Engine lacks and a map next to exclusions."""
+        """Normalize ``exclude_fqns`` and reject options that Transformer Engine does not implement."""
         super().__post_init__()
         if self.four_over_six not in ("none", "weights", "activations", "all"):
             raise ValueError(
@@ -426,18 +420,6 @@ class TENvfp4Config(TEQuantizationConfig):
         if self.backward not in ("quantized", "high_precision", "dequantized"):
             raise ValueError(
                 f"te_nvfp4.backward must be one of quantized, high_precision or dequantized, got {self.backward!r}"
-            )
-        if isinstance(self.precision_map, Mapping):
-            raise ValueError(
-                "te_nvfp4.precision_map must be a precision map object such as NemotronV3PrecisionMap, got a "
-                f"mapping with the keys {sorted(self.precision_map)}. In YAML the config loader builds it only "
-                "when both te_nvfp4 and te_nvfp4.precision_map carry a `_target_` key."
-            )
-        if self.precision_map is not None and self.exclude_fqns:
-            raise ValueError(
-                "te_nvfp4.precision_map and te_nvfp4.exclude_fqns are mutually exclusive, got exclude_fqns="
-                f"{list(self.exclude_fqns)!r} (its default is ['lm_head']). The map gives every Transformer Engine "
-                "GEMM module its precision: express the exclusions in the map and set te_nvfp4.exclude_fqns to []."
             )
         if self.random_hadamard_transform and (
             self.row_scaled_activation or self.four_over_six in ("activations", "all")
@@ -476,23 +458,6 @@ class TENvfp4Config(TEQuantizationConfig):
                 "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
             )
         return recipe_cls(**self.recipe_kwargs())
-
-    def exclude_modules(self, model: nn.Module) -> list[str]:
-        """Apply ``exclude_fqns`` or ``precision_map``, whichever the config sets, to ``model``; idempotent.
-
-        Args:
-            model: Model (or pipeline stage) whose modules are inspected by qualified name.
-
-        Returns:
-            Qualified names of the modules that ``exclude_fqns`` excludes; empty with a precision map.
-
-        Raises:
-            ValueError: If ``precision_map`` rejects the model.
-        """
-        excluded = super().exclude_modules(model)
-        if self.precision_map is not None:
-            self.precision_map.prepare(model)
-        return excluded
 
 
 @dataclass(kw_only=True)

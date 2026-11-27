@@ -13,14 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# te_nvfp4.precision_map on a small Nemotron 3 model, 2 GPUs with NVFP4 kernels (Blackwell).
+# The NVFP4 precision layout of NemotronSuperNvfp4Config on a small Nemotron 3 model, 2 GPUs with NVFP4
+# kernels (Blackwell).
 #
 # Leg 1 runs the recipe on the configuration in run_nemotron_v3_te_nvfp4.py and checks, from Transformer
-# Engine's state after each module ran, that every GEMM module used the recipe the map gives it.
+# Engine's state after each module ran, that every GEMM module used the recipe the layout gives it.
 # It also checks that the two ranks hold different values in every randomly initialized block weight.
-# Legs 2 and 3 are negative controls: with a tail one layer short, or with the Mamba output projection in
-# NVFP4 instead of MXFP8, the same checks must fail. Leg 4 builds the Mamba projections as torch.nn.Linear
-# (backend.mamba_linear: torch): the map must stop the run at startup instead of leaving them unquantized.
+# Legs 2 and 3 are negative controls on the expectation: stated with a tail one layer short, or with the Mamba
+# output projection in NVFP4 instead of MXFP8, the same checks must fail. Leg 4 builds the Mamba projections
+# as torch.nn.Linear (backend.mamba_linear: torch): the run must stop at startup instead of leaving them
+# unquantized.
 
 set -xeuo pipefail
 
@@ -42,20 +44,20 @@ run() {
 run recipe
 grep -q "NVFP4_PRECISION_RESULT" "$RUN_DIR/recipe.log"
 
-if run short_tail --model.backend.te_nvfp4.precision_map.high_precision_tail_layers 2; then
-    echo "A tail of 2 layers passed the checks written for a tail of 3" >&2
+if EXPECTED_HIGH_PRECISION_TAIL_LAYERS=13 run short_tail; then
+    echo "The tail of 14 layers passed the checks written for a tail of 13" >&2
     exit 1
 fi
-grep -q "ran {'nvfp4'}, not high_precision" "$RUN_DIR/short_tail.log"
+grep -q "ran {'high_precision'}, not nvfp4" "$RUN_DIR/short_tail.log"
 
-if run out_proj_nvfp4 --model.backend.te_nvfp4.precision_map.mamba_out_proj nvfp4; then
-    echo "An NVFP4 Mamba output projection passed the checks written for MXFP8" >&2
+if EXPECTED_MAMBA_OUT_PROJ_PRECISION=nvfp4 run out_proj_nvfp4; then
+    echo "The MXFP8 Mamba output projection passed the checks written for NVFP4" >&2
     exit 1
 fi
-grep -q "ran {'nvfp4'}, not mxfp8" "$RUN_DIR/out_proj_nvfp4.log"
+grep -q "ran {'mxfp8'}, not nvfp4" "$RUN_DIR/out_proj_nvfp4.log"
 
 if run torch_mamba --model.backend.mamba_linear torch; then
-    echo "A precision map that quantizes torch.nn.Linear Mamba projections did not stop the run" >&2
+    echo "A layout that quantizes torch.nn.Linear Mamba projections did not stop the run" >&2
     exit 1
 fi
 grep -q "module(s) that are not Transformer Engine GEMM modules" "$RUN_DIR/torch_mamba.log"

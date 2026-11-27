@@ -66,7 +66,8 @@ run whose model you keep; neither was exercised with this recipe.
 
 Precision follows the per-layer-type layout published for the model family in the
 [Nemotron 3 Super technical report](https://arxiv.org/abs/2604.12374) (section 2.2). The NVFP4 pretraining
-recipe is described in [arXiv:2509.25149](https://arxiv.org/abs/2509.25149). `te_nvfp4.precision_map` assigns it:
+recipe is described in [arXiv:2509.25149](https://arxiv.org/abs/2509.25149). The layout is fixed in
+`NemotronSuperNvfp4Config`, the recipe's `te_nvfp4` config:
 
 | Precision | TE GEMM modules | Modules per rank |
 | --- | --- | ---: |

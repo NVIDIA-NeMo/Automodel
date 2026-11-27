@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Precision of the Transformer Engine GEMMs of Nemotron 3 models under ``te_nvfp4``.
+"""NVFP4 training of Nemotron 3 Super models with the precision layout published for them.
 
-The map knows the Mamba, attention and MoE blocks of the hybrid pattern and the MTP head. A dense MLP block
+:class:`NemotronSuperNvfp4Config` is the ``model.backend.te_nvfp4`` config of these models. Which module runs
+NVFP4, MXFP8 or high precision is fixed here and has no setting. It is the layout of the Nemotron 3 Super
+technical report, arXiv 2604.12374, section 2.2 "Precision by Layer Type".
+
+The layout knows the Mamba, attention and MoE blocks of the hybrid pattern and the MTP head. A dense MLP block
 (block type ``mlp`` of Nemotron-H) has no module class here: its projections are rejected like every other
-GEMM module the map does not know. The output projection (``lm_head``) is an ``LMHead``, a ``torch.nn.Linear``
-that Transformer Engine does not quantize: it runs in the model dtype under every map and has no class.
+GEMM module the layout does not know. The output projection (``lm_head``) is an ``LMHead``, a
+``torch.nn.Linear`` that Transformer Engine does not quantize: it runs in the model dtype and has no class.
 """
 
 from __future__ import annotations
@@ -33,16 +37,15 @@ import torch
 from torch import nn
 
 from nemo_automodel.components.models.common import utils as common_utils
-from nemo_automodel.components.models.common.te_precision import (
-    TE_PRECISIONS,
-    TEModulePrecision,
-    TEPrecision,
-    TEPrecisionMap,
-    TEPrecisionPlan,
-)
-from nemo_automodel.components.models.common.utils import _EXCLUDED_FORWARD_ATTR, _forward_outside_fp8
+from nemo_automodel.components.models.common.utils import _EXCLUDED_FORWARD_ATTR, TENvfp4Config, _forward_outside_fp8
 
 logger = logging.getLogger(__name__)
+
+TEPrecision: TypeAlias = Literal["nvfp4", "mxfp8", "high_precision"]
+"""How the GEMMs of a module run inside the NVFP4 autocast: under the NVFP4 recipe, under Transformer Engine's
+MXFP8 recipe, or outside the autocast in the model dtype."""
+
+TE_PRECISIONS: tuple[TEPrecision, ...] = ("nvfp4", "mxfp8", "high_precision")
 
 NemotronV3ModuleClass: TypeAlias = Literal[
     "mamba_in_proj",
@@ -53,6 +56,111 @@ NemotronV3ModuleClass: TypeAlias = Literal[
     "latent_proj",
     "mtp",
 ]
+
+HIGH_PRECISION_TAIL_LAYERS = 14
+"""Number of decoder layers at the end of the stack whose GEMMs all run in high precision, whatever their
+class: layers 74-87 of the 88."""
+
+PRECISION_BY_CLASS: dict[NemotronV3ModuleClass, TEPrecision] = {
+    "mamba_in_proj": "nvfp4",
+    "mamba_out_proj": "mxfp8",
+    "attention": "high_precision",
+    "routed_experts": "nvfp4",
+    "shared_experts": "nvfp4",
+    "latent_proj": "high_precision",
+    "mtp": "high_precision",
+}
+"""Precision of every module class in the layers before the high-precision tail; ``mtp`` is every GEMM of the
+multi-token-prediction head, whatever its kind."""
+
+
+@dataclass(frozen=True)
+class TEModulePrecision:
+    """Precision of one Transformer Engine GEMM module (``Linear`` or ``GroupedLinear``)."""
+
+    name: str
+    """Qualified name of the GEMM module in ``model.named_modules()``."""
+    module_class: str
+    """Label of the kind of module, as the model family names it, e.g. ``"mamba_in_proj"``."""
+    layer: int | None
+    """Index of the decoder layer that holds the module; ``None`` outside the decoder stack."""
+    precision: TEPrecision
+    """How the GEMMs of the module run."""
+    scope: str
+    """Qualified name of the module whose forward selects the precision: ``name`` or one of its ancestors.
+    An ancestor is used when it reads the active recipe itself, as grouped experts do to pad their inputs."""
+
+    def __post_init__(self) -> None:
+        """Reject a scope that does not contain the module."""
+        if self.scope != self.name and not self.name.startswith(f"{self.scope}."):
+            raise ValueError(f"Scope {self.scope!r} is not {self.name!r} or one of its ancestors")
+
+
+@dataclass(frozen=True)
+class TEPrecisionPlan:
+    """Precision of every Transformer Engine GEMM module of one model."""
+
+    modules: tuple[TEModulePrecision, ...]
+    """One entry per GEMM module."""
+    num_layers: int
+    """Number of decoder layers; 0 when the plan has no notion of layers."""
+    high_precision_tail_layers: int
+    """Number of decoder layers at the end of the stack whose GEMMs all run in high precision."""
+
+    def __post_init__(self) -> None:
+        """Reject scopes with two precisions and scopes inside other scopes."""
+        scopes = self.scopes()
+        for module in self.modules:
+            if scopes[module.scope] != module.precision:
+                raise ValueError(
+                    f"Scope {module.scope!r} holds modules with different precisions "
+                    f"({scopes[module.scope]} and {module.precision})"
+                )
+        for scope in scopes:
+            parent = next((other for other in scopes if scope.startswith(f"{other}.")), None)
+            if parent is not None:
+                raise ValueError(f"Scope {scope!r} lies inside scope {parent!r}")
+
+    def scopes(self) -> dict[str, TEPrecision]:
+        """Precision by scope name, in the order of the first module of each scope."""
+        scopes: dict[str, TEPrecision] = {}
+        for module in self.modules:
+            scopes.setdefault(module.scope, module.precision)
+        return scopes
+
+    def counts(self) -> dict[str, dict[TEPrecision, int]]:
+        """Number of GEMM modules by module class and precision, classes in order of first appearance."""
+        counts: dict[str, dict[TEPrecision, int]] = {}
+        for module in self.modules:
+            by_precision = counts.setdefault(module.module_class, dict.fromkeys(TE_PRECISIONS, 0))
+            by_precision[module.precision] += 1
+        return counts
+
+    def summary(self) -> str:
+        """Table of :meth:`counts` with a line for the layer range, for the startup log."""
+        lines = []
+        if self.num_layers > 0:
+            first_tail_layer = self.num_layers - self.high_precision_tail_layers
+            layer_range = f"decoder layers: {self.num_layers}"
+            if first_tail_layer > 0:
+                layer_range += f"; layers 0-{first_tail_layer - 1} follow the precision of their module class"
+            if self.high_precision_tail_layers > 0:
+                layer_range += f"; layers {first_tail_layer}-{self.num_layers - 1} run in high precision"
+            lines.append(layer_range)
+        counts = self.counts()
+        width = max([len("module class"), *(len(module_class) for module_class in counts)])
+        header = f"{'module class':<{width}}" + "".join(f"  {precision:>14}" for precision in TE_PRECISIONS)
+        lines.append(header)
+        totals = dict.fromkeys(TE_PRECISIONS, 0)
+        for module_class, by_precision in counts.items():
+            lines.append(
+                f"{module_class:<{width}}" + "".join(f"  {by_precision[precision]:>14}" for precision in TE_PRECISIONS)
+            )
+            for precision in TE_PRECISIONS:
+                totals[precision] += by_precision[precision]
+        lines.append(f"{'total':<{width}}" + "".join(f"  {totals[precision]:>14}" for precision in TE_PRECISIONS))
+        return "\n".join(lines)
+
 
 # Activation checkpointing replaces a module by a wrapper that holds it under this attribute: the block
 # (``activation_checkpointing: true``) or the MoE mixer of the block (``activation_checkpointing: moe``).
@@ -212,174 +320,150 @@ def apply_precision_plan(model: nn.Module, plan: TEPrecisionPlan) -> None:
         )
 
 
-@dataclass(frozen=True, kw_only=True)
-class NemotronV3PrecisionMap(TEPrecisionMap):
-    """Precision of every Transformer Engine GEMM of a Nemotron 3 language model, by module class.
+def resolve_precision_plan(module_names: Sequence[str], gemm_module_names: Collection[str]) -> TEPrecisionPlan:
+    """Assign the precision of the published layout to every Transformer Engine GEMM module of a model.
 
-    Set as ``te_nvfp4.precision_map``. It covers a language model built from Mamba, attention and MoE blocks
+    Args:
+        module_names: Qualified names of all modules of the model, in ``named_modules`` order.
+        gemm_module_names: The names among them that are Transformer Engine GEMM modules.
+
+    Returns:
+        Plan with one entry per Transformer Engine GEMM module, in ``module_names`` order.
+
+    Raises:
+        ValueError: If the names hold no decoder layer; if a Transformer Engine GEMM module is not one the
+            layout has a class for (the projections of a dense MLP block among them); if a module that the
+            layout quantizes is not a Transformer Engine module (a Mamba projection built with
+            ``backend.mamba_linear="torch"``, another projection built with ``backend.linear="torch"``,
+            experts without Transformer Engine grouped GEMMs), which would silently leave it in high
+            precision; if the decoder layers are not numbered 0..N-1 (a pipeline stage holds only some of
+            them, so the tail cannot be located); or if the model has fewer decoder layers than the tail.
+    """
+    gemm_modules = set(gemm_module_names)
+    # (name, module class, decoder layer, scope) of every module that runs GEMMs in this model family.
+    sites: list[tuple[str, NemotronV3ModuleClass, int | None, str]] = []
+    layers: set[int] = set()
+    for name in module_names:
+        decoder = _DECODER_BLOCK.match(name)
+        mtp = _MTP_BLOCK.match(name)
+        if decoder is not None:
+            layers.add(int(decoder["layer"]))
+            kind = _classify_block_module(decoder["block"], decoder["module"])
+            if kind is not None:
+                sites.append((name, kind[0], int(decoder["layer"]), kind[1]))
+            elif _is_expert_container(decoder["module"]) and f"{name}.gate_up_linear" not in gemm_modules:
+                # Experts of another backend hold their weights themselves; they are one site.
+                sites.append((name, "routed_experts", int(decoder["layer"]), name))
+        elif mtp is not None:
+            # Inside the head only the scope depends on the kind of module.
+            kind = _classify_block_module(mtp["block"], mtp["module"])
+            if kind is not None:
+                sites.append((name, "mtp", None, kind[1]))
+            elif mtp["module"] == "eh_proj":
+                sites.append((name, "mtp", None, name))
+            elif _is_expert_container(mtp["module"]) and f"{name}.gate_up_linear" not in gemm_modules:
+                sites.append((name, "mtp", None, name))
+    if not layers:
+        raise ValueError(
+            "NemotronSuperNvfp4Config found no module named 'model.layers.<index>.<module>': the model is not "
+            "a Nemotron 3 model, so nothing would be quantized as published."
+        )
+    unknown = sorted(gemm_modules - {name for name, _, _, _ in sites})
+    if unknown:
+        raise ValueError(
+            f"NemotronSuperNvfp4Config does not know {len(unknown)} Transformer Engine GEMM module(s) and "
+            f"will not guess their precision: {', '.join(unknown)}. It has classes for the projections of "
+            "Mamba, attention and MoE blocks and for the MTP head; a dense MLP block (block type 'mlp') "
+            "and modules outside the decoder layers and the MTP head have none."
+        )
+    num_layers = len(layers)
+    if sorted(layers) != list(range(num_layers)):
+        raise ValueError(
+            f"NemotronSuperNvfp4Config needs the whole decoder stack to locate its last layers, but the model "
+            f"holds layers {sorted(layers)}; pipeline stages are not supported."
+        )
+    if HIGH_PRECISION_TAIL_LAYERS > num_layers:
+        raise ValueError(
+            f"NemotronSuperNvfp4Config keeps the last {HIGH_PRECISION_TAIL_LAYERS} decoder layers in high "
+            f"precision, which exceeds the {num_layers} decoder layers of the model"
+        )
+    first_tail_layer = num_layers - HIGH_PRECISION_TAIL_LAYERS
+    modules: list[TEModulePrecision] = []
+    not_quantizable: list[str] = []
+    for name, module_class, layer, scope in sites:
+        in_tail = layer is not None and layer >= first_tail_layer
+        precision: TEPrecision = "high_precision" if in_tail else PRECISION_BY_CLASS[module_class]
+        if name in gemm_modules:
+            modules.append(
+                TEModulePrecision(name=name, module_class=module_class, layer=layer, precision=precision, scope=scope)
+            )
+        elif precision != "high_precision":
+            not_quantizable.append(f"{name} ({module_class}: {precision})")
+    if not_quantizable:
+        raise ValueError(
+            f"NemotronSuperNvfp4Config quantizes {len(not_quantizable)} module(s) that are not Transformer Engine "
+            "GEMM modules and would silently stay in high precision; build them with "
+            "backend.mamba_linear='te' (Mamba projections), backend.linear='te' (other projections) / "
+            "backend.experts='te' (with an expert-parallel dispatcher on more than one rank): "
+            f"{', '.join(not_quantizable[:8])}"
+            + (f" and {len(not_quantizable) - 8} more" if len(not_quantizable) > 8 else "")
+        )
+    return TEPrecisionPlan(
+        modules=tuple(modules), num_layers=num_layers, high_precision_tail_layers=HIGH_PRECISION_TAIL_LAYERS
+    )
+
+
+@dataclass(kw_only=True)
+class NemotronSuperNvfp4Config(TENvfp4Config):
+    """``te_nvfp4`` with the precision layout published for Nemotron 3 Super models.
+
+    Set as ``model.backend.te_nvfp4`` through its ``_target_``. The layout (:data:`PRECISION_BY_CLASS`,
+    :data:`HIGH_PRECISION_TAIL_LAYERS`) is fixed and has no setting; the options of the NVFP4 recipe are those
+    of ``TENvfp4Config``. It covers a language model built from Mamba, attention and MoE blocks
     (``NemotronHForCausalLM`` with that pattern) on its own and inside a vision-language model, where the
     names carry a ``language_model.`` prefix, with or without activation checkpointing of the blocks or of the
     MoE mixers. A model with dense MLP blocks is rejected. The router, the norms, the embedding, the Mamba
     convolution and scan and the output projection have no Transformer Engine GEMM and are not affected.
 
-    Every decoder layer is one block of the hybrid pattern (Mamba, attention or MoE), so
-    ``high_precision_tail_layers=14`` on an 88-layer model keeps layers 74-87 in high precision whatever
-    their class says.
+    Every decoder layer is one block of the hybrid pattern (Mamba, attention or MoE), so the 88-layer model
+    keeps layers 74-87 in high precision whatever their class says.
     """
 
-    high_precision_tail_layers: int
-    """Number of decoder layers at the end of the stack whose GEMMs all run in high precision."""
-    mamba_in_proj: TEPrecision
-    """Input projection of the Mamba mixers."""
-    mamba_out_proj: TEPrecision
-    """Output projection of the Mamba mixers."""
-    attention: TEPrecision
-    """Query, key, value and output projections of the attention mixers."""
-    routed_experts: TEPrecision
-    """Grouped up and down projections of the routed experts."""
-    shared_experts: TEPrecision
-    """Up and down projections of the shared expert."""
-    latent_proj: TEPrecision
-    """Projections into and out of the latent space of the routed experts."""
-    mtp: TEPrecision
-    """Every GEMM of the multi-token-prediction head, whatever its kind."""
+    exclude_fqns: tuple[str, ...] = ()
+    """Stays empty: the layout keeps modules in high precision itself."""
 
     def __post_init__(self) -> None:
-        """Reject a negative tail and precisions Transformer Engine does not have."""
-        if isinstance(self.high_precision_tail_layers, bool) or not isinstance(self.high_precision_tail_layers, int):
-            raise ValueError(f"high_precision_tail_layers must be an integer, got {self.high_precision_tail_layers!r}")
-        if self.high_precision_tail_layers < 0:
-            raise ValueError(f"high_precision_tail_layers must be at least 0, got {self.high_precision_tail_layers}")
-        for module_class, precision in self.precision_by_class().items():
-            if precision not in TE_PRECISIONS:
-                raise ValueError(f"{module_class} must be one of {', '.join(TE_PRECISIONS)}, got {precision!r}")
-
-    def precision_by_class(self) -> dict[NemotronV3ModuleClass, TEPrecision]:
-        """The configured precision of every module class, before the high-precision tail is applied."""
-        return {
-            "mamba_in_proj": self.mamba_in_proj,
-            "mamba_out_proj": self.mamba_out_proj,
-            "attention": self.attention,
-            "routed_experts": self.routed_experts,
-            "shared_experts": self.shared_experts,
-            "latent_proj": self.latent_proj,
-            "mtp": self.mtp,
-        }
-
-    def resolve(self, module_names: Sequence[str], gemm_module_names: Collection[str]) -> TEPrecisionPlan:
-        """Assign a precision to every Transformer Engine GEMM module of a Nemotron 3 model.
-
-        Args:
-            module_names: Qualified names of all modules of the model, in ``named_modules`` order.
-            gemm_module_names: The names among them that are Transformer Engine GEMM modules.
-
-        Returns:
-            Plan with one entry per Transformer Engine GEMM module, in ``module_names`` order.
-
-        Raises:
-            ValueError: If the names hold no decoder layer; if a Transformer Engine GEMM module is not one the
-                map has a class for (the projections of a dense MLP block among them); if a module that the
-                map quantizes is not a Transformer Engine module (a
-                Mamba projection built with ``backend.mamba_linear="torch"``, another projection built with
-                ``backend.linear="torch"``, experts without Transformer Engine grouped GEMMs), which would
-                silently leave it in high precision; if the decoder layers are not
-                numbered 0..N-1 (a pipeline stage holds only some of them, so the tail cannot be located); or
-                if the tail is longer than the stack.
-        """
-        precision_by_class = self.precision_by_class()
-        gemm_modules = set(gemm_module_names)
-        # (name, module class, decoder layer, scope) of every module that runs GEMMs in this model family.
-        sites: list[tuple[str, NemotronV3ModuleClass, int | None, str]] = []
-        layers: set[int] = set()
-        for name in module_names:
-            decoder = _DECODER_BLOCK.match(name)
-            mtp = _MTP_BLOCK.match(name)
-            if decoder is not None:
-                layers.add(int(decoder["layer"]))
-                kind = _classify_block_module(decoder["block"], decoder["module"])
-                if kind is not None:
-                    sites.append((name, kind[0], int(decoder["layer"]), kind[1]))
-                elif _is_expert_container(decoder["module"]) and f"{name}.gate_up_linear" not in gemm_modules:
-                    # Experts of another backend hold their weights themselves; they are one site.
-                    sites.append((name, "routed_experts", int(decoder["layer"]), name))
-            elif mtp is not None:
-                # Inside the head only the scope depends on the kind of module.
-                kind = _classify_block_module(mtp["block"], mtp["module"])
-                if kind is not None:
-                    sites.append((name, "mtp", None, kind[1]))
-                elif mtp["module"] == "eh_proj":
-                    sites.append((name, "mtp", None, name))
-                elif _is_expert_container(mtp["module"]) and f"{name}.gate_up_linear" not in gemm_modules:
-                    sites.append((name, "mtp", None, name))
-        if not layers:
+        """Reject excluded module names next to the fixed layout."""
+        super().__post_init__()
+        if self.exclude_fqns:
             raise ValueError(
-                "NemotronV3PrecisionMap found no module named 'model.layers.<index>.<module>': the model is not "
-                "a Nemotron 3 model, so nothing would be quantized as configured."
+                "NemotronSuperNvfp4Config has a fixed precision layout and takes no te_nvfp4.exclude_fqns, got "
+                f"{list(self.exclude_fqns)!r}"
             )
-        unknown = sorted(gemm_modules - {name for name, _, _, _ in sites})
-        if unknown:
-            raise ValueError(
-                f"NemotronV3PrecisionMap does not know {len(unknown)} Transformer Engine GEMM module(s) and "
-                f"will not guess their precision: {', '.join(unknown)}. It has classes for the projections of "
-                "Mamba, attention and MoE blocks and for the MTP head; a dense MLP block (block type 'mlp') "
-                "and modules outside the decoder layers and the MTP head have none."
-            )
-        num_layers = len(layers)
-        if sorted(layers) != list(range(num_layers)):
-            raise ValueError(
-                f"NemotronV3PrecisionMap needs the whole decoder stack to locate its last layers, but the model "
-                f"holds layers {sorted(layers)}; pipeline stages are not supported."
-            )
-        if self.high_precision_tail_layers > num_layers:
-            raise ValueError(
-                f"high_precision_tail_layers={self.high_precision_tail_layers} exceeds the {num_layers} decoder layers"
-            )
-        first_tail_layer = num_layers - self.high_precision_tail_layers
-        modules: list[TEModulePrecision] = []
-        not_quantizable: list[str] = []
-        for name, module_class, layer, scope in sites:
-            in_tail = layer is not None and layer >= first_tail_layer
-            precision: TEPrecision = "high_precision" if in_tail else precision_by_class[module_class]
-            if name in gemm_modules:
-                modules.append(
-                    TEModulePrecision(
-                        name=name, module_class=module_class, layer=layer, precision=precision, scope=scope
-                    )
-                )
-            elif precision != "high_precision":
-                not_quantizable.append(f"{name} ({module_class}: {precision})")
-        if not_quantizable:
-            raise ValueError(
-                f"NemotronV3PrecisionMap quantizes {len(not_quantizable)} module(s) that are not Transformer Engine "
-                "GEMM modules and would silently stay in high precision; build them with "
-                "backend.mamba_linear='te' (Mamba projections), backend.linear='te' (other projections) / "
-                "backend.experts='te' (with an expert-parallel dispatcher on more than one rank) or set their "
-                f"class to high_precision: {', '.join(not_quantizable[:8])}"
-                + (f" and {len(not_quantizable) - 8} more" if len(not_quantizable) > 8 else "")
-            )
-        return TEPrecisionPlan(
-            modules=tuple(modules), num_layers=num_layers, high_precision_tail_layers=self.high_precision_tail_layers
-        )
 
-    def prepare(self, model: nn.Module) -> None:
+    def exclude_modules(self, model: nn.Module) -> list[str]:
         """Give every Transformer Engine GEMM module of ``model`` the forward of its precision; idempotent.
-
-        ``TENvfp4Config.exclude_modules`` calls this for ``te_nvfp4.precision_map``.
 
         Args:
             model: Model (or pipeline stage) whose modules are inspected by qualified name.
 
+        Returns:
+            Qualified names of the modules now kept out of the autocast, in the order of their first GEMM
+            module; empty without Transformer Engine.
+
         Raises:
-            ValueError: If the model has no Transformer Engine GEMM module, or :meth:`resolve` rejects it.
+            ValueError: If the model has no Transformer Engine GEMM module, or :func:`resolve_precision_plan`
+                rejects it.
         """
         if not common_utils.HAVE_TE:
-            return
+            return []
         gemm_modules = te_gemm_modules(model)
         if not gemm_modules:
             raise ValueError(
-                "te_nvfp4.precision_map is set but the model has no Transformer Engine GEMM module "
+                "NemotronSuperNvfp4Config is set but the model has no Transformer Engine GEMM module "
                 "(backend.linear='te' or backend.experts='te' with an expert-parallel dispatcher): "
                 "nothing would be quantized"
             )
-        plan = self.resolve([name for name, _ in model.named_modules()], [name for name, _ in gemm_modules])
+        plan = resolve_precision_plan([name for name, _ in model.named_modules()], [name for name, _ in gemm_modules])
         apply_precision_plan(model, plan)
+        return [scope for scope, precision in plan.scopes().items() if precision == "high_precision"]

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pytest wrapper for the 2-GPU NVFP4 precision-map check of a small Nemotron 3 model."""
+"""Pytest wrapper for the 2-GPU NVFP4 precision-layout check of a small Nemotron 3 model."""
 
 import importlib.util
 
@@ -22,7 +22,7 @@ import torch
 from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "moe"
-TE_NVFP4_PRECISION_MAP = "L2_Nemotron_V3_TE_NVFP4_Precision_Map.sh"
+TE_NVFP4_PRECISION_LAYOUT = "L2_Nemotron_V3_TE_NVFP4_Precision_Layout.sh"
 
 
 def _two_nvfp4_gpus() -> bool:
@@ -33,6 +33,6 @@ def _two_nvfp4_gpus() -> bool:
 
 
 @pytest.mark.skipif(not _two_nvfp4_gpus(), reason="requires Transformer Engine and two GPUs with NVFP4 kernels")
-class TestNemotronV3TENvfp4PrecisionMap:
-    def test_every_gemm_module_runs_the_precision_the_map_gives_it(self):
-        run_test_script(TEST_FOLDER, TE_NVFP4_PRECISION_MAP)
+class TestNemotronV3TENvfp4PrecisionLayout:
+    def test_every_gemm_module_runs_the_precision_the_layout_gives_it(self):
+        run_test_script(TEST_FOLDER, TE_NVFP4_PRECISION_LAYOUT)

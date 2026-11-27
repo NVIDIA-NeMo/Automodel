@@ -33,9 +33,10 @@
 #     sizes its buffers. Valid only while every rank dispatches the same number of rows in every micro-batch,
 #     which fixed-length mock rows guarantee. With variable-length or packed data the dispatch hangs.
 #
-# Precision by module (te_nvfp4.precision_map), the layout published for this model family: Nemotron 3 Super
-# technical report, arXiv 2604.12374, section 2.2 "Precision by Layer Type"; the NVFP4 recipe itself is
-# described in arXiv 2509.25149. Counts are Transformer Engine GEMM modules on one rank.
+# Precision by module is fixed in NemotronSuperNvfp4Config (the `_target_` of te_nvfp4) and has no setting.
+# It is the layout published for this model family: Nemotron 3 Super technical report, arXiv 2604.12374,
+# section 2.2 "Precision by Layer Type"; the NVFP4 recipe itself is described in arXiv 2509.25149. Counts are
+# Transformer Engine GEMM modules on one rank.
 #   NVFP4, layers 0-73: Mamba input projection (34), routed experts (2 x 33), shared expert (2 x 33).
 #   MXFP8, layers 0-73: Mamba output projection (34).
 #   High precision (BF16): every GEMM of layers 74-87, the attention projections, the latent projections of the
@@ -44,7 +45,7 @@
 # 34 MXFP8, 163 high precision). Parameters are BF16; FusedAdam keeps FP32 master weights, stored as the BF16
 # parameter plus its 16 low bits, and FP32 moments.
 # nemotron_3_5_super_vl_te_nvfp4_gb300.yaml in this directory is the training recipe with the same precision
-# map on FineWeb; its header describes the map and the NVFP4 size requirements in full.
+# layout on FineWeb; its header describes the layout and the NVFP4 size requirements in full.
 #
 # What makes the step fast, each measured on this workload:
 #   - One micro-batch of 8 sequences per rank under full-block activation checkpointing; the MoE block of the
@@ -137,7 +138,7 @@ model:
     _target_: nemo_automodel.components.models.nemotron_v3.layers.NemotronV3BackendConfig
     attn: te
     linear: te
-    # The Mamba projections as Transformer Engine linears, so that the precision map can quantize them.
+    # The Mamba projections as Transformer Engine linears, so that te_nvfp4 can quantize them.
     mamba_linear: te
     rms_norm: te
     experts: te
@@ -155,21 +156,9 @@ model:
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     te_nvfp4:
-      _target_: nemo_automodel.components.models.common.TENvfp4Config
+      # NVFP4 with the precision layout of the header; the layout is fixed in this class.
+      _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronSuperNvfp4Config
       row_scaled_activation: false
-      # Empty next to a precision map, which keeps modules in high precision itself. The list defaults to
-      # lm_head, a torch linear in this model: it runs in BF16 with or without the entry.
-      exclude_fqns: []
-      precision_map:
-        _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
-        high_precision_tail_layers: 14
-        mamba_in_proj: nvfp4
-        mamba_out_proj: mxfp8
-        routed_experts: nvfp4
-        shared_experts: nvfp4
-        attention: high_precision
-        latent_proj: high_precision
-        mtp: high_precision
 
 distributed:
   strategy: fsdp2

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""NVFP4 precision map of a small Nemotron 3 model, checked against Transformer Engine's own state.
+r"""NVFP4 precision layout of a small Nemotron 3 model, checked against Transformer Engine's own state.
 
 The training recipe builds the model from ``CONFIG_YAML`` below. On identical tokens it runs
 (1) a forward without autocast, twice (high-precision reference and its repeatability), (2) forward and backward
@@ -53,8 +53,8 @@ from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenP
 # examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_gb300.yaml: Mamba, MoE with a
 # latent space and a shared expert, attention, one MTP depth of [attention, moe], Transformer Engine experts
 # behind HybridEP, FSDP2 with activation checkpointing, and FusedAdam with FP32 master weights.
-# 8 layers with a high-precision tail of 3: layers 0-4 hold every module kind once below the tail, and
-# layers 5-7 (Mamba, MoE, Mamba) are the tail.
+# 19 layers: layers 0-4 hold every module kind once below the high-precision tail, and layers 5-18 (Mamba
+# and MoE in turn) are the 14 layers of the tail, the number the layout fixes.
 #
 # Every GEMM dimension is a multiple of 128, as in the full model (the Mamba input projection has 1408 = 11 x 128
 # outputs; the full model has 18560 = 145 x 128). 2 x 256 tokens per rank reach the 8 routed experts with a
@@ -88,7 +88,8 @@ model:
     architectures: [NemotronHForCausalLM]
     vocab_size: 512
     hidden_size: 256
-    layers_block_type: [mamba, moe, attention, mamba, moe, mamba, moe, mamba]
+    layers_block_type: [mamba, moe, attention, mamba, moe,
+                        mamba, moe, mamba, moe, mamba, moe, mamba, moe, mamba, moe, mamba, moe, mamba, moe]
     num_attention_heads: 8
     num_key_value_heads: 2
     head_dim: 32
@@ -122,19 +123,7 @@ model:
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: false
     te_nvfp4:
-      _target_: nemo_automodel.components.models.common.TENvfp4Config
-      # Empty next to a precision map; lm_head, the default entry, is a torch linear and runs in BF16 anyway.
-      exclude_fqns: []
-      precision_map:
-        _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronV3PrecisionMap
-        high_precision_tail_layers: 3
-        mamba_in_proj: nvfp4
-        mamba_out_proj: mxfp8
-        routed_experts: nvfp4
-        shared_experts: nvfp4
-        attention: high_precision
-        latent_proj: high_precision
-        mtp: high_precision
+      _target_: nemo_automodel.components.models.nemotron_v3.quantization.NemotronSuperNvfp4Config
 
 checkpoint:
   enabled: false
@@ -183,9 +172,11 @@ clip_grad_norm:
   max_norm: 1.0
 """
 
-# The recipe under test, restated: the test fails if the YAML or the code drift from it.
-LAYER_PATTERN = ["mamba", "moe", "attention", "mamba", "moe", "mamba", "moe", "mamba"]
-HIGH_PRECISION_TAIL_LAYERS = 3
+# The layout under test, restated: the test fails if the YAML or the code drift from it. The two environment
+# variables let the negative controls of the shell script state a wrong expectation.
+LAYER_PATTERN = ["mamba", "moe", "attention", "mamba", "moe"] + ["mamba", "moe"] * 7
+HIGH_PRECISION_TAIL_LAYERS = int(os.environ.get("EXPECTED_HIGH_PRECISION_TAIL_LAYERS", "14"))
+MAMBA_OUT_PROJ_PRECISION = os.environ.get("EXPECTED_MAMBA_OUT_PROJ_PRECISION", "mxfp8")
 NVFP4_EXPERT_ALIGNMENT = 128
 # Relative error of the quantized logits against the high-precision logits of the same weights and tokens.
 # One NVFP4 GEMM of random operands is off by about 0.15 and the Mamba blocks dominate the residual stream
@@ -196,7 +187,7 @@ MAX_LOSS_ERROR = 0.02
 
 
 def expected_precision(name: str) -> str:
-    """Precision the recipe gives the GEMM module ``name``: ``nvfp4``, ``mxfp8`` or ``high_precision``."""
+    """Precision the layout gives the GEMM module ``name``: ``nvfp4``, ``mxfp8`` or ``high_precision``."""
     parts = [part for part in name.split(".") if part != "_checkpoint_wrapped_module"]
     if parts[0] == "mtp":
         return "high_precision"
@@ -206,7 +197,7 @@ def expected_precision(name: str) -> str:
         return "high_precision"
     kind, module = LAYER_PATTERN[layer], ".".join(parts[4:])
     if kind == "mamba":
-        return {"in_proj": "nvfp4", "out_proj": "mxfp8"}[module]
+        return {"in_proj": "nvfp4", "out_proj": MAMBA_OUT_PROJ_PRECISION}[module]
     if kind == "attention":
         assert module in ("q_proj", "k_proj", "v_proj", "o_proj"), name
         return "high_precision"

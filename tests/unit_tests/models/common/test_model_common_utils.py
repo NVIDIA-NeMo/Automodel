@@ -16,7 +16,6 @@ import copy
 import types
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,7 +23,6 @@ import pytest
 import torch
 from torch import nn
 
-from nemo_automodel.components.models.common.te_precision import TEModulePrecision, TEPrecisionMap, TEPrecisionPlan
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
@@ -40,7 +38,6 @@ from nemo_automodel.components.models.common.utils import (
     set_is_first_microbatch,
     set_is_optim_step,
 )
-from nemo_automodel.components.models.nemotron_v3.quantization import apply_precision_plan, te_gemm_modules
 
 
 class TestQuackBackend:
@@ -168,73 +165,6 @@ def _fake_te_autocast():
         "transformer_engine": te_root,
         "transformer_engine.pytorch": te_pytorch,
         "transformer_engine.pytorch.quantization": quantization,
-    }
-    with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
-        yield entered
-
-
-@contextmanager
-def _fake_te_mxfp8_autocast():
-    """Stand in for the Transformer Engine autocast, its global state, ``MXFP8BlockScaling`` and the GEMM modules.
-
-    Yields the ``(enabled, recipe name)`` of every autocast entered. ``FP8GlobalStateManager.is_fp8_enabled()``
-    follows the innermost autocast. ``transformer_engine.pytorch.Linear`` is a ``torch.nn.Linear`` subclass, so
-    a test model can hold modules that count as Transformer Engine GEMM modules.
-    """
-    entered: list[tuple[bool, str | None]] = []
-    active: list[bool] = []
-
-    class MXFP8BlockScaling:
-        pass
-
-    @contextmanager
-    def autocast(enabled: bool = True, recipe: MXFP8BlockScaling | None = None):
-        entered.append((enabled, None if recipe is None else type(recipe).__name__))
-        active.append(enabled)
-        try:
-            yield
-        finally:
-            active.pop()
-
-    class FP8GlobalStateManager:
-        @staticmethod
-        def is_fp8_enabled() -> bool:
-            return bool(active) and active[-1]
-
-    class Linear(nn.Linear):
-        pass
-
-    class GroupedLinear(nn.Module):
-        pass
-
-    class LayerNormLinear(nn.Module):
-        pass
-
-    class LayerNormMLP(nn.Module):
-        pass
-
-    quantization = types.ModuleType("transformer_engine.pytorch.quantization")
-    quantization.autocast = autocast
-    quantization.FP8GlobalStateManager = FP8GlobalStateManager
-    te_pytorch = types.ModuleType("transformer_engine.pytorch")
-    te_pytorch.quantization = quantization
-    te_pytorch.Linear = Linear
-    te_pytorch.GroupedLinear = GroupedLinear
-    te_pytorch.LayerNormLinear = LayerNormLinear
-    te_pytorch.LayerNormMLP = LayerNormMLP
-    recipe_module = types.ModuleType("transformer_engine.common.recipe")
-    recipe_module.MXFP8BlockScaling = MXFP8BlockScaling
-    te_common = types.ModuleType("transformer_engine.common")
-    te_common.recipe = recipe_module
-    te_root = types.ModuleType("transformer_engine")
-    te_root.pytorch = te_pytorch
-    te_root.common = te_common
-    modules = {
-        "transformer_engine": te_root,
-        "transformer_engine.pytorch": te_pytorch,
-        "transformer_engine.pytorch.quantization": quantization,
-        "transformer_engine.common": te_common,
-        "transformer_engine.common.recipe": recipe_module,
     }
     with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
         yield entered
@@ -434,158 +364,12 @@ class TestTENvfp4Config:
         with pytest.raises(ValueError, match="te_nvfp4"):
             TENvfp4Config(**options)
 
-    def test_precision_map_left_as_a_mapping_is_rejected(self):
-        """A YAML block without ``_target_`` reaches the config as a mapping; it has no ``resolve``."""
-        mapping = {"high_precision_tail_layers": 14, "mamba_in_proj": "nvfp4"}
-        with pytest.raises(ValueError, match=r"te_nvfp4.precision_map must be a precision map object.*`_target_`"):
-            TENvfp4Config(precision_map=mapping)
-        with pytest.raises(ValueError, match=r"te_nvfp4.precision_map must be a precision map object"):
-            BackendConfig(te_nvfp4={"precision_map": mapping})
-
-    def test_precision_map_and_exclude_fqns_are_mutually_exclusive(self):
-        """A map keeps modules in high precision itself, so a config with a map has an empty exclusion list."""
-        precision_map = _LastNamePrecisionMap({})
-        message = r"te_nvfp4.precision_map and te_nvfp4.exclude_fqns are mutually exclusive, got exclude_fqns="
-        # The default list is not empty.
-        with pytest.raises(ValueError, match=message + r"\['lm_head'\] .*exclusions in the map and set .* to \[\]"):
-            TENvfp4Config(precision_map=precision_map)
-        with pytest.raises(ValueError, match=message + r"\['model.score'\]"):
-            TENvfp4Config(precision_map=precision_map, exclude_fqns="model.score")
-        with pytest.raises(ValueError, match=message + r"\['lm_head', 'q_proj'\]"):
-            BackendConfig(te_nvfp4={"precision_map": precision_map, "exclude_fqns": ["lm_head", "q_proj"]})
-        cfg = TENvfp4Config(precision_map=precision_map, exclude_fqns=[])
-        assert cfg.precision_map is precision_map
-        assert cfg.exclude_fqns == ()
-        # Without a map the list is the one of every Transformer Engine quantization config.
-        assert TENvfp4Config(exclude_fqns=["model.score"]).exclude_fqns == ("model.score",)
-
     def test_exclude_fqns_default_and_normalization(self):
         assert TENvfp4Config().exclude_fqns == ("lm_head",)
         assert TENvfp4Config(exclude_fqns=["lm_head", "model.score"]).exclude_fqns == ("lm_head", "model.score")
         assert TENvfp4Config(exclude_fqns="score").module_excluded("model.score")
         with pytest.raises(ValueError, match="te_nvfp4.exclude_fqns"):
             TENvfp4Config(exclude_fqns=[""])
-
-
-@dataclass(frozen=True)
-class _LastNamePrecisionMap:
-    """Test map: precision by the last part of a GEMM module name; ``inner`` uses its parent as scope."""
-
-    precisions: dict[str, str]
-    drop: str | None = None
-
-    def resolve(self, module_names: list[str], gemm_module_names: list[str]) -> TEPrecisionPlan:
-        modules = tuple(
-            TEModulePrecision(
-                name=name,
-                module_class=name.rsplit(".", 1)[-1],
-                layer=None,
-                precision=self.precisions[name.rsplit(".", 1)[-1]],
-                scope=name.rsplit(".", 1)[0] if name.endswith(".inner") else name,
-            )
-            for name in gemm_module_names
-            if name != self.drop
-        )
-        return TEPrecisionPlan(modules=modules, num_layers=0, high_precision_tail_layers=0)
-
-
-class TestTENvfp4PrecisionMap:
-    @staticmethod
-    def _model() -> nn.ModuleDict:
-        from transformer_engine.pytorch import Linear
-
-        return nn.ModuleDict(
-            {
-                "quantized": Linear(4, 4),
-                "eight_bit": Linear(4, 4),
-                "block": nn.Sequential(OrderedDict(inner=Linear(4, 4), norm=nn.LayerNorm(4))),
-                "torch_linear": nn.Linear(4, 4),
-            }
-        )
-
-    def test_scopes_get_the_forward_of_their_precision(self, caplog):
-        precision_map = _LastNamePrecisionMap({"quantized": "nvfp4", "eight_bit": "mxfp8", "inner": "high_precision"})
-        x = torch.randn(2, 4)
-        with _fake_te_mxfp8_autocast() as entered:
-            from transformer_engine.pytorch.quantization import autocast
-
-            model = self._model()
-            expected = model.block(model.eight_bit(model.quantized(x)))
-            plan = precision_map.resolve(
-                [name for name, _ in model.named_modules()], [name for name, _ in te_gemm_modules(model)]
-            )
-            with caplog.at_level("INFO", logger="nemo_automodel.components.models.nemotron_v3.quantization"):
-                apply_precision_plan(model, plan)
-                apply_precision_plan(model, plan)  # idempotent: one wrapper per scope
-            with autocast(enabled=True):
-                torch.testing.assert_close(model.block(model.eight_bit(model.quantized(x))), expected)
-            # NVFP4 modules keep the outer recipe; MXFP8 and high-precision scopes switch it once each.
-            assert entered == [(True, None), (True, "MXFP8BlockScaling"), (False, None)]
-            # The binding follows the instance through a copy.
-            clone = copy.deepcopy(model)
-            assert clone.eight_bit.forward.__self__ is clone.eight_bit
-            assert clone.block.forward.__self__ is clone.block
-        assert "forward" in vars(model.block) and "forward" in vars(model.eight_bit)
-        for untouched in (model.quantized, model.block.inner, model.block.norm, model.torch_linear):
-            assert "forward" not in vars(untouched)
-        summary = caplog.records[0].getMessage().splitlines()
-        assert [line.split() for line in summary[1:]] == [
-            ["module", "class", "nvfp4", "mxfp8", "high_precision"],
-            ["quantized", "1", "0", "0"],
-            ["eight_bit", "0", "1", "0"],
-            ["inner", "0", "0", "1"],
-            ["total", "1", "1", "1"],
-        ]
-
-    def test_mxfp8_scopes_quantize_only_inside_an_enabled_autocast(self):
-        """A forward without the Transformer Engine autocast, or inside a disabled one, stays in high precision."""
-        x = torch.randn(2, 4)
-        with _fake_te_mxfp8_autocast() as entered:
-            from transformer_engine.pytorch import Linear
-            from transformer_engine.pytorch.quantization import autocast
-
-            model = nn.ModuleDict({"mlp": Linear(4, 4)})
-            expected = model.mlp(x)
-            precision_map = _LastNamePrecisionMap({"mlp": "mxfp8"})
-            apply_precision_plan(model, precision_map.resolve(["", "mlp"], ["mlp"]))
-            assert "forward" in vars(model.mlp)
-            torch.testing.assert_close(model.mlp(x), expected)
-            with autocast(enabled=False):
-                torch.testing.assert_close(model.mlp(x), expected)
-            assert entered == [(False, None)]
-            with autocast(enabled=True):
-                torch.testing.assert_close(model.mlp(x), expected)
-            assert entered == [(False, None), (True, None), (True, "MXFP8BlockScaling")]
-
-    def test_exclude_modules_hands_the_model_to_the_map(self):
-        prepared = []
-
-        class _Recording(TEPrecisionMap):
-            def prepare(self, model: nn.Module) -> None:
-                prepared.append(model)
-
-        model = nn.Linear(2, 2)
-        assert TENvfp4Config(precision_map=_Recording(), exclude_fqns=()).exclude_modules(model) == []
-        assert prepared == [model]
-
-    def test_plan_rejects_inconsistent_scopes(self):
-        def module(name: str, precision: str, scope: str) -> TEModulePrecision:
-            return TEModulePrecision(name=name, module_class="linear", layer=None, precision=precision, scope=scope)
-
-        with pytest.raises(ValueError, match="not 'a.b' or one of its ancestors"):
-            module("a.b", "nvfp4", "a.c")
-        with pytest.raises(ValueError, match="different precisions"):
-            TEPrecisionPlan(
-                modules=(module("a.b", "nvfp4", "a"), module("a.c", "mxfp8", "a")),
-                num_layers=0,
-                high_precision_tail_layers=0,
-            )
-        with pytest.raises(ValueError, match="lies inside scope 'a'"):
-            TEPrecisionPlan(
-                modules=(module("a.b", "nvfp4", "a"), module("a.c.d", "nvfp4", "a.c")),
-                num_layers=0,
-                high_precision_tail_layers=0,
-            )
 
 
 class TestBackendConfigTeNvfp4:
