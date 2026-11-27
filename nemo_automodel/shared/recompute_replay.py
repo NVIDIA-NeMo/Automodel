@@ -35,11 +35,19 @@ process-global, per-gate registry.
 from __future__ import annotations
 
 import threading
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
-__all__ = ["RecomputeReplay", "RecomputeReplayRecorder"]
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
+
+__all__ = [
+    "ReenterableContext",
+    "RecomputeReplay",
+    "RecomputeReplayRecorder",
+    "replayable_selective_checkpoint_contexts",
+]
 
 T = TypeVar("T")
 
@@ -90,21 +98,59 @@ class RecomputeReplayRecorder(Generic[T]):
         return len(self._records)
 
 
-class _ReplayScope(ExitStack):
-    """Recompute context that opens a fresh replay scope on every entry.
+class ReenterableContext(ExitStack):
+    """Recompute context that builds a fresh inner context on every entry.
 
-    ``torch.utils.checkpoint`` enters the recompute context once per backward pass over the same
-    graph, and a ``@contextmanager`` object cannot be entered twice. Each entry here builds a new
-    scope, which rewinds the recorder again.
+    ``torch.utils.checkpoint`` enters the recompute context once per backward pass that reads the
+    region: once for an ordinary backward, twice when a pipeline schedule splits the backward into
+    an input-gradient and a weight-gradient pass (``stage_backward_input`` /
+    ``stage_backward_weight``). A ``@contextmanager`` object cannot be entered twice, so every
+    recompute context in a checkpoint ``context_fn`` chain wraps its factory in this class.
     """
 
-    def __init__(self, make_scope: Callable[[], AbstractContextManager]) -> None:
+    def __init__(self, make_context: Callable[[], AbstractContextManager]) -> None:
         super().__init__()
-        self._make_scope = make_scope
+        self._make_context = make_context
 
-    def __enter__(self) -> _ReplayScope:
-        self.enter_context(self._make_scope())
+    def __enter__(self) -> ReenterableContext:
+        self.enter_context(self._make_context())
         return self
+
+
+class _ReplayableSelectiveRecompute(AbstractContextManager):
+    """Recompute half of a selective-checkpoint pair that serves the saved outputs on every recompute.
+
+    PyTorch's recompute mode pops each saved op output as it serves it, so a region whose backward
+    runs in two passes finds the storage empty on the second recompute ("Trying to backward an
+    extra time"). Each entry serves from a fresh copy of the lists the forward filled; the outputs
+    themselves are shared, not copied.
+    """
+
+    def __init__(self, recompute_mode: Any) -> None:
+        self._mode = recompute_mode
+        self._forward_storage = recompute_mode.storage
+
+    def __enter__(self) -> Any:
+        self._mode.storage = defaultdict(list, {op: list(outs) for op, outs in self._forward_storage.items()})
+        return self._mode.__enter__()
+
+    def __exit__(self, *exc_info: Any) -> Any:
+        return self._mode.__exit__(*exc_info)
+
+
+def replayable_selective_checkpoint_contexts(
+    policy_fn: Callable[..., Any],
+) -> tuple[AbstractContextManager, AbstractContextManager]:
+    """``create_selective_checkpoint_contexts`` whose recompute context can be entered more than once.
+
+    Args:
+        policy_fn: Selective-checkpoint policy; it must not keep per-pass state.
+
+    Returns:
+        ``(forward, recompute)`` context managers for a ``torch.utils.checkpoint`` ``context_fn``.
+    """
+    forward_mode, recompute_mode = create_selective_checkpoint_contexts(policy_fn)
+    return forward_mode, _ReplayableSelectiveRecompute(recompute_mode)
 
 
 class _Binding(threading.local):
@@ -198,6 +244,6 @@ class RecomputeReplay(Generic[T]):
                     if mode == "record":
                         recorder.on_record_exit()
 
-            return scoped("record", forward_context), _ReplayScope(lambda: scoped("replay", recompute_context))
+            return scoped("record", forward_context), ReenterableContext(lambda: scoped("replay", recompute_context))
 
         return wrapped_context_fn

@@ -196,13 +196,8 @@ class MoERecomputeCache(RecomputeReplayRecorder[torch.Tensor]):
         """Whether the recompute's next combine has a cached forward output."""
         return self._cursor < len(self._records)
 
-    def take(self) -> torch.Tensor | None:
-        """Return the next cached output (released from the cache), or ``None`` when the recompute diverged."""
-        index = self._cursor
-        cached = super().take()
-        if cached is not None:
-            self._records[index] = None  # the recompute graph owns it from here
-        return cached
+    # take() keeps each output: a split input/weight backward recomputes the region twice and both
+    # recomputes are served; the outputs are freed with the checkpoint frame after the last backward.
 
 
 # Checkpoint-recompute replay of HybridEP combine outputs; see MoERecomputeCache.

@@ -31,7 +31,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
-from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+from torch.utils.checkpoint import CheckpointPolicy
 
 from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.fsdp_patches import (
@@ -59,6 +59,7 @@ from nemo_automodel.components.moe.layers import (
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
+from nemo_automodel.shared.recompute_replay import ReenterableContext, replayable_selective_checkpoint_contexts
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -216,7 +217,7 @@ def _preserve_gate_load_during_recompute(
             finally:
                 gate._cumulative_expert_load = load_after_forward
 
-        return forward_context, recompute()
+        return forward_context, ReenterableContext(recompute)
 
     return checkpoint_context_fn
 
@@ -666,7 +667,7 @@ def checkpoint_moe_block(
         )
 
     def selective_checkpointing_context_fn():
-        return create_selective_checkpoint_contexts(router_policy)
+        return replayable_selective_checkpoint_contexts(router_policy)
 
     # Only a pinned routing makes replaying a recorded dispatch layout sound; with a recomputed router
     # the recompute may choose a different layout.
@@ -873,7 +874,7 @@ def apply_ac(
     _custom_policy = router_save_checkpoint_policy(hidden_size, num_experts) if num_experts is not None else None
 
     def selective_checkpointing_context_fn():
-        return create_selective_checkpoint_contexts(_custom_policy)
+        return replayable_selective_checkpoint_contexts(_custom_policy)
 
     from nemo_automodel.components.distributed.activation_checkpointing import (
         ensure_fsdp_ops_sac_ignored,

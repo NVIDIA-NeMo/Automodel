@@ -1569,6 +1569,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
+        # EXPERIMENT ONLY (perf-gap trace; not for merge): chrome trace of one step on selected ranks.
+        import os as _exp_os
+
+        import torch.distributed as _exp_dist
+
+        _exp_step = getattr(self, "_exp_step_counter", 0)
+        self._exp_step_counter = _exp_step + 1
+        _exp_prof = None
+        _exp_dir = _exp_os.environ.get("EXP_TRACE_DIR")
+        if _exp_dir and _exp_step == int(_exp_os.environ.get("EXP_TRACE_STEP", "20")):
+            _exp_rank = _exp_dist.get_rank()
+            if str(_exp_rank) in _exp_os.environ.get("EXP_TRACE_RANKS", "0").split(","):
+                torch.cuda.synchronize()
+                _exp_prof = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+                )
+                _exp_prof.__enter__()
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         # All three counts are needed as Python integers. Reduce and read them in one
         # transfer so the later counts do not add more collectives and device syncs.
@@ -1701,6 +1718,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
+        if _exp_prof is not None:
+            torch.cuda.synchronize()
+            _exp_prof.__exit__(None, None, None)
+            _exp_os.makedirs(_exp_dir, exist_ok=True)
+            _exp_prof.export_chrome_trace(_exp_os.path.join(_exp_dir, f"trace_rank{_exp_dist.get_rank()}.json.gz"))
+            print(f"EXP_TRACE rank={_exp_dist.get_rank()} written", flush=True)
         # fix reporting_loss, tps across ranks
 
         metrics = {

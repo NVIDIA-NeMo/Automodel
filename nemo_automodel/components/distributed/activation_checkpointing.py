@@ -45,6 +45,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.shared.import_utils import get_torch_version, safe_import
+from nemo_automodel.shared.recompute_replay import ReenterableContext
 
 __all__ = [
     "SELECTIVE_AC_WRAPPER_FLAG",
@@ -558,10 +559,9 @@ def transformer_engine_attention_backend_snapshot_context_fn(
     cache = _get_transformer_engine_attention_backend_cache()
     if cache is None:
         return forward_context, recompute_context
-    return forward_context, _restore_transformer_engine_attention_backend_cache(
-        cache,
-        dict(cache),
-        recompute_context,
+    captured_cache = dict(cache)
+    return forward_context, ReenterableContext(
+        lambda: _restore_transformer_engine_attention_backend_cache(cache, captured_cache, recompute_context)
     )
 
 
