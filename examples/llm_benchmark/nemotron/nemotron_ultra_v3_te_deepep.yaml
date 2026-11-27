@@ -115,3 +115,7 @@ ci:
   cluster_tag: h100
   time: "00:45:00"
   nodes: 16
+  recipe_owner: akoumpa
+  nproc_per_node: 8
+  perf_testing:
+    schedule: nightly
