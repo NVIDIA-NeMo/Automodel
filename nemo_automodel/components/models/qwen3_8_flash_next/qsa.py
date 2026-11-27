@@ -496,8 +496,9 @@ def select_qsa_cuda_kernel(backend: str) -> Callable[..., torch.Tensor] | None:
     """Return the CUDA QSA kernel selected by ``backend.attn``, resolved once at layer setup.
 
     Args:
-        backend: ``backend.attn`` value; "flex", "fa4" and "cudnn" have CUDA kernels. FA4 requires SM90 BF16
-            D256; cuDNN requires SM100/SM103 BF16 D256 and equal Q/KV extents.
+        backend: ``backend.attn`` value; "flex", "fa4" and "cudnn" have CUDA kernels. FA4 requires SM90 or an
+            SM100-family GPU (10.x/11.x), BF16 and D256; cuDNN requires SM100/SM103 BF16 D256 and equal Q/KV
+            extents.
 
     Returns:
         The kernel, called as ``kernel(query, key, value, selected_token_ids, softmax_scale=..., flex_mask=...)``, or
