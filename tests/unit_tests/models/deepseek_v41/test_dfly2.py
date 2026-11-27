@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -297,6 +298,15 @@ def test_warm_start_reads_the_released_layout(tmp_path: Path) -> None:
     )
 
 
+def test_exported_config_carries_the_dfly2_settings() -> None:
+    draft = _draft()
+    exported = json.loads(draft.config.to_json_string(use_diff=False))
+    assert exported["architectures"] == ["DeepseekV41DFly2Model"]
+    assert exported["dfly_config"]["block_size"] == 3
+    assert exported["dfly_config"]["target_kv_layers"] == list(_PAIRED_LAYERS)
+    assert exported["dfly_config"]["mask_token_id"] == 63
+
+
 def test_attentive_correction_starts_from_the_last_layer() -> None:
     draft = _draft()
     source = draft.layers[-1].attn
@@ -323,13 +333,13 @@ def test_build_from_target_config_honors_recipe_options() -> None:
         attn_backend="eager",
     )
     draft = config.build_dfly2_draft(options)
-    assert draft.config.target_layer_ids == (4, 5)
+    assert draft.dfly2_config.target_layer_ids == (4, 5)
     assert draft.confidence_head is not None
     assert len(draft.layers) == 2
     assert draft.layers[0].attn.backend.attn == "eager"
     # The target's TileLang-only backward selector is not inherited by the draft.
     assert config.text_config.sparse_attention_backward == "deterministic"
-    assert draft.config.text_config.sparse_attention_backward == "atomic"
+    assert draft.dfly2_config.text_config.sparse_attention_backward == "atomic"
 
 
 def _fsdp_draft_features(batch: int, sequence: int) -> tuple:

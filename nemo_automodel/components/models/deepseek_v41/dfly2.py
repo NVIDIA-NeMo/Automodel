@@ -31,6 +31,7 @@ block of ``block_size`` slots drafts ``block_size - 1`` tokens.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -520,7 +521,27 @@ class DeepseekV41DFly2Model(nn.Module):
         super().__init__()
         text = config.text_config
         dtype = dtype_from_str(text.dtype, torch.bfloat16)
-        self.config = config
+        self.dfly2_config = config
+        # The exported config.json: the target's text config with the DFly2 settings alongside,
+        # as the released draft stores it.
+        self.config = copy.deepcopy(text)
+        self.config.architectures = ["DeepseekV41DFly2Model"]
+        self.config.dfly_config = {
+            "block_size": config.block_size,
+            "causal_block": False,
+            "target_kv_layers": list(config.target_layer_ids),
+            "target_index_layers": list(config.target_layer_ids),
+            "mask_token_id": config.mask_token_id,
+            "mtp_fusion": "slot0",
+            "hidden_correction": {"intermediate_size": text.hidden_size},
+            "attentive_correction": {
+                "source_layer": -1,
+                "block_keys": True,
+                "block_mode": "gated",
+                "block_kv_in": "hidden_embed",
+                "max_block_slots": MAX_BLOCK_SLOTS,
+            },
+        }
         self.moe_config = MoEConfig(
             dim=text.hidden_size,
             inter_dim=text.moe_intermediate_size,
@@ -574,7 +595,7 @@ class DeepseekV41DFly2Model(nn.Module):
         """
         if buffer_device is None:
             buffer_device = self.layers[0].attn.wq_a.weight.device
-        std = self.config.text_config.initializer_range
+        std = self.dfly2_config.text_config.initializer_range
         for layer in self.layers:
             layer.ffn.init_weights(buffer_device, init_std=std)
             layer.attn_hc.reset_parameters(std)
@@ -612,7 +633,7 @@ class DeepseekV41DFly2Model(nn.Module):
         """
         source = self.layers[-1].attn
         attention = self.hidden_correction.attention
-        hidden = self.config.text_config.hidden_size
+        hidden = self.dfly2_config.text_config.hidden_size
         attention.q_in.weight.zero_()
         attention.q_in.weight[:, :hidden].copy_(source.wq_a.weight)
         attention.q_norm.weight.copy_(source.q_norm.weight)
@@ -641,7 +662,7 @@ class DeepseekV41DFly2Model(nn.Module):
                 DTensors, which are gathered one at a time.
         """
         target_layers = target.model.layers
-        for layer, layer_id in zip(self.layers, self.config.target_layer_ids):
+        for layer, layer_id in zip(self.layers, self.dfly2_config.target_layer_ids):
             source = target_layers[str(layer_id)]
             pairs = [(layer.attn_norm, source.attn_norm), (layer.ffn_norm, source.ffn_norm)]
             pairs += [(getattr(layer.attn, name), getattr(source.attn, name)) for name in _ATTENTION_INIT_MODULES]
@@ -706,7 +727,7 @@ class DeepseekV41DFly2Model(nn.Module):
         Returns:
             The collapsed, not yet normalized output of shape [batch, draft_sequence, hidden].
         """
-        hc_mult = self.config.text_config.hc_mult
+        hc_mult = self.dfly2_config.text_config.hc_mult
         hidden_states = noise_embeddings.unsqueeze(2).expand(-1, -1, hc_mult, -1)
         pre_mix = noise_embeddings.new_zeros(*noise_embeddings.shape[:2], hc_mult, dtype=torch.float32)
         pre_mix[..., 0] = 1
@@ -745,13 +766,13 @@ class DeepseekV41DFly2Model(nn.Module):
             shape [batch, num_anchors, block_size - 1].
         """
         batch, sequence = input_ids.shape
-        block_size = self.config.block_size
+        block_size = self.dfly2_config.block_size
         if len(context_keys) != len(self.layers) or len(context_indices) != len(self.layers):
             raise ValueError(f"DFly2 needs target features for {len(self.layers)} draft layers")
         if target_last_hidden_states.shape[:2] != (batch, sequence):
             raise ValueError("target_last_hidden_states must match input_ids [batch, sequence]")
         anchor_positions, block_keep_mask = sample_anchor_positions(
-            seq_len=sequence, loss_mask=loss_mask, num_anchors=self.config.num_anchors, device=input_ids.device
+            seq_len=sequence, loss_mask=loss_mask, num_anchors=self.dfly2_config.num_anchors, device=input_ids.device
         )
         num_blocks = anchor_positions.shape[1]
         hidden = target_last_hidden_states.shape[-1]
@@ -769,7 +790,7 @@ class DeepseekV41DFly2Model(nn.Module):
             input_ids,
             anchor_positions,
             block_keep_mask,
-            mask_token_id=self.config.mask_token_id,
+            mask_token_id=self.dfly2_config.mask_token_id,
             block_size=block_size,
         ).view(batch, num_blocks, block_size, hidden)
         previous_rows = (anchor_positions - 1).clamp(min=0)
@@ -824,7 +845,7 @@ class DeepseekV41DFly2Model(nn.Module):
         confidence_pred = None
         if self.confidence_head is not None:
             states = backbone.view(batch, num_blocks, block_size, hidden)[:, :, 1:]
-            if self.config.confidence_head_stop_gradient:
+            if self.dfly2_config.confidence_head_stop_gradient:
                 states = states.detach()
             with torch.autocast(device_type=states.device.type, enabled=False):
                 confidence_pred = self.confidence_head(states.float()).squeeze(-1)
