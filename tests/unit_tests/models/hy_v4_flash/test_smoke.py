@@ -22,6 +22,7 @@ from nemo_automodel.components.models.hy_v4_flash.attention import HYV4FlashRope
 from nemo_automodel.components.models.hy_v4_flash.model import HYV4FlashForCausalLM
 from nemo_automodel.components.moe.parallelizer import apply_ac
 from tests.unit_tests.models.hy_v4_flash.conftest import CPU_BACKEND, TOKEN_RANGE, tiny_config
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 
 def test_tiny_forward_backward_is_finite() -> None:
@@ -31,13 +32,32 @@ def test_tiny_forward_backward_is_finite() -> None:
     ids = torch.randint(*TOKEN_RANGE, (2, 24))
     out = model(ids, labels=ids)
     assert torch.isfinite(out.logits).all()
-    # What the fused-loss recipes request: one projected position and the full hidden states.
+    # One projected position and the full hidden states.
     last = model(ids, logits_to_keep=1, output_hidden_states=True)
     assert last.logits.shape == (ids.shape[0], 1, model.config.text_config.vocab_size)
     assert last.hidden_states.shape[:2] == ids.shape
     torch.testing.assert_close(last.logits, out.logits[:, -1:], rtol=1e-4, atol=1e-5)
     out.loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+
+def test_fused_loss_forward_skips_the_head() -> None:
+    torch.manual_seed(0)
+    model = HYV4FlashForCausalLM(tiny_config(), backend=CPU_BACKEND)
+    model.initialize_weights(dtype=torch.float32)
+    ids = torch.randint(*TOKEN_RANGE, (2, 24))
+    full = model(ids, output_hidden_states=True)
+    head_calls = []
+    model.lm_head.register_forward_hook(lambda *_: head_calls.append(None))
+    # What the fused-loss recipes request: no logits, and the hidden states the loss projects with the head's weight.
+    skipped = model(ids, output_hidden_states=True, compute_logits=False)
+    assert not head_calls
+    assert skipped.logits.shape == (*ids.shape, 0)
+    torch.testing.assert_close(skipped.hidden_states, full.hidden_states, rtol=0, atol=0)
+    # FSDP2 hooks every grad-requiring tensor of a root's output; a hook on a leaf would never be removed.
+    assert not leaf_tensors_requiring_grad(skipped)
+    with pytest.raises(ValueError, match="labels require logits"):
+        model(ids, labels=ids, compute_logits=False)
 
 
 def _train_step(mode: str | None) -> tuple[torch.Tensor, dict[str, torch.Tensor], HYV4FlashForCausalLM]:
