@@ -54,8 +54,6 @@ model:
     dispatcher_hybridep_permute_fusion: true
     dispatcher_hybridep_compact_routing: true
     dispatcher_recompute_cache: moe_tail
-    shared_expert_overlap: true
-    compile_router_weight: true
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
