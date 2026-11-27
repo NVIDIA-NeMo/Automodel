@@ -1569,6 +1569,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
+        # EXPERIMENT ONLY (perf-gap phase timers; not for merge)
+        import time as _exp_time
+
+        def _exp_t():
+            torch.cuda.synchronize()
+            return _exp_time.perf_counter()
+
+        _exp_t0 = _exp_t()
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         # All three counts are needed as Python integers. Reduce and read them in one
         # transfer so the later counts do not add more collectives and device syncs.
@@ -1636,6 +1644,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        _exp_t1 = _exp_t()
         synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = clip_grads_for_optimizers(
             self.optimizer,
@@ -1658,10 +1667,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].finish_grad_sync()
 
+        _exp_t2 = _exp_t()
         self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
+        _exp_t3 = _exp_t()
 
         if hasattr(self.model_parts[0], "update_moe_gate_bias"):
             for mp in self.model_parts:
@@ -1687,6 +1698,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
+        _exp_t4 = _exp_t()
         tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
 
         reporting_loss = torch.sum(torch.stack(loss_buffer))
@@ -1701,6 +1713,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
+        _exp_t5 = _exp_t()
+        logging.info(
+            "EXP_PHASES pre=%.3f fwdbwd=%.3f clip=%.3f optim=%.3f misc=%.3f report=%.3f total=%.3f",
+            _exp_t0 and 0.0,
+            _exp_t1 - _exp_t0,
+            _exp_t2 - _exp_t1,
+            _exp_t3 - _exp_t2,
+            _exp_t4 - _exp_t3,
+            _exp_t5 - _exp_t4,
+            _exp_t5 - _exp_t0,
+        )
         # fix reporting_loss, tps across ranks
 
         metrics = {
