@@ -70,9 +70,19 @@ _LONG_INPUT_IDS = [list(range(100, 124))]
 
 # Row 0 is padded on the left, as a left-padding tokenizer with ``padding: max_length`` does. Moving its three
 # masked tokens behind the five attended ones is not its own inverse, unlike the swap of two pairs in the rows above.
-_LEFT_PADDED_INPUT_IDS = [[0, 0, 0, 10, 11, 12, 13, 14], [20, 21, 22, 23, 24, 25, 26, 27]]
-_LEFT_PADDED_ATTENTION_MASK = [[0, 0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1]]
-_LEFT_PADDED_LABELS = [[-100, -100, -100, 11, 12, 13, 14, -100], [21, 22, 23, 24, 25, 26, 27, -100]]
+# Row 2 has a masked run of three in the middle and two attended tokens behind it, so its new order is not a
+# rotation of the row either.
+_LEFT_PADDED_INPUT_IDS = [
+    [0, 0, 0, 10, 11, 12, 13, 14],
+    [20, 21, 22, 23, 24, 25, 26, 27],
+    [30, 90, 91, 92, 31, 32, 0, 0],
+]
+_LEFT_PADDED_ATTENTION_MASK = [[0, 0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1], [1, 0, 0, 0, 1, 1, 0, 0]]
+_LEFT_PADDED_LABELS = [
+    [-100, -100, -100, 11, 12, 13, 14, -100],
+    [21, 22, 23, 24, 25, 26, 27, -100],
+    [-100, -100, -100, -100, 32, -100, -100, -100],
+]
 
 
 class _SubMesh:
@@ -316,11 +326,19 @@ def _left_padded_batch() -> dict[str, torch.Tensor]:
 def test_token_order_maps_between_the_loader_and_the_reordered_batch() -> None:
     batch = _left_padded_batch()
     sharder = ContextParallelSharder(None, _DeviceMesh(2), batch)
-    assert batch["input_ids"].tolist() == [[10, 11, 12, 13, 14, 0, 0, 0], _LEFT_PADDED_INPUT_IDS[1]]
+    assert batch["input_ids"].tolist() == [
+        [10, 11, 12, 13, 14, 0, 0, 0],
+        _LEFT_PADDED_INPUT_IDS[1],
+        [30, 31, 32, 90, 91, 92, 0, 0],
+    ]
     # A per-token tensor a recipe built from the loader's batch (here: the next token, as an MTP stream is).
     next_token = torch.roll(torch.tensor(_LEFT_PADDED_INPUT_IDS), shifts=-1, dims=1)
 
-    assert sharder.apply_token_order(next_token).tolist() == [[11, 12, 13, 14, 0, 0, 0, 10], next_token[1].tolist()]
+    assert sharder.apply_token_order(next_token).tolist() == [
+        [11, 12, 13, 14, 0, 0, 0, 10],
+        next_token[1].tolist(),
+        [90, 32, 0, 91, 92, 31, 0, 30],
+    ]
     # A model output of shape [batch, sequence, vocab] computed on the reordered batch.
     logits = torch.nn.functional.one_hot(batch["input_ids"], 100)
     assert sharder.restore_token_order(logits).argmax(-1).tolist() == _LEFT_PADDED_INPUT_IDS
@@ -338,6 +356,23 @@ class _TokenIdTeacher(torch.nn.Module):
     def forward(self, input_ids: torch.Tensor) -> SimpleNamespace:
         """Return one-hot logits of shape [batch, sequence, 100] for ``input_ids`` of shape [batch, sequence]."""
         return SimpleNamespace(logits=torch.nn.functional.one_hot(input_ids, 100).float())
+
+
+class _ReversingSharder(ContextParallelSharder):
+    """The real sharder resolution with a stand-in for the rank split.
+
+    A shard is one token longer than the row and in reverse order, so a caller that treats a shard as the full
+    row in the batch's order gets other tokens.
+    """
+
+    def shard(self, batch: dict[str, torch.Tensor]) -> tuple[type[nullcontext], dict[str, torch.Tensor]]:
+        """Append one padding token to every [batch, sequence] tensor and reverse its sequence axis."""
+        return nullcontext, {key: torch.nn.functional.pad(value, (0, 1)).flip(1) for key, value in batch.items()}
+
+
+def _undo_reversing_shard(logits: torch.Tensor, *, device_mesh: _DeviceMesh, sequence_length: int) -> torch.Tensor:
+    """Stand-in for ``materialize_teacher_logits``: [batch, sequence + 1, vocab] back to the batch's order."""
+    return logits.flip(1)[:, :sequence_length]
 
 
 class _UnshardedSharder(ContextParallelSharder):
@@ -366,13 +401,42 @@ def test_separate_teacher_logits_come_back_in_the_loader_order(
     monkeypatch: pytest.MonkeyPatch, recipe_module: ModuleType, recipe_cls: type
 ) -> None:
     """The student pairs ``teacher_logits[b, i]`` with token ``i`` of its own batch, which is not reordered."""
-    monkeypatch.setattr(recipe_module, "ContextParallelSharder", _UnshardedSharder)
-    monkeypatch.setattr(recipe_module, "materialize_teacher_logits", lambda logits, **kwargs: logits)
+    monkeypatch.setattr(recipe_module, "ContextParallelSharder", _ReversingSharder)
+    monkeypatch.setattr(recipe_module, "materialize_teacher_logits", _undo_reversing_shard)
     recipe = object.__new__(recipe_cls)
     recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
     recipe.device_mesh = _DeviceMesh(2)
     recipe.teacher_model = _TokenIdTeacher()
     recipe.pp_enabled = False
+
+    logits = recipe._teacher_forward_separate(_left_padded_batch())
+
+    assert logits.argmax(-1).tolist() == _LEFT_PADDED_INPUT_IDS
+
+
+@pytest.mark.parametrize("microbatch_size", [1, 2])
+def test_pipeline_teacher_logits_come_back_in_the_loader_order(
+    monkeypatch: pytest.MonkeyPatch, microbatch_size: int
+) -> None:
+    """The pipeline teacher of the LLM recipe returns its logits one microbatch at a time."""
+    teacher = _TokenIdTeacher()
+    teacher._teacher_logits_capture = [None]
+
+    def run_schedule(input_ids: torch.Tensor, **kwargs: torch.Tensor | list[torch.Tensor]) -> None:
+        """Capture the teacher's logits for each microbatch of ``input_ids`` ([batch, local sequence])."""
+        teacher._teacher_logits_capture[0] = [teacher(rows).logits for rows in input_ids.split(microbatch_size)]
+
+    monkeypatch.setattr(llm_kd, "ContextParallelSharder", _ReversingSharder)
+    monkeypatch.setattr(llm_kd, "materialize_teacher_logits", _undo_reversing_shard)
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
+    recipe.device_mesh = _DeviceMesh(2)
+    recipe.teacher_model = teacher
+    recipe.pp_enabled = True
+    recipe.teacher_pp = SimpleNamespace(
+        update_seq_len=lambda sequence_length: None,
+        info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=SimpleNamespace(eval=run_schedule)),
+    )
 
     logits = recipe._teacher_forward_separate(_left_padded_batch())
 
@@ -426,10 +490,19 @@ class _MTPModel(torch.nn.Module):
         return prepare_mtp_context_parallel_inputs(batch, num_depths=1, ignore_index=ignore_index)
 
     def forward(
-        self, input_ids: torch.Tensor, *, mtp_per_depth_input_ids: tuple[torch.Tensor, ...], **kwargs: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        *,
+        mtp_per_depth_input_ids: tuple[torch.Tensor, ...],
+        mtp_per_depth_position_ids: tuple[torch.Tensor, ...],
+        **kwargs: torch.Tensor,
     ) -> SimpleNamespace:
-        """Record ``input_ids`` and the first MTP stream, both of shape [batch, sequence]."""
-        self.seen = {"input_ids": input_ids, "mtp_input_ids": mtp_per_depth_input_ids[0]}
+        """Record ``input_ids`` and the first MTP streams, all of shape [batch, sequence]."""
+        self.seen = {
+            "input_ids": input_ids,
+            "mtp_input_ids": mtp_per_depth_input_ids[0],
+            "mtp_position_ids": mtp_per_depth_position_ids[0],
+        }
         hidden = self.scale * input_ids.float().unsqueeze(-1)
         return SimpleNamespace(
             logits=hidden, mtp_per_depth_h=[hidden], mtp_per_depth_logits=None, mtp_loss_scaling_factor=1.0
@@ -477,5 +550,10 @@ def test_llm_recipe_mtp_streams_follow_the_reordered_batch(monkeypatch: pytest.M
     # At every attended token the MTP stream holds the token after it (0 after the last one) and its label.
     assert model.seen["mtp_input_ids"][0, :4].tolist() == [11, 12, 13, 0]
     assert model.seen["mtp_input_ids"][1].tolist() == [21, 22, 23, 24, 25, 0]
-    assert seen_targets["targets"][0, :4].tolist() == [12, 13, -100, -100]
+    # The row's first token sits at position 2 of the loader's row; each attended token's stream is one ahead.
+    assert model.seen["mtp_position_ids"][0, :3].tolist() == [3, 4, 5]
+    assert model.seen["mtp_position_ids"][1, :5].tolist() == [1, 2, 3, 4, 5]
+    # The padding in front of row 0 was built with the row's first token as its MTP target. Behind the row it
+    # could attend to that token, so it has no target, like right padding.
+    assert seen_targets["targets"][0].tolist() == [12, 13, -100, -100, -100, -100]
     assert seen_targets["targets"][1].tolist() == [22, 23, 24, 25, -100, -100]

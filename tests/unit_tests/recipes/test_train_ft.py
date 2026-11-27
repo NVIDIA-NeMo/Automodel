@@ -3540,6 +3540,8 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     model = _MTPModel()
 
     class _FakeContextParallelSharder:
+        token_order = None
+
         def __init__(self, resolved_model, device_mesh, batch, **kwargs):
             del device_mesh, kwargs
             assert resolved_model is model

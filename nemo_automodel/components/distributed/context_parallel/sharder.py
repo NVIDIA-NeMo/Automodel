@@ -883,9 +883,10 @@ def _take_tokens(tensor: torch.Tensor, token_order: torch.Tensor, seq_dim: int) 
     Returns:
         Tensor of the same shape with every row's tokens in ``token_order``.
     """
-    index_shape = [1] * tensor.ndim
-    index_shape[seq_dim - 1 : seq_dim + 1] = token_order.shape
-    return torch.take_along_dim(tensor, token_order.reshape(index_shape).to(tensor.device), dim=seq_dim)
+    token_order = token_order.to(tensor.device)
+    rows = torch.arange(token_order.shape[0], device=tensor.device).unsqueeze(1)
+    # Indexing the batch and sequence axes together needs no index of the tensor's full shape.
+    return tensor[(slice(None),) * (seq_dim - 1) + (rows, token_order)]
 
 
 def move_masked_tokens_behind_attended(
