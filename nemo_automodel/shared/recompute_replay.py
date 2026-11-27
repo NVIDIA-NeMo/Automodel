@@ -34,8 +34,8 @@ process-global, per-gate registry.
 
 from __future__ import annotations
 
+import copy
 import threading
-from collections import defaultdict
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from typing import Any, Generic, TypeVar
@@ -120,9 +120,9 @@ class ReenterableContext(ExitStack):
 class _ReplayableSelectiveRecompute(AbstractContextManager):
     """Recompute half of a selective-checkpoint pair that serves the saved outputs on every recompute.
 
-    PyTorch's recompute mode pops each saved op output as it serves it, so a region whose backward
-    runs in two passes finds the storage empty on the second recompute ("Trying to backward an
-    extra time"). Each entry serves from a fresh copy of the lists the forward filled; the outputs
+    PyTorch's recompute mode consumes each saved op output as it serves it, so a region whose
+    backward runs in two passes finds it consumed on the second recompute ("Trying to backward an
+    extra time"). Each entry serves from a fresh copy of the storage the forward filled; the outputs
     themselves are shared, not copied.
     """
 
@@ -131,7 +131,12 @@ class _ReplayableSelectiveRecompute(AbstractContextManager):
         self._forward_storage = recompute_mode.storage
 
     def __enter__(self) -> Any:
-        self._mode.storage = defaultdict(list, {op: list(outs) for op, outs in self._forward_storage.items()})
+        # Shallow copies at both levels: PyTorch keeps a per-op list (popped) or a per-op dict of
+        # entries (marked consumed) depending on the version; the saved tensors are shared.
+        storage = copy.copy(self._forward_storage)
+        for op in storage:
+            storage[op] = copy.copy(storage[op])
+        self._mode.storage = storage
         return self._mode.__enter__()
 
     def __exit__(self, *exc_info: Any) -> Any:
