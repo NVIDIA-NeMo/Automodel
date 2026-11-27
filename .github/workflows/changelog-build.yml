@@ -45,7 +45,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repo: ${{ github.event.repository.name }}
           ignorePreReleases: "false"
-          failOnError: "false"
+          failOnError: "true"
           fromTag: ${{ inputs.last-release-tag }}
           toTag: ${{ inputs.release-branch }}
 

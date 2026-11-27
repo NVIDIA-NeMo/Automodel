@@ -45,6 +45,15 @@ def test_limit_legacy_secrets_to_existing_integrations() -> None:
                     assert (file.name, name) in permitted[secret], (file.name, name, secret)
 
 
+def test_changelog_requires_successful_compare_of_requested_refs() -> None:
+    """Prevent a failed comparison from opening a changelog pull request."""
+    workflow = yaml.safe_load((WORKFLOWS / "changelog-build.yml").read_text())
+    step = next(step for step in workflow["jobs"]["changelog"]["steps"] if step["name"] == "Build Changelog")
+    assert step["with"]["failOnError"] == "true"
+    assert step["with"]["fromTag"] == "${{ inputs.last-release-tag }}"
+    assert step["with"]["toTag"] == "${{ inputs.release-branch }}"
+
+
 @pytest.mark.parametrize("current_head", [True, False])
 def test_guardwords_uses_only_the_current_mirror(tmp_path: Path, current_head: bool) -> None:
     """Only submit the reviewed PR's public metadata to the catalog-scanning job."""
