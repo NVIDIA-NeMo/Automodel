@@ -1577,6 +1577,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return _exp_time.perf_counter()
 
         _exp_t0 = _exp_t()
+        # EXPERIMENT ONLY: profile one steady-state step on the first and last global rank.
+        import torch.distributed as _exp_dist
+
+        _exp_step = getattr(self, "_exp_step_counter", 0)
+        self._exp_step_counter = _exp_step + 1
+        _exp_rank = _exp_dist.get_rank() if _exp_dist.is_initialized() else 0
+        _exp_world = _exp_dist.get_world_size() if _exp_dist.is_initialized() else 1
+        _exp_prof = None
+        if _exp_step == 20 and _exp_rank in (0, _exp_world - 1):
+            _exp_prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+            )
+            _exp_prof.__enter__()
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         # All three counts are needed as Python integers. Reduce and read them in one
         # transfer so the later counts do not add more collectives and device syncs.
@@ -1714,6 +1727,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         reporting_loss = reporting_loss.cpu().item()
         _exp_t5 = _exp_t()
+        if _exp_prof is not None:
+            _exp_prof.__exit__(None, None, None)
+            _exp_ka = _exp_prof.key_averages()
+            _exp_cuda_total = sum(e.self_device_time_total for e in _exp_ka) / 1e6
+            print(
+                f"EXP_PROFILE rank={_exp_rank} wall={_exp_t5 - _exp_t0:.3f}s self_cuda_sum={_exp_cuda_total:.3f}s",
+                flush=True,
+            )
+            print(
+                _exp_ka.table(sort_by="self_device_time_total", row_limit=45, max_name_column_width=70),
+                flush=True,
+            )
         logging.info(
             "EXP_PHASES pre=%.3f fwdbwd=%.3f clip=%.3f optim=%.3f misc=%.3f report=%.3f total=%.3f",
             _exp_t0 and 0.0,
