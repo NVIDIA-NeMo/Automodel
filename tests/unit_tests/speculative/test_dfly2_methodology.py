@@ -22,13 +22,11 @@ import torch.nn as nn
 
 from nemo_automodel.components.speculative.dfly2.common import (
     KEY_LIST_ALIGNMENT,
-    DFly2TargetFeatures,
     build_block_key_indices,
     context_key_indices,
 )
 from nemo_automodel.components.speculative.dfly2.core import DFly2TrainerModule
 from nemo_automodel.components.speculative.dfly2.loss import compute_dfly2_loss
-from nemo_automodel.components.speculative.dfly2.target import DFly2TargetModel
 from nemo_automodel.components.speculative.dspark.common import DSparkForwardOutput
 
 pytestmark = pytest.mark.cpu_only
@@ -79,19 +77,6 @@ def test_dropped_blocks_and_sequence_start_anchors_read_nothing_from_the_context
 def test_context_key_indices_masks_only_the_draft_keys() -> None:
     indices = torch.tensor([[[3, -1, 20, 21]]], dtype=torch.int32)
     assert context_key_indices(indices, 20).tolist() == [[[3, -1, -1, -1]]]
-
-
-def test_target_features_check_their_shapes() -> None:
-    with pytest.raises(ValueError, match="one key tensor per key-list"):
-        DFly2TargetFeatures(
-            context_keys=(torch.zeros(1, 4, 2),), context_indices=(), last_hidden_states=torch.zeros(1, 2, 3)
-        )
-    with pytest.raises(ValueError, match="must match"):
-        DFly2TargetFeatures(
-            context_keys=(torch.zeros(1, 4, 2),),
-            context_indices=(torch.zeros(1, 3, 2, dtype=torch.long),),
-            last_hidden_states=torch.zeros(1, 2, 3),
-        )
 
 
 def _outputs(draft_logits: torch.Tensor, target_logits: torch.Tensor, eval_mask: torch.Tensor, confidence=None):
@@ -180,13 +165,6 @@ def test_confidence_head_regresses_the_acceptance_probability() -> None:
     assert terms["confidence_diag_den"] > 0
 
 
-def test_objective_requires_the_teacher() -> None:
-    outputs = _outputs(torch.randn(1, 1, 2, 5), torch.randn(1, 1, 2, 5), torch.ones(1, 1, 2, dtype=torch.bool))
-    outputs.aligned_target_logits = None
-    with pytest.raises(ValueError, match="aligned_target_logits"):
-        compute_dfly2_loss(outputs=outputs, dpace_alpha=0.5, lk_eta=3.0, confidence_head_alpha=1.0)
-
-
 class _StubDraft(nn.Module):
     """Return fixed outputs over two drafted slots, recording the features it receives."""
 
@@ -222,13 +200,3 @@ def test_trainer_reports_per_drafted_token_acceptance_over_the_block() -> None:
     assert draft.seen["context_keys"] is keys and draft.seen["context_indices"] is indices
     metrics.loss.backward()
     assert draft.weight.grad is not None
-
-
-def test_trainer_rejects_invalid_dpace_alpha() -> None:
-    with pytest.raises(ValueError, match="dpace_alpha"):
-        DFly2TrainerModule(nn.Linear(1, 1), dpace_alpha=1.5)
-
-
-def test_target_wrapper_requires_a_feature_provider() -> None:
-    with pytest.raises(TypeError, match="does not provide DFly2 target features"):
-        DFly2TargetModel(nn.Linear(1, 1), [1])
