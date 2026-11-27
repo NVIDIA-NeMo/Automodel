@@ -46,6 +46,7 @@ model:
     rope_fusion: true
     experts: te
     dispatcher: hybridep
+    dispatcher_num_sms: 48  # HybridEP dispatch/combine SMs (default 20)
     dispatcher_equal_token_counts: true  # fixed-length mock batches: every EP rank dispatches the same rows
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
