@@ -29,7 +29,6 @@ import gc
 import inspect
 import logging
 import pathlib
-import time
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -86,6 +85,13 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     end_mlflow_active_run_as_killed,
     to_float_metrics,
 )
+from nemo_automodel.components.loggers.step_metrics import (
+    StepMetricReducer,
+    TrainingStepReporter,
+    restore_moe_metrics,
+    snapshot_moe_metrics,
+    write_remote_step_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
@@ -119,6 +125,7 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     FreezeConfig,
     _supports_logits_to_keep,
@@ -489,6 +496,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     domain_mixture = None
     # Tokens per pack when sequence packing is on; setup() sets it.
     pack_size = None
+    _pending_end_to_end_tps: float | None = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -905,12 +913,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "checkpoint.best_metric_key",
             WEIGHTED_AGGREGATE_NAME if self.domain_mixture is not None else "default",
         )
+        # Keep preemption and streaming availability checks off the CUDA stream.
+        scheduler_group = getattr(self, "_training_process_group", None)
+        self._step_control_group = None
+        if torch.distributed.is_initialized() and scheduler_group is None and self.dist_env.device.type == "cuda":
+            self._step_control_group = torch.distributed.new_group(backend="gloo")
+            scheduler_group = self._step_control_group
+
         # Scheduler — typed configs from RecipeConfig, built with runtime args here.
         self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
             self.cfg.get("step_scheduler.local_batch_size", 1),
-            process_group=getattr(self, "_training_process_group", None),
+            process_group=scheduler_group,
         )
         self._setup_garbage_collection(self.step_scheduler)
 
@@ -999,35 +1014,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             all_loads.update(collect_expert_loads(mp, dp_group=dp_group))
         self._moe_layer_loads = all_loads if all_loads else None
 
-    def _log_moe_metrics(self, step: int, wandb_log_fn) -> None:
-        """Log MoE load balance metrics to wandb.
-
-        Call after :meth:`_collect_moe_load_balance`.  Only logs when
-        ``_moe_layer_loads`` is populated and a wandb log function is provided.
-
-        Args:
-            step: Current training/benchmark step for wandb x-axis.
-            wandb_log_fn: Callable like ``wandb.log`` or ``wandb_run.log``.
-        """
-        if not getattr(self, "_moe_layer_loads", None):
-            return
+    def _compute_moe_metrics(self, step: int) -> dict[str, float]:
+        """Build remote load balance metrics for the given step's logging cadence."""
+        loads = getattr(self, "_moe_layer_loads", None)
+        if not loads:
+            return {}
 
         from nemo_automodel.components.moe.load_balance_metrics import (
             compute_brief_metrics,
             compute_detailed_metrics,
         )
 
-        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
-        mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
-        top_k = moe_metrics_cfg.get("top_k_experts", 0) if moe_metrics_cfg else 0
-        if mode == "detailed":
-            detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
-            if detailed_every is None or step % detailed_every == 0:
-                wandb_log_fn(compute_detailed_metrics(self._moe_layer_loads, top_k=top_k), step=step)
-            else:
-                wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
-        else:
-            wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+        config = self.cfg.get("moe_metrics") or {}
+        every = config.get("detailed_every_steps")
+        detailed = config.get("mode") == "detailed" and (every is None or step % every == 0)
+        compute = compute_detailed_metrics if detailed else compute_brief_metrics
+        return compute(loads, top_k=config.get("top_k_experts", 0))
 
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
@@ -1143,11 +1145,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         for mp in self.model_parts:
             mp.train()
-        self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
         train_log_data = None
         last_validation_step = None
+        reporter = self._training_step_reporter()
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
@@ -1157,18 +1159,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 for batches in self.step_scheduler:
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
+                    start = reporter.mark()
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    end = reporter.mark()
                     # Capture outside the microbatch loop and only after the
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
                     if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
                         self.partial_cuda_graph_manager.capture()
                         self._partial_cuda_graph_capture_pending = False
-                    # Collect MoE load balance metrics (all ranks participate in all-reduce)
-                    self._collect_moe_load_balance()
-                    # log
-                    self.log_train_metrics(train_log_data)
-                    self._update_progress_bar(pbar, train_log_data.metrics)
+                    remote_log = self.step_scheduler.is_remote_logging_step
+                    if remote_log:
+                        self._snapshot_moe_metrics(train_log_data)
+                    reporter.enqueue(train_log_data, start=start, end=end, remote_log=remote_log)
+                    if self.dist_env.is_main and self.dist_env.device.type == "cuda":
+                        torch.cuda.reset_peak_memory_stats()
+                    self._emit_train_metrics(
+                        reporter, pbar, wait=self.step_scheduler.is_val_step or self.step_scheduler.is_ckpt_step
+                    )
 
                     # Run validation every val_every_steps
                     val_losses = {}
@@ -1186,6 +1194,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
+            self._emit_train_metrics(reporter, pbar, wait=True)
             if self.step_scheduler.stream_exhausted and train_log_data is not None:
                 completed_step = self.step_scheduler.step - 1
                 if last_validation_step != completed_step:
@@ -1200,6 +1209,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     best_metric_key=self.best_metric_key,
                 )
         finally:
+            reporter.close()
+            self._close_step_control_group()
             close_dataloader(self.dataloader)
             for loader in self.val_dataloaders.values():
                 close_dataloader(loader)
@@ -1569,57 +1580,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
-        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        # All three counts are needed as Python integers. Reduce and read them in one
-        # transfer so the later counts do not add more collectives and device syncs.
-        # The second count is the number of tokens in the batch, excluding any tail padding,
-        # and the third is the number of packs (one per row) when packing.
-        token_counts = torch.tensor(
-            [
-                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
-            ],
-            dtype=torch.long,
+        reducer = self._step_metric_reducer()
+        counts = reducer.token_counts(
+            batches, ignore_index=_get_loss_ignore_index(getattr(self, "loss_fn", None)), pack_size=self.pack_size or 0
         )
-        num_label_tokens, num_tokens_in_batch, num_packs = self._dp_allreduce(token_counts).tolist()
-
         domain_label_counts = None
         if self.domain_mixture is not None:
-            # This runs between two data-parallel collectives, so a rank-local
-            # raise would leave every peer blocked in all_reduce until the NCCL
-            # watchdog fires. Collect the failure instead and all-reduce a flag so
-            # all ranks abort together, on the same step, with a real traceback.
-            # This also validates every microbatch up front, letting the
-            # per-microbatch weighting skip its bounds-check syncs.
-            ignore_index = getattr(self.loss_fn, "ignore_index", -100)
-            domain_label_counts = torch.zeros(len(self.domain_mixture.names), dtype=torch.long)
-            local_error = ""
-            try:
-                for batch in batches:
-                    dataset_ids = batch.get("dataset_id")
-                    if dataset_ids is None:
-                        raise ValueError(
-                            "domain_mixture requires each training batch to contain dataset_id; "
-                            "use a blended dataset that emits one ID per sample"
-                        )
-                    domain_label_counts += self.domain_mixture.label_counts(
-                        dataset_ids, batch["labels"], ignore_index=ignore_index
-                    ).cpu()
-            except (TypeError, ValueError) as exc:
-                local_error = f"{type(exc).__name__}: {exc}"
-                domain_label_counts.zero_()
-            failed = self._dp_allreduce(torch.tensor(1 if local_error else 0, dtype=torch.long)).item()
-            if failed:
-                raise ValueError(
-                    local_error
-                    or "domain_mixture rejected the dataset_id of another data-parallel rank's batch; "
-                    "see that rank's log for the specific error"
-                )
-            domain_label_counts = self._dp_allreduce(domain_label_counts)
+            domain_label_counts = reducer.domain_counts(
+                batches, mixture=self.domain_mixture, ignore_index=getattr(self.loss_fn, "ignore_index", -100)
+            )
 
         num_batches = len(batches)
-        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=counts.labels)
 
         loss_buffer = []
 
@@ -1630,7 +1602,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
             self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                i, batch, loss_buffer=loss_buffer, num_label_tokens=counts.labels, num_batches=num_batches
             )
 
             if i == 0:
@@ -1649,7 +1621,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_label_tokens,
+            num_label_tokens=counts.labels,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
             grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
@@ -1687,50 +1659,64 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
-        tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
-
-        reporting_loss = torch.sum(torch.stack(loss_buffer))
-        if self.pp_enabled:
-            # The last stage's CE may be bf16, while other stages contribute
-            # fp32 zeros. Every PP broadcast participant needs the same dtype.
-            reporting_loss = reporting_loss.float()
-        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-        if self.pp_enabled:
-            reporting_loss = reporting_loss / num_label_tokens
-            reporting_loss = reporting_loss.to(self.dist_env.device)
-            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
-
-        reporting_loss = reporting_loss.cpu().item()
-        # fix reporting_loss, tps across ranks
-
+        step_flops = reducer.flops(batches, self.mfu_calculator)
+        reporting_loss = reducer.loss(loss_buffer, normalize_by=counts.labels if self.pp_enabled else None)
         metrics = {
             "loss": reporting_loss,
             "grad_norm": grad_norm,
             "lr": self.optimizer[0].param_groups[0]["lr"],
             "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            "tps": tps,
-            # tps is global tokens/sec (num_tokens_in_batch is summed over
-            # the DP group), so per-GPU must divide by the full world size.
-            # Dividing by dp*cp alone inflates it by the pp (and tp) factor.
-            "tps_per_gpu": tps / max(self.dist_env.world_size, 1),
-            "mfu": mfu,
-            "num_tokens_per_step": num_tokens_in_batch,
-            "num_label_tokens": num_label_tokens,
+            "_step_flops": step_flops,
+            "num_tokens_per_step": counts.tokens,
+            "num_label_tokens": counts.labels,
         }
         if self.pack_size:
-            # Share of the step's pack capacity holding tokens rather than padding.
-            metrics["pack_fill"] = num_tokens_in_batch / (num_packs * self.pack_size)
+            metrics["_num_packs"] = counts.packs
         if domain_label_counts is not None:
-            total_domain_labels = max(int(domain_label_counts.sum().item()), 1)
-            for name, count in zip(self.domain_mixture.names, domain_label_counts.tolist()):
-                metrics[f"domain_mixture/{name}_label_tokens"] = count
-                metrics[f"domain_mixture/{name}_label_fraction"] = count / total_domain_labels
+            metrics["_domain_label_counts"] = domain_label_counts
 
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics=metrics,
         )
+
+    def _close_step_control_group(self) -> None:
+        if getattr(self, "_step_control_group", None) is not None:
+            torch.distributed.destroy_process_group(self._step_control_group)
+            self._step_control_group = None
+
+    def _step_metric_reducer(self) -> StepMetricReducer:
+        return StepMetricReducer(
+            device=self.dist_env.device,
+            dp_reduce=self._dp_allreduce,
+            count_label_tokens=_count_label_tokens,
+            count_tail_padding=count_tail_padding,
+            pp_broadcast=self._broadcast_from_last_pp_stage if self.pp_enabled else None,
+            control_group=getattr(self, "_step_control_group", None),
+        )
+
+    def _training_step_reporter(self) -> TrainingStepReporter:
+        return TrainingStepReporter(
+            self.dist_env.device,
+            world_size=self.dist_env.world_size,
+            pack_size=self.pack_size or 0,
+            domain_names=getattr(getattr(self, "domain_mixture", None), "names", ()),
+            reference_mfu=self.mfu_calculator.reference_mfu if self.mfu_calculator is not None else None,
+            calculate_mfu=calculate_mfu,
+            # Separate-mesh distillation trains on the student ranks only.
+            process_group=getattr(self, "_training_process_group", None),
+        )
+
+    def _snapshot_moe_metrics(self, sample: MetricsSample) -> None:
+        self._collect_moe_load_balance()
+        snapshot_moe_metrics(sample, self._moe_layer_loads or {})
+
+    def _emit_train_metrics(self, reporter: TrainingStepReporter, pbar, *, wait: bool) -> None:
+        for sample, remote_log, _ in reporter.poll(wait=wait):
+            self._moe_layer_loads = restore_moe_metrics(sample)
+            self.log_train_metrics(sample, remote_log=remote_log)
+            self._update_progress_bar(pbar, sample.metrics)
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
@@ -1954,7 +1940,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         )
 
-    def log_train_metrics(self, log_data):
+    def _remote_train_metrics(self, sample: MetricsSample, remote_log: bool | None) -> dict[str, Any] | None:
+        """Include the latest measured throughput window in the next scheduled remote payload."""
+        if "end_to_end_tps" in sample.metrics:
+            self._pending_end_to_end_tps = sample.metrics["end_to_end_tps"]
+        should_log = self.step_scheduler.is_remote_logging_step if remote_log is None else remote_log
+        if not should_log:
+            return None
+        metrics = sample.to_dict()
+        if self._pending_end_to_end_tps is not None:
+            metrics["end_to_end_tps"] = self._pending_end_to_end_tps
+            self._pending_end_to_end_tps = None
+        return metrics
+
+    def log_train_metrics(self, log_data: MetricsSample, *, remote_log: bool | None = None) -> None:
         """Log metrics to wandb and other loggers.
 
         Args:
@@ -1966,40 +1965,32 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "grad_norm": Grad norm from the training step.
                     "lr": Learning rate.
                     "mem": Memory allocated.
-                    "tps": Tokens per second.
-                    "tps_per_gpu": Tokens per second per GPU.
+                    "tps": Tokens per second over the step's span, which excludes the time
+                        between steps (data loading, logging). "end_to_end_tps" includes it and
+                        is measured over windows of at least 20 completed steps.
+                    "tps_per_gpu": Tokens per second per GPU over the same span; "mfu" uses it too.
                     "num_label_tokens": Number of label tokens.
                     "pack_fill": Share of pack capacity holding tokens; present only with sequence packing.
+            remote_log: Saved logging cadence for an asynchronous sample.
         """
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, Trackio, MLflow, Comet) according to step_scheduler frequency
-        trackio_logger = getattr(self, "trackio_logger", None)
-        if self.step_scheduler.is_remote_logging_step:
+        remote_metrics = self._remote_train_metrics(log_data, remote_log)
+        if remote_metrics is not None:
+            sinks = []
+            trackio_logger = getattr(self, "trackio_logger", None)
             if _HAS_WANDB and wandb.run is not None:
-                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+                sinks.append(wandb.log)
             if trackio_logger is not None:
-                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
-            if _HAS_MLFLOW and mlflow.active_run() is not None:
-                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
+                sinks.append(trackio_logger.log_metrics)
             if self.comet_logger is not None:
-                self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
-
-        # Log MoE load balance metrics (already collected/reduced on all ranks)
-        if self.step_scheduler.is_remote_logging_step:
-            if _HAS_WANDB and wandb.run is not None:
-                self._log_moe_metrics(self.step_scheduler.step, wandb.log)
-            if trackio_logger is not None:
-                self._log_moe_metrics(self.step_scheduler.step, trackio_logger.log_metrics)
-            if self.comet_logger is not None:
-                self._log_moe_metrics(
-                    self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
-                )
+                sinks.append(self.comet_logger.log_metrics)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
-                self._log_moe_metrics(
-                    self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
-                )
+                sinks.append(lambda metrics, step: mlflow.log_metrics(to_float_metrics(metrics), step=step))
+            write_remote_step_metrics(
+                step=log_data.step, metrics=remote_metrics, sinks=sinks, moe_metrics=self._compute_moe_metrics
+            )
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
@@ -2020,7 +2011,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["mfu"],
             )
         )
-        torch.cuda.reset_peak_memory_stats()
 
 
 # ---------------------------------------------------------------------------

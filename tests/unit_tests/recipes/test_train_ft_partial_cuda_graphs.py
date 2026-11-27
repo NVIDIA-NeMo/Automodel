@@ -15,9 +15,11 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
 from torch import nn
 
 import nemo_automodel.components.cuda_graphs.partial as partial_graphs
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.models.common import BackendConfig, CudaGraphConfig
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
@@ -75,6 +77,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
         is_val_step = False
         is_ckpt_step = False
         sigterm_flag = False
+        is_remote_logging_step = False
         stream_exhausted = False
 
         def set_epoch(self, epoch):
@@ -90,6 +93,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
         close=lambda: events.append("close"),
     )
     recipe = _bare_recipe()
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
     recipe.model_parts = [nn.Linear(2, 2)]
     recipe.dataloader = SimpleNamespace(close=lambda: events.append("loader-close"))
     recipe.step_scheduler = _TwoStepScheduler()
@@ -98,10 +102,11 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
     recipe._partial_cuda_graph_capture_pending = True
     recipe._enable_qat_if_delayed = lambda _step: None
     recipe._run_train_optim_step = lambda batches, _norm: (
-        events.append(("train-step", tuple(batches))) or SimpleNamespace(metrics={"loss": 1.0})
+        events.append(("train-step", tuple(batches)))
+        or MetricsSample(step=recipe.step_scheduler.step, epoch=0, metrics={"loss": 1.0, "num_tokens_per_step": 4})
     )
     recipe._collect_moe_load_balance = lambda: None
-    recipe.log_train_metrics = lambda _metrics: None
+    recipe.log_train_metrics = lambda _metrics, **_kwargs: None
     recipe._update_progress_bar = lambda _pbar, _metrics: None
     recipe._make_progress_bar = lambda: SimpleNamespace(close=lambda: events.append("progress-close"))
     recipe.val_dataloaders = {}

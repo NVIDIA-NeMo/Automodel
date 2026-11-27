@@ -134,3 +134,4 @@ paths = ["nemo_automodel", "examples"]
 "nemo_automodel/components/loggers/loggers.py:_patch_mirror_values.log_builtin_scalars:args" = "Extra positional arguments pass unchanged to the WandB Run.log hook, whose SDK version owns their contract."
 "nemo_automodel/components/loggers/loggers.py:_patch_mirror_values.log_builtin_scalars:kwargs" = "Extra keyword arguments pass unchanged to the WandB Run.log hook, whose SDK version owns their contract."
 "nemo_automodel/components/loggers/loggers.py:_patch_mirror_values.log_strings_as_text:data" = "The SwanLab SDK owns rich metric value schemas. The mirror wraps strings as text and otherwise forwards values unchanged."
+"nemo_automodel/components/loggers/step_metrics.py:write_remote_step_metrics:metrics" = "The step record is forwarded unchanged to the configured remote sinks (WandB, Trackio, Comet, MLflow), whose SDKs own the metric value schemas."

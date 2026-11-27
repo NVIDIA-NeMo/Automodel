@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.loss.token_normalization import normalize_token_loss
 from nemo_automodel.components.loss.utils import _normalize_loss_labels
 
 
@@ -43,7 +44,7 @@ class MaskedCrossEntropy(nn.Module):
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: torch.Tensor | None = None,
-        num_label_tokens: int | None = None,
+        num_label_tokens: int | torch.Tensor | None = None,
         loss_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
@@ -60,7 +61,7 @@ class MaskedCrossEntropy(nn.Module):
                 of the loss. Defaults to None. ``labels`` is not modified in place:
                 masked positions are written to an internal copy, so the caller's
                 tensor is safe to reuse for another loss term or another mask.
-            num_label_tokens: Optional global supervised-token count used to
+            num_label_tokens: Optional global supervised-token count as an integer or a device scalar used to
                 normalize a sum-reduced loss.
             loss_weights: Optional per-token multipliers with the same shape as
                 ``labels``. Only supported with ``reduction="sum"``.
@@ -107,7 +108,5 @@ class MaskedCrossEntropy(nn.Module):
         if num_label_tokens is not None:
             if self.reduction != "sum":
                 raise ValueError("num_label_tokens is only supported when reduction is 'sum'")
-            if num_label_tokens == 0:
-                return loss * 0.0
-            loss = loss / num_label_tokens
+            loss = normalize_token_loss(loss, num_label_tokens)
         return loss

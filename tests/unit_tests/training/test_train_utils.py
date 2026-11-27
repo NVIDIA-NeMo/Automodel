@@ -726,6 +726,44 @@ class TestScaleGradsAndClipGradNorm:
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
 
 
+_needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+
+
+def _linear_with_gradients(dtype: torch.dtype, device: str) -> nn.Linear:
+    torch.manual_seed(0)
+    model = nn.Linear(8, 4).to(device=device, dtype=dtype)
+    for parameter in model.parameters():
+        parameter.grad = torch.randn_like(parameter) * 3
+    return model
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("count", [0, 6, 1_000_003])
+@pytest.mark.parametrize(
+    ("grad_device", "count_device"),
+    [
+        ("cpu", "cpu"),
+        pytest.param("cuda", "cuda", marks=_needs_cuda),
+        # FSDP2 CPUOffloadPolicy keeps gradients on the host while the count stays on the device.
+        pytest.param("cpu", "cuda", marks=_needs_cuda),
+    ],
+)
+def test_pp_scaling_by_a_count_tensor_matches_the_integer_count(dtype, count, grad_device, count_device):
+    """The deferred-metrics step passes its PP token count as a device scalar instead of an int."""
+    expected, actual = _linear_with_gradients(dtype, grad_device), _linear_with_gradients(dtype, grad_device)
+    common = {"max_grad_norm": None, "pp_enabled": True, "dp_group_size": 4}
+    scale_grads_and_clip_grad_norm(model_parts=[expected], num_label_tokens=count, **common)
+    scale_grads_and_clip_grad_norm(
+        model_parts=[actual], num_label_tokens=torch.tensor(count, device=count_device), **common
+    )
+
+    # On CPU the integer path divides while the tensor path multiplies by the reciprocal, so the
+    # results may differ by one ulp; on CUDA both multiply and must agree exactly.
+    rtol = 0.0 if grad_device == "cuda" else torch.finfo(dtype).eps
+    for want, got in zip(expected.parameters(), actual.parameters(), strict=True):
+        torch.testing.assert_close(got.grad, want.grad, rtol=rtol, atol=0.0)
+
+
 @pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
 @pytest.mark.parametrize("transposed", [False, True])
 def test_clip_large_gradient_matches_dense_float64_reference(norm_type, transposed):

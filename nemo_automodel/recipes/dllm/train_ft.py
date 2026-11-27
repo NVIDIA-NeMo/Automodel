@@ -588,7 +588,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
+        # The inherited training loop's reporter derives tps, tps_per_gpu and mfu from the
+        # step span, num_tokens_per_step and _step_flops.
+        step_flops = self._step_metric_reducer().flops(batches, self.mfu_calculator)
 
         total_loss = torch.sum(torch.stack(loss_buffer))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()
@@ -625,14 +627,14 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             "grad_norm": grad_norm,
             "lr": self.optimizer[0].param_groups[0]["lr"],
             "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            "tps": tps,
-            "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
-            "mfu": mfu,
             "tokens_per_step": num_tokens_in_batch,
+            "num_tokens_per_step": num_tokens_in_batch,
             "supervised_tokens": num_supervised_tokens,
             "draft_acc": draft_acc,
             "mode": self.dllm_mode,
         }
+        if step_flops is not None:
+            metrics["_step_flops"] = step_flops
         if draft_acc_per_pos is not None:
             for k, v in enumerate(draft_acc_per_pos, start=1):
                 metrics[f"draft_acc_k{k}"] = v
@@ -715,8 +717,14 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             },
         )
 
-    def log_train_metrics(self, log_data):
-        """Log dLLM-specific training metrics."""
+    def log_train_metrics(self, log_data: MetricsSample, *, remote_log: bool | None = None) -> None:
+        """Log dLLM-specific training metrics.
+
+        Args:
+            log_data: Completed step sample.
+            remote_log: Saved logging cadence for a sample reported after its step. None means
+                the step scheduler's current step.
+        """
         if not self.dist_env.is_main:
             return
 
@@ -730,19 +738,22 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             {k: float(v) for k, v in log_data.metrics.items() if isinstance(v, (int, float))}
         )
 
-        if self.step_scheduler.is_remote_logging_step:
+        should_log_remotely = self.step_scheduler.is_remote_logging_step if remote_log is None else remote_log
+        if should_log_remotely:
             # Window mean of each numeric metric (Loss/Train_Total, Loss/Train_DLLM,
-            # grad_norm, lr, ...) since the last remote log.
-            _win = self._remote_log_window
-            remote_metrics = {
-                k: sum(d[k] for d in _win) / len(_win) for k in _win[0] if k not in ("step", "epoch", "timestamp")
-            }
+            # grad_norm, lr, ...) since the last remote log. Some metrics, such as
+            # end_to_end_tps, are present only on some steps; each averages its own steps.
+            totals: dict[str, list[float]] = {}
+            for entry in self._remote_log_window:
+                for k, v in entry.items():
+                    totals.setdefault(k, []).append(v)
+            remote_metrics = {k: sum(v) / len(v) for k, v in totals.items() if k not in ("step", "epoch", "timestamp")}
             self._remote_log_window = []
             if _HAS_WANDB and wandb.run is not None:
-                wandb.log(remote_metrics, step=self.step_scheduler.step)
+                wandb.log(remote_metrics, step=log_data.step)
             trackio_logger = getattr(self, "trackio_logger", None)
             if trackio_logger is not None:
-                trackio_logger.log_metrics(remote_metrics, step=self.step_scheduler.step)
+                trackio_logger.log_metrics(remote_metrics, step=log_data.step)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(remote_metrics), step=log_data.step)
             if self.comet_logger is not None:

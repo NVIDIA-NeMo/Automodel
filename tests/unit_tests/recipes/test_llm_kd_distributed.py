@@ -92,7 +92,6 @@ def _make_recipe(model, device_mesh, moe_mesh):
     recipe.lr_scheduler = None
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = {}
-    recipe.timestamp = time.perf_counter() - 1.0
     recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
     recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
     recipe.kd_ratio = 0.5
@@ -123,6 +122,23 @@ def single_rank_gloo():
         yield
     finally:
         dist.destroy_process_group()
+
+
+def test_llm_kd_reporter_uses_student_group(monkeypatch, single_rank_gloo):
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1)
+    recipe.pack_size = 0
+    recipe.mfu_calculator = None
+    recipe._training_process_group = dist.new_group(ranks=[0])
+    get_ranks = Mock(wraps=dist.get_process_group_ranks)
+    monkeypatch.setattr(dist, "get_process_group_ranks", get_ranks)
+
+    try:
+        reporter = recipe._training_step_reporter()
+        reporter.close()
+        get_ranks.assert_called_once_with(recipe._training_process_group)
+    finally:
+        dist.destroy_process_group(recipe._training_process_group)
 
 
 def test_llm_kd_non_pp_step_clips_gradients_across_device_meshes(single_rank_gloo):
@@ -198,6 +214,8 @@ def test_llm_kd_pp_step_undoes_expert_tp_replication(single_rank_gloo):
 
     recipe = _make_recipe(model, device_mesh, expert_mesh)
     recipe.pp_enabled = True
+    # KD's own pipeline-parallel loop starts this step timer; the shared loop no longer does.
+    recipe.timestamp = time.perf_counter() - 1.0
     recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True)
     recipe._forward_backward_step_pp = Mock(

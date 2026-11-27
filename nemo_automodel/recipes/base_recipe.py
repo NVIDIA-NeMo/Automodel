@@ -868,21 +868,35 @@ class BaseRecipe:
             return 1
         return device_mesh["cp"].size()
 
-    def _set_moe_aux_loss_backward_scale(self, *, num_batches: int, num_label_tokens: int) -> None:
+    def _set_moe_aux_loss_backward_scale(self, *, num_batches: int, num_label_tokens: int | torch.Tensor) -> None:
         """Set the per-microbatch MoE auxiliary-loss scale for one optimizer step.
 
         The base scale averages accumulation microbatches and restores the CP
         sum lost in the flattened DP-CP gradient average. PP additionally needs
         to compensate for its post-backward token normalization.
+
+        Args:
+            num_batches: Number of accumulation batches in the optimizer step.
+            num_label_tokens: Global supervised-token count as an integer or device scalar.
         """
         num_model_microbatches = num_batches
         if self.pp_enabled:
             num_model_microbatches *= self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         scale = self._get_cp_group_size() / num_model_microbatches
-        if self.pp_enabled and num_label_tokens > 0:
-            scale *= num_label_tokens / self._get_dp_group_size(include_cp=True)
-        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(scale)
+        if isinstance(num_label_tokens, torch.Tensor):
+            if self.pp_enabled:
+                scaled = (scale * (num_label_tokens.double() / self._get_dp_group_size(include_cp=True))).to(
+                    torch.get_default_dtype()
+                )
+                scale = torch.where(num_label_tokens > 0, scaled, scale)
+            else:
+                scale = torch.full_like(num_label_tokens, scale, dtype=torch.get_default_dtype())
+            MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            if self.pp_enabled and num_label_tokens > 0:
+                scale *= num_label_tokens / self._get_dp_group_size(include_cp=True)
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(scale)
 
     def _get_dp_rank(self, include_cp: bool = False):
         device_mesh = getattr(self, "device_mesh", None)
@@ -934,17 +948,36 @@ class BaseRecipe:
             raise RuntimeError("Pipeline optimizer checkpointing requires AutoPipeline.build() to complete first.")
         return [stage.stage_index for stage in stages]
 
-    def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
+    def _dp_allreduce(
+        self,
+        tensor: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+        include_cp: bool = False,
+        *,
+        keep_device: bool = False,
+    ) -> torch.Tensor:
+        """Reduce a scalar or metric vector on DP, optionally including CP.
+
+        Args:
+            tensor: Scalar or vector of shape [metrics] to reduce in place.
+            op: Distributed reduction operator.
+            include_cp: Include context-parallel contributions in the group.
+            keep_device: Reduce and return the tensor on its current device.
+
+        Returns:
+            Reduced tensor, aliasing the input when it needs no device transfer.
+        """
         dp_group = self._get_dp_group(include_cp=include_cp)
         if getattr(self, "device_mesh", None) and dp_group is None:
             return tensor
         if dp_group is not None or dist.is_initialized():
-            if not tensor.is_cuda and torch.cuda.is_available():
+            if not keep_device and not tensor.is_cuda and torch.cuda.is_available():
                 tensor = tensor.pin_memory().to(
                     device=torch.device("cuda", torch.cuda.current_device()), non_blocking=True
                 )
             dist.all_reduce(tensor, op=op, group=dp_group)
-            tensor = tensor.cpu()
+            if not keep_device:
+                tensor = tensor.cpu()
         return tensor
 
     def _step_throughput(

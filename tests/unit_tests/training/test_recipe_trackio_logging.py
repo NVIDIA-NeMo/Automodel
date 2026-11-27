@@ -89,6 +89,46 @@ def test_log_train_metrics_skips_trackio_off_the_remote_logging_step():
     run.log.assert_not_called()
 
 
+@pytest.mark.parametrize("recipe_name", ["llm", "kd"])
+def test_remote_logs_receive_the_latest_completed_throughput_window(monkeypatch, recipe_name):
+    from nemo_automodel.components.loggers import step_metrics
+    from nemo_automodel.recipes.llm.kd import KnowledgeDistillationRecipeForNextTokenPrediction
+
+    run = Mock()
+    recipe = _ft_recipe(run, KnowledgeDistillationRecipeForNextTokenPrediction if recipe_name == "kd" else None)
+    recipe.kd_ratio = 0.5
+    recipe.metric_logger_train = Mock()
+    reporter = step_metrics.TrainingStepReporter(
+        torch.device("cpu"), world_size=1, pack_size=0, domain_names=(), reference_mfu=None, calculate_mfu=Mock()
+    )
+    # Deliver two samples per poll. Windows close on steps 21 and 41, while the
+    # remote sink only receives steps divisible by ten.
+    clock = iter(range(26))
+    monkeypatch.setattr(step_metrics, "perf_counter", lambda: next(clock))
+    for step in range(52):
+        sample = _train_sample(step=step)
+        sample.metrics.update(ce_loss=1.0, kd_loss=1.5, kd_ratio=0.5, temperature=1.0)
+        sample.metrics["num_tokens_per_step"] = 64 if step < 22 else 32
+        reporter.enqueue(sample, start=0.0, end=1.0, remote_log=step % 10 == 0)
+        if step % 2:
+            for done, remote, _ in reporter.poll():
+                recipe.log_train_metrics(done, remote_log=remote)
+    reporter.close()
+
+    local_rates = {
+        sample.step: sample.metrics["end_to_end_tps"]
+        for (sample,), _ in recipe.metric_logger_train.log.call_args_list
+        if "end_to_end_tps" in sample.metrics
+    }
+    remote_rates = {
+        kwargs["step"]: payload["end_to_end_tps"]
+        for (payload,), kwargs in run.log.call_args_list
+        if "end_to_end_tps" in payload
+    }
+    assert local_rates == {21: 128, 41: 64}
+    assert remote_rates == {30: 128, 50: 64}
+
+
 def test_log_val_metrics_calls_trackio_with_named_set_prefix():
     run = Mock()
     recipe = _ft_recipe(run)
@@ -124,6 +164,7 @@ def test_dllm_log_train_metrics_sends_the_window_mean_to_trackio():
     recipe = _ft_recipe(run, DiffusionLMSFTRecipe)
     first, second = _train_sample(step=6), _train_sample(step=7)
     second.metrics["loss"] = 0.75
+    second.metrics["end_to_end_tps"] = 12.0
     for sample in (first, second):
         # dLLM samples carry the diffusion loss and the strategy name as a string
         sample.metrics.update(dllm_loss=sample.metrics["loss"], mode="uno")
@@ -137,7 +178,28 @@ def test_dllm_log_train_metrics_sends_the_window_mean_to_trackio():
     args, kwargs = run.log.call_args
     assert kwargs.get("step") == 7
     assert args[0]["loss"] == pytest.approx(1.0)
+    assert args[0]["end_to_end_tps"] == 12.0
     assert "mode" not in args[0]
+
+
+@pytest.mark.parametrize("recipe_name", ["kd", "dllm"])
+def test_loop_subclass_loggers_use_the_reported_step_and_cadence(recipe_name):
+    """The inherited training loop logs a step after the scheduler has moved past it."""
+    from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+    from nemo_automodel.recipes.llm.kd import KnowledgeDistillationRecipeForNextTokenPrediction
+
+    recipe_cls = {"kd": KnowledgeDistillationRecipeForNextTokenPrediction, "dllm": DiffusionLMSFTRecipe}[recipe_name]
+    run = Mock()
+    recipe = _ft_recipe(run, recipe_cls)
+    recipe.kd_ratio = 0.5
+    recipe.step_scheduler = types.SimpleNamespace(step=9, is_remote_logging_step=False)
+    sample = _train_sample(step=7)
+    sample.metrics.update(ce_loss=1.0, kd_loss=1.5, kd_ratio=0.5, temperature=1.0, dllm_loss=1.25, mode="mdlm")
+
+    recipe.log_train_metrics(sample, remote_log=True)
+
+    run.log.assert_called_once()
+    assert run.log.call_args.kwargs["step"] == 7
 
 
 @pytest.mark.parametrize("recipe_name", ["eagle1", "eagle3", "dflash", "dspark"])

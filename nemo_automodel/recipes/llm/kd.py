@@ -919,10 +919,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
+        # The inherited training loop's reporter adds tps and tps_per_gpu from the step span.
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
@@ -943,8 +940,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 "grad_norm": grad_norm,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
                 "kd_ratio": self.kd_ratio,
@@ -1138,6 +1133,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                             best_metric_key=self.best_metric_key,
                         )
         finally:
+            self._close_step_control_group()
             if pbar is not None:
                 pbar.close()
         self.metric_logger_train.close()
@@ -1245,7 +1241,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 )
             )
 
-    def log_train_metrics(self, log_data) -> float:
+    def log_train_metrics(self, log_data: MetricsSample, *, remote_log: bool | None = None) -> None:
         """Log metrics to wandb and other loggers.
 
         Args:
@@ -1260,17 +1256,20 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     "tps": Tokens per second.
                     "tps_per_gpu": Tokens per second per GPU.
                     "num_label_tokens": Number of label tokens.
+            remote_log: Saved logging cadence for a sample reported after its step. None means
+                the step scheduler's current step, which the synchronous pipeline-parallel loop uses.
         """
         if not self.dist_env.is_main:
             return
 
         # Log to remote services (WandB) according to step_scheduler frequency.
-        if self.step_scheduler.is_remote_logging_step:
+        remote_metrics = self._remote_train_metrics(log_data, remote_log)
+        if remote_metrics is not None:
             if _HAS_WANDB and wandb.run is not None:
-                wandb.log(log_data.to_dict(), step=log_data.step)
+                wandb.log(remote_metrics, step=log_data.step)
             trackio_logger = getattr(self, "trackio_logger", None)
             if trackio_logger is not None:
-                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+                trackio_logger.log_metrics(remote_metrics, step=log_data.step)
 
         # JSONL training log (always log for detailed local records).
         self.metric_logger_train.log(log_data)

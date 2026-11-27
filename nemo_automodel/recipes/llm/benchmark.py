@@ -17,12 +17,16 @@ import logging
 import math
 import pathlib
 import warnings
+from contextlib import closing
 
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loggers.step_metrics import restore_moe_metrics, write_remote_step_metrics
+from nemo_automodel.components.loggers.step_reporting import DeferredStepReporter
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -354,8 +358,14 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         This method implements a simplified training loop focused on benchmarking
         with timers and profiling support, similar to the original benchmarking script.
         """
+        try:
+            with closing(DeferredStepReporter(self.dist_env.device)) as reporter:
+                self._run_benchmark(reporter)
+        finally:
+            self._close_step_control_group()
+
+    def _run_benchmark(self, reporter: DeferredStepReporter) -> None:
         rank = self.dist_env.rank
-        device = self.dist_env.device
 
         # Get benchmarking config
         steps = self._bench_steps
@@ -387,6 +397,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
+        reducer = self._step_metric_reducer()
+        elapsed_steps = []
+
         # Main benchmarking loop
         for i in range(steps):
             self.step_scheduler.step = i
@@ -405,46 +418,40 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             for opt in self.optimizer:
                 opt.zero_grad()
 
-            # Time the iteration
-            iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
-            with self.timers(iter_timer, log_level=1):
-                # Gradient accumulation loop
-                num_label_tokens = 0
-                loss_buffer = []
-                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+            start = reporter.mark()
+            phases = {}
+            label_counts = []
+            loss_buffer = []
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-                for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
-                        prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+            for ga_step_idx in range(ga_steps):
+                if ga_step_idx == ga_steps - 1:
+                    prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-                    # Get batch from dataloader
-                    batch = next(dataloader_iter)
-                    torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
+                batch = next(dataloader_iter)
+                torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
+                label_counts.append((batch["labels"] != -100).sum())
+                phase_start = reporter.mark()
+                self._forward_backward_step(
+                    ga_step_idx,
+                    batch,
+                    loss_buffer=loss_buffer,
+                    num_label_tokens=None,
+                    num_batches=ga_steps,
+                    is_train=True,
+                )
+                phases[f"forward_backward_{ga_step_idx}"] = (phase_start, reporter.mark())
+                torch.cuda.nvtx.range_pop()
 
-                    # Accumulate label tokens locally
-                    num_label_tokens += (batch["labels"] != -100).sum().item()
+                if ga_step_idx == 0:
+                    prepare_after_first_microbatch()
 
-                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
-                        self._forward_backward_step(
-                            ga_step_idx,
-                            batch,
-                            loss_buffer=loss_buffer,
-                            num_label_tokens=None,
-                            num_batches=ga_steps,
-                            is_train=True,
-                        )
-
-                    torch.cuda.nvtx.range_pop()
-
-                    if ga_step_idx == 0:
-                        prepare_after_first_microbatch()
-
-                # Optimizer step
-                with self.timers("optimizer", log_level=2):
-                    synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
-                    for opt in self.optimizer:
-                        opt.step()
-                    logger.debug("Optimizer step")
+            optimizer_start = reporter.mark()
+            synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
+            for opt in self.optimizer:
+                opt.step()
+            end = reporter.mark()
+            phases["optimizer"] = (optimizer_start, end)
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
@@ -452,48 +459,19 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            # Synchronize num_label_tokens across DP ranks
-            num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
-            num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
-            num_label_tokens = num_label_tokens_tensor.item()
-
-            # Calculate loss - following exact train_ft.py:1059-1071 pattern
-            reporting_loss = torch.sum(torch.stack(loss_buffer))
-            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
-
-            if self.pp_enabled:
-                reporting_loss = reporting_loss.to(self.dist_env.device)
-                # Send loss to first rank if pp group rank is 0
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-                if self.dist_env.rank == src_rank:
-                    torch.distributed.send(reporting_loss, dst=0)
-                elif self.dist_env.is_main:
-                    torch.distributed.recv(reporting_loss, src=src_rank)
-
-            reporting_loss = reporting_loss.cpu().item()
-
-            if rank == 0:
-                print(f"num_label_tokens={num_label_tokens} | loss={reporting_loss:.4f}")
-                logger.info(
-                    f"Rank {rank} | Iteration {i} | num_label_tokens={num_label_tokens} | "
-                    f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
-                    f"loss={reporting_loss:.4f}"
-                )
-                if self._wandb_enabled and self.wandb_run is not None:
-                    self.wandb_run.log({"loss": reporting_loss}, step=i)
-                if self.trackio_logger is not None:
-                    self.trackio_logger.log_metrics({"loss": reporting_loss}, step=i)
-
-            # Collect and log MoE load balance metrics (inherited from train_ft)
-            self._collect_moe_load_balance()
-            if self._wandb_enabled and self.wandb_run is not None:
-                self._log_moe_metrics(i, self.wandb_run.log)
-            if self.trackio_logger is not None:
-                self._log_moe_metrics(i, self.trackio_logger.log_metrics)
-
-            # Calculate and log MFU
-            self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
+            count = reducer.reduce(torch.stack(label_counts).sum())
+            sample = MetricsSample(
+                step=i,
+                epoch=0,
+                metrics={
+                    "loss": reducer.loss(loss_buffer, normalize_by=count),
+                    "num_label_tokens": count,
+                    "max_memory_gib": torch.cuda.max_memory_allocated() / 1024**3,
+                },
+            )
+            self._snapshot_moe_metrics(sample)
+            reporter.enqueue(sample, start=start, end=end, remote_log=True, phases=phases)
+            elapsed_steps.extend(self._emit_benchmark_metrics(reporter, peak_tflops, rank))
 
             # Stop nsys profiling if configured
             if i == nsys_end and rank in nsys_ranks:
@@ -502,58 +480,50 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             self._maybe_collect_garbage()
 
+        elapsed_steps.extend(self._emit_benchmark_metrics(reporter, peak_tflops, rank, wait=True))
+
         if self.partial_cuda_graph_manager is not None:
             self.partial_cuda_graph_manager.log_stats("benchmark")
 
-        # Final summary
-        self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
+        self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank, elapsed_steps=elapsed_steps)
 
-    def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
-        max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[
-            iter_timer
-        ][1]
+    def _emit_benchmark_metrics(
+        self, reporter: DeferredStepReporter, peak_tflops: float, rank: int, *, wait: bool = False
+    ) -> list[float]:
+        elapsed_steps = []
+        for sample, _, elapsed in reporter.poll(wait=wait):
+            elapsed_steps.append(elapsed)
+            if rank == 0:
+                self._log_iteration_metrics(sample, peak_tflops=peak_tflops, elapsed=elapsed)
+        return elapsed_steps
 
-        if rank == 0:
-            mfu = calculate_mfu(
-                self.tflops,
-                self.dist_env.world_size,
-                max_iter_time,
-                reference_mfu=peak_tflops,
-            )
-            logger.info(f"Max iter time: {max_iter_time:.6f} seconds")
-            logger.info(f"MFU: {mfu:.6f}% | FLOPs scope: {self._bench_flops_scope}")
-
-        # Log detailed timers
-        timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
-        # Log timers to wandb
-        if self._wandb_enabled:
-            self.timers.write_to_wandb(
-                names=timer_names,
-                writer=self.wandb_run,
-                iteration=iteration,
-                normalizer=1.0,
-                reset=False,
-                barrier=False,
-            )
-        if self._trackio_enabled:
-            self.timers.write_to_wandb(
-                names=timer_names,
-                writer=self.trackio_logger.run if self.trackio_logger is not None else None,
-                iteration=iteration,
-                normalizer=1.0,
-                reset=False,
-                barrier=False,
-            )
-
-        self.timers.log(
-            names=timer_names,
-            rank=0,
-            normalizer=1000.0,  # Convert to seconds
-            reset=True,
-            barrier=True,
+    def _log_iteration_metrics(self, sample: MetricsSample, *, peak_tflops: float, elapsed: float) -> None:
+        self._moe_layer_loads = restore_moe_metrics(sample)
+        mfu = calculate_mfu(self.tflops, self.dist_env.world_size, elapsed, reference_mfu=peak_tflops)
+        logger.info(
+            "Rank 0 | Iteration %d | num_label_tokens=%d | Max Memory Allocated: %.2f GB | loss=%.4f",
+            sample.step,
+            sample.metrics["num_label_tokens"],
+            sample.metrics["max_memory_gib"],
+            sample.metrics["loss"],
         )
+        logger.info("Max iter time: %.6f seconds", elapsed)
+        logger.info("MFU: %.6f%% | FLOPs scope: %s", mfu, self._bench_flops_scope)
 
-    def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank):
+        iteration = "iteration_warmup" if sample.step < self._bench_warmup_steps else "iteration"
+        metrics = {key: value for key, value in sample.metrics.items() if key.endswith("-time")}
+        logger.info(
+            "Max phase times (seconds): %s", ", ".join(f"{key}={seconds:.6f}" for key, seconds in metrics.items())
+        )
+        metrics.update({"loss": sample.metrics["loss"], f"{iteration}-time": elapsed})
+        sinks = []
+        if self._wandb_enabled and self.wandb_run is not None:
+            sinks.append(self.wandb_run.log)
+        if self.trackio_logger is not None:
+            sinks.append(self.trackio_logger.log_metrics)
+        write_remote_step_metrics(step=sample.step, metrics=metrics, sinks=sinks, moe_metrics=self._compute_moe_metrics)
+
+    def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank, *, elapsed_steps: list[float]):
         torch.distributed.barrier()
         if rank == 0:
             logger.info(f"{'=' * 60}")
@@ -562,10 +532,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Get active times for summary
         setup_time = self.timers._timers["setup"].active_time() if "setup" in self.timers._timers else 0
-        iter_time = self.timers._timers["iteration"].active_time() if "iteration" in self.timers._timers else 0
-        warmup_time = (
-            self.timers._timers["iteration_warmup"].active_time() if "iteration_warmup" in self.timers._timers else 0
-        )
+        warmup_steps = min(warmup_steps, steps)
+        warmup_time = sum(elapsed_steps[:warmup_steps])
+        iter_time = sum(elapsed_steps[warmup_steps:])
 
         if rank == 0:
             logger.info(f"Total setup time: {setup_time:.2f} seconds")
@@ -576,7 +545,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if steps > warmup_steps:
                 avg_iter_time = iter_time / (steps - warmup_steps)
             else:
-                avg_iter_time = iter_time / steps
+                avg_iter_time = warmup_time / steps
 
             logger.info(
                 f"Average iteration time: {avg_iter_time:.3f} seconds"

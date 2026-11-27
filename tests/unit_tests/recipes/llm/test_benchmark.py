@@ -15,12 +15,13 @@
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
 from transformers import LlamaConfig, PretrainedConfig
 
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
@@ -157,7 +158,7 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.partial_cuda_graph_manager = None
         recipe._partial_cuda_graph_capture_pending = False
         recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)
-        recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False: x)
+        recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False, keep_device=False: x)
         recipe.device_mesh = None
         return recipe
 
@@ -460,6 +461,19 @@ class TestBenchmarkingRecipeSetup:
 class TestBenchmarkingRecipeRunBenchmark:
     """Test run_benchmark method of BenchmarkingRecipeForNextTokenPrediction."""
 
+    def test_run_benchmark_releases_groups_when_data_runs_out(self, mock_recipe, monkeypatch):
+        mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+        mock_recipe.dataloader = []
+        mock_recipe._step_control_group = object()
+        destroy = MagicMock()
+        monkeypatch.setattr(torch.distributed, "destroy_process_group", destroy, raising=False)
+        with patch("nemo_automodel.recipes.llm.benchmark.DeferredStepReporter", autospec=True) as reporter:
+            with pytest.raises(StopIteration):
+                mock_recipe.run_benchmark()
+        reporter.return_value.close.assert_called_once_with()
+        destroy.assert_called_once()
+        assert mock_recipe._step_control_group is None
+
     def test_run_benchmark_sets_models_to_train_mode(self, mock_recipe):
         """Test that run_benchmark sets all models to training mode."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
@@ -503,7 +517,7 @@ class TestBenchmarkingRecipeRunBenchmark:
         ):
             mock_recipe.run_benchmark()
 
-            log_summary.assert_called_once_with(30, 10, 989, 0)
+            log_summary.assert_called_once_with(30, 10, 989, 0, elapsed_steps=ANY)
             for model_part in mock_recipe.model_parts:
                 model_part.train.assert_called_once()
 
@@ -801,37 +815,35 @@ class TestBenchmarkingRecipeWandBIntegration:
         """Test that iteration metrics are logged to wandb."""
         mock_recipe._wandb_enabled = True
         mock_recipe.wandb_run = MagicMock()
-        mock_recipe.timers._get_global_min_max_time = MagicMock(return_value={"iteration": (0.0, 1.5)})
+        metrics = {
+            "loss": 0.5,
+            "num_label_tokens": 10,
+            "max_memory_gib": 1.0,
+            "optimizer-time": 0.3,
+            "forward_backward_0-time": 0.8,
+        }
+        sample = MetricsSample(step=10, epoch=0, metrics=metrics)
 
-        with patch("nemo_automodel.recipes.llm.benchmark.calculate_mfu", return_value=50.0):
-            mock_recipe._log_iteration_metrics("iteration", ga_steps=4, peak_tflops=989, rank=0, iteration=10)
+        mock_recipe._log_iteration_metrics(sample, peak_tflops=989, elapsed=1.5)
 
-            # Verify wandb logging was called with correct parameters
-            expected_timer_names = [
-                "iteration",
-                "optimizer",
-                "forward_backward_0",
-                "forward_backward_1",
-                "forward_backward_2",
-                "forward_backward_3",
-            ]
-            mock_recipe.timers.write_to_wandb.assert_called_once_with(
-                names=expected_timer_names,
-                writer=mock_recipe.wandb_run,
-                iteration=10,
-                normalizer=1.0,
-                reset=False,
-                barrier=False,
-            )
+        mock_recipe.wandb_run.log.assert_called_once_with(
+            {"loss": 0.5, "iteration-time": 1.5, "optimizer-time": 0.3, "forward_backward_0-time": 0.8},
+            step=10,
+        )
 
     def test_log_iteration_mfu_uses_global_flops_once(
         self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, caplog: pytest.LogCaptureFixture
     ) -> None:
-        mock_recipe.timers._get_global_min_max_time.return_value = {"iteration": (0.5, 1.5)}
+        sample = MetricsSample(
+            step=10,
+            epoch=0,
+            metrics={"loss": 0.5, "num_label_tokens": 10, "max_memory_gib": 1.0, "forward_backward_0-time": 0.8},
+        )
         with caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"):
-            mock_recipe._log_iteration_metrics("iteration", ga_steps=4, peak_tflops=989, rank=0, iteration=10)
+            mock_recipe._log_iteration_metrics(sample, peak_tflops=989, elapsed=1.5)
         expected_mfu = mock_recipe.tflops / (mock_recipe.dist_env.world_size * 1.5 * 989) * 100
         assert f"MFU: {expected_mfu:.6f}%" in caplog.text
+        assert "forward_backward_0-time=0.800000" in caplog.text
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
@@ -883,7 +895,9 @@ class TestBenchmarkingRecipeJSONOutput:
             patch("torch.distributed.barrier"),
             caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"),
         ):
-            mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=peak_tflops, rank=0)
+            mock_recipe._log_benchmark_summary(
+                steps=30, warmup_steps=10, peak_tflops=peak_tflops, rank=0, elapsed_steps=[1.0] * 10 + [0.5] * 20
+            )
 
         # The CI artifact collector reads the peak from this line.
         assert ("MFU peak: 989 TFLOPs/s per device" if peak_tflops == 989 else "MFU peak: unknown") in caplog.text
@@ -913,6 +927,21 @@ class TestBenchmarkingRecipeJSONOutput:
             mock_recipe.tflops / (8 * (10.0 / 20) * peak_tflops) * 100
         )
 
+    @pytest.mark.parametrize("warmup_steps", [2, 5])
+    def test_all_warmup_steps_have_no_measured_training_time(self, mock_recipe, tmp_path, warmup_steps):
+        import json
+
+        path = tmp_path / "warmup.json"
+        mock_recipe._bench_json_output_path = str(path)
+        mock_recipe._log_benchmark_summary(2, warmup_steps, 989, 0, elapsed_steps=[1.0, 2.0])
+
+        summary = json.loads(path.read_text())
+        assert summary["warmup_steps"] == 2
+        assert summary["warmup_time_seconds"] == 3.0
+        assert summary["training_steps"] == 0
+        assert summary["training_time_seconds"] == 0.0
+        assert summary["avg_iter_time_seconds"] == 1.5
+
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""
         mock_recipe._bench_json_output_path = None
@@ -927,7 +956,9 @@ class TestBenchmarkingRecipeJSONOutput:
         }
 
         with patch("torch.distributed.barrier"):
-            mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=989, rank=0)
+            mock_recipe._log_benchmark_summary(
+                steps=30, warmup_steps=10, peak_tflops=989, rank=0, elapsed_steps=[1.0] * 10 + [0.5] * 20
+            )
 
         # Verify no JSON file was created
         assert not any(tmp_path.glob("*.json"))
@@ -964,7 +995,9 @@ class TestBenchmarkingRecipeSummaryData:
 
         with patch("torch.distributed.barrier"):
             with patch("wandb.finish"):
-                mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=989, rank=0)
+                mock_recipe._log_benchmark_summary(
+                    steps=30, warmup_steps=10, peak_tflops=989, rank=0, elapsed_steps=[10.0] * 10 + [5.0] * 20
+                )
 
         # Verify Table was created with correct columns
         mock_table_class.assert_called_once()
@@ -1011,7 +1044,9 @@ class TestBenchmarkingRecipeSummaryData:
         with patch("torch.distributed.barrier"):
             with patch("wandb.Table"):
                 with patch("wandb.finish"):
-                    mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=989, rank=0)
+                    mock_recipe._log_benchmark_summary(
+                        steps=30, warmup_steps=10, peak_tflops=989, rank=0, elapsed_steps=[10.0] * 10 + [5.0] * 20
+                    )
 
         # Verify scalar metrics were logged
         calls = mock_wandb_log.call_args_list
@@ -1051,7 +1086,9 @@ class TestBenchmarkingRecipeSummaryData:
         with patch("torch.distributed.barrier"):
             with patch("wandb.log"):
                 with patch("wandb.Table"):
-                    mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=989, rank=0)
+                    mock_recipe._log_benchmark_summary(
+                        steps=30, warmup_steps=10, peak_tflops=989, rank=0, elapsed_steps=[1.0] * 10 + [0.5] * 20
+                    )
 
         # Verify wandb.finish was called
         mock_wandb_finish.assert_called_once()
@@ -1115,7 +1152,7 @@ class TestBenchmarkingRecipeLossCalculation:
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         dp_allreduce_calls = []
 
-        def track_allreduce(tensor, include_cp=False):
+        def track_allreduce(tensor, include_cp=False, keep_device=False):
             dp_allreduce_calls.append({"tensor_shape": tensor.shape, "include_cp": include_cp})
             return tensor
 

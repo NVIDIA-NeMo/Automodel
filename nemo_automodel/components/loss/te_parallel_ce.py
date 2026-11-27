@@ -15,6 +15,8 @@
 
 import torch
 
+from nemo_automodel.components.loss.token_normalization import normalize_token_loss
+
 try:
     # DTensor support is needed when tensor-parallel plans set `use_local_output=False`
     # causing `logits` to be a DTensor sharded on vocab dim.
@@ -135,7 +137,7 @@ class TEParallelCrossEntropy:
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: torch.Tensor | None = None,
-        num_label_tokens: int | None = None,
+        num_label_tokens: int | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute parallel cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -146,7 +148,7 @@ class TEParallelCrossEntropy:
             mask: Mask to apply to the loss. Shape: [B, T]. ``labels`` is not
                 modified in place -- for a DTensor this matters doubly, since the
                 local shard returned by ``to_local()`` aliases its storage.
-            num_label_tokens (int): The number of non-padding tokens.
+            num_label_tokens: Non-padding token count as a Python integer or a scalar tensor on the loss device.
 
         Returns:
             Computed loss tensor
@@ -192,7 +194,7 @@ class TEParallelCrossEntropy:
         elif self.reduction == "sum":
             loss = te_loss.sum()
             if num_label_tokens is not None:
-                loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens
+                loss = normalize_token_loss(loss, num_label_tokens)
             return loss
         else:
             raise ValueError(f"Invalid reduction: {self.reduction}. Must be one of 'none', 'mean', 'sum'")
