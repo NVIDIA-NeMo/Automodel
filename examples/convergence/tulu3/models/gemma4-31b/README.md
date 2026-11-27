@@ -45,12 +45,12 @@ the recipe sets `inject_fake_images: false`. Documents are lost at three points 
 939,343 rows of `allenai/tulu-3-sft-mixture@b14afda6`):
 
 - The packing length estimate (`chars // 3`) drops 42,520 rows (4.5%) as longer than 2k.
-- 10,353 rows pass the estimate but tokenize to more than 2,048 tokens; each is replaced by a random
+- 10,314 rows pass the estimate but tokenize to more than 2,048 tokens; each is replaced by a random
   other row.
-- 45,039 of the 896,823 packed documents (5.0%) are cut when a pack is built, because the estimate
+- 43,965 of the 896,823 packed documents (4.9%) are cut when a pack is built, because the estimate
   was too small for them and the pack overflows 2,048 tokens.
 
-842,048 distinct rows (89.6%) are trained in one epoch. So there is no meta-JSON / prefilter / cache
+843,152 distinct rows (89.8%) are trained in one epoch. So there is no meta-JSON / prefilter / cache
 step to run.
 
 ## Training
@@ -81,6 +81,12 @@ bash examples/convergence/tulu3/eval/run_eval.sh \
 base ships none). The eval env pins `nvidia-cutlass-dsl==4.5.0` (see Gotchas).
 
 ## Results
+
+The loss, curves and IFEval scores below were measured before the recipe's data changed: with a
+fake image in every document, two `<bos>` at the start of every document and the 2026-04-02 launch
+chat template. The recipe now trains on different packs (no image tokens, one `<bos>`, the upstream
+template), so these numbers are to be re-measured; the step-999 loss and the IFEval score with the
+current data are not known yet.
 
 ### Training Loss
 
@@ -118,6 +124,9 @@ This recipe's `ci.downstream_eval` block registers it in the weekly convergence 
 `prompt_level_strict_acc > 0.5287 − 2·0.0455`** (floor `0.4378`). The gate is one-sided, so a higher
 score always passes. The base ships no chat template; the recipe supplies the `-it` template via
 `dataset.chat_template`.
+
+The baseline `0.5287` and the `stderr` `0.0455` were measured on the previous data (fake image,
+two `<bos>`, launch template; see Results) and are to be re-measured on the current data.
 
 The `stderr` there is the **between-run** sigma of the full train→eval pipeline, not the within-eval
 bootstrap stderr from the table above (`0.0215`) — the two differ by ~2×, since the gate must absorb

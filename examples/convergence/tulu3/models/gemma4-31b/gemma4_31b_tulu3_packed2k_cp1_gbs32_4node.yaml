@@ -60,7 +60,7 @@ dataset:
   path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
-  # Text-only data: no fake image. It would add 259 tokens to every document that the
+  # Text-only data: no fake image. It would add 258 tokens to every document that the
   # packing length estimate does not count.
   inject_fake_images: false
   # google/gemma-4-31B (base) ships no chat template; make_tulu3_dataset formats via the
@@ -138,6 +138,8 @@ ci:
     dp_size: 1
     extra_model_args: "max_model_len=8192"
     metric: prompt_level_strict_acc
+    # Baseline and stderr were measured on the previous data (fake image, two <bos>,
+    # launch template); re-measure them on the current data (see README).
     baseline: 0.5287
     # Between-run sigma of the train->eval pipeline, NOT lm-eval's within-eval
     # bootstrap stderr (0.0215) -- that is ~2x smaller and only covers scoring 541

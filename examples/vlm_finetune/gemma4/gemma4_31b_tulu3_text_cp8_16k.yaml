@@ -74,7 +74,7 @@ dataset:
   path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
-  # Text-only data: no fake image. It would add 259 tokens to every document that the
+  # Text-only data: no fake image. It would add 258 tokens to every document that the
   # packing length estimate does not count.
   inject_fake_images: false
 
