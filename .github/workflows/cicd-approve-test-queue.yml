@@ -111,7 +111,10 @@ jobs:
                   if not isinstance(entry, dict):
                       raise ValueError("Invalid SSO roster entry")
                   roles = entry.get("org_roles", [])
-                  if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+                  email = entry.get("nvidia_email")
+                  if roles is None and isinstance(email, str) and re.fullmatch(r"[^@\s]+@nvidia\.com", email, re.IGNORECASE):
+                      entry["org_roles"] = []
+                  elif not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
                       raise ValueError("Invalid org_roles in SSO roster")
               return users
 

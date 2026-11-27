@@ -130,6 +130,7 @@ def _run_approval(tmp_path: Path, roster: str, get: Mock) -> None:
         "{}",
         '{"private":1}',
         '{"private":{"org_roles":null}}',
+        '{"private":{"org_roles":null,"nvidia_email":"user@nvidia.com.example"}}',
         '{"private":{"org_roles":[3]}}',
         '{"private":{"org_roles":"bad"}}',
     ],
@@ -166,7 +167,10 @@ def test_incomplete_pr_metadata_fails_queue(tmp_path: Path, metadata: dict) -> N
         _run_approval(tmp_path, '{"member":{}}', get)
 
 
-def test_queue_filters_supported_runs_with_one_pr_read_each(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+@pytest.mark.parametrize("guest", [{"extra": "metadata"}, {"org_roles": None, "nvidia_email": "guest@NVIDIA.com"}])
+def test_queue_filters_supported_runs_with_one_pr_read_each(
+    tmp_path: Path, capsys: pytest.CaptureFixture, guest: dict
+) -> None:
     """Ordinary branches, other PR targets and external authors stay outside the internal main queue."""
     branches = [
         None,
@@ -184,7 +188,7 @@ def test_queue_filters_supported_runs_with_one_pr_read_each(tmp_path: Path, caps
         for base, user in [("main", "member"), ("dev", "member"), ("main", "guest")]
     )
     get = Mock(side_effect=responses + [_response({"workflow_runs": []})])
-    roster = {"member": {"org_roles": ["NVIDIA:Member", "Other:Role"]}, "guest": {"extra": "metadata"}}
+    roster = {"member": {"org_roles": ["NVIDIA:Member", "Other:Role"]}, "guest": guest}
     _run_approval(tmp_path, json.dumps(roster), get)
     assert "Current queued workflows (PRs targeting main, internal): 1" in capsys.readouterr().out
     assert [call.args[0].split("/")[-1] for call in get.call_args_list if "/pulls/" in call.args[0]] == [

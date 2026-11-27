@@ -54,6 +54,18 @@ def test_changelog_requires_successful_compare_of_requested_refs() -> None:
     assert step["with"]["toTag"] == "${{ inputs.release-branch }}"
 
 
+def test_community_label_caller_passes_only_the_roster_credential() -> None:
+    """Keep the audit credential separate from the repository token used for labels."""
+    workflow = yaml.safe_load((WORKFLOWS / "community-bot.yml").read_text())
+    job = workflow["jobs"]["community-bot"]
+    assert workflow["permissions"] == {}
+    assert job["permissions"] == {"issues": "write", "pull-requests": "write"}
+    assert job["secrets"] == {"NVIDIA_MANAGEMENT_ORG_PAT": "${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}"}
+    assert re.fullmatch(
+        r"NVIDIA-NeMo/FW-CI-templates/\.github/workflows/_community_label\.yml@[0-9a-f]{40}", job["uses"]
+    )
+
+
 @pytest.mark.parametrize("current_head", [True, False])
 def test_guardwords_uses_only_the_current_mirror(tmp_path: Path, current_head: bool) -> None:
     """Only submit the reviewed PR's public metadata to the catalog-scanning job."""
