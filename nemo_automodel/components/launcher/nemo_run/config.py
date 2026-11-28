@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # Default path to user-defined executor definitions.
@@ -69,17 +70,77 @@ class NemoRunConfig:
     # Arbitrary executor attribute overrides (e.g. nodes, partition,
     # container_image, time, env_vars).  Populated automatically from
     # unrecognised YAML keys by ``from_dict``.
-    overrides: dict = field(default_factory=dict)
+    overrides: dict[str, object] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "NemoRunConfig":
-        """Build from a raw YAML dict, splitting launcher keys from executor overrides."""
-        launcher_kwargs = {}
-        overrides = {}
-        for k, v in d.items():
-            if k in _LAUNCHER_KEYS:
-                launcher_kwargs[k] = v
-            else:
+    def from_dict(cls, d: Mapping[str, object]) -> NemoRunConfig:
+        """Build from the raw ``nemo_run:`` YAML section, splitting launcher keys from executor overrides.
+
+        Args:
+            d: The parsed ``nemo_run:`` section. Launcher keys are validated here;
+                every other key is an executor attribute override whose value is
+                forwarded unchanged.
+
+        Returns:
+            The launcher configuration. A launcher key that is null in YAML takes its
+            default, as if it were absent, except ``detach``: null keeps its existing
+            meaning of ``False``. Python callers may pass ``os.PathLike`` values for
+            ``executors_file`` and ``job_dir``; they are stored as ``str``.
+
+        Raises:
+            TypeError: If a non-null launcher key has the wrong type, or ``overrides``
+                is not a mapping with string keys.
+        """
+        # A key that is absent or null in YAML (``tail_logs:``) means "use the default", except ``detach``.
+        default = cls()
+        executor = d.get("executor")
+        executor = default.executor if executor is None else executor
+        if not isinstance(executor, str):
+            raise TypeError(f"nemo_run.executor must be a string, got {type(executor).__name__}")
+        executors_file = d.get("executors_file")
+        executors_file = default.executors_file if executors_file is None else executors_file
+        executors_file = os.fspath(executors_file) if isinstance(executors_file, os.PathLike) else executors_file
+        if not isinstance(executors_file, str):
+            raise TypeError(f"nemo_run.executors_file must be a string, got {type(executors_file).__name__}")
+        job_name = d.get("job_name")
+        job_name = default.job_name if job_name is None else job_name
+        if not isinstance(job_name, str):
+            raise TypeError(f"nemo_run.job_name must be a string, got {type(job_name).__name__}")
+        job_dir = d.get("job_dir")
+        job_dir = default.job_dir if job_dir is None else job_dir
+        job_dir = os.fspath(job_dir) if isinstance(job_dir, os.PathLike) else job_dir
+        if not isinstance(job_dir, str):
+            raise TypeError(f"nemo_run.job_dir must be a string, got {type(job_dir).__name__}")
+        detach = d.get("detach", default.detach)
+        # Unlike the other keys, a null ``detach`` has always meant "do not detach": it reached
+        # ``Experiment.run`` as a falsy value. Keep that instead of switching to the default (True).
+        detach = False if detach is None else detach
+        if not isinstance(detach, bool):
+            raise TypeError(f"nemo_run.detach must be true or false, got {type(detach).__name__}")
+        tail_logs = d.get("tail_logs")
+        tail_logs = default.tail_logs if tail_logs is None else tail_logs
+        if not isinstance(tail_logs, bool):
+            raise TypeError(f"nemo_run.tail_logs must be true or false, got {type(tail_logs).__name__}")
+
+        explicit_overrides = d.get("overrides")
+        explicit_overrides = {} if explicit_overrides is None else explicit_overrides
+        if not isinstance(explicit_overrides, Mapping):
+            raise TypeError(f"nemo_run.overrides must be a mapping, got {type(explicit_overrides).__name__}")
+        # Explicit ``overrides`` first, then unrecognised top-level keys, which win on conflict.
+        # Both become executor attribute names, so their keys must be strings.
+        overrides: dict[str, object] = {}
+        for source in (explicit_overrides, {k: v for k, v in d.items() if k not in _LAUNCHER_KEYS}):
+            for k, v in source.items():
+                if not isinstance(k, str):
+                    raise TypeError(f"nemo_run executor override keys must be strings, got {type(k).__name__}")
                 overrides[k] = v
-        launcher_kwargs.setdefault("overrides", {}).update(overrides)
-        return cls(**launcher_kwargs)
+
+        return cls(
+            executor=executor,
+            job_name=job_name,
+            detach=detach,
+            tail_logs=tail_logs,
+            executors_file=executors_file,
+            job_dir=job_dir,
+            overrides=overrides,
+        )

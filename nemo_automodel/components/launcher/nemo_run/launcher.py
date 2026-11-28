@@ -16,8 +16,9 @@ import logging
 import os
 import sys
 import time as _time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import yaml
 
@@ -100,12 +101,28 @@ class NemoRunLauncher(Launcher):
 
     def launch(
         self,
-        config: Dict[str, Any],
+        config: dict[str, object],
         config_path: Path,
         recipe_target: str,
-        launcher_config: Dict[str, Any],
-        extra_args: List[str] | None = None,
+        launcher_config: Mapping[str, object],
+        extra_args: Sequence[str] | None = None,
     ) -> int:
+        """Submit the recipe through a NeMo-Run executor.
+
+        Args:
+            config: Parsed YAML config (without the ``nemo_run`` section). It is only
+                written back out with ``yaml.dump`` for the job, so its values are not
+                interpreted here. It must be a plain ``dict``: the default dumper writes other
+                mappings with Python tags that the recipe's ``yaml.safe_load`` cannot read.
+            config_path: Resolved path to the original YAML file.
+            recipe_target: Dotted import path of the recipe class.
+            launcher_config: The raw ``nemo_run:`` YAML section, validated by
+                :meth:`NemoRunConfig.from_dict`.
+            extra_args: Additional CLI overrides forwarded to the recipe.
+
+        Returns:
+            Process exit code (0 = success).
+        """
         try:
             import nemo_run as run
         except ImportError:
