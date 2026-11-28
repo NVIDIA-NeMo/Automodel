@@ -960,32 +960,46 @@ class BaseRecipe:
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
 
+        _, mfu = self._model_flop_rates(self._step_flops(batches), time_delta)
+        return tps, mfu
+
+    def _step_flops(self, batches: Sequence[Mapping[str, torch.Tensor]]) -> float | None:
+        """Count global model FLOPs across the distinct data-parallel microbatches.
+
+        Args:
+            batches: Local microbatches with input_ids of shape [batch, sequence]
+                before context-parallel sharding.
+
+        Returns:
+            Total FLOPs, or None when a microbatch has no supported estimate.
+        """
         if not batches:
-            return tps, None
+            return None
         mfu_calculator = self.mfu_calculator
         step_flops = 0.0
         for batch in batches:
             input_ids = batch.get("input_ids")
             if input_ids is None:
-                return tps, None
+                return None
             batch_flops = mfu_calculator.get_flops(input_ids)
             if batch_flops is None:
-                return tps, None
+                return None
             step_flops += float(batch_flops)
 
         # Sum over DP ranks only, like the token count. Every CP rank of a DP replica holds
         # the same unsharded batches (CP shards a copy inside the step), so including CP
         # would count each sequence's FLOPs cp_size times.
-        step_flops = self._dp_allreduce(
-            torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device)
-        ).item()
+        return self._dp_allreduce(torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device)).item()
+
+    def _model_flop_rates(self, step_flops: float | None, elapsed: float) -> tuple[float | None, float | None]:
+        """Return aggregate model TFLOPs/s and MFU for the same measured interval."""
+        if step_flops is None:
+            return None, None
+        step_tflops = step_flops / 1e12
         mfu = calculate_mfu(
-            step_flops / 1e12,
-            self.dist_env.world_size,
-            time_delta,
-            reference_mfu=mfu_calculator.reference_mfu,
+            step_tflops, self.dist_env.world_size, elapsed, reference_mfu=self.mfu_calculator.reference_mfu
         )
-        return tps, mfu
+        return step_tflops / elapsed, mfu
 
     def _make_progress_bar(self, total: int | None = None, initial: int = 0):
         """Create a tqdm progress bar on rank 0; returns None on other ranks.

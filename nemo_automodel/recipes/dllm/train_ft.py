@@ -35,6 +35,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import nullcontext
 
 from nemo_automodel.shared.import_utils import safe_import
@@ -588,14 +589,14 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         ):
             precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
 
-        tps, mfu = self._step_throughput(batches, num_tokens_in_batch)
-
         total_loss = torch.sum(torch.stack(loss_buffer))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()
 
         dllm_loss = self._dp_allreduce(torch.stack(self._dllm_loss_buffer).sum(), include_cp=True).item()
         self._dllm_loss_buffer.clear()
-
+        # Every blocking metric reduction runs before the clock is read, as in the base recipe, so that queued
+        # GPU work completing during them stays inside this step's window.
+        step_flops = self._step_flops(batches)
         # DFlash draft top-1 accuracy. Per-rank raw (correct, count) per block
         # offset are summed over grad-accum microbatches, SUM-allreduced across
         # DP+CP (same primitive as dllm_loss), then divided post-reduction to
@@ -618,6 +619,11 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             draft_acc_per_pos = (correct_per_pos / count_safe).tolist()
         self._dflash_correct_per_pos_buffer.clear()
         self._dflash_count_per_pos_buffer.clear()
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+        _, mfu = self._model_flop_rates(step_flops, time_delta)
 
         metrics = {
             "loss": total_loss,
