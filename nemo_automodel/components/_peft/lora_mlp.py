@@ -344,6 +344,8 @@ def _fusible(module: torch.nn.Module | torch.Tensor) -> TypeGuard[LinearLoRA]:
     lora_A, lora_B = module.lora_A, module.lora_B
     if not module.use_memory_efficient_lora:
         return False
+    if module.weight_fake_quantizer is not None:
+        return False
     if module.use_dora:
         return False
     if module.dropout_p and module.training:
