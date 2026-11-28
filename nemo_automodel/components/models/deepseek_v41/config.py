@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     import torch
 
     from nemo_automodel.components.distributed.config import DistributedSetup
+    from nemo_automodel.components.models.deepseek_v41.dfly2 import DeepseekV41DFly2Model
     from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
     from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 
@@ -44,6 +45,18 @@ class _DSparkDraftOptions(Protocol):
     confidence_head_alpha: float
     confidence_head_with_markov: bool
     confidence_head_stop_gradient: bool
+
+
+class _DFly2DraftOptions(Protocol):
+    """Declarative DFly2 settings supplied by the DFly2 training recipe."""
+
+    target_layer_ids: list[int]
+    block_size: int
+    num_anchors: int
+    mask_token_id: int
+    enable_confidence_head: bool
+    confidence_head_stop_gradient: bool
+    attn_backend: str
 
 
 class DeepseekV41TextConfig(PretrainedConfig):
@@ -519,6 +532,30 @@ class DeepseekV41Config(PretrainedConfig):
             confidence_head_stop_gradient=bool(options.confidence_head_stop_gradient),
             quantization_config=copy.deepcopy(getattr(self, "quantization_config", None)),
         ).build()
+
+    def build_dfly2_draft(self, options: _DFly2DraftOptions) -> DeepseekV41DFly2Model:
+        """Build the model-owned DFly2 draft.
+
+        Args:
+            options: Declarative draft settings supplied by the DFly2 recipe.
+
+        Returns:
+            Freshly initialized DeepSeek V4.1 DFly2 draft ready for device placement.
+        """
+        from nemo_automodel.components.models.deepseek_v41.dfly2 import DeepseekV41DFly2Config, default_dfly2_backend
+
+        # The draft runs the default atomic sparse backward; keep the target's selector out of it.
+        draft_text_config = copy.deepcopy(self.text_config)
+        draft_text_config.sparse_attention_backward = "atomic"
+        return DeepseekV41DFly2Config(
+            text_config=draft_text_config,
+            target_layer_ids=tuple(int(layer_id) for layer_id in options.target_layer_ids),
+            block_size=int(options.block_size),
+            num_anchors=int(options.num_anchors),
+            mask_token_id=int(options.mask_token_id),
+            enable_confidence_head=bool(options.enable_confidence_head),
+            confidence_head_stop_gradient=bool(options.confidence_head_stop_gradient),
+        ).build(default_dfly2_backend(str(options.attn_backend)))
 
 
 @dataclass(frozen=True)

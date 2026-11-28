@@ -679,6 +679,13 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
     """Convert the released ``mtp.*`` DSpark weights for training and export."""
 
     _supports_low_memory_dcp_load = False
+    # Native name of the draft's layer list, and the released-name patterns that differ per draft layout.
+    _native_layers = "mtp"
+    _expert_fqn_pattern = _DSPARK_EXPERT_PATTERN
+    _released_expert_pattern = re.compile(r"mtp\.\d+\.ffn\.experts\.(\d+)\.")
+    _quantized_released_pattern = re.compile(
+        r"mtp\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)|main_proj|ffn\.(?:shared_experts|experts\.\d+)\.w[123])\.weight"
+    )
 
     def __init__(
         self,
@@ -693,6 +700,22 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
         self.dtype = dtype
         self._uses_model_prefix = False
 
+    def _to_native_key(self, key: str) -> str:
+        """Map one released draft tensor name to the native draft namespace."""
+        return _dspark_native_key(key)
+
+    def _to_released_key(self, key: str) -> str:
+        """Map one native draft parameter name to the released checkpoint namespace."""
+        return _dspark_released_key(key)
+
+    def _to_layer_namespace(self, key: str) -> str:
+        """Rename the native layer list to ``layers.``, the namespace of the split-expert helpers."""
+        return re.sub(rf"^{self._native_layers}\.(\d+)\.", r"layers.\1.", key)
+
+    def _from_layer_namespace(self, key: str) -> str:
+        """Undo :meth:`_to_layer_namespace`."""
+        return re.sub(r"^layers\.(\d+)\.", rf"{self._native_layers}.\1.", key)
+
     @property
     def _expert_path_segment(self) -> str:
         return "ffn.experts"
@@ -700,7 +723,7 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
     @property
     def view_loaded_native_keys(self) -> set[str]:
         """Return native DSpark keys populated through checkpoint views."""
-        return {re.sub(r"^layers\.(\d+)\.", r"mtp.\1.", key) for key in super().view_loaded_native_keys}
+        return {self._from_layer_namespace(key) for key in super().view_loaded_native_keys}
 
     def is_draft_checkpoint_key(self, key: str) -> bool:
         """Return whether a tensor in a released checkpoint belongs to the draft."""
@@ -710,16 +733,16 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
         """Return released names for the draft's native state-dict keys."""
         keys: list[str] = []
         for fqn in state_dict:
-            expert = _DSPARK_EXPERT_PATTERN.fullmatch(fqn)
+            expert = self._expert_fqn_pattern.fullmatch(fqn)
             if expert:
-                projections = (1, 3) if expert[2] == "gate_and_up_projs" else (2,)
+                projections = ("gate_proj", "up_proj") if expert[2] == "gate_and_up_projs" else ("down_proj",)
                 keys.extend(
-                    f"mtp.{expert[1]}.ffn.experts.{index}.w{projection}.weight"
+                    self._to_released_key(f"{self._native_layers}.{expert[1]}.ffn.experts.{index}.{projection}.weight")
                     for index in range(self.moe_config.n_routed_experts)
                     for projection in projections
                 )
             elif "_extra_state" not in fqn:
-                keys.append(_dspark_released_key(fqn))
+                keys.append(self._to_released_key(fqn))
         return keys
 
     def from_hf(
@@ -743,7 +766,7 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
             2 * expert_hidden] and [experts, expert_hidden, hidden].
         """
         for key in list(hf_state_dict):
-            expert = re.match(r"mtp\.\d+\.ffn\.experts\.(\d+)\.", key)
+            expert = self._released_expert_pattern.match(key)
             nonlocal_expert = expert is not None and not should_load_expert_for_rank(
                 int(expert[1]), device_mesh, self.moe_config.n_routed_experts
             )
@@ -757,17 +780,16 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
             value = hf_state_dict.pop(key)
             if key.endswith(".scale"):
                 raise ValueError(f"Checkpoint scale {key} has no matching weight")
-            native_key = _dspark_native_key(key)
+            native_key = self._to_native_key(key)
             if ".ffn.experts." in native_key:
-                pseudo_key = re.sub(r"^mtp\.(\d+)\.", r"layers.\1.", native_key)
-                expert_state[pseudo_key] = value
+                expert_state[self._to_layer_namespace(native_key)] = value
             else:
                 if native_key in converted:
                     raise ValueError(f"Multiple checkpoint tensors map to {native_key}")
                 converted[native_key] = value
 
         merged = self._from_hf_w_merged_experts(expert_state, device_mesh)
-        converted.update({re.sub(r"^layers\.(\d+)\.", r"mtp.\1.", key): value for key, value in merged.items()})
+        converted.update({self._from_layer_namespace(key): value for key, value in merged.items()})
         return converted
 
     def _dequantize(self, state_dict: dict[str, Any]) -> None:
@@ -816,34 +838,26 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
                 "Quantization targets are for checkpoint loading only; export trained weights without quantization"
             )
 
-        expert = _DSPARK_EXPERT_PATTERN.fullmatch(fqn)
+        expert = self._expert_fqn_pattern.fullmatch(fqn)
         if expert:
-            pseudo_fqn = re.sub(r"^mtp\.(\d+)\.", r"layers.\1.", fqn)
             result = self._convert_single_merged_expert_to_hf_split_experts(
-                pseudo_fqn,
+                self._to_layer_namespace(fqn),
                 tensor,
                 for_checkpoint_load=kwargs.get("for_checkpoint_load", False),
                 quantization=quantization,
             )
             if result is None:
                 raise RuntimeError(f"Could not convert DSpark expert tensor {fqn}")
-            released = [
-                (_dspark_released_key(re.sub(r"^layers\.(\d+)\.", r"mtp.\1.", key)), value) for key, value in result
-            ]
+            released = [(self._to_released_key(self._from_layer_namespace(key)), value) for key, value in result]
         else:
-            released = [(_dspark_released_key(fqn), tensor)]
+            released = [(self._to_released_key(fqn), tensor)]
 
         exclude = kwargs.get("exclude_key_regex")
         converted: list[tuple[str, Any]] = []
         for key, value in released:
             if exclude and re.match(exclude, key):
                 continue
-            quantized = re.fullmatch(
-                r"mtp\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)"
-                r"|main_proj|ffn\.(?:shared_experts|experts\.\d+)\.w[123])\.weight",
-                key,
-            )
-            if quantization and quantized:
+            if quantization and self._quantized_released_pattern.fullmatch(key):
                 converted.extend(DeepseekV41StateDictAdapter._quantized_load_targets(key, value))
             else:
                 converted.append((key, value))
@@ -852,7 +866,48 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
     def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
         """Return released draft keys whose trained values must remain FP32."""
         return {
-            _dspark_released_key(key): "float32"
+            self._to_released_key(key): "float32"
             for key, value in state_dict.items()
             if isinstance(value, torch.Tensor) and value.dtype == torch.float32
         }
+
+
+# FP32 holders of the DFly2 attentive correction, stored as plain tensors in the release.
+_DFLY2_CORRECTION_HOLDER = re.compile(
+    r"(\.attention\.(?:attn_sink|block_sink|block_rel_bias|block_gate_bias))\.weight$"
+)
+
+
+class DeepseekV41DFly2StateDictAdapter(DeepseekV41DSparkStateDictAdapter):
+    """Convert the released DFly2 draft for training and export.
+
+    The release names every tensor under ``model.``: the draft layers as the target's own
+    layers (``model.layers.{i}.attn.wq_a.weight``, ``hc_attn_fn``, split ``ffn.experts.{e}.w1``
+    in FP4) and the heads by their module path (``model.mtp_fusion.gate``,
+    ``model.hidden_correction.attention.block_sink``). Native names drop the prefix and use
+    the target's native layer names.
+    """
+
+    _native_layers = "layers"
+    _expert_fqn_pattern = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(gate_and_up_projs|down_projs)$")
+    _released_expert_pattern = re.compile(r"model\.layers\.\d+\.ffn\.experts\.(\d+)\.")
+    # Only the routed experts are quantized in the release.
+    _quantized_released_pattern = re.compile(r"model\.layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight")
+
+    def is_draft_checkpoint_key(self, key: str) -> bool:
+        """Return whether a tensor in a released checkpoint belongs to the draft."""
+        return key.startswith("model.")
+
+    def _to_native_key(self, key: str) -> str:
+        """Map one released DFly2 tensor name to the native draft namespace."""
+        key = key.removeprefix("model.")
+        if key.startswith("layers."):
+            return _native_key(key).removeprefix("model.")
+        holder = key + ".weight"
+        return holder if _DFLY2_CORRECTION_HOLDER.search(holder) else key
+
+    def _to_released_key(self, key: str) -> str:
+        """Map one native DFly2 parameter name to the released checkpoint namespace."""
+        if key.startswith("layers."):
+            return "model." + _released_key(key)
+        return "model." + _DFLY2_CORRECTION_HOLDER.sub(r"\1", key)

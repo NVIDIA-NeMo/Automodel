@@ -26,6 +26,7 @@ inference engine (SGLang or vLLM). The training code lives in
 | **Domino** | DFlash backbone plus a serial GRU correction head (`prefix_gru` / `embed_proj`) that refines each block position on the previous ones. | `TrainDominoRecipe` | `dflash/qwen3_domino.yaml` |
 | **JetSpec** | DFlash backbone trained as a *causal* parallel tree drafter: causal in-block attention plus forward-KL distillation against the target distribution. | `TrainJetSpecRecipe` | `jetspec/` |
 | **DSpark** | Semi-autoregressive parallel drafting: a parallel backbone drafts the block, a lightweight serial Markov head adds intra-block dependency, and a confidence head predicts per-position acceptance. | `TrainDSparkRecipe` | `dspark/` |
+| **DFly2** | Block-parallel drafting for sparse-attention targets: each draft layer reads its paired target layer's cached keys at the positions that layer's indexer selected, so the drafter keeps no KV cache and runs no indexer of its own. | `TrainDFly2Recipe` | `dfly2/` |
 
 EAGLE-1, EAGLE-2, and EAGLE-3 keep their separate code paths: `*_v12.py` files are the **EAGLE-1 and EAGLE-2**
 (v1 and v2) implementation. The unsuffixed files are the EAGLE-3 and EAGLE-3.1 path. Inside
@@ -90,6 +91,10 @@ The shipped example configs only cover a subset.
   multimodal data path through `recipe_args.multimodal: true`). MiniMax-M3.1-Flash
   ships `dspark/config.json`, so its draft follows that contract and exports the
   released layout (`dspark/minimax_m3_1_flash_dspark.yaml`).
+- **DFly2**: DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`), following the released
+  `AngelSlim/DS-V4.1-Flash-DFly2-B6` layout (`dfly2/deepseek_v41_flash_dfly2.yaml`). The
+  draft is model-owned: the target pairs its ratio-1 sparse layers with the draft layers and
+  exposes their cached keys and key lists. Colocated, unpacked, text-only targets only.
 
 Qwen3-MoE is handled exactly like a dense target: the draft only consumes
 post-block hidden states, never per-expert routing. gpt-oss uses a dedicated
@@ -140,6 +145,7 @@ Select them in the config. All degrade gracefully when a dependency is missing.
 | P-EAGLE | `flex_attention` (compiled when CUDA + head_dim ≥ 16, else eager flex) | automatic |
 | DFlash / DFlash 2 / Domino / JetSpec | `flex_attention`, `sdpa` | `recipe_args.attention_backend` (default `flex_attention`) |
 | DSpark | `flex_attention` (Qwen3 / Gemma4 / MiniMax M3 drafts), `sdpa` (V4 / GLM MLA drafts, fixed) | `recipe_args.attention_backend` |
+| DFly2 | `tilelang`, `cudnn` (sparse key lists, needed for long rows), `sdpa`, `eager` (dense mask, short rows) | `recipe_args.draft_attn_backend` (default `sdpa`) |
 
 For EAGLE-3, FlashAttention-2 is real FA2 over the TTT attention pattern: FA2
 computes the `T×T` causal block and returns `softmax_lse`, and the diagonal
@@ -623,6 +629,7 @@ such caveat.
 | DFlash 2 | not yet wired here (`--speculative-algorithm DFLASH` upstream) | not yet wired here (`dflash` method upstream) |
 | Domino | no | no (the GRU correction head has no engine runtime) |
 | DSpark | no | not yet (runtime in development upstream, unreleased) |
+| DFly2 | no | not yet (runtime in development upstream, unreleased) |
 
 `serve_sglang.py` rejects P-EAGLE drafts with an actionable error. Serve those on
 vLLM.

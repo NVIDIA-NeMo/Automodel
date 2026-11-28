@@ -39,11 +39,11 @@ caching and SWA bounded replay remain out of scope.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -113,6 +113,9 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.speculative.dfly2.common import DFly2TargetFeatures
 
 
 class DeepseekV41Block(nn.Module):
@@ -739,6 +742,23 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
                 f"DSpark target layer IDs must be integers in [0, {len(self.model.layers)}), got {layer_ids}"
             )
         return tuple(self.model.layers[str(layer_id)].attn_hc for layer_id in layer_ids)
+
+    def dfly2_target_features(
+        self, input_ids: torch.Tensor, *, attention_mask: torch.Tensor, layer_ids: Sequence[int]
+    ) -> DFly2TargetFeatures:
+        """Run the frozen forward and return the keys and key lists of the layers paired with a DFly2 draft.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence].
+            attention_mask: Binary right-padding tensor of shape [batch, sequence].
+            layer_ids: Paired ratio-1 layers, in draft-layer order.
+
+        Returns:
+            Features documented by :func:`dfly2_target.dfly2_target_features`.
+        """
+        from nemo_automodel.components.models.deepseek_v41.dfly2_target import dfly2_target_features
+
+        return dfly2_target_features(self, input_ids, attention_mask=attention_mask, layer_ids=layer_ids)
 
     def _nemo_prepare_model_owned_dtensors(self, fsdp_mesh: DeviceMesh) -> set[nn.Parameter]:
         """Register owner table DTensors before FSDP records ignored parameters.

@@ -758,6 +758,73 @@ _DFLASH_LOSS_TYPES = {
 _DPACE_LOSS_TYPES = _DFLASH_LOSS_TYPES - {"dflash"}
 
 
+def dpace_position_weights(
+    token_nll: torch.Tensor,
+    binary_mask: torch.Tensor,
+    binary_mask_bool: torch.Tensor,
+    *,
+    dpace_alpha: float,
+    loss_type: str = "dpace",
+) -> torch.Tensor:
+    """Compute detached D-PACE position weights (arXiv:2605.18810).
+
+    Args:
+        token_nll: Per-token NLL of the draft on the target token, shape
+            ``[batch, blocks, k]``; the draft confidence is ``exp(-token_nll)``.
+            Taken as the NLL rather than the confidence so the smoothed
+            log-confidence stays finite even where ``exp(-token_nll)``
+            underflows.
+        binary_mask: Float valid-position mask, same shape.
+        binary_mask_bool: Boolean valid-position mask, same shape.
+        dpace_alpha: Smoothing alpha for the confidence products, in ``[0, 1]``.
+        loss_type: One of the ``"dpace*"`` variants.
+
+    Returns:
+        Detached weights of shape ``[batch, blocks, k]``, in ``token_nll``'s
+        dtype. The ``cumprod`` / reverse-``cumsum`` run over the last (``k``)
+        axis, so the confidence product resets at every block boundary by
+        construction. Accumulated in float32: the per-block products span many
+        orders of magnitude at small ``dpace_alpha``, which bf16's 8-bit
+        mantissa cannot carry.
+    """
+    nll = token_nll.float()
+    smooth = (1.0 - dpace_alpha) * torch.exp(-nll) + dpace_alpha
+    smooth = torch.where(binary_mask_bool, smooth, torch.ones_like(smooth))
+    prefix = torch.cumprod(smooth, dim=-1)
+
+    if loss_type == "dpace-cumulative-confidence-only":
+        return prefix.to(token_nll.dtype)
+
+    if loss_type == "dpace":
+        suffix = torch.flip(
+            torch.cumsum(torch.flip(prefix * binary_mask.to(prefix.dtype), dims=[-1]), dim=-1),
+            dims=[-1],
+        )
+        return suffix.to(token_nll.dtype)
+
+    if loss_type == "dpace-continuation-value-only":
+        # The same suffix/prefix ratio, evaluated in log space. Computing it as a
+        # division underflows for small dpace_alpha: alpha=0 leaves a bare product
+        # of block_size-1 confidences, so a merely lukewarm draft (0.3 per position
+        # over 15 positions) already reaches 1e-8 and keeps falling, and once both
+        # operands flush to zero the ratio is lost. log(smooth) is built from the
+        # NLL via logaddexp, so it stays finite even where exp(-nll) is zero.
+        log_alpha = nll.new_tensor(dpace_alpha).log()
+        log_one_minus_alpha = torch.log1p(nll.new_tensor(-dpace_alpha))
+        log_smooth = torch.logaddexp(log_one_minus_alpha - nll, log_alpha.expand_as(nll))
+        log_smooth = torch.where(binary_mask_bool, log_smooth, torch.zeros_like(log_smooth))
+        log_prefix = torch.cumsum(log_smooth, dim=-1)
+        log_suffix = torch.flip(
+            torch.logcumsumexp(
+                torch.flip(log_prefix.masked_fill(~binary_mask_bool, float("-inf")), dims=[-1]),
+                dim=-1,
+            ),
+            dims=[-1],
+        )
+        return torch.exp(log_suffix - log_prefix).to(token_nll.dtype)
+    raise ValueError(f"unknown D-PACE loss_type {loss_type!r}")
+
+
 class DFlashDecayLoss(nn.Module):
     """Position-decay cross-entropy loss for DFlash draft model training.
 
@@ -858,61 +925,19 @@ class DFlashDecayLoss(nn.Module):
         binary_mask: torch.Tensor,
         binary_mask_bool: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute detached D-PACE position weights.
+        """Compute detached D-PACE position weights with this loss's alpha and variant.
 
         Args:
-            token_nll: Per-token NLL of the draft on the target token, shape
-                ``[batch, blocks, k]``; the draft confidence is ``exp(-token_nll)``.
-                Taken as the NLL rather than the confidence so the smoothed
-                log-confidence stays finite even where ``exp(-token_nll)``
-                underflows.
+            token_nll: Per-token NLL of shape ``[batch, blocks, k]``.
             binary_mask: Float valid-position mask, same shape.
             binary_mask_bool: Boolean valid-position mask, same shape.
 
         Returns:
-            Detached weights of shape ``[batch, blocks, k]``, in ``token_nll``'s
-            dtype. The ``cumprod`` / reverse-``cumsum`` run over the last (``k``)
-            axis, so the confidence product resets at every block boundary by
-            construction. Accumulated in float32: the per-block products span many
-            orders of magnitude at small ``dpace_alpha``, which bf16's 8-bit
-            mantissa cannot carry.
+            Detached weights of shape ``[batch, blocks, k]``; see :func:`dpace_position_weights`.
         """
-        nll = token_nll.float()
-        smooth = (1.0 - self.dpace_alpha) * torch.exp(-nll) + self.dpace_alpha
-        smooth = torch.where(binary_mask_bool, smooth, torch.ones_like(smooth))
-        prefix = torch.cumprod(smooth, dim=-1)
-
-        if self.loss_type == "dpace-cumulative-confidence-only":
-            return prefix.to(token_nll.dtype)
-
-        if self.loss_type == "dpace":
-            suffix = torch.flip(
-                torch.cumsum(torch.flip(prefix * binary_mask.to(prefix.dtype), dims=[-1]), dim=-1),
-                dims=[-1],
-            )
-            return suffix.to(token_nll.dtype)
-
-        if self.loss_type == "dpace-continuation-value-only":
-            # The same suffix/prefix ratio, evaluated in log space. Computing it as a
-            # division underflows for small dpace_alpha: alpha=0 leaves a bare product
-            # of block_size-1 confidences, so a merely lukewarm draft (0.3 per position
-            # over 15 positions) already reaches 1e-8 and keeps falling, and once both
-            # operands flush to zero the ratio is lost. log(smooth) is built from the
-            # NLL via logaddexp, so it stays finite even where exp(-nll) is zero.
-            log_alpha = nll.new_tensor(self.dpace_alpha).log()
-            log_one_minus_alpha = torch.log1p(nll.new_tensor(-self.dpace_alpha))
-            log_smooth = torch.logaddexp(log_one_minus_alpha - nll, log_alpha.expand_as(nll))
-            log_smooth = torch.where(binary_mask_bool, log_smooth, torch.zeros_like(log_smooth))
-            log_prefix = torch.cumsum(log_smooth, dim=-1)
-            log_suffix = torch.flip(
-                torch.logcumsumexp(
-                    torch.flip(log_prefix.masked_fill(~binary_mask_bool, float("-inf")), dims=[-1]),
-                    dim=-1,
-                ),
-                dims=[-1],
-            )
-            return torch.exp(log_suffix - log_prefix).to(token_nll.dtype)
-        raise ValueError(f"unknown D-PACE loss_type {self.loss_type!r}")
+        return dpace_position_weights(
+            token_nll, binary_mask, binary_mask_bool, dpace_alpha=self.dpace_alpha, loss_type=self.loss_type
+        )
 
     def position_weights(self, token_nll: torch.Tensor, block_mask: torch.Tensor) -> torch.Tensor:
         """Per-position loss weights for this instance's ``loss_type``, unreduced.
