@@ -389,27 +389,14 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Main benchmarking loop
         for i in range(steps):
-            # EXPERIMENT ONLY (perf-gap kernel comparison; not for merge): profile iteration 20 on rank 0.
+            # EXPERIMENT ONLY (perf-gap idle attribution; not for merge): profile iteration 20 on rank 0.
             if rank == 0 and i in (20, 21):
-                torch.cuda.synchronize()
+                from nemo_automodel.recipes.llm import _exp_idle_profile
+
                 if i == 20:
-                    _exp_prof = torch.profiler.profile(
-                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-                    )
-                    _exp_prof.__enter__()
+                    _exp_prof = _exp_idle_profile.start()
                 else:
-                    _exp_prof.__exit__(None, None, None)
-                    _exp_rows = sorted(
-                        (
-                            (e.key, e.self_device_time_total)
-                            for e in _exp_prof.key_averages()
-                            if str(e.device_type).endswith("CUDA") and e.self_device_time_total > 0
-                        ),
-                        key=lambda r: -r[1],
-                    )
-                    print(f"EXP_KERNELS total_ms={sum(d for _, d in _exp_rows) / 1e3:.1f}", flush=True)
-                    for _exp_k, _exp_d in _exp_rows[:70]:
-                        print(f"EXP_KERNELS {_exp_d / 1e3:10.2f} ms  {_exp_k[:120]}", flush=True)
+                    _exp_idle_profile.finish(_exp_prof)
             self.step_scheduler.step = i
             # Start nsys profiling if configured
             if i == nsys_start and rank in nsys_ranks:
