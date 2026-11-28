@@ -26,6 +26,21 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_coverage_reports_the_tested_mirror_revision() -> None:
+    """Bind the Codecov status to the event SHA and PR metadata verified for the image build."""
+    jobs = yaml.safe_load((_ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    outputs = jobs["cicd-compute-build-matrix"]["outputs"]
+    assert outputs["pr_number"] == "${{ steps.revision.outputs.pr_number }}"
+    assert outputs["base_sha"] == "${{ steps.revision.outputs.base }}"
+    coverage_job = jobs["Coverage"]
+    assert "cicd-container-build" in coverage_job["needs"]
+    assert "needs.cicd-container-build.result == 'success'" in coverage_job["if"]
+    upload = next(step["with"] for step in coverage_job["steps"] if "codecov/codecov-action" in step.get("uses", ""))
+    assert upload["base_sha"] == "${{ needs.cicd-compute-build-matrix.outputs.base_sha }}"
+    assert upload["override_pr"] == "${{ needs.cicd-compute-build-matrix.outputs.pr_number }}"
+    assert upload["override_commit"] == "${{ github.sha }}"
+
+
 def _run_aggregation(tmp_path: Path) -> subprocess.CompletedProcess[str]:
     workflow = yaml.safe_load((_ROOT / ".github/workflows/cicd-main.yml").read_text())
     step = next(

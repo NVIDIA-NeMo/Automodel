@@ -26,11 +26,15 @@ env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
   CUDA_CONTAINER_IMAGE: nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04@sha256:843a5e81ed49ad2a2787aa10e48e926dc1f9440522a122ec2a637c27039fc77d
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
-      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160  # pragma: allowlist secret
+      workflow_ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
 
   setup-install-image:
     runs-on: ubuntu-latest
@@ -92,7 +96,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.39.0
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel
@@ -183,7 +187,6 @@ jobs:
 
       - name: Install project
         env:
-          PAT: ${{ secrets.PAT }}
           UV_PROJECT_ENVIRONMENT: ./venv
           TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
           # TE's optional NCCL-EP binding requires private PyTorch headers that
@@ -192,10 +195,7 @@ jobs:
           INSTALL_MODE: ${{ matrix.mode }}
         shell: bash
         run: |
-          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
-          chmod 600 ~/.netrc
-
-          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          uv venv "${UV_PROJECT_ENVIRONMENT}" --system-site-packages
           source ./venv/bin/activate
 
           export PATH="./bin/:$PATH"
@@ -237,7 +237,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.39.0
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel
@@ -514,7 +514,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.39.0
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel
@@ -549,16 +549,11 @@ jobs:
       - name: Install dependencies with UV
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
-          PAT: ${{ secrets.PAT }}
         run: |
-
-          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
-          chmod 600 ~/.netrc
-
           export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 
           # Keep runner packages isolated, but seed pip for the check-imports action.
-          uv venv ${UV_PROJECT_ENVIRONMENT} --seed
+          uv venv "${UV_PROJECT_ENVIRONMENT}" --seed
 
           uv sync --link-mode copy --locked --only-group build
 
@@ -570,7 +565,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.39.0
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel
@@ -583,36 +578,18 @@ jobs:
     needs: [pip-test, uv-test, ngc-cuda-test-uv, cuda-wheelhouse, verify-cuda-wheelhouse, ngc-cuda-test-pip, pre-flight, setup-install-image]
     runs-on: ubuntu-latest
     name: Install test summary
-    if: |
-      (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || always()
-      )
-      && !cancelled()
+    if: ${{ always() && !cancelled() }}
+    permissions: {}
     steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
       - name: Get workflow result
-        id: result
-        shell: bash -x -e -u -o pipefail {0}
         env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ (needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push') || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+          RESULTS: ${{ toJSON(needs) }}
+          ALLOW_SKIPS: ${{ (needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push') || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
-
-          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
-              echo "✅ All previous jobs completed successfully"
-              exit 0
-          else
-              echo "❌ Found $FAILED_JOBS failed job(s)"
-              # Show which jobs failed
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
-              exit 1
-          fi
+          jq -e --argjson skips "$ALLOW_SKIPS" '
+            .["pre-flight"].result == "success" and .["setup-install-image"].result == "success" and
+            all(.[]; .result == "success" or ($skips and .result == "skipped"))
+          ' <<< "$RESULTS"
 
   notify-scheduled-failure:
     name: Notify teams of scheduled installation failure

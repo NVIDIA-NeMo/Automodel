@@ -20,23 +20,36 @@ on:
       - 'pyproject.toml'
       - 'docker/common/uv-pytorch.toml'
 
+permissions: {}
+
 jobs:
   check_uv_lock_and_update:
     if: github.repository == 'NVIDIA-NeMo/Automodel'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    env:
-      CAN_PUSH_LOCKS: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
+      - name: Check whether the PR branch can receive lock updates
+        id: target
+        if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          branch=$(jq -nr --arg name "$PR_BRANCH" '$name | @uri')
+          protected=$(gh api "repos/$GITHUB_REPOSITORY/branches/$branch" --jq .protected)
+          echo "can_push=$([[ "$protected" == false ]] && echo true || echo false)" | tee -a "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-          persist-credentials: ${{ env.CAN_PUSH_LOCKS }}
-          token: ${{ env.CAN_PUSH_LOCKS == 'true' && secrets.PAT || github.token }}
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -48,6 +61,8 @@ jobs:
           version: 0.8.22
 
       - name: Check or update uv lock files
+        env:
+          CAN_PUSH_LOCKS: ${{ steps.target.outputs.can_push }}
         run: |
           set -e
 
@@ -75,16 +90,68 @@ jobs:
           fi
           mv uv_main.lock uv.lock
 
-      - name: Commit and push uv lock updates
-        if: env.CAN_PUSH_LOCKS == 'true'
+      - name: Check for lockfile changes
+        id: changes
+        if: steps.target.outputs.can_push == 'true'
         run: |
-          git config --global user.email "nemo-bot@nvidia.com"
-          git config --global user.name "NeMo Bot"
-
-          if git diff --quiet uv.lock docker/common/uv-pytorch.lock; then
-            echo "No changes to commit"
-          else
-            git add uv.lock docker/common/uv-pytorch.lock
-            git commit --signoff -m "Update uv lock"
-            git push
+          if ! git diff --quiet -- uv.lock docker/common/uv-pytorch.lock; then
+            echo "changed=true" | tee -a "$GITHUB_OUTPUT"
           fi
+
+      - name: Upload updated lock files
+        id: upload
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: uv-locks-${{ github.run_attempt }}
+          path: |
+            uv.lock
+            docker/common/uv-pytorch.lock
+          if-no-files-found: error
+
+  push-locks:
+    needs: check_uv_lock_and_update
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' && needs.check_uv_lock_and_update.outputs.artifact_id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the PR commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /uv.lock
+            /docker/common/uv-pytorch.lock
+
+      - name: Download updated lock files
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ needs.check_uv_lock_and_update.outputs.artifact_id }}
+          path: ${{ runner.temp }}/uv-locks
+
+      - name: Commit and push uv lock updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          branch=$(jq -nr --arg name "$PR_BRANCH" '$name | @uri')
+          gh api "repos/$GITHUB_REPOSITORY/branches/$branch" |
+            jq -e --arg sha "$PR_HEAD" '.protected == false and .commit.sha == $sha' > /dev/null
+
+          for lock in uv.lock docker/common/uv-pytorch.lock; do
+            file="$RUNNER_TEMP/uv-locks/$lock"
+            [[ -f "$file" && ! -L "$file" ]]
+            blob=$(git hash-object -w --no-filters -- "$file")
+            git update-index --cacheinfo "100644,$blob,$lock"
+          done
+          git config user.email "nemo-bot@nvidia.com"
+          git config user.name "NeMo Bot"
+          git commit --signoff -m "Update uv lock"
+          ref="refs/heads/$PR_BRANCH"
+          git push --force-with-lease="$ref:$PR_HEAD" origin "HEAD:$ref"

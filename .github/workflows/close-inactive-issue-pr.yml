@@ -3,6 +3,10 @@ on:
   schedule:
     - cron: "30 1 * * *"
 
+permissions:
+  issues: write
+  pull-requests: write
+
 jobs:
   close-issues:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_close_inactive_issue_pr.yml@9e07489b8a6bc533c8792099b012c588f4430298 # v0.44.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_close_inactive_issue_pr.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4

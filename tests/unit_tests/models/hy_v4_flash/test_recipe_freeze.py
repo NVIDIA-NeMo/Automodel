@@ -27,7 +27,7 @@ from tests.unit_tests.models.hy_v4_flash.conftest import CPU_BACKEND, TOKEN_RANG
 REPO = Path(__file__).resolve().parents[4]
 RECIPES = [
     "examples/llm_finetune/hy_v4_flash/hy4_flash_tulu3_128k_cp16_ep64_100steps.yaml",
-    "examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep64_lora.yaml",
+    "examples/vlm_finetune/hy_v4_flash/hy4_flash_medpix_4k_ep16_lora.yaml",
 ]
 
 

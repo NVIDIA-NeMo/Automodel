@@ -26,7 +26,6 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  id-token: write
   contents: read
   pull-requests: read
 
@@ -36,7 +35,7 @@ env:
 
 jobs:
   ephemeral-runner-routing:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
       lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
       legacy_label: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
@@ -45,9 +44,9 @@ jobs:
 
   pre-flight:
     needs: [ephemeral-runner-routing]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
-      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160  # pragma: allowlist secret
+      workflow_ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label_base }}
       default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
@@ -277,8 +276,42 @@ jobs:
       )
       && !cancelled()
     outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+      pr_number: ${{ steps.revision.outputs.pr_number }}
+      base_sha: ${{ steps.revision.outputs.base }}
       matrix: ${{ steps.compute.outputs.matrix }}
     steps:
+      - name: Resolve verified container revision
+        id: revision
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$GITHUB_SHA
+          pr_number=""
+          base=""
+          if [[ "$GITHUB_REF" == refs/heads/pull-request/* ]]; then
+            if ! [[ "$GITHUB_REF" =~ ^refs/heads/pull-request/([1-9][0-9]*)$ ]]; then
+              echo "::error::Invalid PR mirror branch."
+              exit 1
+            fi
+            pr_number=${BASH_REMATCH[1]}
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" \
+              --jq '[.state, .head.sha, .base.sha, .merge_commit_sha] | @tsv')
+            read -r state head base sha <<< "$pr"
+            if [[ "$state" != open || "$head" != "$GITHUB_SHA" || ! "$sha" =~ ^[0-9a-f]{40}$ || ! "$base" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::The PR mirror is stale or the current test merge is unavailable."
+              exit 1
+            fi
+            parents=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$sha" --jq '[.parents[].sha] | join(" ")')
+            if [[ "$parents" != "$base $GITHUB_SHA" ]]; then
+              echo "::error::Test merge parents do not match the current base and vetted PR head."
+              exit 1
+            fi
+          fi
+          printf 'sha=%s\npr_number=%s\nbase=%s\n' "$sha" "$pr_number" "$base" | tee -a "$GITHUB_OUTPUT"
+
       - name: Compute build matrix
         id: compute
         env:
@@ -312,32 +345,16 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
+      && needs.cicd-compute-build-matrix.result == 'success'
     runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     environment: ${{ contains(matrix.registry, 'azure') && 'nemo-ci' || '' }}
     steps:
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
-
-      - name: Get merge commit sha
-        shell: bash -x -e -u -o pipefail {0}
-        id: sha
-        env:
-          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
-        run: |
-          if [[ "$IS_PR" == "true" ]]; then
-            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
-          else
-            SHA=${GITHUB_SHA}
-          fi
-          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
-
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ steps.sha.outputs.main }}
+          ref: ${{ needs.cicd-compute-build-matrix.outputs.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -351,10 +368,11 @@ jobs:
       - name: Compute cache keys
         id: cache_keys
         shell: bash
+        env:
+          PR_NUMBER: ${{ needs.cicd-compute-build-matrix.outputs.pr_number }}
         run: |
-          PR_NUMBER="${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}"
-          BRANCH_SANITIZED=$(echo "${{ github.ref_name }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          BRANCH_SANITIZED=$(echo "$GITHUB_REF_NAME" | tr '/' '-' | tr -cd '[:alnum:]._-')
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
             KEY="main"
           elif [[ -n "$PR_NUMBER" ]]; then
             KEY="$PR_NUMBER"
@@ -435,13 +453,6 @@ jobs:
           # after the build would create an archive that no step persists.
           skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.uv-build-cache-main.outputs.cache-hit == 'true' }}
 
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-
       # Persist installed native extensions and the complete venv. Unlike a
       # BuildKit layer cache, this image remains reusable when its parent cache
       # chain is missing or a PR/release has no writable Actions uv cache.
@@ -459,8 +470,6 @@ jobs:
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: ${{ steps.cache_keys.outputs.cache-to }}
           tags: ${{ steps.dependencies.outputs.image }}
-          secrets: |
-            GH_TOKEN=${{ steps.app-token.outputs.token }}
 
       - name: Build and push
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
@@ -477,8 +486,6 @@ jobs:
           tags: |
             ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}
             ${{ matrix.registry }}/automodel:${{ github.sha }}
-          secrets: |
-            GH_TOKEN=${{ steps.app-token.outputs.token }}
 
   cicd-unit-tests:
     strategy:
@@ -516,7 +523,7 @@ jobs:
             cpu-only: false
             test-folder: kernel_parity
             timeout: 20
-    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
+    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build, cicd-compute-build-matrix]
     runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     name: ${{ matrix.test-name }}
     if: |
@@ -526,16 +533,13 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
+      && needs.cicd-container-build.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-
+          ref: ${{ needs.cicd-compute-build-matrix.outputs.sha }}
+          persist-credentials: false
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -550,7 +554,6 @@ jobs:
           cpu-only: ${{ matrix.cpu-only || false }}
           shard-id: ${{ matrix.shard-id }}
           num-shards: ${{ matrix.num-shards }}
-          PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
@@ -629,7 +632,7 @@ jobs:
             timeout: 50
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-    needs: [pre-flight, cicd-unit-tests]
+    needs: [pre-flight, cicd-unit-tests, cicd-container-build, cicd-compute-build-matrix]
     runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     name: ${{ matrix.test-name }}
     if: |
@@ -639,24 +642,20 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
+      && needs.cicd-container-build.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-
+          ref: ${{ needs.cicd-compute-build-matrix.outputs.sha }}
+          persist-credentials: false
       - name: main
         uses: ./.github/actions/test-template
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
-          is_unit_test: "false"
-          PAT: ${{ steps.app-token.outputs.token }}
+          is-unit-test: "false"
           test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
@@ -714,7 +713,7 @@ jobs:
           - test-name: L2_Distributed
             test-folder: moe,parallelism,optim,decision_models/clef,distributed
             timeout: 45
-    needs: [pre-flight, cicd-unit-tests, cicd-container-build]
+    needs: [pre-flight, cicd-unit-tests, cicd-container-build, cicd-compute-build-matrix]
     runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}
     if: |
@@ -724,18 +723,15 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
+      && needs.cicd-container-build.result == 'success'
       && needs.pre-flight.outputs.is_member == 'true'
       && vars.DISABLE_GB200_TESTS != 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-
+          ref: ${{ needs.cicd-compute-build-matrix.outputs.sha }}
+          persist-credentials: false
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -743,8 +739,7 @@ jobs:
           timeout: ${{ matrix.timeout }}
           full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is-optional: ${{ matrix.is-optional || 'false' }}
-          is_unit_test: "false"
-          PAT: ${{ steps.app-token.outputs.token }}
+          is-unit-test: "false"
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
           runner: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
@@ -752,49 +747,35 @@ jobs:
   Nemo_CICD_Test:
     needs:
       - pre-flight
+      - Nemo_Linting_Test
+      - cicd-wait-in-queue
+      - cicd-compute-build-matrix
+      - cicd-container-build
       - cicd-unit-tests
       - cicd-e2e-tests
       - cicd-e2e-tests-gb200
-    if: |
-      (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || needs.pre-flight.outputs.is_ci_workload == 'true'
-        || always()
-      )
-      && !cancelled()
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
-    permissions: write-all
+    permissions: {}
     steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
       - name: Get workflow result
-        id: result
-        shell: bash -x -e -u -o pipefail {0}
         env:
-          GH_TOKEN: ${{ github.token }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
-          IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
-          DISABLE_GB200_TESTS: ${{ vars.DISABLE_GB200_TESTS }}
+          RESULTS: ${{ toJSON(needs) }}
+          ALLOW_SKIPS: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+          CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload == 'true' }}
+          CHECK_GB200: ${{ needs.pre-flight.outputs.is_member == 'true' && vars.DISABLE_GB200_TESTS != 'true' }}
         run: |
-          if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
-            FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
-          else
-            FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | startswith("gb200_") | not))] | length') || echo 0
-          fi
-
-          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
-              echo "✅ All previous jobs completed successfully"
-              exit 0
-          else
-              echo "❌ Found $FAILED_JOBS failed job(s)"
-              # Show which jobs failed
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
-              exit 1
-          fi
+          jq -e --argjson skips "$ALLOW_SKIPS" --argjson workload "$CI_WORKLOAD" --argjson gb200 "$CHECK_GB200" '
+            .["pre-flight"].result == "success" and
+            ($workload or (
+              (if $gb200 then . else del(.["cicd-e2e-tests-gb200"]) end) |
+              all(.[]; .result == "success" or ($skips and .result == "skipped"))
+            ))
+          ' <<< "$RESULTS"
 
   Coverage_Fake:
+    permissions:
+      statuses: write
     runs-on: ubuntu-latest
     needs: [Nemo_CICD_Test, pre-flight]
     if: |
@@ -806,17 +787,9 @@ jobs:
       && !cancelled()
       && vars.ENABLE_CODECOV == 'true'
     steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-
       - name: Generate fake coverage report
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -829,11 +802,12 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [pre-flight, Nemo_CICD_Test, cicd-unit-tests, cicd-e2e-tests]
+    needs: [pre-flight, Nemo_CICD_Test, cicd-container-build, cicd-unit-tests, cicd-e2e-tests, cicd-compute-build-matrix]
     # The summary permits failures on CI workloads; publish only complete test runs.
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
+      && needs.cicd-container-build.result == 'success'
       && needs.cicd-unit-tests.result == 'success'
       && needs.cicd-e2e-tests.result == 'success'
       && vars.ENABLE_CODECOV == 'true'
@@ -841,13 +815,11 @@ jobs:
       matrix:
         flag: [unit-test, e2e]
     steps:
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
-
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.cicd-compute-build-matrix.outputs.sha }}
+          persist-credentials: false
 
       - name: Set up UV
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
@@ -888,9 +860,9 @@ jobs:
           files: coverage.xml
           disable_search: true
           fail_ci_if_error: true
-          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
-          override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          override_commit: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
+          base_sha: ${{ needs.cicd-compute-build-matrix.outputs.base_sha }}
+          override_pr: ${{ needs.cicd-compute-build-matrix.outputs.pr_number }}
+          override_commit: ${{ github.sha }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

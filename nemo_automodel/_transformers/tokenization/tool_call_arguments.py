@@ -19,7 +19,7 @@ mapping. Automodel's chat datasets store arguments as JSON strings (the OpenAI w
 Arrow-backed datasets keep intact). ``wrap_tokenizer`` makes a tokenizer instance's ``apply_chat_template`` parse
 such strings back into dicts first, which is also what the serving stacks pass to those templates.
 ``DictToolArgumentsTokenizer`` is registered in ``TokenizerRegistry`` for the model types whose templates need it
-(Beam, DeepSeek-V4.1, Nemotron-H); other models are unaffected, and the tokenizer class (and hence ``save_pretrained`` output)
+(Beam, DeepSeek-V4.1, Gemma4, Nemotron-H); other models are unaffected, and the tokenizer class (and hence ``save_pretrained`` output)
 is unchanged.
 """
 
@@ -92,6 +92,32 @@ def wrap_tokenizer(tokenizer: PreTrainedTokenizerBase) -> PreTrainedTokenizerBas
         :func:`tool_call_arguments_as_dicts` first.
     """
     tokenizer.apply_chat_template = functools.partial(_apply_chat_template_with_dict_arguments, tokenizer)
+    return tokenizer
+
+
+def wrap_tokenizer_for_model(
+    tokenizer: PreTrainedTokenizerBase,
+    pretrained_model_name_or_path: str | os.PathLike[str],
+    trust_remote_code: bool = False,
+) -> PreTrainedTokenizerBase:
+    """Apply :func:`wrap_tokenizer` when the model's type is registered for :class:`DictToolArgumentsTokenizer`.
+
+    Loaders that take the tokenizer from a processor (the VLM dataloader) bypass ``NeMoAutoTokenizer``'s registry
+    dispatch; this gives their tokenizer the same tool-call argument handling.
+
+    Args:
+        tokenizer: The tokenizer to wrap in place.
+        pretrained_model_name_or_path: Hub id or local directory whose config gives the model type.
+        trust_remote_code: Whether loading the model config may run remote code.
+
+    Returns:
+        ``tokenizer``, wrapped when the model type needs dict arguments.
+    """
+    from nemo_automodel._transformers.auto_tokenizer import _get_model_type, _get_tokenizer_registry
+
+    model_type = _get_model_type(str(pretrained_model_name_or_path), trust_remote_code=trust_remote_code)
+    if model_type and _get_tokenizer_registry().get_custom_tokenizer_cls(model_type) is DictToolArgumentsTokenizer:
+        return wrap_tokenizer(tokenizer)
     return tokenizer
 
 
