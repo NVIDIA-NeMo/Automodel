@@ -34,6 +34,71 @@ from tools.docs.checks.model_cards import (
 pytestmark = pytest.mark.timeout(70)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("recipe_backed", [False, True])
+def test_family_card_accepts_explicit_sizes_and_keeps_related_links_separate(
+    tmp_path: Path, recipe_backed: bool
+) -> None:
+    from tools.docs.build.coverage_tables import _load_model_doc_catalog
+
+    card = tmp_path / "docs/model-coverage/embedding/org/family.mdx"
+    card.parent.mkdir(parents=True)
+    document = (
+        '---\ntitle: "Embed"\nslug: model-coverage/embedding-models/org/Embed\n'
+        "checkpoints:\n  - org/Embed-1B-BF16\n  - org/Embed-8B-BF16\n---\n"
+        "[1B](https://huggingface.co/org/Embed-1B-BF16)\n"
+        "[8B](https://huggingface.co/org/Embed-8B-BF16)\n"
+        "[Related](https://huggingface.co/other/Rerank-8B)\n"
+    )
+    if recipe_backed:
+        recipe = tmp_path / "examples/embed.yaml"
+        recipe.parent.mkdir()
+        recipe.write_text("model:\n  pretrained_model_name_or_path: org/Embed-8B-BF16\n")
+        document += "[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/embed.yaml)\n"
+    card.write_text(document)
+
+    _validate_model_card_recipe_identity(tmp_path, card)
+    models, _, pages = _load_model_doc_catalog(tmp_path / "docs")
+    assert set(models) == {"org/Embed-1B-BF16", "org/Embed-8B-BF16"}
+    assert len(pages) == 1
+    assert pages[0].title == "Embed"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "checkpoints,links,recipe_id,message",
+    [
+        ([], [], None, "nonempty list"),
+        (["org/Embed-1B", "org/Embed-1B"], ["org/Embed-1B"], None, "unique"),
+        (["org/Embed-1B"], [], None, "exact HF link"),
+        (["org/Embedding-1B"], ["org/Embedding-1B"], None, "match the title"),
+        (["org/Embed-1B", "other/Embed-8B"], ["org/Embed-1B", "other/Embed-8B"], None, "one publisher"),
+        (["org/Embed-1B"], ["org/Embed-1B", "org/Embed-8B"], "org/Embed-8B", "declared family"),
+    ],
+)
+def test_family_card_rejects_invalid_membership(
+    tmp_path: Path, checkpoints: list[str], links: list[str], recipe_id: str | None, message: str
+) -> None:
+    import yaml
+
+    metadata = {
+        "title": "Embed",
+        "slug": "model-coverage/embedding-models/org/Embed",
+        "checkpoints": checkpoints,
+    }
+    document = "---\n" + yaml.safe_dump(metadata) + "---\n"
+    document += "\n".join(f"[Checkpoint](https://huggingface.co/{checkpoint})" for checkpoint in links)
+    if recipe_id:
+        recipe = tmp_path / "examples/embed.yaml"
+        recipe.parent.mkdir()
+        recipe.write_text(f"model:\n  pretrained_model_name_or_path: {recipe_id}\n")
+        document += "\n[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/embed.yaml)\n"
+    card = tmp_path / "family.mdx"
+    card.write_text(document)
+    with pytest.raises(ValueError, match=message):
+        _validate_model_card_recipe_identity(tmp_path, card)
+
+
 def test_model_card_path_aliases_preserve_published_paths():
     _validate_card_aliases(Path(__file__).resolve().parents[5])
 
@@ -244,3 +309,65 @@ def test_description_validator_accepts_a_valid_model_card(tmp_path: Path):
     card.write_text(f'---\ntitle: "Model-1B"\ndescription: "{description}"\n---\n')
 
     checks._validate_descriptions(tmp_path)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("family", [False, True])
+def test_model_catalog_preserves_frontmatter_scalar_with_delimiter(tmp_path: Path, family: bool) -> None:
+    from tools.docs.build.coverage_tables import _load_model_doc_catalog
+
+    card = tmp_path / "docs/model-coverage/embedding/org/embed.mdx"
+    card.parent.mkdir(parents=True)
+    membership = "checkpoints:\n  - org/Embed-1B\n" if family else ""
+    card.write_text(
+        '---\ntitle: "Embed"\ndescription: "Train --- then evaluate"\n'
+        "slug: model-coverage/embedding-models/org/Embed\n"
+        + membership
+        + "---\n[Checkpoint](https://huggingface.co/org/Embed-1B)\n"
+    )
+
+    models, _, pages = _load_model_doc_catalog(tmp_path / "docs")
+
+    assert set(models) == {"org/Embed-1B"}
+    assert len(pages) == 1
+    assert pages[0].docs_page == "/model-coverage/embedding-models/org/Embed"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "checkpoint_url,accepted",
+    [
+        ("https://huggingface.co/org/Embed-1B", True),
+        ("https://huggingface.co/org/Embed-1B?download=true", True),
+        ("https://huggingface.co/org/Embed-1B#usage", True),
+        ("https://huggingface.co/org/Embed-1B/tree/main", True),
+        ("https://huggingface.co/org/Embed-1B/resolve/main/config.json", True),
+        ("https://huggingface.co/org/Embed%2D1B", True),
+        ("https://huggingface.co/org/Embed-1B%2Dwrong", False),
+        ("https://huggingface.co/org/Embed-1B%2Fwrong", False),
+        ("https://huggingface.co/org/Embed-1B%252Dwrong", False),
+        ("https://huggingface.co/org/Embed-1B/../Other", False),
+        ("https://huggingface.co/org/Embed-1B/%2e%2e/Other", False),
+        ("https://huggingface.co//org/Embed-1B", False),
+    ],
+)
+def test_family_checkpoint_links_match_complete_decoded_segments(
+    tmp_path: Path, checkpoint_url: str, accepted: bool
+) -> None:
+    from tools.docs.cards import checkpoint_links, family_checkpoints
+
+    document = (
+        '---\ntitle: "Embed"\nslug: model-coverage/embedding-models/org/Embed\n'
+        "checkpoints:\n  - org/Embed-1B\n---\n"
+        f"[Checkpoint]({checkpoint_url})\n"
+    )
+    card = tmp_path / "family.mdx"
+    card.write_text(document)
+
+    if accepted:
+        assert checkpoint_links(document) == {"org/Embed-1B"}
+        assert family_checkpoints(card) == {"org/Embed-1B"}
+    else:
+        assert "org/Embed-1B" not in checkpoint_links(document)
+        with pytest.raises(ValueError, match="exact HF link"):
+            family_checkpoints(card)

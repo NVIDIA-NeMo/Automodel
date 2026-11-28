@@ -255,6 +255,127 @@ def test_recipe_model_redirects_are_case_insensitive(tmp_path):
     assert routes == {("org/Model", "LLM"): model_doc.docs_page}
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_type", ["Embedding", "Reranking"])
+@pytest.mark.parametrize("guide_checkpoint", ["org/Base-1B", "other/Base-1B", None])
+def test_retrieval_base_checkpoint_redirect_requires_matching_guide(
+    tmp_path: Path, model_type: str, guide_checkpoint: str | None
+) -> None:
+    category = "embedding-models" if model_type == "Embedding" else "reranking-models"
+    route = "/recipes-e2e-examples/retrieval-base-models"
+    docs_config = tmp_path / "docs/fern/docs.yml"
+    docs_config.parent.mkdir(parents=True)
+    docs_config.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": f"/nemo/automodel/model-coverage/{category}/org/Base-1B",
+                        "destination": f"/nemo/automodel/nightly{route}",
+                    }
+                ]
+            }
+        )
+    )
+    if guide_checkpoint is not None:
+        guide = tmp_path / "docs/guides/retrieval-base-models.mdx"
+        guide.parent.mkdir(parents=True)
+        guide.write_text(
+            f'---\ntitle: "Train from a Base Checkpoint"\nslug: {route.lstrip("/")}\n---\n'
+            f"[Starting checkpoint](https://huggingface.co/{guide_checkpoint})\n"
+        )
+    nav_path = tmp_path / "docs/fern/versions/nightly.yml"
+    nav_path.parent.mkdir(parents=True, exist_ok=True)
+    nav_path.write_text(yaml.safe_dump({"navigation": [
+        {"page": "Base", "path": "../../guides/retrieval-base-models.mdx"}
+    ]}) if guide_checkpoint is not None else yaml.safe_dump({"navigation": []}))
+    release = _ModelRelease("2026-01-01", "org/Base-1B", "", model_type, "recipe.yaml")
+    if guide_checkpoint == "org/Base-1B":
+        assert _resolve_model_card_routes(tmp_path, [release], {}, []) == {("org/Base-1B", model_type): route}
+    else:
+        with pytest.raises(ValueError, match="missing:"):
+            _resolve_model_card_routes(tmp_path, [release], {}, [])
+
+
+@pytest.mark.parametrize(
+    "checkpoint,provider,slug,expected",
+    [
+        ("org/Base-1B", "org", "'recipes-e2e-examples/base'", True),
+        ("org/Base-1B", "org", '"recipes-e2e-examples/base" # routing metadata', True),
+        ("org/Base-1B", "other", "recipes-e2e-examples/base", False),
+        ("meta-llama/Base-1B", "meta", "recipes-e2e-examples/base", True),
+        ("meta-llama/Base-1B", "meta-llama", "recipes-e2e-examples/base", True),
+        ("meta-llama/Base-1B", "mistralai", "recipes-e2e-examples/base", False),
+    ],
+)
+def test_retrieval_guide_redirect_preserves_yaml_slugs_and_publisher_identity(
+    tmp_path: Path, checkpoint: str, provider: str, slug: str, expected: bool
+) -> None:
+    route = "/recipes-e2e-examples/base"
+    docs_config = tmp_path / "docs/fern/docs.yml"
+    docs_config.parent.mkdir(parents=True)
+    docs_config.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": f"/nemo/automodel/model-coverage/embedding-models/{provider}/Base-1B",
+                        "destination": f"/nemo/automodel/nightly{route}",
+                    }
+                ]
+            }
+        )
+    )
+    guide = tmp_path / "docs/guides/base.mdx"
+    guide.parent.mkdir(parents=True)
+    guide.write_text(
+        f"---\ntitle: Base model training\nslug: {slug}\n---\n"
+        f"[Starting checkpoint](https://huggingface.co/{checkpoint})\n"
+    )
+    nav_path = tmp_path / "docs/fern/versions/nightly.yml"
+    nav_path.parent.mkdir(parents=True, exist_ok=True)
+    nav_path.write_text(yaml.safe_dump({"navigation": [{"page": "Base", "path": "../../guides/base.mdx"}]}))
+    release = _ModelRelease("2026-01-01", checkpoint, "", "Embedding", "recipe.yaml")
+    if expected:
+        assert _resolve_model_card_routes(tmp_path, [release], {}, []) == {(checkpoint, "Embedding"): route}
+    else:
+        with pytest.raises(ValueError, match="missing:"):
+            _resolve_model_card_routes(tmp_path, [release], {}, [])
+
+
+@pytest.mark.parametrize("hidden_slug", ["recipes-e2e-examples/base", "Recipes-E2E-Examples/Base"])
+def test_retrieval_guide_cannot_borrow_identity_from_hidden_page_with_same_slug(
+    tmp_path: Path, hidden_slug: str
+) -> None:
+    docs_config = tmp_path / "docs/fern/docs.yml"
+    docs_config.parent.mkdir(parents=True)
+    docs_config.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": "/nemo/automodel/model-coverage/embedding-models/org/Base-1B",
+                        "destination": "/nemo/automodel/nightly/recipes-e2e-examples/base",
+                    }
+                ]
+            }
+        )
+    )
+    guides = tmp_path / "docs/guides"
+    guides.mkdir()
+    (guides / "visible.mdx").write_text(
+        "---\ntitle: Visible guide\nslug: recipes-e2e-examples/base\n---\n"
+        "[Unrelated checkpoint](https://huggingface.co/other/Unrelated)\n"
+    )
+    (guides / "hidden.mdx").write_text(
+        f"---\ntitle: Hidden guide\nslug: {hidden_slug}\n---\n"
+        "[Starting checkpoint](https://huggingface.co/org/Base-1B)\n"
+    )
+    release = _ModelRelease("2026-01-01", "org/Base-1B", "", "Embedding", "recipe.yaml")
+    with pytest.raises(ValueError, match="guide routes collide case-insensitively"):
+        _resolve_model_card_routes(tmp_path, [release], {}, [])
+
+
 def test_case_insensitive_redirect_cannot_shadow_a_canonical_card(tmp_path):
     docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
     docs_config_path.parent.mkdir(parents=True)
@@ -918,3 +1039,75 @@ def test_missing_introduction_for_committed_model_still_fails(tmp_path: Path, mo
     monkeypatch.setattr(coverage, "_load_model_introduction_dates", lambda root: {})
     with pytest.raises(ValueError, match="Could not find when org/model"):
         _load_model_releases(tmp_path, {})
+
+
+@pytest.mark.parametrize("model_type", ["Embedding", "Reranking"])
+@pytest.mark.parametrize("visible_mode", ["inferred", "outside_guides", "correct"])
+def test_guide_evidence_belongs_to_the_navigated_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model_type: str, visible_mode: str
+) -> None:
+    from tools.docs.checks import navigation
+
+    route = "/recipes-e2e-examples/base"
+    category = "embedding-models" if model_type == "Embedding" else "reranking-models"
+    config = tmp_path / "docs/fern/docs.yml"
+    config.parent.mkdir(parents=True)
+    redirects = [{"source": f"/nemo/automodel/model-coverage/{category}/org/Base-1B",
+                  "destination": f"/nemo/automodel/nightly{route}"}]
+    redirects.extend({"source": f"/nemo/automodel/model-coverage/large-language-models/meta/{name}",
+                      "destination": "/nemo/automodel/model-coverage/large-language-models/meta/Llama-3.1-8B"}
+                     for name in ("Meta-Llama-3.1-8B", "Meta-Llama-3.1-8B-Instruct"))
+    config.write_text(yaml.safe_dump({"redirects": redirects}))
+    guides = tmp_path / "docs/guides"
+    guides.mkdir()
+    if visible_mode != "correct":
+        (guides / "hidden.mdx").write_text(
+            f"---\ntitle: Hidden\nslug: {route[1:]}\n---\n"
+            "[Checkpoint](https://huggingface.co/org/Base-1B)\n"
+        )
+    visible = tmp_path / ("docs/elsewhere/visible.mdx" if visible_mode == "outside_guides" else "docs/guides/visible.mdx")
+    visible.parent.mkdir(parents=True, exist_ok=True)
+    slug = "" if visible_mode == "inferred" else f"slug: {route[1:]}\n"
+    checkpoint = "org/Base-1B" if visible_mode == "correct" else "other/Unrelated"
+    visible.write_text(f"---\ntitle: Visible\n{slug}---\n[Checkpoint](https://huggingface.co/{checkpoint})\n")
+    nav = tmp_path / "docs/fern/versions/nightly.yml"
+    nav.parent.mkdir(parents=True)
+    nav.write_text(yaml.safe_dump({"navigation": [{"section": "Examples", "slug": "recipes-e2e-examples", "contents": [
+        {"page": "Base", "slug": "base", "path": "../../" + str(visible.relative_to(tmp_path / "docs"))}
+    ]}]}))
+    release = _ModelRelease("2026-01-01", "org/Base-1B", "", model_type, "recipe.yaml")
+    monkeypatch.setattr(navigation, "_load_model_releases", lambda *_: [release])
+    if visible_mode == "correct":
+        assert _resolve_model_card_routes(tmp_path, [release], {}, []) == {("org/Base-1B", model_type): route}
+        navigation._validate_recipe_routes(tmp_path)
+    else:
+        with pytest.raises(ValueError, match="missing:"):
+            _resolve_model_card_routes(tmp_path, [release], {}, [])
+        with pytest.raises(ValueError, match="missing:"):
+            navigation._validate_recipe_routes(tmp_path)
+
+
+@pytest.mark.parametrize("model_type", ["Embedding", "Reranking"])
+@pytest.mark.parametrize("suffix,accepted", [("", True), ("?download=true", True), ("#usage", True), ("/tree/main", True), ("%2Dwrong", False)])
+def test_guide_links_match_complete_checkpoint_segments(
+    tmp_path: Path, model_type: str, suffix: str, accepted: bool
+) -> None:
+    category = "embedding-models" if model_type == "Embedding" else "reranking-models"
+    config = tmp_path / "docs/fern/docs.yml"
+    config.parent.mkdir(parents=True)
+    route = "/recipes-e2e-examples/base"
+    config.write_text(yaml.safe_dump({"redirects": [
+        {"source": f"/nemo/automodel/model-coverage/{category}/org/Embed-1B", "destination": f"/nemo/automodel/nightly{route}"}
+    ]}))
+    guide = tmp_path / "docs/guides/base.mdx"
+    guide.parent.mkdir()
+    guide.write_text(f"---\ntitle: Base\nslug: {route[1:]}\n---\n[Checkpoint](https://huggingface.co/org/Embed-1B{suffix})\n")
+    nav = tmp_path / "docs/fern/versions/nightly.yml"
+    nav.parent.mkdir()
+    nav.write_text(yaml.safe_dump({"navigation": [{"page": "Base", "path": "../../guides/base.mdx"}]}))
+    release = _ModelRelease("2026-01-01", "org/Embed-1B", "", model_type, "recipe.yaml")
+    if accepted:
+        assert _resolve_model_card_routes(tmp_path, [release], {}, []) == {("org/Embed-1B", model_type): route}
+    else:
+        with pytest.raises(ValueError, match="missing:"):
+            _resolve_model_card_routes(tmp_path, [release], {}, [])

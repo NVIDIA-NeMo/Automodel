@@ -17,7 +17,6 @@
 import base64
 import re
 from pathlib import Path
-from typing import TypedDict
 
 import yaml
 
@@ -27,49 +26,24 @@ from tools.docs.build.coverage_tables import (
     _load_model_releases,
     _resolve_model_card_routes,
 )
-from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths
+from tools.docs.cards import (
+    FernNavigationItem,
+    _frontmatter_slug,
+    _model_card_aliases,
+    _model_card_paths,
+    family_checkpoints,
+    fern_page_paths,
+)
 from tools.docs.catalog import (
     MAX_TOTAL_ENCODED_BYTES,
     PROVIDER_ORGS,
 )
 
-_NavigationItem = TypedDict(
-    "_NavigationItem",
-    {"page": str, "section": str, "path": str, "slug": str, "skip-slug": bool, "contents": list["_NavigationItem"]},
-    total=False,
-)
-
-
-def _fern_slug(value: str) -> str:
-    value = value.lower().replace("&", "and")
-    return re.sub("[^a-z0-9]+", "-", value).strip("-")
-
 
 def _collect_fern_routes(
-    items: list[_NavigationItem], parents: tuple[str, ...] = (), config_dir: Path | None = None
+    items: list[FernNavigationItem], parents: tuple[str, ...] = (), config_dir: Path | None = None
 ) -> set[str]:
-    routes = set()
-    for item in items:
-        if "section" in item:
-            slug = str(item.get("slug", _fern_slug(str(item["section"]))))
-            section_path = item.get("path")
-            if config_dir is not None and isinstance(section_path, str):
-                frontmatter_slug = _frontmatter_slug((config_dir / section_path).resolve())
-                if frontmatter_slug:
-                    routes.add("/" + frontmatter_slug)
-            child_parents = parents if item.get("skip-slug") else (*parents, slug)
-            routes.update(_collect_fern_routes(item.get("contents", []), child_parents, config_dir))
-        elif "page" in item:
-            page_path = item.get("path")
-            frontmatter_slug = None
-            if config_dir is not None and isinstance(page_path, str):
-                frontmatter_slug = _frontmatter_slug((config_dir / page_path).resolve())
-            if frontmatter_slug:
-                routes.add("/" + frontmatter_slug)
-            else:
-                slug = str(item.get("slug", _fern_slug(str(item["page"]))))
-                routes.add("/" + "/".join((*parents, slug)))
-    return routes
+    return set(fern_page_paths(items, parents=parents, config_dir=config_dir))
 
 
 def _model_size_key(hf_model_id: str) -> tuple[str, str]:
@@ -230,6 +204,9 @@ def _validate_provider_sections(repo_root: Path) -> None:
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall("https://huggingface\\.co/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", document)
                 canonical_publishers = {owner for (owner, checkpoint) in hf_checkpoints if checkpoint == model_id}
+                family_ids = family_checkpoints(model_path)
+                if family_ids:
+                    canonical_publishers = {checkpoint.split("/", 1)[0] for checkpoint in family_ids}
                 if not canonical_publishers:
                     offenders.append(f"{path}: URL model ID {model_id!r} is not linked by the card")
                 expected_publisher = PROVIDER_ORGS.get(provider_slug)
@@ -293,18 +270,35 @@ def _validate_recipe_routes(repo_root: Path) -> None:
         raise ValueError(f"Duplicate model names within one provider index: {duplicates}")
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
+    config_path = repo_root / "docs/fern/versions/nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    navigated_routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     destinations_by_group: dict[tuple[str, tuple[str, str]], set[str]] = {}
     destination_groups: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    family_routes = {
+        f"/{_frontmatter_slug(path)}": checkpoints
+        for path in _model_card_paths(repo_root)
+        if (checkpoints := family_checkpoints(path))
+    }
     missing = []
     for release in releases:
         destination = model_card_routes[release.hf_model_id, release.model_type]
+        if not destination.startswith("/model-coverage/"):
+            # The resolver verifies that this guide documents the exact checkpoint.
+            if release.model_type not in {"Embedding", "Reranking"} or destination not in navigated_routes:
+                raise ValueError(f"Invalid retrieval training guide destination: {destination}")
+            continue
         provider_href = destination.rsplit("/", 1)[0]
         if destination not in index_routes.get(provider_href, set()):
             missing.append((release.model_type, release.hf_model_id, f"provider index card {destination}"))
             continue
         group = (release.model_type, _model_size_key(release.hf_model_id))
         destinations_by_group.setdefault(group, set()).add(destination)
-        destination_groups.setdefault((release.model_type, destination), set()).add(group[1])
+        if destination in family_routes:
+            if release.hf_model_id not in family_routes[destination]:
+                raise ValueError(f"Family page {destination} does not declare checkpoint {release.hf_model_id}")
+        else:
+            destination_groups.setdefault((release.model_type, destination), set()).add(group[1])
     split_groups = {
         group: destinations for (group, destinations) in destinations_by_group.items() if len(destinations) != 1
     }
