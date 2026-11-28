@@ -269,11 +269,17 @@ class ContextParallelSharder:
         shard_layout: The :class:`ShardLayout` of the last ``shard_batch``, set
             by :meth:`shard`. Sharders are built per resolution/hook call, so
             the layout never leaks across steps.
+        token_order: LongTensor of shape [batch, sequence] set when resolving
+            the sharder moved masked tokens behind attended ones (see
+            :func:`move_masked_tokens_behind_attended`): entry ``[b, i]`` is the
+            position that token ``i`` of the reordered row ``b`` had in the
+            caller's batch. None when the batch kept its order.
     """
 
     shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardLayout | None"]]
     local_token_global_indices: Callable[..., torch.Tensor] | None
     shard_layout: "ShardLayout | None"
+    token_order: torch.Tensor | None
     _cp_mesh: Any
     _tp_mesh: Any
     _loss_mask: torch.Tensor | None
@@ -288,6 +294,7 @@ class ContextParallelSharder:
         shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardLayout | None"]] | None = None,
         local_token_global_indices: Callable[..., torch.Tensor] | None = None,
         shard_layout: "ShardLayout | None" = None,
+        token_order: torch.Tensor | None = None,
         padding_token_id: int = 0,
         num_chunks: int = 1,
         loss_mask: torch.Tensor | None = None,
@@ -308,6 +315,9 @@ class ContextParallelSharder:
                 [batch, sequence, ...]; THD source batches declare
                 ``qkv_format="thd"`` and are flattened during :meth:`shard`.
                 Model hook metadata is merged into this mapping in place.
+                A round-robin sharder that drops ``attention_mask`` also moves
+                masked tokens behind attended ones in place and keeps the new
+                order in ``token_order``.
             shard_batch: Optional backend callback for direct strategy
                 construction. It accepts token tensors with backend-defined
                 layouts and returns the sharded batch plus its layout.
@@ -316,6 +326,8 @@ class ContextParallelSharder:
             shard_layout: Optional captured layout for direct strategy
                 construction. Tensor fields use the layouts documented by
                 :class:`ShardLayout`.
+            token_order: Optional tensor of shape [batch, sequence] for direct
+                strategy construction; see the class attribute.
             padding_token_id: Value used to pad ``input_ids`` on the sequence axis.
             num_chunks: Number of THD chunks created during sharding.
             loss_mask: Optional tensor of shape [batch, sequence] sharded with
@@ -337,14 +349,15 @@ class ContextParallelSharder:
             self.shard_batch = shard_batch
             self.local_token_global_indices = local_token_global_indices
             self.shard_layout = shard_layout
+            self.token_order = token_order
             mesh_dim_names = getattr(device_mesh, "mesh_dim_names", ())
             self._cp_mesh = device_mesh["cp"] if "cp" in mesh_dim_names else None
             self._tp_mesh = device_mesh["tp"] if "tp" in mesh_dim_names else None
             self._loss_mask = loss_mask
             self._padding_token_id = padding_token_id
             return
-        if local_token_global_indices is not None or shard_layout is not None:
-            raise TypeError("local_token_global_indices and shard_layout require shard_batch")
+        if local_token_global_indices is not None or shard_layout is not None or token_order is not None:
+            raise TypeError("local_token_global_indices, shard_layout and token_order require shard_batch")
         if batch is None:
             raise TypeError("batch is required when shard_batch is not provided")
 
@@ -363,6 +376,7 @@ class ContextParallelSharder:
         self.shard_batch = resolved.shard_batch
         self.local_token_global_indices = resolved.local_token_global_indices
         self.shard_layout = resolved.shard_layout
+        self.token_order = resolved.token_order
         self._cp_mesh = resolved._cp_mesh
         self._tp_mesh = resolved._tp_mesh
         self._loss_mask = resolved._loss_mask
@@ -378,6 +392,38 @@ class ContextParallelSharder:
             padding_token_id=self._padding_token_id,
         )
         return ctx, batch
+
+    def apply_token_order(self, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
+        """Give a tensor built from the caller's batch the token order of the reordered batch.
+
+        Args:
+            tensor: Tensor of shape [..., batch, sequence, ...] in the token order
+                the batch had before this sharder was resolved.
+            seq_dim: Index of the sequence axis; the batch axis is the one before it.
+
+        Returns:
+            Tensor of the same shape in ``token_order``; ``tensor`` itself when
+            the batch kept its order.
+        """
+        if self.token_order is None:
+            return tensor
+        return _take_tokens(tensor, self.token_order, seq_dim)
+
+    def restore_token_order(self, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
+        """Give a full-sequence model output the token order of the caller's batch.
+
+        Args:
+            tensor: Tensor of shape [..., batch, sequence, ...] in ``token_order``,
+                already gathered from the CP ranks and cut to the unpadded length.
+            seq_dim: Index of the sequence axis; the batch axis is the one before it.
+
+        Returns:
+            Tensor of the same shape in the token order the batch had before this
+            sharder was resolved; ``tensor`` itself when the batch kept its order.
+        """
+        if self.token_order is None:
+            return tensor
+        return _take_tokens(tensor, torch.argsort(self.token_order, dim=1), seq_dim)
 
     def _indices(self, padded_seq_len: int, device) -> torch.Tensor:
         layout = self.shard_layout or _NO_SHARD_LAYOUT
@@ -823,6 +869,82 @@ def _pad_cp_buffers_to_divisor(
     for idx, key in batch_buffer_keys.items():
         batch[key] = cp_buffers[idx]
     return cp_buffers, new_no_restore
+
+
+def _take_tokens(tensor: torch.Tensor, token_order: torch.Tensor, seq_dim: int) -> torch.Tensor:
+    """Reorder the sequence axis of a tensor row by row.
+
+    Args:
+        tensor: Tensor of shape [..., batch, sequence, ...].
+        token_order: LongTensor of shape [batch, sequence]; entry ``[b, i]`` is
+            the position in ``tensor`` of the token that comes ``i``-th in row ``b``.
+        seq_dim: Index of the sequence axis; the batch axis is the one before it.
+
+    Returns:
+        Tensor of the same shape with every row's tokens in ``token_order``.
+    """
+    token_order = token_order.to(tensor.device)
+    rows = torch.arange(token_order.shape[0], device=tensor.device).unsqueeze(1)
+    # Indexing the batch and sequence axes together needs no index of the tensor's full shape.
+    return tensor[(slice(None),) * (seq_dim - 1) + (rows, token_order)]
+
+
+def move_masked_tokens_behind_attended(
+    batch: dict[str, torch.Tensor],
+    *,
+    loss_mask: torch.Tensor | None = None,
+    extra_seq_buffers: dict[str, int] | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Reorder each row so that every masked token follows every attended token.
+
+    Round-robin CP attention is causal only: its backends take no padding mask, so
+    the round-robin sharders drop ``attention_mask``. A masked token that sits in
+    front of attended tokens (the fake image of a text-only VLM row, left padding)
+    would then be attended. Behind them it is out of reach of causal attention,
+    like right padding. Attended tokens keep their order, and their
+    ``position_ids`` when the batch carries them; masked tokens keep their order
+    among themselves. A batch whose masked tokens already come last, or whose
+    ``attention_mask`` is not [batch, sequence], is left untouched.
+
+    Args:
+        batch: Full-sequence batch, reordered in place. ``attention_mask`` is
+            [batch, sequence] with 0 on masked tokens. The sequence axis of
+            ``input_ids``, ``labels``, ``padding_mask`` and ``mm_token_type_ids``
+            ([batch, sequence]), ``inputs_embeds`` ([batch, sequence, hidden]) and
+            ``position_ids`` ([batch, sequence] or [axes, batch, sequence]) follows
+            the same order.
+        loss_mask: Optional per-token mask of shape [batch, sequence] that is
+            sharded with the batch.
+        extra_seq_buffers: Additional batch keys mapped to their sequence axis;
+            the batch axis is the one before it.
+
+    Returns:
+        ``loss_mask`` in the new token order (None when none was given), and the
+        new order as a LongTensor of shape [batch, sequence] whose entry
+        ``[b, i]`` is the old position of the token now at ``i`` in row ``b``
+        (None when the batch is left untouched).
+    """
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is None or attention_mask.ndim != 2:
+        return loss_mask, None
+    masked = attention_mask == 0
+    if not bool((masked[:, :-1] & ~masked[:, 1:]).any()):
+        # No masked token is directly followed by an attended one: they already come last.
+        return loss_mask, None
+    # A stable sort on "is masked" keeps the order inside both groups.
+    token_order = torch.argsort(masked.to(torch.int8), dim=1, stable=True)
+
+    seq_dims = dict.fromkeys(
+        ("input_ids", "inputs_embeds", "labels", "attention_mask", "padding_mask", "mm_token_type_ids"), 1
+    )
+    position_ids = batch.get("position_ids")
+    if position_ids is not None:
+        seq_dims["position_ids"] = position_ids.ndim - 1
+    seq_dims.update(extra_seq_buffers or {})
+    for key, seq_dim in seq_dims.items():
+        if batch.get(key) is not None:
+            batch[key] = _take_tokens(batch[key], token_order, seq_dim)
+    return (None if loss_mask is None else _take_tokens(loss_mask, token_order, 1)), token_order
 
 
 def shard_batch_load_balanced(

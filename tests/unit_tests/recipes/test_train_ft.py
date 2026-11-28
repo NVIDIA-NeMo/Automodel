@@ -3540,6 +3540,8 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     model = _MTPModel()
 
     class _FakeContextParallelSharder:
+        token_order = None
+
         def __init__(self, resolved_model, device_mesh, batch, **kwargs):
             del device_mesh, kwargs
             assert resolved_model is model
@@ -3556,8 +3558,14 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
             local_batch.pop("seq_lens_padded")
             return nullcontext, local_batch
 
+        def apply_token_order(self, tensor, seq_dim=1):
+            # The streams are built before the sharder is resolved, so each must take the sharder's token order.
+            captured.setdefault("token_order_applied", []).append(tensor)
+            return tensor
+
         def shard_token_tensor(self, tensor, seq_dim=1, fill=None):
             del fill
+            assert any(tensor is seen for seen in captured["token_order_applied"])
             return tensor.index_select(seq_dim, local_indices)
 
     recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)

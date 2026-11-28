@@ -1279,18 +1279,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
         )
+        masked_tokens = None
+        if mtp_cp_inputs is not None and cp_sharder.token_order is not None:
+            # A masked token that the sharder moved behind its row can attend to the row, so it gets no MTP target.
+            masked_tokens = batch["attention_mask"] == 0
         train_ctx, batch = cp_sharder.shard(batch)
         mtp_per_depth_targets = None
         if mtp_cp_inputs is not None:
+            # The MTP streams were built before the sharder was resolved, which can reorder the batch.
             batch["mtp_per_depth_input_ids"] = tuple(
-                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
+                cp_sharder.shard_token_tensor(cp_sharder.apply_token_order(ids), seq_dim=1, fill=0)
+                for ids in mtp_cp_inputs.input_ids
             )
             batch["mtp_per_depth_position_ids"] = tuple(
-                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
+                cp_sharder.shard_token_tensor(cp_sharder.apply_token_order(ids), seq_dim=1, fill=0)
+                for ids in mtp_cp_inputs.position_ids
             )
+            mtp_targets = (cp_sharder.apply_token_order(targets) for targets in mtp_cp_inputs.targets)
+            if masked_tokens is not None:
+                mtp_targets = (targets.masked_fill(masked_tokens, ignore_index) for targets in mtp_targets)
             mtp_per_depth_targets = tuple(
-                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
-                for targets in mtp_cp_inputs.targets
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index) for targets in mtp_targets
             )
         # Preserve effective document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
