@@ -15,27 +15,32 @@
 """Tests for the DFly2 recipe seams over the DSpark recipe.
 
 The recipe is constructed via ``__new__`` (bypassing ``setup()``), so only the
-overridden seams are exercised: the unsupported-option gate, the model-owned draft
-options, and the FSDP units of the FP32 heads.
+overridden seams are exercised: the unsupported-option gate, the confidence default, the
+warm-start and rank-count checks, and the FSDP units of the FP32 heads. The draft's start
+from its paired target layers is tested with a real target in the model tests.
 """
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch.nn as nn
 
-from nemo_automodel.recipes.speculative_decoding.train_dfly2 import TrainDFly2Recipe
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes.speculative_decoding.train_dfly2 import TrainDFly2Recipe, check_fsdp_expert_split
 from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe, _DraftArgs
 
 pytestmark = pytest.mark.cpu_only
 
 
-def _recipe(**recipe_args) -> TrainDFly2Recipe:
+def _recipe(*, world_size: int = 1, strategy: str = "fsdp2", **recipe_args) -> TrainDFly2Recipe:
     recipe = TrainDFly2Recipe.__new__(TrainDFly2Recipe)
-    recipe.cfg = SimpleNamespace(recipe_args=dict(recipe_args))
+    recipe.cfg = ConfigNode({"recipe_args": dict(recipe_args), "distributed": {"strategy": strategy}})
+    recipe.dist_env = SimpleNamespace(world_size=world_size)
+    recipe.target_model = object()
     return recipe
 
 
@@ -56,6 +61,12 @@ def _margs(**overrides) -> _DraftArgs:
     return _DraftArgs(**values)
 
 
+def _target_config(routed_experts: int = 128) -> SimpleNamespace:
+    draft = Mock()
+    draft.moe_config.n_routed_experts = routed_experts
+    return SimpleNamespace(build_dfly2_draft=Mock(return_value=draft))
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [
@@ -74,17 +85,19 @@ def test_setup_rejects_options_without_a_colocated_unpacked_target(option, value
 
 
 def test_confidence_head_is_off_and_detached_by_default() -> None:
-    target_config = SimpleNamespace(build_dfly2_draft=Mock(return_value=Mock()))
     recipe = _recipe()
-    recipe.target_model = object()
-    # The recipe's own default, as setup() resolves it when the YAML leaves the key out.
-    recipe._build_model_owned_draft(
-        target_config, _margs(confidence_head_alpha=TrainDFly2Recipe.default_confidence_head_alpha)
-    )
+    # setup() resolves the weight through this method: DFly2 drafts without a head unless asked,
+    # so the released drafter (which has none) loads; DSpark keeps its default of 1.0.
+    alpha = recipe._resolve_confidence_head_alpha(recipe.cfg.recipe_args)
+    assert alpha == 0.0
+    dspark = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    assert dspark._resolve_confidence_head_alpha(ConfigNode({})) == 1.0
+    assert recipe._resolve_confidence_head_alpha(ConfigNode({"confidence_head_alpha": 0.5})) == 0.5
+    target_config = _target_config()
+    recipe._build_model_owned_draft(target_config, _margs(confidence_head_alpha=alpha))
     options = target_config.build_dfly2_draft.call_args.args[0]
     assert options.enable_confidence_head is False
     assert options.confidence_head_stop_gradient is True
-    assert options.attn_backend == "sdpa"
 
 
 def test_fsdp_units_include_the_heads_holding_fp32_tensors() -> None:
@@ -100,18 +113,39 @@ def test_fsdp_units_include_the_heads_holding_fp32_tensors() -> None:
     assert TrainDFly2Recipe._draft_fsdp_units(draft)[-1] is draft.confidence_head
 
 
-def test_warm_start_refuses_a_checkpoint_paired_with_other_layers(tmp_path) -> None:
-    import json
-
-    from nemo_automodel.recipes.speculative_decoding.train_dfly2 import check_dfly2_checkpoint_settings
-
-    # The released draft's dfly_config.
+@pytest.mark.parametrize(
+    ("location", "setting", "value"),
+    [
+        ("config.json", "target_layer_ids", [24, 28, 32]),
+        ("config.json", "mask_token_id", 1),
+        # A step checkpoint's model/ directory keeps its config in .hf_metadata/.
+        (".hf_metadata/config.json", "block_size", 7),
+    ],
+)
+def test_warm_start_refuses_other_dfly2_settings_before_building(tmp_path, location, setting, value) -> None:
     released = {"block_size": 6, "target_kv_layers": [28, 32, 36], "mask_token_id": 128799}
-    (tmp_path / "config.json").write_text(json.dumps({"dfly_config": released}))
-    check_dfly2_checkpoint_settings(str(tmp_path), target_layer_ids=[28, 32, 36], block_size=6, mask_token_id=128799)
-    with pytest.raises(ValueError, match="target_kv_layers"):
-        check_dfly2_checkpoint_settings(
-            str(tmp_path / "model.safetensors"), target_layer_ids=[24, 28, 32], block_size=6, mask_token_id=128799
-        )
-    with pytest.raises(ValueError, match="mask_token_id"):
-        check_dfly2_checkpoint_settings(str(tmp_path), target_layer_ids=[28, 32, 36], block_size=6, mask_token_id=1)
+    (tmp_path / location).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / location).write_text(json.dumps({"dfly_config": released}))
+    target_config = _target_config()
+    recipe = _recipe(draft_weights_path=str(tmp_path))
+    recipe._build_model_owned_draft(target_config, _margs())
+    with pytest.raises(ValueError, match="other DFly2 settings"):
+        recipe._build_model_owned_draft(target_config, _margs(**{setting: value}))
+    assert target_config.build_dfly2_draft.call_count == 1
+
+
+def test_world_sizes_that_cannot_checkpoint_the_experts_are_refused() -> None:
+    usable = []
+    for world_size in range(1, 129):
+        try:
+            check_fsdp_expert_split(128, world_size)
+            usable.append(world_size)
+        except ValueError:
+            pass
+    # FSDP2 splits like torch.chunk; the export expects the remainder spread over the first ranks.
+    assert usable == [1, 2, 3, 4, 8, 16, 32, 43, 64, 128]
+    with pytest.raises(ValueError, match="world size of 12"):
+        _recipe(world_size=12)._build_model_owned_draft(_target_config(), _margs())
+    _recipe(world_size=16)._build_model_owned_draft(_target_config(), _margs())
+    # DDP replicates the draft, so any world size saves.
+    _recipe(world_size=12, strategy="ddp")._build_model_owned_draft(_target_config(), _margs())

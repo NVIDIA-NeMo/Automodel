@@ -219,7 +219,7 @@ def test_drafted_slots_label_the_tokens_after_the_anchor() -> None:
     torch.testing.assert_close(outputs.aligned_target_logits[0, 0], draft.compute_logits(last_hidden[0, 6:8]))
 
 
-def test_confidence_head_reads_detached_backbone_states() -> None:
+def test_confidence_head_reads_detached_draft_states() -> None:
     draft = _draft(enable_confidence_head=True, confidence_head_stop_gradient=True)
     draft.initialize_embeddings_and_head(embed_tokens=torch.nn.Embedding(64, 16), lm_head=torch.nn.Linear(16, 64))
     sequence = 10
@@ -397,18 +397,24 @@ def _fsdp_training_worker(rank: int, rendezvous: str, reference_path: str, compu
         )
         metrics.loss.backward()
         reference = torch.load(reference_path)
+        grads = {}
         for name, parameter in trainer.named_parameters():
             if name not in reference:
                 assert parameter.grad is None, name
                 continue
-            grad = parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
-            if param_dtype == torch.float32:
+            grads[name] = parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
+        if param_dtype == torch.float32:
+            for name, grad in grads.items():
                 torch.testing.assert_close(grad, reference[name], rtol=1e-4, atol=1e-6, msg=name)
-            else:
-                # The recipe's BF16 policy: the FP32 heads must still run (a BF16 weight against
-                # their FP32 inputs fails) and every gradient must stay close to the FP32 one.
-                assert torch.isfinite(grad).all(), name
-                assert (grad - reference[name]).norm() <= 0.1 * reference[name].norm() + 1e-6, name
+        else:
+            # The recipe's BF16 policy: the FP32 heads must still run (a BF16 weight against their
+            # FP32 inputs fails), compute in FP32, and the draft's gradient must stay close overall.
+            assert all(torch.isfinite(grad).all() for grad in grads.values())
+            head = "draft_model.confidence_head.confidence_proj.weight"
+            torch.testing.assert_close(grads[head], reference[head], rtol=0.05, atol=1e-5)
+            flat = torch.cat([grad.flatten() for grad in grads.values()])
+            expected = torch.cat([reference[name].flatten() for name in grads])
+            assert (flat - expected).norm() <= 0.05 * expected.norm()
     finally:
         dist.destroy_process_group()
 
@@ -500,13 +506,27 @@ def test_each_drafted_slot_reads_only_what_exists_when_its_block_is_drafted() ->
                 if moved[anchor, drafted] and not allowed(anchor, drafted + 1):
                     violations.append((name, anchor, drafted + 1))
 
+    missing = []
+
+    def require(name, changed, required):
+        moved = (changed - base).abs().amax(-1) > 1e-6
+        for anchor in anchors:
+            for drafted in range(block_size - 1):
+                if required(anchor, drafted + 1) and not moved[anchor, drafted]:
+                    missing.append((name, anchor, drafted + 1))
+
     for row in range(sequence):
         ids = input_ids.clone()
         ids[0, row] = (ids[0, row] + 1) % 60
-        check(f"token {row}", logits(ids=ids), lambda a, k, r=row: r <= a + k - 1)
+        changed = logits(ids=ids)
+        check(f"token {row}", changed, lambda a, k, r=row: r <= a + k - 1)
+        # The token before slot k's label is that slot's teacher-forced previous token.
+        require(f"token {row}", changed, lambda a, k, r=row: r == a + k - 1)
         hidden = last_hidden.clone()
         hidden[0, row] += 1.0
-        check(f"last hidden {row}", logits(hidden=hidden), lambda a, k, r=row: r == a - 1)
+        changed = logits(hidden=hidden)
+        check(f"last hidden {row}", changed, lambda a, k, r=row: r == a - 1)
+        require(f"last hidden {row}", changed, lambda a, k, r=row: r == a - 1)
         for layer in range(len(_PAIRED_LAYERS)):
             context = [key.clone() for key in keys]
             context[layer][0, row] += 1.0
@@ -517,6 +537,7 @@ def test_each_drafted_slot_reads_only_what_exists_when_its_block_is_drafted() ->
             indices[layer][0, row, 0] = -1
             check(f"layer {layer} key list {row}", logits(indices=indices), lambda a, k, r=row: r == a - 1)
     assert violations == []
+    assert missing == []
 
 
 def test_unused_slots_never_read_key_zero() -> None:
@@ -639,3 +660,53 @@ def test_consolidated_save_of_a_sharded_draft_holds_every_expert(tmp_path: Path)
     import torch.multiprocessing as mp
 
     mp.spawn(_consolidated_save_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def test_attentive_correction_starts_from_the_last_layer_closed() -> None:
+    draft = _draft()
+    source = draft.layers[-1].attn
+    correction = draft.hidden_correction.attention
+    # The hidden columns of the query and key inputs take the layer's projections; the
+    # previous-embedding columns start at zero, and so does the output.
+    torch.testing.assert_close(correction.q_in.weight[:, :16], source.wq_a.weight, rtol=0, atol=0)
+    torch.testing.assert_close(correction.kv_in.weight[:, :16], source.wkv.weight, rtol=0, atol=0)
+    assert correction.q_in.weight[:, 16:].abs().max() == 0 and correction.kv_in.weight[:, 16:].abs().max() == 0
+    torch.testing.assert_close(correction.attn_sink.weight, source.sinks_param.weight, rtol=0, atol=0)
+    torch.testing.assert_close(correction.block_sink.weight, source.sinks_param.weight, rtol=0, atol=0)
+    assert correction.wo_b.weight.abs().max() == 0 and correction.block_gate_bias.weight.abs().max() == 0
+
+
+def test_recipe_starts_each_draft_layer_from_its_paired_target_layer() -> None:
+    """Eq. (9): attention (sinks included), norms, mHC mixes and the shared expert of draft layer i
+    equal the tensors of paired target layer i after the recipe builds the draft."""
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.recipes.speculative_decoding.train_dfly2 import TrainDFly2Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_dspark import _DraftArgs
+
+    target = _target()
+    recipe = TrainDFly2Recipe.__new__(TrainDFly2Recipe)
+    recipe.cfg = ConfigNode({"recipe_args": {"draft_attn_backend": "eager", "confidence_head_stop_gradient": False}})
+    recipe.dist_env = SimpleNamespace(world_size=1)
+    recipe.target_model = target
+    margs = _DraftArgs(
+        target_layer_ids=list(_PAIRED_LAYERS),
+        block_size=3,
+        num_anchors=4,
+        mask_token_id=63,
+        confidence_head_alpha=1.0,
+    )
+    draft = recipe._build_model_owned_draft(target.config, margs)
+    assert draft.layers[0].attn.backend.attn == "eager"
+    assert draft.confidence_head is not None and draft.dfly2_config.confidence_head_stop_gradient is False
+    for layer, layer_id in zip(draft.layers, _PAIRED_LAYERS):
+        source = target.model.layers[str(layer_id)]
+        pairs = [
+            (layer.attn, source.attn, ("wq_a", "q_norm", "wq_b", "wkv", "kv_norm", "wo_a", "wo_b", "sinks_param")),
+            (layer, source, ("attn_norm", "ffn_norm", "attn_hc", "ffn_hc")),
+            (layer.ffn, source.ffn, ("shared_experts",)),
+        ]
+        for draft_parent, target_parent, names in pairs:
+            for name in names:
+                theirs = getattr(target_parent, name).state_dict()
+                for key, value in getattr(draft_parent, name).state_dict().items():
+                    torch.testing.assert_close(value, theirs[key], rtol=0, atol=0, msg=f"{layer_id}.{name}.{key}")
