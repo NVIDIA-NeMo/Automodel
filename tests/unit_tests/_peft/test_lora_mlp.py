@@ -375,10 +375,10 @@ def _lora_grads(mlp):
     }
 
 
-def _autocast_backward(mlp, x0, gout):
-    """Run one forward/backward under BF16 autocast, as mixed-precision training does."""
+def _autocast_backward(mlp, x0, gout, autocast=True):
+    """Run one forward/backward, under BF16 autocast as mixed-precision training does unless disabled."""
     x = x0.clone().requires_grad_(True)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
         out = mlp(x)
     (out.float() * gout).sum().backward()
     return out, x.grad, _lora_grads(mlp)
@@ -393,20 +393,23 @@ def _rel(a, b):
     [("swiglu", "LoRASwiGLUMLPFunctionBackward"), ("relu2", "LoRAReLU2MLPFunctionBackward")],
 )
 @pytest.mark.parametrize(
-    ("case", "act_dtype", "lora_dtype"),
+    ("case", "act_dtype", "lora_dtype", "autocast"),
     [
         # FSDP2 param_dtype=bf16 with output_dtype=fp32: fp32 activations meet bf16 compute weights.
-        ("fp32_activations", torch.float32, None),
+        ("fp32_activations", torch.float32, None, True),
         # lora_dtype keeps the adapters in another dtype than the (bf16) base weights.
-        ("fp32_adapters", torch.bfloat16, torch.float32),
+        ("fp32_adapters", torch.bfloat16, torch.float32, True),
+        # Same adapters with no autocast to reconcile dtypes (e.g. DDP with a bf16 model).
+        ("fp32_adapters_no_autocast", torch.bfloat16, torch.float32, False),
     ],
 )
-def test_fused_mlp_mixed_dtype_matches_unfused(case, act_dtype, lora_dtype, activation, expected_backward):
+def test_fused_mlp_mixed_dtype_matches_unfused(case, act_dtype, lora_dtype, autocast, activation, expected_backward):
     """The fused MLP must handle every mixed-dtype layout the per-linear path handles, and agree with it.
 
     Both fused paths used to raise "expected m1 and m2 to have the same dtype" here: the custom
     backward recomputed its matmuls outside autocast (so an fp32 saved activation met bf16 weights),
     and the forward's ``addmm_`` is not autocast-eligible (so an fp32 adapter met the bf16 base).
+    Without autocast the adapter matmuls themselves met a bf16 activation with fp32 adapters.
     """
     lora_grad_dtype = lora_dtype or torch.bfloat16
     fused = _mixed_precision_mlp(activation, memory_efficient=True, lora_dtype=lora_dtype)
@@ -416,12 +419,13 @@ def test_fused_mlp_mixed_dtype_matches_unfused(case, act_dtype, lora_dtype, acti
 
     x0 = torch.randn(2, 8, 32, dtype=act_dtype)
     gout = torch.randn(2, 8, 32, dtype=torch.float32)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
         assert type(fused(x0).grad_fn).__name__ == expected_backward  # fusion is really routed to
 
-    out_f, dx_f, grads_f = _autocast_backward(fused, x0, gout)
-    out_u, dx_u, grads_u = _autocast_backward(unfused, x0, gout)
+    out_f, dx_f, grads_f = _autocast_backward(fused, x0, gout, autocast)
+    out_u, dx_u, grads_u = _autocast_backward(unfused, x0, gout, autocast)
 
+    assert out_f.dtype == out_u.dtype
     # Every gradient must come back in the dtype of the input it belongs to.
     assert dx_f.dtype == dx_u.dtype == act_dtype
     for name, grad in grads_f.items():

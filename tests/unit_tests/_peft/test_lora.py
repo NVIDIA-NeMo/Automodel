@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from unittest.mock import patch
 
 import pytest
@@ -26,10 +27,12 @@ from nemo_automodel.components._peft.lora import (
     LinearLoRA,
     LoRATritonFunction,
     PeftConfig,
+    TritonLinearLoRA,
     apply_lora_to_linear_modules,
     apply_memory_efficient_lora,
     patch_linear_module,
 )
+from nemo_automodel.components._peft.lora_kernel import HAVE_TRITON, lora_forward_wrapper
 from nemo_automodel.components.distributed.parallel_styles import TPLinear
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.tp_linear import _async_tp_linear
@@ -852,3 +855,162 @@ def test_lora_kernel_launchers_report_missing_triton(monkeypatch: pytest.MonkeyP
     for launch, args in launches:
         with pytest.raises(ImportError, match="triton is not installed"):
             launch(*args)
+
+
+def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Max absolute error of ``actual`` normalized by the largest magnitude in ``expected``."""
+    return ((actual.double() - expected).abs().max() / expected.abs().max()).item()
+
+
+# Relative-error bound by the dtype a value is computed in: BF16 rounding is ~4e-3 per element, so 2e-2
+# leaves room for accumulation; FP32 values must not carry BF16 rounding of the base projection (~2e-3).
+_DTYPE_TOL = {torch.bfloat16: 2e-2, torch.float32: 5e-4}
+
+_LORA_DTYPE_LAYOUTS = [
+    # (base weight dtype, adapter dtype, activation dtype, BF16 autocast)
+    pytest.param(torch.bfloat16, torch.bfloat16, torch.bfloat16, False, id="uniform_bf16"),
+    # FP32 master adapters over a BF16 base without autocast: F.linear raised a dtype mismatch.
+    pytest.param(torch.bfloat16, torch.float32, torch.bfloat16, False, id="fp32_adapters_bf16_base"),
+    # A narrower adapter than the base must not round the FP32 base output to BF16.
+    pytest.param(torch.float32, torch.bfloat16, torch.float32, False, id="bf16_adapters_fp32_base"),
+    pytest.param(torch.bfloat16, torch.float32, torch.bfloat16, True, id="fp32_adapters_bf16_autocast"),
+    # Autocast promotes e.g. torch.square to FP32; the Triton kernel then compiled FP32 operands.
+    pytest.param(torch.bfloat16, torch.float32, torch.float32, True, id="autocast_promoted_fp32_activation"),
+]
+
+_LORA_ROUTES = [
+    pytest.param(LinearLoRA, False, "cpu", id="eager-cpu"),
+    pytest.param(LinearLoRA, True, "cpu", id="memory_efficient-cpu"),
+    pytest.param(TritonLinearLoRA, False, "cpu", id="triton_class_eager-cpu"),
+    pytest.param(
+        TritonLinearLoRA,
+        True,
+        "cuda",
+        id="triton_kernel-cuda",
+        marks=pytest.mark.skipif(not (torch.cuda.is_available() and HAVE_TRITON), reason="needs CUDA and Triton"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("lora_cls", "use_memory_efficient_lora", "device"), _LORA_ROUTES)
+@pytest.mark.parametrize(("base_dtype", "lora_dtype", "x_dtype", "autocast"), _LORA_DTYPE_LAYOUTS)
+def test_lora_mixed_dtype_matches_fp64_reference(
+    lora_cls, use_memory_efficient_lora, device, base_dtype, lora_dtype, x_dtype, autocast
+):
+    """Each LoRA route runs every dtype layout and matches ``x W^T + b + s (x A^T) B^T`` computed in FP64.
+
+    The classes are constructed directly: ``patch_linear_module`` swaps ``TritonLinearLoRA`` for
+    ``LinearLoRA`` whenever Transformer Engine imports, which would leave the Triton class untested in CI.
+    The output comes back in the base output dtype, the input gradient in the input dtype, and the adapter
+    gradients in the adapter dtype. Without autocast the output and input gradient are bounded by their own
+    dtype: the LoRA update is kept small against the base projection, as in training, so an FP32 result that
+    rounded the base projection through BF16 fails. Under autocast every matmul runs in BF16.
+    """
+    torch.manual_seed(0)
+    base = nn.Linear(128, 64, dtype=base_dtype, device=device)
+    module = lora_cls(
+        base, dim=16, alpha=32, lora_dtype=lora_dtype, use_memory_efficient_lora=use_memory_efficient_lora
+    )
+    assert type(module) is lora_cls
+    # lora_B initializes to zero, which would make the LoRA branch and the lora_A gradient vanish.
+    nn.init.normal_(module.lora_B.weight, std=0.005)
+    x = torch.randn(4, 8, 128, dtype=x_dtype, device=device, requires_grad=True)
+
+    with (
+        torch.autocast(device, dtype=torch.bfloat16, enabled=autocast),
+        patch("nemo_automodel.components._peft.lora.lora_forward_wrapper", wraps=lora_forward_wrapper) as kernel,
+    ):
+        out = module(x)
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+
+    # Under autocast the base projection runs in BF16; otherwise it runs in the base weight dtype.
+    out_dtype = torch.bfloat16 if autocast else base_dtype
+    assert out.dtype == out_dtype
+    assert x.grad.dtype == x_dtype
+    assert module.lora_A.weight.grad.dtype == module.lora_B.weight.grad.dtype == lora_dtype
+    # The Triton class must reach its kernel rather than fall back to the torch matmul path.
+    assert kernel.called is (lora_cls is TritonLinearLoRA and use_memory_efficient_lora)
+
+    ref = {
+        "x": x.detach().double().requires_grad_(True),
+        "lora_A": module.lora_A.weight.detach().double().requires_grad_(True),
+        "lora_B": module.lora_B.weight.detach().double().requires_grad_(True),
+    }
+    ref_out = F.linear(ref["x"], module.weight.double(), module.bias.double())
+    ref_out = ref_out + module.scale * F.linear(F.linear(ref["x"], ref["lora_A"]), ref["lora_B"])
+    ref_out.backward(grad_out.double())
+
+    assert _rel_err(out, ref_out.detach()) < _DTYPE_TOL[torch.bfloat16 if autocast else out_dtype]
+    assert _rel_err(x.grad, ref["x"].grad) < _DTYPE_TOL[torch.bfloat16 if autocast else x_dtype]
+    # Adapter gradients carry the rounding of whichever dtype the branch computed in, at worst BF16.
+    for name in ("lora_A", "lora_B"):
+        grad = getattr(module, name).weight.grad
+        assert _rel_err(grad, ref[name].grad) < _DTYPE_TOL[torch.bfloat16], name
+
+
+@pytest.mark.parametrize("dropout_position", ["pre", "post"])
+def test_dora_fp32_adapters_over_bf16_base_matches_fp64(dropout_position):
+    """DoRA computes its LoRA branch in the adapter dtype and agrees with the same adapter run in FP64."""
+    torch.manual_seed(0)
+    module = LinearLoRA(
+        nn.Linear(32, 24, dtype=torch.bfloat16),
+        dim=4,
+        alpha=8,
+        use_dora=True,
+        dropout_position=dropout_position,
+        lora_dtype=torch.float32,
+    )
+    nn.init.normal_(module.lora_B.weight, std=0.1)
+    reference = copy.deepcopy(module).double()
+    x = torch.randn(2, 5, 32, dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().double().requires_grad_(True)
+
+    out = module(x)
+    ref_out = reference(x_ref)
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    ref_out.backward(grad_out.double())
+
+    assert out.dtype == torch.bfloat16
+    assert x.grad.dtype == torch.bfloat16
+    assert _rel_err(out, ref_out.detach()) < 2e-2
+    assert _rel_err(x.grad, x_ref.grad) < 2e-2
+    for name in ("lora_A", "lora_B", "lora_magnitude"):
+        param = getattr(module, name)
+        param = getattr(param, "weight", param)
+        ref_param = getattr(reference, name)
+        ref_param = getattr(ref_param, "weight", ref_param)
+        assert param.grad.dtype == param.dtype, name
+        assert _rel_err(param.grad, ref_param.grad) < 2e-2, name
+
+
+@pytest.mark.parametrize("use_memory_efficient_lora", [True, False])
+def test_lora_under_autocast_saves_no_widened_activation(use_memory_efficient_lora):
+    """Under autocast the matmuls reconcile dtypes, so FP32 adapters must not make backward hold an FP32 copy.
+
+    Up-casting the BF16 activation to the adapter dtype changes no result under autocast (the matmul casts it
+    straight back) but keeps a second, twice-as-wide activation alive until backward.
+    """
+    torch.manual_seed(0)
+    module = LinearLoRA(
+        nn.Linear(32, 24, bias=False, dtype=torch.bfloat16),
+        dim=4,
+        alpha=8,
+        lora_dtype=torch.float32,
+        use_memory_efficient_lora=use_memory_efficient_lora,
+    )
+    x = torch.randn(3, 5, 32, dtype=torch.bfloat16, requires_grad=True)
+    saved = []
+
+    def pack_hook(tensor):
+        saved.append((tuple(tensor.shape), tensor.dtype))
+        return tensor
+
+    with torch.autocast("cpu", dtype=torch.bfloat16), saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+        out = module(x)
+    assert out.dtype == torch.bfloat16
+    # The activation is saved as [3, 5, 32] or flattened to [15, 32]; the weights have other shapes.
+    activations = [dtype for shape, dtype in saved if shape in ((3, 5, 32), (15, 32))]
+    assert activations, "expected the LoRA branch to save its input activation"
+    assert torch.float32 not in activations, saved
