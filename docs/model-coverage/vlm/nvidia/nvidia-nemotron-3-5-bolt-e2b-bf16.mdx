@@ -1,0 +1,74 @@
+---
+title: "NVIDIA-Nemotron-3.5-Bolt-E2B-BF16"
+description: "Fine-tune NVIDIA-Nemotron-3.5-Bolt-E2B-BF16 with NeMo AutoModel using dense Gemma 4 full-parameter and LoRA recipes and its tool-aware chat template."
+slug: model-coverage/vision-language-models/nvidia/NVIDIA-Nemotron-3.5-Bolt-E2B-BF16
+---
+
+[NVIDIA-Nemotron-3.5-Bolt-E2B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E2B-BF16)
+uses the registered `Gemma4ForConditionalGeneration` implementation. NeMo AutoModel provides
+full-parameter and LoRA image-text fine-tuning recipes with the E2B chat template.
+
+<Note>
+The checkpoint used for onboarding was supplied as a local Hugging Face-format directory.
+The Hub repository was unavailable to the inspection credential. Use an accessible local
+checkpoint with both safetensors shards, the index, config, tokenizer, processor, and chat-template files.
+Scheduled recipe CI remains disabled until the checkpoint is available to CI workers.
+</Note>
+
+## Fine-Tune Bolt E2B
+
+Follow the [installation instructions](/get-started/installation). From the repository root,
+set the absolute path to your local checkpoint:
+
+```bash
+export BOLT_E2B_MODEL_PATH=/path/to/Nemotron-3.5-Bolt-E2B-BF16
+```
+
+Run the LoRA recipe:
+
+```bash
+uv run automodel examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e2b_peft.yaml \
+  --nproc-per-node 2 \
+  --model.pretrained_model_name_or_path "${BOLT_E2B_MODEL_PATH}"
+```
+
+Or run the full-parameter language-model tuning recipe with the vision and audio towers frozen:
+
+```bash
+uv run automodel examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e2b.yaml \
+  --nproc-per-node 8 \
+  --model.pretrained_model_name_or_path "${BOLT_E2B_MODEL_PATH}"
+```
+
+The VLM recipe loads the processor from the overridden model location. The LoRA command uses two GPUs
+and full tuning uses eight, following the E4B recipe layout. GPU memory requirements depend on image sizes, sequence length, and optimizer state. These commands
+do not establish a minimum GPU-memory requirement.
+
+## Choose a Workflow
+
+| Goal | Recipe |
+| --- | --- |
+| LoRA on MedPix-VQA | [nemotron_3_5_bolt_e2b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e2b_peft.yaml) |
+| Full-parameter language-model tuning on MedPix-VQA | [nemotron_3_5_bolt_e2b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e2b.yaml) |
+
+Both recipes use FSDP2, activation checkpointing, a 2,048-token limit, right padding,
+and frozen vision/audio towers. Full tuning uses eager attention; LoRA uses SDPA. LoRA targets the
+language model's attention and MLP projections with rank 16 and alpha 32. Full tuning keeps parameters and AdamW state in FP32 with BF16 forward compute;
+LoRA loads the BF16 base weights. Other parallelism axes remain at size one.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Architecture | `Gemma4ForConditionalGeneration`, dense text backbone |
+| Decoder layers / hidden size | 35 / 1,536 |
+| Shared-KV layers | Last 20 decoder layers |
+| Stored precision | BF16 |
+| Configured maximum positions | 131,072; recipes use 2,048 tokens |
+
+## Related Resources
+
+- [Bolt E4B](/model-coverage/vision-language-models/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16)
+- [Gemma 4 fine-tuning guide](/recipes-e2e-examples/gemma-4)
