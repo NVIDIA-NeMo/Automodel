@@ -402,7 +402,7 @@ def test_exact_pack_length_uses_headers_without_decoding(mode: str, size: tuple[
         {"role": "assistant", "content": [{"type": "text", "text": "tail"}]},
     ]
     raw = [{"conversation": messages}, {"conversation": messages}]
-    dataset = PreTokenizedDatasetWrapperConfig(inject_fake_images=False).build(dataset=raw, processor=processor)
+    dataset = PreTokenizedDatasetWrapperConfig().build(dataset=raw, processor=processor)
     with monkeypatch.context() as patch:
         patch.setattr(image, "load", lambda *a, **k: pytest.fail("Length estimation decoded image pixels"))
         expected_length, expected_media = processor.estimate_packed_tokens(messages)

@@ -313,3 +313,82 @@ class TestMaskingIntegration:
         assert batch["attention_mask"][0].tolist() == [1, 1, 1]
         # Sample 1: masked.
         assert batch["attention_mask"][1].tolist() == [0, 1, 0]
+
+
+class _CountingDataset:
+    """Sequence of raw samples that records which indices were read."""
+
+    def __init__(self, samples):
+        self.samples = samples
+        self.read = []
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        self.read.append(index)
+        sample = self.samples[index]
+        if isinstance(sample, Exception):
+            raise sample
+        return sample
+
+
+def _text_sample():
+    return {"conversation": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]}
+
+
+def _image_sample():
+    content = [{"type": "image", "image": "cat.png"}, {"type": "text", "text": "hi"}]
+    return {"conversation": [{"role": "user", "content": content}, {"role": "assistant", "content": "ok"}]}
+
+
+class TestDatasetHasMedia:
+    def test_stops_at_the_first_sample_with_media(self):
+        dataset = _CountingDataset([_text_sample(), _image_sample(), _text_sample(), _image_sample()])
+        assert fake_image.dataset_has_media(dataset) is True
+        assert dataset.read == [0, 1]
+
+    def test_text_only_dataset_is_read_to_the_end(self):
+        dataset = _CountingDataset([_text_sample(), _text_sample(), _text_sample()])
+        assert fake_image.dataset_has_media(dataset) is False
+        assert dataset.read == [0, 1, 2]
+
+    def test_video_counts_as_media(self):
+        video = {"conversation": [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]}
+        assert fake_image.dataset_has_media([_text_sample(), video]) is True
+
+    def test_sample_that_cannot_be_read_counts_as_media(self, caplog):
+        dataset = _CountingDataset([_text_sample(), OSError("broken file"), _text_sample()])
+        with caplog.at_level(logging.WARNING, logger=fake_image.__name__):
+            assert fake_image.dataset_has_media(dataset) is True
+        assert dataset.read == [0, 1]
+        assert "treating the dataset as having media" in caplog.text
+
+    def test_samples_without_a_conversation_have_no_media(self):
+        assert fake_image.dataset_has_media([{"audio": b"wave", "text": "hello"}, 7]) is False
+
+
+class TestFakeImageDatasetWrapper:
+    def test_text_sample_gets_the_fake_image_and_the_mark(self):
+        raw = [_text_sample()]
+        sample = fake_image.FakeImageDatasetWrapper(raw)[0]
+
+        assert sample["_injected_fake"] is True
+        assert sample["conversation"][0]["content"] == [
+            {"type": "image", "image": fake_image._FAKE_IMAGE},
+            {"type": "text", "text": "hi"},
+        ]
+        assert sample["conversation"][1] == {"role": "assistant", "content": "ok"}
+        # The stored record is not changed.
+        assert raw == [_text_sample()]
+
+    def test_sample_with_media_is_returned_as_stored(self):
+        raw = [_image_sample(), _text_sample()]
+        wrapper = fake_image.FakeImageDatasetWrapper(raw)
+
+        assert len(wrapper) == 2
+        assert wrapper[0] is raw[0]
+
+    def test_other_fields_of_the_sample_are_kept(self):
+        sample = fake_image.FakeImageDatasetWrapper([{**_text_sample(), "_text_tokens": 9}])[0]
+        assert sample["_text_tokens"] == 9

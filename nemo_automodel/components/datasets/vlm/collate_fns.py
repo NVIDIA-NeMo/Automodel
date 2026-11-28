@@ -57,7 +57,7 @@ _DEFAULT_MERGE_KERNEL: Tuple[int, int] = (2, 2)
 # ---------------------------------------------------------------------------
 # Fake image fallback for FSDP / DeepSpeed Zero3
 # ---------------------------------------------------------------------------
-# Fake images are injected per-sample at __getitem__ time (see datasets.py).
+# Fake images are injected per-sample by FakeImageDatasetWrapper (see fake_image.py).
 # The helpers live in fake_image.py and are imported here for use in collate
 # functions that need to mask vision tokens for samples that were injected.
 # ---------------------------------------------------------------------------

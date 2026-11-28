@@ -3998,18 +3998,22 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
     return wrapper_mock
 
 
-def test_build_dataloader_inject_fake_images_defaults_true():
-    """When dataset cfg omits inject_fake_images, the wrapper defaults to True."""
+def test_build_dataloader_leaves_fake_images_to_the_loader():
+    """The pretokenized wrapper is built without a fake-image switch of its own."""
     wrapper_mock = _run_build_dataloader_capturing_wrapper(_make_dataset_cfg())
-    assert wrapper_mock.call_args.kwargs["inject_fake_images"] is True
+    assert "inject_fake_images" not in wrapper_mock.call_args.kwargs
 
 
-def test_build_dataloader_forwards_inject_fake_images_false():
-    """inject_fake_images=False in dataset cfg must reach PreTokenizedDatasetWrapper."""
-    cfg = ConfigNode({"_target_": _test_vlm_dataset, "truncate": True, "inject_fake_images": False})
+@pytest.mark.parametrize("switch", [None, True, False])
+def test_dataset_inject_fake_images_reaches_the_loader_config(switch):
+    """dataset.inject_fake_images is automatic (None) when omitted and kept when written."""
+    from nemo_automodel.recipes._typed_config import RecipeConfig
 
-    wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
-    assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
+    dataset = {"_target_": _test_vlm_dataset, "truncate": True}
+    if switch is not None:
+        dataset["inject_fake_images"] = switch
+    config = RecipeConfig.resolve_vlm_dataloader(ConfigNode(dataset), _vlm_dataloader_cfg())
+    assert config.inject_fake_images is switch
 
 
 @pytest.mark.parametrize("pixel_shape", [(2, 4, 6), (2, 3, 4, 4)])

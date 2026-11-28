@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import base64
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -22,6 +23,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from PIL import Image
+from tokenizers import AddedToken
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
@@ -35,6 +38,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 )
 from nemo_automodel.components.datasets.vlm.datasets import (
     CordV2DatasetConfig,
+    MetaDatasetConfig,
     PreTokenizedDatasetWrapperConfig,
     RobustDatasetWrapper,
 )
@@ -48,6 +52,8 @@ from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 from nemo_automodel.components.models.common.packing import PackingCapabilities
+from nemo_automodel.components.models.kimi_k3.processing import KimiK3ImageProcessor, KimiK3Processor
+from nemo_automodel.components.models.kimi_k3.tokenization import TikTokenTokenizer
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -118,7 +124,7 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
     assert isinstance(config.dataset_config, MockVlmDatasetConfig)
     assert config.dataset_config.max_length == 128
     assert config.pretokenization.max_length == 128
-    assert config.pretokenization.inject_fake_images is False
+    assert config.inject_fake_images is False
     assert config.packing.pack_size == 128
     assert config.packing.packing_ratio == 0.9
     assert config.packing.collate_max_length == 128
@@ -894,3 +900,344 @@ def test_build_source_forwards_bare_tokenizer_unchanged():
     config._build_source(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, dataset_build_context=None)
 
     assert ds_cfg.received_tokenizer is bare_tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Fake images: one rule, decided per loader, the same on every data path
+# ---------------------------------------------------------------------------
+
+_HAS_IMAGE = {
+    "text": (False, False, False, False),
+    "image": (True, True, True, True),
+    "mixed": (True, False, False, True),
+}
+_MARKER = ord("~")  # sample i carries i + 1 of these, so a tokenized document names its sample
+_REAL_IMAGE_TOKENS = 2  # the 56x28 image of _conversation_sample
+_FAKE_IMAGE_TOKENS = 4  # the 56x56 fake image
+
+
+def _conversation_sample(index, has_image):
+    content = [{"type": "text", "text": "Describe." + chr(_MARKER) * (index + 1)}]
+    if has_image:
+        content.insert(0, {"type": "image", "image": Image.new("RGB", (56, 28), "red")})
+    return {"conversation": [{"role": "user", "content": content}, {"role": "assistant", "content": "Red."}]}
+
+
+@dataclass
+class _ConversationDatasetConfig:
+    has_image: tuple[bool, ...]
+
+    def build(self):
+        return [_conversation_sample(index, has_image) for index, has_image in enumerate(self.has_image)]
+
+
+def _collate_examples(examples, *, processor):
+    return examples
+
+
+def _fake_image_marks(config, *, dp_world_size, dp_rank=0, cp_size=1):
+    """Build the loader and return, per sample it serves, whether the sample was given a fake image."""
+    result = config.build(
+        pretrained_model_name_or_path="unused",
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        batch_size=1,
+        cp_size=cp_size,
+    )
+    dataset = result.dataloader.dataset
+    return [bool(dataset[index].get("_injected_fake")) for index in range(len(dataset))]
+
+
+@pytest.mark.parametrize(
+    ("dp_world_size", "data", "switch", "expected"),
+    [
+        # Automatic: more than one data-parallel rank and a dataset with media.
+        (1, "text", None, "off"),
+        (1, "image", None, "off"),
+        (1, "mixed", None, "off"),
+        (2, "text", None, "off"),
+        (2, "image", None, "on"),
+        (2, "mixed", None, "on"),
+        # An explicit switch keeps its meaning.
+        (1, "text", True, "on"),
+        (1, "image", True, "on"),
+        (1, "mixed", True, "on"),
+        (2, "text", True, "on"),
+        (2, "image", True, "on"),
+        (2, "mixed", True, "on"),
+        (1, "text", False, "off"),
+        (1, "image", False, "off"),
+        (1, "mixed", False, "off"),
+        (2, "text", False, "off"),
+        (2, "image", False, "off"),
+        (2, "mixed", False, "off"),
+    ],
+)
+def test_fake_image_decision_table(caplog, dp_world_size, data, switch, expected):
+    config = VlmDataloaderConfig(
+        dataset_config=_ConversationDatasetConfig(_HAS_IMAGE[data]),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        collator=VlmCollatorConfig(factory=_collate_examples),
+        inject_fake_images=switch,
+        num_workers=1,
+    )
+
+    with caplog.at_level(logging.INFO, logger=vlm_loader.__name__):
+        marks = _fake_image_marks(config, dp_world_size=dp_world_size)
+
+    # Only a sample without media can get the fake image, and only when the loader decided "on".
+    assert marks == [expected == "on" and not has_image for has_image in _HAS_IMAGE[data]]
+    assert [m for m in caplog.messages if m.startswith("VLM fake image injection:")] == [
+        m for m in caplog.messages if m.startswith(f"VLM fake image injection: {expected} (")
+    ]
+    assert caplog.text.count("VLM fake image injection:") == 1
+
+
+def test_dataset_sharded_by_rank_gets_the_same_decision_on_every_rank(monkeypatch):
+    """Rank 0's slice is text only and rank 1's has an image: both ranks must inject."""
+    slices = {0: (False, False), 1: (True, False)}
+    monkeypatch.setattr(
+        MetaDatasetConfig,
+        "build",
+        lambda self, *, rank, world_size: [
+            _conversation_sample(index, has_image) for index, has_image in enumerate(slices[rank])
+        ],
+    )
+    config = VlmDataloaderConfig(
+        dataset_config=MetaDatasetConfig(path_or_dataset="unused", shard_data=True),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        collator=VlmCollatorConfig(factory=_collate_examples),
+        num_workers=1,
+    )
+
+    marks = {rank: _fake_image_marks(config, dp_world_size=2, dp_rank=rank) for rank in slices}
+
+    assert marks == {0: [True, True], 1: [False, True]}
+
+
+def test_unsharded_text_only_meta_dataset_gets_no_fake_image(monkeypatch):
+    monkeypatch.setattr(
+        MetaDatasetConfig,
+        "build",
+        lambda self, *, rank, world_size: [_conversation_sample(index, False) for index in range(2)],
+    )
+    config = VlmDataloaderConfig(
+        dataset_config=MetaDatasetConfig(path_or_dataset="unused"),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        collator=VlmCollatorConfig(factory=_collate_examples),
+        num_workers=1,
+    )
+
+    assert _fake_image_marks(config, dp_world_size=2) == [False, False]
+
+
+@pytest.mark.parametrize(
+    ("collator", "pretokenize", "cp_size", "unmasked_warning", "cp_warning"),
+    [
+        (None, False, 1, False, False),  # default_collate_fn masks the fake image
+        (VlmCollatorConfig(factory=_collate_examples), False, 1, True, False),
+        (None, False, 2, False, True),
+        (None, True, 2, False, False),  # the pretokenized wrapper masks before CP sees the sample
+        (VlmCollatorConfig(factory=_collate_examples), True, 2, False, False),
+    ],
+)
+def test_fake_image_warnings(monkeypatch, caplog, collator, pretokenize, cp_size, unmasked_warning, cp_warning):
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=_ConversationDatasetConfig(_HAS_IMAGE["mixed"]),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        pretokenization=PreTokenizedDatasetWrapperConfig() if pretokenize else None,
+        collator=collator,
+        num_workers=1,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=vlm_loader.__name__):
+        _fake_image_marks(config, dp_world_size=2, cp_size=cp_size)
+
+    assert ("is not one of those that mask fake-image tokens" in caplog.text) is unmasked_warning
+    assert ("drops the attention mask of fake images" in caplog.text) is cp_warning
+
+
+def test_no_fake_image_warning_when_nothing_is_injected(caplog):
+    config = VlmDataloaderConfig(
+        dataset_config=_ConversationDatasetConfig(_HAS_IMAGE["text"]),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        collator=VlmCollatorConfig(factory=_collate_examples),
+        num_workers=1,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=vlm_loader.__name__):
+        _fake_image_marks(config, dp_world_size=2, cp_size=2)
+
+    assert "fake" not in caplog.text
+
+
+@pytest.fixture
+def kimi_k3_processor(tmp_path):
+    """A real processor built from local files: byte-level tokenizer, 14x14 patches merged 2x2."""
+    vocab = tmp_path / "tiktoken.model"
+    vocab.write_text("".join(f"{base64.b64encode(bytes([i])).decode()} {i}\n" for i in range(256)))
+    names = [
+        "[BOS]",
+        "[EOS]",
+        "[PAD]",
+        "[UNK]",
+        "<|media_pad|>",
+        "<|media_begin|>",
+        "<|media_content|>",
+        "<|media_end|>",
+        "<|im_end|>",
+        "<|im_user|>",
+        "<|im_assistant|>",
+        "<|close|>",
+    ]
+    tokenizer = TikTokenTokenizer(
+        str(vocab),
+        bos_token="[BOS]",
+        eos_token="[EOS]",
+        pad_token="[PAD]",
+        unk_token="[UNK]",
+        added_tokens_decoder={256 + i: AddedToken(name, special=True) for i, name in enumerate(names)},
+    )
+    return KimiK3Processor(KimiK3ImageProcessor(), tokenizer)
+
+
+_DATA_PATHS = ("plain", "pretokenized", "packed")
+
+
+def _served_documents(path, data, processor, *, dp_world_size):
+    """Build the loader of one data path and return what it serves.
+
+    Returns:
+        ``(documents, outputs)``. ``documents`` maps a sample index to
+        ``(image_tokens, masked_image_tokens)``, counted in that sample's tokenized
+        document. ``outputs`` are the collated batches of the plain and pretokenized
+        paths (one sample each; ``input_ids`` and ``attention_mask`` of shape
+        [1, sequence]) or the packs of the packed path (``input_ids`` and the
+        per-token document numbers in ``attention_mask``, both of shape [pack_length]).
+    """
+    config = VlmDataloaderConfig(
+        dataset_config=_ConversationDatasetConfig(_HAS_IMAGE[data]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=None if path == "plain" else PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(pack_size=4096) if path == "packed" else None,
+        num_workers=1,
+    )
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=dp_world_size, batch_size=1)
+    dataset = result.dataloader.dataset
+
+    documents = {}
+    outputs = []
+    for index in range(len(dataset)):
+        if path == "packed":
+            pack = dataset[index]
+            outputs.append(pack)
+            document_ids = pack["attention_mask"]
+            token_rows = [pack["input_ids"][document_ids == number] for number in document_ids.unique() if number > 0]
+            masked_rows = [None] * len(token_rows)  # packing replaces the mask by document numbers
+        else:
+            batch = result.dataloader.collate_fn([dataset[index]])
+            outputs.append(batch)
+            token_rows = [batch["input_ids"][0]]
+            masked_rows = [batch["attention_mask"][0] == 0]
+        for tokens, masked in zip(token_rows, masked_rows):
+            image_tokens = tokens == processor.image_token_id
+            sample_index = int((tokens == _MARKER).sum()) - 1
+            assert sample_index not in documents
+            documents[sample_index] = (
+                int(image_tokens.sum()),
+                None if masked is None else int((image_tokens & masked).sum()),
+            )
+    return documents, outputs
+
+
+@pytest.mark.parametrize("path", _DATA_PATHS)
+def test_mixed_dataset_gets_the_same_fake_images_on_every_data_path(kimi_k3_processor, path):
+    """Samples 1 and 2 have no image: with two ranks exactly they carry the fake image, masked."""
+    documents, _ = _served_documents(path, "mixed", kimi_k3_processor, dp_world_size=2)
+
+    image_tokens = {index: counts[0] for index, counts in documents.items()}
+    assert image_tokens == {
+        0: _REAL_IMAGE_TOKENS,
+        1: _FAKE_IMAGE_TOKENS,
+        2: _FAKE_IMAGE_TOKENS,
+        3: _REAL_IMAGE_TOKENS,
+    }
+    if path != "packed":
+        masked_image_tokens = {index: counts[1] for index, counts in documents.items()}
+        assert masked_image_tokens == {0: 0, 1: _FAKE_IMAGE_TOKENS, 2: _FAKE_IMAGE_TOKENS, 3: 0}
+
+
+@pytest.mark.parametrize("path", _DATA_PATHS)
+@pytest.mark.parametrize("dp_world_size", [1, 2])
+def test_text_only_dataset_gets_no_fake_image_on_any_data_path(kimi_k3_processor, path, dp_world_size):
+    documents, outputs = _served_documents(path, "text", kimi_k3_processor, dp_world_size=dp_world_size)
+
+    assert {index: counts[0] for index, counts in documents.items()} == {0: 0, 1: 0, 2: 0, 3: 0}
+    assert all(output.get("pixel_values") is None for output in outputs)
+
+
+@pytest.mark.parametrize("path", _DATA_PATHS)
+def test_mixed_dataset_on_one_rank_gets_no_fake_image(kimi_k3_processor, path):
+    documents, _ = _served_documents(path, "mixed", kimi_k3_processor, dp_world_size=1)
+
+    assert {index: counts[0] for index, counts in documents.items()} == {
+        0: _REAL_IMAGE_TOKENS,
+        1: 0,
+        2: 0,
+        3: _REAL_IMAGE_TOKENS,
+    }
+
+
+@pytest.mark.parametrize("path", _DATA_PATHS)
+def test_image_only_dataset_is_served_unchanged(kimi_k3_processor, path):
+    """With two ranks the loader injects, yet an image-only dataset's outputs equal the one-rank outputs bit for bit."""
+    _, one_rank = _served_documents(path, "image", kimi_k3_processor, dp_world_size=1)
+    _, two_ranks = _served_documents(path, "image", kimi_k3_processor, dp_world_size=2)
+
+    assert len(one_rank) == len(two_ranks) > 0
+    for expected, actual in zip(one_rank, two_ranks):
+        assert expected.keys() == actual.keys()
+        for key in expected:
+            if isinstance(expected[key], torch.Tensor):
+                assert torch.equal(expected[key], actual[key]), key
+            else:
+                assert expected[key] == actual[key], key
+
+
+_VLM_RECIPES_WITH_FAKE_IMAGES_OFF = {
+    "examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml",
+    "examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_packed128k_cp32_ep64.yaml",
+    "examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_packed128k_pp2_cp32_ep32.yaml",
+    "examples/vlm_finetune/gemma4/gemma4_31b_tulu3_text_cp8_16k.yaml",
+    "examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_cp16_64k.yaml",
+    "examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_tp2_cp2.yaml",
+    "examples/vlm_finetune/mistral/mistral_large4_tulu3_packed128k_ep64_pp2_cp32_tilelang.yaml",
+    "examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml",
+}
+
+
+def test_shipped_vlm_recipes_leave_fake_images_automatic_unless_switched_off():
+    """Every shipped VLM recipe resolves to the automatic rule, except the eight that say ``false``."""
+    repo = Path(__file__).resolve().parents[4]
+    switches = {}
+    for recipe_path in sorted((repo / "examples").rglob("*.yaml")):
+        raw = yaml.safe_load(recipe_path.read_text())
+        if not isinstance(raw, dict) or "VLM" not in str(raw.get("recipe")):
+            continue
+        sections = ("dataset", "dataloader", "validation_dataset", "validation_dataloader", "packed_sequence")
+        recipe = RecipeConfig(ConfigNode({key: raw[key] for key in sections if key in raw}))
+        name = recipe_path.relative_to(repo).as_posix()
+        switches[name] = recipe.vlm_dataloader.inject_fake_images
+        if recipe.vlm_validation_dataloader is not None:
+            assert recipe.vlm_validation_dataloader.inject_fake_images is None, name
+
+    assert len(switches) > 100
+    assert {name for name, switch in switches.items() if switch is False} == _VLM_RECIPES_WITH_FAKE_IMAGES_OFF
+    assert {name for name, switch in switches.items() if switch is True} == set()
+    # The two MiniMax M3 Tulu-3 packed recipes follow the rule: a text-only dataset gets no fake image.
+    for name in (
+        "examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml",
+        "examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_msa_16k.yaml",
+    ):
+        assert switches[name] is None

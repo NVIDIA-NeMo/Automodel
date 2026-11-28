@@ -38,5 +38,6 @@ class ConversationSample(TypedDict, total=False):
     """Raw conversation with optional media metadata and token estimate."""
 
     conversation: list[ConversationMessage]
+    _injected_fake: bool
     mm_inputs_meta: dict[str, MediaValue]
     _text_tokens: int
