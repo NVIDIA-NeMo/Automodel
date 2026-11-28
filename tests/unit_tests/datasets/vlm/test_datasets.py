@@ -2011,7 +2011,7 @@ class _FakeProcessor:
 
 
 class TestPreTokenizedDatasetWrapperInjectFakeImages:
-    """The ``inject_fake_images`` flag gates fake-image injection for pure-text samples."""
+    """The wrapper masks the fake image of a sample marked ``_injected_fake`` and injects none itself."""
 
     def _patch_pipeline(self, monkeypatch):
         """Stub out the heavy media/tokenization helpers used by ``__getitem__``."""
@@ -2059,33 +2059,18 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
             }
         ]
 
-    def test_default_injects_fake_image_for_text_only(self, monkeypatch):
+    def test_marked_sample_has_its_fake_vision_tokens_masked(self, monkeypatch):
         inject_calls, mask_calls = self._patch_pipeline(monkeypatch)
-        wrapper = ds.PreTokenizedDatasetWrapper(self._make_dataset(), _FakeProcessor())
-        assert wrapper.inject_fake_images is True
+        marked = [{**self._make_dataset()[0], "_injected_fake": True}]
+        ds.PreTokenizedDatasetWrapper(marked, _FakeProcessor())[0]
+        assert inject_calls == [], "the wrapper must not inject a second fake image"
+        assert len(mask_calls) == 1, "the fake vision tokens of a marked sample should be masked"
 
-        wrapper[0]
-
-        assert len(inject_calls) == 1, "fake image should be injected for pure-text samples by default"
-        assert len(mask_calls) == 1, "injected fake vision tokens should be masked"
-
-    def test_disabled_skips_injection(self, monkeypatch):
+    def test_unmarked_text_only_sample_gets_no_fake_image(self, monkeypatch):
         inject_calls, mask_calls = self._patch_pipeline(monkeypatch)
-        wrapper = ds.PreTokenizedDatasetWrapper(self._make_dataset(), _FakeProcessor(), inject_fake_images=False)
-        assert wrapper.inject_fake_images is False
-
-        wrapper[0]
-
-        assert inject_calls == [], "injection must be skipped when inject_fake_images=False"
+        ds.PreTokenizedDatasetWrapper(self._make_dataset(), _FakeProcessor())[0]
+        assert inject_calls == [], "the wrapper must not decide on fake images by itself"
         assert mask_calls == [], "no masking when nothing was injected"
-
-    def test_config_forwards_inject_fake_images(self):
-        wrapper = ds.PreTokenizedDatasetWrapperConfig(inject_fake_images=False).build(
-            dataset=self._make_dataset(),
-            processor=_FakeProcessor(),
-        )
-
-        assert wrapper.inject_fake_images is False
 
     def test_native_preprocessing_preserves_original_image_sizes(self, monkeypatch):
         import torch
@@ -2098,9 +2083,7 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
             def __call__(self, **kwargs):
                 return {**super().__call__(**kwargs), "image_sizes": sizes, "pixel_values": pixels}
 
-        wrapper = ds.PreTokenizedDatasetWrapper(
-            self._make_dataset(), SizedImageProcessor(), inject_fake_images=False, max_retries=1
-        )
+        wrapper = ds.PreTokenizedDatasetWrapper(self._make_dataset(), SizedImageProcessor(), max_retries=1)
         encoded = wrapper[0]
         assert encoded["image_sizes"] is sizes
         assert encoded["pixel_values"] is pixels
@@ -2284,7 +2267,7 @@ class TestPreTokenizedDatasetWrapperReplacementDeterminism:
 
         self._stub_pipeline(monkeypatch)
         wrapper = ds.PreTokenizedDatasetWrapper(
-            self._make_dataset(), _LengthByTextProcessor(), max_length=4, truncate=False, inject_fake_images=False
+            self._make_dataset(), _LengthByTextProcessor(), max_length=4, truncate=False
         )
 
         random.seed(1)

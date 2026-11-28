@@ -644,7 +644,7 @@ class RecipeConfig:
         dataset_pretokenize = dataset_kwargs.pop("pretokenize", None)
         dataset_max_length = dataset_kwargs.get("max_length", None)
         truncate = dataset_kwargs.pop("truncate", dataset_max_length is not None)
-        inject_fake_images = dataset_kwargs.pop("inject_fake_images", True)
+        inject_fake_images = dataset_kwargs.pop("inject_fake_images", None)
         dataset_config = make_dataset_config(target, dataset_kwargs)
 
         packed = _as_dict(packed_sequence_node)
@@ -668,7 +668,6 @@ class RecipeConfig:
             pretokenization = PreTokenizedDatasetWrapperConfig(
                 max_length=max_length,
                 truncate=truncate,
-                inject_fake_images=inject_fake_images,
                 post_tokenize_hook=post_tokenize_hook,
             )
 
@@ -739,6 +738,7 @@ class RecipeConfig:
             packing=packing,
             collator=collator,
             chat_template=chat_template,
+            inject_fake_images=inject_fake_images,
             shuffle=loader_kwargs.pop("shuffle", True),
             num_workers=loader_kwargs.pop("num_workers", 0),
             pin_memory=loader_kwargs.pop("pin_memory", False),

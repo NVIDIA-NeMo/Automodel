@@ -106,9 +106,7 @@ def test_default_collate_supervises_answer_not_image_tokens(processor, num_image
 
 @pytest.mark.parametrize("num_images", [0, 1, 2])
 def test_pretokenization_supervises_answer_not_image_tokens(processor, num_images):
-    dataset = PreTokenizedDatasetWrapper(
-        [{"conversation": _conversation(num_images)}], processor, inject_fake_images=False, max_retries=1
-    )
+    dataset = PreTokenizedDatasetWrapper([{"conversation": _conversation(num_images)}], processor, max_retries=1)
     sample = dataset[0]
     image_positions = sample["input_ids"] == processor.image_token_id
     assert image_positions.any() == (num_images > 0)

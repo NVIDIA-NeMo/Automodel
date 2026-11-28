@@ -92,7 +92,6 @@ def _pretokenize(processor, conversations):
     dataset = PreTokenizedDatasetWrapper(
         [{"conversation": conversation} for conversation in conversations],
         processor,
-        inject_fake_images=False,
         max_retries=1,
     )
     return [dataset[i] for i in range(len(dataset))]
@@ -170,7 +169,7 @@ def test_tool_and_multiturn_terminators(processor):
 
 def test_pretokenized_pack_preserves_each_document_stop_target(processor):
     examples = [{"conversation": _conversation("the answer ")}, {"conversation": _conversation("the " * 50)}]
-    dataset = PreTokenizedDatasetWrapper(examples, processor, inject_fake_images=False, max_retries=1)
+    dataset = PreTokenizedDatasetWrapper(examples, processor, max_retries=1)
     samples = [dataset[i] for i in range(2)]
     for sample in samples:
         assert sample["labels"][-1] == processor.tokenizer.eos_token_id

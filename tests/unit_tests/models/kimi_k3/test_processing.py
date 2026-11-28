@@ -25,7 +25,10 @@ from transformers import AutoProcessor
 
 from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn, pad_collate_fn
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
-from nemo_automodel.components.datasets.vlm.fake_image import inject_fake_image_into_conversation
+from nemo_automodel.components.datasets.vlm.fake_image import (
+    FakeImageDatasetWrapper,
+    inject_fake_image_into_conversation,
+)
 from nemo_automodel.components.models.kimi_k3.processing import KimiK3ImageProcessor, KimiK3Processor
 from nemo_automodel.components.models.kimi_k3.tokenization import TikTokenTokenizer
 
@@ -90,7 +93,7 @@ def test_local_processor_load_save_and_checkpoint_remote_metadata(processor, tmp
 
 def test_native_packing_and_default_collation_share_expanded_tokens(processor):
     examples = [{"conversation": _chat(Image.new("RGB", (56, 28), "red"))}, {"conversation": _chat()}]
-    wrapper = PreTokenizedDatasetWrapper(examples, processor, inject_fake_images=False, max_retries=1)
+    wrapper = PreTokenizedDatasetWrapper(examples, processor, max_retries=1)
     first, second = wrapper[0], wrapper[1]
     assert int((first["input_ids"] == processor.image_token_id).sum()) == 2
     assert first["image_grid_thw"].tolist() == [[1, 2, 4]]
@@ -149,9 +152,9 @@ def _fake_and_real_batch(processor, path: str, fake_color: str) -> dict[str, tor
     fake_image._FAKE_IMAGE = Image.new("RGB", (56, 56), fake_color)
     try:
         if path == "pretokenized":
-            # inject_fake_images keeps its default (True), as in native recipes.
+            # The loader puts FakeImageDatasetWrapper under the pretokenized wrapper.
             wrapper = PreTokenizedDatasetWrapper(
-                [{"conversation": _chat()}, {"conversation": real}], processor, max_retries=1
+                FakeImageDatasetWrapper([{"conversation": _chat()}, {"conversation": real}]), processor, max_retries=1
             )
             return pad_collate_fn([wrapper[0], wrapper[1]], processor)
         examples = [

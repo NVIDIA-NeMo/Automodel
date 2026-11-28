@@ -57,7 +57,7 @@ _DEFAULT_MERGE_KERNEL: Tuple[int, int] = (2, 2)
 # ---------------------------------------------------------------------------
 # Fake image fallback for FSDP / DeepSpeed Zero3
 # ---------------------------------------------------------------------------
-# Fake images are injected per-sample at __getitem__ time (see datasets.py).
+# Fake images are injected per-sample by FakeImageDatasetWrapper (see fake_image.py).
 # The helpers live in fake_image.py and are imported here for use in collate
 # functions that need to mask vision tokens for samples that were injected.
 # ---------------------------------------------------------------------------
@@ -2209,6 +2209,11 @@ def nemotron_omni_collate_fn(
     for key, value in list(result.items()):
         if isinstance(value, torch.Tensor) and value.shape == input_shape:
             result[key] = value[:, :-1]
+
+    # Mask fake vision tokens for samples that had fake images injected at dataset level.
+    fake_indices = [i for i, ex in enumerate(examples) if ex.get("_injected_fake")]
+    if fake_indices:
+        mask_fake_vision_tokens_batch(result, processor, fake_indices)
 
     return result
 

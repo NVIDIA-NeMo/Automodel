@@ -168,7 +168,7 @@ def test_pretokenized_text_matches_collator():
         {"role": "user", "content": [{"type": "text", "text": "Bye."}]},
         {"role": "assistant", "content": [{"type": "text", "text": answers[1]}]},
     ]
-    sample = PreTokenizedDatasetWrapper([{"conversation": conversation}], tokenizer, inject_fake_images=False)[0]
+    sample = PreTokenizedDatasetWrapper([{"conversation": conversation}], tokenizer)[0]
     batch = default_collate_fn([{"conversation": conversation}], processor=tokenizer)
 
     # The collator shifts once; pretokenized samples are shifted later by the packer.
