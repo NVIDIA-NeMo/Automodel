@@ -171,24 +171,32 @@ def test_loss_is_finite_scalar_and_backprops():
     assert attn_grad is not None and torch.isfinite(attn_grad).all()
 
 
-def test_bf16_draft_projects_the_fp32_target_last_hidden_state():
-    """Online capture hands the BF16 draft the FP32 last hidden state of a DeepSeek V4 target."""
+@pytest.mark.parametrize("features_dtype", [torch.bfloat16, torch.float32], ids=["inner_layers", "with_last_layer"])
+def test_bf16_draft_trains_on_the_fp32_states_of_an_online_target(features_dtype):
+    """An online DeepSeek V4 target hands the BF16 draft FP32 states.
+
+    The last hidden state is always FP32. The concatenated features are FP32 when the
+    target's last layer is one of the captured layers, and BF16 otherwise.
+    """
     model = _build_model().to(torch.bfloat16)
     batch = _batch()
-    batch["target_hidden_states"] = batch["target_hidden_states"].to(torch.bfloat16)
+    batch["target_hidden_states"] = batch["target_hidden_states"].to(features_dtype)
     assert batch["target_last_hidden_states"].dtype == torch.float32
+    # The same states already rounded to the draft's dtype, which needs no conversion.
+    rounded = dict(batch)
+    rounded["target_hidden_states"] = batch["target_hidden_states"].to(torch.bfloat16)
+    rounded["target_last_hidden_states"] = batch["target_last_hidden_states"].to(torch.bfloat16)
 
     with torch.no_grad():
         out = _forward(model, batch)
-        logits = model.compute_logits(batch["target_last_hidden_states"])
+        reference = _forward(model, rounded)
 
+    assert out.draft_logits.dtype == torch.bfloat16
     assert out.aligned_target_logits.dtype == torch.bfloat16
     assert out.aligned_target_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
-    # The head sees the state rounded to BF16; FP32 arithmetic on those rounded operands is the reference.
-    rounded_state = batch["target_last_hidden_states"].to(torch.bfloat16).float()
-    reference = rounded_state @ model.lm_head.weight.float().T
-    assert logits.dtype == torch.bfloat16
-    torch.testing.assert_close(logits.float(), reference, rtol=2e-2, atol=2e-2)
+    assert torch.isfinite(out.draft_logits).all() and torch.isfinite(out.aligned_target_logits).all()
+    assert torch.equal(out.draft_logits, reference.draft_logits)
+    assert torch.equal(out.aligned_target_logits, reference.aligned_target_logits)
 
 
 def test_config_builder_fields():
