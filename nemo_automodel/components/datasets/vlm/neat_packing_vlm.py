@@ -235,8 +235,11 @@ def _estimate_video_tokens(vid_meta, video_cfg: dict) -> int:
     else:
         nframes = max(1, int(duration * video_cfg["fps"]))
 
-    nframes = min(total_frames, video_cfg["max_frames"], nframes)
-    nframes = max(video_cfg["min_frames"], nframes)
+    # Raise to min_frames first, then cap by max_frames and the frames the clip has,
+    # as Qwen3-VL's sample_frames does; a clip shorter than min_frames keeps all of its frames.
+    nframes = min(max(nframes, video_cfg["min_frames"]), video_cfg["max_frames"])
+    if total_frames > 0:
+        nframes = min(nframes, total_frames)
 
     tp = video_cfg["temporal_patch_size"]
     if nframes % tp != 0:
