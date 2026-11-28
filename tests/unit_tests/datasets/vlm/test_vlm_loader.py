@@ -31,6 +31,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+from nemo_automodel.components.datasets.vlm import fake_image
 from nemo_automodel.components.datasets.vlm import loader as vlm_loader
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
@@ -1058,6 +1059,22 @@ def test_fake_image_warnings(monkeypatch, caplog, collator, pretokenize, cp_size
 
     assert ("is defined outside nemo_automodel" in caplog.text) is unmasked_warning
     assert ("drops the attention mask of fake images" in caplog.text) is cp_warning
+
+
+def test_log_says_how_many_samples_of_a_large_text_dataset_were_looked_at(monkeypatch, caplog):
+    monkeypatch.setattr(vlm_loader, "MEDIA_LOOK_MAX_SAMPLES", 2)
+    monkeypatch.setattr(fake_image, "MEDIA_LOOK_MAX_SAMPLES", 2)
+    config = VlmDataloaderConfig(
+        dataset_config=_ConversationDatasetConfig((False,) * 5),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        collator=VlmCollatorConfig(factory=_collate_examples),
+        num_workers=1,
+    )
+
+    with caplog.at_level(logging.INFO, logger=vlm_loader.__name__):
+        assert _fake_image_marks(config, dp_world_size=2) == [False] * 5
+
+    assert "VLM fake image injection: off (none of 2 sampled of 5 samples has an image or video)" in caplog.text
 
 
 def test_no_fake_image_warning_when_nothing_is_injected(caplog):

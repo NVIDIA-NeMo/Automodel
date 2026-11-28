@@ -369,6 +369,34 @@ class TestDatasetHasMedia:
         assert fake_image.dataset_has_media(dataset) is True
         assert dataset.read == [0, 1]
 
+    def test_dataset_at_the_cap_is_read_in_order(self, monkeypatch):
+        monkeypatch.setattr(fake_image, "MEDIA_LOOK_MAX_SAMPLES", 10)
+        dataset = _CountingDataset([_text_sample() for _ in range(10)])
+        assert fake_image.dataset_has_media(dataset) is False
+        assert dataset.read == list(range(10))
+
+    def test_larger_dataset_is_read_at_no_more_than_the_cap(self, monkeypatch):
+        monkeypatch.setattr(fake_image, "MEDIA_LOOK_MAX_SAMPLES", 10)
+        dataset = _CountingDataset([_text_sample() for _ in range(1000)])
+        assert fake_image.dataset_has_media(dataset) is False
+        assert len(dataset.read) == len(set(dataset.read)) == 10
+        assert dataset.read != list(range(10))
+
+    def test_every_rank_draws_the_same_indices(self, monkeypatch):
+        monkeypatch.setattr(fake_image, "MEDIA_LOOK_MAX_SAMPLES", 10)
+        ranks = [_CountingDataset([_text_sample() for _ in range(1000)]) for _ in range(2)]
+        for dataset in ranks:
+            fake_image.dataset_has_media(dataset)
+        fake_image.dataset_has_media(ranks[0])
+        assert ranks[0].read[:10] == ranks[0].read[10:] == ranks[1].read
+
+    def test_random_draw_finds_media_that_only_late_samples_have(self, monkeypatch):
+        """The first 10 samples are text; a read of the first 10 would answer "no media"."""
+        monkeypatch.setattr(fake_image, "MEDIA_LOOK_MAX_SAMPLES", 10)
+        dataset = _CountingDataset([_text_sample() for _ in range(500)] + [_image_sample() for _ in range(500)])
+        assert fake_image.dataset_has_media(dataset) is True
+        assert dataset.read[-1] >= 500 and len(dataset.read) <= 10
+
     def test_samples_without_a_conversation_have_no_media(self):
         assert fake_image.dataset_has_media([{"audio": b"wave", "text": "hello"}, 7]) is False
 

@@ -50,7 +50,11 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 )
 from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
-from nemo_automodel.components.datasets.vlm.fake_image import FakeImageDatasetWrapper, dataset_has_media
+from nemo_automodel.components.datasets.vlm.fake_image import (
+    MEDIA_LOOK_MAX_SAMPLES,
+    FakeImageDatasetWrapper,
+    dataset_has_media,
+)
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.datasets.vlm.pp_media import wrap_vlm_collate_for_pp
 
@@ -371,6 +375,9 @@ class VlmDataloaderConfig:
             inject, reason = False, "one data-parallel rank"
         elif dataset_has_media(dataset):
             inject, reason = True, f"{dp_world_size} data-parallel ranks and the dataset has samples with media"
+        elif len(dataset) > MEDIA_LOOK_MAX_SAMPLES:
+            inject = False
+            reason = f"none of {MEDIA_LOOK_MAX_SAMPLES} sampled of {len(dataset)} samples has an image or video"
         else:
             inject, reason = False, "no sample of the dataset has an image or video"
         logger.info("VLM fake image injection: %s (%s)", "on" if inject else "off", reason)

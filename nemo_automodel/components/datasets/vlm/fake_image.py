@@ -29,6 +29,7 @@ keeping the visual encoder active.
 
 import copy
 import logging
+import random
 from collections.abc import Sequence
 
 import torch
@@ -98,13 +99,25 @@ def inject_fake_image_into_conversation(conversation):
     return conversation
 
 
-def dataset_has_media(dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample]) -> bool:
-    """Return whether *dataset* holds a sample with an image or video.
+# Most samples dataset_has_media reads, so that its start-up time does not grow with the size of the dataset.
+MEDIA_LOOK_MAX_SAMPLES = 100_000
 
-    Reads the raw samples in order and stops at the first one with media. A sample that
-    cannot be read is skipped with a warning; the answer comes from the samples that can be read.
+
+def dataset_has_media(dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample]) -> bool:
+    """Return whether *dataset* holds a sample with an image or video, among the samples looked at.
+
+    A dataset with at most ``MEDIA_LOOK_MAX_SAMPLES`` samples is read in order. A larger one is
+    read at that many indices drawn at random with a fixed seed, so every rank looks at the same
+    samples; media that exists only outside the draw is not seen. The look stops at the first
+    sample with media. A sample that cannot be read is skipped with a warning; the answer comes
+    from the samples that can be read.
     """
-    for index in range(len(dataset)):
+    size = len(dataset)
+    if size > MEDIA_LOOK_MAX_SAMPLES:
+        indices = sorted(random.Random(0).sample(range(size), MEDIA_LOOK_MAX_SAMPLES))
+    else:
+        indices = range(size)
+    for index in indices:
         try:
             sample = dataset[index]
         except Exception as error:
