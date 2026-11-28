@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 
 import pytest
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -282,6 +284,53 @@ def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
             torch.testing.assert_close(value, loaded[key], rtol=0, atol=0)
     finally:
         checkpointer.close()
+
+
+def test_final_consolidated_export_indexes_every_released_draft_tensor(tmp_path: Path) -> None:
+    """The recipe's final save must index the draft under the released names it is saved with."""
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41DSparkModel(_config(), backend, num_anchors=1, enable_confidence_head=True)
+    # The target checkpoint lists the embedding and head under the names the draft also saves them with.
+    target = tmp_path / "target"
+    target.mkdir()
+    save_file(
+        {"embed.weight": torch.zeros(32, 16), "head.weight": torch.zeros(32, 16), "norm.weight": torch.ones(16)},
+        target / "model.safetensors",
+    )
+
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            save_consolidated="final",
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id=str(target),
+            # The draft recipes hand the checkpointer the draft's native names.
+            model_state_dict_keys=list(model.state_dict()),
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+    )
+    try:
+        checkpointer.save_model(model, str(tmp_path / "trained"), is_final_checkpoint=True)
+    finally:
+        checkpointer.close()
+
+    consolidated = tmp_path / "trained" / "model" / "consolidated"
+    indexed = set(json.loads((consolidated / "model.safetensors.index.json").read_text())["weight_map"])
+    exported = set()
+    for shard in consolidated.glob("*.safetensors"):
+        with safe_open(shard, framework="pt") as handle:
+            exported.update(handle.keys())
+    expert_names = {
+        f"mtp.{stage}.ffn.experts.{expert}.w{projection}.weight"
+        for stage in range(3)
+        for expert in range(4)
+        for projection in (1, 2, 3)
+    }
+    assert {"embed.weight", "head.weight"} | expert_names <= indexed
+    assert indexed == exported
 
 
 @pytest.mark.runtime_budget(

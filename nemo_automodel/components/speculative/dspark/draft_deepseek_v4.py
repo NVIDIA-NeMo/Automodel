@@ -436,10 +436,10 @@ class DeepseekV4DSparkModel(nn.Module):
         Args:
             input_ids: Tensor of shape [batch, sequence] with target tokens.
             target_hidden_states: Tensor of shape [batch, sequence, target_layers * hidden]
-                with the concatenated target features.
+                with the concatenated target features. It is cast to the draft's dtype.
             loss_mask: Tensor of shape [batch, sequence] selecting supervised tokens.
             target_last_hidden_states: Optional tensor of shape [batch, sequence, hidden]
-                with the target's final normalized states.
+                with the target's final normalized states. It is cast to the draft's dtype.
             position_ids: Optional tensor of shape [batch, sequence] with document-local
                 positions of packed rows.
             seq_lens: Optional tensor of shape [batch, documents] with packed document
@@ -452,6 +452,13 @@ class DeepseekV4DSparkModel(nn.Module):
             vocab]; token, mask, and confidence tensors have shape [batch, num_anchors,
             block_size].
         """
+        # An online DeepSeek V4 target hands over its last hidden state in FP32: its
+        # hyper-connection head is kept in FP32 and the final norm keeps that dtype. When the
+        # last layer is one of the captured layers, that state is one of the concatenated
+        # features and the whole tensor is FP32 too.
+        target_hidden_states = target_hidden_states.to(self.fc.weight.dtype)
+        if target_last_hidden_states is not None:
+            target_last_hidden_states = target_last_hidden_states.to(self.lm_head.weight.dtype)
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         packed = seq_lens is not None

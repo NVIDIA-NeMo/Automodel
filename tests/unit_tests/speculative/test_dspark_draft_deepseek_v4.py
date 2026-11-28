@@ -171,6 +171,34 @@ def test_loss_is_finite_scalar_and_backprops():
     assert attn_grad is not None and torch.isfinite(attn_grad).all()
 
 
+@pytest.mark.parametrize("features_dtype", [torch.bfloat16, torch.float32], ids=["inner_layers", "with_last_layer"])
+def test_bf16_draft_trains_on_the_fp32_states_of_an_online_target(features_dtype):
+    """An online DeepSeek V4 target hands the BF16 draft FP32 states.
+
+    The last hidden state is always FP32. The concatenated features are FP32 when the
+    target's last layer is one of the captured layers, and BF16 otherwise.
+    """
+    model = _build_model().to(torch.bfloat16)
+    batch = _batch()
+    batch["target_hidden_states"] = batch["target_hidden_states"].to(features_dtype)
+    assert batch["target_last_hidden_states"].dtype == torch.float32
+    # The same states already rounded to the draft's dtype, which needs no conversion.
+    rounded = dict(batch)
+    rounded["target_hidden_states"] = batch["target_hidden_states"].to(torch.bfloat16)
+    rounded["target_last_hidden_states"] = batch["target_last_hidden_states"].to(torch.bfloat16)
+
+    with torch.no_grad():
+        out = _forward(model, batch)
+        reference = _forward(model, rounded)
+
+    assert out.draft_logits.dtype == torch.bfloat16
+    assert out.aligned_target_logits.dtype == torch.bfloat16
+    assert out.aligned_target_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
+    assert torch.isfinite(out.draft_logits).all() and torch.isfinite(out.aligned_target_logits).all()
+    assert torch.equal(out.draft_logits, reference.draft_logits)
+    assert torch.equal(out.aligned_target_logits, reference.aligned_target_logits)
+
+
 def test_config_builder_fields():
     cfg = build_deepseek_v4_draft_config(_tiny_target_config(), _tiny_model_args())
     assert cfg.architectures == ["DeepseekV4DSparkModel"]

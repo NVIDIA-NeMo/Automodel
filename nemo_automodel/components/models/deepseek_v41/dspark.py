@@ -622,6 +622,10 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         )
 
         self.state_dict_adapter = DeepseekV41DSparkStateDictAdapter(config, self.moe_config, backend, dtype=dtype)
+        # The draft is saved under released names, with the routed experts of each
+        # layer split across ranks. The consolidated export indexes every saved
+        # tensor, so it needs the released names of all experts on every rank.
+        self._pre_shard_hf_state_dict_keys = self.state_dict_adapter.get_hf_state_dict_keys(self.state_dict())
         self.initialize_weights(self.embed_tokens.weight.device)
 
     @property
