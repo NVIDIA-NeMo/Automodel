@@ -57,6 +57,7 @@ from torch.distributed.tensor import DTensor, Shard
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ernie5_5.layers import ernie_situ
+from nemo_automodel.components.models.ernie5_5.mtp_router import Ernie5_5MTPRouterState
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MLP, Gate, MoE
@@ -167,6 +168,8 @@ class Ernie5_5Gate(Gate):
         x: torch.Tensor,
         token_mask: torch.Tensor,
         cp_mesh: DeviceMesh | None,
+        *,
+        routing_state: Ernie5_5MTPRouterState | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
         """Route local token states and record valid-token loads.
 
@@ -174,6 +177,7 @@ class Ernie5_5Gate(Gate):
             x: Local token states of shape [tokens, hidden].
             token_mask: Boolean valid-token mask of shape [tokens].
             cp_mesh: Context mesh; auxiliary loss is unsupported and it is unused.
+            routing_state: Optional independent MTP correction bias of shape [experts].
 
         Returns:
             Tuple of FP32 routing weights [tokens, topk], integer expert IDs
@@ -187,7 +191,9 @@ class Ernie5_5Gate(Gate):
         del cp_mesh
         if token_mask.shape != (x.shape[0],):
             raise ValueError("token_mask must have one entry per token")
-        correction = self._local_score_correction_bias()
+        correction = (
+            self._local_score_correction_bias() if routing_state is None else routing_state.e_score_correction_bias
+        )
         if correction is None:
             raise RuntimeError("ERNIE 5.5 correction bias is missing")
         if correction.device != x.device:
@@ -201,6 +207,8 @@ class Ernie5_5Gate(Gate):
             self.topk,
             normalize=self.norm_topk_prob,
         )
+        if routing_state is not None:
+            return weights, indices, None
         # Loads are accumulated for the bias update only in training with gradients enabled, so that a forward
         # under no_grad is not counted.
         accumulate = self.bias_update_factor > 0 and self.training and torch.is_grad_enabled()
@@ -412,6 +420,8 @@ class Ernie5_5MoE(MoE):
         hidden: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
         cp_mesh: DeviceMesh | None = None,
+        *,
+        routing_state: Ernie5_5MTPRouterState | None = None,
     ) -> torch.Tensor:
         """Run the MoE.
 
@@ -419,6 +429,7 @@ class Ernie5_5MoE(MoE):
             hidden: Tensor of shape [..., hidden] with arbitrary leading dimensions.
             padding_mask: Boolean tensor of shape [...] where true marks padding.
             cp_mesh: Context-parallel mesh; unused, because the gate computes no auxiliary loss.
+            routing_state: Optional independent MTP correction bias of shape [experts].
 
         Returns:
             Output of shape [..., hidden].
@@ -466,7 +477,10 @@ class Ernie5_5MoE(MoE):
             if padding_mask is not None
             else torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
         )
-        weights, indices, _ = self.gate(x, token_mask, None)
+        if routing_state is None:
+            weights, indices, _ = self.gate(x, token_mask, None)
+        else:
+            weights, indices, _ = self.gate(x, token_mask, None, routing_state=routing_state)
         latent = self.fc1_latent_proj(x)
         if self._dispatches_through_hybridep and latent.dtype != torch.bfloat16:
             # HybridEP exchanges 16-bit activations only. Its dispatch copies the tensor as 16-bit elements without

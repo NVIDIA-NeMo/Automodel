@@ -112,6 +112,7 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
         vision_config=None,
         canvas_length=4,
     ),
+    "Ernie5_5MTPForCausalLM": lambda: _helper("tests.unit_tests.models.ernie5_5.test_mtp_training_local:config")(),
     "Ernie5_5_MoeForCausalLM": lambda: _helper("tests.unit_tests.models.ernie5_5.test_model:_tiny_config")(),
     "Gemma4DrafterForCausalLM": lambda: importlib.import_module(
         "transformers.models.gemma4_assistant.configuration_gemma4_assistant"
@@ -146,6 +147,9 @@ _CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
 _BUILD_KWARGS: dict[str, Callable[[], dict[str, object]]] = {
     # ERNIE 5.5 implements the torch kernels only, and its default backend runs the DSA layers on cuDNN
     # kernels that need BF16 and the released dimensions.
+    "Ernie5_5MTPForCausalLM": lambda: {
+        "backend": BackendConfig(attn="eager", linear="torch", experts="torch", dispatcher="torch", rope_fusion=False)
+    },
     "Ernie5_5_MoeForCausalLM": lambda: {
         "backend": BackendConfig(attn="eager", linear="torch", experts="torch", dispatcher="torch", rope_fusion=False)
     },

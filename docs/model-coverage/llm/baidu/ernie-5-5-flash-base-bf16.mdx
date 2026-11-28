@@ -1,6 +1,6 @@
 ---
 title: "ERNIE-5.5-Flash-Base-BF16"
-description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: SFT and LoRA of the 43-layer decoder with expert parallelism, also on packed rows with context parallelism."
+description: "Fine-tune ERNIE-5.5-Flash-Base-BF16 with NeMo AutoModel: decoder SFT and LoRA with expert parallelism, and optional shared multi-token prediction training."
 slug: model-coverage/large-language-models/baidu/ERNIE-5.5-Flash-Base-BF16
 ---
 
@@ -22,7 +22,9 @@ This page covers the 43-layer main decoder with expert parallelism (EP) and
 FSDP2: full-parameter supervised fine-tuning (SFT) on 16 nodes and
 [LoRA](#lora) on 2 nodes, on single unpacked documents and on
 [packed rows of 131,072 tokens](#packed-sequences-and-context-parallelism)
-with context parallelism (CP). [Current Scope](#current-scope) lists what is
+with context parallelism (CP). The optional
+[shared MTP path](#shared-multi-token-prediction) supports joint training on
+unpacked documents at CP1. [Current Scope](#current-scope) lists what is
 outside them.
 
 </Note>
@@ -42,7 +44,7 @@ outside them.
 | **Experts** | 512 routed, 1 shared; 10 routed experts per token; 2,048-wide latent |
 | **Residual Streams** | 4 mHC streams; hyper head |
 | **Output Head** | MultiMax |
-| **MTP** | 1 block, stored as 1,582 keys under `model.layers.43.*`; not loaded |
+| **MTP** | 1 shared-last-layer block, stored as 1,582 keys under `model.layers.43.*`; opt-in joint SFT |
 | **Vocabulary** | 201,216 |
 | **Parameters** | About 280B in the loaded decoder, embedding, and output head; 286B stored including the MTP block |
 | **Checkpoint** | BF16; 128 safetensors shards, about 534 GiB |
@@ -104,13 +106,15 @@ recipe as it ships was run on one node for 10 updates.
 
 Dense parameters use FSDP2, and the routed experts of each MoE layer are
 distributed over the EP group. The parameters of the DSA indexers are frozen.
-The router correction bias is a fixed buffer, not a parameter. The MTP block is
-not loaded or trained.
+The router correction bias is a fixed buffer, not a parameter. The decoder SFT
+and LoRA recipes do not load or train the MTP block; the separate MTP recipe
+selects the shared auxiliary depth described below.
 
 | Recipe | Dataset | Description |
 |---|---|---|
 | [ernie5_5_flash_squad_ep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep.yaml) | SQuAD | Full-parameter SFT of the 43-layer decoder with EP and FSDP2; checkpoint saving disabled because of the checkpoint size |
 | [ernie5_5_flash_squad_ep_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_lora.yaml) | SQuAD | LoRA on the 43-layer decoder with EP and FSDP2 on 2 nodes; adapter checkpoints enabled; see [LoRA](#lora) |
+| [ernie5_5_flash_squad_ep_mtp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_mtp.yaml) | SQuAD | Full-parameter SFT with one shared MTP depth, EP and FSDP2; see [Shared Multi-Token Prediction](#shared-multi-token-prediction) for validation limits |
 
 The six DSA layers run through the cuDNN sparse-attention path
 (`model.backend.attn: cudnn`). This path requires
@@ -156,7 +160,8 @@ run with the `torch` expert and dispatcher backends, wrote one checkpoint, with
 `step_scheduler.ckpt_every_steps: 100` and `dist_env.timeout_minutes: 180`. The
 full fine-tuning recipe's values of 50 and 30 were not run with saving enabled.
 [Validated Configuration](#validated-configuration) lists what was saved and
-restored. The consolidated Hugging Face export has not been validated.
+restored. A consolidated Hugging Face export of the full 43-layer model has
+not been validated.
 
 </Note>
 
@@ -260,6 +265,114 @@ documents of 4,096 tokens, with labels only on answer tokens from position
 loss and the gradient norms stayed finite. The run was not compared with a
 reference. Outside the packed recipes, full fine-tuning of the 43-layer model
 has not been run with documents longer than 256 tokens.
+
+## Shared Multi-Token Prediction
+
+The MTP variant trains the main next-token objective and one auxiliary
+prediction depth. Select it through the existing model config override:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: baidu/ERNIE-5.5-Flash-Base-BF16
+  revision: 68d19ee51c032344fa0a8018e7dc21b2668a55c4
+  config:
+    architectures: [Ernie5_5MTPForCausalLM]
+  num_nextn_predict_layers: 1
+  mtp_shared_last_layer: true
+  mtp_loss_scaling_factor: 0.1
+```
+
+The full example is
+[`ernie5_5_flash_squad_ep_mtp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie5_5/ernie5_5_flash_squad_ep_mtp.yaml).
+It composes the same `TrainFinetuneRecipeForNextTokenPrediction`, SQuAD dataset,
+`MaskedCrossEntropy`, and TE FusedAdam components as the decoder SFT recipe.
+It was run on 16 nodes with four GB200 GPUs each, EP8, and TP=PP=CP=1.
+Set the backend and optimizer fields from that example as well;
+the model block above only shows the MTP selection.
+
+<Note>
+The full 43-layer MTP model completed two fresh runs of 100 updates and two
+validations each on 16 nodes with four GB200 GPUs per node, with FSDP2, EP8,
+TP=PP=CP=1, global batch size 64, and single unpacked SQuAD documents of at
+most 256 tokens. The runs used the recipe above with
+`dist_env.timeout_minutes: 24` and separate output directories; saving stayed
+disabled. The second of them carried per-rank instrumentation and gave an
+identical initial loss. All 1,452 trainable tensors were in the optimizer on all 64 ranks,
+including physically empty shards. For all eight MTP tensors and all 100
+updates, nonempty local gradient shards were present and finite; the expected
+empty shards had present, zero-element gradients.
+
+Later training and validation losses differed; the largest relative
+training-loss difference was 7.60%, an observation rather than a tolerance. The largest peak allocation
+reported by rank 0 was 136.05 GiB (`torch.cuda.max_memory_allocated`); each
+phase took about 18 minutes including loading and validation in this
+placement. These runs validate training mechanics. They do not establish
+quality, convergence, inference, or full-model checkpoint, export, or resume
+behavior.
+</Note>
+
+The last decoder block is reused for MTP. It is registered once and has one
+optimizer owner per physical parameter. MTP owns eight additional trainable
+tensors and its own persistent router correction bias. Released checkpoints
+store copies of the shared body under the MTP layer prefix, and the MTP class
+requires them. A checkpoint loaded through `Ernie5_5MTPForCausalLM` must hold,
+under the MTP layer prefix, the nine MTP-owned tensors and a copy of every
+tensor of the last decoder block except its router correction bias, as the
+released checkpoint does. Loading checks that these copies agree with the
+decoder body after conversion to the destination dtype. A checkpoint that
+stores the shared body only once, under the decoder layer, is rejected at
+load with a missing-key error (`Missing key in checkpoint state_dict`); the
+decoder-only class, selected with `num_nextn_predict_layers: 0`, loads such a
+checkpoint. Deduplicated exports, which store the shared body once, are not
+currently supported by this MTP loader. Export writes the released alias
+layout again.
+
+The auxiliary targets are the next depth's labels, with document-tail and
+ignored targets excluded. Both main and auxiliary cross-entropy sums use
+the same global main-token denominator. Thus `mtp_loss_scaling_factor: 0.1`
+sets the auxiliary contribution per token, including when micro-batches
+have different numbers of valid targets. It does not independently
+normalize the auxiliary sum by its smaller valid-target count. Evaluation
+computes only the main decoder logits. The native recipe therefore
+reports the main validation loss only; it does not report an auxiliary or joint
+validation loss.
+
+This variant supports full-parameter training on single unpadded documents,
+with FSDP2 and expert parallelism. The native capability checks reject
+THD packing before data loading, and the model rejects multi-document
+NEAT rows after the recipe filters their packing metadata. Call the model
+with one unpadded document per row and no packing metadata; its forward
+method rejects padding and KV caching and does not accept `seq_lens` or
+`packed_seq_ids`.
+Context, pipeline, and tensor parallelism are rejected during parallelization.
+LoRA and routing replay are unsupported for this MTP variant. The first
+training forward rejects any configuration that freezes an MTP-owned
+parameter, including the default LoRA configuration, which freezes every base
+parameter. It also rejects any model that carries LoRA adapter tensors, also
+when a `freeze_config` unfreezes the MTP tensors next to the adapters. Adapter
+tensors are recognized by `lora_` in the parameter name, which holds for the
+LoRA and DoRA adapters that NeMo AutoModel installs. The check does not detect
+frozen decoder parameters without adapters. Activation checkpointing can cover
+the other decoder blocks; the shared last block is excluded because it is
+entered twice per forward.
+With multiple micro-batches, reused parameters can also undergo multiple
+gradient reductions, adding synchronization and BF16 rounding relative to
+one invocation. The DSA indexers and both decoder and MTP router correction
+biases remain frozen. The auxiliary router call uses its own correction bias.
+
+Keep the explicit `architectures: [Ernie5_5MTPForCausalLM]` override when
+resuming. The saved HF `config.json` retains the release architecture
+`Ernie5_5_MoeForCausalLM`, MTP depth 1, and shared-last-layer metadata, so the
+saved config is portable. Loading it through the default decoder entry
+requires an explicit choice: select the MTP class again, or set
+`num_nextn_predict_layers: 0` to exclude MTP. Checkpoint saving is disabled
+in the full example because of its size. To enable step-boundary saves,
+set `checkpoint.enabled: true` and choose the checkpoint directory and
+consolidation policy for the available storage. Resume training from a native
+sharded checkpoint: a consolidated HF export rounds training tensors back to
+the release dtypes, including FP32 decoder tensors stored in BF16 in the
+release. A full 43-layer MTP checkpoint or export has not been validated.
 
 ## LoRA
 
@@ -685,12 +798,13 @@ NeMo AutoModel resolves through its own registry.
 
 The released configuration sets `num_nextn_predict_layers: 1`, and the
 checkpoint stores the MTP block as 1,582 keys under `model.layers.43.*`. This
-implementation does not construct that block: a non-zero
-`num_nextn_predict_layers` is rejected when the model is constructed, so the
-released configuration cannot be loaded unchanged. Set
-`model.num_nextn_predict_layers: 0` to load the 43 decoder layers. The MTP keys
-of the checkpoint are then not loaded. Both example recipes set it. A
-configuration that does not come from the released file defaults to 0.
+default decoder entry does not construct that block: a non-zero
+`num_nextn_predict_layers` is rejected unless the
+[MTP class is selected explicitly](#shared-multi-token-prediction). Set
+`model.num_nextn_predict_layers: 0` to load only the 43 decoder layers and
+exclude the checkpoint's MTP keys. The decoder SFT and LoRA recipes set
+that override. A configuration that does not come from the released file
+defaults to 0.
 
 The SQuAD recipes feed single unpacked documents: `forward` accepts one
 unpadded document, `input_ids` of shape `[1, sequence]`, which they provide
@@ -779,12 +893,18 @@ was not compared.
 ## Current Scope
 
 Supported: full-parameter SFT and LoRA of the 43-layer main decoder with EP and
-FSDP2, on single unpacked documents and on packed rows with CP. The
+FSDP2, on single unpacked documents and on packed rows with CP; and the
+opt-in shared MTP variant on unpacked documents at CP1, with the validation
+limits described [above](#shared-multi-token-prediction). The
 following limits apply:
 
-- The MTP block is not loaded or trained. Its 1,582 checkpoint keys under
-  `model.layers.43.*` are excluded, and loading requires
-  `model.num_nextn_predict_layers: 0`.
+- The default decoder and LoRA entries exclude the MTP block and require
+  `model.num_nextn_predict_layers: 0`. MTP training requires the explicit
+  architecture override, exactly one depth, and the released shared-last-layer
+  layout. It does not support packed documents, CP, LoRA, or KV caching.
+- Keep `checkpoint.is_async: false`, the default, for both decoder and
+  MTP runs. Asynchronous save is not validated. This setting is not
+  enforced by the model.
 - The parameters of the DSA indexers are frozen, and a `freeze_config` unfreeze
   selector that covers a DSA indexer is an error at the first training step.
   A LoRA adapter on an indexer projection is an error at the first training
@@ -851,8 +971,9 @@ following limits apply:
   and with HybridEP on a three-layer model with 4 and with 16 GPUs, each time
   with the same number of ranks before and after and with
   `checkpoint.save_consolidated: false`. A resume loads the released
-  checkpoint before the saved one. The consolidated Hugging Face export and
-  a resume on a different number of ranks have not been validated. A saved
+  checkpoint before the saved one. A consolidated Hugging Face export of
+  the full 43-layer model and a resume on a different number of ranks have
+  not been validated. A saved
   checkpoint of full fine-tuning contains the 43 decoder layers and declares
   no MTP block.
 
