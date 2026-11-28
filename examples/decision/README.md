@@ -6,6 +6,7 @@
 | `clef_soc_triage_heads.yaml` | `TrainClefDecisionRecipe` | CLEF frozen backbone + joint schema head, using the same eval / SFT / reward loop |
 | `clef_soc_triage_lora.yaml` | `TrainClefDecisionRecipe` | Clef 27B: LoRA + joint schema head with FSDP2, eval / SFT / RL, stage chaining with `init_from` |
 | `d1_posttrain.py` | `D1PostTraining` | Experimental frozen-backbone D1-3B answer-token rows or Omni marker-head adaptation, with a publisher-baseline gate |
+| `gs1_distribution_sft.yaml` | `TrainGS1DecisionRecipe` | Native GS1 compiler, hybrid backbone, and decision head with distribution NLL + expected Brier SFT |
 | `export_clef_release.py` | — | Merge a Clef stage (LoRA + head) into a directory with the `Cloudflare/clef` release layout |
 | `nemotron_decision_soc_triage_lora.yaml` | `TrainNemotronDecisionRecipe` | Nemotron 3.5 Decision: LoRA (or backbone) post-training on fictional SOC triage, one question per read |
 | `nemotron_decision_support_routing_lora.yaml` | `TrainNemotronDecisionRecipe` | The same recipe on a synthetic support-routing dataset in one-decision JSONL (bring your own) |
@@ -66,6 +67,24 @@ implementation follows this repository's Apache 2.0 license. Downloaded publishe
 their own license terms:
 [D1-3B](https://huggingface.co/LiquidAI/d1-3B) and [D1 Omni](https://huggingface.co/LiquidAI/d1-omni-600M).
 No publisher weights are included in these examples.
+
+GS1 checkpoints expose their native `AutoModel` implementation, prompt compiler, hybrid backbone, and cross-attention
+decision head through their Hub code. The recipe loads that checkpoint through NeMo AutoModel's DDP path and samples up
+to 3,000 text-only questions from a native `request`/`targets` JSONL file. Its single-stage objective is
+`distribution_NLL + brier_weight * expected_Brier`; `brier_weight` defaults to 1.0. Image/video states and tensor,
+context, pipeline, and expert parallelism are not supported by this initial recipe.
+
+The GS1 family provides [0.8B](https://huggingface.co/bigai/GS1-0.8B),
+[2B](https://huggingface.co/bigai/GS1-2B), [4B](https://huggingface.co/bigai/GS1-4B), and
+[9B](https://huggingface.co/bigai/GS1-9B) checkpoints; the example YAML pins GS1-0.8B.
+
+The checkpoint code requires Transformers 5.3 or newer and `typesafe-sdk==0.7.0`. Install the optional GS1 runtime
+dependency with `uv pip install "typesafe-sdk==0.7.0"`, then set `data.train` in
+`examples/decision/gs1_distribution_sft.yaml` to your `distribution-v4.5/train.jsonl` path and run:
+
+```bash
+automodel examples/decision/gs1_distribution_sft.yaml --nproc-per-node 8
+```
 
 CLEF uses complete optimizer windows and drops an incomplete final window. Its global batch size must be positive,
 divisible by `local_batch_size * DP world size`, and small enough to fit at least one training window. For the
