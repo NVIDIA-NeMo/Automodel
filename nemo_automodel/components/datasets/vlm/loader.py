@@ -44,16 +44,9 @@ from nemo_automodel.components.datasets.packing import (
 )
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     COLLATE_FNS,
-    default_collate_fn,
-    gemma4_prefix_collate_fn,
-    kimi_k25_vl_collate_fn,
-    kimi_vl_collate_fn,
-    llava_onevision_collate_fn,
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
     pad_collate_fn,
-    qwen2_5_collate_fn,
-    qwen3_omni_collate_fn,
 )
 from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.datasets import MetaDatasetConfig, PreTokenizedDatasetWrapperConfig
@@ -67,16 +60,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 VlmCollateFn = Callable[[list[object]], object]
-# Collators of the non-pretokenized path that set attention_mask to 0 on the tokens of an injected fake image.
-_FAKE_IMAGE_MASKING_COLLATE_FNS = (
-    default_collate_fn,
-    gemma4_prefix_collate_fn,
-    kimi_k25_vl_collate_fn,
-    kimi_vl_collate_fn,
-    llava_onevision_collate_fn,
-    qwen2_5_collate_fn,
-    qwen3_omni_collate_fn,
-)
 _VLM_PARENT_DATASET_STATE = "_vlm_parent_dataset_state"
 
 
@@ -506,10 +489,10 @@ class VlmDataloaderConfig:
             collate_fn = partial(plain_collate_fn, processor=processor)
 
         if inject_fake_images and self.pretokenization is None:
-            if plain_collate_fn not in _FAKE_IMAGE_MASKING_COLLATE_FNS:
+            if not plain_collate_fn.__module__.startswith("nemo_automodel."):
                 logger.warning(
-                    "This loader's collate function is not one of those that mask fake-image tokens: "
-                    "samples without media get a fake image that attention sees."
+                    "This loader's collate function is defined outside nemo_automodel, so it may not mask "
+                    "fake-image tokens: samples without media may get a fake image that attention sees."
                 )
             if cp_size > 1:
                 logger.warning(

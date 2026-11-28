@@ -668,6 +668,45 @@ def test_nemotron_omni_collate_extracts_images(collate_mod, monkeypatch):
     assert "image_flags" in batch and batch["image_flags"].shape == (1, 1)
 
 
+class DummyNemotronOmniImageTokenProcessor(DummyNemotronOmniProcessor):
+    """Variant that puts two image tokens into the ids of a sample that has an image."""
+
+    def __call__(self, *, text, return_tensors, **kwargs):
+        assert return_tensors == "pt"
+        if "images" in kwargs:
+            ids = torch.tensor([[1, self.IMAGE_TOKEN_ID, self.IMAGE_TOKEN_ID, 4, 5]], dtype=torch.long)
+            pixel_values = torch.zeros(len(kwargs["images"]), 3, 4, 4, dtype=torch.float32)
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids), "pixel_values": pixel_values}
+        ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+
+def test_nemotron_omni_collate_masks_only_injected_fake_image_tokens(collate_mod, monkeypatch):
+    """Image tokens lose attention on a sample marked ``_injected_fake`` and keep it on a real image."""
+    from PIL import Image as PILImage
+
+    from nemo_automodel.components.datasets.vlm.fake_image import inject_fake_image_into_conversation
+
+    monkeypatch.setattr(collate_mod, "build_labels", lambda ids, conv, p: torch.zeros_like(ids), raising=True)
+    text_conversation = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+    image_conversation = [
+        {"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (4, 4))}]},
+        {"role": "assistant", "content": "ok"},
+    ]
+    examples = [
+        {"conversation": inject_fake_image_into_conversation(text_conversation), "_injected_fake": True},
+        {"conversation": image_conversation},
+        {"conversation": text_conversation},
+    ]
+
+    batch = collate_mod.nemotron_omni_collate_fn(examples, processor=DummyNemotronOmniImageTokenProcessor())
+
+    # The label shift drops the last of the five positions.
+    assert batch["input_ids"].tolist() == [[1, 9, 9, 4], [1, 9, 9, 4], [1, 2, 3, 4]]
+    assert batch["attention_mask"].tolist() == [[1, 0, 0, 1], [1, 1, 1, 1], [1, 1, 1, 1]]
+    assert batch["pixel_values"].shape[0] == 2
+
+
 class DummyNemotronOmniTruncationProcessor(DummyNemotronOmniProcessor):
     """Variant returning fixed per-sample token ids where ``9`` is the image token.
 
@@ -844,6 +883,39 @@ def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
     assert torch.equal(batch["labels"], torch.tensor([[21, 22, 23]]))
     assert torch.equal(batch["decoder_input_ids"], torch.tensor([[10, 11, 12]]))
     assert torch.equal(batch["decoder_attention_mask"], torch.tensor([[1, 1, 1]]))
+
+
+def test_nemotron_parse_collate_ignores_fake_image_mark(collate_mod, monkeypatch):
+    """The image is encoder input and ``input_ids`` hold no image token, so the mark changes nothing."""
+    from nemo_automodel.components.datasets.vlm.fake_image import inject_fake_image_into_conversation
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda ids, conv, p: ids.clone(), raising=True)
+    conversation = inject_fake_image_into_conversation(
+        [{"role": "user", "content": "please parse"}, {"role": "assistant", "content": "ok"}]
+    )
+    processor = DummyNemotronParseProcessor()
+
+    marked = collate_mod.nemotron_parse_collate_fn([{"conversation": conversation, "_injected_fake": True}], processor)
+    unmarked = collate_mod.nemotron_parse_collate_fn([{"conversation": conversation}], processor)
+
+    assert marked.keys() == unmarked.keys()
+    assert all(torch.equal(marked[key], unmarked[key]) for key in marked)
+    assert torch.equal(marked["attention_mask"], torch.ones(1, 3, dtype=torch.long))
+    assert marked["n_images_per_sample"].tolist() == [1]
+
+
+def test_phi4_mm_collate_ignores_fake_image_mark(collate_mod, monkeypatch):
+    """The processor is called with text and audio only, so the mark changes nothing."""
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda ids, conv, p: ids.clone(), raising=True)
+    example = {"conversation": CONVERSATION, "audio": ([0.1, 0.2], 16000)}
+    processor = DummyPhi4Processor()
+
+    marked = collate_mod.phi4_mm_collate_fn([{**example, "_injected_fake": True}], processor)
+    unmarked = collate_mod.phi4_mm_collate_fn([example], processor)
+
+    assert [set(call) & {"images", "image"} for call in processor.forward_calls] == [set(), set()]
+    assert marked.keys() == unmarked.keys()
+    assert all(torch.equal(torch.as_tensor(marked[key]), torch.as_tensor(unmarked[key])) for key in marked)
 
 
 def test_import_error_when_qwen_omni_utils_missing(collate_mod, monkeypatch):

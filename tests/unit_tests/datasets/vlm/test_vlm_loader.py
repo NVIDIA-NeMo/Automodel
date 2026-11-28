@@ -34,6 +34,7 @@ from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_C
 from nemo_automodel.components.datasets.vlm import loader as vlm_loader
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
+    nemotron_omni_collate_fn,
     packed_sequence_thd_vlm_collater,
 )
 from nemo_automodel.components.datasets.vlm.datasets import (
@@ -1035,7 +1036,8 @@ def test_unsharded_text_only_meta_dataset_gets_no_fake_image(monkeypatch):
     ("collator", "pretokenize", "cp_size", "unmasked_warning", "cp_warning"),
     [
         (None, False, 1, False, False),  # default_collate_fn masks the fake image
-        (VlmCollatorConfig(factory=_collate_examples), False, 1, True, False),
+        (VlmCollatorConfig(factory=nemotron_omni_collate_fn), False, 1, False, False),  # a repository collate
+        (VlmCollatorConfig(factory=_collate_examples), False, 1, True, False),  # defined outside nemo_automodel
         (None, False, 2, False, True),
         (None, True, 2, False, False),  # the pretokenized wrapper masks before CP sees the sample
         (VlmCollatorConfig(factory=_collate_examples), True, 2, False, False),
@@ -1054,7 +1056,7 @@ def test_fake_image_warnings(monkeypatch, caplog, collator, pretokenize, cp_size
     with caplog.at_level(logging.WARNING, logger=vlm_loader.__name__):
         _fake_image_marks(config, dp_world_size=2, cp_size=cp_size)
 
-    assert ("is not one of those that mask fake-image tokens" in caplog.text) is unmasked_warning
+    assert ("is defined outside nemo_automodel" in caplog.text) is unmasked_warning
     assert ("drops the attention mask of fake images" in caplog.text) is cp_warning
 
 
