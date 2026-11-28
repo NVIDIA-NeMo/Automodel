@@ -256,6 +256,7 @@ def _parallelize_moe(
         enable_async_tensor_parallel = strategy_config.enable_async_tensor_parallel
         activation_checkpointing_scope = strategy_config.activation_checkpointing_scope
         frozen_multimodal_sharding = strategy_config.multimodal.frozen_sharding
+        offload_experts_only = moe.offload_experts_only
     else:
         mp_policy = moe.mp_policy
         tp_shard_plan = None
@@ -265,6 +266,7 @@ def _parallelize_moe(
         enable_async_tensor_parallel = False
         activation_checkpointing_scope = "all"
         frozen_multimodal_sharding = "root"
+        offload_experts_only = moe.offload_experts_only
 
     parallelize_moe_model(
         model,
@@ -278,6 +280,7 @@ def _parallelize_moe(
         wrap_outer_model=moe.wrap_outer_model,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
+        offload_experts_only=offload_experts_only,
         tp_shard_plan=tp_shard_plan,
         sequence_parallel=sequence_parallel,
         enable_async_tensor_parallel=enable_async_tensor_parallel,
