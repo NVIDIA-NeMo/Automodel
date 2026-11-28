@@ -22,7 +22,6 @@ from typing import Any, Union
 
 import torch
 import torch.nn as nn
-from torch.distributed.fsdp import FSDPModule
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
@@ -578,10 +577,8 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             **kwargs: Text metadata, including ``cu_seqlens`` of shape
                 [batch, max_documents + 1] or [documents + 1], integer
                 ``max_seqlen``, and ``packed_token_indices`` of shape [batch,
-                sequence] or [tokens]. ``mm_token_type_ids`` of shape [batch,
-                sequence] marks each token as text (0), image (1), or video (2).
-                Image/video-prefixed metadata retains the inherited HF
-                precomputed-vision contract.
+                sequence] or [tokens]. Image/video-prefixed metadata retains
+                the inherited HF precomputed-vision contract.
 
         Returns:
             Model output with ``last_hidden_state`` of shape [batch, sequence,
@@ -590,22 +587,20 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
         # If we have visual pixel values and a vision encoder, go through the full HF
         # VL forward (vision encoding + multimodal scatter + text).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
-            embed_tokens = getattr(self.language_model, "embed_tokens", None)
-            input_ids_for_super = input_ids
-            inputs_embeds_for_super = inputs_embeds
-            if inputs_embeds_for_super is None:
-                if (
+            embed_tokens = self.get_input_embeddings()
+            if inputs_embeds is None:
+                if embed_tokens is not None:
+                    inputs_embeds = embed_tokens(input_ids)
+                elif (
                     input_ids is not None
                     and isinstance(input_ids, torch.Tensor)
                     and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
                 ):
                     # Pipeline-parallel: input_ids may already be embeddings
-                    inputs_embeds_for_super = input_ids
-                    input_ids_for_super = None
-                elif embed_tokens is None:
+                    inputs_embeds = input_ids
+                    input_ids = None
+                else:
                     raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
-            else:
-                input_ids_for_super = None
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
@@ -614,36 +609,12 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             for key in ("cu_seqlens", "max_seqlen"):
                 if key in kwargs:
                     kwargs[f"_text_{key}"] = kwargs.pop(key)
-            mm_token_type_ids = kwargs.get("mm_token_type_ids")
-            if (
-                position_ids is None
-                and input_ids_for_super is not None
-                and mm_token_type_ids is not None
-                and image_grid_thw is not None
-                and isinstance(attention_mask, torch.Tensor)
-                and attention_mask.ndim == 2
-            ):
-                # The loader masks the vision tokens of an injected fake image (attention_mask 0) and leaves its
-                # grid in image_grid_thw. The HF position walk drops masked tokens, so it would hand that grid to
-                # the next image. When an image is masked, walk with the grids of the attended images only.
-                is_image = mm_token_type_ids == 1
-                # First token of every image run, shape [batch, sequence]; row-major order is the grid order.
-                run_starts = is_image & ~nn.functional.pad(is_image, (1, 0))[:, :-1]
-                run_attended = attention_mask.bool()[run_starts]
-                if run_attended.numel() == image_grid_thw.shape[0] and not bool(run_attended.all()):
-                    position_ids, self.rope_deltas = self.get_rope_index(
-                        input_ids_for_super,
-                        mm_token_type_ids=mm_token_type_ids,
-                        image_grid_thw=image_grid_thw[run_attended],
-                        video_grid_thw=video_grid_thw,
-                        attention_mask=attention_mask,
-                    )
             return super().forward(
-                input_ids=input_ids_for_super,
+                input_ids=None,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds_for_super,
+                inputs_embeds=inputs_embeds,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
@@ -664,16 +635,6 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
 
         if input_ids is None and inputs_embeds is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
-
-        # A text model that is an FSDP unit embeds the token ids itself. On a call through the outer forward
-        # in this file, token ids reach such a text model only when no FSDP root above it has run: the text
-        # model is then the root, and FSDP2 requires a root to run before the units inside it. A caller that
-        # runs this module directly under another FSDP root has to pass inputs_embeds to embed first.
-        if inputs_embeds is None and input_ids is not None and not isinstance(self.language_model, FSDPModule):
-            embed_tokens = getattr(self.language_model, "embed_tokens", None)
-            if embed_tokens is not None:
-                inputs_embeds = embed_tokens(input_ids)
-                input_ids = None
 
         outputs = self.language_model(
             input_ids=input_ids,
@@ -1579,48 +1540,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             ignore_index=ignore_index,
         )
 
-    def _language_model_is_fsdp_root(self) -> bool:
-        """Whether the text model is an FSDP unit while this model is not, so no FSDP root runs before it."""
-        return isinstance(self.model.language_model, FSDPModule) and not isinstance(self, FSDPModule)
-
-    def _vision_tower_is_trainable(self) -> bool:
-        """Whether the vision tower is or contains an FSDP unit and has at least one trainable parameter."""
-        visual = getattr(self.model, "visual", None)
-        if visual is None:
-            return False
-        return any(isinstance(module, FSDPModule) for module in visual.modules()) and any(
-            param.requires_grad for param in visual.parameters()
-        )
-
-    def _anchor_unused_vision_tower(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
-        """Tie text-only embeddings to a trainable vision tower without changing their values.
-
-        Under FSDP2 a trainable tower is its own FSDP unit (MoE parallelizer) or its blocks are FSDP
-        units (dense parallelizer). A rank whose batch has no media would skip those units' all-gathers
-        and gradient reductions while ranks with media issue them, and the step deadlocks. Encoding one
-        blank image and adding zero times its features makes every rank enter the tower once and gives
-        the tower's parameters a zero gradient on this rank.
-
-        Args:
-            inputs_embeds: Text embeddings of shape ``[batch, sequence, hidden]``.
-
-        Returns:
-            Embeddings of shape ``[batch, sequence, hidden]`` with the same values. The input
-            tensor itself is returned when the tower is absent, fully frozen, or holds no FSDP unit.
-        """
-        if not self._vision_tower_is_trainable():
-            return inputs_embeds
-        vision_config = self.config.vision_config
-        merge = vision_config.spatial_merge_size
-        patch_dim = vision_config.in_channels * vision_config.temporal_patch_size * vision_config.patch_size**2
-        # One blank image of merge x merge patches: rows of shape [patches, patch_dim], grid [images, 3].
-        blank = inputs_embeds.new_zeros((merge * merge, patch_dim))
-        grid_thw = torch.tensor([[1, merge, merge]], device=inputs_embeds.device)
-        if hasattr(self.model.visual, "rotary_pos_emb"):
-            self.model.visual.rotary_pos_emb.to(inputs_embeds.device)
-        features = self._encode_vision_for_cp(blank, grid_thw, is_video=False)
-        return inputs_embeds + 0.0 * features.sum().to(inputs_embeds.dtype)
-
     def _embed_and_splice_for_cp(
         self,
         input_ids: torch.Tensor,
@@ -1658,9 +1577,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         with cp_dispatcher_suspended(self.cp_mesh):
-            if pixel_values is None and pixel_values_videos is None:
-                inputs_embeds = self._anchor_unused_vision_tower(inputs_embeds)
-
             if pixel_values is not None:
                 if hasattr(self.model.visual, "rotary_pos_emb"):
                     self.model.visual.rotary_pos_emb.to(pixel_values.device)
@@ -1851,31 +1767,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             input_ids = None
             for media_key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"):
                 kwargs.pop(media_key, None)
-        elif (
-            cp_size <= 1
-            and inputs_embeds is None
-            and input_ids is not None
-            and not torch.is_floating_point(input_ids)
-            and pixel_values is None
-            and pixel_values_videos is None
-            and getattr(self.model.language_model, "embed_tokens", None) is not None
-            and (
-                isinstance(self, FSDPModule)
-                or (self.mtp is not None and self.training)
-                or self._vision_tower_is_trainable()
-            )
-            and not self._language_model_is_fsdp_root()
-        ):
-            # A text-only batch that takes this branch embeds here, so MTP rolls these embeddings instead
-            # of calling embed_tokens again after lm_head. Media batches call it once (above). FSDP2
-            # prefetches in backward by forward call order, so a rank that called it again would issue
-            # different all-gathers and deadlock a step that mixes media and text-only ranks. A trainable
-            # vision tower is entered here as well, for the same reason. The branch is skipped when the
-            # text model is the FSDP root of embed_tokens (distributed.moe.wrap_outer_model false),
-            # because a root has to run before its units: the text model then embeds the token ids, MTP
-            # embeds the rolled ids after lm_head, and the tower is not entered.
-            inputs_embeds = self._anchor_unused_vision_tower(self.model.language_model.embed_tokens(input_ids))
-            input_ids = None
         if cp_size > 1 and inputs_embeds is None and input_ids is not None and not torch.is_floating_point(input_ids):
             is_first_stage = getattr(self.model.language_model, "embed_tokens", None) is not None
             is_last_stage = getattr(self, "lm_head", None) is not None
@@ -1927,18 +1818,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 for media_key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"):
                     kwargs.pop(media_key, None)
 
-        if (
-            position_ids is None
-            and self.lm_head is None
-            and input_ids is not None
-            and not torch.is_floating_point(input_ids)
-            and input_ids.ndim == 2
-            and (pixel_values is not None or pixel_values_videos is not None)
-        ):
-            # First pipeline stage of a media batch: later stages receive hidden states only and decode with
-            # sequential positions, so decode this stage's layers with the same ones.
-            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device)
-            position_ids = position_ids.view(1, 1, -1).expand(3, input_ids.shape[0], -1)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

@@ -76,7 +76,9 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: /path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    # FinetuneRecipeForVLM ignores this block: ChatDataset gets the processor's tokenizer, which the VLM
+    # dataloader wraps so the Gemma4 template receives tool-call arguments as dicts (it raises on JSON strings).
+    _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: google/gemma-4-31B
   split: train
   seq_length: 65536
@@ -84,7 +86,7 @@ dataset:
   # Assistant-only masking comes from a Gemma4 chat template with {% generation %}
   # blocks (tokenizer returns the assistant mask directly). The stock Gemma4
   # template has no generation block, forcing the prefix-arithmetic fallback that
-  # #3024's guard rejects for multi-turn conversations. Renders byte-identically.
+  # #3024's guard rejects for multi-turn conversations. See the README for how it differs from upstream.
   chat_template: examples/long_context_validation/gemma4_31B/gemma4_coderforge_chat_template.jinja
   shuffle_seed: 42
 

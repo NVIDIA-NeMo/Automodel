@@ -29,7 +29,6 @@ benchmark:
   nsys_end: -1
   nsys_ranks: []
   num_nodes: 8
-  peak_tflops: 989
   warmup_steps: 6
 checkpoint:
   enabled: false

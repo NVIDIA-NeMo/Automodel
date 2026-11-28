@@ -1661,6 +1661,11 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     if isinstance(text, list):
                         text = text[0]
                     images, videos = _extract_media_from_conversations([conversation])
+                    # A template that renders BOS itself and a tokenizer that also prepends
+                    # it would yield two; apply_chat_template(tokenize=True) yields one.
+                    bos_token = getattr(getattr(self.processor, "tokenizer", None), "bos_token", None)
+                    if isinstance(bos_token, str) and bos_token and text.startswith(bos_token):
+                        processor_kwargs["add_special_tokens"] = False
                     result = self.processor(
                         text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs
                     )

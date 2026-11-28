@@ -56,7 +56,8 @@ def warn_if_torch_adam_with_bf16_params(
         "Detected torch.optim.Adam/AdamW with trainable bf16 model parameters. Updates and Adam state "
         "will use bf16, which saves memory but may affect training stability, convergence, or final loss. "
         "For maximum stability, set model.torch_dtype=float32 with FSDP mixed precision, or use Transformer "
-        "Engine FusedAdam with master_weights=True. See docs/guides/mixed-precision-training.mdx."
+        "Engine FusedAdam with master_weights=True (the only option for the speculative-decoding drafts, whose "
+        "storage dtype is fixed). See docs/guides/mixed-precision-training.mdx."
     )
 
     _WARNED_CONTEXTS.add(context)

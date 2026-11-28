@@ -60,13 +60,18 @@ dataset:
   path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
+  # Text-only data: no fake image. It would add 258 tokens to every document that the
+  # packing length estimate does not count.
+  inject_fake_images: false
   # google/gemma-4-31B (base) ships no chat template; make_tulu3_dataset formats via the
   # processor's tokenizer, so supply the -it template here. The VLM loader pops this key and
   # applies it to processor.chat_template (no manual moving the chat template onto the model dir needed).
+  # Vendored verbatim from upstream (revision in the file header); re-sync on upstream template fixes.
   chat_template: examples/convergence/tulu3/models/gemma4-31b/chat_template.jinja
 
 # 2k sequence packing (multiple conversations per sample); the gemma4 hook injects
-# the thinking prefix and the packer masks it out of the loss.
+# the thinking prefix after every model turn marker. Its four tokens are supervised;
+# the generation prompt at evaluation already ends with the prefix.
 packed_sequence:
   pretokenize: true
   max_length: 2048
@@ -133,6 +138,8 @@ ci:
     dp_size: 1
     extra_model_args: "max_model_len=8192"
     metric: prompt_level_strict_acc
+    # Baseline and stderr were measured on the previous data (fake image, two <bos>,
+    # launch template); re-measure them on the current data (see README).
     baseline: 0.5287
     # Between-run sigma of the train->eval pipeline, NOT lm-eval's within-eval
     # bootstrap stderr (0.0215) -- that is ~2x smaller and only covers scoring 541

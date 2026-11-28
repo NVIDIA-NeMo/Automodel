@@ -435,6 +435,9 @@ class _StubConfigNode(dict):
         except KeyError as exc:
             raise AttributeError(name) from exc
 
+    def to_dict(self):
+        return dict(self)
+
 
 class _FakeDistributedDataParallel(nn.Module):
     """Minimal DDP stand-in that preserves parameter discovery in setup tests."""

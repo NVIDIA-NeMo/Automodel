@@ -454,8 +454,19 @@ installs the adapters from the `peft` section of the run and reads their
 tensors from `adapter_model.safetensors`; it does not use the list in
 `adapter_config.json`. A LoRA run writes no consolidated Hugging Face export,
 whatever `checkpoint.save_consolidated` says. Loading the adapter with Hugging
-Face PEFT and merging it into the base weights with
-`export_merged_peft_checkpoint` have not been tested.
+Face PEFT has not been tested.
+
+Merging the adapter into the base weights was validated at two sizes only:
+with `export_merged_peft_checkpoint` on a small configuration on CPU, and
+with `tools/merge_lora.py --automodel-native-export` on a three-layer cut of
+the released checkpoint on one GPU, where the tool ran to completion. That
+run used `--dtype bfloat16` and
+`--backend attn=sdpa experts=torch dispatcher=torch`: the model rejects the
+tool's default dtype, `float16`, and the backend defaults of a machine with
+CUDA, Transformer Engine, and DeepEP. The 43-layer model was not merged this
+way: the tool loads the whole model on one GPU, and it builds the model from
+the `config.json` of the base checkpoint, where the released configuration
+declares the MTP block that this model rejects.
 
 ## Packed Sequences and Context Parallelism
 
@@ -811,9 +822,9 @@ following limits apply:
   applied to the adapters of the routed experts, which hold 98% of the adapter
   parameters, and dropout on the linear projections was not validated. Not
   validated: `peft.moe_rank_scaling`, the full model with more ranks than
-  `ep_size`, merging an adapter into the base weights with
-  `export_merged_peft_checkpoint`, and loading an adapter with Hugging Face
-  PEFT. See [LoRA Checkpoints](#lora-checkpoints) for optimizer restoration.
+  `ep_size`, merging an adapter into the base weights of the 43-layer model
+  (see [Adapter Format](#adapter-format)), and loading an adapter with Hugging
+  Face PEFT. See [LoRA Checkpoints](#lora-checkpoints) for optimizer restoration.
 - Documents longer than 512 tokens require the cuDNN sparse-attention path of
   the DSA layers, which requires `nvidia-cudnn-frontend[cutedsl]` and FlashMLA
   and is validated on SM100-class GPUs (GB200) only. Multi-GPU training of the

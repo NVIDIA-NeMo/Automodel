@@ -16,8 +16,7 @@
 """NCCL interleaved schedule gradient/update parity with pooled or native JIT receives."""
 
 import datetime
-import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -71,12 +70,6 @@ class _Block(nn.Module):
             Stage output with the same shape and dtype as x.
         """
         return checkpoint(self._core, x, use_reentrant=False) if self.activation_checkpointing else self._core(x)
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _run_pipeline(
@@ -161,7 +154,7 @@ def _run_pipeline(
 def _worker(
     rank: int,
     world_size: int,
-    port: int,
+    init_file: str,
     virtual: int,
     dtype_name: str,
     activation_checkpointing: bool,
@@ -169,11 +162,15 @@ def _worker(
     pool_slack: int = 2,
     num_microbatches: int = 16,
 ) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
     torch.set_num_threads(1)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=180))
+    dist.init_process_group(
+        "nccl",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=180),
+    )
     try:
         dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
         reference = _run_pipeline(
@@ -222,6 +219,7 @@ def test_interleaved_pooled_receives_preserve_every_gradient_and_update(
     activation_checkpointing: bool,
     pool_slack: int,
     num_microbatches: int,
+    tmp_path: Path,
 ) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} CUDA devices required")
@@ -229,7 +227,7 @@ def test_interleaved_pooled_receives_preserve_every_gradient_and_update(
         _worker,
         args=(
             world_size,
-            _free_port(),
+            str(tmp_path / "process-group"),
             virtual,
             dtype_name,
             activation_checkpointing,
@@ -246,7 +244,9 @@ def test_interleaved_pooled_receives_preserve_every_gradient_and_update(
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Four CUDA devices required")
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize("virtual,num_microbatches", [(4, 16), (2, 32), (2, 64)])
-def test_omitting_owned_forward_inputs_fails_the_checkpointed_parity_check(virtual: int, num_microbatches: int) -> None:
+def test_omitting_owned_forward_inputs_fails_the_checkpointed_parity_check(
+    virtual: int, num_microbatches: int, tmp_path: Path
+) -> None:
     # A version-counter error or numerical mismatch is evidence of the storage
     # defect; unrelated initialization/communication failures must not pass.
     with pytest.raises(
@@ -254,5 +254,8 @@ def test_omitting_owned_forward_inputs_fails_the_checkpointed_parity_check(virtu
         match="not equal|not close|modified by an inplace operation|backward through the graph a second time",
     ):
         mp.spawn(
-            _worker, args=(4, _free_port(), virtual, "bfloat16", True, True, 0, num_microbatches), nprocs=4, join=True
+            _worker,
+            args=(4, str(tmp_path / "process-group"), virtual, "bfloat16", True, True, 0, num_microbatches),
+            nprocs=4,
+            join=True,
         )

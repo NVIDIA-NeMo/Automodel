@@ -23,8 +23,6 @@ import torch.nn as nn
 # Skip entire module when transformers has no Qwen3.5-MoE (e.g. older CI environments).
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
-from types import SimpleNamespace
-
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
@@ -432,57 +430,18 @@ class TestQwen3_5MoeModel:
         assert core.embed_tokens is core.language_model.embed_tokens
         assert core.norm is core.language_model.norm
 
-    def test_forward_text_only_embeds_before_language_model(self, vl_config, backend_config, moe_config, device):
-        """Text-only path embeds input_ids before entering language_model so the
-        FSDP2 unshard order (embed_tokens -> language_model) matches the
-        multimodal path."""
-        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
-        core = model.model
-
-        batch, seq_len = 2, 3
-        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
-        expected_embeds = core.embed_tokens(input_ids)
-
-        call_order = []
-        orig_embed_forward = core.embed_tokens.forward
-
-        def _tracked_embed(*args, **kwargs):
-            call_order.append("embed_tokens")
-            return orig_embed_forward(*args, **kwargs)
-
-        mock_output = MagicMock()
-        mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
-
-        def _tracked_lang_forward(*args, **kwargs):
-            call_order.append("language_model")
-            return mock_output
-
-        with (
-            patch.object(core.embed_tokens, "forward", side_effect=_tracked_embed),
-            patch.object(core.language_model, "forward", side_effect=_tracked_lang_forward) as mock_lang_forward,
-        ):
-            core.forward(input_ids=input_ids)
-
-        assert call_order == ["embed_tokens", "language_model"]
-        call_kwargs = mock_lang_forward.call_args.kwargs
-        assert call_kwargs["input_ids"] is None
-        torch.testing.assert_close(call_kwargs["inputs_embeds"], expected_embeds)
-
-    def test_forward_text_only_forwards_input_ids_when_embed_tokens_absent(
+    def test_forward_text_only_forwards_input_ids_to_language_model(
         self, vl_config, backend_config, moe_config, device
     ):
-        """When get_input_embeddings() returns None, integer input_ids are still
-        forwarded to language_model so it can raise its pipeline-stage error."""
+        """Text-only path passes integer input_ids straight to the backend language
+        model (which embeds internally), rather than pre-embedding here."""
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         core = model.model
 
         batch, seq_len = 2, 3
         input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
 
-        with (
-            patch.object(core.language_model, "embed_tokens", None),
-            patch.object(core.language_model, "forward") as mock_lang_forward,
-        ):
+        with patch.object(core.language_model, "forward") as mock_lang_forward:
             mock_output = MagicMock()
             mock_output.last_hidden_state = torch.randn(
                 batch, seq_len, vl_config.text_config.hidden_size, device=device
@@ -766,74 +725,11 @@ class TestQwen3_5MoeModelVLPath:
         mock_language_forward.assert_not_called()
         kw = mock_hf_forward.call_args.kwargs
         assert kw["pixel_values"] is pixel_values
-        assert kw["input_ids"] is input_ids
-        assert kw["inputs_embeds"] is None
+        assert kw["input_ids"] is None
+        assert kw["inputs_embeds"] is not None
         # model.model (base) delegates the VL path to HF super().forward(), which returns the
         # multimodal hidden states; lm_head/logits live on the outer ForConditionalGeneration.
         assert result.last_hidden_state.shape == (batch, seq_len, vl_config.text_config.hidden_size)
-
-    def test_media_and_text_paths_issue_identical_embed_then_lm_sequence(
-        self, vl_config, backend_config, moe_config, device
-    ):
-        """Both media and text-only paths must invoke embed_tokens exactly once
-        before language_model so FSDP2 collectives match even with
-        reshard_after_forward=True."""
-        vl_config.image_token_id = 10
-        vl_config.video_token_id = 11
-        vl_config.vision_start_token_id = 12
-        vl_config.vision_end_token_id = 13
-
-        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
-        core = model.model
-        model_dtype = next(model.parameters()).dtype
-
-        batch, seq_len = 1, 4
-        image_token_id = vl_config.image_token_id
-        media_input_ids = torch.tensor([[1, image_token_id, image_token_id, 2]], device=device)
-        text_input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
-        pixel_values = torch.randn(4, 3 * 2 * 16 * 16, device=device, dtype=model_dtype)
-        image_grid_thw = torch.tensor([[1, 1, 2]], device=device)
-        mm_token_type_ids = torch.tensor([[0, 1, 1, 0]], device=device, dtype=torch.int32)
-
-        fake_image_embeds = torch.randn(2, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
-        fake_lm_output = Qwen3_5MoeModelOutputWithPast(
-            last_hidden_state=torch.randn(
-                batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
-            )
-        )
-
-        def _run_and_record(**forward_kwargs):
-            call_order = []
-            orig_embed_forward = core.embed_tokens.forward
-
-            def _tracked_embed(*args, **kwargs):
-                call_order.append("embed_tokens")
-                return orig_embed_forward(*args, **kwargs)
-
-            def _tracked_lm(*args, **kwargs):
-                call_order.append("language_model")
-                return fake_lm_output
-
-            with (
-                patch.object(core.embed_tokens, "forward", side_effect=_tracked_embed),
-                patch.object(
-                    core, "get_image_features", return_value=SimpleNamespace(pooler_output=(fake_image_embeds,))
-                ),
-                patch.object(core.language_model, "forward", side_effect=_tracked_lm),
-            ):
-                core.forward(**forward_kwargs)
-            return call_order
-
-        media_order = _run_and_record(
-            input_ids=media_input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            mm_token_type_ids=mm_token_type_ids,
-        )
-        text_order = _run_and_record(input_ids=text_input_ids)
-
-        assert media_order == ["embed_tokens", "language_model"]
-        assert text_order == ["embed_tokens", "language_model"]
 
 
 # ---------------------------------------------------------------------------
