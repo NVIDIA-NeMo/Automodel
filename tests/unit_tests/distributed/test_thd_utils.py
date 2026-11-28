@@ -774,3 +774,20 @@ def test_thd_original_document_ids_survive_attention_joining_and_pp_chunks():
     torch.testing.assert_close(chunked["_packed_seq_ids"], batch["_packed_seq_ids"])
 
     torch.testing.assert_close(chunked["document_ids"], batch["document_ids"])
+
+
+def test_process_input_for_thd_pad_between_seqs_and_passthrough():
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        "labels": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        "position_ids": torch.tensor([[0, 1, 2], [0, 1, 2]]),
+        "seq_lens": torch.tensor([[2], [2]]),
+        "seq_lens_padded": torch.tensor([[3], [3]]),
+        "custom_metadata_tag": "non_tensor_passthrough",
+    }
+    result = process_input_for_thd(batch)
+    assert isinstance(result["pad_between_seqs"], bool)
+    assert result["pad_between_seqs"] is True
+    assert result.get("custom_metadata_tag") == "non_tensor_passthrough"
