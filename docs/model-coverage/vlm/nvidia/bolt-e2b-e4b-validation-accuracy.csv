@@ -1,0 +1,9 @@
+family,mode,epoch,training_step,correct_tokens,label_tokens,examples,validation/token_accuracy_percent,validation/loss,wandb_url
+e2b,full,1,124,29683,52794,500,56.22419214304656,2.1006371317684014,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e2b-full-accuracy-23059246
+e2b,full,2,249,30760,52794,500,58.264196689017695,2.1017944999557105,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e2b-full-accuracy-23059246
+e2b,lora,1,124,29292,52794,500,55.48357767928174,2.1426704692927285,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e2b-lora-accuracy-23059246
+e2b,lora,2,249,29465,52794,500,55.811266431791495,2.136022996725438,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e2b-lora-accuracy-23059246
+e4b,full,1,124,30556,52794,500,57.87778914270561,1.9772326981664115,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e4b-full-accuracy-23059247
+e4b,full,2,249,31663,52794,500,59.97461832784028,2.0824220749258604,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e4b-full-accuracy-23059247
+e4b,lora,1,124,30121,52794,500,57.05383187483426,1.99363281531113,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e4b-lora-accuracy-23059247
+e4b,lora,2,249,30373,52794,500,57.53115884380801,2.003650023665632,https://forge.coreweave.com/wandb/Nemo-automodel/automodel/runs/e4b-lora-accuracy-23059247
