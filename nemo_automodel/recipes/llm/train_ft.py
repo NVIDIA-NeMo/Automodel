@@ -185,6 +185,30 @@ def _should_pack_validation(
     )
 
 
+def _validation_loader_config(
+    training_dataloader: DataloaderConfig | None,
+    validation_dataloader: DataloaderConfig,
+    model: nn.Module,
+) -> DataloaderConfig:
+    """Return the validation loader config, unpacked unless validation must use the training packer.
+
+    Skipping the online packer leaves raw examples, which ``neat_packed_collater`` cannot stack, so
+    that collate_fn is dropped only when this loader would have packed them itself. Already-packed
+    data (``packing.prepacked`` or no ``packing``) keeps its configured collater.
+    """
+    if _should_pack_validation(training_dataloader, validation_dataloader, model):
+        return validation_dataloader
+    packing = validation_dataloader.packing
+    collate_fn = validation_dataloader.collate_fn
+    if (
+        packing is not None
+        and not packing.prepacked
+        and getattr(collate_fn, "func", collate_fn) is neat_packed_collater
+    ):
+        collate_fn = None
+    return replace(validation_dataloader, packing=None, collate_fn=collate_fn)
+
+
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     # Probe the wrapped model's signature, head, and config; training still calls DDP.
@@ -870,9 +894,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.pack_size = packing.packed_sequence_size if packing is not None else None
         self.val_dataloaders = {
             name: materialize_loader(
-                dl_config
-                if _should_pack_validation(self.cfg.dataloader, dl_config, self.model_parts[0])
-                else replace(dl_config, packing=None),
+                _validation_loader_config(self.cfg.dataloader, dl_config, self.model_parts[0]),
                 is_training=False,
             )
             for name, dl_config in self.cfg.validation_dataloaders.items()
