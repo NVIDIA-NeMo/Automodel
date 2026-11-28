@@ -669,6 +669,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
         """Forward pass.
@@ -698,6 +699,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 ``[1, tokens]`` for packed THD.
             logits_to_keep: If ``0``, project all positions; else only the last ``logits_to_keep``.
                 A tensor value contains the one-dimensional token indices to project.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: When set (single-process), carry final hidden states on the output.
             **attn_kwargs: Additional attention metadata forwarded to the base model. Packed THD
                 uses an int32 ``cu_seqlens`` tensor of shape ``[sequences + 1]`` and
@@ -789,7 +793,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         if hidden.dim() == 2:  # packed (THD) [tokens, hidden] -> [1, tokens, hidden]
             hidden = hidden.unsqueeze(0)
-        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()

@@ -1420,6 +1420,20 @@ class TestSCDDLoss:
         with pytest.raises(ValueError, match="num_timesteps >= 2"):
             SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=num_timesteps)
 
+    @pytest.mark.parametrize("mask_token_id", [V, -1])
+    def test_rejects_a_mask_id_outside_the_vocabulary(self, mask_token_id):
+        """No vocabulary column can be the absorbing state, so the posterior would be wrong."""
+        logits, x0, z_t, loss_mask, p_mask = _scdd_batch(seed=1, t=0.4)
+        with pytest.raises(ValueError, match="outside the vocabulary"):
+            SCDDLoss(mask_token_id=mask_token_id, num_timesteps=1000)(
+                logits=logits,
+                target_ids=x0,
+                noise_mask=None,
+                p_mask=p_mask,
+                loss_mask=loss_mask,
+                noisy_input_ids=z_t,
+            )
+
     def test_reduces_to_mdlm_when_the_uniform_channel_is_off(self):
         """With max_ratio=0 the NELBO collapses to -log p(x0)/t at masked
         positions and exactly zero elsewhere — the MDLM objective."""

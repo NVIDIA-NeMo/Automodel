@@ -480,6 +480,8 @@ class Lfm3VlForConditionalGeneration(HFCheckpointingMixin, Lfm3VlPreTrainedModel
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         mm_encoder_outputs: dict[str, BaseModelOutputWithPooling] | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         """Predict next-token logits over text interleaved with images and videos.
@@ -501,6 +503,9 @@ class Lfm3VlForConditionalGeneration(HFCheckpointingMixin, Lfm3VlPreTrainedModel
             use_cache: Whether to create and return a generation cache.
             logits_to_keep: Project only the last ``logits_to_keep`` positions (0 keeps
                 all), or the positions in a long Tensor of shape [kept].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             mm_encoder_outputs: Precomputed vision features, as generation passes them.
             **kwargs: Hugging Face output-capture, attention and loss arguments.
 
@@ -523,9 +528,14 @@ class Lfm3VlForConditionalGeneration(HFCheckpointingMixin, Lfm3VlPreTrainedModel
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         loss = None
         if labels is not None:
             loss = self.loss_function(

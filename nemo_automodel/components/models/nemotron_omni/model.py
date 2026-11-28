@@ -1213,6 +1213,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs,
     ) -> Union[dict, Tuple, CausalLMOutputWithPast]:
         """Forward pass for training.
@@ -1245,6 +1247,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 if > 0, only compute logits for the last ``logits_to_keep``
                 positions (used by fused linear cross-entropy to avoid the full
                 logit matrix). Forwarded to the language-model lm_head gating.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Additional arguments
 
         Returns:
@@ -1638,6 +1643,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             output_hidden_states=output_hidden_states,
             return_dict=True,
             logits_to_keep=logits_to_keep,
+            compute_logits=compute_logits,
             **kwargs,
         )
         if mtp_embed_inputs:

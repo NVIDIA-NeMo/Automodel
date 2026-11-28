@@ -628,6 +628,7 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         qkv_format: str = "bshd",
         use_cache: bool = False,
         _mistral_packed_document_ids: torch.Tensor | None = None,
+        compute_logits: bool = True,
     ) -> CausalLMOutputWithPast | torch.Tensor | tuple[torch.Tensor, ...]:
         """Run causal or document-packed text with capped logits and optional shifted CE.
 
@@ -651,6 +652,9 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
                 HF-style path shifts labels once, excluding padding/document edges.
             logits_to_keep: Zero for all, positive tail length, or int64 [kept_positions].
                 Labels require all positions. Index selection applies to the sequence axis.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Return final [batch, sequence, hidden] activations.
             cu_seqlens: SDPA THD requires integer offsets [documents + 1]
                 strictly partitioning flattened storage. Prepared THD receives padded
@@ -785,7 +789,10 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
             raise ValueError("logits_to_keep must be nonnegative")
         if labels is not None and (not isinstance(logits_to_keep, int) or logits_to_keep != 0):
             raise ValueError("Labels require logits for all positions")
-        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         output = CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
         if labels is not None:
             if labels.shape != (input_ids.shape if input_ids is not None else inputs_embeds.shape[:-1]):

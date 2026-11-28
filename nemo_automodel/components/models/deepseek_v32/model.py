@@ -266,6 +266,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Run the decoder and project the kept positions to vocabulary logits.
@@ -283,6 +284,9 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
                 padding.
             logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
                 Tensor of shape [kept] keeps those positions.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether the output carries the final hidden states; None reads
                 ``config.output_hidden_states``.
             **attn_kwargs: Backend metadata for the decoder. Packed input sets ``qkv_format="thd"`` and passes
@@ -310,9 +314,14 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             **attn_kwargs,
         )
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_states if output_hidden_states else None)
 
 

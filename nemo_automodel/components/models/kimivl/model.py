@@ -736,6 +736,8 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         image_grid_hws=None,
         padding_mask=None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs,
     ):
         # Resolve from the text/decoder sub-config (the language model produces text logits).
@@ -756,9 +758,10 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
                 targets must already be masked with -100.
             use_cache: Unused; kept for HF API compatibility.
             output_attentions: Unused; kept for HF API compatibility.
-            output_hidden_states: Include final hidden states when return_dict
-                is set.
-            return_dict: Return a LlavaCausalLMOutputWithPast instead of logits.
+            output_hidden_states: Include final hidden states when the forward
+                returns its output object.
+            return_dict: Return a LlavaCausalLMOutputWithPast instead of
+                logits; the forward always returns it when compute_logits is False.
             pixel_values: Optional tensor of shape [patches, channels,
                 patch_height, patch_width], where each image's height * width
                 patches are concatenated along axis 0 in image order. When None,
@@ -769,14 +772,17 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
                 marks padding.
             logits_to_keep: Number of trailing positions to project, or indices
                 of shape [kept_sequence].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Attention metadata forwarded to the language model.
 
         Returns:
             Logits of shape [batch, kept_sequence, vocab], or hidden states of
             shape [batch, sequence, hidden] on a stage without the LM head.
             kept_sequence is restricted by logits_to_keep (0 keeps all). With
-            return_dict, a LlavaCausalLMOutputWithPast that also carries the
-            scalar loss and, when requested, hidden states
+            return_dict or compute_logits=False, a LlavaCausalLMOutputWithPast
+            that also carries the scalar loss and, when requested, hidden states
             [batch, sequence, hidden].
         """
         output_hidden_states = (
@@ -802,9 +808,14 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             **kwargs,
         )
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         if labels is not None and self.lm_head is not None:
@@ -822,7 +833,8 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
 
         if return_dict is None:
             return_dict = False
-        if not return_dict:
+        # Empty logits alone would drop the hidden states a fused-linear loss needs.
+        if not return_dict and compute_logits:
             return logits
 
         return LlavaCausalLMOutputWithPast(

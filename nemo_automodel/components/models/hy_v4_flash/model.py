@@ -573,6 +573,7 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
         loss_mask: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool = False,
+        compute_logits: bool = True,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
@@ -594,6 +595,8 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
             loss_mask: Consumed by the recipe loss; accepted so the standard batch reaches the model.
             logits_to_keep: Number of final positions, or integer positions to keep.
             output_hidden_states: Attach the final hidden states [batch, sequence, hidden].
+            compute_logits: Whether to run the LM head. Fused-linear losses pass False and project the final hidden
+                states themselves; the logits are then empty, of shape [batch, sequence, 0].
             pixel_values: Optional tensor of shape [patches, channels * patch_size * patch_size].
             image_grid_thw: Optional integer tensor of shape [images, 3] of (time, height, width) patch counts.
             mm_token_type_ids: Optional integer tensor of shape [batch, sequence], 0 text / 1 image.
@@ -602,7 +605,11 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
                 (non-CP); ``seq_lens_padded`` gives the physical spans and ``qkv_format`` must be ``"thd"`` or omitted.
 
         Returns:
-            ``CausalLMOutputWithPast`` with logits [batch, kept_sequence, vocab].
+            ``CausalLMOutputWithPast`` with logits [batch, kept_sequence, vocab], or [batch, sequence, 0] without
+            ``compute_logits``.
+
+        Raises:
+            ValueError: If ``labels`` are given without logits for every input position.
         """
         del loss_mask
         if cp_group is None and self.cp_mesh is not None:
@@ -667,9 +674,14 @@ class HYV4FlashForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMix
         )
         if layout is not None:
             hidden = layout.restore(hidden)
-        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         loss = None
         if labels is not None:
+            if not compute_logits or logits.shape[:2] != labels.shape:
+                raise ValueError("labels require logits for every input position")
             targets = labels[:, 1:]
             documents = layout.restore(layout.sequence_ids) if layout is not None else packed_seq_ids
             if documents is not None:

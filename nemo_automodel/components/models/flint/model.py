@@ -458,6 +458,7 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         logits_to_keep: int = 0,
         skip_logits: bool = False,
         padding_mask: torch.Tensor | None = None,
+        compute_logits: bool = True,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast | torch.Tensor:
         """Return FP32 logits for full-sequence, padded causal language modeling.
@@ -475,10 +476,14 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             use_cache: True is unsupported by this full-sequence training baseline.
             past_key_values: Inference cache; only None is supported.
             output_hidden_states: Include all [batch, sequence, hidden] states,
-                except logits_to_keep=1 selects the final FP32 hidden tensor for
-                the shared linear-loss contract without retaining every layer.
+                except compute_logits=False or logits_to_keep=1 selects the final
+                FP32 hidden tensor for the shared linear-loss contract without
+                retaining every layer.
             logits_to_keep: Zero projects all positions; a positive value projects
                 that many final positions. Labels require all positions.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             skip_logits: Return only final FP32 hidden states for an external
                 already-shifted linear loss; do not run the vocabulary projection.
             padding_mask: Boolean [batch, sequence] or THD [tokens], True for
@@ -499,7 +504,9 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             raise ValueError("Flint labels require logits_to_keep=0")
         if labels is not None and skip_logits:
             raise ValueError("Flint skip_logits consumes already-shifted labels through a separate linear loss")
-        final_hidden_only = skip_logits or (output_hidden_states and logits_to_keep == 1)
+        # The shared linear-loss call asks for the final hidden states without logits (or, from older callers, with
+        # logits_to_keep=1).
+        final_hidden_only = skip_logits or (output_hidden_states and (not compute_logits or logits_to_keep == 1))
         received_residual = inputs_embeds is None and input_ids is not None and torch.is_floating_point(input_ids)
         if received_residual:
             inputs_embeds, input_ids = input_ids, None
@@ -575,7 +582,10 @@ class FlintForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             return CausalLMOutputWithPast(hidden_states=hidden_states.float())
         if self.lm_head is None:
             return CausalLMOutputWithPast(logits=hidden_states)
-        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         loss = None
         if labels is not None:
             if labels.shape != hidden_states.shape[:2]:

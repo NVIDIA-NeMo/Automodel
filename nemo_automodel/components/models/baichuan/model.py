@@ -544,6 +544,8 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """Run the backbone and project the kept positions to vocabulary logits.
@@ -566,6 +568,9 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
             return_dict: Whether to return ``CausalLMOutputWithPast`` instead of a tuple.
             logits_to_keep: ``0`` keeps every position, a positive int keeps the last N positions, and an integer
                 Tensor of shape [kept] keeps those positions.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             **kwargs: Extra batch keys, such as ``padding_mask`` or packed-sequence metadata, which are ignored.
 
         Returns:
@@ -598,9 +603,14 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
 
         hidden_states = outputs.last_hidden_state
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()

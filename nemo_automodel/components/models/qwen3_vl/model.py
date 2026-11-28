@@ -37,7 +37,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.lm_head import LMHead, slice_logits_to_keep
+from nemo_automodel.components.models.common.lm_head import LMHead, call_hf_forward, slice_logits_to_keep
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -348,6 +348,8 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> tuple | Qwen3VLCausalLMOutputWithPast:
         """Run Qwen3-VL, including its model-owned multimodal and CP paths.
@@ -378,6 +380,10 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                 ``[sequence]``.
             logits_to_keep: Number of trailing logits to return, or token indices
                 of shape ``[kept_sequence]``.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the logits are then empty, of shape [..., 0]. The forward that
+                delegates to Hugging Face (without CP or packed media) runs the head on the last position only; the
+                model-owned forward skips it.
             **kwargs: Additional Hugging Face language-model options. Packed
                 FlashAttention metadata contains cumulative sequence lengths of
                 shape ``[num_documents + 1]`` and scalar maximum lengths, or an
@@ -397,7 +403,10 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         )
         use_packed_media_path = cp_size <= 1 and has_media and has_packed_flash_metadata
         if cp_size <= 1 and not use_packed_media_path:
-            return super().forward(
+            return call_hf_forward(
+                self,
+                super().forward,
+                compute_logits=compute_logits,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -464,7 +473,10 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
             **kwargs,
         )
         hidden_states = text_outputs[0]
-        logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)

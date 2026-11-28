@@ -56,6 +56,7 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 
 class _FakeMesh:
@@ -695,6 +696,74 @@ def test_patch_liger_kernel_success(monkeypatch):
 
     # SDPA not called inside _patch_liger_kernel (it's called separately)
     attn_mock.assert_not_called()
+
+
+def test_patch_liger_kernel_gives_liger_forward_compute_logits(monkeypatch):
+    """Liger binds its forward to the instance, ahead of the forward the loader's class gives the model."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    import nemo_automodel._transformers.kernel_patches as tgt
+    from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
+
+    kept = []
+
+    def liger_forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        """Stand in for Liger's forward, which takes logits_to_keep like Hugging Face's.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+            logits_to_keep: Number of trailing positions to project.
+            **kwargs: Hugging Face forward options.
+
+        Returns:
+            Output whose logits have shape [batch, kept_sequence, vocab].
+        """
+        kept.append(logits_to_keep)
+        return LlamaForCausalLM.forward(self, input_ids=input_ids, logits_to_keep=logits_to_keep, **kwargs)
+
+    def bind_liger_forward(*, model):
+        model.forward = types.MethodType(liger_forward, model)
+
+    monkeypatch.setattr(tgt, "HAS_LIGER_KERNEL", True, raising=False)
+    monkeypatch.setattr(
+        tgt, "liger_kernel_trf", types.SimpleNamespace(_apply_liger_kernel_to_instance=bind_liger_forward)
+    )
+    config = LlamaConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2, use_cache=False
+    )
+    model = LlamaForCausalLM(config)
+    model.__class__ = _get_mixin_wrapped_class(LlamaForCausalLM)
+
+    tgt._patch_liger_kernel(model)
+    output = model(input_ids=torch.zeros(1, 4, dtype=torch.long), compute_logits=False)
+
+    assert kept == [1]
+    assert output.logits.shape == (1, 1, 0)
+    assert not leaf_tensors_requiring_grad(output)
+
+
+def test_patch_liger_kernel_keeps_compute_logits_when_liger_keeps_the_forward(monkeypatch):
+    """Liger may patch only a model's modules; the forward the loader's class gives the model keeps working."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    import nemo_automodel._transformers.kernel_patches as tgt
+    from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
+
+    monkeypatch.setattr(tgt, "HAS_LIGER_KERNEL", True, raising=False)
+    monkeypatch.setattr(
+        tgt, "liger_kernel_trf", types.SimpleNamespace(_apply_liger_kernel_to_instance=lambda *, model: None)
+    )
+    config = LlamaConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2, use_cache=False
+    )
+    model = LlamaForCausalLM(config)
+    model.__class__ = _get_mixin_wrapped_class(LlamaForCausalLM)
+
+    assert tgt._patch_liger_kernel(model) is model
+    output = model(input_ids=torch.zeros(1, 4, dtype=torch.long), compute_logits=False)
+
+    assert output.logits.shape == (1, 1, 0)
+    assert not leaf_tensors_requiring_grad(output)
 
 
 def test_patch_liger_kernel_uses_model_owned_hook(monkeypatch):

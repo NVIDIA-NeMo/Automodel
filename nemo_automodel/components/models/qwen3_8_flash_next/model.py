@@ -780,6 +780,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
         _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> Qwen3_8_FlashNextCausalLMOutput:
         """Run language-only generation and project final HC-mixed states.
@@ -803,6 +805,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             logits_to_keep: ``0`` for all positions, a positive trailing count,
                 or an integer tensor of shape ``[kept_sequence]`` containing
                 explicit sequence indices.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Explicit ``True`` returns the embedding,
                 every per-layer HC state, and the final state. When omitted,
                 ``config.output_hidden_states=True`` returns only the final
@@ -842,11 +847,14 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             **kwargs,
         )
         last_hidden_state = outputs.last_hidden_state
-        logits = (
-            last_hidden_state
-            if self.lm_head is None
-            else self.lm_head(slice_logits_to_keep(last_hidden_state, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                last_hidden_state
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(last_hidden_state, logits_to_keep))
+            )
+        else:
+            logits = last_hidden_state.new_empty((*last_hidden_state.shape[:-1], 0))
         if capture_all_hidden_states:
             hidden_states = outputs.hidden_states
         else:

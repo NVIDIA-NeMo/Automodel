@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import ShardedLMHeadWeight
 
 
 class Gemma4TensorParallelFusedLinearCrossEntropy(FusedLinearCrossEntropy):
@@ -36,31 +37,33 @@ class Gemma4TensorParallelFusedLinearCrossEntropy(FusedLinearCrossEntropy):
     """
 
     @staticmethod
-    def materialize_lm_weight(
-        lm_weight: torch.Tensor,
+    def resolve_lm_weight(
+        lm_weight: torch.Tensor | ShardedLMHeadWeight,
         *,
         grad_reduce_group: dist.ProcessGroup | None = None,
-    ) -> torch.Tensor:
-        """Materialize a Gemma4 TP LM head with correct TP gradient semantics.
+    ) -> torch.Tensor | ShardedLMHeadWeight:
+        """Resolve a Gemma4 TP LM head with correct TP gradient semantics.
 
         Args:
-            lm_weight: Regular or DTensor LM-head weight shaped
-                ``[vocab, hidden]``.
+            lm_weight: Regular tensor, DTensor, or ``ShardedLMHeadWeight`` of
+                global shape ``[vocab, hidden]``.
             grad_reduce_group: DP/CP group whose ranks own independent tokens.
                 It remains owned by FSDP when the visible DTensor mesh contains
                 only TP, as it does while an FSDP unit is unsharded.
 
         Returns:
-            A rank-local full-vocabulary tensor. Backward slices, rather than
-            sums, duplicate gradients along every named TP mesh axis.
+            For a mesh with a ``tp`` axis, a rank-local full-vocabulary tensor
+            whose backward slices, rather than sums, duplicate gradients along
+            every TP mesh axis. Any other weight follows
+            ``FusedLinearCrossEntropy.resolve_lm_weight``.
         """
-        if not hasattr(lm_weight, "full_tensor"):
+        if not isinstance(lm_weight, DTensor):
             return lm_weight
 
         mesh = lm_weight.device_mesh
         mesh_names = mesh.mesh_dim_names
         if mesh_names is None or "tp" not in mesh_names:
-            return FusedLinearCrossEntropy.materialize_lm_weight(
+            return FusedLinearCrossEntropy.resolve_lm_weight(
                 lm_weight,
                 grad_reduce_group=grad_reduce_group,
             )

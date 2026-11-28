@@ -63,7 +63,16 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str, student_tp
         received_teacher_logits = None
         for wave in range(bridge.num_waves):
             teacher_batch = bridge.send_batch(wave, batch)
-            logits = _teacher_logits(teacher_batch["input_ids"]) if bridge.is_teacher else None
+            logits = None
+            if bridge.is_teacher:
+                input_ids = teacher_batch["input_ids"]
+                teacher_mesh = setups.teacher.mesh_context.device_mesh
+                # A TP teacher's head returns vocabulary-sharded logits; only the rank that sends them assembles
+                # the whole vocabulary.
+                sharded = distribute_tensor(_teacher_logits(input_ids), teacher_mesh["tp"], [Shard(-1)])
+                logits = kd_utils.materialize_teacher_logits(
+                    sharded, device_mesh=teacher_mesh, sequence_length=input_ids.shape[1]
+                )
             received = bridge.send_logits(wave, logits)
             if received is not None:
                 received_teacher_logits = received
@@ -85,7 +94,12 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str, student_tp
             else:
                 expected_teacher = expected
             teacher = bridge.match_student_vocab_shard(student, received_teacher_logits)
-            torch.testing.assert_close(teacher, expected_teacher)
+            if student_tp > 1:
+                # A vocab-sharded student gets the teacher in its own layout, holding this rank's slice.
+                assert teacher.placements == student.placements
+                torch.testing.assert_close(teacher.to_local(), expected_teacher)
+            else:
+                torch.testing.assert_close(teacher, expected_teacher)
             loss = KDLoss()(student, teacher, batch["labels"])
             loss.backward()
             actual_grad = student.grad.full_tensor() if student_tp > 1 else student.grad

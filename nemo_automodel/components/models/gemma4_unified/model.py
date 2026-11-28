@@ -30,6 +30,7 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import (
 from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_contiguous
 from nemo_automodel.components.models.common import LMHead, slice_logits_to_keep
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import call_hf_forward
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -119,6 +120,8 @@ class Gemma4UnifiedForConditionalGeneration(
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         mm_encoder_outputs: dict[str, Any] | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> Gemma4UnifiedCausalLMOutputWithPast:
         """Hugging Face's forward, or the context-parallel forward once CP is set up.
@@ -157,6 +160,9 @@ class Gemma4UnifiedForConditionalGeneration(
             use_cache: Whether to return a KV cache; off under CP.
             logits_to_keep: Integer suffix length, or an index tensor ``[kept_positions]`` selecting the
                 returned positions.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the logits are then empty, of shape [..., 0]. Without CP the forward
+                delegates to Hugging Face, which runs the head on the last position only.
             mm_encoder_outputs: Precomputed multimodal encoder outputs; not supported under CP.
             **kwargs: Remaining keyword arguments. Under CP, ``padding_mask`` (True = pad) and
                 ``_packed_seq_ids`` (0 = pad) carry this rank's slices to the ring.
@@ -185,7 +191,10 @@ class Gemma4UnifiedForConditionalGeneration(
                     position_ids,
                     mm_token_type_ids=mm_token_type_ids,
                 )
-            return super().forward(
+            return call_hf_forward(
+                self,
+                super().forward,
+                compute_logits=compute_logits,
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
@@ -260,9 +269,14 @@ class Gemma4UnifiedForConditionalGeneration(
             **kwargs,
         )
         hidden_states = text_outputs.last_hidden_state
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
         if (final_logit_softcapping := text_config.final_logit_softcapping) is not None:
             logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
         return Gemma4UnifiedCausalLMOutputWithPast(logits=logits, hidden_states=text_outputs.hidden_states)

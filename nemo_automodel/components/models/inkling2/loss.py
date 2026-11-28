@@ -14,10 +14,13 @@
 
 """Fused softcapped cross entropy over the model's usable vocabulary."""
 
+from dataclasses import replace
+
 import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import ShardedLMHeadWeight
 
 
 class Inkling2FusedLinearCrossEntropy(FusedLinearCrossEntropy):
@@ -45,27 +48,31 @@ class Inkling2FusedLinearCrossEntropy(FusedLinearCrossEntropy):
         super().__init__(ignore_index=ignore_index, logit_softcapping=logit_softcapping, reduction=reduction)
         self.unpadded_vocab_size = unpadded_vocab_size
 
-    def materialize_lm_weight(
+    def resolve_lm_weight(
         self,
-        lm_weight: torch.Tensor,
+        lm_weight: torch.Tensor | ShardedLMHeadWeight,
         *,
         grad_reduce_group: dist.ProcessGroup | None = None,
-    ) -> torch.Tensor:
-        """Gather the head and keep its usable rows as the BF16 compute weight.
+    ) -> torch.Tensor | ShardedLMHeadWeight:
+        """Resolve usable BF16 head rows without gathering a sharded head.
 
         Args:
             lm_weight: Head weight with global shape [padded_vocab, hidden], a regular
-                tensor or an FSDP-sharded DTensor.
+                tensor, an FSDP-sharded DTensor, or an already resolved operand.
             grad_reduce_group: Ranks contributing independent token losses, as in the
-                shared materialization contract.
+                shared resolution contract.
 
         Returns:
-            BF16 tensor of shape [unpadded_vocab_size, hidden]. Gradients reach the
-            original weight; excluded rows receive zero.
+            BF16 tensor or streamed operand of effective global shape
+            [unpadded_vocab_size, hidden]. Gradients reach the original weight;
+            excluded rows receive zero. A streamed operand retains the physical
+            padded shard boundaries and casts only each gathered chunk to BF16.
         """
-        weight = super().materialize_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
+        weight = super().resolve_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
         if weight.shape[0] < self.unpadded_vocab_size:
             raise ValueError(
                 f"lm_head has {weight.shape[0]} rows, fewer than unpadded_vocab_size={self.unpadded_vocab_size}"
             )
+        if isinstance(weight, ShardedLMHeadWeight):
+            return replace(weight, dtype=torch.bfloat16, vocab_size=self.unpadded_vocab_size)
         return weight[: self.unpadded_vocab_size].to(torch.bfloat16)

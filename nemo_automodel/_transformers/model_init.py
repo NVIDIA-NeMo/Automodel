@@ -65,6 +65,7 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     is_gated_delta_net_fp32_param_key,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.lm_head import with_compute_logits
 from nemo_automodel.components.models.common.packing import (
     AttentionBackendSelection,
     get_model_attn_implementation,
@@ -125,7 +126,9 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
     """
     Get a class that combines HFCheckpointingMixin with the original model class.
 
-    If the class already has the mixin, returns it unchanged.
+    If the class already has the mixin, returns it unchanged. A Hugging Face forward that takes
+    ``logits_to_keep`` also gets the ``compute_logits`` option of the repo's forwards (see
+    ``with_compute_logits``), so fused-linear losses call every model the same way.
 
     Args:
         model_class: The original model class (e.g., LlamaForCausalLM)
@@ -140,14 +143,12 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
         return configure_parallelization_metadata(model_class)
 
     # Create wrapper class that looks identical to original
-    wrapped_class = type(
-        model_class.__name__,
-        (HFCheckpointingMixin, model_class),
-        {
-            "__module__": model_class.__module__,
-            "__qualname__": model_class.__qualname__,
-        },
-    )
+    namespace = {"__module__": model_class.__module__, "__qualname__": model_class.__qualname__}
+    forward = with_compute_logits(model_class.forward)
+    if forward is not model_class.forward:
+        # Define only a forward that gains compute_logits; any other stays inherited.
+        namespace["forward"] = forward
+    wrapped_class = type(model_class.__name__, (HFCheckpointingMixin, model_class), namespace)
     return configure_parallelization_metadata(wrapped_class)
 
 

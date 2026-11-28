@@ -19,6 +19,7 @@ argument, so each class is built on the meta device with it.
 """
 
 import importlib
+import inspect
 import sys
 import typing
 from collections.abc import Callable
@@ -194,3 +195,17 @@ def test_registered_lm_class_takes_logits_dtype(module, name, monkeypatch):
         model = model_cls(config, logits_dtype=torch.float64, **kwargs)
 
     assert model.get_output_embeddings().logits_dtype == torch.float64
+
+
+@pytest.mark.parametrize(
+    ("module", "name"), [pytest.param(*entry, id=f"{entry[0].split('.')[-2]}.{entry[1]}") for entry in _LM_CLASSES]
+)
+def test_registered_lm_class_can_skip_its_logits(module, name):
+    # Fused-linear losses call every forward with compute_logits=False, which spares the head's FSDP all-gather
+    # where the forward is the repo's own. A class that inherits a Hugging Face forward wraps it with_compute_logits.
+    if name in _NEEDS_MODULE:
+        pytest.importorskip(_NEEDS_MODULE[name])
+    forward = inspect.signature(getattr(importlib.import_module(module), name).forward).parameters
+    if "logits_to_keep" not in forward:
+        pytest.skip("the recipe uses MaskedCrossEntropy for models without logits_to_keep")
+    assert forward["compute_logits"].default is True

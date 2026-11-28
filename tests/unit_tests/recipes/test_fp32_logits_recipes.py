@@ -35,6 +35,7 @@ from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.models.common.lm_head import LMHead
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 pytestmark = pytest.mark.cpu_only
 
@@ -152,6 +153,8 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
     )
     input_ids, labels, num_label_tokens = _batch()
     losses = []
+    head_calls = []
+    model.lm_head.register_forward_pre_hook(lambda module, args: head_calls.append(module))
 
     TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
         recipe,
@@ -162,6 +165,8 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         num_batches=1,
     )
 
+    # The model can skip its logits, so the step never runs the head; the loss projects the hidden states.
+    assert head_calls == []
     expected = _assert_matches_fp32_logits_ce(losses[0], reference, input_ids, labels, num_label_tokens)
     expected.backward()
     control_grads = _bf16_projection_gradients(control, input_ids, labels, num_label_tokens)
@@ -174,6 +179,34 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         else:
             # A backward that projected in BF16 would be as far off as the control.
             assert error * 10 < (control_grads[name].float() - reference_grad).norm(), name
+
+
+def test_vlm_validation_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 0)
+    model = _fp32_logits_llama()
+    reference = copy.deepcopy(model)
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        loss_fn=ChunkedCrossEntropy(8, compile=False),
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        device_mesh=None,
+        pp_enabled=False,
+        step_scheduler=SimpleNamespace(step=3, epoch=1),
+        optimizer=[SimpleNamespace(param_groups=[{"lr": 1e-3}])],
+        _cp_vision_frame_sharding_context=nullcontext,
+        _maybe_add_drafter_loss=lambda *, out, base_loss, labels, model, num_label_tokens: base_loss,
+        _dp_allreduce=lambda tensor, include_cp=False: tensor,
+    )
+    input_ids, labels, num_label_tokens = _batch()
+    head_calls = []
+    model.lm_head.register_forward_pre_hook(lambda module, args: head_calls.append(module))
+
+    metrics = FinetuneRecipeForVLM._run_validation_epoch(recipe, [{"input_ids": input_ids, "labels": labels}]).metrics
+
+    # The model skips its logits, so validation never runs the head; the loss projects the hidden states.
+    assert head_calls == []
+    assert metrics["num_label_tokens"] == num_label_tokens
+    _assert_matches_fp32_logits_ce(torch.tensor(metrics["val_loss"]), reference, input_ids, labels, num_label_tokens)
 
 
 class _OneHotTeacher(nn.Module):
@@ -232,4 +265,3 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
     )
 
     _assert_matches_fp32_logits_ce(ce_loss, reference, input_ids, labels, num_label_tokens)
-

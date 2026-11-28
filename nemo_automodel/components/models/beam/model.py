@@ -340,6 +340,7 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        compute_logits: bool = True,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Return soft-capped logits or pipeline-stage hidden states.
@@ -352,6 +353,9 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask: Optional bool tensor matching the position axes; True skips routing.
             logits_to_keep: Zero for all positions, a positive final-position count, or integer
                 tensor [selected_positions] indexing the sequence axis.
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Whether to return the final hidden states.
             **attn_kwargs: Backend metadata: qkv_format (bshd/thd), integer cu_seqlens and
                 cu_seqlens_padded [documents + 1], scalar max_seqlen, cp_size and cp_rank.
@@ -381,7 +385,10 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         # Only the stage that owns the head has logits; on other PP stages the hidden states pass through.
-        logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = hidden if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         return CausalLMOutputWithPast(logits=logits, hidden_states=hidden if output_hidden_states else None)
 
     @torch.no_grad()

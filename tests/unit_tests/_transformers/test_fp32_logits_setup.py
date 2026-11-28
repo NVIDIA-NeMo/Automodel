@@ -26,6 +26,7 @@ from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common.lm_head import LMHead
+from tests.utils.model_outputs import leaf_tensors_requiring_grad
 
 _VOCAB = 128
 
@@ -134,6 +135,24 @@ def test_vocabulary_resize_keeps_the_fp32_logits_head(tied, frozen):
     reference = output.hidden_states[-1].double() @ model.lm_head.weight.double().t()
     assert output.logits.dtype == torch.float32
     torch.testing.assert_close(output.logits.double(), reference, rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("config_cls", [LlamaConfig, Qwen2Config, Qwen3Config])
+def test_compute_logits_false_skips_the_head(config_cls):
+    model = _build(_config(config_cls, tied=False), logits_dtype="float32")
+    head_calls = []
+    model.lm_head.register_forward_pre_hook(lambda module, args: head_calls.append(module))
+    input_ids = torch.randint(0, _VOCAB, (2, 6), generator=torch.Generator().manual_seed(1))
+    expected = model(input_ids=input_ids, output_hidden_states=True).hidden_states[-1]
+    head_calls.clear()
+
+    output = model(input_ids=input_ids, output_hidden_states=True, compute_logits=False)
+
+    # Fused-linear losses project the final hidden states themselves, so the forward neither runs nor gathers the head.
+    assert head_calls == []
+    assert output.logits.shape == (2, 6, 0)
+    assert not leaf_tensors_requiring_grad(output)
+    torch.testing.assert_close(output.hidden_states[-1], expected, rtol=0, atol=0)
 
 
 def test_logits_dtype_survives_the_build_retry():

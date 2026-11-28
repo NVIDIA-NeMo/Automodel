@@ -33,7 +33,7 @@ from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
-from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class, resolve_sdpa_method
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
@@ -3450,6 +3450,36 @@ def test_forward_backward_step_eval_skips_metric_for_logits_to_keep_one_verifier
     assert recipe._mtp_accept_metrics == []
 
 
+def test_forward_backward_step_eval_skips_metric_for_empty_verifier_logits(monkeypatch):
+    """A LinearCrossEntropy forward called with ``compute_logits=False`` returns empty logits of shape
+    ``[B, S, 0]``: they carry no verifier to score, and an argmax over the empty vocabulary would raise."""
+    vocab = 6
+
+    class _NoLogitsVerifierModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compute_mtp_in_eval = True
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def forward(self, input_ids, **kwargs):
+            del kwargs
+            draft_logits = [torch.zeros(*input_ids.shape, vocab)]
+            return SimpleNamespace(
+                logits=torch.zeros(*input_ids.shape, 0),
+                mtp_per_depth_h=None,
+                mtp_per_depth_logits=draft_logits,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _NoLogitsVerifierModel()
+    recipe = _make_mtp_forward_backward_recipe(model, monkeypatch)
+
+    batch = {"input_ids": torch.tensor([[10, 11, 12]]), "labels": torch.tensor([[1, 1, 1]])}
+    recipe._forward_backward_step(idx=0, batch=batch, loss_buffer=[], num_label_tokens=3, num_batches=1, is_train=False)
+
+    assert recipe._mtp_accept_metrics == []
+
+
 def test_forward_backward_step_eval_excludes_mtp_loss_from_val_loss(monkeypatch):
     """Forcing MTP outputs on during eval (via compute_mtp_in_eval) must not change
     val_loss: calculate_mtp_loss is a training-loss term and must stay gated on
@@ -3926,8 +3956,8 @@ def test_default_collater_batches_per_sample_dataset_id():
     assert out["input_ids"].shape == (2, 4)
 
 
-@pytest.mark.parametrize("tied", [False, True])
-def test_recipe_profiles_model_and_loss_without_full_logits(tied):
+@pytest.mark.parametrize(("tied", "wrapped"), [(False, True), (True, True), (False, False)])
+def test_recipe_profiles_model_and_loss_without_full_logits(tied, wrapped):
     import torch.nn.functional as F
     from torch.profiler import ProfilerActivity, profile
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -3947,7 +3977,10 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
         tie_word_embeddings=tied,
         use_cache=False,
     )
+    # A raw HF factory is also a supported recipe target and exposes only logits_to_keep.
     model = LlamaForCausalLM(config)
+    if wrapped:
+        model.__class__ = _get_mixin_wrapped_class(LlamaForCausalLM)
     reference = LlamaForCausalLM(config)
     reference.load_state_dict(model.state_dict())
     recipe = SimpleNamespace(
@@ -4127,7 +4160,9 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
     config._attn_implementation = "eager"
     config.text_config._attn_implementation = "eager"
     if implementation == "hf":
+        # The loader gives a Hugging Face model's forward the compute_logits option.
         model = Gemma4ForConditionalGeneration(config)
+        model.__class__ = _get_mixin_wrapped_class(Gemma4ForConditionalGeneration)
     else:
         model = AutoModelGemma4(
             config,

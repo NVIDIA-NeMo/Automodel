@@ -559,6 +559,8 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        *,
+        compute_logits: bool = True,
         **kwargs,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -608,11 +610,14 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # Final decoder hidden states feeding the lm_head.
         final_hidden_states = decoder_outputs.last_hidden_state
 
-        logits = (
-            final_hidden_states
-            if self.lm_head is None
-            else self.lm_head(slice_logits_to_keep(final_hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                final_hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(final_hidden_states, logits_to_keep))
+            )
+        else:
+            logits = final_hidden_states.new_empty((*final_hidden_states.shape[:-1], 0))
 
         if not return_dict:
             return decoder_outputs + encoder_outputs

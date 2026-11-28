@@ -32,7 +32,6 @@ import math
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +79,28 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     """
     sig = _get_forward_signature(model)
     return sig is not None and "logits_to_keep" in sig.parameters
+
+
+def forward_for_linear_ce(model: nn.Module, batch: dict) -> Any:
+    """Run the model for a loss that projects its final hidden states.
+
+    Args:
+        model: Training model, optionally DDP-wrapped.
+        batch: Filtered model inputs for the local microbatch.
+
+    Returns:
+        Model output with hidden states. Native models skip the head; external
+        recipe targets exposing only logits_to_keep project one position.
+    """
+    probe = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+    signature = _get_forward_signature(probe)
+    if (
+        signature is not None
+        and "logits_to_keep" in signature.parameters
+        and "compute_logits" not in signature.parameters
+    ):
+        return model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
+    return model(**{**batch, "compute_logits": False, "output_hidden_states": True})
 
 
 def _supports_seq_lens(model: nn.Module) -> bool:
@@ -183,26 +204,6 @@ def get_lm_head_module(model: nn.Module) -> nn.Module | None:
         if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
             return module
     return None
-
-
-def _full_tensor(weight: torch.Tensor | nn.Module) -> torch.Tensor:
-    """Return ``weight`` as a regular tensor, gathering a DTensor; a module attribute is rejected."""
-    if isinstance(weight, DTensor):
-        return weight.full_tensor()
-    if isinstance(weight, torch.Tensor):
-        return weight
-    raise TypeError(f"LM-head weight must be a tensor, got {type(weight).__name__}")
-
-
-def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
-    """Return the model's LM-head weight, materializing DTensor weights when needed."""
-    lm_head = get_lm_head_module(model)
-    if lm_head is not None:
-        return _full_tensor(lm_head.weight)
-    for name, param in model.named_parameters(remove_duplicate=False):
-        if "lm_head" in name and name.endswith(".weight"):
-            return _full_tensor(param)
-    raise ValueError("lm_head.weight not found in model")
 
 
 def _get_logical_numel(param: torch.Tensor) -> int:

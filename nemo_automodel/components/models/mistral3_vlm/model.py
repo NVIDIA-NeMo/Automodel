@@ -220,6 +220,8 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         logits_to_keep: Union[int, torch.Tensor] = 0,
         image_sizes: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
+        *,
+        compute_logits: bool = True,
         **kwargs,
     ) -> Mistral3CausalLMOutputWithPast:
         """Forward pass with memory-efficient fused cross-entropy (cut-CE) support.
@@ -247,6 +249,9 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             labels: Optional labels for loss computation.
             use_cache: Whether to use KV caching.
             logits_to_keep: Number of final logits to compute (0=all, N=last N tokens).
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             image_sizes: Optional image sizes for the vision tower.
             output_hidden_states: Whether to surface the final hidden states on the
                 output (defaults to the text sub-config's ``output_hidden_states``).
@@ -279,9 +284,14 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # Final hidden states fed to lm_head (single [B, S, H] tensor).
         hidden_states = outputs[0]
 
-        logits = (
-            hidden_states if self.lm_head is None else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
-        )
+        if compute_logits:
+            logits = (
+                hidden_states
+                if self.lm_head is None
+                else self.lm_head(slice_logits_to_keep(hidden_states, logits_to_keep))
+            )
+        else:
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         if labels is not None:

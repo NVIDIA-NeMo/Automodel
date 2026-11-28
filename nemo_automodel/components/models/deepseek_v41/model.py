@@ -779,6 +779,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
         seq_lens: torch.Tensor | None = None,
         seq_lens_padded: torch.Tensor | None = None,
         qkv_format: str | None = None,
+        compute_logits: bool = True,
     ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
         """Compute language outputs, or the documented PP stage tensor contract.
 
@@ -796,6 +797,9 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
             image_grid_hws: Optional patch-grid sizes [images, 2].
             vision_token_types: Optional image/text markers [batch, sequence].
             logits_to_keep: Number of final positions, or integer position indices [kept].
+            compute_logits: Whether to materialize logits. Fused-linear loss callers disable it off-PP when they consume
+                the final hidden states directly; the LM head then does not run and the logits are empty, of shape
+                [..., 0].
             output_hidden_states: Attach the final normalized hidden states
                 [batch, sequence, hidden], in the backbone's activation dtype, as
                 every other model does; the recipes' linear losses project them
@@ -947,7 +951,10 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
         if layout is not None:
             hidden = layout.restore(hidden)
             captured = None if captured is None else tuple(layout.restore(values) for values in captured)
-        logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        if compute_logits:
+            logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+        else:
+            logits = hidden.new_empty((*hidden.shape[:-1], 0))
         loss = None
         if labels is not None:
             if logits.shape[:2] != labels.shape:

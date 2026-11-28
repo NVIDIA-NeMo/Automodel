@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
-from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy, ShardedLMHeadWeight
 from nemo_automodel.components.models.common.lm_head import LMHead
 
 _DATASET_IGNORE_INDEX = -100
@@ -143,19 +143,22 @@ def prepare_lm_weight(
     model: nn.Module,
     *,
     grad_reduce_group: torch.distributed.ProcessGroup | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | ShardedLMHeadWeight:
     """Prepare one shared projection weight for main and auxiliary losses.
 
     Args:
-        loss_fn: Linear-projection loss that owns materialization semantics.
+        loss_fn: Linear-projection loss that owns the weight's resolution.
         model: Model or DDP wrapper whose wrapped module owns the config and
             output head of global shape [vocab, hidden].
         grad_reduce_group: Group contributing independent token losses.
 
     Returns:
-        Dense [vocab, hidden] weight under ``materialize_lm_weight``'s layout
-        and gradient contract. Chunked CE also honors the head's compute dtype;
-        share this result across loss calls to retain only one converted copy.
+        The ``resolve_lm_weight`` result: a dense [vocab, hidden] weight, or a
+        ShardedLMHeadWeight that each loss streams without gathering it whole.
+        A streamed head computes and reduces its gradient under the head's FSDP
+        mixed-precision policy. No collective runs here. Chunked CE also converts a
+        dense head to its compute dtype; share this result across loss calls to
+        convert it once.
     """
     # Match setup's head/config lookup without changing the training wrapper.
     if isinstance(model, nn.parallel.DistributedDataParallel):
@@ -166,7 +169,10 @@ def prepare_lm_weight(
             model_config=getattr(model, "config", None),
             grad_reduce_group=grad_reduce_group,
         )
-    return loss_fn.materialize_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
+    weight = loss_fn.resolve_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
+    if isinstance(weight, ShardedLMHeadWeight):
+        weight = weight.with_head_precision(_get_lm_head_module(model))
+    return weight
 
 
 def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
@@ -193,19 +199,19 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         loss_fn_kwargs["loss_weights"] = loss_weights
     if isinstance(loss_fn, LinearCrossEntropy):
         model = kwargs.pop("model")
-        # Reuse a caller-materialized LM head when provided so a single
-        # full_tensor() all-gather is shared across the main loss and every MTP
-        # depth (see calculate_mtp_loss). Re-gathering the (vocab x hidden) head
-        # per call leaves a copy retained for backward each time; they accumulate
-        # on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab).
-        lm_head = kwargs.pop("lm_weight", None)
-        if lm_head is None:
-            lm_head = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
+        # Reuse a caller-prepared LM head so the main loss and every MTP depth
+        # share one weight operand (see calculate_mtp_loss): a dense head is
+        # converted once, and a sharded head is streamed by each loss instead of
+        # being gathered whole.
+        lm_weight = kwargs.pop("lm_weight", None)
+        if lm_weight is None:
+            lm_weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
         if isinstance(loss_fn, ChunkedCrossEntropy):
+            # A dict output without logits arrives here as the logits argument itself, and a forward called with
+            # compute_logits=False returns empty logits, whose dtype is not the head's.
             logits = kwargs.get("logits")
-            loss_fn_kwargs["logits_dtype"] = kwargs.pop(
-                "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
-            )
+            logits_dtype = logits.dtype if isinstance(logits, torch.Tensor) and logits.shape[-1] else None
+            loss_fn_kwargs["logits_dtype"] = kwargs.pop("logits_dtype", logits_dtype)
             unwrapped = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
             head = _get_lm_head_module(unwrapped)
             loss_fn_kwargs["lm_head"] = head if isinstance(head, LMHead) else None
@@ -213,7 +219,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             {
                 "hidden_states": kwargs.pop("hidden_states"),
                 "labels": labels,
-                "lm_weight": lm_head,
+                "lm_weight": lm_weight,
                 "grad_reduce_group": kwargs.pop("grad_reduce_group", None),
             }
         )

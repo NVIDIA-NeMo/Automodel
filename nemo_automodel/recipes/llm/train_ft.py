@@ -124,6 +124,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
     filter_forward_kwargs,
+    forward_for_linear_ce,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
@@ -1386,8 +1387,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             with train_ctx(), sync_ctx, te_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
+                    out = forward_for_linear_ce(model, batch)
                     if "hidden_states" not in out:
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
@@ -1395,9 +1395,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
-                # Gather the LM head once and share it across the main loss and
-                # all MTP depths (linear CE path) to avoid redundant
-                # full_tensor() gathers that accumulate on-device and OOM.
+                # Prepare the LM head once and share it across the main loss and
+                # all MTP depths (linear CE path). A sharded head is streamed in
+                # vocabulary chunks by each loss and never gathered whole.
                 loss_distributed_kwargs = {}
                 shared_lm_weight = None
                 if isinstance(self.loss_fn, LinearCrossEntropy):
@@ -1408,8 +1408,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         grad_reduce_group=grad_reduce_group,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
-                    if isinstance(self.loss_fn, ChunkedCrossEntropy):
-                        loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
                 # Only forward the domain-mixture weights when configured, so
                 # loss paths that predate them keep their original signature.
                 if loss_weights is not None:
@@ -1508,9 +1506,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     if (
                         mtp_per_depth_targets is None  # CP-sharded verifier targets not supported yet
                         and isinstance(verifier_logits, torch.Tensor)
-                        # Full-sequence logits, not a LinearCrossEntropy logits_to_keep=1 slice.
+                        # Full-sequence logits, not the empty logits of a LinearCrossEntropy forward.
                         and verifier_logits.dim() >= 2
                         and verifier_logits.shape[-2] == labels.shape[-1]
+                        and verifier_logits.shape[-1] > 0
                     ):
                         self._mtp_accept_metrics.append(
                             compute_mtp_prefix_hits(
