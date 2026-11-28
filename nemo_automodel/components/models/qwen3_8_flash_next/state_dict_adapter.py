@@ -22,11 +22,28 @@ range as narrow views of the native parameter, so the checkpoint reader writes
 directly into final model storage and the 51.2B-parameter global table is
 never materialized.  MTP checkpoint keys are ignored in both directions
 because the SFT target does not construct MTP.
+
+A checkpoint whose config sets ``ple_embedding_dtype: float8_e4m3fn`` stores
+the table as FP8 shards plus one global BF16 ``weight_scale``.  That table is a
+frozen host table outside the model's state dict: :meth:`from_hf` checks the
+checkpoint format and loads the table and its scale directly from the
+checkpoint directory, and the shards never pass through the DCP read.  That
+directory is the one the checkpointer reads the base weights from
+(:meth:`Qwen3_8_FlashNextStateDictAdapter.set_base_checkpoint_dir`).  A save
+writes the table and its scale unchanged
+(:meth:`Qwen3_8_FlashNextStateDictAdapter.hf_tensors_outside_state_dict`), so a
+saved checkpoint loads without the base checkpoint.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
+import struct
+from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -36,12 +53,108 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
 from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextOwnerShardedEmbedding
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
+    QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE,
+    Qwen3_8_FlashNextHostNGramTable,
+    Qwen3_8_FlashNextOwnerShardedEmbedding,
+)
 from nemo_automodel.components.moe.layers import MoEConfig
+
+logger = logging.getLogger(__name__)
+
+# Safetensors header dtype name of a ``torch.float8_e4m3fn`` tensor.
+_SAFETENSORS_FP8_E4M3 = "F8_E4M3"
+
+
+def _read_safetensors_header(path: Path) -> dict[str, Any]:
+    """Return the JSON header of one safetensors file without reading tensor data."""
+    with open(path, "rb") as checkpoint_file:
+        (header_size,) = struct.unpack("<Q", checkpoint_file.read(8))
+        return json.loads(checkpoint_file.read(header_size))
+
+
+def _local_safetensors_weight_map(checkpoint_dir: Path) -> dict[str, str] | None:
+    """Map each tensor key of a local safetensors checkpoint to its file name.
+
+    Args:
+        checkpoint_dir: Directory with ``model.safetensors.index.json`` or with
+            ``*.safetensors`` files.
+
+    Returns:
+        Key to file-name mapping, or ``None`` when the directory holds no
+        safetensors checkpoint.
+    """
+    index_path = checkpoint_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        return dict(json.loads(index_path.read_text())["weight_map"])
+    weight_map: dict[str, str] = {}
+    for shard_path in sorted(checkpoint_dir.glob("*.safetensors")):
+        for key in _read_safetensors_header(shard_path):
+            if key != "__metadata__":
+                weight_map[key] = shard_path.name
+    return weight_map or None
+
+
+def _local_checkpoint_dir(name_or_path: str | None) -> Path | None:
+    """Return the folder of a model's named local checkpoint.
+
+    A Hub ID is not resolved here: a second resolution could select another
+    revision than the one the base weights load from. The checkpointer names
+    the resolved snapshot through
+    :meth:`Qwen3_8_FlashNextStateDictAdapter.set_base_checkpoint_dir` instead.
+
+    Args:
+        name_or_path: The model's ``name_or_path``; empty for a model built
+            from a config.
+
+    Returns:
+        The folder, or ``None`` for a model without a named checkpoint.
+
+    Raises:
+        RuntimeError: If a named checkpoint is not a local directory.
+    """
+    if not name_or_path:
+        return None
+    path = Path(name_or_path)
+    if path.is_dir():
+        return path
+    raise RuntimeError(
+        f"Checkpoint {name_or_path!r} is not a local directory, and the checkpointer named no base checkpoint "
+        "directory: the Qwen3.8-Flash-Next PLE table is read only from the snapshot that the base weights load from"
+    )
+
+
+def _safetensors_layouts(
+    checkpoint_dir: Path, weight_map: dict[str, str], keys: Iterable[str]
+) -> dict[str, tuple[str, list[int]]]:
+    """Return the stored safetensors dtype name (for example ``BF16``) and shape of each key."""
+    keys_by_file: dict[str, list[str]] = {}
+    for key in keys:
+        keys_by_file.setdefault(weight_map[key], []).append(key)
+    layouts: dict[str, tuple[str, list[int]]] = {}
+    for file_name, file_keys in keys_by_file.items():
+        header = _read_safetensors_header(checkpoint_dir / file_name)
+        for key in file_keys:
+            layouts[key] = (header[key]["dtype"], list(header[key]["shape"]))
+    return layouts
 
 
 class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
-    """Convert Qwen3.8-Flash-Next checkpoints without gathering the global PLE table."""
+    """Convert Qwen3.8-Flash-Next checkpoints without gathering the global PLE table.
+
+    Args:
+        config: Text architecture configuration.
+        moe_config: Native grouped-MoE layout.
+        backend: Kernel backend configuration.
+        engram_table: The model's PLE table: the trainable owner-sharded BF16
+            embedding, or the frozen FP8 host table when
+            ``config.ple_embedding_dtype`` is ``"float8_e4m3fn"``.
+        dtype: Native parameter dtype.
+        pretrained_model_name_or_path: The model's checkpoint name or local
+            directory. The table is read from the directory that the
+            checkpointer names through :meth:`set_base_checkpoint_dir`; this
+            path is used only when no directory was named and it is local.
+    """
 
     _supports_low_memory_dcp_load = True
 
@@ -50,7 +163,7 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         config: Qwen3_8_FlashNextTextConfig,
         moe_config: MoEConfig,
         backend: BackendConfig,
-        engram_table: Qwen3_8_FlashNextOwnerShardedEmbedding,
+        engram_table: Qwen3_8_FlashNextOwnerShardedEmbedding | Qwen3_8_FlashNextHostNGramTable,
         dtype: torch.dtype = torch.bfloat16,
         pretrained_model_name_or_path: str | None = None,
     ) -> None:
@@ -69,13 +182,28 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         self._table_native_key = f"model.language_model.layers.{ple_layer_idx}.ple.ple_embedding.ngram_embedding.weight"
         self._table_hf_prefix = self._table_native_key.removesuffix(".weight")
         self._table_hf_key_pattern = re.compile(rf"{re.escape(self._table_hf_prefix)}\.shard_(\d+)\.weight")
+        self._table_shard_keys = [
+            f"{self._table_hf_prefix}.shard_{shard_idx}.weight" for shard_idx in range(self.split_ngram_parts)
+        ]
+        self._table_scale_key = f"{self._table_hf_prefix}.weight_scale"
+        self._view_loaded_native_keys: set[str] = set()
+        self._base_checkpoint_dir: Path | None = None
+
+        self._fp8_table = config.ple_embedding_dtype == QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE
+        if self._fp8_table != isinstance(engram_table, Qwen3_8_FlashNextHostNGramTable):
+            raise TypeError(
+                f"ple_embedding_dtype={config.ple_embedding_dtype!r} does not match the PLE table type "
+                f"{type(engram_table).__name__}"
+            )
+        if self._fp8_table:
+            # The frozen host table is outside the state dict: no row views.
+            return
 
         self._rows_per_checkpoint_shard = engram_table.num_embeddings // self.split_ngram_parts
         # An already bound table can fail fast on a misaligned row range; a
         # pending one is checked on first conversion.
         if not engram_table.owner_group_pending:
             self._validate_checkpoint_shard_alignment()
-        self._view_loaded_native_keys: set[str] = set()
 
     def _validate_checkpoint_shard_alignment(self) -> None:
         """Raise unless this rank's row range covers complete physical checkpoint shards."""
@@ -103,12 +231,78 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         """Return native parameters already populated through checkpoint views."""
         return set(self._view_loaded_native_keys)
 
+    def set_base_checkpoint_dir(self, checkpoint_dir: str | os.PathLike[str]) -> None:
+        """Record the directory that the checkpointer reads the base weights from.
+
+        The checkpointer calls this before a base-checkpoint load with the
+        snapshot it resolved (a Hub ID and revision, cache directory and
+        subfolder included). :meth:`from_hf` then reads the PLE table format,
+        and an FP8 table with its scale, from this directory, so the table and
+        every other weight come from one snapshot.
+
+        Args:
+            checkpoint_dir: Local directory of the base checkpoint.
+        """
+        self._base_checkpoint_dir = Path(checkpoint_dir)
+
+    def hf_tensors_outside_state_dict(self) -> dict[str, torch.Tensor]:
+        """Return checkpoint tensors that a save writes although the model's state dict lacks them.
+
+        The frozen FP8 table stays out of the state dict, the optimizer and
+        FSDP, but a saved checkpoint must hold it to load on its own. The
+        returned shards are ``float8_e4m3fn`` views of shape
+        ``[num_embeddings / split_ngram_parts, embedding_dim]`` into the host
+        table, which holds the source checkpoint's bytes unchanged; the scale
+        is the BF16 tensor of shape ``[1]``. Every rank returns the same
+        tensors, and the checkpoint writer stores each one once.
+
+        Returns:
+            Checkpoint-named shards and scale of an FP8 table; empty for a BF16
+            table, which is in the state dict.
+
+        Raises:
+            RuntimeError: If the FP8 table was never loaded.
+        """
+        if not self._fp8_table:
+            return {}
+        table = self.engram_table
+        if table.rows is None or table.scale is None:
+            raise RuntimeError(
+                "Cannot save the FP8 Qwen3.8-Flash-Next PLE table: it was never loaded from a checkpoint"
+            )
+        rows_per_shard = table.num_embeddings // self.split_ngram_parts
+        tensors = {
+            key: table.rows.narrow(0, shard_idx * rows_per_shard, rows_per_shard).view(torch.float8_e4m3fn)
+            for shard_idx, key in enumerate(self._table_shard_keys)
+        }
+        tensors[self._table_scale_key] = table.scale
+        return tensors
+
+    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
+        """Return HF export dtype overrides, including the stored format of an FP8 PLE table.
+
+        Consolidated export otherwise takes dtypes from a cached snapshot of
+        the model ID, which need not be the snapshot this table was loaded
+        from. The FP8 shards and their BF16 scale keep their dtypes, so the
+        export always matches its config's ``ple_embedding_dtype``.
+        """
+        forced = super().forced_hf_dtype_mapping(state_dict)
+        if self._fp8_table:
+            for key in self._table_shard_keys:
+                if key in state_dict:
+                    forced[key] = _SAFETENSORS_FP8_E4M3
+            if self._table_scale_key in state_dict:
+                forced[self._table_scale_key] = "BF16"
+        return forced
+
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
         """Return the rank-independent global HF key set without gathering PLE.
 
         Consolidated checkpoint planning requires the same global key list on
         every rank, so the one local PLE weight is replaced by all
-        ``split_ngram_parts`` physical shard names.  No data is touched.
+        ``split_ngram_parts`` physical shard names.  An FP8 table is outside the
+        state dict; its shard and scale names, which a save writes, are added.
+        No data is touched.
         """
         keys: list[str] = []
         for fqn, tensor in state_dict.items():
@@ -128,6 +322,8 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
                     quantization=False,
                 )
             )
+        if self._fp8_table:
+            keys.extend([*self._table_shard_keys, self._table_scale_key])
         return keys
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
@@ -157,19 +353,186 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         device_mesh: DeviceMesh | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Drop PLE and MTP checkpoint keys; the table was written through views.
+        """Check the PLE table format, then drop PLE and MTP checkpoint keys.
 
-        The PLE entries returned by :meth:`to_hf` alias the native parameter,
-        so by the time DCP hands them back the table is already populated.
-        ``view_loaded_native_keys`` records the native key as loaded.
+        BF16 table: the PLE entries returned by :meth:`to_hf` alias the native
+        parameter, so by the time DCP hands them back the table is already
+        populated. ``view_loaded_native_keys`` records the native key as loaded.
+
+        FP8 table: this call loads the frozen host table and its scale from the
+        checkpoint directory (a no-op when it is already loaded from it).
+
+        Supplied PLE tensors are checked before they are dropped: a scale is an
+        error with a BF16 config and must equal the loaded scale with an FP8
+        config; a supplied shard must be FP8 with an FP8 config and must not be
+        FP8 with a BF16 config. DCP destinations (views of the BF16 table) carry
+        the model's dtype, not the checkpoint's; for them only the checkpoint
+        directory establishes the stored format.
+
+        Args:
+            hf_state_dict: Checkpoint-named tensors read from the checkpoint.
+            device_mesh: Expert-parallel mesh for the plain-tensor init path.
+            **kwargs: Passed to the Qwen3.5-MoE conversion.
+
+        Returns:
+            Native-named state dict without PLE table, scale, or MTP entries.
         """
+        format_checked = self._check_and_load_checkpoint_table()
+        self._check_supplied_table_tensors(hf_state_dict, format_checked=format_checked)
         self._view_loaded_native_keys.clear()
         filtered_state_dict: dict[str, Any] = {}
         for key, value in hf_state_dict.items():
-            if key.startswith("mtp."):
+            if key.startswith("mtp.") or key == self._table_scale_key:
                 continue
             if self._table_hf_key_pattern.fullmatch(key):
-                self._view_loaded_native_keys.add(self._table_native_key)
+                if not self._fp8_table:
+                    self._view_loaded_native_keys.add(self._table_native_key)
                 continue
             filtered_state_dict[key] = value
         return super().from_hf(filtered_state_dict, device_mesh=device_mesh, **kwargs)
+
+    def _check_supplied_table_tensors(self, hf_state_dict: dict[str, Any], *, format_checked: bool) -> None:
+        """Validate PLE table and scale tensors supplied to :meth:`from_hf` before they are dropped.
+
+        Args:
+            hf_state_dict: Checkpoint-named tensors. A scale has shape ``[1]``;
+                a shard has shape ``[rows_per_shard, embedding_dim]``.
+            format_checked: Whether the checkpoint directory already
+                established the stored format.
+
+        Raises:
+            RuntimeError: On a supplied scale with a BF16 config, a scale that
+                differs from the loaded one, or a shard whose dtype contradicts
+                the config.
+        """
+        local_table = None
+        if not self._fp8_table:
+            weight = self.engram_table.weight
+            local_table = weight.to_local() if isinstance(weight, DTensor) else weight
+        unchecked_views = []
+        for key, value in hf_state_dict.items():
+            if key == self._table_scale_key:
+                if not self._fp8_table:
+                    raise RuntimeError(
+                        f"A {key} was supplied, but the config does not set "
+                        f"ple_embedding_dtype={QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE!r}: a scale with a BF16 PLE table"
+                    )
+                if not (
+                    isinstance(value, torch.Tensor)
+                    and value.dtype == torch.bfloat16
+                    and tuple(value.shape) == (1,)
+                    and torch.equal(value.cpu(), self.engram_table.scale)
+                ):
+                    raise RuntimeError(f"The supplied {key} differs from the scale loaded with the FP8 PLE table")
+            elif self._table_hf_key_pattern.fullmatch(key):
+                if self._fp8_table:
+                    if value.dtype != torch.float8_e4m3fn:
+                        raise RuntimeError(
+                            f"The config sets ple_embedding_dtype={QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE!r}, but the "
+                            f"supplied {key} is {value.dtype}"
+                        )
+                elif value.dtype == torch.float8_e4m3fn:
+                    raise RuntimeError(
+                        f"The supplied {key} is float8_e4m3fn, but the config does not set "
+                        f"ple_embedding_dtype={QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE!r}"
+                    )
+                elif value.untyped_storage().data_ptr() == local_table.untyped_storage().data_ptr():
+                    unchecked_views.append(key)
+        if unchecked_views and not format_checked:
+            # The checkpoint reader casts into these BF16 destinations, so their stored dtype is not visible here.
+            if self._base_checkpoint_dir is not None or self.pretrained_model_name_or_path:
+                raise RuntimeError(
+                    f"Cannot check the stored format of {len(unchecked_views)} PLE table shards: checkpoint "
+                    f"{str(self._base_checkpoint_dir or self.pretrained_model_name_or_path)!r} has no local "
+                    "safetensors files"
+                )
+            # A model built from a config has no base checkpoint; it loads tables that it saved itself.
+            logger.warning(
+                "Loaded %d Qwen3.8-Flash-Next PLE table shards into a model built from a config (no base "
+                "checkpoint) without a check of their stored dtype and of a weight_scale",
+                len(unchecked_views),
+            )
+
+    def _check_and_load_checkpoint_table(self) -> bool:
+        """Check the checkpoint's PLE table format against the config; load an FP8 table.
+
+        The config's ``ple_embedding_dtype`` names the format. The checkpoint
+        must agree: equal FP8 shards with a ``weight_scale``, or BF16 shards
+        without one. Any other combination is an error, never a silent fallback.
+
+        Returns:
+            Whether the checkpoint's safetensors files established the format.
+            ``False`` for a BF16 table of a model built from a config, or of a
+            checkpoint without safetensors files; :meth:`from_hf` then checks
+            the supplied tensors.
+
+        Raises:
+            RuntimeError: On a format mismatch, for a named checkpoint that is
+                not a local directory when the checkpointer named no base
+                directory, or for an FP8 table without a local safetensors
+                checkpoint.
+        """
+        checkpoint_dir = self._base_checkpoint_dir or _local_checkpoint_dir(self.pretrained_model_name_or_path)
+        weight_map = None if checkpoint_dir is None else _local_safetensors_weight_map(checkpoint_dir)
+        if weight_map is None:
+            if self._fp8_table:
+                raise RuntimeError(
+                    "The FP8 Qwen3.8-Flash-Next PLE table is read from a local safetensors checkpoint; got "
+                    f"checkpoint directory {checkpoint_dir} and "
+                    f"pretrained_model_name_or_path={self.pretrained_model_name_or_path!r}"
+                )
+            return False
+        present_shard_keys = [key for key in self._table_shard_keys if key in weight_map]
+        shard_layouts = _safetensors_layouts(checkpoint_dir, weight_map, present_shard_keys)
+        shard_dtypes = {dtype for dtype, _ in shard_layouts.values()}
+        has_scale = self._table_scale_key in weight_map
+
+        if not self._fp8_table:
+            if has_scale:
+                raise RuntimeError(
+                    f"Checkpoint {checkpoint_dir} has {self._table_scale_key}, but its config does not set "
+                    f"ple_embedding_dtype={QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE!r}: a scale with a BF16 PLE table"
+                )
+            if _SAFETENSORS_FP8_E4M3 in shard_dtypes:
+                raise RuntimeError(
+                    f"Checkpoint {checkpoint_dir} stores the PLE table shards as {_SAFETENSORS_FP8_E4M3}, but its "
+                    f"config does not set ple_embedding_dtype={QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE!r}"
+                )
+            return True
+
+        if len(present_shard_keys) != len(self._table_shard_keys):
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_dir} has {len(present_shard_keys)} of the "
+                f"{len(self._table_shard_keys)} PLE table shards {self._table_hf_prefix}.shard_<k>.weight"
+            )
+        if shard_dtypes != {_SAFETENSORS_FP8_E4M3}:
+            raise RuntimeError(
+                f"Config sets ple_embedding_dtype={QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE!r}, but checkpoint "
+                f"{checkpoint_dir} stores the PLE table shards as {sorted(shard_dtypes)}"
+            )
+        # Shard k holds rows [k * rows_per_shard, (k + 1) * rows_per_shard), so a shard of another
+        # length would shift every later shard: require equal shards.
+        num_embeddings, embedding_dim = self.engram_table.num_embeddings, self.engram_table.embedding_dim
+        if num_embeddings % self.split_ngram_parts:
+            raise RuntimeError(
+                f"The PLE table's {num_embeddings} rows do not split into {self.split_ngram_parts} equal shards"
+            )
+        expected_shape = [num_embeddings // self.split_ngram_parts, embedding_dim]
+        wrong_shapes = {key: shape for key, (_, shape) in shard_layouts.items() if shape != expected_shape}
+        if wrong_shapes:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_dir} has PLE table shards whose shape is not {expected_shape}: "
+                f"{dict(list(wrong_shapes.items())[:4])}"
+            )
+        if not has_scale:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_dir} has an FP8 PLE table but no {self._table_scale_key}: "
+                "the table values would be unscaled"
+            )
+        self.engram_table.load(
+            checkpoint_dir,
+            weight_map=weight_map,
+            shard_keys=self._table_shard_keys,
+            scale_key=self._table_scale_key,
+        )
+        return True

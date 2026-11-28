@@ -67,8 +67,10 @@ from .cp import (
     shard_batch_for_qwen3_8_flash_next_cp,
 )
 from .engram import (
+    QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE,
     QWEN3_8_FLASH_NEXT_NGRAM_PADDED_ROWS,
     Qwen3_8_FlashNextEngramTableConfig,
+    Qwen3_8_FlashNextHostNGramTable,
     Qwen3_8_FlashNextNGramEmbedding,
     Qwen3_8_FlashNextPLELayer,
 )
@@ -109,8 +111,14 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
             during parallelization, so the owner group is the stage's EP/FSDP
             group rather than the world. Only the MoE parallelizer binds it,
             so PLE layers require ``ep_size > 1``.
+            Unused for an FP8 table.
         engram_table_config: Optional tiny-table override for unit tests. The
             released checkpoint uses ``[320001536, 160]`` globally.
+        engram_host_dir: Node-local directory for the shared FP8 PLE table
+            file when ``config.ple_embedding_dtype`` is ``"float8_e4m3fn"``.
+            Such a table is frozen and lives in host memory, one copy per node.
+            The job chooses the directory and removes the 47.7 GiB file after
+            its last reader ends; loading an FP8 checkpoint without it raises.
 
     Tensor layout:
         Token embeddings start as ``[batch, sequence, hidden_size]``. Decoder
@@ -131,6 +139,7 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         moe_overrides: dict[str, Any] | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
         engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
+        engram_host_dir: str | None = None,
     ) -> None:
         super().__init__()
         if moe_config is not None and moe_overrides is not None:
@@ -193,20 +202,29 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
                     embedding_dim=config.ple_embed_dim // ngram_heads,
                     initializer_range=config.initializer_range,
                 )
-                distributed = dist.is_available() and dist.is_initialized()
-                if engram_process_group is None and not distributed and engram_table_config is None:
-                    raise RuntimeError(
-                        "The released Qwen3.8-Flash-Next PLE table must be constructed after "
-                        "torch.distributed initialization so its 320M rows are owner-sharded. "
-                        "Pass an explicit tiny engram_table_config only for a single-rank test."
+                if config.ple_embedding_dtype == QWEN3_8_FLASH_NEXT_FP8_PLE_DTYPE:
+                    # Frozen FP8 rows with a global scale, one host copy per node;
+                    # the state-dict adapter loads it from the checkpoint.
+                    table = Qwen3_8_FlashNextHostNGramTable(
+                        num_embeddings=table_config.num_embeddings,
+                        embedding_dim=table_config.embedding_dim,
+                        host_dir=engram_host_dir,
                     )
-                table = table_config.build(
-                    process_group=engram_process_group,
-                    dtype=self.model_dtype,
-                    # The owner group is the FSDP mesh of the pipeline stage that
-                    # holds this layer; the parallelizer binds it.
-                    bind_owner_group_later=engram_process_group is None and distributed,
-                )
+                else:
+                    distributed = dist.is_available() and dist.is_initialized()
+                    if engram_process_group is None and not distributed and engram_table_config is None:
+                        raise RuntimeError(
+                            "The released Qwen3.8-Flash-Next PLE table must be constructed after "
+                            "torch.distributed initialization so its 320M rows are owner-sharded. "
+                            "Pass an explicit tiny engram_table_config only for a single-rank test."
+                        )
+                    table = table_config.build(
+                        process_group=engram_process_group,
+                        dtype=self.model_dtype,
+                        # The owner group is the FSDP mesh of the pipeline stage that
+                        # holds this layer; the parallelizer binds it.
+                        bind_owner_group_later=engram_process_group is None and distributed,
+                    )
                 ple_embedding = Qwen3_8_FlashNextNGramEmbedding(
                     table,
                     ngram_size=config.ngram_size,
@@ -431,7 +449,10 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std=self.config.initializer_range)
             if layer.ple is not None:
-                layer.ple.ple_embedding.ngram_embedding.reset_parameters()
+                table = layer.ple.ple_embedding.ngram_embedding
+                # The frozen FP8 table has no initializer: only a checkpoint fills it.
+                if not isinstance(table, Qwen3_8_FlashNextHostNGramTable):
+                    table.reset_parameters()
                 layer.ple.init_weights(self.config.initializer_range)
         if self.hyper_connection_mixer is not None:
             self.hyper_connection_mixer.init_weights(init_std=self.config.initializer_range)
@@ -449,6 +470,7 @@ class Qwen3_8_FlashNextModel(nn.Module):
         moe_overrides: dict[str, Any] | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
         engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
+        engram_host_dir: str | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -459,6 +481,7 @@ class Qwen3_8_FlashNextModel(nn.Module):
             moe_overrides=moe_overrides,
             engram_process_group=engram_process_group,
             engram_table_config=engram_table_config,
+            engram_host_dir=engram_host_dir,
         )
 
     def forward(
@@ -556,6 +579,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     ) -> Qwen3_8_FlashNextForConditionalGeneration:
         """Construct architecture from a local/HF config before checkpoint load."""
         config = Qwen3_8_FlashNextConfig.from_pretrained(pretrained_model_name_or_path)
+        # The state-dict adapter reads the FP8 PLE table from the directory that the checkpointer
+        # loads the base weights from; it uses this path only when no such directory was named.
+        config.name_or_path = pretrained_model_name_or_path
         config.language_model_only = True
         model = cls.from_config(config, *model_args, **kwargs)
         restore_pretrained_generation_config(model, pretrained_model_name_or_path)
@@ -569,6 +595,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
         engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,
+        engram_host_dir: str | None = None,
         logits_dtype: torch.dtype | None = None,
         moe_overrides: dict[str, Any] | None = None,
     ) -> None:
@@ -588,6 +615,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             moe_overrides=moe_overrides,
             engram_process_group=engram_process_group,
             engram_table_config=engram_table_config,
+            engram_host_dir=engram_host_dir,
         )
         dtype = _resolve_model_dtype(config.text_config)
         self.lm_head = LMHead(
@@ -657,13 +685,16 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
 
         Returns:
             The exact registered parameter identities that FSDP must ignore
-            because the model consumes their local shards directly.
+            because the model consumes their local shards directly. A frozen
+            FP8 host table is not a parameter and adds nothing.
         """
         parameters: set[nn.Parameter] = set()
         for layer in self.model.language_model.layers.values():
             if layer.ple is None:
                 continue
             table = layer.ple.ple_embedding.ngram_embedding
+            if isinstance(table, Qwen3_8_FlashNextHostNGramTable):
+                continue
             parameter = table.parallelize_weight(fsdp_mesh)
             if id(parameter) not in {id(registered) for registered in self.parameters()}:
                 raise RuntimeError("The parallelized Engram DTensor is not registered on the Qwen3.8-Flash-Next model")
