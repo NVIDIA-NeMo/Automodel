@@ -17,7 +17,7 @@
 import functools
 import logging
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
@@ -329,7 +329,15 @@ class ExpertParallel(ParallelStyle):
     """
     ExpertParallel class is used to shard the MoE parameters on the EP mesh.
     Dim `0` of each parameter is sharded since that is the expert dimension.
+
+    Args:
+        max_num_local_experts: Largest per-rank expert count over the MoE layers of this process (see
+            :func:`max_local_experts_per_rank`), handed to the token dispatcher; ``None`` for this layer's own.
     """
+
+    def __init__(self, max_num_local_experts: int | None = None) -> None:
+        super().__init__()
+        self.max_num_local_experts = max_num_local_experts
 
     def _partition_fn(self, name, module, device_mesh):
         # shard on the expert dimension
@@ -345,7 +353,9 @@ class ExpertParallel(ParallelStyle):
             )
             module.register_parameter(name, dist_param)
 
-        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK)):
+        if isinstance(module, GroupedExpertsDeepEP):
+            module.init_token_dispatcher(ep_mesh=device_mesh, max_num_local_experts=self.max_num_local_experts)
+        elif isinstance(module, GroupedExpertsMoK):
             module.init_token_dispatcher(ep_mesh=device_mesh)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
@@ -378,7 +388,41 @@ def _iter_moe_blocks(model_wrapper: nn.Module, backbone: nn.Module):
         yield from mtp_module.layers.children()
 
 
-def apply_ep_to_moe(moe_module: MoE, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None) -> None:
+def max_local_experts_per_rank(moe_modules: Iterable[MoE], ep_size: int) -> int:
+    """Return the largest per-rank routed-expert count over the MoE layers this process runs.
+
+    HybridEP keeps one process-global buffer for all layers; layers whose expert counts differ must
+    share a buffer allocated for the largest count.
+
+    The count is read where each layer's ``init_token_dispatcher`` reads its own
+    (``experts.config.n_routed_experts // ep_size``), so the maximum cannot disagree with what a layer
+    requests. Only ``GroupedExpertsDeepEP`` and ``GroupedExpertsTE`` build a dispatcher that takes the
+    maximum; layers with other experts are not counted.
+
+    Args:
+        moe_modules: The MoE layers held by this process (under pipeline parallelism, its stage only).
+        ep_size: Expert-parallel group size.
+
+    Returns:
+        The largest ``experts.config.n_routed_experts // ep_size``, or 0 when no layer builds such a
+        dispatcher.
+    """
+    return max(
+        (
+            moe.experts.config.n_routed_experts // ep_size
+            for moe in moe_modules
+            if isinstance(moe.experts, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        ),
+        default=0,
+    )
+
+
+def apply_ep_to_moe(
+    moe_module: MoE,
+    ep_mesh: DeviceMesh,
+    moe_mesh: DeviceMesh | None = None,
+    max_num_local_experts: int | None = None,
+) -> None:
     """Make one MoE layer expert parallel over ``ep_mesh``.
 
     The routed experts are sharded along the expert dimension and their token dispatcher is
@@ -389,12 +433,16 @@ def apply_ep_to_moe(moe_module: MoE, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh |
         moe_module: The MoE layer; its ``experts`` hold the routed experts.
         ep_mesh: One-dimensional expert-parallel mesh.
         moe_mesh: The full MoE mesh the dispatcher of TE grouped experts may need.
+        max_num_local_experts: Largest per-rank expert count over the MoE layers of this process, from
+            :func:`max_local_experts_per_rank`; ``None`` sizes the dispatcher for this layer alone.
     """
     # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
     # local experts directly. It doesn't support DTensor wrapping, so we
     # skip distribute_module entirely and just initialize token dispatcher.
     if isinstance(moe_module.experts, GroupedExpertsTE):
-        moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+        moe_module.experts.init_token_dispatcher(
+            ep_mesh=ep_mesh, moe_mesh=moe_mesh, max_num_local_experts=max_num_local_experts
+        )
         # TE creates rank-local parameters for the experts owned by this EP
         # rank. A combined MoE mesh may fold physical TP peers into EP, so
         # these plain tensors are different expert shards, not TP replicas.
@@ -405,7 +453,7 @@ def apply_ep_to_moe(moe_module: MoE, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh |
         parallelize_module(
             module=moe_module.experts,
             device_mesh=ep_mesh,
-            parallelize_plan=ExpertParallel(),
+            parallelize_plan=ExpertParallel(max_num_local_experts),
         )
 
 
@@ -420,11 +468,10 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
     # Prefer nested text modules when present
     _model = get_text_module(_model)
 
-    for block in _iter_moe_blocks(model, _model):
-        moe_module = _get_moe_module(block)
-        if moe_module is None:
-            continue
-        apply_ep_to_moe(moe_module, ep_mesh, moe_mesh=moe_mesh)
+    moe_modules = [m for block in _iter_moe_blocks(model, _model) if (m := _get_moe_module(block)) is not None]
+    max_num_local_experts = max_local_experts_per_rank(moe_modules, ep_mesh.size())
+    for moe_module in moe_modules:
+        apply_ep_to_moe(moe_module, ep_mesh, moe_mesh=moe_mesh, max_num_local_experts=max_num_local_experts)
 
 
 # Alias of the shared tower taxonomy. Previously a private copy that had drifted

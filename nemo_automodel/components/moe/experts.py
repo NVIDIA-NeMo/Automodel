@@ -1589,7 +1589,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         self.token_dispatcher = None
         self.expert_activation = get_expert_activation_for_deepep(config)
 
-    def init_token_dispatcher(self, ep_mesh: DeviceMesh):
+    def init_token_dispatcher(self, ep_mesh: DeviceMesh, max_num_local_experts: int | None = None):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
         ep_group = ep_mesh.get_group()
@@ -1630,6 +1630,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             config=config,
             ep_group=ep_group,
             hidden_dim=self.config.expert_dim,
+            max_num_local_experts=max_num_local_experts,
         )
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
@@ -2354,7 +2355,9 @@ class GroupedExpertsTE(nn.Module):
             else:
                 missing_keys.append(down_bias_key)
 
-    def init_token_dispatcher(self, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
+    def init_token_dispatcher(
+        self, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None, max_num_local_experts: int | None = None
+    ):
         """
         Initialize the token dispatcher for expert parallelism.
 
@@ -2362,6 +2365,8 @@ class GroupedExpertsTE(nn.Module):
 
         Args:
             ep_mesh: Device mesh for expert parallelism.
+            moe_mesh: Full MoE mesh, when it differs from ``ep_mesh``.
+            max_num_local_experts: Largest per-rank expert count over the MoE layers of this process.
         """
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
@@ -2416,6 +2421,7 @@ class GroupedExpertsTE(nn.Module):
             config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
             hidden_dim=self.config.expert_dim,
+            max_num_local_experts=max_num_local_experts,
         )
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:

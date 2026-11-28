@@ -50,6 +50,7 @@ from nemo_automodel.components.moe.parallelizer import (
     _uses_moe_recompute_cache,
     apply_ep_to_moe,
     checkpoint_moe_block,
+    max_local_experts_per_rank,
     router_save_checkpoint_policy,
 )
 
@@ -129,12 +130,13 @@ def shard_policy(
     ep_mesh, ep_shard_mesh = _expert_meshes(moe_mesh)
     moe_layers = policy.moe_layers()
     if ep_mesh is not None:
+        max_num_local_experts = max_local_experts_per_rank(moe_layers, ep_mesh.size())
         for layer in moe_layers:
             if layer.n_routed_experts % ep_mesh.size():
                 raise ValueError(
                     f"{layer.n_routed_experts} routed experts are not divisible by ep_size {ep_mesh.size()}"
                 )
-            apply_ep_to_moe(layer, ep_mesh, moe_mesh=moe_mesh)
+            apply_ep_to_moe(layer, ep_mesh, moe_mesh=moe_mesh, max_num_local_experts=max_num_local_experts)
     router_policy = None
     if activation_checkpointing and ignore_router_for_ac and moe_layers:
         gate = moe_layers[0].gate

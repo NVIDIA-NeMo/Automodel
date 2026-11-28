@@ -504,9 +504,13 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_capacity_factor: float | None = None,
         moe_hybridep_equal_token_counts: bool = False,
         moe_hybridep_recompute_cache: str = "none",
+        max_num_local_experts: int | None = None,
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
+        # Per-rank expert count of the process-global buffer: the largest over every MoE layer of this
+        # process, so a later layer with more experts never reallocates the buffer (see HybridEPDispatch).
+        self.max_num_local_experts = max(num_local_experts, max_num_local_experts or 0)
         self.num_experts = num_experts
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
@@ -691,6 +695,7 @@ class _HybridEPManager(_DispatchManager):
             num_blocks_permute=self.moe_hybridep_num_blocks_permute,
             num_blocks_unpermute=self.moe_hybridep_num_blocks_unpermute,
             max_tokens_per_rank=self.moe_hybridep_max_tokens_per_rank,
+            max_local_experts=self.max_num_local_experts,
         )
 
         self.tokens_per_expert = tokens_per_expert
@@ -889,7 +894,7 @@ class HybridEPPipelineRuntimeInitializer:
             id(self.manager.group),
             self.hidden_dim,
             self.dtype,
-            self.manager.num_local_experts,
+            self.manager.max_num_local_experts,
             self.manager.num_experts,
             self.manager.router_topk,
             self.manager.moe_hybridep_num_sms,
@@ -1082,6 +1087,7 @@ class MoEFlexTokenDispatcher:
         config: TokenDispatcherConfig,
         ep_group: torch.distributed.ProcessGroup,
         hidden_dim: int | None = None,
+        max_num_local_experts: int | None = None,
     ) -> None:
         """
         Initialize the Flex token dispatcher.
@@ -1092,6 +1098,8 @@ class MoEFlexTokenDispatcher:
             config (TokenDispatcherConfig): Configuration for the transformer model.
             ep_group (torch.distributed.ProcessGroup): Process group for MoE operations.
             hidden_dim: Dispatched token width; required for NCCL-EP initialization.
+            max_num_local_experts: Largest per-rank expert count over every MoE layer of this process. HybridEP
+                sizes its process-global buffer for it; ``None`` means this layer's ``num_local_experts``.
         """
         self.config = config
         self.shared_experts = None
@@ -1192,6 +1200,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                         moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                         moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
+                        max_num_local_experts=max_num_local_experts,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1219,6 +1228,15 @@ class MoEFlexTokenDispatcher:
                         "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
                         "dispatch settings (and the same recompute-cache setting)"
                     )
+                shared_counts = (self._comm_manager.num_experts, self._comm_manager.num_local_experts)
+                layer_counts = (self.tp_size * self.config.num_moe_experts, self.num_local_experts)
+                if shared_counts != layer_counts:
+                    raise ValueError(
+                        f"A shared HybridEP dispatcher was built for {shared_counts[0]} experts "
+                        f"({shared_counts[1]} per rank) and cannot serve a layer with {layer_counts[0]} experts "
+                        f"({layer_counts[1]} per rank). Set dispatcher_share_token_dispatcher=False for models "
+                        "whose MoE layers differ in expert count."
+                    )
             else:
                 self._comm_manager = _HybridEPManager(
                     group=ep_group,
@@ -1237,6 +1255,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                     moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
+                    max_num_local_experts=max_num_local_experts,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
