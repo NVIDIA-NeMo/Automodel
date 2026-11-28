@@ -91,7 +91,9 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   batch_size: 8
-  num_workers: 0
+  # The collater builds each pack; in the training thread it would hold up the next step.
+  num_workers: 2
+  persistent_workers: true
   pin_memory: true
   drop_last: true
   shuffle: false

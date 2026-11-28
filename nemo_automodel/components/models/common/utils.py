@@ -588,7 +588,7 @@ class MoKBackendConfig:
         )
 
 
-AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
+AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi", "triton"]
 
 
 @dataclass(kw_only=True)
@@ -596,7 +596,10 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", or "magi").
+        attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi", or
+            "triton").
+            For Inkling 2, "triton" selects the Triton kernels of its learned-relative attention on
+            CUDA; CPU execution retains the PyTorch numerical oracle.
             "fa4" selects native FlashAttention-4 (CuTe) and requires an
             INSTALL_FA4=true image. HF-dispatched models use "flash_attention_4". A rank-2 binary
             padding mask is converted to varlen metadata, while dense/block masks and indexed
@@ -715,8 +718,10 @@ class BackendConfig:
             mixing chain is compiled as well. Compiled numerics are allclose to eager but
             not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
-            (currently Kimi K3, DeepSeek V4.1 and GLM-5.3-Flash decoder/final norms),
+            (currently Kimi K3, DeepSeek V4.1, GLM-5.3-Flash decoder/final norms and Inkling 2),
             fusing cast/pow/mean/rsqrt/mul into one kernel.
+            Inkling 2 compiles its other FP32 chains with it as well (depth mixture, message
+            controllers, short convolutions, clipping and the expert activation).
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
         compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in

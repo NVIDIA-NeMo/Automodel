@@ -24,7 +24,10 @@ from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.utils import calculate_loss, prepare_lm_weight
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.inkling2.layers import Inkling2LMHead
-from nemo_automodel.components.models.inkling2.loss import Inkling2FusedLinearCrossEntropy
+from nemo_automodel.components.models.inkling2.loss import (
+    Inkling2ChunkedLinearCrossEntropy,
+    Inkling2FusedLinearCrossEntropy,
+)
 from nemo_automodel.components.models.inkling2.model import Inkling2ForCausalLM
 
 from .test_reference import tiny_config
@@ -77,6 +80,149 @@ def test_output_selection_and_loss_boundary_errors() -> None:
     backend = BackendConfig(attn="flex", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
     with pytest.raises(ValueError, match="requires CUDA"):
         Inkling2ForCausalLM(tiny_config(), backend=backend)(ids)
+
+
+def _softcapped_token_losses(hidden: torch.Tensor, labels: torch.Tensor, head: torch.Tensor) -> torch.Tensor:
+    """Per-token cross entropy [batch, sequence] from FP32 logits of the 37 usable BF16 head rows."""
+    logits = F.linear(hidden.float(), head[:37].to(torch.bfloat16).float())
+    capped = 30 * torch.tanh(logits / 30)
+    return F.cross_entropy(capped.flatten(0, 1), labels.flatten(), reduction="none").reshape(labels.shape)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("chunk_tokens,scale", [(3, 4.0), (64, 4.0), (3, 0.25)])
+def test_chunked_loss_matches_softcapped_cross_entropy(dtype: torch.dtype, chunk_tokens: int, scale: float) -> None:
+    """Chunks of supervised tokens give the loss and both gradients of the unchunked FP32 computation.
+
+    Large logits exercise the softcap; small ones make the padded vocabulary columns visible
+    if they entered the softmax.
+    """
+    torch.manual_seed(211)
+    head = torch.randn(40, 16, requires_grad=True)
+    hidden = (scale * torch.randn(2, 9, 16)).to(dtype).requires_grad_(True)
+    labels = torch.randint(0, 37, (2, 9))
+    labels[0, 2] = labels[1, -1] = -100
+    count = int((labels != -100).sum())
+    loss_fn = Inkling2ChunkedLinearCrossEntropy(37, chunk_tokens=chunk_tokens)
+    weight = loss_fn.materialize_lm_weight(head)
+    assert weight.dtype == torch.bfloat16 and weight.shape == (37, 16)
+    loss = loss_fn(hidden, labels, weight, num_label_tokens=count)
+    loss.backward()
+
+    expected_hidden = hidden.detach().clone().requires_grad_(True)
+    expected_head = head.detach().clone().requires_grad_(True)
+    supervised = labels != -100
+    expected = _softcapped_token_losses(expected_hidden, labels.clamp_min(0), expected_head)[supervised].sum() / count
+    expected.backward()
+    assert loss.dtype == torch.float32
+    torch.testing.assert_close(loss, expected, rtol=1e-6, atol=1e-6)
+    # Returned gradients are rounded to the operand dtypes; BF16 keeps eight mantissa bits.
+    torch.testing.assert_close(hidden.grad.float(), expected_hidden.grad.float(), rtol=1e-2, atol=1e-5)
+    torch.testing.assert_close(head.grad[:37], expected_head.grad[:37], rtol=1e-2, atol=1e-5)
+    assert torch.count_nonzero(head.grad[37:]) == 0
+    assert torch.count_nonzero(hidden.grad[~supervised]) == 0
+
+
+def test_chunked_loss_reductions_weights_and_empty_supervision() -> None:
+    """Per-token losses, token weights and an all-ignored batch follow the shared loss contract."""
+    torch.manual_seed(223)
+    head = torch.randn(40, 16)
+    hidden = (4 * torch.randn(2, 5, 16)).to(torch.bfloat16)
+    labels = torch.randint(0, 37, (2, 5))
+    labels[1, 0] = -100
+    supervised = labels != -100
+    expected = _softcapped_token_losses(hidden, labels.clamp_min(0), head) * supervised
+    per_token = Inkling2ChunkedLinearCrossEntropy(37, reduction="none", chunk_tokens=4)(hidden, labels, head)
+    assert per_token.shape == labels.shape and per_token[1, 0] == 0
+    torch.testing.assert_close(per_token, expected, rtol=1e-6, atol=1e-6)
+    mean = Inkling2ChunkedLinearCrossEntropy(37, reduction="mean")(hidden, labels, head)
+    torch.testing.assert_close(mean, expected.sum() / supervised.sum(), rtol=1e-6, atol=1e-6)
+    weights = torch.rand(2, 5)
+    weighted = Inkling2ChunkedLinearCrossEntropy(37)(hidden, labels, head, loss_weights=weights)
+    torch.testing.assert_close(weighted, (expected * weights).sum(), rtol=1e-6, atol=1e-6)
+
+    hidden.requires_grad_(True)
+    ignored = Inkling2ChunkedLinearCrossEntropy(37)(hidden, torch.full_like(labels, -100), head, num_label_tokens=0)
+    ignored.backward()
+    assert ignored == 0 and torch.count_nonzero(hidden.grad) == 0
+
+
+def test_chunked_loss_projects_the_logits_once_for_a_summed_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A summed loss takes both gradients from the forward; only token weights recompute the chunks."""
+    import nemo_automodel.components.models.inkling2.loss as loss_module
+
+    def recomputed(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("the backward recomputed a chunk")
+
+    monkeypatch.setattr(loss_module, "_logit_gradients_core", recomputed)
+    monkeypatch.setattr(loss_module, "_compiled_logit_gradients", recomputed)
+    torch.manual_seed(227)
+    head = torch.randn(40, 16, requires_grad=True)
+    hidden = (4 * torch.randn(2, 9, 16)).to(torch.bfloat16).requires_grad_(True)
+    labels = torch.randint(0, 37, (2, 9))
+    loss_fn = Inkling2ChunkedLinearCrossEntropy(37, chunk_tokens=4)
+    loss_fn(hidden, labels, head, num_label_tokens=18).backward()
+    assert hidden.grad is not None and head.grad is not None
+    # Token weights give every token another upstream gradient: that backward does recompute.
+    with pytest.raises(AssertionError, match="recomputed a chunk"):
+        loss_fn(hidden, labels, head, loss_weights=torch.rand(2, 9)).backward()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_chunked_loss_token_weights_reach_both_gradients(dtype: torch.dtype) -> None:
+    """Token weights scale each token's contribution to the hidden and the head gradients."""
+    torch.manual_seed(229)
+    head = torch.randn(40, 16, requires_grad=True)
+    hidden = (4 * torch.randn(2, 9, 16)).to(dtype).requires_grad_(True)
+    labels = torch.randint(0, 37, (2, 9))
+    labels[0, 3] = -100
+    weights = torch.rand(2, 9)
+    Inkling2ChunkedLinearCrossEntropy(37, chunk_tokens=4)(hidden, labels, head, loss_weights=weights).backward()
+
+    expected_hidden = hidden.detach().clone().requires_grad_(True)
+    expected_head = head.detach().clone().requires_grad_(True)
+    supervised = labels != -100
+    losses = _softcapped_token_losses(expected_hidden, labels.clamp_min(0), expected_head)
+    (losses * weights)[supervised].sum().backward()
+    torch.testing.assert_close(hidden.grad.float(), expected_hidden.grad.float(), rtol=1e-2, atol=1e-5)
+    torch.testing.assert_close(head.grad[:37], expected_head.grad[:37], rtol=1e-2, atol=1e-5)
+    # Negative control: the unweighted gradient is another one.
+    plain = hidden.detach().clone().requires_grad_(True)
+    Inkling2ChunkedLinearCrossEntropy(37, chunk_tokens=4)(plain, labels, head.detach()).backward()
+    assert not torch.allclose(plain.grad.float(), expected_hidden.grad.float(), rtol=1e-2, atol=1e-5)
+
+
+def test_chunked_loss_second_backward_recomputes_the_same_gradients() -> None:
+    """The forward's gradients are released by the first backward; a retained graph still differentiates."""
+    torch.manual_seed(233)
+    head = torch.randn(40, 16, requires_grad=True)
+    hidden = (4 * torch.randn(2, 9, 16)).to(torch.bfloat16).requires_grad_(True)
+    labels = torch.randint(0, 37, (2, 9))
+    loss = Inkling2ChunkedLinearCrossEntropy(37, chunk_tokens=4)(hidden, labels, head, num_label_tokens=18)
+    first = torch.autograd.grad(loss, (hidden, head), retain_graph=True)
+    assert loss.grad_fn.next_functions is not None
+    second = torch.autograd.grad(loss, (hidden, head))
+    for a, b in zip(first, second):
+        torch.testing.assert_close(a.float(), b.float(), rtol=1e-2, atol=1e-6)
+
+
+def test_chunked_loss_rejects_invalid_configuration() -> None:
+    """Construction and call errors name the offending argument."""
+    for kwargs, match in (
+        ({"unpadded_vocab_size": 0}, "unpadded_vocab_size must be positive"),
+        ({"unpadded_vocab_size": 37, "logit_softcapping": 0}, "logit_softcapping must be positive"),
+        ({"unpadded_vocab_size": 37, "chunk_tokens": 0}, "chunk_tokens must be positive"),
+        ({"unpadded_vocab_size": 37, "reduction": "max"}, "Unsupported reduction"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            Inkling2ChunkedLinearCrossEntropy(**kwargs)
+    head, hidden, labels = torch.randn(40, 16), torch.randn(1, 3, 16), torch.zeros(1, 3, dtype=torch.long)
+    with pytest.raises(ValueError, match="fewer than unpadded_vocab_size"):
+        Inkling2ChunkedLinearCrossEntropy(41)(hidden, labels, head)
+    with pytest.raises(ValueError, match="only supported when reduction is 'sum'"):
+        Inkling2ChunkedLinearCrossEntropy(37, reduction="mean")(hidden, labels, head, num_label_tokens=3)
+    with pytest.raises(ValueError, match="loss_weights.shape must match"):
+        Inkling2ChunkedLinearCrossEntropy(37)(hidden, labels, head, loss_weights=torch.ones(3))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
