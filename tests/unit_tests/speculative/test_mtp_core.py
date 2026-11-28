@@ -91,6 +91,31 @@ def test_draft_matching_the_label_is_rejected_against_a_disagreeing_verifier(lab
     torch.testing.assert_close(simulated_accept_length(metrics.prefix_hits, metrics.valid), torch.tensor(1.0))
 
 
+def test_anchor_mask_excludes_prompt_anchors_at_every_depth() -> None:
+    """A correct target after the prompt cannot count as a trained mask prediction."""
+    labels = torch.tensor([[-100, -100, 1, 1, 1, -100]])
+    verifier = _constant_class_logits(labels.shape, cls=2)
+    drafts = [_constant_class_logits(labels.shape, cls=2) for _ in range(2)]
+    masked = compute_mtp_prefix_hits(
+        model=nn.Identity(),
+        mtp_per_depth_logits=drafts,
+        verifier_logits=verifier,
+        labels=labels,
+        ignore_index=IGNORE_INDEX,
+        anchor_mask=labels != IGNORE_INDEX,
+    )
+    unmasked = compute_mtp_prefix_hits(
+        model=nn.Identity(),
+        mtp_per_depth_logits=drafts,
+        verifier_logits=verifier,
+        labels=labels,
+        ignore_index=IGNORE_INDEX,
+    )
+    torch.testing.assert_close(masked.valid, torch.tensor([2, 1]))
+    torch.testing.assert_close(masked.prefix_hits, masked.valid)
+    torch.testing.assert_close(unmasked.valid, torch.tensor([3, 2]))
+
+
 def test_cu_seqlens_masks_cross_document_positions():
     """``cu_seqlens`` (THD layout) must exclude a document's last token from the
     acceptance count, the same packed-sequence boundary ``calculate_mtp_loss``

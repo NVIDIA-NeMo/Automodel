@@ -49,3 +49,5 @@ class PeftConfig:
     # the whole non-pipeline mesh (ep_size == world_size // pp_size): see
     # validate_packed_expert_topology.
     expert_weight_format: Literal["unquantized", "mxfp4", "nvfp4"] = "unquantized"
+    # Export metadata for token-gated adapters; training gates are supplied by the recipe.
+    alora_invocation_tokens: list[int] | None = None

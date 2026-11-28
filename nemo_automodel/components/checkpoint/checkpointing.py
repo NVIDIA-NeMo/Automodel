@@ -72,6 +72,11 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
 )
+from nemo_automodel.components.checkpoint._peft_token_rows import (
+    _TOKEN_ROWS_SUFFIX,
+    token_rows_key,
+    transfer_token_rows,
+)
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
 from nemo_automodel.components.checkpoint.conversion_mapping import (
     get_combined_key_mapping,
@@ -835,6 +840,13 @@ class Checkpointer:
             is_final_checkpoint,
         )
 
+        exported_tensor_names = tuple(state_dict)
+        mask_vocab_size = None
+        if self.config.is_peft and peft_config is not None and peft_config.alora_invocation_tokens:
+            weight, key = token_rows_key(unwrap_ddp_model(model_state.model[0]))
+            state_dict[key] = transfer_token_rows(weight, peft_config.alora_invocation_tokens)
+            mask_vocab_size = weight.shape[0]
+
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
         for addon in self._addons:
             addon.pre_save(
@@ -844,7 +856,8 @@ class Checkpointer:
                 hf_metadata_dir=hf_metadata_dir,
                 tokenizer=tokenizer,
                 peft_config=peft_config,
-                exported_tensor_names=tuple(state_dict),
+                exported_tensor_names=exported_tensor_names,
+                mask_vocab_size=mask_vocab_size,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
@@ -1499,6 +1512,24 @@ class Checkpointer:
                 )
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
+        if self.config.is_peft and not is_init_step:
+            row_keys = [key for key in state_dict if key.endswith(_TOKEN_ROWS_SUFFIX)]
+            if row_keys:
+                weight, key = token_rows_key(unwrap_ddp_model(model_state.model[0]))
+                if row_keys != [key]:
+                    raise ValueError(f"Expected one input embedding row tensor {key}, got {row_keys}")
+                config_path = os.path.join(model_path, "adapter_config.json")
+                if is_cloud_path(config_path):
+                    _ensure_msc_available()
+                    config_file = msc.open(config_path, "r")
+                else:
+                    config_file = open(config_path)
+                with config_file as f:
+                    metadata = json.load(f)
+                ids = metadata.get("trainable_token_indices")
+                if not isinstance(ids, list) or ids != metadata.get("alora_invocation_tokens"):
+                    raise ValueError("MTP adapter embedding IDs must match alora_invocation_tokens")
+                transfer_token_rows(weight, ids, saved_rows=state_dict.pop(key))
         storage_read_complete = time.monotonic()
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):

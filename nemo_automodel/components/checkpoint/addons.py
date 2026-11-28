@@ -27,6 +27,7 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
 )
+from nemo_automodel.components.checkpoint._peft_token_rows import tokenizer_with_mask_tokens
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, fully_trained_peft_modules
 from nemo_automodel.components.checkpoint.utils import unwrap_ddp_model
@@ -268,6 +269,7 @@ class PeftAddon:
             exported_tensor_names (Collection[str]): Keys of the adapter state dict this
                 save writes, after Hugging Face conversion. Empty on ranks that do not hold
                 the materialized adapter.
+            mask_vocab_size (int | None): Vocabulary size when the adapter saves MTP embedding rows.
         """
         model_path = kwargs["model_path"]
         tokenizer = kwargs.get("tokenizer", None)
@@ -294,6 +296,14 @@ class PeftAddon:
             model_part = model_state.model[0] if model_state is not None else None
             _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
             # save the tokenizer
+            mask_vocab_size = kwargs.get("mask_vocab_size")
+            if mask_vocab_size is not None:
+                ids = peft_config.alora_invocation_tokens
+                hf_peft_config["trainable_token_indices"] = ids
+                if model_state.uses_tied_lm_head:
+                    hf_peft_config["ensure_weight_tying"] = True
+                if tokenizer is not None:
+                    tokenizer = tokenizer_with_mask_tokens(tokenizer, mask_vocab_size, ids)
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
             # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
@@ -381,6 +391,8 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     }
     if target_parameters:
         config["target_parameters"] = target_parameters
+    if peft_config.alora_invocation_tokens is not None:
+        config["alora_invocation_tokens"] = list(peft_config.alora_invocation_tokens)
     modules_to_save = _extract_modules_to_save(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
     if modules_to_save:
         config["modules_to_save"] = modules_to_save

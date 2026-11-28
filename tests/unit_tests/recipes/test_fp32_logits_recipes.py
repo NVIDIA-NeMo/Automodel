@@ -144,6 +144,7 @@ def test_train_ft_step_projects_chunked_ce_like_the_fp32_logits_head():
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
+        gated_mtp=None,
         te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
@@ -232,4 +233,3 @@ def test_kd_step_projects_chunked_ce_like_the_fp32_logits_head(monkeypatch):
     )
 
     _assert_matches_fp32_logits_ce(ce_loss, reference, input_ids, labels, num_label_tokens)
-
