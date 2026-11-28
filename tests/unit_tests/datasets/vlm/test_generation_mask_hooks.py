@@ -132,7 +132,6 @@ def test_pretokenized_wrapper_hook_keeps_unshifted_labels():
         _examples(1),
         processor,
         post_tokenize_hook=gemma4_inject_thinking_prefix,
-        inject_fake_images=False,
         max_retries=1,
     )
     sample = dataset[0]

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Sized
+from collections.abc import Callable, Sequence, Sized
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -26,6 +26,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
+from datasets import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -47,7 +48,13 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
     packed_sequence_thd_vlm_collater,
     pad_collate_fn,
 )
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
+from nemo_automodel.components.datasets.vlm.fake_image import (
+    MEDIA_LOOK_MAX_SAMPLES,
+    FakeImageDatasetWrapper,
+    dataset_has_media,
+)
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.datasets.vlm.pp_media import wrap_vlm_collate_for_pp
 
@@ -296,6 +303,9 @@ class VlmDataloaderConfig:
     packing: NeatPackConfig | None = None
     collator: VlmCollatorConfig | None = None
     chat_template: str | None = None
+    inject_fake_images: bool | None = None
+    """Give samples without an image or video a fake image. ``None`` decides per loader: only with
+    more than one data-parallel rank and a dataset that has samples with media."""
     shuffle: bool = True
     num_workers: int = 0
     """Worker processes per dataloader; zero selects available CPUs, capped at 4 * visible GPUs when present."""
@@ -348,6 +358,31 @@ class VlmDataloaderConfig:
                 dataset = self.dataset_config.build()
         return dataset, processor
 
+    def _injects_fake_images(
+        self,
+        dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample],
+        *,
+        dp_world_size: int,
+    ) -> bool:
+        """Decide once per loader whether samples without media get a fake image, and log why.
+
+        Each rank decides from the dataset it holds. A dataset sharded by rank is looked
+        through per rank and not coordinated, so ranks whose slices differ can decide differently.
+        """
+        if self.inject_fake_images is not None:
+            inject, reason = self.inject_fake_images, "set by dataset.inject_fake_images"
+        elif dp_world_size <= 1:
+            inject, reason = False, "one data-parallel rank"
+        elif dataset_has_media(dataset):
+            inject, reason = True, f"{dp_world_size} data-parallel ranks and the dataset has samples with media"
+        elif len(dataset) > MEDIA_LOOK_MAX_SAMPLES:
+            inject = False
+            reason = f"none of {MEDIA_LOOK_MAX_SAMPLES} sampled of {len(dataset)} samples has an image or video"
+        else:
+            inject, reason = False, "no sample of the dataset has an image or video"
+        logger.info("VLM fake image injection: %s (%s)", "on" if inject else "off", reason)
+        return inject
+
     def build(
         self,
         *,
@@ -397,7 +432,11 @@ class VlmDataloaderConfig:
             dataset_build_context=dataset_build_context,
         )
         raw_dataset = dataset
+        inject_fake_images = self._injects_fake_images(raw_dataset, dp_world_size=dp_world_size)
+        if inject_fake_images:
+            dataset = FakeImageDatasetWrapper(raw_dataset)
 
+        plain_collate_fn = None
         if self.pretokenization is not None:
             if processor is None:
                 raise ValueError("VLM pretokenization requires a processor")
@@ -441,6 +480,7 @@ class VlmDataloaderConfig:
                     materialize_4d_mask=materialize_4d_mask,
                 )
         elif self.collator is not None:
+            plain_collate_fn = self.collator.factory
             collate_fn = self.collator.build(processor=processor)
         elif self.pretokenization is not None:
             collate_fn = partial(pad_collate_fn, processor=processor)
@@ -449,7 +489,21 @@ class VlmDataloaderConfig:
             if processor_type not in COLLATE_FNS:
                 logger.warning("Using %s with the default VLM collator", processor_type)
                 processor_type = "default"
-            collate_fn = partial(COLLATE_FNS[processor_type], processor=processor)
+            plain_collate_fn = COLLATE_FNS[processor_type]
+            collate_fn = partial(plain_collate_fn, processor=processor)
+
+        if inject_fake_images and self.pretokenization is None:
+            if not plain_collate_fn.__module__.startswith("nemo_automodel."):
+                logger.warning(
+                    "This loader's collate function is defined outside nemo_automodel, so it may not mask "
+                    "fake-image tokens: samples without media may get a fake image that attention sees."
+                )
+            if cp_size > 1:
+                logger.warning(
+                    "cp_size=%d drops the attention mask of fake images on the non-pretokenized path (#4969): "
+                    "samples without media get a fake image that attention sees.",
+                    cp_size,
+                )
 
         if hasattr(dataset, "robust_collate"):
             collate_fn = dataset.robust_collate(collate_fn)

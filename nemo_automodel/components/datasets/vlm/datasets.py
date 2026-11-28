@@ -1518,8 +1518,6 @@ class PreTokenizedDatasetWrapperConfig:
     """Number of retry attempts when a sample fails to tokenize."""
     truncate: bool = False
     """If ``True``, truncate overlong samples instead of replacing them."""
-    inject_fake_images: bool = True
-    """If ``True``, inject a fake image into text-only samples for sharded training."""
     post_tokenize_hook: (
         Callable[[dict[str, torch.Tensor | list[list[int]]], ProcessorMixin], dict[str, torch.Tensor | list[list[int]]]]
         | None
@@ -1545,7 +1543,6 @@ class PreTokenizedDatasetWrapperConfig:
             max_retries=self.max_retries,
             truncate=self.truncate,
             post_tokenize_hook=self.post_tokenize_hook,
-            inject_fake_images=self.inject_fake_images,
         )
 
 
@@ -1580,7 +1577,6 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         max_retries=10,
         truncate=False,
         post_tokenize_hook=None,
-        inject_fake_images=True,
     ):
         self.dataset = dataset
         self.processor = processor
@@ -1588,7 +1584,6 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         self.truncate = truncate
         self.max_retries = max_retries
         self.post_tokenize_hook = post_tokenize_hook
-        self.inject_fake_images = inject_fake_images
         # Compatibility attributes expected by build_dataloader
         self.preload_media = False
 
@@ -1601,11 +1596,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
             _extract_media_from_conversations,
             build_labels_from_template,
         )
-        from nemo_automodel.components.datasets.vlm.fake_image import (
-            _conversation_has_media,
-            inject_fake_image_into_conversation,
-            mask_fake_vision_tokens_single,
-        )
+        from nemo_automodel.components.datasets.vlm.fake_image import mask_fake_vision_tokens_single
 
         for attempt in range(self.max_retries):
             try:
@@ -1619,10 +1610,8 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 )
                 conversation = example["conversation"]
 
-                # Inject fake image into pure-text samples for FSDP/Zero3.
-                injected_fake = self.inject_fake_images and not _conversation_has_media(conversation)
-                if injected_fake:
-                    conversation = inject_fake_image_into_conversation(conversation)
+                # The loader's FakeImageDatasetWrapper marks the samples it gave a fake image.
+                injected_fake = bool(example.get("_injected_fake"))
 
                 # Ensure images are RGB
                 for message in conversation:

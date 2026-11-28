@@ -97,7 +97,7 @@ class _Processor(ProcessorMixin):
 def test_bos_appears_once(template_bos, tokenizer_bos, has_bos_token, expected):
     example = {"conversation": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]}
     wrapper = PreTokenizedDatasetWrapper(
-        [example], _Processor(template_bos, tokenizer_bos, has_bos_token), inject_fake_images=False, max_retries=1
+        [example], _Processor(template_bos, tokenizer_bos, has_bos_token), max_retries=1
     )
     sample = wrapper[0]
     assert sample["input_ids"].tolist() == expected

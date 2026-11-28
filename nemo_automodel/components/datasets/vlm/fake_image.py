@@ -29,8 +29,14 @@ keeping the visual encoder active.
 
 import copy
 import logging
+import random
+from collections.abc import Sequence
 
+import torch
+from datasets import Dataset
 from PIL import Image as PILImage
+
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,62 @@ def inject_fake_image_into_conversation(conversation):
         },
     )
     return conversation
+
+
+# Most samples dataset_has_media reads, so that its start-up time does not grow with the size of the dataset.
+MEDIA_LOOK_MAX_SAMPLES = 100_000
+
+
+def dataset_has_media(dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample]) -> bool:
+    """Return whether *dataset* holds a sample with an image or video, among the samples looked at.
+
+    A dataset with at most ``MEDIA_LOOK_MAX_SAMPLES`` samples is read in order. A larger one is
+    read at that many indices drawn at random with a fixed seed, so every rank looks at the same
+    samples; media that exists only outside the draw is not seen. The look stops at the first
+    sample with media. A sample that cannot be read is skipped with a warning; the answer comes
+    from the samples that can be read.
+    """
+    size = len(dataset)
+    if size > MEDIA_LOOK_MAX_SAMPLES:
+        indices = sorted(random.Random(0).sample(range(size), MEDIA_LOOK_MAX_SAMPLES))
+    else:
+        indices = range(size)
+    for index in indices:
+        try:
+            sample = dataset[index]
+        except Exception as error:
+            logger.warning("fake_image: sample %d could not be read (%s); skipping it", index, error)
+            continue
+        conversation = sample.get("conversation") if isinstance(sample, dict) else None
+        if conversation is not None and _conversation_has_media(conversation):
+            return True
+    return False
+
+
+class FakeImageDatasetWrapper(torch.utils.data.Dataset):
+    """Give every sample of a raw dataset that has no image or video a fake image.
+
+    The wrapper sits between the raw dataset and tokenization, so the plain, pretokenized
+    and packed paths get the same samples. A sample that received the fake image carries
+    ``_injected_fake: True``; the step that tokenizes it masks the fake vision tokens.
+    """
+
+    def __init__(self, dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample]) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> ConversationSample:
+        example = self.dataset[index]
+        conversation = example.get("conversation")
+        if conversation is None or _conversation_has_media(conversation):
+            return example
+        return {
+            **example,
+            "conversation": inject_fake_image_into_conversation(conversation),
+            "_injected_fake": True,
+        }
 
 
 # Attribute names that VLM processors / configs use to expose vision token IDs.

@@ -86,8 +86,8 @@ def _build_real_packed_batch(
         pretokenization=PreTokenizedDatasetWrapperConfig(
             max_length=args.pack_size,
             truncate=True,
-            inject_fake_images=True,
         ),
+        inject_fake_images=True,
         packing=NeatPackConfig(
             pack_size=args.pack_size,
             drop_long_samples=True,
