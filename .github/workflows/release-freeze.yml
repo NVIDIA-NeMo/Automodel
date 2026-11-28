@@ -1,4 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from NVIDIA-NeMo/Gym under Apache-2.0.
+# https://github.com/NVIDIA-NeMo/Gym/blob/e58425147cf1729131f8cf3f16dad5fe266944dd/.github/workflows/release-freeze.yml
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,10 +41,10 @@ permissions:
 
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@fb3b45eed8585aafae60297464a004eb209fc95a # code freeze: /cherrypick PSA
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
     with:
-      app-id: ${{ vars.BOT_ID }}
-      environment-name: main
+      release-environment: automodel-release
+      freeze-source-branch: main
       library-name: NeMo-Automodel
       python-package: nemo_automodel
       has-src-dir: false
@@ -51,7 +54,7 @@ jobs:
     secrets:
       SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      BOT_KEY: ${{ secrets.BOT_KEY }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
   # bump-docs-versions: the Sphinx-era docs/versions1.json, docs/project.json,
   # and docs/conf.py no longer exist; Fern manages version metadata via

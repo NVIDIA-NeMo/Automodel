@@ -4,30 +4,32 @@ on:
     - cron: 0 0 * * 1 # Run at midnight UTC on Mondays
   workflow_dispatch: # Allow manual triggering
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   get-release-branch-names:
     runs-on: ubuntu-latest
-    environment: nemo-ci
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
     outputs:
       automodel: ${{ steps.get-branch.outputs.automodel_release_branch }}
     steps:
       - name: Get release branch names
         id: get-branch
         env:
-          PAT: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-
-          latest_branch=$(git ls-remote --heads https://token:${PAT}@github.com/NVIDIA-NeMo/automodel.git 'refs/heads/r*' | 
-            grep -o 'r[0-9]\+\.[0-9]\+\.[0-9]\+' | 
-            sort -V | 
-            tail -n1)
-          echo "automodel_release_branch=$latest_branch" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          latest_branch=$(gh api --paginate "repos/$GITHUB_REPOSITORY/branches?protected=true&per_page=100" \
+            --jq '.[].name | select(test("^r[0-9]+[.][0-9]+[.][0-9]+$"))' | sort -V | tail -n1)
+          test -n "$latest_branch"
+          echo "automodel_release_branch=$latest_branch" | tee -a "$GITHUB_OUTPUT"
 
   bump-tags:
     needs: [get-release-branch-names]
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -38,23 +40,15 @@ jobs:
     with:
       target-branch: ${{ matrix.target-branch }}
     secrets:
-      PAT: ${{ secrets.PAT }}
+      PR_APP_PRIVATE_KEY: ${{ secrets.PR_APP_PRIVATE_KEY }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
       SSH_PWD: ${{ secrets.SSH_PWD }}
 
   notify:
     if: failure()
-    runs-on: ubuntu-latest
     needs: [bump-tags]
-    steps:
-      - name: Notify
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          SLACK_WEBHOOK_ADMIN: <!subteam^${{ secrets.SLACK_WEBHOOK_ADMIN }}>
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          curl -X POST \
-            -H 'Content-type: application/json' \
-            --data "{\"text\":\":robot_joy: <https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|Mcore-bump-bot workflow> failed. Please fix manually.\n\ncc ${SLACK_WEBHOOK_ADMIN}\"}" \
-            $SLACK_WEBHOOK
+    permissions: {}
+    uses: ./.github/workflows/_notify-ci-failure.yml
+    secrets:
+      SLACK_CI_CHANNEL_WEBHOOK: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}
+      SLACK_TEAM_GROUP_ID: ${{ secrets.SLACK_TEAM_GROUP_ID }}

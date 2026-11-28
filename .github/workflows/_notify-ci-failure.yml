@@ -1,0 +1,33 @@
+name: Notify CI failure
+
+on:
+  workflow_call:
+    secrets:
+      SLACK_CI_CHANNEL_WEBHOOK:
+        required: true
+      SLACK_TEAM_GROUP_ID:
+        required: false
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Compose failure notification
+        id: alert
+        env:
+          SLACK_TEAM_GROUP_ID: ${{ secrets.SLACK_TEAM_GROUP_ID }}
+        run: |
+          message="<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID|$GITHUB_WORKFLOW> failed."
+          if [[ -n "$SLACK_TEAM_GROUP_ID" ]]; then
+            message+=" cc <!subteam^$SLACK_TEAM_GROUP_ID>"
+          fi
+          printf 'message=%s\n' "$message" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Send to the CI channel
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+        with:
+          message: ${{ steps.alert.outputs.message }}
+          webhook: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}
