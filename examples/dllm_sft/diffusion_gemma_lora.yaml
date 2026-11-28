@@ -61,7 +61,18 @@ model:
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: torch
+    # DeepEP token dispatch. ep_size=8 is intra-node here, so the single-node
+    # DeepEP path applies. The "torch" fallback all-gathers every token to every
+    # rank (a token-count all_gather, an `.item()` host sync and four varlen
+    # all_gathers per MoE layer per forward pass): on 8xH100 that put 97% of GPU
+    # kernel time in NCCL, 99.9% of it not overlapped with compute, and ran 1.47x
+    # slower. "hybridep" is NOT a drop-in replacement here -- it fails this recipe
+    # with CheckpointError (the tokens routed to a rank differ between forward and
+    # activation-checkpoint recompute, e.g. 481 vs 1087 rows) even though
+    # ignore_router_for_ac already defaults to True. Scaling this recipe past one
+    # node needs that resolved first, since DeepEP's own internode path faults
+    # separately (internode.cu:346).
+    dispatcher: deepep
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
