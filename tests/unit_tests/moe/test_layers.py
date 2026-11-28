@@ -31,12 +31,58 @@ from nemo_automodel.components.moe.layers import (
     FakeBalancedGate,
     Gate,
     MoE,
+    sqrt_softplus_stable,
 )
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_CUDA = torch.cuda.is_available()
 SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("upstream", [-1.0, 0.0, 1.0])
+def test_sqrt_softplus_stable_matches_float64_reference(dtype: torch.dtype, upstream: float) -> None:
+    values = torch.tensor(
+        [-200.0, -120.0, -110.0, -100.0, -80.0, -21.0, -20.0, -19.0, 0.0, 20.0, 100.0, 200.0],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    output = sqrt_softplus_stable(values)
+    output.backward(torch.full_like(output, upstream))
+    reference = F.softplus(values.detach().double()).sqrt()
+    reference_grad = upstream * 0.5 * values.detach().double().sigmoid() / reference
+
+    assert output.dtype == torch.float32
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(values.grad).all()
+    torch.testing.assert_close(output.double(), reference, rtol=2e-6, atol=1e-43)
+    torch.testing.assert_close(values.grad, reference_grad.to(dtype), rtol=2e-6, atol=1e-43)
+
+
+@pytest.mark.cpu_only
+def test_sqrt_softplus_stable_keeps_original_expression_from_threshold_up() -> None:
+    values = torch.linspace(-20.0, 40.0, 6001, dtype=torch.float32, requires_grad=True)
+    reference_values = values.detach().clone().requires_grad_()
+    output = sqrt_softplus_stable(values)
+    reference = F.softplus(reference_values).sqrt()
+    torch.testing.assert_close(output, reference, rtol=0.0, atol=0.0)
+    output_grad = torch.autograd.grad(output.sum(), values)[0]
+    reference_grad = torch.autograd.grad(reference.sum(), reference_values)[0]
+    torch.testing.assert_close(output_grad, reference_grad, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.cpu_only
+def test_sqrt_softplus_stable_large_upstream_gradient() -> None:
+    values = torch.tensor([-100.0], requires_grad=True)
+    output = sqrt_softplus_stable(values)
+    output.backward(torch.full_like(output, -1e18))
+    reference = F.softplus(values.detach().double()).sqrt()
+    reference_grad = -1e18 * 0.5 * values.detach().double().sigmoid() / reference
+
+    assert torch.isfinite(values.grad).all()
+    torch.testing.assert_close(values.grad.double(), reference_grad, rtol=2e-6, atol=0.0)
 
 
 @pytest.fixture
@@ -715,6 +761,43 @@ class TestGate:
 
         torch.testing.assert_close(indices, expected_indices)
         torch.testing.assert_close(weights.detach(), expected_weights, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize("normalize", [False, True])
+    def test_gate_forward_sqrtsoftplus_extreme_gradients(self, moe_config: MoEConfig, normalize: bool) -> None:
+        moe_config.dim = 1
+        moe_config.n_routed_experts = 3
+        moe_config.n_activated_experts = 2 if normalize else 1
+        moe_config.score_func = "sqrtsoftplus"
+        moe_config.norm_topk_prob = normalize
+        moe_config.route_scale = 1.0
+        moe_config.gate_bias_update_factor = 0.0
+        moe_config.aux_loss_coeff = 0.0
+        moe_config.force_e_score_correction_bias = False
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config, gate_precision=torch.float32)
+        with torch.no_grad():
+            logits = [-100.0, -101.0, -120.0] if normalize else [-110.0, 0.0, -120.0]
+            gate.weight.copy_(torch.tensor(logits).unsqueeze(1))
+        x = torch.ones(1, 1, requires_grad=True)
+        weights, indices, _ = gate(x, torch.ones(1, dtype=torch.bool), cp_mesh=None)
+        upstream = torch.linspace(-1.0, 1.0, weights.numel()).reshape_as(weights)
+        (weights * upstream).sum().backward()
+
+        reference_x = x.detach().double().requires_grad_()
+        reference_weight = gate.weight.detach().double().requires_grad_()
+        reference_scores = F.softplus(F.linear(reference_x, reference_weight)).sqrt()
+        reference_weights = reference_scores.gather(1, indices)
+        if normalize:
+            reference_weights = reference_weights / (reference_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        (reference_weights * upstream.double()).sum().backward()
+
+        assert torch.isfinite(weights).all()
+        assert torch.isfinite(x.grad).all()
+        assert torch.isfinite(gate.weight.grad).all()
+        torch.testing.assert_close(weights.double(), reference_weights, rtol=2e-6, atol=1e-40)
+        torch.testing.assert_close(x.grad.double(), reference_x.grad, rtol=2e-6, atol=1e-40)
+        torch.testing.assert_close(gate.weight.grad.double(), reference_weight.grad, rtol=2e-6, atol=1e-40)
 
     def test_gate_forward_sqrtsoftplus_basic(self, moe_config, device):
         """``score_func='sqrtsoftplus'`` should compute weights as sqrt(softplus(logits))."""

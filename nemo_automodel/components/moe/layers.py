@@ -40,6 +40,28 @@ from nemo_automodel.components.moe.quantized_experts import GroupedExpertsTENVFP
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
+def sqrt_softplus_stable(scores: torch.Tensor) -> torch.Tensor:
+    """Compute sqrt(softplus(scores)) with stable FP32 negative-tail gradients.
+
+    Below -20, exp(scores / 2) avoids both softplus underflow and an overflowing
+    sqrt backward intermediate. Its relative approximation error is below 1e-9.
+    Both branches are bounded before evaluation so an unselected torch.where
+    branch cannot introduce a singular backward.
+
+    Args:
+        scores: Floating-point tensor of shape [...], with arbitrary dimensions,
+            containing local router logits. Computation casts the input to FP32.
+
+    Returns:
+        FP32 tensor of shape [...] on the input device, without mutating scores.
+    """
+    values = scores.float()
+    is_tail = values < -20.0
+    regular = F.softplus(torch.where(is_tail, -20.0, values)).sqrt()
+    negative = (0.5 * torch.where(is_tail, values, -20.0)).exp()
+    return torch.where(is_tail, negative, regular)
+
+
 class MLP(nn.Module):
     """
     Multi-Layer Perceptron (MLP) used as a feed-forward layer.
@@ -479,7 +501,7 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
             # sqrt(softplus(x)) = sqrt(log(1 + exp(x))), used in DeepSeek V4.
-            scores = torch.sqrt(F.softplus(scores.float()))
+            scores = sqrt_softplus_stable(scores)
             original_scores = scores
 
             if correction_bias is not None:
