@@ -168,9 +168,12 @@ class SequentialBucketSampler(Sampler[List[int]]):
             perm = torch.randperm(len(current_bucket_keys), generator=g).tolist()
             current_bucket_keys = [current_bucket_keys[i] for i in perm]
 
-        self._batches_yielded = 0
         batches_to_skip = self._batches_to_skip
         self._batches_to_skip = 0
+        # Batches skipped on resume were consumed before the checkpoint, so they
+        # count toward this epoch's position; otherwise a second mid-epoch resume
+        # would skip too few batches and replay data.
+        self._batches_yielded = batches_to_skip
 
         # 2. Iterate Buckets
         for key in current_bucket_keys:
