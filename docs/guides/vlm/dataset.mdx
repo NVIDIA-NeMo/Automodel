@@ -105,6 +105,10 @@ NeMo AutoModel provides specialized collate functions for different VLM processo
 
 Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a Hugging Face `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. NeMo AutoModel provides [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
 
+### Datasets That Mix Samples With and Without Media
+
+When training uses more than one data-parallel rank and the dataset has at least one sample with an image or video, NeMo AutoModel gives every sample that has neither a small white placeholder image, so that all ranks run the vision tower in every step; without it, sharded (FSDP2) training can hang when one rank holds an image and another holds only text. The placeholder sits in the user turn, so it is never part of the loss, and the built-in collate functions mask its tokens from attention (packed sequences keep them visible). Text-only datasets, image-only datasets, and single-rank runs are left unchanged, and the rule is the same with or without `pretokenize` or `packed_sequence`. The training log reports the decision in a line that starts with `VLM fake image injection:`. To override it, set `inject_fake_images: true` or `inject_fake_images: false` in the `dataset` section.
+
 ## YAML-Based Custom Dataset Configuration
 
 NeMo AutoModel supports YAML-based dataset specification using the `_target_` key. This enables you to reference dataset-building classes or functions using either a Python dotted path or a file path and function name.
