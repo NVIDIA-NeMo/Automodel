@@ -153,6 +153,48 @@ verify the kernels in a performance investigation.
 
 The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.
 
+## Round AdamW Working Weights to BF16
+
+For training that uses BF16 working weights while retaining FP32 master weights,
+configure the native AdamW component:
+
+```yaml
+optimizer:
+  _target_: nemo_automodel.components.optim.optimizer.AdamWConfig
+  lr: 1.0e-4
+  weight_rounding: stochastic
+  rounding_seed: 42
+  fused: false
+```
+
+Use `weight_rounding: nearest` for round-to-nearest-even, or omit the option
+(default `null`) to preserve ordinary AdamW behavior. This is an optimizer
+configuration for general training, including supervised fine-tuning.
+
+Start from BF16-representable checkpoint values loaded into **FP32 parameter
+storage**, with BF16 FSDP2 computation. In a model recipe, these are separate
+settings: `model.dtype: float32` controls storage, while
+`distributed.mp_policy.param_dtype: bfloat16` controls FSDP2 computation.
+The existing parameters hold the working weights (`q`) during forward,
+backward, and activation recomputation. Optimizer hooks restore the FP32 master
+(`theta`) for the unchanged native AdamW update, then round the updated master
+back into `q`. Caller-defined optimizer groups may set `quantize: false` to
+protect weights that must remain ordinary FP32 values.
+
+Save and restore both the model and optimizer through the native checkpoint
+path: the model contains `q`, while optimizer state contains `master`, moments,
+and the rounding counter. A model-only export is not a training-resume
+checkpoint. Resume with the same parameter order and mesh. If an application
+uses a separate inference copy, synchronize the actual working weights instead
+of independently rounding the master again.
+
+<Note>
+Rounded mode uses unfused, non-foreach `torch.optim.AdamW`. Transformer Engine
+optimizers, Megatron-FSDP optimizer sharding, optimizer closures, and captured
+or differentiable optimizer steps are unsupported. This option implements
+BF16 weight rounding; FP4 quantization is outside its scope.
+</Note>
+
 ## Select Trainable Modules
 
 The LLM and VLM fine-tuning recipes accept a `freeze_config:` section. Use `freeze_modules` and `unfreeze_modules` with typed selectors to control which modules are trainable:
