@@ -117,6 +117,11 @@ ci:
   cluster_tag: h100
   time: 00:40:00
   nproc_per_node: 8
+  env_vars:
+    # Rank 96 OOMed in FSDP reduce-scatter: a 1.03 GiB request failed with 3.90 GiB reserved but unallocated.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   perf_testing:
     schedule: weekly
+    # 50 steps at ~45 s/step (6.29M tokens/step) plus 16-node startup needs ~49 min; the 40 min default cannot fit.
+    time: "01:00:00"
     fake_balanced_gate: true
