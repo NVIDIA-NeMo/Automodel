@@ -782,6 +782,53 @@ def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
     return stream
 
 
+class _SharedExpertStreamFork(torch.autograd.Function):
+    """Identity on the shared-expert input that orders the side stream against the main stream in both passes.
+
+    Forward (main stream): the side stream waits for main before it reads ``x``. Backward (main stream): main
+    waits for everything the side stream has queued, not only for the kernel that produced ``grad_x``. The
+    shared experts' weight-gradient accumulation also runs on the side stream, and FSDP reduce-scatters and
+    reshards those parameters on the main stream's schedule after this point, so a per-edge event is not
+    enough.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, side_stream: torch.cuda.Stream) -> torch.Tensor:
+        ctx.main_stream = torch.cuda.current_stream()
+        ctx.side_stream = side_stream
+        side_stream.wait_stream(ctx.main_stream)
+        x.record_stream(side_stream)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        ctx.main_stream.wait_stream(ctx.side_stream)
+        grad_x.record_stream(ctx.main_stream)
+        return grad_x, None
+
+
+class _SharedExpertStreamJoin(torch.autograd.Function):
+    """Identity on the shared-expert output that joins the side stream back into the main stream in both passes.
+
+    Forward (main stream): main waits for the side stream before it reads ``z``. Backward (main stream): the side
+    stream waits for main before the shared-expert backward consumes ``grad_z``.
+    """
+
+    @staticmethod
+    def forward(ctx, z: torch.Tensor, side_stream: torch.cuda.Stream) -> torch.Tensor:
+        ctx.main_stream = torch.cuda.current_stream()
+        ctx.side_stream = side_stream
+        ctx.main_stream.wait_stream(side_stream)
+        z.record_stream(ctx.main_stream)
+        return z.view_as(z)
+
+    @staticmethod
+    def backward(ctx, grad_z: torch.Tensor) -> tuple[torch.Tensor, None]:
+        ctx.side_stream.wait_stream(ctx.main_stream)
+        grad_z.record_stream(ctx.side_stream)
+        return grad_z, None
+
+
 class MoE(nn.Module):
     """
     Mixture-of-Experts (MoE) module.
@@ -968,7 +1015,7 @@ class MoE(nn.Module):
             # Routed experts on the main stream.
             y = self.experts(x_latent, token_mask, weights, indices)
             if shared_stream is not None:
-                self._join_shared_experts(z, shared_stream)
+                z = self._join_shared_experts(z, shared_stream)
 
         if self.fc2_latent_proj is not None:
             # ``self.experts`` is its own FSDP unit; an ``output_dtype`` in the FSDP
@@ -996,19 +1043,15 @@ class MoE(nn.Module):
         own ``forward`` (Kimi K3) reuse both helpers so the stream choreography lives in one place.
         """
         stream = _shared_expert_stream(x.device)
-        stream.wait_stream(torch.cuda.current_stream())
+        x_side = _SharedExpertStreamFork.apply(x, stream)
         with torch.cuda.stream(stream):
-            z = self._shared_expert_output(x)
-        # ``x`` was allocated on the current stream; keep its block alive for the side stream.
-        x.record_stream(stream)
+            z = self._shared_expert_output(x_side)
         return z, stream
 
     @staticmethod
-    def _join_shared_experts(z: torch.Tensor, stream: torch.cuda.Stream) -> None:
-        """Make the current stream wait for the side-stream shared-expert output ``z``."""
-        current = torch.cuda.current_stream()
-        current.wait_stream(stream)
-        z.record_stream(current)
+    def _join_shared_experts(z: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
+        """Return the side-stream shared-expert output ``z`` joined into the current stream (both passes)."""
+        return _SharedExpertStreamJoin.apply(z, stream)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)

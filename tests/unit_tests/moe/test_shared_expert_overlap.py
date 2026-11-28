@@ -133,3 +133,17 @@ def test_gpu_overlap_without_shared_experts_is_noop():
     x = torch.randn(2, 4, 8, device="cuda", requires_grad=True)
     moe(x).sum().backward()
     assert x.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="stream overlap needs CUDA")
+def test_gpu_fork_and_join_are_identities_in_both_passes():
+    side = layers_mod._shared_expert_stream(torch.device("cuda"))
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    x_side = layers_mod._SharedExpertStreamFork.apply(x, side)
+    with torch.cuda.stream(side):
+        z = x_side * 3.0
+    z_main = layers_mod.MoE._join_shared_experts(z, side)
+    (z_main * 2.0).sum().backward()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(z_main, x.detach() * 3.0)
+    torch.testing.assert_close(x.grad, torch.full_like(x, 6.0))

@@ -1435,3 +1435,20 @@ def test_checkpoint_load_order_includes_cp_sharding(dp_shard_size: int, cp_size:
         ["initialize", "load", "shard"] if (dp_shard_size, cp_size) == (1, 1) else ["shard", "initialize", "load"]
     )
     assert [event[0] for event in events.mock_calls] == expected
+
+
+def test_instantiate_pipeline_forwards_per_edge_p2p():
+    from nemo_automodel._transformers.infrastructure import _instantiate_pipeline
+    from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+
+    pp_mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 0, get_group=lambda *_, **__: None)
+    mesh = SimpleNamespace(
+        device_mesh={"pp": pp_mesh},
+        moe_mesh=None,
+        pp_size=2,
+        pipeline_axis_kwargs=lambda: {"pp_axis_name": "pp"},
+    )
+
+    pipeline = _instantiate_pipeline(PipelineConfig(pp_p2p_per_edge=True), mesh, device=torch.device("cpu"))
+
+    assert pipeline.pp_p2p_per_edge is True

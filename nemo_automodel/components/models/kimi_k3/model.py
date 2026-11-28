@@ -1744,7 +1744,7 @@ class KimiK3MoE(MoE):
             routed = self.routed_expert_norm(routed)
         output = self.routed_expert_up_proj(routed)
         if shared_output is not None:
-            self._join_shared_experts(shared_output, shared_stream)
+            shared_output = self._join_shared_experts(shared_output, shared_stream)
             output = output + shared_output
         elif self.shared_experts is not None:
             output = output + self.shared_experts(identity)

@@ -356,6 +356,7 @@ def _instantiate_pipeline(
         world_mesh=mesh.device_mesh,
         moe_mesh=mesh.moe_mesh,
         device=device,
+        pp_p2p_per_edge=config.pp_p2p_per_edge,
         **mesh.pipeline_axis_kwargs(),
         **config_dict,
     )
