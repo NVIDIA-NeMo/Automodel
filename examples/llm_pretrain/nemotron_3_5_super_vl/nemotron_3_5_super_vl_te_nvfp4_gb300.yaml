@@ -55,8 +55,8 @@
 #     tensor. With balanced routing that is 22 x 4 x 8192 rows = 1.9e9 elements (3.9e9 with local_batch_size:
 #     8); the learned gate of a randomly initialized model sent one rank up to 3.6 times the balanced rows
 #     (measured, below). A dispatch above 2**32 - 2**28 elements is quantized and multiplied in consecutive
-#     chunks of rows that each stay within that count, whatever its size. Rank 0 logs the first such dispatch
-#     and, at 256, 512, ... dispatches, how many there were.
+#     chunks of rows that each stay within that count, whatever its size. With te_grouped_tensor: true the
+#     limit is 2**31 and a larger dispatch stops the run, so this file leaves it off.
 #   - Dense Transformer Engine linears are not checked. The largest one here, the Mamba input projection,
 #     holds 4 x 8192 x 18560 = 0.6e9 elements in its output.
 #   - The Mamba scan stops the run with an error above 2**31 - 1 projected elements: 15 or more sequences of

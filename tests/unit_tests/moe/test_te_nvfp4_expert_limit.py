@@ -14,7 +14,6 @@
 
 """Transformer Engine experts under NVFP4: at most 64 experts per rank, and resident weights need those experts."""
 
-import logging
 import random
 import sys
 from dataclasses import dataclass
@@ -28,9 +27,11 @@ import torch.nn.functional as F
 from nemo_automodel.components.models.common import utils as common_utils
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe import experts as experts_module
+from nemo_automodel.components.moe import nvfp4_dispatch
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExpertsTE, _plan_dispatch_chunks
+from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.components.moe.nvfp4_dispatch import nvfp4_dispatch_chunks, plan_dispatch_chunks
 
 
 class _FakeGroupedLinear(torch.nn.Module):
@@ -163,10 +164,10 @@ def test_resident_weights_are_rejected_where_floating_point_experts_are_built(
     assert type(MoE(_moe_config(8), BackendConfig(**choice, te_nvfp4={})).experts).__name__ == built
 
 
-# Transformer Engine experts under a quantization recipe: every dispatch runs on a path that is right for it.
+# Transformer Engine experts under NVFP4: a dispatch too large for one quantization.
 #
-# CPU tests of the size limits of the two GEMM paths under NVFP4, of the plan that cuts a dispatch above both into
-# chunks of rows, and of the forward that follows them, against a stand-in for ``GroupedLinear``.
+# CPU tests of the size limits of the two GEMM paths, of the plan that cuts a dispatch with one GEMM per expert
+# into chunks of rows, and of the forward that follows it, against a stand-in for ``GroupedLinear``.
 
 
 # A rank of 32 experts of 1024 -> 2688 -> 1024; 45,056 rows per expert are 22 routes for each of 8 x 8192 tokens.
@@ -207,7 +208,6 @@ class _Call:
     splits_on_host: bool
     grouped_tensor: bool
     weight_cache: bool | None = None
-    output_buffer: bool = False
 
 
 class _RecordingGroupedLinear(torch.nn.Module):
@@ -239,30 +239,20 @@ class _RecordingGroupedLinear(torch.nn.Module):
         values: torch.Tensor,
         splits: torch.Tensor | list[int],
         is_first_microbatch: bool | None = None,
-        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multiply the rows of every expert with its weight."""
         # Transformer Engine takes device split sizes on the grouped-tensor path and host ones otherwise.
         assert isinstance(splits, torch.Tensor) == self.use_grouped_tensor
         counts = splits.tolist() if isinstance(splits, torch.Tensor) else list(splits)
         assert sum(counts) == values.shape[0]
-        self.calls.append(
-            _Call(counts, isinstance(splits, list), self.use_grouped_tensor, is_first_microbatch, out is not None)
-        )
+        self.calls.append(_Call(counts, isinstance(splits, list), self.use_grouped_tensor, is_first_microbatch))
         if self.fail:
             raise RuntimeError("GEMM failed")
         outputs, row = [], 0
         for expert, count in enumerate(counts):
             outputs.append(F.linear(values[row : row + count], getattr(self, f"weight{expert}")))
             row += count
-        result = torch.cat(outputs)
-        if out is not None:
-            # Transformer Engine returns a view of the buffer; here the buffer gets the values and the caller
-            # the tensor that carries the gradient.
-            assert out.shape == result.shape and not out.requires_grad
-            with torch.no_grad():
-                out.copy_(result)
-        return result
+        return torch.cat(outputs)
 
 
 class _Padding(torch.nn.Module):
@@ -325,8 +315,6 @@ def fake_te_state(monkeypatch):
     monkeypatch.setattr(experts_module, "_ExpertGroupedLinear", _RecordingGroupedLinear)
     monkeypatch.setattr(experts_module, "is_te_min_version", lambda version: True)
     monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
-    # The counts behind the log lines are kept per process: every test starts from zero.
-    monkeypatch.setattr(experts_module, "_DISPATCH_COUNTS", experts_module._QuantizedDispatchCounts())
     monkeypatch.setattr(common_utils, "IS_FIRST_MICROBATCH", None)
     return state
 
@@ -382,14 +370,10 @@ def _run(
     return values
 
 
-def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [record.getMessage() for record in caplog.records if record.name == experts_module.__name__]
-
-
 @pytest.mark.cpu_only
 def test_limits_stay_below_the_offsets_at_which_the_kernels_fail():
-    assert experts_module._NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS == GROUPED_LIMIT == 2**31 * 15 // 16
-    assert experts_module._NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS == PER_EXPERT_LIMIT == 2**32 * 15 // 16
+    assert nvfp4_dispatch.NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS == GROUPED_LIMIT == 2**31 * 15 // 16
+    assert nvfp4_dispatch.NVFP4_QUANTIZE_MAX_ELEMENTS == PER_EXPERT_LIMIT == 2**32 * 15 // 16
 
 
 @pytest.mark.cpu_only
@@ -413,13 +397,13 @@ def test_limits_stay_below_the_offsets_at_which_the_kernels_fail():
     ],
 )
 def test_chunk_plan_of_small_dispatches(rows_per_expert, max_rows, align, expected):
-    assert _plan_dispatch_chunks(rows_per_expert, max_rows=max_rows, align=align) == expected
+    assert plan_dispatch_chunks(rows_per_expert, max_rows=max_rows, align=align) == expected
 
 
 @pytest.mark.cpu_only
 def test_chunk_plan_rejects_a_chunk_smaller_than_one_block():
     with pytest.raises(ValueError, match="at most 100 rows cannot hold a block of 128 rows"):
-        _plan_dispatch_chunks([128, 256], max_rows=100, align=128)
+        plan_dispatch_chunks([128, 256], max_rows=100, align=128)
 
 
 @pytest.mark.cpu_only
@@ -432,7 +416,7 @@ def test_chunk_plan_covers_every_row_in_order_within_the_limit():
         max_rows = generator.randint(align, 24 * align)
         capacity = max_rows // align * align
 
-        chunks = _plan_dispatch_chunks(rows_per_expert, max_rows=max_rows, align=align)
+        chunks = plan_dispatch_chunks(rows_per_expert, max_rows=max_rows, align=align)
 
         # Every row of every expert is in exactly one chunk, in whole blocks, and no chunk is over the limit.
         assert [sum(chunk[expert] for chunk in chunks) for expert in range(experts)] == rows_per_expert
@@ -458,77 +442,71 @@ def test_chunk_plan_covers_every_row_in_order_within_the_limit():
             assert sum(chunk) + (rows_per_expert[expert] if whole_expert_moved else first_piece) > capacity
 
 
-def _expected_calls(kind: str | None, native: bool, m_splits: list[int]) -> list[list[int]] | None:
-    """What a dispatch of the 32-expert rank needs, derived from its element count."""
-    if kind is None:
+def _expected_chunks(kind: str | None, grouped: bool, m_splits: list[int]) -> list[list[int]] | str | None:
+    """What a dispatch of the 32-expert rank needs, derived from its element count; ``"error"`` if it must stop."""
+    if kind not in ("nvfp4", "custom"):
         return None
     elements = sum(m_splits) * RANK_WIDTH
-    if kind in ("nvfp4", "custom") and elements > PER_EXPERT_LIMIT:
-        rows = max(m_splits)
-        # Whole experts per chunk: the per-expert limit in rows, rounded down to blocks, holds this many.
-        per_chunk = (PER_EXPERT_LIMIT // RANK_WIDTH // NVFP4_ROW_ALIGN * NVFP4_ROW_ALIGN) // rows
-        assert per_chunk >= 1
-        with_rows = [expert for expert, count in enumerate(m_splits) if count]
-        return [
-            [rows if expert in with_rows[start : start + per_chunk] else 0 for expert in range(RANK_EXPERTS)]
-            for start in range(0, len(with_rows), per_chunk)
-        ]
-    if native and kind in ("nvfp4", "custom") and elements > GROUPED_LIMIT:
-        return [m_splits]
-    return None
+    if grouped and elements > GROUPED_LIMIT:
+        return "error"
+    if elements <= PER_EXPERT_LIMIT:
+        return None
+    rows = max(m_splits)
+    # Whole experts per chunk: the per-expert limit in rows, rounded down to blocks, holds this many.
+    per_chunk = (PER_EXPERT_LIMIT // RANK_WIDTH // NVFP4_ROW_ALIGN * NVFP4_ROW_ALIGN) // rows
+    assert per_chunk >= 1
+    with_rows = [expert for expert, count in enumerate(m_splits) if count]
+    return [
+        [rows if expert in with_rows[start : start + per_chunk] else 0 for expert in range(RANK_EXPERTS)]
+        for start in range(0, len(with_rows), per_chunk)
+    ]
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("kind", "native", "rows_per_expert", "empty_experts", "expected_calls"),
+    ("kind", "grouped", "rows_per_expert", "empty_experts", "expected_chunks"),
     [
-        # NVFP4 with te_grouped_tensor: grouped-tensor GEMMs up to their limit, one GEMM per expert above it,
-        # chunks above the limit of that path.
+        # NVFP4 with te_grouped_tensor: one call up to the limit of the grouped quantization, an error above it.
         ("nvfp4", True, 22528, 0, None),
         ("nvfp4", True, 23296, 0, None),
-        ("nvfp4", True, 23424, 0, 1),
-        ("nvfp4", True, 45056, 0, 1),
-        ("nvfp4", True, 46720, 0, 1),
-        ("nvfp4", True, 46848, 0, 2),
-        ("nvfp4", True, 100352, 0, 3),
-        # NVFP4 with one GEMM per expert: nothing to change up to its limit, chunks above it.
+        ("nvfp4", True, 23424, 0, "error"),
+        ("nvfp4", True, 100352, 0, "error"),
+        # NVFP4 with one GEMM per expert: one call up to its limit, chunks above it.
         ("nvfp4", False, 45056, 0, None),
         ("nvfp4", False, 46720, 0, None),
         ("nvfp4", False, 46848, 0, 2),
-        # A custom recipe can hold NVFP4 quantizers; it only runs with one GEMM per expert.
+        ("nvfp4", False, 100352, 0, 3),
+        # A custom recipe can hold NVFP4 quantizers and is limited like NVFP4.
         ("custom", False, 46720, 0, None),
         ("custom", False, 46848, 0, 2),
+        ("custom", True, 23424, 0, "error"),
         # MXFP8 and unquantized GEMMs are not limited.
         ("mxfp8", True, 100352, 0, None),
         ("mxfp8", False, 100352, 0, None),
         (None, True, 100352, 0, None),
         # Experts without rows change nothing: the size alone decides.
         ("nvfp4", True, 1024, 3, None),
-        ("mxfp8", True, 1024, 1, None),
         ("nvfp4", False, 1024, 3, None),
-        ("nvfp4", True, 45056, 3, 1),
-        ("nvfp4", True, 100352, 16, 2),
-        # Without a recipe the split sizes stay on the device and the dispatch is not inspected.
-        (None, True, 1024, 3, None),
+        ("nvfp4", False, 100352, 16, 2),
+        ("nvfp4", True, 45056, 3, "error"),
     ],
 )
-def test_calls_of_a_dispatch_by_recipe_path_and_size(
-    fake_te_state, monkeypatch, kind, native, rows_per_expert, empty_experts, expected_calls
-):
-    module = _experts([0] * RANK_EXPERTS, native=native)
-    # The widths of the rank above; the plan reads nothing else from the module.
-    monkeypatch.setattr(module.config, "moe_latent_size", 1024)
-    monkeypatch.setattr(module.config, "moe_inter_dim", RANK_WIDTH)
+def test_chunks_of_a_dispatch_by_recipe_path_and_size(kind, grouped, rows_per_expert, empty_experts, expected_chunks):
     recipe = _Recipe(kind) if kind is not None else None
     m_splits = [0] * empty_experts + [rows_per_expert] * (RANK_EXPERTS - empty_experts)
-    expected = _expected_calls(kind, native, m_splits)
-    assert (None if expected is None else len(expected)) == expected_calls
+    expected = _expected_chunks(kind, grouped, m_splits)
+    assert (len(expected) if isinstance(expected, list) else expected) == expected_chunks
 
-    assert module._per_expert_chunks(recipe, m_splits, NVFP4_ROW_ALIGN) == expected
+    if expected == "error":
+        with pytest.raises(ValueError, match=r"grouped NVFP4 quantization.*Set backend.te_grouped_tensor: false"):
+            nvfp4_dispatch_chunks(recipe, m_splits, width=RANK_WIDTH, align=NVFP4_ROW_ALIGN, grouped=grouped)
+    else:
+        chunks = nvfp4_dispatch_chunks(recipe, m_splits, width=RANK_WIDTH, align=NVFP4_ROW_ALIGN, grouped=grouped)
+        assert chunks == expected
 
 
 @pytest.mark.cpu_only
-def test_a_dispatch_too_large_for_grouped_quantization_runs_one_gemm_per_expert(fake_te_state, monkeypatch, caplog):
+def test_a_dispatch_too_large_for_grouped_quantization_stops_the_run(fake_te_state, monkeypatch):
     torch.manual_seed(3)
     counts = [5, 4, 7, 3, 9, 2]
     module = _experts(counts, native=True)
@@ -538,37 +516,24 @@ def test_a_dispatch_too_large_for_grouped_quantization_runs_one_gemm_per_expert(
     _set_recipe(fake_te_state, "nvfp4")
     layers = (module.gate_up_linear, module.down_linear)
 
-    grouped = _run(module, hidden, probs, upstream)
-    assert [layer.calls for layer in layers] == [[_Call(counts, False, True)]] * 2
-
-    # 30 rows of the 16-wide intermediate are 480 elements: above the grouped limit, within the other.
-    monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 30 * INTER_DIM - 1)
-    monkeypatch.setattr(experts_module, "_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS", 30 * INTER_DIM)
-    with caplog.at_level(logging.WARNING, logger=experts_module.__name__):
-        per_expert = _run(module, hidden, probs, upstream)
+    # 30 rows of the 16-wide intermediate are 480 elements: one element above the limit stops the dispatch
+    # before any GEMM runs.
+    monkeypatch.setattr(nvfp4_dispatch, "NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 30 * INTER_DIM - 1)
+    with pytest.raises(
+        ValueError, match=rf"30 rows holds {30 * INTER_DIM} elements, more than the {30 * INTER_DIM - 1}"
+    ):
         _run(module, hidden, probs, upstream)
+    assert [layer.calls for layer in layers] == [[], []]
 
-    # Both projections ran as modules without grouped-tensor GEMMs, with host split sizes, and are restored.
-    assert [layer.calls for layer in layers] == [[_Call(counts, True, False)]] * 2
-    assert all(layer.use_grouped_tensor for layer in layers)
-    assert grouped.keys() == per_expert.keys()
-    for name, expected in grouped.items():
-        torch.testing.assert_close(per_expert[name], expected, rtol=1e-6, atol=1e-6, msg=name)
-    # Two dispatches left the grouped-tensor path, one line says so.
-    messages = _messages(caplog)
-    assert len(messages) == 1, messages
-    assert f"a dispatch of 30 rows holds {30 * INTER_DIM} elements, more than the {30 * INTER_DIM - 1}" in messages[0]
-    assert "such dispatches run one GEMM per expert instead" in messages[0]
-
-    # One row less fits the grouped quantization again.
-    monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 30 * INTER_DIM)
+    # At the limit the dispatch runs grouped-tensor GEMMs with device split sizes.
+    monkeypatch.setattr(nvfp4_dispatch, "NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 30 * INTER_DIM)
     _run(module, hidden, probs, upstream)
     assert [layer.calls for layer in layers] == [[_Call(counts, False, True)]] * 2
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8"])
-def test_a_dispatch_with_an_empty_expert_stays_on_the_path_the_module_is_built_for(fake_te_state, caplog, kind):
+def test_a_dispatch_with_an_empty_expert_stays_on_the_path_the_module_is_built_for(fake_te_state, kind):
     torch.manual_seed(5)
     counts = [5, 0, 7, 3]
     module = _experts(counts, native=True)
@@ -581,14 +546,12 @@ def test_a_dispatch_with_an_empty_expert_stays_on_the_path_the_module_is_built_f
     assert [layer.calls for layer in layers] == [[_Call(counts, False, True)]] * 2
 
     _set_recipe(fake_te_state, kind)
-    with caplog.at_level(logging.WARNING, logger=experts_module.__name__):
-        quantized = _run(module, hidden, probs, upstream)
+    quantized = _run(module, hidden, probs, upstream)
 
-    # Grouped-tensor GEMMs with device split sizes, as without a recipe, and nothing to report.
+    # Grouped-tensor GEMMs with device split sizes, as without a recipe.
     assert [layer.calls for layer in layers] == [[_Call(counts, False, True)]] * 2
     for name, expected in unquantized.items():
         torch.testing.assert_close(quantized[name], expected, rtol=1e-6, atol=1e-6, msg=name)
-    assert _messages(caplog) == []
     # The expert without rows gets zero gradients from the call.
     for layer in layers:
         assert torch.count_nonzero(layer.weight1.grad) == 0
@@ -596,33 +559,14 @@ def test_a_dispatch_with_an_empty_expert_stays_on_the_path_the_module_is_built_f
 
 
 @pytest.mark.cpu_only
-def test_the_grouped_tensor_path_is_restored_when_a_gemm_fails(fake_te_state, monkeypatch):
-    counts = [4, 6]
-    module = _experts(counts, native=True)
-    _set_recipe(fake_te_state, "nvfp4")
-    monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 9 * INTER_DIM)
-    module.gate_up_linear.fail = True
-    hidden = torch.randn(sum(counts), EXPERT_DIM)
-
-    with pytest.raises(RuntimeError, match="GEMM failed"):
-        module(hidden, torch.ones(10, dtype=torch.bool), torch.rand(10, 1), torch.zeros(10, 1, dtype=torch.long))
-
-    assert module.gate_up_linear.calls == [_Call(counts, True, False)]
-    assert module.gate_up_linear.use_grouped_tensor and module.down_linear.use_grouped_tensor
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("native", [True, False])
 @pytest.mark.parametrize("first_microbatch", [True, False, None])
-def test_a_dispatch_too_large_for_one_nvfp4_quantization_runs_in_chunks(
-    fake_te_state, monkeypatch, caplog, native, first_microbatch
-):
+def test_a_dispatch_too_large_for_one_nvfp4_quantization_runs_in_chunks(fake_te_state, monkeypatch, first_microbatch):
     torch.manual_seed(11)
     # Blocks of 2 rows. 26 rows; a chunk holds 10: experts 0-1, expert 2 in three pieces of which the first fills
     # the first chunk, expert 4 behind its last piece, expert 5 alone.
     counts = [4, 2, 14, 0, 2, 4]
     chunks = [[4, 2, 4, 0, 0, 0], [0, 0, 10, 0, 0, 0], [0, 0, 0, 0, 2, 4]]
-    module = _experts(counts, native=native)
+    module = _experts(counts, native=False)
     module.fp8_padding.align_size = 2
     hidden = torch.randn(sum(counts), EXPERT_DIM)
     probs = torch.rand(sum(counts), 1)
@@ -631,66 +575,21 @@ def test_a_dispatch_too_large_for_one_nvfp4_quantization_runs_in_chunks(
     monkeypatch.setattr(common_utils, "IS_FIRST_MICROBATCH", first_microbatch)
     layers = (module.gate_up_linear, module.down_linear)
 
-    # One call on the path the module is built for; here it only supplies the values.
+    # One call per projection; here it only supplies the values.
     single = _run(module, hidden, probs, upstream)
-    assert [len(layer.calls) for layer in layers] == [1, 1]
+    assert [layer.calls for layer in layers] == [[_Call(counts, True, False)]] * 2
 
     # 10 rows of the 16-wide intermediate fit one quantization, 11 do not.
-    monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 5 * INTER_DIM)
-    monkeypatch.setattr(experts_module, "_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS", 11 * INTER_DIM - 1)
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=experts_module.__name__):
-        chunked = _run(module, hidden, probs, upstream)
+    monkeypatch.setattr(nvfp4_dispatch, "NVFP4_QUANTIZE_MAX_ELEMENTS", 11 * INTER_DIM - 1)
+    chunked = _run(module, hidden, probs, upstream)
 
-    # Every chunk went through both projections with one GEMM per expert and host split sizes. The first call
-    # leaves the weight cache to the projection, the later ones reuse what the first quantized whenever weights
-    # are cached at all; the down projections wrote into one buffer.
+    # Every chunk went through both projections with host split sizes. The first call leaves the weight cache
+    # to the projection, the later ones reuse what the first quantized whenever weights are cached at all.
     later = {True: False, False: False, None: None}[first_microbatch]
-    for layer, buffer in zip(layers, (False, True)):
+    for layer in layers:
         assert layer.calls == [
-            _Call(chunk, True, False, None if index == 0 else later, buffer) for index, chunk in enumerate(chunks)
+            _Call(chunk, True, False, None if index == 0 else later) for index, chunk in enumerate(chunks)
         ]
-    assert all(layer.use_grouped_tensor is native for layer in layers)
     assert single.keys() == chunked.keys()
     for name, expected in single.items():
         torch.testing.assert_close(chunked[name], expected, rtol=1e-5, atol=1e-6, msg=name)
-    messages = _messages(caplog)
-    assert len(messages) == 1, messages
-    assert f"a dispatch of 26 rows holds {26 * INTER_DIM} elements, more than the {11 * INTER_DIM - 1}" in messages[0]
-    assert "in consecutive chunks of rows (3 here), with one GEMM per expert" in messages[0]
-
-
-@pytest.mark.cpu_only
-def test_the_counts_of_dispatches_off_the_configured_path_are_logged(fake_te_state, monkeypatch, caplog):
-    torch.manual_seed(13)
-    module = _experts([4, 4, 4], native=True)
-    _set_recipe(fake_te_state, "nvfp4")
-    # 8 rows fit the grouped quantization, 12 fit one quantization of the per-expert path.
-    monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 8 * INTER_DIM)
-    monkeypatch.setattr(experts_module, "_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS", 12 * INTER_DIM)
-    # 256 dispatches: 156 on grouped-tensor GEMMs (56 of them with an empty expert), 60 too large for them, 40 in
-    # chunks (30 of 16 rows in 2 chunks and 10 of 28 rows in 3).
-    dispatches = [[4, 2, 2]] * 100 + [[4, 4, 4]] * 60 + [[4, 0, 2]] * 56 + [[8, 4, 4]] * 30 + [[12, 12, 4]] * 10
-    assert len(dispatches) == 256
-
-    with caplog.at_level(logging.WARNING, logger=experts_module.__name__), torch.no_grad():
-        for counts in dispatches:
-            module.token_dispatcher = _GroupedInputDispatcher(counts)
-            rows = sum(counts)
-            module(
-                torch.randn(rows, EXPERT_DIM),
-                torch.ones(rows, dtype=torch.bool),
-                torch.rand(rows, 1),
-                torch.zeros(rows, 1, dtype=torch.long),
-            )
-
-    messages = _messages(caplog)
-    # One line for the first dispatch of each kind, and the counts at the 256th dispatch.
-    assert len(messages) == 3, messages
-    assert "such dispatches run one GEMM per expert instead" in messages[0]
-    assert "in consecutive chunks of rows (2 here)" in messages[1]
-    assert messages[2] == (
-        "TE experts: of the 256 quantized expert dispatches of this rank so far, 40 ran in chunks (90 chunks in "
-        "all, the largest dispatch 28 rows), and 60 left the grouped-tensor GEMMs for one GEMM per expert because "
-        "of their size."
-    )

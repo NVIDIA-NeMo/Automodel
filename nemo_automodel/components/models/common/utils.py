@@ -1260,7 +1260,6 @@ def _make_lazy_te_patcher():
     2. is_first_microbatch injection: Reads the global IS_FIRST_MICROBATCH flag and
        passes it to TE Linear/GroupedLinear for FP8 weight caching during
        gradient accumulation (quantize on first microbatch, reuse cached on rest).
-       ``out`` is GroupedLinear's output buffer.
     """
     patched = False
 
@@ -1294,12 +1293,10 @@ def _make_lazy_te_patcher():
                 is_first_microbatch = get_is_first_microbatch()
             return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
 
-        def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None, out=None):
+        def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None):
             if is_first_microbatch is None:
                 is_first_microbatch = get_is_first_microbatch()
-            return _original_grouped_linear_forward(
-                self, inp, m_splits, is_first_microbatch=is_first_microbatch, out=out
-            )
+            return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
 
         TERMSNorm.forward = _patched_rmsnorm_forward
         TELinear.forward = _patched_linear_forward

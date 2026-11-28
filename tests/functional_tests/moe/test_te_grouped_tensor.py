@@ -26,7 +26,7 @@ from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import TENvfp4Config, set_is_first_microbatch
-from nemo_automodel.components.moe import experts as experts_module
+from nemo_automodel.components.moe import nvfp4_dispatch
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.shared.import_utils import is_te_min_version
@@ -457,69 +457,42 @@ def test_native_te_grouped_tensor_matches_the_split_path_under_nvfp4(checkpointe
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
-@pytest.mark.parametrize("checkpointed", [False, True])
-def test_nvfp4_dispatch_above_the_grouped_limit_runs_the_per_expert_path(
-    monkeypatch: pytest.MonkeyPatch, checkpointed: bool
-) -> None:
-    """A dispatch above the grouped quantization limit computes what ``te_grouped_tensor=False`` computes, bit for bit.
+def test_nvfp4_dispatch_above_the_grouped_limit_stops_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A grouped-tensor module refuses a dispatch above the grouped quantization limit and runs one at the limit.
 
-    The limit is lowered so that this small dispatch exceeds it. The weight quantizations match the split module over
-    optimizer steps and all three values of the micro-batch flag, and the module returns to grouped-tensor GEMMs
-    once the limit allows it.
+    The limit is lowered so that this small dispatch exceeds it by one element.
     """
     recipe = _nvfp4_recipe_or_skip(stochastic_rounding=False)
     torch.manual_seed(29)
     # Padded to 384, 128, 128 and 128 rows of a 1024-wide gate/up output: 786,432 elements.
     counts = [300, 17, 40, 63]
-    monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 768 * 1024 - 1)
     reference = _experts(native=False, counts=counts, bias=False)
     candidate = _experts(native=True, counts=counts, bias=False)
-    reference_calls, candidate_calls = _record_gemm_calls(reference), _record_gemm_calls(candidate)
-    weight_quantized = _record_weight_quantizations(monkeypatch)
-    forwards = 0
-    try:
-        for flags in ((True, False), (True, False), (None,)):
-            _renew_weights(reference, candidate)
-            for flag in flags:
-                set_is_first_microbatch(flag)
-                x, probs, upstream = _random_batch(sum(counts))
-                results, quantizations = [], []
-                for module in (reference, candidate):
-                    weight_quantized.clear()
-                    results.append(_nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed))
-                    quantizations.append(sum(weight_quantized))
-                forwards += 2 if checkpointed else 1
-                # Two projections of four experts, quantized in the forward and again in its recompute.
-                assert quantizations == [{True: 8, False: 0, None: 8}[flag] * (2 if checkpointed else 1)] * 2
-                per_expert, fallback = results
-                assert per_expert.keys() == fallback.keys()
-                for name, expected in per_expert.items():
-                    assert torch.equal(fallback[name], expected), name
-        assert [path for _, path in reference_calls] == [False] * forwards
-        assert [path for _, path in candidate_calls] == [False] * forwards
-        assert candidate.gate_up_linear.use_grouped_tensor and candidate.down_linear.use_grouped_tensor
+    _renew_weights(reference, candidate)
+    calls = _record_gemm_calls(candidate)
+    x, probs, upstream = _random_batch(sum(counts))
 
-        # Within the limit the same module runs grouped-tensor GEMMs again, with the same result.
-        monkeypatch.setattr(experts_module, "_NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 768 * 1024)
-        set_is_first_microbatch(None)
-        per_expert, grouped = (
-            _nvfp4_step(module, recipe, x, probs, upstream, checkpointed=checkpointed)
-            for module in (reference, candidate)
-        )
-        assert [path for _, path in candidate_calls[forwards:]] == [True] * (2 if checkpointed else 1)
-        assert torch.equal(grouped["output"], per_expert["output"])
-        assert torch.equal(grouped["input_grad"], per_expert["input_grad"])
-        for name, expected in per_expert.items():
-            assert _relative_l2(grouped[name], expected) < 1e-4, name
-    finally:
-        set_is_first_microbatch(None)
+    monkeypatch.setattr(nvfp4_dispatch, "NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 768 * 1024 - 1)
+    with pytest.raises(ValueError, match="Set backend.te_grouped_tensor: false"):
+        _nvfp4_step(candidate, recipe, x, probs, upstream, checkpointed=False)
+    assert calls == []
+
+    # Within the limit the module runs grouped-tensor GEMMs, with the result of one GEMM per expert.
+    monkeypatch.setattr(nvfp4_dispatch, "NVFP4_GROUPED_QUANTIZE_MAX_ELEMENTS", 768 * 1024)
+    per_expert, grouped = (
+        _nvfp4_step(module, recipe, x, probs, upstream, checkpointed=False) for module in (reference, candidate)
+    )
+    assert calls == [(768, True)]
+    assert torch.equal(grouped["output"], per_expert["output"])
+    assert torch.equal(grouped["input_grad"], per_expert["input_grad"])
+    for name, expected in per_expert.items():
+        assert _relative_l2(grouped[name], expected) < 1e-4, name
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
-@pytest.mark.parametrize("native", [True, False])
 @pytest.mark.parametrize("checkpointed", [False, True])
 def test_nvfp4_dispatch_above_the_per_expert_limit_runs_in_chunks(
-    monkeypatch: pytest.MonkeyPatch, native: bool, checkpointed: bool
+    monkeypatch: pytest.MonkeyPatch, checkpointed: bool
 ) -> None:
     """A dispatch above the per-expert quantization limit is quantized in chunks of rows and stays right.
 
@@ -542,7 +515,7 @@ def test_nvfp4_dispatch_above_the_per_expert_limit_runs_in_chunks(
         ]
         for counts, chunk_rows, flags in cases:
             reference = _experts(native=False, counts=counts, bias=False)
-            candidate = _experts(native=native, counts=counts, bias=False)
+            candidate = _experts(native=False, counts=counts, bias=False)
             calls = _record_gemm_calls(candidate)
             _renew_weights(reference, candidate)
             for flag in flags:
@@ -555,13 +528,12 @@ def test_nvfp4_dispatch_above_the_per_expert_limit_runs_in_chunks(
                 calls.clear()
                 weight_quantized.clear()
                 with monkeypatch.context() as lowered:
-                    lowered.setattr(experts_module, "_NVFP4_SPLIT_QUANTIZE_MAX_ELEMENTS", limit)
+                    lowered.setattr(nvfp4_dispatch, "NVFP4_QUANTIZE_MAX_ELEMENTS", limit)
                     chunked = _nvfp4_step(candidate, recipe, x, probs, upstream, checkpointed=checkpointed)
                 chunked_quantizations = sum(weight_quantized)
 
                 # Every call ran one GEMM per expert on at most 512 rows; the chunks cover the padded rows.
                 assert calls == [(rows, False) for rows in chunk_rows] * forwards
-                assert candidate.gate_up_linear.use_grouped_tensor is native
                 # Two projections of four experts. In a first micro-batch the first call of the forward quantizes
                 # the cached weights and the first call of its recompute quantizes them again; without the cache
                 # every call quantizes them.
@@ -669,8 +641,8 @@ def _rank_config(num_experts: int, *, native: bool, side_stream: bool) -> tuple[
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
 @pytest.mark.parametrize(
     ("layout", "native", "side_stream"),
-    [(layout, native, False) for layout in REAL_LAYOUTS for native in (True, False)]
-    + [("half_empty_1.9e9", False, True)],
+    [(layout, False, False) for layout in REAL_LAYOUTS]
+    + [("half_empty_1.9e9", True, False), ("half_empty_1.9e9", False, True)],
 )
 def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
     monkeypatch: pytest.MonkeyPatch, layout: str, native: bool, side_stream: bool
@@ -795,8 +767,7 @@ def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
         set_is_first_microbatch(None)
 
     # No quantization covered more than its path handles: every forward and every recompute ran the same
-    # calls, each within the per-expert limit, on grouped-tensor GEMMs only for a module built for them and a
-    # dispatch within their limit.
+    # calls, each within the per-expert limit, on the path the module is built for.
     per_pass = len(calls) // (2 * rounds)
     forward_calls = calls[:per_pass]
     assert calls == forward_calls * (2 * rounds)
@@ -804,9 +775,7 @@ def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
     assert all(rows * inter <= REAL_PER_EXPERT_LIMIT for rows, _ in forward_calls)
     # The layouts above need no extra call for ending their chunks at expert boundaries.
     assert len(forward_calls) == math.ceil(elements / REAL_PER_EXPERT_LIMIT)
-    grouped = native and elements <= REAL_GROUPED_LIMIT
-    assert all(path is grouped for _, path in forward_calls)
-    assert module.gate_up_linear.use_grouped_tensor is native
+    assert all(path is native for _, path in forward_calls)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 recipe switching requires CUDA")
