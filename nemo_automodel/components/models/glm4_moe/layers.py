@@ -57,7 +57,11 @@ class Glm4MoeAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
         self.use_qk_norm = config.use_qk_norm
-        self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        # Transformers 5.22 nests partial_rotary_factor under rope_parameters; the
+        # legacy flat attribute is kept as a fallback for older configs.
+        self.partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+        if self.partial_rotary_factor is None:
+            self.partial_rotary_factor = getattr(config, "rope_parameters", {}).get("partial_rotary_factor", 0.5)
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 

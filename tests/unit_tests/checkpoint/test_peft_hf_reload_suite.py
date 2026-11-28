@@ -466,6 +466,7 @@ _FAMILIES = (
         {"target_modules": ["*.q_proj", "*.v_proj"]},
         build_reference=_build_qwen3_omni_moe_reference,
         reference_path="thinker",
+        full_modules=("model.language_model.embed_tokens", "model.language_model.norm", "lm_head"),
     ),
     _Family(
         "qwen2_5_omni",
@@ -473,6 +474,7 @@ _FAMILIES = (
         {"target_modules": ["*.q_proj", "*.v_proj"]},
         build_reference=_build_qwen2_5_omni_reference,
         reference_path="thinker",
+        full_modules=("model.language_model.embed_tokens", "model.language_model.norm", "lm_head"),
     ),
     # Same adapter, thinker-only base: the namespace the full layout requires is exactly
     # the one this layout must not have, so one hook has to serve both.
@@ -480,6 +482,7 @@ _FAMILIES = (
         "qwen3_omni_moe_standalone_thinker",
         _build_qwen3_omni_moe_standalone_thinker,
         {"target_modules": ["*.q_proj", "*.v_proj"]},
+        full_modules=("model.language_model.embed_tokens", "model.language_model.norm", "lm_head"),
     ),
 )
 

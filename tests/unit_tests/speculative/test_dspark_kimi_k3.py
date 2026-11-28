@@ -204,6 +204,13 @@ def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch, ena
         "from_pretrained",
         lambda *args, **kwargs: target_config,
     )
+    # resolve_revision downloads the target config to pin its snapshot; stub it so the
+    # CPU test never reaches the Hub.
+    monkeypatch.setattr(
+        _dspark_target_build.NeMoAutoConfig,
+        "resolve_revision",
+        lambda *args, **kwargs: "main",
+    )
     monkeypatch.setattr(
         _dspark_target_build,
         "create_distributed_setup_from_config",
