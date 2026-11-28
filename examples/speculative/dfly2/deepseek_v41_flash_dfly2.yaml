@@ -9,8 +9,8 @@
 # last hidden state is fused into the anchor slot, and a hidden correction with
 # an attentive correction adjusts every slot before the frozen LM head.
 #
-# The draft layers start from their paired target layers (attention, norms and
-# mHC mixes); the routed experts start fresh. Set recipe_args.draft_weights_path
+# The draft layers start from their paired target layers (attention, norms, mHC
+# mixes and shared expert); the routed experts and the router start fresh. Set recipe_args.draft_weights_path
 # to warm-start every draft weight from the released checkpoint instead. Use
 # restore_from below to resume an AutoModel DFly2 training checkpoint.
 #
@@ -21,7 +21,10 @@
 #
 # This is a production-scale configuration. Adapt the node count, EP size,
 # accumulation, data paths, and checkpoint path to the cluster. EP size must
-# divide the target's 384 routed experts.
+# divide the target's 384 routed experts, and the number of ranks must split the
+# draft's 128 routed experts the way its checkpoint expects: of the rank counts
+# from 12 to 128 that divide 384, only 16, 32, 64 and 128 do (setup refuses the
+# others rather than hang at the first checkpoint).
 #
 # Launch the same command on every node and vary --node-rank:
 #   torchrun --nnodes=16 --node-rank=0 --nproc_per_node=4 \

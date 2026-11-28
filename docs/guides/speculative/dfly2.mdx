@@ -39,7 +39,7 @@ before its label:
 |------|---------|
 | LK distillation | `lambda * KL + (1 - lambda) * TV` with `lambda = exp(-lk_eta * (1 - TV))`: distills while the draft is far from the target, then optimizes the acceptance probability `1 - TV` |
 | D-PACE weights (`dpace_alpha`, default 0.5) | detached per-slot weights from the draft's confidence on the corpus token, emphasizing the slots that decide the accepted length |
-| `L_conf` (`confidence_head_alpha`, default 0.0) | optional BCE training a confidence head, on detached states, against the slot's acceptance probability |
+| `L_conf` (`confidence_head_alpha`, default 0.0) | optional BCE training a confidence head, on the detached final-normalized states, against the slot's acceptance probability |
 
 The logs report the corpus cross entropy (`ce`), the TV term (`tv`), the
 per-position acceptance `accept_rate@k`, and the expected accepted block length
@@ -60,7 +60,7 @@ target's training template.
 
 The example configuration follows the released
 [AngelSlim/DS-V4.1-Flash-DFly2-B6](https://huggingface.co/AngelSlim/DS-V4.1-Flash-DFly2-B6)
-layout. Launch the same command on every node:
+layout. Launch the same command on every node, varying `--node-rank`:
 
 ```bash
 torchrun --nnodes=16 --node-rank=0 --nproc_per_node=4 \
@@ -90,6 +90,13 @@ The example trains with AdamW and FP32 master weights at a global batch of 256
 sequences; the paper uses Muon. Its learning rate is for a fresh draft: when
 warm-starting from the released draft, lower it (for example to `5.0e-6`), or the
 first steps move the converged draft away from its optimum.
+
+<Note>
+The number of ranks must split the draft's 128 routed experts the way its checkpoint
+expects: FSDP2 shards them like `torch.chunk`, the export expects an even split. Of the
+rank counts from 12 to 128 that divide the target's 384 experts, only 16, 32, 64, and
+128 qualify; setup refuses the others rather than hang at the first checkpoint.
+</Note>
 
 <Note>
 The DFly2 path trains against a colocated text target on unpacked rows. Sequence
