@@ -87,8 +87,12 @@ class Ernie4_5_MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         device_mesh: "DeviceMesh" | None = None,
         **kwargs,
     ) -> dict[str, Any]:
+        # Detect the prefix from an expert key: lm_head.weight has no "model." prefix and may come last.
+        for key in hf_state_dict:
+            if ".mlp.experts." in key and key.endswith(".weight"):
+                self._uses_model_prefix = key.startswith("model.")
+                break
         for key in list(hf_state_dict.keys()):
-            self._uses_model_prefix = key.startswith("model.")
             if key.startswith("model.mtp_"):
                 hf_state_dict.pop(key)
                 continue
