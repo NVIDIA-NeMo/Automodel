@@ -3814,3 +3814,62 @@ def test_apply_ac_leaves_the_moe_recompute_cache_out_when_no_expert_asks_for_it(
     P.apply_ac(HybridEPModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=384)
 
     cache_wrapper.assert_not_called()
+
+
+def test_router_save_policy_matches_every_per_layer_expert_count(monkeypatch):
+    """A tuple of expert counts saves the router projection of each differently sized layer."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    torch_stub = sys.modules["torch"]
+    hidden_size = 17
+    policy = P.router_save_checkpoint_policy(hidden_size, (31, 47))
+
+    def _mm(num_experts):
+        rhs = type("Mat", (), {"shape": (hidden_size, num_experts)})()
+        return policy(None, torch_stub.ops.aten.mm.default, object(), rhs)
+
+    assert _mm(31) == P.CheckpointPolicy.MUST_SAVE
+    assert _mm(47) == P.CheckpointPolicy.MUST_SAVE
+    assert _mm(39) == P.CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def test_apply_ac_reads_per_layer_expert_counts_from_moe_config(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    captured = {}
+
+    def fake_policy(hidden_size, num_experts):
+        captured["num_experts"] = num_experts
+        return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(P, "router_save_checkpoint_policy", fake_policy)
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", lambda policy: SELECTIVE_CTX)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    model = DummyModel([DummyBlock()])
+    model.moe_config = type("MC", (), {"n_routed_experts": 31, "routed_expert_counts": [31, 47]})()
+    P.apply_ac(model, ignore_router=True, hidden_size=17)
+    assert captured["num_experts"] == (31, 47)
+
+    model.moe_config = type("MC", (), {"n_routed_experts": 31, "routed_expert_counts": [31]})()
+    P.apply_ac(model, ignore_router=True, hidden_size=17)
+    assert captured["num_experts"] == 31
+
+
+def test_parallelize_model_checks_ep_divisibility_for_every_layer_count(monkeypatch):
+    """The first layer's count divides the EP degree; a later layer's count does not."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    moe_config = type("MC", (), {"n_routed_experts": 4, "routed_expert_counts": [4, 6, 7]})()
+    model = type("Outer", (), {"moe_config": moe_config})()
+    world_mesh = FakeWorldMesh({("dp",): 1, "tp": 1, "cp": 1}, mesh_dim_names=["dp", "tp", "cp"])
+
+    with pytest.raises(AssertionError, match="n_routed_experts 7 must be divisible"):
+        P.parallelize_model(
+            model=model,
+            world_mesh=world_mesh,
+            moe_mesh=FakeMoeMesh({"ep": 2}),
+            dp_axis_names=("dp",),
+            cp_axis_name=None,
+            tp_axis_name=None,
+            ep_axis_name="ep",
+            ep_shard_axis_names=None,
+            activation_checkpointing=False,
+        )

@@ -15,6 +15,7 @@
 import gc
 import os
 import re
+from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
@@ -111,6 +112,15 @@ class MoESplitExpertsStateDictMixin:
 
         return is_gated_activation(self.moe_config.expert_activation)
 
+    def _moe_config_for_layer(self, layer_num: int | str) -> Any:
+        """Return the MoE config for one backbone layer (the shared config when layers are uniform).
+
+        Adapters may carry a config object other than ``MoEConfig``; one without ``for_layer`` has a
+        single shape for every layer.
+        """
+        for_layer = getattr(self.moe_config, "for_layer", None)
+        return for_layer(layer_num) if for_layer is not None else self.moe_config
+
     def _register_inplace_loaded_key(self, fqn: str, prefix_override: str | None) -> None:
         """Mark ``fqn`` as loaded via in-place views so ``_from_hf_w_merged_experts`` skips its rebuild.
 
@@ -130,6 +140,11 @@ class MoESplitExpertsStateDictMixin:
         if not hasattr(self, "_inplace_loaded_native_keys") or self._inplace_loaded_native_keys is None:
             self._inplace_loaded_native_keys = set()
         self._inplace_loaded_native_keys.add(tracked)
+        # Expert ids are rank-local and, when MoE layers differ in shape, layer-specific, so keep
+        # them per key rather than relying on the ids of whichever layer was split last.
+        if not hasattr(self, "_inplace_loaded_expert_ids") or self._inplace_loaded_expert_ids is None:
+            self._inplace_loaded_expert_ids = {}
+        self._inplace_loaded_expert_ids[tracked] = list(getattr(self, "_last_expert_ids", None) or [])
 
     @property
     def view_loaded_native_keys(self) -> set[str]:
@@ -181,7 +196,7 @@ class MoESplitExpertsStateDictMixin:
     def _validate_expert_availability(
         self,
         hf_state_dict: dict[str, Any],
-        n_experts: int,
+        n_experts: int | Callable[[int], int],
         device_mesh: Optional["DeviceMesh"] = None,
     ) -> None:
         """Validate that all required experts are available in the HF state dict before loading.
@@ -193,15 +208,22 @@ class MoESplitExpertsStateDictMixin:
             hf_state_dict: HuggingFace state mapping. Expert gate/up values are tensors of shape
                 [expert_hidden, hidden], and down values have shape [hidden, expert_hidden]. This method validates
                 their keys only.
-            n_experts: Total number of experts.
+            n_experts: Total number of experts, or a callable mapping a layer index to that layer's
+                count when MoE layers differ in shape.
             device_mesh: Optional device mesh whose ``ep`` dimension partitions the experts axis.
 
         Raises:
             RuntimeError: If required expert weights are missing from the checkpoint.
         """
+
+        def required_experts_for(layer_num: int) -> list[int]:
+            n = n_experts(layer_num) if callable(n_experts) else n_experts
+            if device_mesh is not None:
+                start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n)
+                return list(range(start_expert, end_expert))
+            return list(range(n))
+
         if device_mesh is not None:
-            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
-            required_experts = list(range(start_expert, end_expert))
             rank = (
                 get_submesh(device_mesh, ("ep",)).get_rank()
                 if "ep" in device_mesh.mesh_dim_names
@@ -209,8 +231,8 @@ class MoESplitExpertsStateDictMixin:
             )
             rank_info = f" (rank {rank})"
         else:
-            required_experts = list(range(n_experts))
             rank_info = ""
+        required_experts: list[int] = []
 
         expert_segment = self._expert_path_segment
 
@@ -246,15 +268,23 @@ class MoESplitExpertsStateDictMixin:
         missing_weights = []
         projection_types = ["gate_proj", "up_proj", "down_proj"] if self._is_gated_moe else ["up_proj", "down_proj"]
         inplace_loaded_keys: set[str] = getattr(self, "_inplace_loaded_native_keys", None) or set()
-        inplace_expert_ids = getattr(self, "_last_expert_ids", None) or required_experts
+        inplace_expert_ids: dict[str, list[int]] = getattr(self, "_inplace_loaded_expert_ids", None) or {}
         total_required = 0
 
         for layer_num, prefixes in layers_with_experts.items():
+            required_experts = required_experts_for(layer_num)
             for prefix in prefixes:
                 for proj_type in projection_types:
                     native_projection = "down_projs" if proj_type == "down_proj" else "gate_and_up_projs"
                     native_key = f"{prefix}layers.{layer_num}.{expert_segment}.{native_projection}"
-                    experts_to_validate = inplace_expert_ids if native_key in inplace_loaded_keys else required_experts
+                    if native_key in inplace_loaded_keys:
+                        experts_to_validate = (
+                            inplace_expert_ids.get(native_key)
+                            or getattr(self, "_last_expert_ids", None)
+                            or required_experts
+                        )
+                    else:
+                        experts_to_validate = required_experts
                     total_required += len(experts_to_validate)
                     for expert_id in experts_to_validate:
                         expected_key = f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.{proj_type}.weight"
@@ -445,6 +475,13 @@ class MoESplitExpertsStateDictMixin:
           - ``experts.base_layer.lora_B.weight`` (H, r*E)  -> (E, H, r)    = lora_gate_and_up_A
         """
         hf_expert_segment = re.escape(self._v5_peft_hf_expert_path_segment())
+        if getattr(self.moe_config, "layer_configs", None):
+            # The ParamWrapper layout packs every expert of a layer into one tensor whose shape is
+            # resolved from a single global expert count; per-layer shapes are not supported yet.
+            segment = self._v5_peft_hf_expert_path_segment()
+            if any(".lora_" in key and segment in key for key in state_dict):
+                raise NotImplementedError("ParamWrapper expert-LoRA load is not supported with per-layer MoE shapes")
+            return state_dict
         n_experts = self.moe_config.n_routed_experts
         moe_inter = self.moe_config.moe_inter_dim
         gate_up_width = 2 * moe_inter if self._is_gated_moe else moe_inter
@@ -657,7 +694,6 @@ class MoESplitExpertsStateDictMixin:
         GroupedExpertsDeepEPLoRA (e.g. ``layers.0.mlp.experts.lora_gate_and_up_A``).
         """
         expert_segment = re.escape(self._expert_path_segment)
-        n_experts = self.moe_config.n_routed_experts
 
         lora_pattern = re.compile(
             rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
@@ -686,6 +722,7 @@ class MoESplitExpertsStateDictMixin:
             if group_id in processed:
                 continue
             processed.add(group_id)
+            n_experts = self._moe_config_for_layer(layer).n_routed_experts
 
             if len(experts) != n_experts:
                 for eid, t in experts.items():
@@ -800,22 +837,28 @@ class MoESplitExpertsStateDictMixin:
         if reset_view_loaded_keys:
             self._view_loaded_native_keys = set()
 
-        n_experts = self.moe_config.n_routed_experts
         is_gated = self._is_gated_moe
 
-        self._validate_expert_availability(hf_state_dict, n_experts, device_mesh)
+        # Expert counts are looked up per layer (identical for uniform models).
+        def layer_n_experts(layer_num: int | str) -> int:
+            return self._moe_config_for_layer(layer_num).n_routed_experts
+
+        def expected_experts_on_rank(layer_num: int | str) -> int:
+            n = layer_n_experts(layer_num)
+            if device_mesh is None:
+                return n
+            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n)
+            return end_expert - start_expert
+
+        self._validate_expert_availability(hf_state_dict, layer_n_experts, device_mesh)
 
         if device_mesh is not None:
-            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
-            expected_experts_per_rank = end_expert - start_expert
             rank = (
                 get_submesh(device_mesh, ("ep",)).get_rank()
                 if "ep" in device_mesh.mesh_dim_names
                 else device_mesh.get_rank()
             )
         else:
-            start_expert, end_expert = 0, n_experts
-            expected_experts_per_rank = n_experts
             rank = None
 
         state_dict: dict[str, Any] = {}
@@ -855,6 +898,8 @@ class MoESplitExpertsStateDictMixin:
                     del value
                     continue
 
+                n_experts = layer_n_experts(layer_num)
+                expected_experts_per_rank = expected_experts_on_rank(layer_num)
                 if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
                     continue
 
@@ -959,6 +1004,8 @@ class MoESplitExpertsStateDictMixin:
         # Drop consumed entries so a subsequent from_hf (e.g. MTP merge after backbone) starts clean.
         if consumed_inplace_keys:
             self._inplace_loaded_native_keys -= consumed_inplace_keys
+            for consumed_key in consumed_inplace_keys:
+                (getattr(self, "_inplace_loaded_expert_ids", None) or {}).pop(consumed_key, None)
             # These native keys were loaded in-place via strided views into model storage (DCP
             # writes the checkpoint tensors straight through them), so they are intentionally
             # absent from the returned state_dict but are NOT missing. Record them so the
@@ -1043,8 +1090,15 @@ class MoESplitExpertsStateDictMixin:
             checkpoint-load tensors may be non-contiguous views into CUDA model
             storage so DCP can overwrite the native grouped weight in place.
         """
-        n_experts = self.moe_config.n_routed_experts
-        inter_dim = self.moe_config.moe_inter_dim
+        # Per-layer expert count and width, resolved from the layer index in the name.
+        layer_match = re.search(r"layers\.(\d+)", fqn)
+        layer_config = (
+            self._moe_config_for_layer(layer_match.group(1))
+            if layer_match is not None and prefix_override is None and f".{self._expert_path_segment}." in fqn
+            else self.moe_config
+        )
+        n_experts = layer_config.n_routed_experts
+        inter_dim = layer_config.moe_inter_dim
         prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
 

@@ -118,6 +118,18 @@ def _pixel_shuffle(x: torch.Tensor, scale_factor: float, ps_version: str) -> tor
     return x
 
 
+def _has_vision_final_layernorm(config: Any) -> bool:
+    """Return whether the checkpoint stores a final vision LayerNorm ahead of the projector.
+
+    A config that sets ``vision_final_layernorm`` decides for itself (a checkpoint with it False
+    ships no such weights); otherwise the norm is inferred from the architecture name.
+    """
+    explicit = getattr(config, "vision_final_layernorm", None)
+    if explicit is not None:
+        return bool(explicit)
+    return "NemotronH_Omni_Reasoning_V3" in (getattr(config, "architectures", None) or [])
+
+
 class VisionProjector(nn.Module):
     """MLP projector from vision encoder to LLM hidden space.
 
@@ -544,11 +556,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             downsample_ratio=self.downsample_ratio,
             # This norm belongs to the pretrained Super 3.5 vision architecture.
             # Disabling the language MTP objective must not remove it.
-            vision_final_layernorm_eps=(
-                vision_config.layer_norm_eps
-                if "NemotronH_Omni_Reasoning_V3" in (getattr(config, "architectures", None) or [])
-                else None
-            ),
+            vision_final_layernorm_eps=(vision_config.layer_norm_eps if _has_vision_final_layernorm(config) else None),
         ).to(dtype)
         logger.info(
             f"NemotronOmni: Vision projector created "

@@ -19,7 +19,7 @@ import logging
 import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -592,7 +592,19 @@ def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     )
 
 
-def router_save_checkpoint_policy(hidden_size: int, num_experts: int) -> Callable[..., CheckpointPolicy]:
+def _routed_expert_counts(moe_config: Any) -> list[int]:
+    """Return the distinct routed-expert counts of a model's MoE layers.
+
+    Models may carry a config object other than ``MoEConfig``; one without
+    ``routed_expert_counts`` has a single count for every layer.
+    """
+    counts = getattr(moe_config, "routed_expert_counts", None)
+    return list(counts) if counts else [moe_config.n_routed_experts]
+
+
+def router_save_checkpoint_policy(
+    hidden_size: int, num_experts: int | tuple[int, ...]
+) -> Callable[..., CheckpointPolicy]:
     """Selective-checkpoint policy that saves the MoE router projection and its top-k selection.
 
     Everything else is recomputed. Pinning the routing keeps the recompute's token-to-expert
@@ -600,21 +612,23 @@ def router_save_checkpoint_policy(hidden_size: int, num_experts: int) -> Callabl
 
     Args:
         hidden_size: Width of the router input; the router projection is recognized by its weight shape.
-        num_experts: Number of routed experts, the router's output width.
+        num_experts: Number of routed experts, the router's output width. A tuple of counts when
+            MoE layers differ in size; a router of any listed width is recognized.
 
     Returns:
         A policy for :func:`torch.utils.checkpoint.create_selective_checkpoint_contexts`.
     """
 
     aten = torch.ops.aten
+    expert_counts = num_experts if isinstance(num_experts, tuple) else (num_experts,)
 
     def _is_router_projection(func, args) -> bool:
         if func == aten.mm.default:
-            return len(args) == 2 and args[1].shape == (hidden_size, num_experts)
+            return len(args) == 2 and any(args[1].shape == (hidden_size, n) for n in expert_counts)
         if func == aten.addmm.default:
-            return len(args) >= 3 and args[2].shape == (hidden_size, num_experts)
+            return len(args) >= 3 and any(args[2].shape == (hidden_size, n) for n in expert_counts)
         if func == aten.linear.default:
-            return len(args) >= 2 and args[1].shape == (num_experts, hidden_size)
+            return len(args) >= 2 and any(args[1].shape == (n, hidden_size) for n in expert_counts)
         return False
 
     def _custom_policy(ctx, func, *args, **kwargs):
@@ -716,7 +730,7 @@ def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
     hidden_size: int | None = None,
-    num_experts: int | None = None,
+    num_experts: int | tuple[int, ...] | None = None,
     selective: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     moe_only: bool = False,
@@ -729,10 +743,10 @@ def apply_ac(
             outputs so recompute preserves expert assignments (avoids a CheckpointError from
             non-deterministic re-routing changing dispatch shapes). If False, a warning is emitted.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
-        num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
-            first, then falls back to model.config attributes. A model whose ``moe_config`` is
-            ``None`` has no routed experts: its blocks are recomputed in full, with no router
-            outputs saved.
+        num_experts: Number of routed experts, or a tuple of counts when MoE layers differ in size.
+            If None, derived from moe_config first, then falls back to model.config attributes.
+            A model whose ``moe_config`` is ``None`` has no routed experts: its blocks are
+            recomputed in full, with no router outputs saved.
         selective: If True, applies TorchTitan-style per-op selective activation checkpointing
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy saves ``topk``, and HybridEP reuses the
@@ -859,7 +873,8 @@ def apply_ac(
             # recomputed in full below.
             logger.info("Model has no routed experts; activation checkpointing recomputes whole blocks")
         elif hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
-            num_experts = _inner.moe_config.n_routed_experts
+            expert_counts = _routed_expert_counts(_inner.moe_config)
+            num_experts = tuple(expert_counts) if len(expert_counts) > 1 else _inner.moe_config.n_routed_experts
         else:
             cfg = getattr(model, "config", None)
             text_cfg = getattr(cfg, "text_config", None) or getattr(cfg, "llm_config", None) or cfg
@@ -1399,10 +1414,11 @@ def parallelize_model(
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
         moe_config = _get_model_moe_config(model)
-        assert moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {moe_config.n_routed_experts} must be divisible by "
-            f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
-        )
+        # Every distinct per-layer expert count must split evenly across EP ranks.
+        for n_routed_experts in _routed_expert_counts(moe_config):
+            assert n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
+                f"n_routed_experts {n_routed_experts} must be divisible by expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
+            )
 
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
