@@ -121,6 +121,7 @@ gh pr checks "$PR_NUMBER" --repo NVIDIA-NeMo/Automodel
 |---|---|---|
 | CI never started | Commits not GPG-signed and no `/ok to test` | Post `/ok to test <full-sha>` on the PR |
 | Lint job fails | `ruff` violation | Run `ruff check --fix . && ruff format .` locally |
+| `Lint merged with main` status fails | Merged into the latest main, the branch conflicts or adds `ruff` findings (main renamed a symbol or enabled a rule after your CI ran) | Merge `main` into the branch, fix the findings listed in the status's run summary, and push |
 | Unit tests fail | Code regression or missing import | Run failing test locally; check the PR diff |
 | Functional test (L0) fails | Integration breakage | Check GPU runner logs |
 | DCO sign-off missing | `git commit` run without `-s` | Amend: `git commit --amend -s` |
