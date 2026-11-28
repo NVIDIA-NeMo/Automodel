@@ -18,6 +18,8 @@ import json
 import os
 from typing import TYPE_CHECKING
 
+from huggingface_hub import try_to_load_from_cache
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -27,6 +29,68 @@ def _write_json(path: str, contents: dict) -> None:
     with open(path, "w") as stream:
         json.dump(contents, stream, indent=2, ensure_ascii=False)
         stream.write("\n")
+
+
+def tokenizer_source_path(
+    tokenizer: "PreTrainedTokenizerBase", model_name_or_path: str | None, original_model_path: str | None
+) -> str | None:
+    """Locate the snapshot the tokenizer was loaded from.
+
+    The tokenizer can come from a different snapshot than the model weights. A tokenizer without a
+    ``name_or_path``, or one that names the same source as the model, takes the snapshot already resolved for the
+    model, which honors the revision and cache directory of the load. A processor, which the VLM recipes hand to
+    the save, has no ``name_or_path`` of its own, so the tokenizer it holds is looked at.
+
+    Args:
+        tokenizer: Tokenizer being saved, or the processor that holds it.
+        model_name_or_path: ``name_or_path`` of the model being saved, or None.
+        original_model_path: Local snapshot of the model weights, or None.
+
+    Returns:
+        The local directory holding the tokenizer's own files, or None when it is not available locally.
+    """
+    if not hasattr(tokenizer, "name_or_path"):
+        tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if not name_or_path or name_or_path == model_name_or_path:
+        return original_model_path
+    if os.path.isdir(name_or_path):
+        return name_or_path
+    cached_file = try_to_load_from_cache(name_or_path, "tokenizer.json")
+    return os.path.dirname(cached_file) if isinstance(cached_file, str) else None
+
+
+def restore_source_tokenizer_truncation_and_padding(original_model_path: str | None, save_directory: str) -> None:
+    """Remove training-time truncation and padding from a saved ``tokenizer.json``.
+
+    A fast tokenizer keeps the truncation and padding of its last call, and ``save_pretrained`` writes them to
+    ``tokenizer.json``, where the ``tokenizers`` library applies them to every input of a consumer that loads the
+    file directly. The two entries of the saved file are reset to those of the source snapshot, or to None when
+    there is no source file. The tokenizer object is not read or changed, and a file that already holds these
+    values is not rewritten.
+
+    Args:
+        original_model_path: Local source snapshot, or None to clear the state.
+        save_directory: Directory containing the serialized tokenizer.
+    """
+    tokenizer_json_path = os.path.join(save_directory, "tokenizer.json")
+    if not os.path.isfile(tokenizer_json_path):
+        return
+    with open(tokenizer_json_path, encoding="utf-8") as f:
+        tokenizer_json = json.load(f)
+    source_tokenizer_json = {}
+    if original_model_path is not None:
+        source_tokenizer_json_path = os.path.join(original_model_path, "tokenizer.json")
+        if os.path.isfile(source_tokenizer_json_path):
+            with open(source_tokenizer_json_path, encoding="utf-8") as f:
+                source_tokenizer_json = json.load(f)
+    source_state = {key: source_tokenizer_json.get(key) for key in ("truncation", "padding")}
+    if all(tokenizer_json.get(key) == value for key, value in source_state.items()):
+        return
+    tokenizer_json.update(source_state)
+    with open(tokenizer_json_path, "w", encoding="utf-8") as f:
+        json.dump(tokenizer_json, f, indent=2, ensure_ascii=False)
+        f.write("\n")
 
 
 def restore_source_tokenizer_serialization_state(

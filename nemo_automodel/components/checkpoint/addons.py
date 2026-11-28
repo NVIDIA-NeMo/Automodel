@@ -38,6 +38,10 @@ from nemo_automodel.components.moe.state_dict_mixin import (
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
+from nemo_automodel.shared.tokenizer_serialization import (
+    restore_source_tokenizer_truncation_and_padding,
+    tokenizer_source_path,
+)
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -109,6 +113,23 @@ def _save_generated_hf_assets(
 
     if tokenizer is not None:
         tokenizer.save_pretrained(hf_metadata_dir)
+
+
+def _has_metadata_exporter_hook(model_part: nn.Module) -> bool:
+    """Whether the model, or a module inside it, can supply its own consolidated metadata exporter.
+
+    The retrieval encoders have the hook, and the retrieval distillation student is built around one of them.
+    """
+    model = unwrap_ddp_model(model_part)
+    # modules() starts with the model itself; a model part that is not a module is looked at on its own.
+    candidates = model.modules() if isinstance(model, nn.Module) else (model,)
+    return any(callable(getattr(candidate, "_get_consolidated_hf_metadata_exporter", None)) for candidate in candidates)
+
+
+def _model_name_or_path(model_part: nn.Module) -> str | None:
+    """The ``name_or_path`` the model was loaded from, or None when it was built without one."""
+    model = unwrap_ddp_model(model_part)
+    return getattr(model, "name_or_path", None) or getattr(getattr(model, "config", None), "name_or_path", None)
 
 
 class CheckpointAddon(Protocol):
@@ -205,6 +226,15 @@ class ConsolidatedHFAddon:
                     tokenizer,
                     v4_compatible=kwargs.get("v4_compatible", False),
                 )
+                if tokenizer is not None and not _has_metadata_exporter_hook(model_part):
+                    # The data pipeline's last call leaves its truncation and padding on a fast tokenizer, and
+                    # save_pretrained wrote them out. Models that have a metadata exporter hook, or are built
+                    # around a module that has one, are left as they are, also when the hook declines: for the
+                    # retrieval encoders the reference directory is not always the source snapshot.
+                    restore_source_tokenizer_truncation_and_padding(
+                        tokenizer_source_path(tokenizer, _model_name_or_path(model_part), original_model_path),
+                        hf_metadata_dir,
+                    )
 
             # save the fqn_to_file_index_mapping file
             with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
@@ -296,6 +326,12 @@ class PeftAddon:
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
+                # As in the full-model save of ConsolidatedHFAddon.
+                if not _has_metadata_exporter_hook(model_part):
+                    restore_source_tokenizer_truncation_and_padding(
+                        tokenizer_source_path(tokenizer, _model_name_or_path(model_part), original_model_path),
+                        model_path,
+                    )
             # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
             with open(os.path.join(model_path, "adapter_config.json"), "w") as f:
                 json.dump(hf_peft_config, f, indent=2, sort_keys=True)
