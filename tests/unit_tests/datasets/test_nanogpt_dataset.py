@@ -28,7 +28,8 @@ from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
     load_bin_shard,
     _get_start_end_pos_single_file,
     _get_next_bos_position,
-    _get_worker_id_and_total_workers
+    _get_worker_id_and_total_workers,
+    _bos_index_matches,
 )
 
 
@@ -323,6 +324,54 @@ def test_get_worker_id_and_total_workers():
         worker_id, total_workers = _get_worker_id_and_total_workers(mock_worker)
         assert worker_id == 2
         assert total_workers == 3
+
+
+def test_bos_index_matches():
+    bos = 50256
+    tokens = torch.tensor([bos, 1, 2, bos, 3], dtype=torch.int32)
+
+    assert _bos_index_matches(np.array([0, 3], dtype=np.int32), tokens, bos)
+    assert _bos_index_matches(np.array([], dtype=np.int32), tokens, bos)
+    assert not _bos_index_matches(np.array([0, 2], dtype=np.int32), tokens, bos)  # last entry is not BOS
+    assert not _bos_index_matches(np.array([1024, 1030], dtype=np.int32), tokens, bos)  # stale byte offsets
+    assert not _bos_index_matches(np.array([3, 1, 0], dtype=np.int32), tokens, bos)  # BOS at both ends, but unordered
+    assert not _bos_index_matches(np.array([0, 3, 3], dtype=np.int32), tokens, bos)  # repeated entry
+
+
+def test_stale_bos_index_falls_back_to_linear_search(tmp_path, caplog):
+    bos = 50256
+    shard = _make_fake_shard(tmp_path, np.array([9, bos, 1, 2, 3, 4], dtype=np.uint16))
+    # Old writer layout: byte offset of the chunk (header included) plus the token index.
+    np.array([1024 + 1], dtype=np.int32).tofile(shard.with_suffix(".bos.idx"))
+
+    ds = NanogptDataset(str(shard), seq_len=4, align_to_bos=True, bos_token=bos)
+    with caplog.at_level("WARNING"):
+        sample = next(iter(ds))
+
+    assert sample["input_ids"] == [bos, 1, 2, 3]
+    assert "falling back to linear BOS search" in caplog.text
+
+
+def test_mixed_width_bos_index_falls_back_to_linear_search(tmp_path, caplog):
+    # With NumPy 1.x the old writer appended int64 byte offsets once the file position reached 2**31, after
+    # the int32 offsets of earlier chunks. Both ends of the decoded index point at BOS tokens of this shard.
+    bos = 50256
+    toks = np.zeros(1024 + 8, dtype=np.uint16)
+    toks[[0, 1024]] = bos
+    toks[1:4], toks[1025:1028] = [1, 2, 3], [4, 5, 6]
+    shard = _make_fake_shard(tmp_path, toks)
+    index = shard.with_suffix(".bos.idx")
+    index.write_bytes(np.array([1024, 2048], dtype=np.int32).tobytes() + np.array([2**31], dtype=np.int64).tobytes())
+    assert np.fromfile(index, dtype=np.int32).tolist() == [1024, 2048, -(2**31), 0]
+
+    ds = NanogptDataset(str(shard), seq_len=4, align_to_bos=True, bos_token=bos)
+    with caplog.at_level("WARNING"):
+        samples = iter(ds)
+        first, second = next(samples), next(samples)
+
+    assert first["input_ids"] == [bos, 1, 2, 3]
+    assert second["input_ids"] == [bos, 4, 5, 6]
+    assert "falling back to linear BOS search" in caplog.text
 
 
 def test_nanogpt_dataset_raises_when_no_sample_possible():
