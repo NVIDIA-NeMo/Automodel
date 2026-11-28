@@ -604,6 +604,18 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
+            # Compute mRoPE position_ids here: the HF forward below receives
+            # input_ids=None, so it cannot build them and would fall back to 1-D
+            # positions for image tokens.
+            if position_ids is None and input_ids is not None and kwargs.get("mm_token_type_ids") is not None:
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids,
+                    mm_token_type_ids=kwargs["mm_token_type_ids"],
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                )
+                self.rope_deltas = rope_deltas
             # HF interprets bare sequence metadata as vision-frame boundaries.
             # Preserve packed text metadata until the native text decoder.
             for key in ("cu_seqlens", "max_seqlen"):
