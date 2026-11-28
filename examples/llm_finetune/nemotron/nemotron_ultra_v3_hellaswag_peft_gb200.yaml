@@ -144,3 +144,7 @@ ci:
   recipe_owner: adil-a
   cluster_tag: gb200
   nodes: 4
+  # This recipe has no ci.time; use the H100 sibling's 30-minute budget instead of the 10-minute default.
+  perf_testing:
+    schedule: nightly
+    time: "00:30:00"

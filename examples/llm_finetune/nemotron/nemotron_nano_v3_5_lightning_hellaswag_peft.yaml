@@ -126,6 +126,8 @@ ci:
   recipe_owner: adil-a
   time: "00:30:00"
   nodes: 1
+  perf_testing:
+    schedule: nightly
 
 # wandb:
 #   project: <your_wandb_project>

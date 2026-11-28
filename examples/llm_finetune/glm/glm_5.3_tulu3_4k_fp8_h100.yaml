@@ -145,3 +145,5 @@ ci:
     HF_HUB_OFFLINE: "0"
     FINETUNE_ARGS: "--wandb.enable=true"
     REQUIRE_FINITE_METRICS: "true"
+  perf_testing:
+    schedule: weekly
