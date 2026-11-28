@@ -80,7 +80,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
 
   release-workflow-tests:
     runs-on: ubuntu-latest
@@ -164,7 +164,7 @@ jobs:
       && needs.release-workflow-tests.result == 'success'
     permissions:
       contents: read
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_automodel
@@ -185,7 +185,7 @@ jobs:
       !cancelled() && !failure() && needs.bump.result == 'success'
     permissions:
       contents: read
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_wheel.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_wheel.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
       python-package: nemo_automodel
       packaging: uv
@@ -226,7 +226,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       library-name: NeMo-Automodel
