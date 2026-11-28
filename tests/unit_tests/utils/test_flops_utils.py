@@ -16,9 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
 
 from nemo_automodel._transformers import mfu as mfu_module
 from nemo_automodel._transformers.mfu import AutoMFU, get_device_flops
+from nemo_automodel.components.models.nemotron_omni.model import NemotronOmniConfig
 from nemo_automodel.components.utils import flops_utils
 
 
@@ -619,3 +621,116 @@ def test_mla_moe_flops_accepts_alternate_ffn_field_names():
     del alternate.intermediate_size, alternate.moe_intermediate_size
 
     assert flops_utils.mla_moe_flops(alternate, gbs=1, seq_len=1024) == standard
+
+
+# Model FLOPs of a text-only training step of Nemotron 3.5 Super VL.
+# A text batch runs the language model only. ``nemotronh_vl_flops``, registered for the config
+# class of the checkpoint, counts its backbone: 88 layers (40 Mamba, 40 MoE, 8 attention) and
+# ``lm_head``. An MTP head is not counted, as for the Nemotron 3 language model on its own.
+#
+# The expected values are derived in this file from the layer shapes of ``llm_config`` in
+# ``nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16``, not from the FLOPs helpers. A
+# GEMM counts six FLOPs per multiply-accumulate (forward, input gradient and weight
+# gradient, two each). Two conventions of the Nemotron-H count are taken as given: a query
+# attends half of the sequence on average under the causal mask, and the state-space scan,
+# which is not a GEMM, counts 21 FLOPs per element of its state.
+
+
+SEQ_LEN = 8192
+
+# One symbol per layer of the language model: M Mamba, E MoE, * attention.
+LAYER_PATTERN = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+NUM_MAMBA, NUM_MOE, NUM_ATTENTION = 40, 40, 8
+
+HIDDEN = 4096
+VOCAB = 131072
+
+# Mamba block: 128 heads of 64 channels, 8 groups of state size 128.
+MAMBA_INNER = 128 * 64
+MAMBA_IN_PROJ = HIDDEN * (2 * MAMBA_INNER + 2 * 8 * 128 + 128)  # hidden -> gate, x, B, C and dt
+MAMBA_OUT_PROJ = MAMBA_INNER * HIDDEN
+MAMBA_SCAN_STATE = MAMBA_INNER * 128
+
+# MoE block: 22 of 512 routed experts in a latent space of 1024, one shared expert on the hidden state.
+TOP_K = 22
+EXPERT = 2 * 1024 * 2688  # latent -> 2688 -> latent
+MOE_LATENT_PROJ = 2 * HIDDEN * 1024  # hidden -> latent and latent -> hidden
+MOE_SHARED_EXPERT = 2 * HIDDEN * 5376  # hidden -> 5376 -> hidden
+MOE_ROUTER = HIDDEN * 512
+MOE = MOE_LATENT_PROJ + TOP_K * EXPERT + MOE_SHARED_EXPERT + MOE_ROUTER
+
+# Attention block: 32 query heads and 2 key/value heads of 128 channels.
+ATTENTION_PROJ = HIDDEN * (32 * 128) + 2 * HIDDEN * (2 * 128) + (32 * 128) * HIDDEN  # q, k and v, o
+ATTENTION_CORE = 2 * (SEQ_LEN // 2) * 32 * 128  # scores and weighted values over SEQ_LEN / 2 keys
+ATTENTION = ATTENTION_PROJ + ATTENTION_CORE
+
+LM_HEAD = HIDDEN * VOCAB
+
+BACKBONE_FLOPS_PER_TOKEN = (
+    6 * (NUM_MAMBA * (MAMBA_IN_PROJ + MAMBA_OUT_PROJ) + NUM_MOE * MOE + NUM_ATTENTION * ATTENTION + LM_HEAD)
+    + 21 * NUM_MAMBA * MAMBA_SCAN_STATE
+)
+
+
+def _llm_config(**overrides: int) -> NemotronHConfig:
+    """Build the language-model config of the checkpoint, with the fields that set layer shapes."""
+    block_type = {"M": "mamba", "E": "moe", "*": "attention"}
+    fields = {
+        "vocab_size": VOCAB,
+        "hidden_size": HIDDEN,
+        "layers_block_type": [block_type[symbol] for symbol in LAYER_PATTERN],
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 2688,
+        "mamba_num_heads": 128,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "n_routed_experts": 512,
+        "num_experts_per_tok": TOP_K,
+        "moe_intermediate_size": 2688,
+        "moe_shared_expert_intermediate_size": 5376,
+        "moe_latent_size": 1024,
+        # The checkpoint keeps one MTP depth: an attention block and an MoE block.
+        "num_nextn_predict_layers": 1,
+        "mtp_layers_block_type": ["attention", "moe"],
+    }
+    fields.update(overrides)
+    return NemotronHConfig(**fields)
+
+
+@pytest.mark.cpu_only
+def test_derivation_covers_the_layers_of_the_checkpoint():
+    assert len(LAYER_PATTERN) == 88
+    assert [LAYER_PATTERN.count(symbol) for symbol in "ME*"] == [NUM_MAMBA, NUM_MOE, NUM_ATTENTION]
+    assert BACKBONE_FLOPS_PER_TOKEN == 75_874_959_360
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("config_class_name", ["NemotronH_Omni_Reasoning_V3_Config", "NemotronOmniConfig"])
+def test_recipe_calculator_counts_the_language_model_of_the_vl_model(config_class_name):
+    """The recipe builds its calculator from the VL model; a text batch counts the backbone of its language model.
+
+    The checkpoint brings its own config class, ``NemotronH_Omni_Reasoning_V3_Config``; the formula is found by
+    that name and by the name of this repository's ``NemotronOmniConfig``.
+    """
+    config_class = type(config_class_name, (NemotronOmniConfig,), {})
+    # A RADIO ViT-H tower: 32 layers of width 1280 that a text batch never runs.
+    vision_config = {"hidden_size": 1280, "num_hidden_layers": 32, "num_attention_heads": 16, "patch_size": 16}
+    config = config_class(llm_config=_llm_config(), vision_config=vision_config)
+    assert flops_utils.get_flops_formula_for_hf_config(config) is flops_utils.nemotronh_vl_flops
+    calculator = AutoMFU.from_config(SimpleNamespace(config=config), compute_dtype=torch.bfloat16)
+    input_ids = torch.zeros((8, SEQ_LEN), dtype=torch.long)
+
+    assert calculator.get_flops(input_ids) == 8 * SEQ_LEN * BACKBONE_FLOPS_PER_TOKEN
+
+
+@pytest.mark.cpu_only
+def test_one_routed_expert_fewer_per_token_lowers_the_count_by_that_expert():
+    """A wrong expert top-k does not go unnoticed: each routed expert is 6 x 2 x 1024 x 2688 FLOPs per token."""
+    config = NemotronOmniConfig(llm_config=_llm_config(num_experts_per_tok=TOP_K - 1))
+
+    flops = flops_utils.get_flops_formula_for_hf_config(config)(config, gbs=1, seq_len=SEQ_LEN)
+
+    assert SEQ_LEN * BACKBONE_FLOPS_PER_TOKEN - flops == SEQ_LEN * 6 * EXPERT * NUM_MOE

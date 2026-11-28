@@ -1,0 +1,190 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# BF16 pretraining throughput of the language model of Nemotron 3.5 Super VL (120B-A12B) on text, from random
+# initialization: 4 nodes x 4 GB300, tp1 / cp1 / pp1 / ep16, 128 sequences of 8192 tokens per optimizer step
+# (16 ranks x 2 micro-batches of 4), the MTP head trained with two prediction depths through its one block.
+# The vision tower and projector are frozen and never run on text batches.
+# NVFP4 counterpart: nemotron_3_5_super_vl_te_nvfp4_8k_ep16_gb300_benchmark.yaml.
+#
+# This file measures training speed. Three of its settings exist only for that; none belongs in a run whose
+# model is meant to be kept:
+#   - Mock data (dataset): random token ids in rows of fixed length. Nothing can be learned from them.
+#   - Balanced gate: `--benchmark` applies ci.perf_testing.fake_balanced_gate as
+#     model.backend.fake_balanced_gate: true, so every expert receives the same number of tokens. Run this
+#     file with `--benchmark`. Without it the gate is learned, which this file was not run with.
+#   - Equal token counts (model.backend.dispatcher_equal_token_counts: true): HybridEP skips the all-reduce that
+#     sizes its buffers. Valid only while every rank dispatches the same number of rows in every micro-batch,
+#     which fixed-length mock rows guarantee. With variable-length or packed data the dispatch hangs.
+#
+# What makes the step fast, each measured on this workload:
+#   - distributed.activation_checkpointing: moe recomputes only the MoE sub-blocks in the backward pass; the
+#     Mamba and attention blocks keep their activations. Micro-batches of 4 make room for that.
+#   - reshard_after_forward: false (FSDP and MoE) keeps the unsharded parameters between forward and backward.
+#   - te_grouped_tensor (one grouped GEMM per expert projection), dispatcher_num_sms: 64,
+#     dispatcher_recompute_cache: combine and mamba_norm_backward_grid_scale: 8.
+#   - FusedLinearCrossEntropy computes lm_head and the loss in one operation and does not keep the logits of the
+#     three heads (8 GiB each in BF16 for 4 x 8192 tokens).
+# shared_expert_overlap (the shared expert on a second CUDA stream) is off: with Transformer Engine 2.19.0
+# and cuBLASLt 13.7.0 a grouped GEMM can leave part of a weight gradient unwritten while GEMMs run on a second
+# stream, whatever the routing, so this file does not use te_grouped_tensor together with it. Of the two, the
+# grouped GEMMs are worth more here. On one node with 128 of the 512 experts (ep4), two runs each: this file
+# 12,573 and 12,567 tokens/s/GPU; the side stream with one GEMM per expert 12,348 and 12,351; both together
+# 12,565 and 12,566.
+#
+# Reported figures. Every step logs `tps <tokens/s>(<tokens/s per GPU>/gpu)` and `mfu <percent>`. The model
+# FLOPs behind mfu are those of the backbone of the language model for the tokens of the step: its 88 layers
+# and lm_head, 75.87 GFLOPs per token at this sequence length. The MTP head (9.78 GFLOPs per token more for its
+# two depths) and the vision tower are not counted. mfu is taken against the dense peak that the recipe looks
+# up for the GPU and the training precision, 2,500 TFLOPs/s for a GB300 in BF16, so
+#   model TFLOPs/s/GPU = mfu / 100 x 2500.
+# tps counts 8191 label positions per sequence, the FLOPs all 8192 tokens.
+#
+# Environment: GB300 (per GPU the step peaked at 251 GiB of 277 GiB in nvidia-smi and at 244 GiB allocated by
+# torch), Transformer Engine 2.19 or newer, PYTORCH_ALLOC_CONF=expandable_segments:True in every rank.
+# NEMO_HYBRIDEP_JIT_CACHE=<directory> keeps the compiled HybridEP kernels between launches: a shorter start,
+# the same step time.
+#
+# Measured with this file on 16 GB300 (Transformer Engine 2.19.0, cuBLASLt 13.7.0) with `--benchmark`, over 20
+# steps after 6 warm-up steps, the model config read from a local copy of the Hub config. Two runs: 5.302 and
+# 5.297 s per optimizer step, 12,360 and 12,373 tokens/s/GPU counting all 8192 tokens of a sequence, and
+# 938 and 939 model TFLOPs/s/GPU (tokens/s/GPU times 75.87 GFLOPs per token).
+#
+# Launch on 4 nodes x 4 GPUs: on every node, from the repository root (26 steps, the first 6 are warm-up):
+#   torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=<first node>:<port> \
+#     -m nemo_automodel.cli.app \
+#     examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_bf16_8k_ep16_gb300_benchmark.yaml \
+#     --benchmark --step_scheduler.max_steps 26
+# The measured runs also passed --numa-binding=node to torchrun and set OMP_NUM_THREADS=8 in every rank; the
+# effect of either was not measured.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 128
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  num_epochs: null
+  max_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: bfloat16
+  # Two prediction depths through the one MTP block of the checkpoint.
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+    trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.nemotron_v3.layers.NemotronV3BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: te
+    te_grouped_tensor: true
+    dispatcher: hybridep
+    dispatcher_num_sms: 64
+    dispatcher_recompute_cache: combine
+    # Benchmark only: valid for fixed-length rows, see the header.
+    dispatcher_equal_token_counts: true
+    # Not together with te_grouped_tensor, see the header.
+    shared_expert_overlap: false
+    mamba_norm_backward_grid_scale: 8
+    # `--benchmark` sets this to true through ci.perf_testing.fake_balanced_gate.
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: moe
+  reshard_after_forward: false
+  # Two micro-batches per step: no unsharded gradient copy is held between them.
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: false
+  multimodal:
+    frozen_sharding: replicate
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+mtp:
+  scaling_factor: 0.3
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
+
+dataset:
+  # Benchmark only: random token ids.
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 131072
+  seq_len: 8192
+  include_position_ids: false
+  exclude_token_ids: [0]
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+  pin_memory: true
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0
+  foreach: false
+  fused: true
+  param_group_overrides:
+  - pattern: (?:^|\.)experts\.(?:gate_up_linear|down_linear)\.
+    lr_mult: 1
+    wd_mult: 1
+
+ci:
+  nemo_ci_schedule: skipped
+  recipe_owner: HuiyingLi
+  time: "00:30:00"
+  nodes: 4
+  cluster_tag: gb300
+  nproc_per_node: 4
+  env_vars:
+    PYTORCH_ALLOC_CONF: expandable_segments:True
+  perf_testing:
+    schedule: disabled
+    fake_balanced_gate: true

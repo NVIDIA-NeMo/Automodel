@@ -3796,6 +3796,48 @@ def test_apply_ac_leaves_the_moe_recompute_cache_out_for_moe_only_regions(monkey
     cache_wrapper.assert_not_called()
 
 
+@pytest.mark.parametrize("has_latent_back_projection", [True, False])
+def test_apply_ac_caches_the_combine_of_moe_only_regions_with_a_latent_back_projection(
+    monkeypatch, has_latent_back_projection
+):
+    """An MoE-only region with a latent back-projection continues after the combine: that projection saves the
+    combine output, so the recompute would re-run the combine and the cache is installed. Without the projection
+    the region ends at the combine and the cache stays out."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_recompute_cache = "combine"
+    moe = P.MoE()
+    moe.fc2_latent_proj = MagicMock() if has_latent_back_projection else None
+
+    class MoEBlock:
+        def __init__(self):
+            self.mlp = moe
+
+        def named_children(self):
+            return [("mlp", self.mlp)]
+
+        def register_module(self, name, module):
+            setattr(self, name, module)
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    cache_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_cache_moe_combine_on_recompute", cache_wrapper)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", MagicMock(side_effect=lambda c: c))
+    wrapper = MagicMock(side_effect=lambda module, **kwargs: module)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper)
+
+    P.apply_ac(HybridEPModel([MoEBlock()]), ignore_router=True, moe_only=True, hidden_size=7168, num_experts=384)
+
+    # The MoE child itself is the checkpointed region in both cases.
+    wrapper.assert_called_once()
+    assert wrapper.call_args.args[0] is moe
+    assert cache_wrapper.call_count == (1 if has_latent_back_projection else 0)
+
+
 def test_apply_ac_leaves_the_moe_recompute_cache_out_when_no_expert_asks_for_it(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     expert = P.GroupedExpertsDeepEP()

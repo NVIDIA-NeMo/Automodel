@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import re
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -40,6 +41,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
     TokenDispatcherConfig,
 )
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
+from nemo_automodel.components.moe.nvfp4_dispatch import expert_mlp_in_chunks, nvfp4_dispatch_chunks
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import is_te_min_version, safe_import, safe_import_te
@@ -2503,6 +2505,7 @@ class GroupedExpertsTE(nn.Module):
                 self._grouped_tensor_signature = signature
         actual_m_splits = None
         unpadding = self.fp8_unpadding
+        row_align = 1
         if recipe is not None:
             actual_m_splits = m_splits
             padding = self.fp8_padding
@@ -2516,8 +2519,17 @@ class GroupedExpertsTE(nn.Module):
                 unpadding = self.native_fp8_unpadding
             permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
             permuted_probs, _ = padding(permuted_probs, actual_m_splits)
+            row_align = padding.align_size
 
         if sum(m_splits) > 0:
+            # An NVFP4 dispatch too large for one quantization runs in chunks of rows.
+            chunks = nvfp4_dispatch_chunks(
+                recipe,
+                m_splits,
+                width=max(self.config.expert_dim, self.config.moe_inter_dim * (2 if self.is_gated else 1)),
+                align=row_align,
+                grouped=self.use_grouped_tensor,
+            )
             # The native grouped-tensor API consumes device-side int64 split sizes.
             # Keep the host list for padding, unpadding, and the legacy TE path.
             grouped_m_splits = (
@@ -2535,11 +2547,22 @@ class GroupedExpertsTE(nn.Module):
                 and not torch.is_autocast_enabled("cuda")
                 else nullcontext()
             )
-            with cast_weights:
-                output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
-            output1 = self.expert_activation(output1, permuted_probs)
-            with cast_weights:
-                output2 = self.down_linear(output1, grouped_m_splits)
+            if chunks is not None:
+                output2 = expert_mlp_in_chunks(
+                    self.gate_up_linear,
+                    self.down_linear,
+                    self.expert_activation,
+                    permuted_local_hidden_states,
+                    permuted_probs,
+                    chunks,
+                    cast_weights,
+                )
+            else:
+                with cast_weights:
+                    output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
+                output1 = self.expert_activation(output1, permuted_probs)
+                with cast_weights:
+                    output2 = self.down_linear(output1, grouped_m_splits)
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
@@ -2598,9 +2621,50 @@ class GroupedExpertsTE(nn.Module):
         return y
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        """Initialize weights using reset_parameters()"""
-        self.gate_up_linear.reset_parameters()
-        self.down_linear.reset_parameters()
+        """Draw the weights of this rank's experts with Transformer Engine's ``reset_parameters()``.
+
+        The experts of an expert-parallel rank are local parameters, and the ranks hold one random state once
+        a sharded tensor has been drawn, so every rank would draw the same values for its own experts. The
+        draw therefore uses a random stream of its own per first expert: ranks with different experts get
+        independent values, ranks that hold the same experts get the same ones.
+
+        Args:
+            buffer_device: Unused; Transformer Engine keeps a parameter on its device and materializes a
+                meta parameter on the current CUDA device.
+            init_std: Unused; Transformer Engine draws from its default N(0, 0.023).
+        """
+        parameter = next(self.gate_up_linear.parameters())
+        device = torch.device("cuda", torch.cuda.current_device()) if parameter.is_meta else parameter.device
+        first_expert = self.ep_rank * self.num_local_experts
+        with _random_stream(device, first_expert):
+            self.gate_up_linear.reset_parameters()
+            self.down_linear.reset_parameters()
+
+
+@contextmanager
+def _random_stream(device: torch.device, stream: int) -> Iterator[None]:
+    """Draw from stream ``stream`` of the default random generator of ``device`` inside the context.
+
+    One value is drawn from the generator and the generator is reseeded with that value plus ``stream``.
+    Generators in the same state therefore give independent values for different streams and equal values
+    for the same stream. On exit the generator continues from its state after that one draw, whatever was
+    drawn inside, so generators that were in the same state stay in the same state.
+
+    Args:
+        device: Device whose default generator is used; for CUDA without an index, the current device.
+        stream: Non-negative number of the stream.
+    """
+    base = int(torch.randint(2**62, (1,), device=device).item())
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [torch.cuda.current_device() if device.index is None else device.index]
+    with torch.random.fork_rng(devices=cuda_devices):
+        if device.type == "cuda":
+            with torch.cuda.device(cuda_devices[0]):
+                torch.cuda.manual_seed(base + stream)
+        else:
+            torch.default_generator.manual_seed(base + stream)
+        yield
 
 
 def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):

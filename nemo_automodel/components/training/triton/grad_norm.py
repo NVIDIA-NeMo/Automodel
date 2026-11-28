@@ -26,11 +26,12 @@ about the two things that are easy to get wrong in a norm reduction:
 
 **Precision.** Values are widened to fp32 on load, so a BF16 gradient is never
 squared in BF16 (|g| > 256 overflows BF16's range once squared, and the
-mantissa loses most of its bits well before that). Within a tile the reduction
-is a ``tl.sum`` tree reduction carried out **in fp64** (reducing the tile in
-fp32 and widening only the tile total leaves fp32-level error, ~1e-7 relative,
-which is what this kernel exists to avoid); across tiles each program
-accumulates into an fp64 scalar; across programs the fp64 partials are summed
+mantissa loses most of its bits well before that). The squares are formed and
+accumulated **in fp64** throughout (accumulating in fp32 and widening only a
+partial total leaves fp32-level error, ~1e-7 relative, which is what this
+kernel exists to avoid): across tiles each of a program's ``_BLOCK`` lanes
+accumulates into its own fp64 slot, the lanes are combined by one ``tl.sum``
+tree reduction per program, and across programs the fp64 partials are summed
 by PyTorch. Accumulation error therefore stays at fp64 level regardless of how
 many elements a parameter has. ``max|x|`` accumulates nothing and stays in
 fp32, where it is already exact.
@@ -44,6 +45,12 @@ every subsequent optimizer step -- non-reproducible.
 Widening on load also makes the usual "divide by the max first, then square"
 overflow dance unnecessary, so the 2-norm needs a single pass over the
 gradients instead of two.
+
+**In-place scaling.** Clipping multiplies every gradient by one coefficient and
+expert-parallel normalization divides the expert gradients by one ratio.
+``multi_tensor_mul_`` and ``multi_tensor_div_`` do that in one launch per
+device and dtype and reproduce the arithmetic of the per-tensor ``mul_`` /
+``div_`` they replace bit for bit (see their docstrings).
 """
 
 from __future__ import annotations
@@ -115,6 +122,10 @@ def _multi_tensor_reduce_kernel(
     end = tl.minimum(start + CHUNK, numel)
 
     acc = tl.zeros([], dtype=tl.float64)
+    # Sum of squares: one fp64 accumulator per tile lane, tree-reduced once after the
+    # last tile. A tl.sum per tile is a cross-thread reduction for each of the
+    # CHUNK / BLOCK tiles of a program.
+    lane_acc = tl.zeros([BLOCK], dtype=tl.float64)
     nan_count = tl.zeros([], dtype=tl.float64)
     for tile in range(0, CHUNK, BLOCK):
         offs = start + tile + tl.arange(0, BLOCK)
@@ -127,15 +138,15 @@ def _multi_tensor_reduce_kernel(
         # Literals, not the module constants: a @triton.jit body may only read
         # globals declared as tl.constexpr. 0 == _REDUCE_SUMSQ, 1 == _REDUCE_ABSMAX.
         if REDUCE_OP == 0:
-            # fp64 for the square and the in-tile tree reduction, not just for
-            # the tile total: reducing a 1024-element tile in fp32 and widening
-            # afterwards leaves fp32-level error (~1e-7 relative), which defeats
-            # the point of accumulating across tiles in fp64.
+            # fp64 for the square and for every accumulation, not just for the
+            # program total: accumulating a lane or reducing a tile in fp32 and
+            # widening afterwards leaves fp32-level error (~1e-7 relative), which
+            # defeats the point of accumulating in fp64.
             # NaN/Inf need no special handling here: NaN*NaN and Inf*Inf
             # propagate through fp64 addition, so a non-finite gradient reaches
             # the caller's error_if_nonfinite check intact.
             x = tl.load(base + offs, mask=mask, other=0.0).to(tl.float64)
-            acc += tl.sum(x * x)
+            lane_acc += x * x
         else:
             # max|x| accumulates nothing, so fp32 is already exact here.
             x = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32)
@@ -146,9 +157,78 @@ def _multi_tensor_reduce_kernel(
             # explicitly (x != x) and poison the partial below.
             nan_count += tl.sum((x != x).to(tl.float64))
 
-    if REDUCE_OP == 1:
+    if REDUCE_OP == 0:
+        acc = tl.sum(lane_acc)
+    else:
         acc = tl.where(nan_count > 0.0, float("nan"), acc)
     tl.store(partial_ptr + pid, acc)
+
+
+@(triton.jit if HAVE_TRITON else null_decorator)
+def _multi_tensor_mul_kernel(
+    ptrs_ptr: tl.tensor,  # int64[num_tensors]  -- data_ptr() of each tensor
+    numel_ptr: tl.tensor,  # int64[num_tensors]
+    chunk_end_ptr: tl.tensor,  # int64[num_tensors] -- exclusive prefix sum of chunk counts
+    factor_ptr: tl.tensor,  # float64[1] -- the scalar every element is multiplied by
+    DTYPE_ID: tl.constexpr,
+    NUM_TENSORS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    """Multiply one chunk of one tensor by the factor, in place."""
+    pid = tl.program_id(0)
+
+    if NUM_TENSORS == 1:
+        tensor_idx = 0
+        first_chunk = 0
+    else:
+        lo = 0
+        hi = NUM_TENSORS
+        while lo < hi:
+            mid = (lo + hi) // 2
+            go_right = pid >= tl.load(chunk_end_ptr + mid)
+            lo = tl.where(go_right, mid + 1, lo)
+            hi = tl.where(go_right, hi, mid)
+        tensor_idx = lo
+        first_chunk = tl.load(chunk_end_ptr + tensor_idx - 1, mask=tensor_idx > 0, other=0)
+    start = (pid.to(tl.int64) - first_chunk) * CHUNK
+    numel = tl.load(numel_ptr + tensor_idx)
+    base_addr = tl.load(ptrs_ptr + tensor_idx)
+    end = tl.minimum(start + CHUNK, numel)
+    factor = tl.load(factor_ptr)
+
+    # A multiply by exactly one leaves every value as it is, so the program touches no
+    # gradient memory. This is the clamped clip coefficient of every step whose norm is
+    # within the threshold; the test runs on the device, so the host never waits for it.
+    if factor != 1.0:
+        # One branch per storage dtype: the typed pointer, the arithmetic dtype (fp32 for
+        # BF16, FP16 and FP32 storage, fp64 for FP64 storage -- PyTorch's own choice for
+        # these dtypes) and the store dtype are compile-time choices.
+        if DTYPE_ID == 3:
+            base64 = base_addr.to(tl.pointer_type(tl.float64))
+            for tile in range(0, CHUNK, BLOCK):
+                offs = start + tile + tl.arange(0, BLOCK)
+                mask = offs < end
+                x64 = tl.load(base64 + offs, mask=mask, other=0.0)
+                tl.store(base64 + offs, x64 * factor, mask=mask)
+        else:
+            factor32 = factor.to(tl.float32)
+            if DTYPE_ID == 0:
+                base = base_addr.to(tl.pointer_type(tl.bfloat16))
+            elif DTYPE_ID == 1:
+                base = base_addr.to(tl.pointer_type(tl.float16))
+            else:
+                base = base_addr.to(tl.pointer_type(tl.float32))
+            for tile in range(0, CHUNK, BLOCK):
+                offs = start + tile + tl.arange(0, BLOCK)
+                mask = offs < end
+                y = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32) * factor32
+                if DTYPE_ID == 0:
+                    tl.store(base + offs, y.to(tl.bfloat16), mask=mask)
+                elif DTYPE_ID == 1:
+                    tl.store(base + offs, y.to(tl.float16), mask=mask)
+                else:
+                    tl.store(base + offs, y, mask=mask)
 
 
 _DTYPE_IDS = {
@@ -276,6 +356,105 @@ def multi_tensor_sumsq(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
 def multi_tensor_absmax(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
     """Largest absolute value across every element, in fp64."""
     return _reduce(tensors, _REDUCE_ABSMAX)
+
+
+def _mul_by_dtype_(tensors: Sequence[torch.Tensor], factors: dict[torch.dtype, torch.Tensor]) -> None:
+    """Launch the multiply kernel once per device and dtype.
+
+    Args:
+        tensors: Kernel-eligible tensors of arbitrary shape; no two may share storage.
+        factors: For every dtype in ``tensors``, a float64 tensor holding the one factor
+            for that dtype, on any device. The kernel rounds it to fp32 for BF16, FP16
+            and FP32 storage and uses it as is for FP64 storage.
+    """
+    by_device_and_dtype: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for t in tensors:
+        by_device_and_dtype.setdefault((t.device, t.dtype), []).append(t)
+
+    for (device, dtype), group in by_device_and_dtype.items():
+        ptrs = _copy_metadata_to_device([t.data_ptr() for t in group], device)
+        numels = _copy_metadata_to_device([t.numel() for t in group], device)
+        if len(group) == 1:
+            chunk_ends = numels
+            num_chunks = (group[0].numel() + _CHUNK - 1) // _CHUNK
+        else:
+            chunk_ends, num_chunks = _build_chunk_ends(group, device)
+        factor = factors[dtype].to(device=device, dtype=torch.float64, non_blocking=True).reshape(1)
+        _multi_tensor_mul_kernel[(num_chunks,)](
+            ptrs,
+            numels,
+            chunk_ends,
+            factor,
+            DTYPE_ID=_DTYPE_IDS[dtype],
+            NUM_TENSORS=len(group),
+            CHUNK=_CHUNK,
+            BLOCK=_BLOCK,
+        )
+
+
+def _split_by_kernel_eligibility(tensors: Sequence[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Split the non-empty ``tensors`` into those the kernels can address and the rest."""
+    eligible: list[torch.Tensor] = []
+    ineligible: list[torch.Tensor] = []
+    for t in tensors:
+        if t.numel():
+            (eligible if _kernel_eligible(t) else ineligible).append(t)
+    return eligible, ineligible
+
+
+def multi_tensor_mul_(tensors: Sequence[torch.Tensor], factor: torch.Tensor) -> None:
+    """``t.mul_(factor)`` for every tensor, in one kernel launch per device and dtype.
+
+    The results are bit-identical to the per-tensor op with ``factor`` on the tensor's
+    device, whose arithmetic the kernel reproduces: ``factor`` is first rounded to the
+    tensor's dtype; BF16, FP16 and FP32 elements are then multiplied in fp32 and
+    rounded once to their dtype, FP64 elements are multiplied in fp64. A factor of
+    exactly one (after that rounding) is detected on the device and the tensors are
+    neither read nor written: every value keeps its bits, which for finite values and
+    infinities is also what the multiplication returns, and a NaN stays a NaN.
+    Tensors the kernel cannot address (non-CUDA, non-contiguous, other dtypes) take
+    the per-tensor op itself.
+
+    Args:
+        tensors: Plain local tensors of arbitrary shape, scaled in place. DTensor
+            gradients must already be unwrapped with ``to_local()``. No two entries
+            may share storage.
+        factor: 0-dim floating-point tensor on any device. It is never synchronized
+            to the host.
+    """
+    eligible, ineligible = _split_by_kernel_eligibility(tensors)
+    if eligible:
+        factor64 = factor.detach().to(torch.float64)
+        _mul_by_dtype_(eligible, {dtype: factor64.to(dtype).to(torch.float64) for dtype in {t.dtype for t in eligible}})
+    for t in ineligible:
+        t.mul_(factor.to(t.device))
+
+
+def multi_tensor_div_(tensors: Sequence[torch.Tensor], divisor: float) -> None:
+    """``t.div_(divisor)`` for every tensor, in one kernel launch per device and dtype.
+
+    The results are bit-identical to the per-tensor op on CUDA, which for a Python
+    scalar multiplies by the reciprocal: the reciprocal is taken in fp32 for BF16,
+    FP16 and FP32 tensors and in fp64 for FP64 tensors, and the product is rounded
+    once to the tensor's dtype. Tensors the kernel cannot address (non-CUDA,
+    non-contiguous, other dtypes) take the per-tensor op itself.
+
+    Args:
+        tensors: Plain local tensors of arbitrary shape, scaled in place. DTensor
+            gradients must already be unwrapped with ``to_local()``. No two entries
+            may share storage.
+        divisor: Python scalar.
+    """
+    eligible, ineligible = _split_by_kernel_eligibility(tensors)
+    if eligible:
+        reciprocals: dict[torch.dtype, torch.Tensor] = {}
+        for dtype in {t.dtype for t in eligible}:
+            arithmetic_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+            reciprocal = torch.ones((), dtype=arithmetic_dtype) / torch.tensor(divisor, dtype=arithmetic_dtype)
+            reciprocals[dtype] = reciprocal.to(torch.float64).pin_memory()
+        _mul_by_dtype_(eligible, reciprocals)
+    for t in ineligible:
+        t.div_(divisor)
 
 
 # Elements per slice in the fallback path. Bounds the widened temporary to a

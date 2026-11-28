@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 import torch
 import torch.nn as nn
@@ -252,6 +252,18 @@ class NemotronV3Model(nn.Module):
         # seq_idx (no 2D mask); attention uses the 4D mask directly.
         _neat_packed = "seq_idx" in kwargs and attention_mask is not None and attention_mask.dim() == 4
 
+        # A [batch, sequence] padding mask without padding leaves every hidden state unchanged, so the
+        # Mamba layers skip their mask multiply: one elementwise pass over the hidden states per layer in
+        # the forward and one in the backward. Resolved once per forward with a single host read.
+        mamba_mask = attention_mask
+        if (
+            past_key_values is None
+            and attention_mask is not None
+            and attention_mask.dim() == 2
+            and bool((attention_mask == 1).all())
+        ):
+            mamba_mask = None
+
         for layer in self.layers.values():
             if is_thd:
                 mask = None
@@ -263,7 +275,7 @@ class NemotronV3Model(nn.Module):
                 mask = causal_mask if causal_mask is not None else attention_mask
             elif layer.block_type == "mamba":
                 # Mamba layers use 2D padding mask during prefill, None during decode
-                mask = None if (past_key_values is not None and past_key_values.has_previous_state) else attention_mask
+                mask = None if (past_key_values is not None and past_key_values.has_previous_state) else mamba_mask
             else:
                 # MLP/MoE layers don't use mask
                 mask = None
@@ -403,6 +415,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         num_nextn_predict_layers: int | None = None,
         mtp_use_repeated_layer: bool = False,
         logits_dtype: torch.dtype | None = None,
+        mamba_scan_ac_exempt_blocks: int | Literal["all"] = 0,
     ):
         """Initialize NemotronV3ForCausalLM.
 
@@ -424,6 +437,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 MTP depth and reuse it across all iterations. Mirrors
                 Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
             logits_dtype: Dtype of the LM head's logits; None keeps the head's weight dtype.
+            mamba_scan_ac_exempt_blocks: Number of Mamba blocks, counted from the
+                first in layer order, whose scan kernel state and output
+                projection opt out of activation checkpointing (``"all"`` for
+                every Mamba block). The block itself stays checkpointed. The
+                recompute of such a block ends after its input projection: the
+                scan kernels and the output projection run once per step instead
+                of twice. The block keeps its scan output and what its output
+                projection saves: about 2 hidden-size activations per token in
+                BF16 (0.125 GiB per 8192-token sequence at hidden size 4096),
+                plus the saved input of the output projection. The gradients are
+                those of the checkpointed block. Not supported with context
+                parallelism: such a mixer raises in its forward. Defaults to ``0``.
         """
         super().__init__()
         self.config = config
@@ -461,6 +486,28 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             )
         else:
             self.mtp = None
+
+        if mamba_scan_ac_exempt_blocks != 0:
+            mamba_blocks = [
+                module
+                for module in self.modules()
+                if isinstance(module, NemotronV3Block) and module.block_type == "mamba"
+            ]
+            if mamba_scan_ac_exempt_blocks == "all":
+                num_scan_exempt = len(mamba_blocks)
+            elif (
+                isinstance(mamba_scan_ac_exempt_blocks, int)
+                and not isinstance(mamba_scan_ac_exempt_blocks, bool)
+                and 0 <= mamba_scan_ac_exempt_blocks <= len(mamba_blocks)
+            ):
+                num_scan_exempt = mamba_scan_ac_exempt_blocks
+            else:
+                raise ValueError(
+                    f"mamba_scan_ac_exempt_blocks must be 'all' or an integer between 0 and the number of "
+                    f"Mamba blocks ({len(mamba_blocks)}), got {mamba_scan_ac_exempt_blocks!r}"
+                )
+            for block in mamba_blocks[:num_scan_exempt]:
+                block.mixer.scan_ac_exempt = True
 
         # When True, the MTP heads also run under eval mode (``self.training``
         # False) so validation can measure per-head token acceptance. Defaults

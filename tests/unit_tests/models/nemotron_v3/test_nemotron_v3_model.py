@@ -94,6 +94,54 @@ class MockNemotronV3Config:
         return vars(self)
 
 
+def _model_parallelizer_checkpointing_worker(rank: int, rendezvous: str) -> None:
+    """One gloo rank: apply the model's own parallelizer with activation checkpointing on a CPU mesh.
+
+    Without expert parallelism this parallelizer checkpoints every block of the native layout through the MoE
+    parallelizer's ``apply_ac``. A block whose scan state is exempt has to be checkpointed on this path as it
+    is with expert parallelism, and the MoE block of a weight-tied MTP depth has to keep its activations.
+    """
+    import torch.distributed as dist
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1, 1, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
+        backend = BackendConfig(
+            linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+        )
+        for activation_checkpointing in (True, "selective"):
+            config = MockNemotronV3Config(
+                layers_block_type=["mamba", "attention", "mlp", "mamba", "moe"], num_hidden_layers=5
+            )
+            model = NemotronHForCausalLM(config, backend=backend, mamba_scan_ac_exempt_blocks=1)
+            PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=activation_checkpointing)
+            blocks = list(model.model.layers.values())
+            # Every block is checkpointed, the Mamba block that ``mamba_scan_ac_exempt_blocks`` selects too.
+            wrapped = [isinstance(block, CheckpointWrapper) for block in blocks]
+            assert wrapped == [True, True, True, True, True], (activation_checkpointing, wrapped)
+            # ``mamba_scan_ac_exempt_blocks`` counts from the first Mamba block: the mixer of that block
+            # keeps the scan state, the mixer of the second Mamba block does not.
+            assert blocks[0]._checkpoint_wrapped_module.mixer.scan_ac_exempt is True
+            assert blocks[3]._checkpoint_wrapped_module.mixer.scan_ac_exempt is False
+
+        # One physical ``[attention, moe]`` MTP depth that runs twice.
+        config = MockNemotronV3Config(
+            layers_block_type=["attention", "moe"], num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E"
+        )
+        model = NemotronHForCausalLM(config, backend=backend, num_nextn_predict_layers=2, mtp_use_repeated_layer=True)
+        PARALLELIZER._apply(model, device_mesh=mesh, activation_checkpointing=True)
+        assert all(isinstance(block, CheckpointWrapper) for block in model.model.layers.values())
+        # The MoE block of a weight-tied MTP depth keeps its activations.
+        assert [isinstance(block, CheckpointWrapper) for block in model.mtp.layers] == [True, False]
+    finally:
+        dist.destroy_process_group()
+
+
 class TestNemotronV3Model:
     """Test NemotronV3Model base model."""
 
@@ -608,6 +656,47 @@ class TestNemotronHForCausalLM:
             assert params[name].dtype == torch.float32
             torch.testing.assert_close(params[name], values)
         assert model.lm_head.weight.dtype == torch.bfloat16
+
+    def test_model_parallelizer_checkpoints_scan_exempt_blocks(self, tmp_path):
+        """FSDP2 without expert parallelism (``NemotronHModelParallelizer``) checkpoints scan-exempt blocks too.
+
+        Full and selective checkpointing with ``mamba_scan_ac_exempt_blocks``, and the MoE block of a
+        weight-tied MTP depth.
+        """
+        import torch.multiprocessing as mp
+
+        mp.spawn(
+            _model_parallelizer_checkpointing_worker,
+            args=((tmp_path / "rendezvous").as_uri(),),
+            nprocs=1,
+            join=True,
+        )
+
+    @pytest.mark.parametrize(
+        ("scan_exempt", "expected"),
+        [("all", [True, True, True]), (1, [True, False, False]), (2, [True, True, False]), (0, [False] * 3)],
+    )
+    def test_mamba_scan_ac_exempt_blocks_marks_the_first_mamba_blocks(self, config, backend, scan_exempt, expected):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba", "mamba"]
+        config.num_hidden_layers = 5
+        model = NemotronHForCausalLM(config, backend=backend, mamba_scan_ac_exempt_blocks=scan_exempt)
+
+        marked = [block.mixer.scan_ac_exempt for block in model.model.layers.values() if block.block_type == "mamba"]
+        assert marked == expected
+
+    @pytest.mark.parametrize("scan_exempt", [3, -1, "some", 1.5, True])
+    def test_mamba_scan_ac_exempt_blocks_rejects_values_outside_the_mamba_block_count(
+        self, config, backend, scan_exempt
+    ):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "mamba"]
+        config.num_hidden_layers = 4
+
+        with pytest.raises(ValueError, match="mamba_scan_ac_exempt_blocks must be 'all' or an integer between 0 and"):
+            NemotronHForCausalLM(config, backend=backend, mamba_scan_ac_exempt_blocks=scan_exempt)
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""
@@ -1359,6 +1448,25 @@ class TestNemotronV3ModelWithMoE:
         assert model.layers["0"].block_type == "moe"
         assert hasattr(model.layers["0"].mixer, "experts")
         assert hasattr(model.layers["0"].mixer, "shared_experts")
+
+    def test_moe_overrides_turn_on_gate_load_balancing(self, config, backend):
+        """The pretraining recipe trains the gate with an auxiliary loss and the expert-bias update."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        backend = BackendConfig(
+            linear=backend.linear,
+            attn=backend.attn,
+            rms_norm=backend.rms_norm,
+            dispatcher="torch",
+            fake_balanced_gate=False,
+            enable_hf_state_dict_adapter=False,
+        )
+        gate = NemotronHForCausalLM(config, backend).model.layers["0"].mixer.gate
+        assert (gate.aux_loss_coeff, gate.bias_update_factor) == (0.0, 0.0)
+
+        overrides = {"aux_loss_coeff": 1e-4, "gate_bias_update_factor": 1e-3}
+        gate = NemotronHForCausalLM(config, backend, moe_overrides=overrides).model.layers["0"].mixer.gate
+        assert (gate.aux_loss_coeff, gate.bias_update_factor) == (1e-4, 1e-3)
 
     def test_e_score_correction_bias_stays_fp32_after_dtype_cast(self, config, backend):
         """Nemotron v3 router correction bias must stay fp32 under bf16 storage casts."""

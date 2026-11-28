@@ -23,7 +23,7 @@ Training performance measurements for language, vision-language, and image-gener
 | [Laguna-XS-2.1](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) | HellaSwag packed | 8 | 8 | 1 | 1 | 1 | 1024 | 1 | 1 | 1 | 8 | - | NR | SDPA + torch + torch_mm | 1.323 | NR | 6,174 | 771.73 |
 
 - Qwen3.8-27B freezes vision; GLM-5.3-Flash and Nemotron-3.5-Super-VL freeze vision and embeddings.
-- Nemotron-3.5-Super-VL uses text-only checkpoint `nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`.
+- Nemotron-3.5-Super-VL uses text-only checkpoint `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`.
 - Nemotron-3.5-Lightning uses all 52 layers with MTP disabled.
 
 ### Full Fine-Tuning: NVIDIA GB200, Precision: BF16
@@ -103,6 +103,27 @@ TE current scaling; 10 warmup and 20 measured steps.
 - TE MXFP8 block scaling; 10 warmup and 20 measured steps, except Qwen3 MoE 235B (two warmup and three measured steps).
 - FP8 and MXFP8 token rates count full sequences; TFLOPs derive from MFU and the 5,000 TFLOPs/s GB200 dense FP8 peak.
 
+### GPU: NVIDIA GB300, Precision: BF16
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/509c65b7eb3c1b37d46d7f947f1aa09ad57a57c6/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_bf16_8k_ep16_gb300_benchmark.yaml) | Mock (text only), balanced routing | 16 | 128 | 4 | 4 | 2 | 8192 | 1 | 1 | 1 | 16 | - | 16 | TE attention/linear + TE grouped experts + HybridEP | 5.302 | 937.79 | 197,755 | 12,359.67 |
+
+- Full-length mock sequences; random initialization; balanced MoE routing (`--benchmark`); 6 warmup and 20 measured steps. The frozen vision tower does not run on text.
+- The Multi-Token Prediction (MTP) head is trained with two depths. Model TFLOPs count the backbone of the language model (its 88 layers and `lm_head`): 75.87 GFLOPs per token at this sequence length. The MTP head is not counted.
+- TFLOPs derive from MFU and the 2,500 TFLOPs/s GB300 dense BF16 peak; token rates count full sequences.
+
+### GPU: NVIDIA GB300, Precision: NVFP4
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/509c65b7eb3c1b37d46d7f947f1aa09ad57a57c6/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_8k_ep16_gb300_benchmark.yaml) | Mock (text only), balanced routing | 16 | 128 | 8 | 8 | 1 | 8192 | 1 | 1 | 1 | 16 | - | 16 | TE NVFP4/MXFP8 + TE attention + HybridEP | 5.045 | 985.54 | 207,824 | 12,989.00 |
+
+- Workload, step counts and TFLOPs as in the GB300 BF16 row: tokens/sec/GPU times the same 75.87 GFLOPs per token.
+- TE NVFP4 for the routed and shared experts and the Mamba input projections of the first 74 layers, MXFP8 for their Mamba output projections, and BF16 for the last 14 layers, the attention and latent projections, the MTP head and `lm_head`.
+- With `NVTE_USE_FAST_MATH=1`: 4.696 s per step, 1,195.41 TFLOPs/sec/GPU, 13,955.62 tokens/sec/GPU.
+- The same recipe without `te_nvfp4`: 5.708 s per step, 983.56 TFLOPs/sec/GPU, 11,482.37 tokens/sec/GPU. The BF16 row above is a different, faster BF16 setting.
+
 ## Image Generation Performance
 
 ### Image Generation, Full Fine-Tuning: NVIDIA H100 80GB, Precision: BF16
@@ -146,6 +167,6 @@ Model names in the tables link directly to their YAML recipes. Mock-data benchma
 
 ## Version Information
 
-- **Last Updated**: November 2, 2026.
+- **Last Updated**: November 24, 2026.
 - **Default Recipe Snapshot**: [`b203f3f9`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856).
 - **Measurements**: Historical development and benchmark runs; source commits vary.

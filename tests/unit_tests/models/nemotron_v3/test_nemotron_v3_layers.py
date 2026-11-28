@@ -13,18 +13,34 @@
 # limitations under the License.
 
 
+import copy
 import math
 
 import pytest
 import torch
+from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.nemotron_v3 import layers as nemotron_layers
 from nemo_automodel.components.models.nemotron_v3.layers import (
     NemotronV3Attention,
+    NemotronV3BackendConfig,
     NemotronV3Block,
     NemotronV3Mamba2Mixer,
 )
+from nemo_automodel.components.models.nemotron_v3.mamba_scan import split_conv1d_scan
+from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM, NemotronV3Model
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.components.moe.parallelizer import _get_moe_module, apply_ac
+from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mamba_out_projection import (
+    _install_cpu_scan,
+    _pre_projection,
+)
+from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_model import MockNemotronV3Config as ModelMockNemotronV3Config
+from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mtp import MockNemotronV3Config as MtpMockNemotronV3Config
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
@@ -917,3 +933,520 @@ class TestMambaMixerSeqIdxConstruction:
 
         seq_idx = capture["seq_idx"]
         assert seq_idx is upstream, "upstream seq_idx must not be replaced by the construction path"
+
+    def test_projected_states_too_large_for_the_scan_kernels_are_rejected(self, monkeypatch, config):
+        """The scan kernels address the projected states with 32-bit offsets; a larger tensor must not reach them."""
+        from nemo_automodel.components.models.nemotron_v3 import layers
+
+        mixer = layers.NemotronV3Mamba2Mixer(config, layer_idx=0)
+        capture: dict[str, torch.Tensor | None] = {}
+        self._patch_mamba_kernel(monkeypatch, capture)
+        projection_size = mixer.in_proj.out_features
+        # 2 x 16 tokens of the projection are the limit here; a third sequence is one too many.
+        monkeypatch.setattr(layers, "_MAMBA_SCAN_MAX_ELEMENTS", 2 * 16 * projection_size)
+
+        mixer.forward(torch.randn(2, 16, config.hidden_size))
+        assert "seq_idx" in capture
+        capture.clear()
+        message = f"Mamba scan received 3 x 16 x {projection_size} = {3 * 16 * projection_size} projected elements"
+        with pytest.raises(ValueError, match=message):
+            mixer.forward(torch.randn(3, 16, config.hidden_size))
+        assert capture == {}
+
+
+def test_mamba_scan_size_limit_is_the_largest_32_bit_offset():
+    from nemo_automodel.components.models.nemotron_v3.layers import _check_mamba_scan_size
+
+    # A 4096 -> 18560 projection of 8192-token sequences: 14 sequences are 2,128,609,280 elements, 15 are
+    # 2,280,652,800. Meta tensors carry the shape without the memory.
+    assert 14 * 8192 * 18560 < 2**31 < 15 * 8192 * 18560
+    _check_mamba_scan_size(torch.empty(14, 8192, 18560, device="meta"))
+    with pytest.raises(
+        ValueError, match=r"15 x 8192 x 18560 = 2280652800 projected elements, more than the 2147483647"
+    ):
+        _check_mamba_scan_size(torch.empty(15, 8192, 18560, device="meta"))
+    # Exactly 2**31 - 1 elements pass, 2**31 do not.
+    _check_mamba_scan_size(torch.empty(1, 2**31 - 1, 1, device="meta"))
+    with pytest.raises(ValueError, match="2147483648 projected elements"):
+        _check_mamba_scan_size(torch.empty(1, 2**31, 1, device="meta"))
+
+
+# ``NemotronV3BackendConfig.mamba_linear``: the Mamba projections as ``torch.nn.Linear`` or Transformer Engine linears.
+#
+# The comparison of an output projection applied after the scan kernel with the one applied inside it, on the
+# real kernel, is in ``tests/functional_tests/kernel_parity/test_nemotron_v3_mamba_scan.py``.
+
+
+def _mamba_linear_backend(mamba_linear: str) -> NemotronV3BackendConfig:
+    return NemotronV3BackendConfig(
+        attn="sdpa",
+        linear="torch",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        mamba_linear=mamba_linear,
+    )
+
+
+@pytest.mark.cpu_only
+def test_default_backend_keeps_torch_projections():
+    # The shared config has no Mamba field; a mixer built with it uses the defaults of the model's config.
+    shared = BackendConfig(attn="sdpa", linear="torch", experts="torch", dispatcher="torch")
+    assert _backend().mamba_linear == "torch"
+    for mixer in (
+        NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0),
+        NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=shared),
+        NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=_mamba_linear_backend("torch")),
+    ):
+        assert type(mixer.in_proj) is nn.Linear
+        assert type(mixer.out_proj) is nn.Linear
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("with_backend", [False, True])
+def test_torch_projection_construction_draws_the_same_initial_values(with_backend):
+    """The default path must not change the initialization stream of existing recipes.
+
+    The expectation is built here from plain PyTorch modules, in the order the mixer has always constructed
+    them: input projection, depthwise convolution, output projection. The SSM parameters and the norm weight
+    draw nothing.
+    """
+    config = MtpMockNemotronV3Config()
+    intermediate = config.mamba_num_heads * config.mamba_head_dim
+    conv_dim = intermediate + 2 * config.n_groups * config.ssm_state_size
+    torch.manual_seed(7)
+    in_proj = nn.Linear(config.hidden_size, intermediate + conv_dim + config.mamba_num_heads, bias=config.use_bias)
+    conv1d = nn.Conv1d(
+        conv_dim,
+        conv_dim,
+        kernel_size=config.conv_kernel,
+        groups=conv_dim,
+        padding=config.conv_kernel - 1,
+        bias=config.use_conv_bias,
+    )
+    out_proj = nn.Linear(intermediate, config.hidden_size, bias=config.use_bias)
+    expected = {
+        **{f"in_proj.{name}": value for name, value in in_proj.named_parameters()},
+        **{f"conv1d.{name}": value for name, value in conv1d.named_parameters()},
+        **{f"out_proj.{name}": value for name, value in out_proj.named_parameters()},
+    }
+
+    torch.manual_seed(7)
+    mixer = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_mamba_linear_backend("torch") if with_backend else None)
+    actual = dict(mixer.named_parameters())
+    assert set(expected) == {name for name in actual if not name.startswith(("_fp32_params.", "norm."))}
+    for name, value in expected.items():
+        assert actual[name].dtype == value.dtype, name
+        torch.testing.assert_close(actual[name], value, rtol=0, atol=0, msg=name)
+    # Nothing else was drawn: the next random number is the one that follows the three modules.
+    after_mixer = torch.rand(())
+    torch.manual_seed(7)
+    nn.Linear(config.hidden_size, intermediate + conv_dim + config.mamba_num_heads, bias=config.use_bias)
+    nn.Conv1d(conv_dim, conv_dim, kernel_size=config.conv_kernel, groups=conv_dim, bias=config.use_conv_bias)
+    nn.Linear(intermediate, config.hidden_size, bias=config.use_bias)
+    assert torch.equal(after_mixer, torch.rand(()))
+
+
+@pytest.mark.cpu_only
+def test_block_forwards_the_backend_to_the_mixer(monkeypatch):
+    seen = []
+    original = NemotronV3Mamba2Mixer._build_projection
+
+    def record(mamba_linear, in_features, out_features, config):
+        seen.append(mamba_linear)
+        return original("torch", in_features, out_features, config)
+
+    monkeypatch.setattr(NemotronV3Mamba2Mixer, "_build_projection", staticmethod(record))
+    backend = _mamba_linear_backend("torch")
+    backend.mamba_linear = "te"  # bypass the constructor check: only the plumbing is under test here
+    NemotronV3Block(MtpMockNemotronV3Config(layers_block_type=["mamba", "moe"]), layer_idx=0, backend=backend)
+    assert seen == ["te", "te"]
+
+
+@pytest.mark.cpu_only
+def test_unknown_mamba_linear_is_rejected():
+    with pytest.raises(ValueError, match="mamba_linear"):
+        _mamba_linear_backend("quack")
+
+
+@pytest.mark.parametrize("mamba_linear", ["torch", pytest.param("te", marks=pytest.mark.run_only_on("GPU"))])
+def test_init_weights_restores_every_parameter_of_a_zeroed_mixer(mamba_linear):
+    """Parameters that hold no usable values get their construction-time values, with either projection type.
+
+    A model on more than one rank is built on the meta device and materialized before ``init_weights``
+    runs, so the values its parameters had at construction are gone; zeros stand in for that here. A mixer
+    left like that returns zeros and passes no gradient to its parameters.
+    """
+    if mamba_linear == "te":
+        pytest.importorskip("transformer_engine")
+    config = MtpMockNemotronV3Config(hidden_size=256, mamba_num_heads=8, mamba_head_dim=64)
+    mixer = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_mamba_linear_backend(mamba_linear))
+    assert (type(mixer.in_proj) is nn.Linear) == (mamba_linear == "torch")
+    assert (type(mixer.out_proj) is nn.Linear) == (mamba_linear == "torch")
+    with torch.no_grad():
+        for parameter in mixer.parameters():
+            parameter.zero_()
+    torch.manual_seed(0)
+    num_hidden_layers = 4
+    mixer.init_weights(num_hidden_layers=num_hidden_layers, buffer_device=torch.device("cpu"))
+    # Uniform in +-1/sqrt(fan_in): standard deviation bound / sqrt(3). The output projection is rescaled.
+    # Transformer Engine projections hold bfloat16 values, which round up to 1% past the bound.
+    for weight, scale in ((mixer.in_proj.weight, 1.0), (mixer.out_proj.weight, math.sqrt(num_hidden_layers))):
+        bound = 1.0 / math.sqrt(weight.shape[1]) / scale
+        assert float(weight.float().abs().max()) <= bound * 1.01
+        assert float(weight.float().std()) == pytest.approx(bound / math.sqrt(3), rel=0.03)
+    # The depthwise convolution has a fan-in of its kernel size.
+    conv_bound = 1.0 / math.sqrt(config.conv_kernel)
+    assert 0.8 * conv_bound < float(mixer.conv1d.weight.abs().max()) <= conv_bound
+    assert 0.8 * conv_bound < float(mixer.conv1d.bias.abs().max()) <= conv_bound
+    torch.testing.assert_close(mixer.norm.weight, torch.ones_like(mixer.norm.weight))
+    torch.testing.assert_close(mixer.D, torch.ones_like(mixer.D))
+    torch.testing.assert_close(mixer.A_log, torch.log(torch.arange(1, config.mamba_num_heads + 1.0)))
+    assert float(mixer.dt_bias.abs().min()) > 0
+
+
+@pytest.mark.run_only_on("GPU")
+def test_te_projections_start_from_the_torch_linear_distribution():
+    pytest.importorskip("transformer_engine")
+    config = MtpMockNemotronV3Config(hidden_size=256, mamba_num_heads=8, mamba_head_dim=64)
+    mixer = NemotronV3Mamba2Mixer(config, layer_idx=0, backend=_mamba_linear_backend("te"))
+    mixer.init_weights(num_hidden_layers=4, rescale_prenorm_residual=True, buffer_device=torch.device("cpu"))
+    # torch.nn.Linear draws U(-1/sqrt(fan_in), 1/sqrt(fan_in)); the output projection is then divided by sqrt(layers).
+    in_bound = 1.0 / math.sqrt(config.hidden_size)
+    out_bound = 1.0 / math.sqrt(mixer.intermediate_size) / math.sqrt(4)
+    for weight, bound in ((mixer.in_proj.weight.float(), in_bound), (mixer.out_proj.weight.float(), out_bound)):
+        assert weight.abs().max().item() <= bound * 1.01
+        assert weight.std().item() == pytest.approx(bound / math.sqrt(3), rel=0.05)
+
+
+# Which padding mask the backbone hands to its Mamba layers.
+#
+# A ``[batch, sequence]`` mask of ones multiplies every hidden state by one, so the Mamba layers get no
+# mask at all. Any other mask (padding zeros, or values other than one) must reach them unchanged.
+
+
+@pytest.fixture
+def model_and_masks(monkeypatch):
+    seen: list[tuple[str, torch.Tensor | None]] = []
+
+    def record(self, hidden_states, attention_mask=None, **kwargs):
+        seen.append((self.block_type, attention_mask))
+        return hidden_states
+
+    monkeypatch.setattr(NemotronV3Block, "forward", record)
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    config = MtpMockNemotronV3Config(layers_block_type=["mamba", "attention"])
+    return NemotronV3Model(config, backend=backend).float(), seen
+
+
+def _mamba_masks(seen: list[tuple[str, torch.Tensor | None]]) -> list[torch.Tensor | None]:
+    return [mask for block_type, mask in seen if block_type == "mamba"]
+
+
+@pytest.mark.cpu_only
+def test_mask_of_ones_is_not_passed_to_mamba_layers(model_and_masks):
+    model, seen = model_and_masks
+    input_ids = torch.randint(1, 64, (2, 6))
+    mask = torch.ones(2, 6, dtype=torch.long)
+    model(input_ids, attention_mask=mask)
+    assert _mamba_masks(seen) == [None]
+    # Attention layers are unaffected: without a causal mask they still fall back to the 2D mask.
+    assert [m for block_type, m in seen if block_type == "attention"][0] is mask
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mask",
+    [
+        torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]], dtype=dtype)
+        for dtype in (torch.long, torch.bool, torch.float32)
+    ]
+    # Only a multiply by exactly one is dropped; an indexed mask keeps its existing behaviour.
+    + [torch.tensor([[1, 1, 1, 2, 2, 2], [1, 1, 2, 2, 3, 3]])],
+    ids=["padding_long", "padding_bool", "padding_float", "values_other_than_one"],
+)
+def test_other_masks_reach_mamba_layers(model_and_masks, mask):
+    model, seen = model_and_masks
+    model(torch.randint(1, 64, (2, 6)), attention_mask=mask)
+    (mamba_mask,) = _mamba_masks(seen)
+    assert mamba_mask is mask
+
+
+# ``NemotronV3BackendConfig.mamba_norm_backward_grid_scale`` and the mixer's ``scan_ac_exempt`` on a CPU stand-in.
+#
+# Which scan the mixer runs, how often an output projection that saves its input after computing (as a
+# Transformer Engine linear does) runs under a non-reentrant activation checkpoint, and what context
+# parallelism refuses. The comparisons with mamba_ssm's own scan on the real kernels are in
+# ``tests/functional_tests/kernel_parity/test_nemotron_v3_mamba_scan.py``.
+
+
+def _backend(**mamba: int | float | bool | str) -> NemotronV3BackendConfig:
+    return NemotronV3BackendConfig(
+        attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch", **mamba
+    )
+
+
+@pytest.mark.cpu_only
+def test_defaults_keep_the_library_scan_and_checkpointed_scan_state():
+    backend = _backend()
+    assert backend.mamba_norm_backward_grid_scale == 1
+    for mixer in (
+        NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0),
+        NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=backend),
+    ):
+        assert mixer.norm_backward_grid_scale == 1
+        assert mixer.scan_ac_exempt is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("scale", [2.5, 8.0, True, "8"])
+def test_grid_scale_that_is_not_an_integer_is_rejected(scale):
+    """YAML can deliver a float, a boolean or a string; the value multiplies a kernel's launch grid."""
+    with pytest.raises(ValueError, match="mamba_norm_backward_grid_scale must be an integer"):
+        _backend(mamba_norm_backward_grid_scale=scale)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("scale", [0, -3])
+def test_grid_scale_below_one_is_rejected(scale):
+    with pytest.raises(ValueError, match="mamba_norm_backward_grid_scale"):
+        _backend(mamba_norm_backward_grid_scale=scale)
+    with pytest.raises(ValueError, match="norm_backward_grid_scale"):
+        split_conv1d_scan(
+            torch.zeros(1, 1, 1),
+            torch.zeros(1, 1),
+            None,
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.zeros(1),
+            chunk_size=1,
+            seq_idx=None,
+            dt_limit=(0.0, float("inf")),
+            activation="silu",
+            rmsnorm_weight=torch.zeros(1),
+            rmsnorm_eps=1e-5,
+            outproj_weight=None,
+            outproj_bias=None,
+            headdim=1,
+            ngroups=1,
+            norm_backward_grid_scale=scale,
+            checkpoint_exempt=False,
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("scale", "scan_exempt"), [(1, False), (8, False), (1, True), (8, True)])
+@pytest.mark.parametrize("fused", [True, False], ids=["torch_linear", "module_after_kernel"])
+def test_mixer_selects_the_scan_by_grid_scale_and_exemption(monkeypatch, scale, scan_exempt, fused):
+    torch.manual_seed(3)
+    backend = _backend(mamba_norm_backward_grid_scale=scale)
+    mixer = NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=backend).float()
+    if not fused:
+        # Only a plain ``torch.nn.Linear`` is applied inside the kernel; any other module, as a
+        # Transformer Engine linear, runs after it.
+        mixer.out_proj = _SaveAfterLinear(mixer.out_proj.weight)
+    mixer.scan_ac_exempt = scan_exempt
+    library_calls = _install_cpu_scan(monkeypatch, mixer)
+    own_calls = []
+
+    def own_scan(projected, conv_weight, conv_bias, dt_bias, a, d, **kwargs):
+        own_calls.append({"conv_weight": conv_weight, "conv_bias": conv_bias, "dt_bias": dt_bias, "D": d, **kwargs})
+        result = _pre_projection(projected, mixer.intermediate_size, kwargs["rmsnorm_weight"], kwargs["rmsnorm_eps"])
+        if kwargs["outproj_weight"] is not None:
+            result = result @ kwargs["outproj_weight"].T
+        return result
+
+    monkeypatch.setattr(nemotron_layers, "split_conv1d_scan", own_scan)
+    x = torch.randn(2, 7, mixer.hidden_size)
+    actual = mixer(x)
+
+    # Independent expectation: the stand-in scan without a projection, then plain matrix algebra.
+    expected = (
+        _pre_projection(mixer.in_proj(x), mixer.intermediate_size, mixer.norm.weight, mixer.norm.variance_epsilon)
+        @ mixer.out_proj.weight.T
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    if scale == 1 and not scan_exempt:
+        assert len(library_calls) == 1 and own_calls == []
+        assert (library_calls[0]["outproj_weight"] is mixer.out_proj.weight) == fused
+        return
+    assert library_calls == [] and len(own_calls) == 1
+    call = own_calls[0]
+    assert call["norm_backward_grid_scale"] == scale
+    assert call["checkpoint_exempt"] is scan_exempt
+    assert call["rmsnorm_weight"] is mixer.norm.weight
+    assert call["rmsnorm_eps"] == mixer.norm.variance_epsilon
+    assert (call["outproj_weight"] is mixer.out_proj.weight) == fused
+    assert call["outproj_bias"] is None
+    assert call["conv_weight"].shape == (mixer.conv_dim, mixer.conv_kernel_size)
+    assert call["conv_bias"] is mixer.conv1d.bias
+    assert call["chunk_size"] == mixer.chunk_size
+    assert call["headdim"] == mixer.head_dim and call["ngroups"] == mixer.n_groups
+    assert call["dt_limit"] == (0.0, float("inf"))
+    assert call["activation"] == "silu" and call["seq_idx"] is None
+
+
+class _SaveAfterMatmul(torch.autograd.Function):
+    """``x @ weight.T`` that saves its inputs after computing, as a Transformer Engine linear does."""
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        out = x @ weight.T
+        ctx.save_for_backward(x, weight)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, weight = ctx.saved_tensors
+        return grad @ weight, torch.einsum("bso,bsi->oi", grad, x)
+
+
+class _SaveAfterLinear(nn.Module):
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight.detach().clone())
+        self.computed = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.computed += 1
+        return _SaveAfterMatmul.apply(x, self.weight)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("scan_exempt", [False, True])
+def test_scan_ac_exempt_keeps_what_a_projection_after_the_kernel_saves(monkeypatch, scan_exempt):
+    """The GEMM of a projection applied after the kernel runs twice under a checkpoint unless the scan is exempt.
+
+    The stand-in scans are plain autograd operations, so they run in the forward and in the recompute either
+    way: here only the tensors saved by the projection are kept. That the real scan runs once is checked on
+    the real kernels.
+    """
+    torch.manual_seed(17)
+    mixer = NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=_backend()).float()
+    mixer.scan_ac_exempt = scan_exempt
+    mixer.out_proj = _SaveAfterLinear(mixer.out_proj.weight)
+    library_calls = _install_cpu_scan(monkeypatch, mixer)
+    own_calls = []
+
+    def own_scan(projected, conv_weight, conv_bias, dt_bias, a, d, **kwargs):
+        own_calls.append(kwargs)
+        return _pre_projection(projected, mixer.intermediate_size, kwargs["rmsnorm_weight"], kwargs["rmsnorm_eps"])
+
+    monkeypatch.setattr(nemotron_layers, "split_conv1d_scan", own_scan)
+
+    x = torch.randn(2, 7, mixer.hidden_size)
+    hidden = x.clone().requires_grad_()
+    out = checkpoint(mixer, hidden, use_reentrant=False)
+    assert mixer.out_proj.computed == 1
+    out.square().sum().backward()
+
+    # An exempt scan goes through ``split_conv1d_scan``, the other one through the library scan.
+    scan_calls, other_calls = (own_calls, library_calls) if scan_exempt else (library_calls, own_calls)
+    assert len(scan_calls) == 2, "the stand-in scan runs in the forward and in the recompute"
+    assert other_calls == []
+    assert all(call["outproj_weight"] is None for call in scan_calls)
+    assert mixer.out_proj.computed == (1 if scan_exempt else 2)
+
+    # Independent expectation: an uncheckpointed stand-in scan and plain matrix algebra under autograd.
+    reference_hidden = x.clone().requires_grad_()
+    reference = (
+        _pre_projection(
+            mixer.in_proj(reference_hidden), mixer.intermediate_size, mixer.norm.weight, mixer.norm.variance_epsilon
+        )
+        @ mixer.out_proj.weight.T
+    )
+    torch.testing.assert_close(out, reference, rtol=1e-6, atol=1e-6)
+    names = ["hidden", "in_proj.weight", "norm.weight", "out_proj.weight"]
+    actual_grads = [hidden.grad, mixer.in_proj.weight.grad, mixer.norm.weight.grad, mixer.out_proj.weight.grad]
+    expected_grads = torch.autograd.grad(
+        reference.square().sum(),
+        (reference_hidden, mixer.in_proj.weight, mixer.norm.weight, mixer.out_proj.weight),
+    )
+    for name, actual, expected in zip(names, actual_grads, expected_grads):
+        assert actual is not None and torch.count_nonzero(actual) > 0, name
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6, msg=name)
+
+
+class _UnusedContextParallel:
+    """Stands in for the context-parallel transport of a mixer; a refused forward never calls it."""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("scan_exempt", [True, False])
+def test_checkpoint_exempt_scan_state_is_refused_with_context_parallelism(monkeypatch, scan_exempt):
+    """The context-parallel scan has no checkpoint-exempt path: it must not silently recompute the state."""
+    torch.manual_seed(23)
+    mixer = NemotronV3Mamba2Mixer(MtpMockNemotronV3Config(), layer_idx=0, backend=_backend()).float()
+    mixer.scan_ac_exempt = scan_exempt
+    _install_cpu_scan(monkeypatch, mixer)
+    x = torch.randn(2, 7, mixer.hidden_size)
+    mixer.cp = _UnusedContextParallel()
+    if scan_exempt:
+        with pytest.raises(ValueError, match="not supported with context parallelism"):
+            mixer(x)
+    else:
+        # The transport is reached: the stand-in has none of its methods.
+        with pytest.raises(AttributeError, match="pre_conv_ssm"):
+            mixer(x)
+
+
+# Activation checkpointing of NemotronV3 MoE blocks in MoE-only mode (``mlp`` aliases ``mixer``).
+
+
+def _moe_checkpointing_backend() -> BackendConfig:
+    return BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+
+
+@pytest.mark.cpu_only
+def test_moe_only_wraps_the_registered_moe_child() -> None:
+    config = ModelMockNemotronV3Config(layers_block_type=["mamba", "attention", "moe"], num_hidden_layers=3)
+    model = NemotronHForCausalLM(config, backend=_moe_checkpointing_backend())
+
+    apply_ac(model, moe_only=True, hidden_size=config.hidden_size, num_experts=config.n_routed_experts)
+
+    mamba_block, attention_block, moe_block = model.model.layers.values()
+    assert all(isinstance(block, NemotronV3Block) for block in (mamba_block, attention_block, moe_block))
+    # ``mlp`` is a property that aliases ``mixer``: the wrapper has to replace the registered child.
+    assert isinstance(moe_block.mixer, CheckpointWrapper)
+    assert moe_block.mlp is moe_block.mixer
+    assert isinstance(_get_moe_module(moe_block), MoE)
+    assert not isinstance(mamba_block.mixer, CheckpointWrapper)
+    assert not isinstance(attention_block.mixer, CheckpointWrapper)
+
+
+@pytest.mark.cpu_only
+def test_moe_only_keeps_loss_and_gradients() -> None:
+    """One CPU forward/backward with and without the MoE-only checkpoint: loss and gradients are bitwise equal."""
+    config = ModelMockNemotronV3Config(layers_block_type=["attention", "moe"], torch_dtype="float32")
+    torch.manual_seed(0)
+    reference = NemotronHForCausalLM(config, backend=_moe_checkpointing_backend()).to(torch.float32)
+    # The constructor leaves the routed-expert weights at zero; without this the expert gradients would be zero too.
+    reference.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    reference.train()
+    checkpointed = copy.deepcopy(reference)
+    apply_ac(checkpointed, moe_only=True, hidden_size=config.hidden_size, num_experts=config.n_routed_experts)
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 8), generator=torch.Generator().manual_seed(3))
+
+    def loss_and_grads(model: NemotronHForCausalLM) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logits = model(input_ids).logits
+        loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), input_ids.reshape(-1))
+        loss.backward()
+        return loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    ref_loss, ref_grads = loss_and_grads(reference)
+    loss, grads = loss_and_grads(checkpointed)
+
+    assert torch.equal(loss, ref_loss)
+    # The wrapper adds one path component to the names of the MoE parameters.
+    assert {name.replace("._checkpoint_wrapped_module", "") for name in grads} == set(ref_grads)
+    assert all(grad.abs().sum() > 0 for name, grad in ref_grads.items() if ".experts." in name)
+    for name, grad in grads.items():
+        assert torch.equal(grad, ref_grads[name.replace("._checkpoint_wrapped_module", "")]), name

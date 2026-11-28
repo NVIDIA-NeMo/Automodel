@@ -118,6 +118,13 @@ class _NemotronHConfig(_AttentionLayerConfig, _MambaLayerConfig, _MlpLayerConfig
     def hybrid_override_pattern(self) -> str: ...
 
 
+class _NemotronVLConfig(Protocol):
+    """Nemotron vision-language config that keeps its language model's fields on ``llm_config``."""
+
+    @property
+    def llm_config(self) -> _NemotronHConfig: ...
+
+
 class _ClipViTConfig(Protocol):
     """NeMo ``FLOPSConfig`` fields for CLIP ViT; a missing ``img_seq_len`` is derived and stored."""
 
@@ -974,6 +981,15 @@ def nemotronh_flops(config: _NemotronHConfig, gbs: int = 1, seq_len: int | None 
         seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     return _hybrid_model_flops(config, gbs, seq_len)
+
+
+def nemotronh_vl_flops(config: _NemotronVLConfig, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Model FLOPs of a text batch of a Nemotron vision-language model: the backbone of its language model.
+
+    The vision and sound encoders do not run on a batch without media and are not counted, as for the other
+    vision-language entries. An MTP head is not counted, as in :func:`nemotronh_flops`.
+    """
+    return nemotronh_flops(config.llm_config, gbs, seq_len)
 
 
 def attention_flops_calculator(
@@ -2331,6 +2347,8 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         # Nemotron
         "NemotronConfig": nemotron_flops,
         "NemotronHConfig": nemotronh_flops,
+        "NemotronH_Omni_Reasoning_V3_Config": nemotronh_vl_flops,  # Nemotron 3.5 Super VL wrapper (llm_config)
+        "NemotronOmniConfig": nemotronh_vl_flops,
         # General transformer fallback
         "OPTConfig": transformer_flops,
         "BloomConfig": transformer_flops,

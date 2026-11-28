@@ -679,8 +679,11 @@ class BackendConfig:
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
             keep it False for variable-length or in-batch-packed inputs.
-        dispatcher_recompute_cache: HybridEP only; effective under full-block activation checkpointing (not
-            installed for ``checkpoint_moe_only`` regions, which end at the combine the recompute never re-runs).
+        dispatcher_recompute_cache: HybridEP only; effective under full-block activation checkpointing and,
+            for an MoE with a latent back-projection (``moe_latent_size``), under ``activation_checkpointing="moe"``:
+            that projection saves the combine output, so the recompute of the MoE-only region re-runs the combine.
+            Not installed for other ``checkpoint_moe_only`` regions, which end at the combine the recompute never
+            re-runs.
             ``"none"`` (default) recomputes the whole MoE layer in the backward. ``"combine"`` keeps
             a clone of every MoE layer's combine output ([tokens, hidden] in the activation dtype)
             from the checkpoint forward and returns it in the recompute instead of re-running the

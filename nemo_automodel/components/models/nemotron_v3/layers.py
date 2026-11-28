@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
+from typing import Literal, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -25,17 +27,50 @@ from nemo_automodel.components.attention.utils import (
     preprocess_args_and_kwargs_for_attn,
 )
 from nemo_automodel.components.models.common import (
+    HAVE_TE,
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.nemotron_v3.mamba_scan import split_conv1d_scan
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+# Elements of the projected states that the Triton kernels of the Mamba2 training scan (mamba_ssm) can address:
+# their offsets into that tensor are 32-bit.
+_MAMBA_SCAN_MAX_ELEMENTS = 2**31 - 1
+
+
+def _check_mamba_scan_size(projected_states: torch.Tensor) -> None:
+    """Reject projected states that are too large for the kernels of the Mamba2 training scan.
+
+    With 2**31 elements or more the scan reads and writes outside its tensors: an illegal memory access when
+    the mixer runs alone, a huge gradient norm followed by NaN losses in a training run.
+
+    Args:
+        projected_states: Output of the input projection as the scan receives it, of shape
+            [batch, seq_len, projection_size].
+
+    Raises:
+        ValueError: If the tensor holds more than ``_MAMBA_SCAN_MAX_ELEMENTS`` elements.
+    """
+    if projected_states.numel() > _MAMBA_SCAN_MAX_ELEMENTS:
+        batch_size, seq_len, projection_size = projected_states.shape
+        raise ValueError(
+            f"The Mamba scan received {batch_size} x {seq_len} x {projection_size} = {projected_states.numel()} "
+            f"projected elements, more than the {_MAMBA_SCAN_MAX_ELEMENTS} its kernels can address. Use fewer "
+            "tokens per micro-batch."
+        )
 
 
 def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(tensor, DTensor):
         tensor = tensor.full_tensor()
     return tensor.clone()
+
+
+def _keep_saved_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Pack and unpack hook that keeps a tensor saved for backward as it is."""
+    return tensor
 
 
 class NemotronV3Attention(nn.Module):
@@ -225,6 +260,55 @@ class NemotronV3MambaFP32Params(nn.Module):
         )
 
 
+class _MambaProjectionConfig(Protocol):
+    """The fields of the model configuration that a Mamba projection is built from."""
+
+    use_bias: bool
+    """Whether the projections have a bias."""
+    torch_dtype: str | torch.dtype | None
+    """Parameter dtype of the model; a Transformer Engine projection is built in it."""
+
+
+@dataclass(kw_only=True)
+class NemotronV3BackendConfig(BackendConfig):
+    """Backend choices of the NemotronV3 Mamba mixer, on top of the shared ones.
+
+    A model built with the shared ``BackendConfig`` runs with the defaults of both fields.
+
+    Attributes:
+        mamba_linear: Linear implementation of the Mamba mixer's input and output projections.
+            ``"torch"`` keeps ``torch.nn.Linear`` with the output projection applied inside the scan
+            kernel. ``"te"`` builds both as Transformer Engine linears: the output projection then runs
+            as a module after the scan kernel and ``te_fp8`` / ``te_nvfp4`` quantize both GEMMs.
+        mamba_norm_backward_grid_scale: Number of programs of the gated-RMSNorm backward kernel in the
+            Mamba training scan, as a multiple of the number mamba_ssm launches (about one per streaming
+            multiprocessor, each looping over thousands of rows). 1 runs mamba_ssm's own backward. Above
+            1 the scan runs through ``mamba_scan.split_conv1d_scan``: the same kernels in the same order,
+            with shorter row loops for this one. The output is unchanged; of the gradients only the norm
+            weight's changes, in its float32 summation order. Not used with context parallelism.
+    """
+
+    mamba_linear: Literal["torch", "te"] = "torch"
+    mamba_norm_backward_grid_scale: int = 1
+
+    def __post_init__(self) -> None:
+        if self.mamba_linear not in ("torch", "te"):
+            raise ValueError(f"Unsupported mamba_linear={self.mamba_linear!r}; expected 'torch' or 'te'.")
+        if self.mamba_linear == "te" and not HAVE_TE:
+            raise ValueError("mamba_linear='te' requires Transformer Engine")
+        if isinstance(self.mamba_norm_backward_grid_scale, bool) or not isinstance(
+            self.mamba_norm_backward_grid_scale, int
+        ):
+            raise ValueError(
+                f"mamba_norm_backward_grid_scale must be an integer, got {self.mamba_norm_backward_grid_scale!r}"
+            )
+        if self.mamba_norm_backward_grid_scale < 1:
+            raise ValueError(
+                f"mamba_norm_backward_grid_scale must be at least 1, got {self.mamba_norm_backward_grid_scale!r}"
+            )
+        super().__post_init__()
+
+
 class NemotronV3Mamba2Mixer(nn.Module):
     """Mamba2 mixer for NemotronV3 (training-only, uses CUDA kernels).
 
@@ -232,11 +316,38 @@ class NemotronV3Mamba2Mixer(nn.Module):
     for maximum training efficiency. Does not support inference caching.
 
     Requires mamba_ssm and causal_conv1d packages.
+
+    The input and output projections follow ``mamba_linear`` of :class:`NemotronV3BackendConfig`; a mixer
+    given the shared ``BackendConfig`` runs with the defaults of that class. With ``"torch"`` (the default) both
+    are ``torch.nn.Linear`` and the training path applies the output projection inside the scan kernel.
+    With ``"te"`` both are Transformer Engine linears, the output projection runs as a module after the
+    scan kernel, and ``te_fp8`` / ``te_nvfp4`` quantize both GEMMs like every other TE linear.
+
+    ``backend.mamba_norm_backward_grid_scale`` above 1 runs the training scan through
+    ``mamba_scan.split_conv1d_scan``, which launches the gated-RMSNorm backward kernel with that many times
+    the programs. ``scan_ac_exempt`` (set per block through ``mamba_scan_ac_exempt_blocks`` of
+    ``NemotronV3ForCausalLM``) keeps the scan kernel's state and the tensors an output projection applied
+    after the kernel saves out of activation checkpointing, so a checkpoint recompute of the block ends
+    after the input projection.
+
+    With context parallelism the scan runs through the context-parallel transport, which applies the norm and
+    the output projection as modules and has neither path: ``mamba_norm_backward_grid_scale`` does not apply
+    there, and a mixer with ``scan_ac_exempt`` raises in its forward instead of silently recomputing what it
+    was told to keep.
     """
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.layer_idx = layer_idx
+        if isinstance(backend, NemotronV3BackendConfig):
+            mamba_linear = backend.mamba_linear
+            self.norm_backward_grid_scale = backend.mamba_norm_backward_grid_scale
+        else:
+            # The shared ``BackendConfig`` has no Mamba field: the defaults apply.
+            mamba_linear = "torch"
+            self.norm_backward_grid_scale = 1
+        # Set by ``NemotronV3ForCausalLM`` through ``mamba_scan_ac_exempt_blocks``.
+        self.scan_ac_exempt = False
 
         # Model dimensions
         self.hidden_size = config.hidden_size
@@ -264,7 +375,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # Layers
         # Input projection: projects to [gate, x, B, C, dt]
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
-        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=config.use_bias)
+        self.in_proj = self._build_projection(mamba_linear, self.hidden_size, projection_size, config)
 
         # Conv1d for sequence mixing
         self.conv1d = nn.Conv1d(
@@ -287,10 +398,39 @@ class NemotronV3Mamba2Mixer(nn.Module):
         )
 
         # Output projection
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
+        self.out_proj = self._build_projection(mamba_linear, self.intermediate_size, self.hidden_size, config)
 
         # Context parallelism — set post-construction by the parallelizer
         self.cp = None
+
+    @staticmethod
+    def _build_projection(
+        mamba_linear: Literal["torch", "te"],
+        in_features: int,
+        out_features: int,
+        config: _MambaProjectionConfig,
+    ) -> nn.Module:
+        """Build one Mamba projection of shape ``[out_features, in_features]``.
+
+        Args:
+            mamba_linear: ``NemotronV3BackendConfig.mamba_linear``.
+            in_features: Width of the projection input.
+            out_features: Width of the projection output.
+            config: Model configuration; ``use_bias`` and ``torch_dtype`` are read.
+
+        Returns:
+            ``torch.nn.Linear`` with PyTorch's default construction for ``"torch"`` (unchanged
+            initialization stream), otherwise the module built by ``initialize_linear_module``.
+        """
+        if mamba_linear == "torch":
+            return nn.Linear(in_features, out_features, bias=config.use_bias)
+        return initialize_linear_module(
+            mamba_linear,
+            in_features,
+            out_features,
+            bias=config.use_bias,
+            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+        )
 
     @property
     def dt_bias(self) -> torch.Tensor:
@@ -396,6 +536,12 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             if self.cp is not None:
+                if self.scan_ac_exempt:
+                    raise ValueError(
+                        "mamba_scan_ac_exempt_blocks is not supported with context parallelism: the "
+                        "context-parallel Mamba scan has no checkpoint-exempt path and would recompute the "
+                        "scan and the output projection. Remove it."
+                    )
                 # ``MambaContextParallel`` uses a non-None ``cu_seqlens`` to
                 # select its packed 2D THD transport. SDPA/flex attention
                 # keeps qkv_format="thd" inputs in 3D BSHD, where the CP
@@ -410,6 +556,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 projected_states = self.cp.pre_conv_ssm(projected_states, cu_seqlens=cu_seqlens_cp)
                 if squeezed and cu_seqlens_cp is not None:
                     projected_states = projected_states.unsqueeze(0).contiguous()
+                _check_mamba_scan_size(projected_states)
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(self.cp.get_A_log(A_log).float())
 
@@ -446,33 +593,64 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     out = out.squeeze(0)
                 return out
             else:
+                _check_mamba_scan_size(projected_states)
                 A_log, dt_bias, D = self._get_fp32_ssm_params(projected_states)
                 A = -torch.exp(A_log.float())
                 # Adapters and sharded wrappers must execute their module forward/hooks.
                 fuse_out_proj = type(self.out_proj) is nn.Linear
 
-                out = mamba_split_conv1d_scan_combined(
-                    projected_states,
-                    self.conv1d.weight.squeeze(1),
-                    self.conv1d.bias,
-                    dt_bias,
-                    A,
-                    D=D,
-                    chunk_size=self.chunk_size,
-                    seq_idx=seq_idx,
-                    activation=self.activation,
-                    rmsnorm_weight=self.norm.weight,
-                    rmsnorm_eps=self.norm.variance_epsilon,
-                    outproj_weight=self.out_proj.weight if fuse_out_proj else None,
-                    outproj_bias=self.out_proj.bias if fuse_out_proj else None,
-                    headdim=self.head_dim,
-                    ngroups=self.n_groups,
-                    norm_before_gate=False,
-                    return_final_states=False,
-                    **dt_limit_kwargs,
-                )
+                if self.norm_backward_grid_scale > 1 or self.scan_ac_exempt:
+                    out = split_conv1d_scan(
+                        projected_states,
+                        self.conv1d.weight.squeeze(1),
+                        self.conv1d.bias,
+                        dt_bias,
+                        A,
+                        D,
+                        chunk_size=self.chunk_size,
+                        seq_idx=seq_idx,
+                        dt_limit=tuple(self.time_step_limit),
+                        activation=self.activation,
+                        rmsnorm_weight=self.norm.weight,
+                        rmsnorm_eps=self.norm.variance_epsilon,
+                        outproj_weight=self.out_proj.weight if fuse_out_proj else None,
+                        outproj_bias=self.out_proj.bias if fuse_out_proj else None,
+                        headdim=self.head_dim,
+                        ngroups=self.n_groups,
+                        norm_backward_grid_scale=self.norm_backward_grid_scale,
+                        checkpoint_exempt=self.scan_ac_exempt,
+                    )
+                else:
+                    out = mamba_split_conv1d_scan_combined(
+                        projected_states,
+                        self.conv1d.weight.squeeze(1),
+                        self.conv1d.bias,
+                        dt_bias,
+                        A,
+                        D=D,
+                        chunk_size=self.chunk_size,
+                        seq_idx=seq_idx,
+                        activation=self.activation,
+                        rmsnorm_weight=self.norm.weight,
+                        rmsnorm_eps=self.norm.variance_epsilon,
+                        outproj_weight=self.out_proj.weight if fuse_out_proj else None,
+                        outproj_bias=self.out_proj.bias if fuse_out_proj else None,
+                        headdim=self.head_dim,
+                        ngroups=self.n_groups,
+                        norm_before_gate=False,
+                        return_final_states=False,
+                        **dt_limit_kwargs,
+                    )
                 if not fuse_out_proj:
-                    out = self.out_proj(out)
+                    if self.scan_ac_exempt:
+                        # Only the innermost pair of saved-tensor hooks applies, so the projection's saved
+                        # tensors bypass the hooks of an enclosing activation checkpoint: they stay alive,
+                        # and the checkpoint's recompute, which already skips the scan kernels, ends after
+                        # the input projection.
+                        with torch.autograd.graph.saved_tensors_hooks(_keep_saved_tensor, _keep_saved_tensor):
+                            out = self.out_proj(out)
+                    else:
+                        out = self.out_proj(out)
                 if squeezed:
                     out = out.squeeze(0)
                 return out
@@ -742,7 +920,7 @@ class NemotronV3Block(nn.Module):
 
         # Create mixer based on block type
         if self.block_type == "mamba":
-            self.mixer = NemotronV3Mamba2Mixer(config, layer_idx=layer_idx)
+            self.mixer = NemotronV3Mamba2Mixer(config, layer_idx=layer_idx, backend=backend)
         elif self.block_type == "attention":
             self.mixer = NemotronV3Attention(config, backend=backend)
         elif self.block_type == "mlp":

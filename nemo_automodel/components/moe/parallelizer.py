@@ -678,9 +678,9 @@ def checkpoint_moe_block(
     if uses_hybridep_dispatch:
         block_context_fn = _replay_hybridep_dispatch_on_recompute(block_context_fn)
     if uses_moe_recompute_cache:
-        # Full-block regions only: an MoE-only region ends at the combine, whose output is held by the
-        # consumer outside the region, so its recompute never re-runs the combine and the cache would
-        # only cost the clone.
+        # Full-block regions, and MoE-only regions with a latent back-projection (installed by ``apply_ac``).
+        # Any other MoE-only region ends at the combine, whose output is held by the consumer outside the
+        # region, so its recompute never re-runs the combine and the cache would only cost the clone.
         block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
     return ptd_checkpoint_wrapper(
         block,
@@ -691,11 +691,18 @@ def checkpoint_moe_block(
 
 
 def _moe_child(block: nn.Module) -> tuple[str, MoE] | None:
-    """Return the attribute name and module of the block's MoE sub-block, if any."""
+    """Return the registered child name and module of the block's MoE sub-block, if any.
+
+    ``moe`` / ``mlp`` may be a property that aliases the registered child (``NemotronV3Block.mlp`` returns
+    ``mixer``). A checkpoint wrapper has to replace the registered child, so the name under which the
+    module is registered is returned, not the alias.
+    """
     for name in ("moe", "mlp"):
         module = getattr(block, name, None)
         if isinstance(module, MoE):
-            return name, module
+            for child_name, child in block.named_children():
+                if child is module:
+                    return child_name, module
     return None
 
 
@@ -922,6 +929,10 @@ def apply_ac(
                 )
                 continue
             child_name, moe_module = moe_child
+            if uses_moe_recompute_cache and moe_module.fc2_latent_proj is not None:
+                # This MoE-only region does not end at the combine: the latent back-projection saves the
+                # combine output for its backward, so the recompute would re-run the combine to rebuild it.
+                block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
             wrapped_moe = ptd_checkpoint_wrapper(
                 moe_module,
                 preserve_rng_state=True,

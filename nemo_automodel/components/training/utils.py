@@ -26,7 +26,12 @@ from nemo_automodel.components.models.common.utils import set_is_first_microbatc
 from nemo_automodel.components.training.triton.grad_norm import (
     HAVE_TRITON as HAVE_FUSED_GRAD_NORM,
 )
-from nemo_automodel.components.training.triton.grad_norm import multi_tensor_absmax, multi_tensor_sumsq
+from nemo_automodel.components.training.triton.grad_norm import (
+    multi_tensor_absmax,
+    multi_tensor_div_,
+    multi_tensor_mul_,
+    multi_tensor_sumsq,
+)
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
 _GradNormBackend = Literal["triton", "te"]
@@ -150,6 +155,18 @@ def count_tail_padding(labels: torch.Tensor, ignore_label: int = -100) -> int:
 
     # Count tail -100s by summing cumprod mask along the sequence dimension
     return int(prod_mask.view(-1).sum().item())
+
+
+def _local_gradient(gradient: torch.Tensor) -> torch.Tensor:
+    """Return the rank-local storage of a gradient.
+
+    Args:
+        gradient: Plain tensor or DTensor of arbitrary shape.
+
+    Returns:
+        The tensor itself, or a DTensor's local shard; both alias the gradient's storage.
+    """
+    return gradient.to_local() if isinstance(gradient, DTensor) else gradient
 
 
 def _use_fused_grad_norm(representative: torch.Tensor, norm_type: float) -> bool:
@@ -467,8 +484,20 @@ def _clip_grad_norm_impl(
 
     # Clip gradients for each sharding group separately
     # This is necessary because clip_grads_with_norm_ doesn't support mixing tensors from different device meshes
-    for _, group_params in sharding_groups.values():
-        if group_params:
+    clip_coefficient: torch.Tensor | None = None
+    for representative, group_params in sharding_groups.values():
+        if not group_params:
+            continue
+        has_partial = isinstance(representative, DTensor) and any(
+            isinstance(pl, Partial) for pl in representative.placements
+        )
+        if HAVE_FUSED_GRAD_NORM and representative.is_cuda and not has_partial:
+            # One launch per dtype instead of one multiply per gradient tensor, with the
+            # coefficient and the arithmetic of clip_grads_with_norm_ (multi_tensor_mul_).
+            if clip_coefficient is None:
+                clip_coefficient = torch.clamp(float(max_norm) / (total_norm + 1e-6), max=1.0)
+            multi_tensor_mul_([_local_gradient(p.grad) for p in group_params], clip_coefficient)
+        else:
             torch.nn.utils.clip_grads_with_norm_(group_params, max_norm, total_norm, foreach)
 
     return total_norm
@@ -746,14 +775,18 @@ def scale_grads_and_clip_grad_norm(
     # reduction inside clipping.
     ep_param_ids = _ep_local_expert_param_ids(model_parts, ep_axis_name) if moe_mesh is not None else None
 
-    # Single pass over parameters to apply both scalings where applicable
+    # Single pass over parameters to collect the gradients each scaling applies to. The
+    # divisions themselves run as one multi-tensor launch per dtype (multi_tensor_div_),
+    # not one launch per gradient: TE grouped experts alone hold thousands of tensors.
     if pp_divisor is not None or ep_ratio is not None:
+        pp_scaled_gradients: list[torch.Tensor] = []
+        ep_scaled_gradients: list[torch.Tensor] = []
         for mp in model_parts:
             for p in mp.parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
-                    p.grad.div_(pp_divisor)
+                    pp_scaled_gradients.append(_local_gradient(p.grad))
                 if ep_ratio is not None:
                     # Scale expert gradients by the FSDP/EP ratio and by any
                     # identical TP token replicas that were gathered inside EP.
@@ -771,7 +804,11 @@ def scale_grads_and_clip_grad_norm(
                     )
                     is_expert_param = ep_param_ids is not None and id(p) in ep_param_ids
                     if is_ep_sharded_dtensor or is_expert_param:
-                        p.grad.div_(ep_ratio)
+                        ep_scaled_gradients.append(_local_gradient(p.grad))
+        if pp_divisor is not None:
+            multi_tensor_div_(pp_scaled_gradients, pp_divisor)
+        if ep_ratio is not None:
+            multi_tensor_div_(ep_scaled_gradients, ep_ratio)
 
     # Clip with the existing PP/EP-aware helper
     return clip_grad_norm(
