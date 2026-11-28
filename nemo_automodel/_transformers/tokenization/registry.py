@@ -128,6 +128,9 @@ def _register_default_tokenizers():
     dict_tool_arguments = "nemo_automodel._transformers.tokenization.tool_call_arguments:DictToolArgumentsTokenizer"
     TokenizerRegistry.register("beam", dict_tool_arguments)
     TokenizerRegistry.register("deepseek_v41", dict_tool_arguments)
+    # Gemma4's template raises on string arguments (and older revisions pasted them between braces).
+    TokenizerRegistry.register("gemma4", dict_tool_arguments)
+    TokenizerRegistry.register("gemma4_unified", dict_tool_arguments)  # gemma-4-12B
     TokenizerRegistry.register("nemotron_h", dict_tool_arguments)
 
 

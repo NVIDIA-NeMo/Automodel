@@ -23,19 +23,24 @@ capability-down is a BUG, not a finding.
 For a few samples it reports:
   - supervised fraction (labels != -100); flags ~0% (nothing learned) or ~100% (user/tool text
     also supervised -> the model imitates non-assistant text).
-  - whether the gemma4 stop token <turn|> (106) falls inside supervised spans.
+  - whether a gemma4 stop token, <turn|> (106) or <|tool_response> (50), is a supervised label.
+    CoderForge trajectories end on a tool call, so their model turn stays open and the supervised
+    stop token is usually 50.
   - a decoded supervised span vs a decoded masked span, so a human can eyeball that ASSISTANT
     content (incl. tool_calls) is supervised and system/user/tool-result content is masked.
+
+Labels are shifted by one (labels[i] is the target for input_ids[i]), so stop tokens and supervised
+text are read from the labels, not from input_ids at supervised positions.
 """
 
 import argparse
 import os
 
-from transformers import AutoTokenizer
-
+from nemo_automodel import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
 GEMMA4 = "/path/to/checkpoints/hf_gemma4_31b"
+STOP_TOKEN_IDS = (106, 50)  # <turn|>, <|tool_response>
 JSONL = "/path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl"
 # Generation-block template lives one directory up from this script (data/../).
 _DEFAULT_CHAT_TEMPLATE = os.path.join(
@@ -67,12 +72,12 @@ def main():
     ap.add_argument(
         "--chat-template",
         default=_DEFAULT_CHAT_TEMPLATE,
-        help="Chat template with {% generation %} blocks for direct assistant masking. "
+        help="Chat template with {%% generation %%} blocks for direct assistant masking. "
         "Empty string uses the tokenizer's own template (the prefix-arithmetic fallback).",
     )
     args = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained(GEMMA4)
+    tok = NeMoAutoTokenizer.from_pretrained(GEMMA4)
     ds = ChatDataset(
         path_or_dataset_id=args.jsonl,
         tokenizer=tok,
@@ -94,9 +99,10 @@ def main():
         n = len(ids)
         sup = [j for j in range(n) if labels[j] != -100]
         frac = 100 * len(sup) / max(1, n)
-        sup_ids = [ids[j] for j in sup]
+        sup_labels = {labels[j] for j in sup}
+        stops = [t for t in STOP_TOKEN_IDS if t in sup_labels]
         print(f"\n===== sample {i} (keys={keys}) =====")
-        print(f"  tokens={n}  supervised={len(sup)} ({frac:.1f}%)  106_in_supervised={106 in sup_ids}")
+        print(f"  tokens={n}  supervised={len(sup)} ({frac:.1f}%)  supervised_stop_tokens={stops}")
         if not sup:
             print("  !!! ALL-MASKED — nothing supervised (BUG).")
             continue
@@ -108,14 +114,14 @@ def main():
         msk_spans = contiguous_spans(labels, keep=False)
         if sup_spans:
             a, b = sup_spans[0]
-            print(f"  first SUPERVISED span [{a}:{b}] ->\n    {tok.decode(ids[a : min(b, a + 80)])!r}")
+            print(f"  first SUPERVISED span [{a}:{b}] ->\n    {tok.decode(labels[a : min(b, a + 80)])!r}")
         if msk_spans:
             a, b = msk_spans[0]
             print(f"  first MASKED span [{a}:{b}] ->\n    {tok.decode(ids[a : min(b, a + 80)])!r}")
 
     print(
         "\nVERDICT: supervised fraction should be moderate (roughly 10-60% for agent"
-        " transcripts), 106 present in supervised spans, assistant text supervised &"
+        " transcripts), a stop token (106 or 50) among the supervised labels, assistant text supervised &"
         " system/user/tool text masked. All-masked or ~all-supervised => masking bug."
     )
 

@@ -26,6 +26,7 @@ from nemo_automodel._transformers.tokenization.tool_call_arguments import (
     DictToolArgumentsTokenizer,
     tool_call_arguments_as_dicts,
     wrap_tokenizer,
+    wrap_tokenizer_for_model,
 )
 
 
@@ -77,7 +78,7 @@ def test_wrapped_tokenizer_survives_copies():
         assert args == ("x",) and kwargs == {"tokenize": False}
 
 
-@pytest.mark.parametrize("model_type", ["beam", "deepseek_v41", "nemotron_h"])
+@pytest.mark.parametrize("model_type", ["beam", "deepseek_v41", "gemma4", "gemma4_unified", "nemotron_h"])
 def test_registered_for_models_whose_templates_need_dict_arguments(model_type: str) -> None:
     assert TokenizerRegistry.get_custom_tokenizer_cls(model_type) is DictToolArgumentsTokenizer
 
@@ -91,3 +92,14 @@ def test_factory_wraps_apply_chat_template(tmp_path):
     tok.save_pretrained(tmp_path)
     loaded = DictToolArgumentsTokenizer.from_pretrained(str(tmp_path))
     assert loaded.apply_chat_template(_conversation('{"a": 1}'), tokenize=False) == "True"
+
+
+@pytest.mark.parametrize(("model_type", "wrapped"), [("gemma4", True), ("llama", False), (None, False)])
+def test_wrap_tokenizer_for_model_follows_the_registry(tmp_path, model_type, wrapped):
+    # Tokenizers that do not come from NeMoAutoTokenizer (the VLM processor's) get the same decoding,
+    # but only for the model types registered for DictToolArgumentsTokenizer.
+    if model_type is not None:
+        (tmp_path / "config.json").write_text(f'{{"model_type": "{model_type}"}}')
+    tok = wrap_tokenizer_for_model(_RecordingTokenizer(), tmp_path)
+    conversation, _, _ = tok.apply_chat_template(_conversation('{"a": 1}'))
+    assert _arguments(conversation) == ({"a": 1} if wrapped else '{"a": 1}')

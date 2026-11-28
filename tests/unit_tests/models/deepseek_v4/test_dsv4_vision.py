@@ -525,6 +525,37 @@ def test_processor_renders_released_vision_prompt_format():
     assert len(images) == 1
 
 
+class _RecordingTokenizer:
+    """Tokenizes each text to fixed ids and records the keywords of each call."""
+
+    pad_token_id = 0
+    eos_token_id = 1
+    unk_token_id = 3
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, texts, *, add_special_tokens=True, **kwargs):
+        self.calls.append({"add_special_tokens": add_special_tokens, **kwargs})
+        return {"input_ids": [[5, 6] for _ in texts]}
+
+    def convert_tokens_to_ids(self, token):
+        return 2
+
+
+@pytest.mark.parametrize("passed, expected", [(None, False), (False, False), (True, True)])
+def test_processor_accepts_add_special_tokens_from_the_caller(passed, expected):
+    processor = object.__new__(DeepseekV4VisionProcessor)
+    processor.tokenizer = _RecordingTokenizer()
+    processor.config = _vision_config()
+    kwargs = {} if passed is None else {"add_special_tokens": passed}
+
+    batch = processor(text="hello", **kwargs)
+
+    assert batch["input_ids"].tolist() == [[5, 6]]
+    assert processor.tokenizer.calls == [{"add_special_tokens": expected, "padding": False}]
+
+
 def test_state_dict_adapter_maps_native_vision_keys_bidirectionally():
     config = _vision_config()
     adapter = DeepSeekV4StateDictAdapter(config, _moe_config(), BackendConfig(), dtype=torch.float32)
