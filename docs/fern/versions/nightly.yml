@@ -467,6 +467,8 @@ navigation:
                 path: ../../model-coverage/llm/tencent/hy-mt2.mdx
               - page: "Hy3-preview"
                 path: ../../model-coverage/llm/tencent/hy3.mdx
+              - page: "Hy4-flash"
+                path: ../../model-coverage/llm/tencent/hy4-flash.mdx
           - section: "TII"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRqoBAABXRUJQVlA4TJ4BAAAvE8AEAH/jIJJkpxqyAjRiFyn8HO5214bjRpIUKQfsXP+/cHzVnQ7bSFKkquP8k4WHqfmP2ABEACIAwsAIGBgABAJRAxQUBRqAjTotUqNbLSI6wwJiVQU3fv8REIeFhE3VBhH0/f+FMNCFCIQb8Fe1MrEYkqo0Q16WrXHqetwqCKkCY6WxAm0b/9eryBA1kejOJ1IlLPBHrRgJFaRMUGGM4vMF5N2HmH/0zUENDVT0/GDnY5wYyGDO8xD0/W3+H7B+pnsB4h/9hCI5jgeg27ZtvFn3nvB+cVKbqW03dWrb9vv//vgIEf2fANwlH9YEGvYhtK+NVKOUJ03d+OrZgkF5cazYOC2IchF7Lq+Y3TXiYizLYMCwN0wYUKQvbq6vJh87xx6aG44Qh8zW2/v24u/A0k83x7VoAG3dviRmvntLn1263ILYVPruNTX93Vf6Kupyq5NO3H8kp/76l3+KnNSgHaz/S6vnuWP0qanxEMHZGDBg2B8k6iKC5PIwt2NC+KzcPMhGlAdN/cT6+byFwqPQtjJURSyO/zB+JR/WOAM="/></svg>'
             slug: tiiuae
@@ -708,6 +710,13 @@ navigation:
               - page: "Step-5-Preview-BF16"
                 path: ../../model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx
                 slug: Step-5-Preview
+          - section: "Tencent"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRkYBAABXRUJQVlA4TDoBAAAvE8AEAK/iOJIkR6kacfqHV3hPYIzWYASDRpIU9ewcw0t4/wpewNuiOGokyZEy2/Dntyz2Z+9q/skmbdYk7SF7jgIIAeiPgyQgRL8nFC8gIQKhECCAFF4KhACnBxd+dmcs/1AKReZWBfinKjoERQcqgTIDIpMw0gr/VCnhlhmpPwMvQWlohfgzpAMpKGMvASL9mZCWOfz/1Oqmpz7lNbQwSoTuXLZjdVrdJTjep8MVcCTbtul8+yc3uA+xbds25z+ctNKP6P8E+APwt32/IACg43I/B2ReCsgALS/E86ddQZA9hhQzHF1yjXTEG04sJ7NVbzPuzNvrxWA7fdXFkHY4Pz7P5vuZvN73t+7lGEUINlKjciVTavVzw+I3W6taBEAxJUO2VVFURUM1FQ18AAw5ZUg5o5xSZBT+OA=="/></svg>'
+            slug: tencent
+            path: ../../model-coverage/vlm/tencent/index.mdx
+            contents:
+              - page: "Hy4-flash"
+                path: ../../model-coverage/vlm/tencent/hy4-flash.mdx
           - section: "Thinking Machines"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRvIAAABXRUJQVlA4TOYAAAAvE8AEAHVAsm3btNPqX7Jt24xt15Kibdu22YA3st/OmIAJ6P8EPPAL3wMQeAGQeOVzt5nnDJ5zyj0X3CEccwmuWEAk/ziA83pKpElgohYHZVrRkSZHmAEeuOMerNBFI24CJLCjQgfKxJDuIEiBB24hrzjiDO5xjrDOFUdsc8Il4jAX8B7+XyMKB9wwxAYPHLPHEdesMMkxY/AB9qLCcBtqGuimES8eUkiIoiFHNQrWeIAj6IkQw4qfNhopkiJLeSN2MgyiZBzyCt5wBo+Z5QjilBtuOWCVQ4R7+Cr4iSAAEiQAvPa7Ag=="/></svg>'
             slug: thinkingmachines

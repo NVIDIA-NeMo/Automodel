@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM90 FA4 QSA parity against an independent dense FP64 attention oracle."""
+"""FA4 QSA parity on SM90 and SM100-family GPUs against an independent dense FP64 attention oracle."""
 
 import functools
 
@@ -25,8 +25,9 @@ from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_spar
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention, select_qsa_cuda_kernel
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
-    reason="FA4 QSA implements SM90 CUDA kernels",
+    not torch.cuda.is_available()
+    or not (torch.cuda.get_device_capability() == (9, 0) or torch.cuda.get_device_capability()[0] in (10, 11)),
+    reason="FA4 QSA implements SM90 and SM100-family (10.x/11.x) CUDA kernels",
 )
 
 

@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -43,6 +43,7 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
+from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_torch_ckpt,
     save_config,
@@ -53,9 +54,14 @@ from nemo_automodel.components.checkpoint.utils import (
     resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config, TENvfp4Config
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.moe.mxfp8 import uses_native_mxfp8_experts
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.quantization.fp8 import uses_hardware_fp8
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -63,10 +69,40 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 if TYPE_CHECKING:
-    from nemo_automodel._transformers.mfu import AutoMFU
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from nemo_automodel.components.distributed.config import DistributedStrategyConfig, MoEParallelizerConfig
     from nemo_automodel.components.distributed.init_utils import DistInfo
+    from nemo_automodel.components.distributed.mesh import MeshContext
+    from nemo_automodel.components.models.common.utils import BackendConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _strategy_compute_dtype(
+    strategy: "DistributedStrategyConfig | None",
+    device_mesh: "DeviceMesh | None",
+    *,
+    recipe_autocast_dtype: torch.dtype | None = None,
+    moe_policy: "MixedPrecisionPolicy | None" = None,
+) -> torch.dtype | None:
+    """Return the dtype used for CUDA matmuls, or None to infer it from the model."""
+    if recipe_autocast_dtype in (torch.bfloat16, torch.float16):
+        return recipe_autocast_dtype
+    if moe_policy is not None:
+        return moe_policy.param_dtype
+    if not isinstance(strategy, FSDP2Config) or device_mesh is None:
+        return None
+    policy_dtype = strategy.mp_policy.param_dtype if strategy.mp_policy is not None else None
+    if fsdp2_sharding_enabled(device_mesh):
+        return policy_dtype
+    # Unsharded FSDP2 decorates the forward with autocast on the mesh's device.
+    # A one-rank Gloo mesh autocasts CPU ops even when the model is on CUDA.
+    autocast_dtype = strategy.autocast_dtype or policy_dtype
+    if device_mesh.device_type == "cuda" and autocast_dtype in (torch.bfloat16, torch.float16):
+        return autocast_dtype
+    return None
 
 
 def has_load_restore_state(object):
@@ -173,7 +209,7 @@ class BaseRecipe:
     """
 
     dist_env: "DistInfo"
-    mfu_calculator: "AutoMFU | None" = None
+    mfu_calculator: AutoMFU = AutoMFU()
     timestamp: float
 
     @staticmethod
@@ -234,6 +270,62 @@ class BaseRecipe:
             return
         for key in keys:
             tracked.discard(key)
+
+    def _setup_mfu(
+        self,
+        model: torch.nn.Module,
+        *,
+        compute_dtype: torch.dtype | Literal["auto"] = "auto",
+        recipe_autocast_dtype: torch.dtype | None = None,
+    ) -> AutoMFU:
+        """Return the MFU calculator for the recipe's precision policy and model.
+
+        An explicit compute dtype bypasses automatic precision selection.
+        """
+
+        def infer_compute_dtype(
+            *,
+            compute_dtype: torch.dtype | Literal["auto"],
+            fp8_config: ConfigNode | None,
+            backend: "BackendConfig | None",
+            moe_config: "MoEParallelizerConfig | None",
+            mesh_context: "MeshContext",
+            strategy: "DistributedStrategyConfig | None",
+        ) -> torch.dtype | None:
+            if isinstance(compute_dtype, torch.dtype):
+                return compute_dtype
+            if compute_dtype != "auto":
+                raise TypeError('compute_dtype must be "auto" or a torch.dtype')
+
+            te_quantization = backend.te_quantization if backend is not None else None
+            if HAVE_TE and isinstance(te_quantization, TENvfp4Config):
+                return torch.float4_e2m1fn_x2
+            if (
+                (HAVE_TE and isinstance(te_quantization, TEFp8Config))
+                # MoK runs the routed-expert GEMMs in MXFP8: E4M3 data with E8M0 block scales.
+                or (backend is not None and backend.dispatcher == "mok" and backend.mok.precision == "mxfp8")
+                or uses_native_mxfp8_experts(model)
+                or (fp8_config and fp8_config.get("enabled", False) and uses_hardware_fp8(model))
+            ):
+                return torch.float8_e4m3fn
+            return _strategy_compute_dtype(
+                strategy,
+                mesh_context.device_mesh,
+                recipe_autocast_dtype=recipe_autocast_dtype,
+                moe_policy=moe_config.mp_policy if moe_config is not None and mesh_context.ep_size > 1 else None,
+            )
+
+        return AutoMFU.from_config(
+            model,
+            compute_dtype=infer_compute_dtype(
+                compute_dtype=compute_dtype,
+                fp8_config=self.cfg.get("fp8"),
+                backend=getattr(model, "backend", None),
+                moe_config=self.moe_parallel_config,
+                mesh_context=self.mesh_context,
+                strategy=self.distributed_config,
+            ),
+        )
 
     def _autocast_context(self):
         """Return the recipe-level autocast context configured by the strategy."""
@@ -860,17 +952,17 @@ class BaseRecipe:
     ) -> tuple[float, float | None]:
         """Advance the step timer and return the step's tokens/s and MFU.
 
-        MFU is ``None`` without an MFU calculator, without batches, or when any batch
-        lacks ``input_ids`` or has no FLOPs formula.
+        MFU is ``None`` when the model has no FLOPs formula, there are no batches,
+        or a batch lacks ``input_ids``.
         """
         t = time.perf_counter()
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
 
-        mfu_calculator = self.mfu_calculator
-        if not batches or mfu_calculator is None:
+        if not batches:
             return tps, None
+        mfu_calculator = self.mfu_calculator
         step_flops = 0.0
         for batch in batches:
             input_ids = batch.get("input_ids")

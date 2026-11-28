@@ -20,6 +20,7 @@ from unittest.mock import Mock, call
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
 
@@ -51,7 +52,7 @@ def _train_sample(step=7):
 def _ft_recipe(run, recipe_cls=None):
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
-    recipe = (recipe_cls or TrainFinetuneRecipeForNextTokenPrediction)(cfg=None)
+    recipe = (recipe_cls or TrainFinetuneRecipeForNextTokenPrediction)(cfg=ConfigNode({}))
     # Minimal attributes required by the logging methods
     recipe.dist_env = types.SimpleNamespace(is_main=True)
     recipe.step_scheduler = types.SimpleNamespace(step=7, is_remote_logging_step=True)
@@ -106,7 +107,7 @@ def test_log_train_metrics_without_trackio_logger_does_not_raise():
     """Recipes built without a ``trackio:`` section (or before setup) skip Trackio."""
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
-    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=None)
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=ConfigNode({}))
     recipe.dist_env = types.SimpleNamespace(is_main=True)
     recipe.step_scheduler = types.SimpleNamespace(step=7, is_remote_logging_step=True)
     recipe.metric_logger_train = types.SimpleNamespace(log=lambda x: None)

@@ -4,7 +4,7 @@
 #   automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
-#PR4637: removed benchmark: {nsys_end: -1, nsys_ranks: [], nsys_start: -1, num_nodes: 1, peak_tflops: 989, warmup_steps: 5}
+#PR4637: removed benchmark: {nsys_end: -1, nsys_ranks: [], nsys_start: -1, num_nodes: 1, warmup_steps: 5}
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 42

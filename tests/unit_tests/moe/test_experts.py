@@ -104,6 +104,47 @@ def moe_config():
     )
 
 
+@pytest.mark.parametrize(
+    "expert_type, capable, installed, expected",
+    [
+        (GroupedExperts, True, True, 5000.0),
+        (GroupedExpertsDeepEP, True, True, 5000.0),
+        (GroupedExperts, False, True, 2500.0),
+        (GroupedExperts, True, False, 2500.0),
+        (None, True, True, 2500.0),
+        ("deepep_lora", True, True, 2500.0),
+    ],
+)
+def test_mfu_tracks_native_mxfp8_expert_dispatch(moe_config, monkeypatch, expert_type, capable, installed, expected):
+    from nemo_automodel.components.moe import mxfp8
+    from nemo_automodel.recipes.base_recipe import BaseRecipe
+
+    backend = BackendConfig(experts="torch_mm_mxfp8", dispatcher="torch")
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8, dtype=torch.bfloat16))
+    model.config = SimpleNamespace(model_type="llama")
+    model.backend = backend
+    if expert_type == "deepep_lora":
+        from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA
+
+        experts = GroupedExpertsDeepEP(moe_config, backend=backend)
+        model.add_module("experts", GroupedExpertsDeepEPLoRA(experts))
+    elif expert_type is not None:
+        model.add_module("experts", expert_type(moe_config, backend=backend))
+
+    # Isolate the hardware and torchao availability probes used by expert dispatch.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10 if capable else 9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA GB200")
+    monkeypatch.setattr(mxfp8, "_resolve_mxfp8_grouped_mm", lambda: torch._grouped_mm if installed else None)
+    recipe = SimpleNamespace(
+        cfg={},
+        distributed_config=None,
+        moe_parallel_config=None,
+        mesh_context=SimpleNamespace(device_mesh=None, ep_size=1),
+    )
+    assert BaseRecipe._setup_mfu(recipe, model).reference_mfu == expected
+
+
 class TestActivationFunctions:
     """Test activation functions used in MoE layers."""
 

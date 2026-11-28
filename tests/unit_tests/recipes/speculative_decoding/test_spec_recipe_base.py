@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ import yaml
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig
 from nemo_automodel.recipes.speculative_decoding import _spec_recipe_base
 from nemo_automodel.recipes.speculative_decoding._spec_recipe_base import SpecDecodeRecipeBase
 
@@ -100,8 +102,9 @@ def _make_recipe(cls, tmp_path, *, is_async=False, cp_mesh=None, cfg=None):
 # --------------------------------------------------------------------------- #
 def _optim_recipe(tmp_path, dataloader):
     obj = _Recipe.__new__(_Recipe)
-    obj.cfg = SimpleNamespace(optimizer=_Cfg(lr=1e-3, warmup_ratio=0.25, min_lr_ratio=0.2))
+    obj.cfg = SimpleNamespace(optimizer=ConfigNode({"lr": 1e-3, "warmup_ratio": 0.25, "min_lr_ratio": 0.2}))
     obj.trainer_module = torch.nn.Linear(2, 2)
+    obj.dp_mesh = None
     obj.train_dataloader = dataloader
     recipe_cfg = _Cfg(num_epochs=2, grad_accumulation_steps=3, output_dir=str(tmp_path / "out"))
     return obj, recipe_cfg
@@ -146,6 +149,223 @@ def test_min_warmup_steps_floor_is_used(tmp_path):
     obj.__class__ = _FlooredWarmup
     obj._setup_training_state(recipe_cfg)
     assert obj.warmup_steps == 5
+
+
+# --------------------------------------------------------------------------- #
+# Optimizer construction (``optimizer:`` block -> ``build_optimizer_config``)
+# --------------------------------------------------------------------------- #
+def _recipe_with_optimizer(cls, opt_block, module, tmp_path):
+    obj = cls.__new__(cls)
+    obj.cfg = SimpleNamespace(optimizer=ConfigNode(opt_block))
+    obj.trainer_module = module
+    obj.dp_mesh = None
+    obj.train_dataloader = list(range(4))
+    recipe_cfg = _Cfg(num_epochs=1, output_dir=str(tmp_path / "out"))
+    return obj, recipe_cfg
+
+
+def _eagle3_cls():
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+
+    return TrainEagle3Recipe
+
+
+def test_eagle3_setup_honors_configured_optimizer_target_and_kwargs(tmp_path):
+    """Regression: ``optimizer._target_`` and its kwargs used to be ignored (torch AdamW was built)."""
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(),
+        {"_target_": "torch.optim.SGD", "lr": 3e-4, "momentum": 0.8, "nesterov": True},
+        torch.nn.Linear(2, 2),
+        tmp_path,
+    )
+    obj._setup_training_state(recipe_cfg)
+
+    assert type(obj.optimizer) is torch.optim.SGD
+    assert obj.optimizer.param_groups[0]["momentum"] == 0.8
+    assert obj.optimizer.param_groups[0]["nesterov"] is True
+    # The scheduler wraps the configured optimizer, at the configured peak LR.
+    assert obj.peak_lr == pytest.approx(3e-4)
+    assert obj.lr_scheduler.optimizer is obj.optimizer
+
+
+_DRAFT_RECIPES = [
+    ("train_eagle1", "TrainEagle1Recipe"),
+    ("train_eagle2", "TrainEagle2Recipe"),
+    ("train_eagle3", "TrainEagle3Recipe"),
+    ("train_vispec", "TrainVispecRecipe"),
+    ("train_vispec", "TrainVispecStage1Recipe"),
+    ("train_dflash", "TrainDFlashRecipe"),
+    ("train_dflash2", "TrainDFlash2Recipe"),
+    ("train_domino", "TrainDominoRecipe"),
+    ("train_jetspec", "TrainJetSpecRecipe"),
+    ("train_dspark", "TrainDSparkRecipe"),
+]
+
+
+@pytest.mark.parametrize("module_name,class_name", _DRAFT_RECIPES)
+def test_every_draft_recipe_builds_the_configured_optimizer(module_name, class_name, tmp_path):
+    """No subclass may override the base builder and drop ``_target_`` again."""
+    cls = getattr(importlib.import_module(f"nemo_automodel.recipes.speculative_decoding.{module_name}"), class_name)
+    obj, recipe_cfg = _recipe_with_optimizer(
+        cls, {"_target_": "torch.optim.SGD", "lr": 3e-4, "momentum": 0.8}, torch.nn.Linear(2, 2), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+    assert type(obj.optimizer) is torch.optim.SGD
+    assert obj.optimizer.param_groups[0]["momentum"] == 0.8
+
+
+def test_file_form_target_builds(tmp_path, monkeypatch):
+    """A ``/path/file.py:Class`` target (user modules enabled) must build, not be re-imported by name."""
+    from nemo_automodel.components.config import loader
+
+    monkeypatch.setattr(loader, "ENABLE_USER_MODULES", True)
+    (tmp_path / "my_opt.py").write_text("import torch\n\n\nclass MyAdam(torch.optim.AdamW):\n    pass\n")
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"_target_": f"{tmp_path}/my_opt.py:MyAdam", "lr": 1e-4}, torch.nn.Linear(2, 2), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+    assert type(obj.optimizer).__name__ == "MyAdam"
+    assert isinstance(obj.optimizer, torch.optim.AdamW)
+
+
+def test_peft_draft_with_bf16_torch_adam_still_warns(tmp_path, caplog):
+    from nemo_automodel.components.optim import precision_warnings
+
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2).to(torch.bfloat16), tmp_path
+    )
+    obj.peft_config = SimpleNamespace()
+    with caplog.at_level(logging.WARNING):
+        obj._setup_training_state(recipe_cfg)
+    assert len(_torch_adam_warnings(caplog)) == 1
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+
+
+def test_dspark_muown_group_rule_keeps_its_lr_and_decay_over_two_steps(tmp_path):
+    """The Muown rule is baked into the group at build time; the LambdaLR must scale it, not double it."""
+    pytest.importorskip("dion")
+    from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe
+
+    module = torch.nn.Sequential(torch.nn.Linear(8, 8))
+    obj, recipe_cfg = _recipe_with_optimizer(
+        TrainDSparkRecipe,
+        {
+            "_target_": "nemo_automodel.components.optim.optimizer.MuownConfig",
+            "lr": 5e-5,
+            "weight_decay": 0.5,
+            "warmup_ratio": 0.5,
+            "param_group_overrides": [{"pattern": "bias", "lr_mult": 0.25, "wd_mult": 0.5}],
+        },
+        module,
+        tmp_path,
+    )
+    obj.train_dataloader = list(range(8))
+    obj._setup_training_state(recipe_cfg)
+
+    bias = next(g for g in obj.optimizer.param_groups if any(p is module[0].bias for p in g["params"]))
+    matrix = next(g for g in obj.optimizer.param_groups if any(p is module[0].weight for p in g["params"]))
+    assert bias["weight_decay"] == pytest.approx(0.25)
+    assert matrix["weight_decay"] == pytest.approx(0.5)
+    for _ in range(2):
+        assert bias["lr"] == pytest.approx(0.25 * matrix["lr"])
+        obj.lr_scheduler.step()
+    assert bias["lr"] == pytest.approx(0.25 * matrix["lr"])
+    assert bias["weight_decay"] == pytest.approx(0.25)
+
+
+def test_eagle3_setup_honors_adamw_eps(tmp_path):
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 1e-4, "eps": 1e-6, "betas": [0.9, 0.999]}, torch.nn.Linear(2, 2), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+    assert isinstance(obj.optimizer, torch.optim.AdamW)
+    assert obj.optimizer.param_groups[0]["eps"] == 1e-6
+
+
+def test_unconfigured_optimizer_matches_a_hand_built_adamw_bitwise(tmp_path):
+    """A config without ``_target_`` must give exactly the previous hard-coded AdamW, step for step."""
+
+    def _make():
+        torch.manual_seed(7)
+        return torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 2))
+
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 2e-3, "betas": [0.9, 0.999], "weight_decay": 0.0}, _make(), tmp_path
+    )
+    obj._setup_training_state(recipe_cfg)
+
+    reference = _make()
+    ref_opt = torch.optim.AdamW(reference.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=0.0)
+
+    assert type(obj.optimizer) is torch.optim.AdamW
+    group, ref_group = obj.optimizer.param_groups[0], ref_opt.param_groups[0]
+    for key in ("lr", "betas", "eps", "weight_decay", "amsgrad", "foreach", "fused", "maximize"):
+        assert group[key] == ref_group[key], key
+
+    gen = torch.Generator().manual_seed(3)
+    for _ in range(5):
+        x, y = torch.randn(4, 8, generator=gen), torch.randn(4, 2, generator=gen)
+        for module, opt in ((obj.trainer_module, obj.optimizer), (reference, ref_opt)):
+            opt.zero_grad()
+            torch.nn.functional.mse_loss(module(x), y).backward()
+            opt.step()
+    for got, want in zip(obj.trainer_module.parameters(), reference.parameters()):
+        assert torch.equal(got, want)
+
+
+def test_unconfigured_optimizer_keeps_recipe_betas_default(tmp_path):
+    obj, recipe_cfg = _recipe_with_optimizer(_eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2), tmp_path)
+    obj._setup_training_state(recipe_cfg)
+    assert obj.optimizer.param_groups[0]["betas"] == (0.9, 0.95)
+    assert obj.optimizer.param_groups[0]["weight_decay"] == 0.0
+
+
+def test_only_trainable_parameters_are_optimized(tmp_path):
+    module = torch.nn.Linear(4, 4)
+    module.bias.requires_grad_(False)
+    obj, recipe_cfg = _recipe_with_optimizer(_eagle3_cls(), {"lr": 1e-4}, module, tmp_path)
+    obj._setup_training_state(recipe_cfg)
+    (params,) = (group["params"] for group in obj.optimizer.param_groups)
+    assert params == [module.weight]
+
+
+def _torch_adam_warnings(caplog):
+    return [r for r in caplog.records if "Detected torch.optim.Adam/AdamW" in r.getMessage()]
+
+
+def test_bf16_draft_with_torch_adam_warns(tmp_path, caplog):
+    """Regression: the BF16-parameter + torch-Adam warning never fired for the draft recipes."""
+    from nemo_automodel.components.optim import precision_warnings
+
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+    obj, recipe_cfg = _recipe_with_optimizer(
+        _eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2).to(torch.bfloat16), tmp_path
+    )
+    with caplog.at_level(logging.WARNING):
+        obj._setup_training_state(recipe_cfg)
+    assert len(_torch_adam_warnings(caplog)) == 1
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+
+
+def test_fp32_draft_with_torch_adam_does_not_warn(tmp_path, caplog):
+    from nemo_automodel.components.optim import precision_warnings
+
+    precision_warnings._WARNED_CONTEXTS.discard("optim")
+    obj, recipe_cfg = _recipe_with_optimizer(_eagle3_cls(), {"lr": 1e-4}, torch.nn.Linear(2, 2), tmp_path)
+    with caplog.at_level(logging.WARNING):
+        obj._setup_training_state(recipe_cfg)
+    assert _torch_adam_warnings(caplog) == []
+
+
+def test_build_draft_optimizer_builds_sgd_for_an_explicit_target():
+    obj = _Recipe.__new__(_Recipe)
+    obj.trainer_module = torch.nn.Linear(4, 4)
+    obj.dp_mesh = None
+    config = OptimizerFromFactoryConfig(factory=torch.optim.SGD, kwargs={"lr": 0.1, "momentum": 0.9})
+    optimizer = obj._build_draft_optimizer(config)
+    assert isinstance(optimizer, torch.optim.SGD)
+    assert optimizer.param_groups[0]["momentum"] == 0.9
 
 
 # --------------------------------------------------------------------------- #

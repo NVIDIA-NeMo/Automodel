@@ -21,7 +21,7 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``trackio``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
+``embedding_row_repair``/``domain_mixture`` map to component config
 dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
@@ -42,16 +42,17 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, TypeVar, cast
+
+import torch
 
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
-    from nemo_automodel._transformers.mfu import MFUConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
@@ -153,6 +154,205 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
     return None
 
 
+class SwanLabOptions(TypedDict, total=False):
+    """The ``wandb.swanlab:`` sub-block (see ``SwanLabConfig``)."""
+
+    mode: str
+    workspace: str
+    log_dir: str
+    upload_to_wandb: bool
+
+
+class WandbInitKwargs(TypedDict, total=False):
+    """Keyword set of ``wandb.init`` that a ``wandb:`` block can carry.
+
+    A TypedDict does not reject other keys at run time: every key of the block except ``enable`` is
+    forwarded to ``wandb.init`` as written.
+    """
+
+    project: str
+    entity: str
+    name: str
+    group: str
+    job_type: str
+    tags: list[str]
+    notes: str
+    mode: str
+    dir: str
+    id: str
+    resume: str | bool
+    swanlab: SwanLabOptions
+
+
+@dataclass(frozen=True)
+class DraftWandbSettings:
+    """Typed ``wandb:`` block of the speculative-decoding recipes.
+
+    Attributes:
+        init_kwargs: Keywords for ``wandb.init`` (the block without ``enable``).
+        run_config: The full resolved config recorded as the run's ``config``.
+    """
+
+    init_kwargs: WandbInitKwargs
+    run_config: dict[str, Any]
+
+    @classmethod
+    def from_config(cls, raw: "ConfigNode") -> "DraftWandbSettings | None":
+        """Parse the top-level ``wandb:`` block of ``raw``; ``None`` when it is absent or ``enable: false``.
+
+        ``enable`` is the examples' opt-in flag, not a ``wandb.init`` keyword, so it is dropped.
+        """
+        node = raw.get("wandb", None)
+        if node is None:
+            return None
+        kwargs = _as_dict(node)
+        if kwargs.pop("enable", True) is False:
+            return None
+        return cls(init_kwargs=cast(WandbInitKwargs, kwargs), run_config=raw.to_dict())
+
+
+@dataclass(frozen=True)
+class DraftCheckpointDefaults:
+    """Runtime values the draft recipes derive for the checkpointer; the YAML ``checkpoint:`` block overrides them.
+
+    Attributes:
+        checkpoint_dir: Directory the checkpoints go to.
+        model_repo_id: Repo id or path of the target the draft belongs to.
+        model_cache_dir: Hugging Face hub cache directory.
+        save_consolidated: Whether to export a consolidated HF checkpoint (``False`` for LoRA drafts).
+        is_peft: Whether the draft is trained with LoRA.
+        model_state_dict_keys: State-dict keys of the draft, used to diff the consolidated export.
+    """
+
+    checkpoint_dir: str
+    model_repo_id: str
+    model_cache_dir: str
+    save_consolidated: bool
+    is_peft: bool
+    model_state_dict_keys: list[str]
+
+    def resolve(self, node: "ConfigNode | None") -> "CheckpointingConfig":
+        """Build the :class:`CheckpointingConfig`: these defaults, then the user's block over them.
+
+        ``restore_from`` is read separately at load time, so it is not a config field. A key that
+        ``CheckpointingConfig`` does not have raises ``TypeError``. A ``model_state_dict_keys: null`` in
+        the block falls back to the draft's keys.
+        """
+        from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+        kwargs = {
+            "enabled": True,
+            "checkpoint_dir": self.checkpoint_dir,
+            "model_save_format": "safetensors",
+            "model_repo_id": self.model_repo_id,
+            "model_cache_dir": self.model_cache_dir,
+            "save_consolidated": self.save_consolidated,
+            "is_peft": self.is_peft,
+            "model_state_dict_keys": self.model_state_dict_keys,
+        }
+        if node is not None:
+            user = _as_dict(node)
+            user.pop("restore_from", None)
+            kwargs.update(user)
+        if kwargs["model_state_dict_keys"] is None:
+            kwargs["model_state_dict_keys"] = self.model_state_dict_keys
+        return CheckpointingConfig(**kwargs)
+
+
+OptimizerOption: TypeAlias = (
+    float | int | bool | str | torch.dtype | list[float] | tuple[float, ...] | list[dict[str, str | float]] | None
+)
+
+# Optimizer options YAML writes as dtype names (``torch.float32``); the factory route needs real dtypes.
+_OPTIMIZER_DTYPE_KEYS = ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
+
+
+@dataclass(frozen=True)
+class DraftOptimizerSettings:
+    """Typed ``optimizer:`` block of the speculative-decoding recipes.
+
+    The draft recipes keep the LR-schedule keys in the same block as the optimizer, so the block is split
+    here: ``optimizer`` owns construction, and the schedule values go to the recipe's warmup + cosine
+    schedule.
+
+    Attributes:
+        optimizer: The constructed optimizer config; build it with ``.build(model, device_mesh=...)``.
+        peak_lr: The block's ``lr``, the peak of the schedule.
+        warmup_ratio: Fraction of the optimizer steps used for LR warmup.
+        min_lr_ratio: Final LR as a fraction of ``peak_lr``.
+    """
+
+    optimizer: "OptimizerConfig"
+    peak_lr: float
+    warmup_ratio: float
+    min_lr_ratio: float
+
+    @classmethod
+    def from_config(cls, node: "ConfigNode") -> "DraftOptimizerSettings":
+        """Parse an ``optimizer:`` block without modifying it.
+
+        The target and its options are resolved here: an ``OptimizerConfig`` subclass or a Dion class
+        is constructed from the options, and any other optimizer callable (``torch.optim.*``,
+        Transformer Engine ``FusedAdam``) becomes an ``OptimizerFromFactoryConfig`` that holds the
+        class itself and its options, with dtype names already turned into dtypes.
+
+        Without a ``_target_`` the optimizer is ``torch.optim.AdamW`` with ``betas=(0.9, 0.95)`` and
+        ``weight_decay=0.0`` unless the block sets them; with one, no AdamW defaults are added.
+
+        ``param_group_overrides`` is a no-op when empty. The draft recipes schedule with a warmup + cosine
+        ``LambdaLR``, which does not apply ``lr_mult`` / ``wd_mult``; only the Dion-family configs bake the
+        multipliers into the group's LR and weight decay, so a non-empty list with any other optimizer
+        raises ``ValueError``.
+        """
+        from nemo_automodel.components.optim.optimizer import (
+            Dion2Config,
+            DionConfig,
+            MuonConfig,
+            MuownConfig,
+            NorMuonConfig,
+            OptimizerConfig,
+            OptimizerFromFactoryConfig,
+            dion_config_class,
+        )
+        from nemo_automodel.shared.utils import dtype_from_str
+
+        options = _as_dict(node)
+        target = options.pop("_target_", None)
+        warmup_ratio = float(options.pop("warmup_ratio", 0.05))
+        min_lr_ratio = float(options.pop("min_lr_ratio", 0.1))
+        options["lr"] = float(options["lr"])
+        overrides = options.get("param_group_overrides")
+        if not overrides:
+            options.pop("param_group_overrides", None)
+        if target is None:
+            target = torch.optim.AdamW
+            options.setdefault("betas", (0.9, 0.95))
+            options.setdefault("weight_decay", 0.0)
+
+        if isinstance(target, type) and issubclass(target, OptimizerConfig):
+            optimizer = target(**options)
+        elif (dion_config := dion_config_class(target)) is not None:
+            optimizer = dion_config(**options)
+        else:
+            for key in _OPTIMIZER_DTYPE_KEYS:
+                if isinstance(options.get(key), str):
+                    options[key] = dtype_from_str(options[key])
+            optimizer = OptimizerFromFactoryConfig(factory=target, kwargs=options)
+
+        if overrides and not isinstance(optimizer, (DionConfig, Dion2Config, MuonConfig, MuownConfig, NorMuonConfig)):
+            raise ValueError(
+                "optimizer.param_group_overrides is not supported by the speculative-decoding recipes with this "
+                "optimizer: their warmup + cosine LambdaLR does not apply lr_mult / wd_mult (only the Dion-family "
+                "optimizers bake the multipliers into the group's LR and weight decay)."
+            )
+        return cls(
+            optimizer=optimizer,
+            peak_lr=options["lr"],
+            warmup_ratio=warmup_ratio,
+            min_lr_ratio=min_lr_ratio,
+        )
+
+
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
@@ -166,6 +366,12 @@ class RecipeConfig:
 
     def __init__(self, raw: "ConfigNode"):
         self._raw = raw
+        if "mfu" in raw:
+            warnings.warn(
+                "The YAML mfu section is deprecated and ignored. MFU uses the detected device and training precision.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
     @cached_property
     def freeze_config(self) -> FreezeConfig | None:
@@ -695,13 +901,6 @@ class RecipeConfig:
 
         node = self._raw.get("prewarm", None)
         return PrewarmConfig(**_section_kwargs(node)) if node else None
-
-    @cached_property
-    def mfu(self) -> "MFUConfig":
-        from nemo_automodel._transformers.mfu import MFUConfig
-
-        node = self._raw.get("mfu", None)
-        return MFUConfig(**_section_kwargs(node)) if node else MFUConfig()
 
     @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":

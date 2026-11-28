@@ -145,6 +145,10 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
     # DiffusionGemma subclass overrides it to True.
     _response_window_collation: bool = False
 
+    @property
+    def _forward_autocast_dtype(self) -> torch.dtype | None:
+        return getattr(self.distributed_config, "autocast_dtype", None)
+
     def setup(self):
         """Build all training components, then apply dLLM-specific overrides."""
         # Diffusion-LM training expects the user-specified ``torch_dtype`` to
@@ -405,7 +409,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             else nullcontext()
         )
 
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
+        autocast_dtype = self._forward_autocast_dtype
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
@@ -1161,7 +1165,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             if is_train
             else nullcontext()
         )
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
+        autocast_dtype = self._forward_autocast_dtype
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )

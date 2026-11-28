@@ -1,0 +1,81 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
+
+from nemo_automodel.components.models.hy_v4_flash.config import HYV4FlashConfig
+from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
+from tests.unit_tests.models.hy_v4_flash.conftest import released_config, tiny_config
+
+
+def _brute_force(cfg: HYV4FlashConfig, seq_len: int) -> float:
+    """Count every GEMM and attention key one query at a time, without the production closed forms."""
+    t = cfg.text_config
+    total = 0.0
+    hs, hc = t.hidden_size, t.hc_mult
+    for layer, kind in enumerate(t.attention_types):
+        heads = t.attention_heads(kind)
+        nope, rope, v = t.attention_dims(kind)
+        linear = hs * t.q_lora_rank + t.q_lora_rank * heads * (nope + rope)
+        linear += hs * (t.kv_lora_rank + rope) + t.kv_lora_rank * heads * (nope + v)
+        linear += 2 * hs * heads * v
+        if t.mlp_layer_types[layer] == "sparse":
+            linear += hs * t.n_routed_experts + 2 * hs * t.routed_expert_hidden_size
+            linear += (t.num_experts_per_tok * 3 * t.routed_expert_hidden_size + 3 * hs) * t.moe_intermediate_size
+        else:
+            linear += 3 * hs * t.intermediate_size
+        linear += 2 * 2 * hc * hc * hs
+        total += 6 * seq_len * linear
+        for i in range(seq_len):
+            if kind == "sliding_attention":
+                keys = min(i + 1, t.sliding_window)
+            else:
+                closed_groups, offset = divmod(i, t.index_kpool)
+                recalled = min(closed_groups, t.index_topk // t.index_kpool - 1)
+                keys = recalled * t.index_kpool + offset + 1
+            total += 6 * heads * ((nope + rope) + v) * keys
+            if kind != "sliding_attention":
+                n, d = t.index_n_heads, t.index_head_dim
+                total += 2 * hs * d
+                if seq_len > t.index_topk:
+                    total += 2 * (t.q_lora_rank * n * d + hs * n + n * d * (i // t.index_kpool))
+                    if i // t.index_kpool < (seq_len - 1) // t.index_kpool:
+                        total += 4 * d * d
+    total += (
+        6
+        * seq_len
+        * (hc * hc * hs + len(t.engram_layer_ids) * (hc + 1) * 2 * t.engram_n_embed_per_ngram * hs + hs * t.vocab_size)
+    )
+    return total
+
+
+@pytest.mark.parametrize("seq_len", [1, 7, 40])
+def test_formula_matches_per_query_counting(seq_len: int) -> None:
+    cfg = tiny_config()
+    formula = get_flops_formula_for_hf_config(cfg)
+    assert formula(cfg, gbs=3, seq_len=seq_len) == pytest.approx(3 * _brute_force(cfg, seq_len), rel=1e-12)
+
+
+def test_text_config_resolves_the_same_formula() -> None:
+    cfg = tiny_config()
+    assert get_flops_formula_for_hf_config(cfg.text_config)(cfg.text_config, 1, 16) == get_flops_formula_for_hf_config(
+        cfg
+    )(cfg, 1, 16)
+
+
+def test_released_config_has_roughly_the_model_card_active_parameters() -> None:
+    cfg = released_config()
+    per_token_at_one = cfg.flops_formula(cfg, 1, 1) / 6
+    # model card: "Activated Parameters per Token: Text 11.3B"
+    assert 11.2e9 < per_token_at_one < 11.4e9, per_token_at_one

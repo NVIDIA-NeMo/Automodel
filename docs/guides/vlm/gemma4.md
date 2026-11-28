@@ -339,8 +339,8 @@ Gemma 4 31B instruction-tuned models always emit a thinking-channel prefix
 (`<|channel>thought\n<channel|>`) before the actual response. When this prefix
 is absent from training sequences, the model predicts `<|channel>` but the label
 says answer text, inflating initial loss to ~9. The `gemma4_prefix_collate_fn`
-injects this prefix (masked as -100 in labels so the model is not penalized for it)
-and brings initial loss down to ~3.
+injects this prefix and brings initial loss down to ~3. The four prefix tokens of
+every model turn are supervised, like the answer that follows them.
 
 ---
 

@@ -46,7 +46,8 @@
 # Reported figures. Every step logs `tps <tokens/s>(<tokens/s per GPU>/gpu)` and `mfu <percent>`. The model
 # FLOPs behind mfu are those of the backbone of the language model for the tokens of the step: its 88 layers
 # and lm_head, 75.87 GFLOPs per token at this sequence length. The MTP head (9.78 GFLOPs per token more for its
-# two depths) and the vision tower are not counted. mfu.peak_tflops is the dense BF16 peak of a GB300, so
+# two depths) and the vision tower are not counted. mfu is taken against the dense peak that the recipe looks
+# up for the GPU and the training precision, 2,500 TFLOPs/s for a GB300 in BF16, so
 #   model TFLOPs/s/GPU = mfu / 100 x 2500.
 # tps counts 8191 label positions per sequence, the FLOPs all 8192 tokens.
 #
@@ -140,10 +141,6 @@ freeze_config:
 
 mtp:
   scaling_factor: 0.3
-
-mfu:
-  # Dense BF16 peak of a GB300 in TFLOPs/s.
-  peak_tflops: 2500.0
 
 checkpoint:
   enabled: false

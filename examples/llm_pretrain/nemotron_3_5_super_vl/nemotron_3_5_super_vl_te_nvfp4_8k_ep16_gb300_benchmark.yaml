@@ -65,10 +65,11 @@
 # FLOPs behind mfu are those of the backbone of the language model for the tokens of the step: its 88 layers
 # and lm_head, 75.87 GFLOPs per token at this sequence length. The MTP head (9.78 GFLOPs per token more for its
 # two depths) and the vision tower are not counted, and the count does not depend on the precision.
-# mfu.peak_tflops is the dense BF16 peak of a
-# GB300, as in the BF16 file, although the GEMMs here mix NVFP4, MXFP8 and BF16: read mfu as a rate, not as a
-# utilization of the NVFP4 peak.
-#   model TFLOPs/s/GPU = mfu / 100 x 2500.
+# mfu is taken against the dense peak that the recipe looks up for the GPU and the training precision. With a
+# te_nvfp4 block that is the NVFP4 peak of the GPU, not its BF16 peak, although the GEMMs here mix NVFP4, MXFP8
+# and BF16: the mfu of this file is not comparable with that of the BF16 file. The training log prints the peak
+# once (`MFU peak: ... TFLOPs/s per device`), and
+#   model TFLOPs/s/GPU = mfu / 100 x that peak.
 # tps counts 8191 label positions per sequence, the FLOPs all 8192 tokens.
 #
 # Environment: GB300 (per GPU the step peaked at 262 GiB of 277 GiB in nvidia-smi and at 250 GiB allocated by
@@ -174,10 +175,6 @@ freeze_config:
 
 mtp:
   scaling_factor: 0.3
-
-mfu:
-  # Dense BF16 peak of a GB300 in TFLOPs/s; see the header.
-  peak_tflops: 2500.0
 
 checkpoint:
   enabled: false
