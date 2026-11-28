@@ -3000,6 +3000,137 @@ def test_estimate_media_tokens_no_image_processor(collate_mod):
     assert collate_mod._estimate_media_tokens(conversation, ProcNoIP()) == 0
 
 
+def test_estimate_media_tokens_with_patch_counter(collate_mod):
+    """When image_processor implements get_number_of_image_patches, it is used."""
+    img = PILImage.new("RGB", (192, 16))
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": "What is this?"},
+            ],
+        },
+    ]
+
+    class MockMimoIP:
+        patch_size = 16
+        merge_size = 2
+        min_pixels = 8192
+        max_pixels = 8388608
+        size = {"min_pixels": 8192, "max_pixels": 8388608}
+
+        def get_number_of_image_patches(self, height, width, images_kwargs=None):
+            # 16x192 at factor=32 upscales short side to factor -> 32x384
+            # (32 // 16) * (384 // 16) = 2 * 24 = 48 patches
+            return 48
+
+    class ProcWithPatchCounter:
+        image_processor = MockMimoIP()
+
+    extra = collate_mod._estimate_media_tokens(conversation, ProcWithPatchCounter())
+    # 48 patches // (2*2) = 12 image tokens
+    # extra = 12 - 1 = 11 tokens (fallback _smart_resize_image would give 10 - 1 = 9)
+    assert extra == 11
+
+
+def test_drop_overlong_samples_uses_image_patches(collate_mod):
+    """_drop_overlong_samples drops sample when image patch count exceeds max_length."""
+    img = PILImage.new("RGB", (192, 16))
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": "x"},
+            ],
+        },
+    ]
+
+    class MockMimoIP:
+        patch_size = 16
+        merge_size = 2
+        min_pixels = 8192
+        max_pixels = 8388608
+        size = {"min_pixels": 8192, "max_pixels": 8388608}
+
+        def get_number_of_image_patches(self, height, width, images_kwargs=None):
+            return 48
+
+    class MockProcessor(_DropTestProcessor):
+        def __init__(self):
+            super().__init__()
+            self.image_processor = MockMimoIP()
+
+    proc = MockProcessor()
+    # 1 text token ("x") + 11 extra image tokens = 12 tokens total.
+    # At max_length=10, the sample must be dropped (all dropped raises ValueError).
+    import pytest
+
+    with pytest.raises(ValueError, match="exceed max_length=10"):
+        collate_mod._drop_overlong_samples([conversation], proc, max_length=10)
+
+    # At max_length=12, the sample is kept.
+    kept, indices = collate_mod._drop_overlong_samples([conversation], proc, max_length=12)
+    assert len(kept) == 1
+    assert indices == [0]
+
+
+def test_estimate_media_tokens_real_mimo_and_muse_spark(collate_mod):
+    """Real MimoV2ImageProcessor divides unmerged patches by merge_size**2;
+    MuseSparkImageProcessor returns final visual tokens directly without re-division.
+    """
+    from nemo_automodel.components.models.mimo_v2_flash.processing import MimoV2ImageProcessor
+    from nemo_automodel.components.models.muse_spark.image_processing import MuseSparkImageProcessor
+
+    class WrapperProc:
+        def __init__(self, ip):
+            self.image_processor = ip
+
+    mimo_proc = WrapperProc(MimoV2ImageProcessor())
+    muse_proc = WrapperProc(MuseSparkImageProcessor())
+
+    # MiMo: 16x192 and 192x16 produce 48 patches -> 12 visual tokens (extra=11)
+    conv_16_192 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (192, 16))}]}]
+    conv_192_16 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (16, 192))}]}]
+    assert collate_mod._estimate_media_tokens(conv_16_192, mimo_proc) == 11
+    assert collate_mod._estimate_media_tokens(conv_192_16, mimo_proc) == 11
+
+    # MiMo controls: 96x64 produces 48 patches -> 12 visual tokens (extra=11)
+    conv_96_64 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (64, 96))}]}]
+    assert collate_mod._estimate_media_tokens(conv_96_64, mimo_proc) == 11
+
+    # MiMo controls: 112x112 produces 64 patches -> 16 visual tokens (extra=15)
+    conv_112_112 = [{"role": "user", "content": [{"type": "image", "image": PILImage.new("RGB", (112, 112))}]}]
+    assert collate_mod._estimate_media_tokens(conv_112_112, mimo_proc) == 15
+
+    # Muse Spark: 112x112 produces 16 visual tokens -> extra=15 (must NOT divide by 4)
+    assert collate_mod._estimate_media_tokens(conv_112_112, muse_proc) == 15
+
+
+def test_estimate_media_tokens_incompatible_counter_fallbacks(collate_mod):
+    """Counters returning non-scalars (e.g. Idefics3 tuples) or crop counts (e.g. Aria)
+    must fall back to _smart_resize_image instead of corrupting extra token counts.
+    """
+    from transformers import AriaImageProcessor, Idefics3ImageProcessor
+
+    img = PILImage.new("RGB", (112, 112))
+    conv = [{"role": "user", "content": [{"type": "image", "image": img}]}]
+
+    class WrapperProc:
+        def __init__(self, ip):
+            self.image_processor = ip
+
+    idefics_proc = WrapperProc(Idefics3ImageProcessor())
+    aria_proc = WrapperProc(AriaImageProcessor())
+
+    # Idefics3 returns (17, 4, 4); non-scalar return must be skipped and fall back to _smart_resize_image
+    assert collate_mod._estimate_media_tokens(conv, idefics_proc) == 0
+
+    # Aria returns crop count 1; without merge_size, must fall back to _smart_resize_image
+    assert collate_mod._estimate_media_tokens(conv, aria_proc) == 15
+
+
 # ---------------------------------------------------------------------------
 # _count_media_per_sample tests
 # ---------------------------------------------------------------------------

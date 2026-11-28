@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 def _smart_resize_image(height, width, factor=28, min_pixels=56 * 56, max_pixels=14 * 14 * 4 * 1280):
     """Compute the resized (height, width) for an image, matching
     ``transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize``.
+
+    Used as a fallback when an image processor does not expose
+    ``get_number_of_image_patches``. Processors with custom resize rules
+    (such as MiMo V2's sub-factor upscale) should provide
+    ``get_number_of_image_patches`` to ensure exact patch counts.
     """
     h_bar = round(height / factor) * factor
     w_bar = round(width / factor) * factor
