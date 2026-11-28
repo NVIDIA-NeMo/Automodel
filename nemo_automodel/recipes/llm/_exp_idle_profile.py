@@ -65,18 +65,18 @@ def finish(prof, tag="EXP_IDLE"):
         if gap < 200:
             continue
         total += gap
-        t = e0 + 1
-        labels = []
-        for tid, lst in host.items():
-            active = [e for e in lst if e["ts"] <= t <= e["ts"] + e["dur"]]
-            if not active:
-                continue
-            inner = min(active, key=lambda e: e["dur"])
-            outer_ann = [e["name"] for e in active if e.get("cat") == "user_annotation"]
-            labels.append(f"{inner['name'][:60]} | {outer_ann[0][:40] if outer_ann else '-'}")
-        key = " || ".join(sorted(labels)) if labels else "(no host op active)"
-        per[key] += gap
-        cnt[key] += 1
+        for where, t in (("mid", e0 + gap / 2),):
+            labels = []
+            for tid, lst in host.items():
+                active = [e for e in lst if e["ts"] <= t <= e["ts"] + e["dur"]]
+                if not active:
+                    continue
+                inner = min(active, key=lambda e: e["dur"])
+                outer_ann = [e["name"] for e in active if e.get("cat") == "user_annotation"]
+                labels.append(f"{inner['name'][:60]} | {outer_ann[0][:40] if outer_ann else '-'}")
+            key = " || ".join(sorted(labels)) if labels else "(no host op active)"
+            per[key] += gap
+            cnt[key] += 1
     print(
         f"{tag} window={(t1 - t0) / 1e3:.1f} ms busy={sum(e - s for s, e in busy) / 1e3:.1f} ms gaps>=0.2ms={total / 1e3:.1f} ms",
         flush=True,
