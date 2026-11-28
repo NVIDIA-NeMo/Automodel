@@ -34,13 +34,18 @@ _START_METHOD_CHANGE = """
 import multiprocessing
 
 
-def test_switches_the_process_to_spawn():
+def test_switches_the_process_to_spawn() -> None:
     multiprocessing.set_start_method("spawn", force=True)
 
 
-def test_next_test_gets_the_platform_default():
-    # multiprocessing documents that get_all_start_methods() lists the platform default first.
-    assert multiprocessing.get_start_method() == multiprocessing.get_all_start_methods()[0]
+def test_next_test_finds_no_start_method_chosen() -> None:
+    assert multiprocessing.get_start_method(allow_none=True) is None
+    # Like the first worker started from the default context, this fixes the platform default.
+    multiprocessing.get_start_method()
+
+
+def test_fixed_default_does_not_reach_the_next_test_either() -> None:
+    assert multiprocessing.get_start_method(allow_none=True) is None
 """
 
 
@@ -62,4 +67,4 @@ def test_start_method_set_by_one_test_does_not_reach_the_next(
 
     result = pytester.runpytest_subprocess("-p", "pytest_timeout", "-p", "no:cacheprovider", "--tb=short", timeout=40)
 
-    result.assert_outcomes(passed=2)
+    result.assert_outcomes(passed=3)

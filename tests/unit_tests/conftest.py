@@ -24,6 +24,7 @@ import subprocess
 import sys
 import types
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
 from shutil import rmtree
 
@@ -675,7 +676,7 @@ _SESSION_START_METHOD = multiprocessing.get_start_method(allow_none=True)
 
 
 @pytest.fixture(autouse=True)
-def _restore_multiprocessing_start_method():
+def _restore_multiprocessing_start_method() -> Iterator[None]:
     """Put the process-wide multiprocessing start method back after every test.
 
     Building a ``ParallelAwareDataloader`` switches a process that has not chosen a start method
