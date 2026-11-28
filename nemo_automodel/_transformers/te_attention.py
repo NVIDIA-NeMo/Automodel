@@ -42,10 +42,10 @@ Mask handling
 - ``is_causal=True`` with ``attn_mask=None`` → TE ``"causal"``.
 - ``is_causal=False`` with ``attn_mask=None`` → TE ``"no_mask"``.
 - A 4D ``attn_mask`` matching HF's canonical causal or causal+sliding pattern
-  is detected by :func:`_detect_causal_mask` in O(S) and converted to
+  is verified entry by entry by :func:`_detect_causal_mask` and converted to
   ``("causal", window_size)``, so HF's always-present mask doesn't force a
-  fallback. Per-sample padded batches or non-canonical mask patterns still
-  fall back to native SDPA.
+  fallback. Per-sample padded batches or any other mask pattern (e.g. Gemma4's
+  image-bidirectional blocks) still fall back to native SDPA.
 
 Sliding window
 --------------
@@ -65,6 +65,7 @@ import contextlib
 import logging
 import os
 import types
+import weakref
 from typing import Any
 
 import torch
@@ -93,6 +94,10 @@ _STATS_LOG_EVERY = int(os.environ.get("AUTOMODEL_TE_STATS_EVERY", "500"))
 # One-shot flag so we warn at most once when the runtime ``scale`` disagrees
 # with the ``softmax_scale`` captured at TE-module creation time.
 _SCALE_MISMATCH_WARNED = False
+
+# One-shot flag so we log at most once when a mask is not plain causal and the
+# layer therefore runs on native SDPA instead of TE.
+_MASK_FALLBACK_WARNED = False
 
 
 def get_te_attention_stats() -> dict[str, int]:
@@ -235,40 +240,109 @@ def _create_te_dot_product_attention(
 # ---------------------------------------------------------------------------
 
 
+# Verdict cache for _detect_causal_mask.  HF hands the *same* mask tensor to every
+# layer of a given type, so the exact comparison runs once per distinct mask per
+# forward instead of once per layer.  An entry is keyed by the mask's object id and
+# window size and holds a weak reference to that very tensor plus its identity
+# fingerprint; it is reused only if the weak reference still resolves to the same
+# object and the data pointer, shape, strides, storage offset, dtype, device and
+# version counter are unchanged.  A different tensor (even one allocated at the
+# same address after the old one was freed) is a different object, so it misses;
+# nothing is kept alive (weak reference only); an in-place edit through the mask or
+# any view of it bumps the shared version counter and misses.  Writes that bypass
+# the version counter (``.data``) are not detected; inference tensors have no
+# version counter and are never cached.
+_VERDICT_CACHE: dict[
+    tuple[int, tuple[int, int]],
+    tuple[weakref.ref, tuple, tuple[str, tuple[int, int]] | None],
+] = {}
+
+
+def _mask_fingerprint(attn_mask: torch.Tensor) -> tuple | None:
+    """Identity fingerprint of ``attn_mask``'s data and view, or ``None`` if it cannot be trusted."""
+    try:
+        version = attn_mask._version
+    except RuntimeError:  # inference tensors do not track a version counter
+        return None
+    return (
+        version,
+        attn_mask.data_ptr(),
+        tuple(attn_mask.shape),
+        tuple(attn_mask.stride()),
+        attn_mask.storage_offset(),
+        attn_mask.dtype,
+        attn_mask.device,
+    )
+
+
+def _passes_cheap_checks(attn_mask: torch.Tensor, window_size: tuple[int, int]) -> bool:
+    """O(S) necessary conditions for a causal / sliding-window mask, over all batch items.
+
+    The first query sees exactly itself, the last query sees ``S`` (or
+    ``min(S, window + 1)``) keys, the upper-right corner is masked and the
+    ``[0, 0]`` entry is visible.  One host sync.
+    """
+    S = attn_mask.shape[2]
+    first_row = attn_mask[:, 0, 0, :]
+    last_row = attn_mask[:, 0, -1, :]
+    if attn_mask.dtype == torch.bool:
+        visible_first, visible_last = first_row.sum(dim=-1), last_row.sum(dim=-1)
+        corner_masked, diag_visible = ~attn_mask[:, 0, 0, -1], attn_mask[:, 0, 0, 0]
+    else:
+        visible_first, visible_last = (first_row > -1e4).sum(dim=-1), (last_row > -1e4).sum(dim=-1)
+        corner_masked, diag_visible = attn_mask[:, 0, 0, -1] < -1e4, attn_mask[:, 0, 0, 0] > -1e4
+    expected_last = S if window_size[0] < 0 else min(S, window_size[0] + 1)
+    ok = (visible_first == 1).all() & (visible_last == expected_last).all() & corner_masked.all() & diag_visible.all()
+    return bool(ok.item())
+
+
+def _matches_causal_exactly(attn_mask: torch.Tensor, window_size: tuple[int, int]) -> bool:
+    """Compare every entry with the causal (or sliding-window causal) pattern.  O(B * S^2); one host sync."""
+    S = attn_mask.shape[2]
+    rows = torch.arange(S, device=attn_mask.device).unsqueeze(1)
+    cols = torch.arange(S, device=attn_mask.device).unsqueeze(0)
+    expected = cols <= rows
+    if window_size[0] >= 0:
+        expected = expected & ((rows - cols) <= window_size[0])
+    if attn_mask.dtype == torch.bool:
+        matches = attn_mask == expected
+    else:
+        matches = torch.where(expected, attn_mask == 0, attn_mask < -1e4)
+    return bool(matches.all().item())
+
+
 def _detect_causal_mask(
     attn_mask: torch.Tensor,
     window_size: tuple[int, int],
 ) -> tuple[str, tuple[int, int]] | None:
-    """Map a 4D HF additive attention mask to a TE (attn_mask_type, window_size) pair.
+    """Map a 4D HF attention mask to a TE (attn_mask_type, window_size) pair.
 
-    HF's ``create_causal_mask`` and ``create_sliding_window_causal_mask`` always
-    emit a 4D float mask even when the batch has no padding.  This causes the
-    generic ``attn_mask is not None`` guard to fire for every sliding/full-attention
-    layer and route every call to native SDPA instead of TE.
+    HF's mask builders emit a 4D mask even when the batch has no padding, which
+    would make the generic ``attn_mask is not None`` guard route every sliding or
+    full-attention layer to native SDPA.  This function converts the two
+    structurally trivial cases:
 
-    This function detects the two structurally trivial cases:
-    - Pure causal (lower-triangular 0 / -inf): returns ``("causal", (-1, 0))``.
+    - Pure causal (lower-triangular): returns ``("causal", (-1, 0))``.
     - Sliding-window causal: returns ``("causal", window_size)``.
 
-    Returns ``None`` when the mask cannot be safely converted — e.g. it encodes
-    per-sample padding, has an unexpected shape, or is not a float additive mask.
-    The caller should fall back to native SDPA in that case.
+    It returns ``None`` for anything else: padding, packed documents, bidirectional
+    overlays such as Gemma4's same-image blocks (``use_bidirectional_attention="vision"``),
+    an unexpected shape or dtype.  The caller then falls back to native SDPA with
+    the real mask.  The rule is model-independent: after conversion TE never sees
+    the mask, so the mask must be *exactly* causal.
 
-    Detection is O(S) per call (two row reductions of length S_k) and transfers
-    one combined validation result to the host:
-    1. Upper-right corner scalar check: must be < -1e4 (causal-like).
-    2. First-row visible-key count across all batch items must equal 1
-       (each first query token can only attend to itself).
-    3. Last-row visible-key count across all batch items must equal ``S``
-       (full causal) or ``min(S, window_size[0]+1)`` (sliding window).
-    Any deviation indicates padding or a non-standard mask structure.
+    Two stages keep the cost low:
+
+    1. O(S) necessary checks (first row, last row, corner, diagonal over all batch
+       items).  Padded batches and most non-causal masks are rejected here.
+    2. Only if those pass, an exact entry-by-entry comparison with the pattern built
+       from index arithmetic (O(B * S^2)).  A float mask must hold exactly ``0``
+       where visible and a value below ``-1e4`` where masked; a bool mask must be
+       ``True`` exactly where visible.
+
+    The verdict is cached per mask tensor (see ``_VERDICT_CACHE``), so the exact
+    comparison runs once per distinct mask per forward, not once per layer.
     """
-    logger.debug(
-        "_detect_causal_mask: dtype=%s shape=%s",
-        attn_mask.dtype,
-        tuple(attn_mask.shape),
-    )
-
     is_bool = attn_mask.dtype == torch.bool
     is_float = attn_mask.dtype in (torch.float16, torch.bfloat16, torch.float32)
     if not (is_bool or is_float):
@@ -277,56 +351,35 @@ def _detect_causal_mask(
     if attn_mask.ndim != 4:
         logger.debug("_detect_causal_mask: ndim=%d (need 4) → None", attn_mask.ndim)
         return None
-
-    sq, sk = attn_mask.shape[2], attn_mask.shape[3]
-    if sq != sk:
-        logger.debug("_detect_causal_mask: sq=%d != sk=%d → None", sq, sk)
+    if attn_mask.shape[2] != attn_mask.shape[3]:
+        logger.debug("_detect_causal_mask: sq=%d != sk=%d → None", attn_mask.shape[2], attn_mask.shape[3])
         return None
 
-    S = sq
+    cache_key = (id(attn_mask), tuple(window_size))
+    fingerprint = _mask_fingerprint(attn_mask)
+    if fingerprint is not None:
+        entry = _VERDICT_CACHE.get(cache_key)
+        if entry is not None and entry[0]() is attn_mask and entry[1] == fingerprint:
+            return entry[2]
 
-    # Scalar guard: upper-right corner must indicate "masked" (causal structure).
-    # bool mask: False = masked; float mask: < -1e4 = masked.
-    # Count visible keys per row for all batch items.
-    # bool: True = visible; float: > -1e4 = visible.
-    first_row = attn_mask[:, 0, 0, :]
-    last_row = attn_mask[:, 0, -1, :]
-    if is_bool:
-        visible_first = first_row.sum(dim=-1)
-        visible_last = last_row.sum(dim=-1)
+    if not _passes_cheap_checks(attn_mask, window_size):
+        verdict = None
+    elif not _matches_causal_exactly(attn_mask, window_size):
+        verdict = None
+    elif window_size[0] < 0:
+        verdict = ("causal", (-1, 0))
     else:
-        visible_first = (first_row > -1e4).sum(dim=-1)
-        visible_last = (last_row > -1e4).sum(dim=-1)
+        verdict = ("causal", window_size)
 
-    expected_last = S if window_size[0] < 0 else min(S, window_size[0] + 1)
-    corner = attn_mask[0, 0, 0, -1]
-    diag = attn_mask[0, 0, 0, 0]
-    if is_bool:
-        corner_masked = ~corner
-        diag_visible = diag
-    else:
-        corner_masked = corner < -1e4
-        diag_visible = diag > -1e4
-    first_valid = (visible_first == 1).all()
-    last_valid = (visible_last == expected_last).all()
-    mask_valid = corner_masked & diag_visible & first_valid & last_valid
+    if fingerprint is not None:
 
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "_detect_causal_mask: S=%d visible_first=%s visible_last=%s window_size=%s",
-            S,
-            visible_first.tolist(),
-            visible_last.tolist(),
-            window_size,
-        )
+        def _drop(ref, key=cache_key):
+            entry = _VERDICT_CACHE.get(key)
+            if entry is not None and entry[0] is ref:
+                del _VERDICT_CACHE[key]
 
-    if not mask_valid.item():
-        logger.debug("_detect_causal_mask: structural validation failed → None")
-        return None
-
-    if window_size[0] < 0:
-        return "causal", (-1, 0)
-    return "causal", window_size
+        _VERDICT_CACHE[cache_key] = (weakref.ref(attn_mask, _drop), fingerprint, verdict)
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +434,7 @@ def _make_te_sdpa(
         enable_gqa: bool = False,
         **_unused: Any,
     ) -> torch.Tensor:
-        global _SCALE_MISMATCH_WARNED
+        global _SCALE_MISMATCH_WARNED, _MASK_FALLBACK_WARNED
 
         # Runtime ``scale`` must match the value baked into ``te_module``;
         # otherwise TE would silently use the baked-in one and produce wrong
@@ -418,6 +471,16 @@ def _make_te_sdpa(
         if attn_mask is not None:
             converted = _detect_causal_mask(attn_mask, window_size)
             if converted is None:
+                if not _MASK_FALLBACK_WARNED:
+                    logger.warning(
+                        "te_sdpa: attention mask (dtype=%s shape=%s) is not plain causal / sliding-window causal "
+                        "(padding, packing or a bidirectional overlay such as image blocks); layers with such a "
+                        "mask run on native SDPA instead of TE. (This warning is emitted once; see "
+                        "get_te_attention_stats()['fallback_mask'] for the count.)",
+                        attn_mask.dtype,
+                        tuple(attn_mask.shape),
+                    )
+                    _MASK_FALLBACK_WARNED = True
                 logger.debug("TE attention: non-trivial attn_mask — falling back to native SDPA.")
                 _TE_STATS["fallback_mask"] += 1
                 _maybe_log_stats()

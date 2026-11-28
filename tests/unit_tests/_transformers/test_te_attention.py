@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel._transformers import te_attention
 from nemo_automodel._transformers.te_attention import (
     _detect_causal_mask,
     _infer_attn_params,
@@ -493,6 +494,250 @@ class TestDetectCausalMask:
         assert _detect_causal_mask(m, (3, 0)) is None
 
 
+def _visible_pattern(S, window=None):
+    """Visible[i, j] from index arithmetic: j <= i, and i - j <= window when given."""
+    rows = torch.arange(S).unsqueeze(1)
+    cols = torch.arange(S).unsqueeze(0)
+    vis = cols <= rows
+    if window is not None:
+        vis = vis & ((rows - cols) <= window)
+    return vis
+
+
+def _add_block(vis, start, length):
+    """Overlay a bidirectional block [start, start + length) like Gemma4's same-image attention."""
+    vis = vis.clone()
+    vis[start : start + length, start : start + length] = True
+    return vis
+
+
+def _to_mask(vis_per_batch, form):
+    """Stack per-item visible patterns into a [B, 1, S, S] mask in the requested form."""
+    vis = torch.stack(vis_per_batch).unsqueeze(1)
+    if form == "bool":
+        return vis
+    dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[form]
+    return torch.zeros(vis.shape, dtype=dtype).masked_fill(~vis, torch.finfo(dtype).min)
+
+
+_FORMS = ["bool", "fp32", "bf16", "fp16"]
+_S = 64
+_BLOCK = 20  # interior block of 20 tokens, 190 future edges
+_WINDOW = 16  # TE window_size[0] for a sliding window of 17 keys
+
+
+class TestDetectCausalMaskImageBlocks:
+    """Gemma4-style same-image bidirectional blocks must never be converted to causal."""
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_controls_still_convert(self, form):
+        causal = _to_mask([_visible_pattern(_S)] * 2, form)
+        sliding = _to_mask([_visible_pattern(_S, _WINDOW)] * 2, form)
+        assert _detect_causal_mask(causal, (-1, 0)) == ("causal", (-1, 0))
+        assert _detect_causal_mask(sliding, (_WINDOW, 0)) == ("causal", (_WINDOW, 0))
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_right_padded_control_is_none(self, form):
+        vis = _visible_pattern(_S)
+        padded = vis.clone()
+        padded[:, _S - 4 :] = False
+        assert _detect_causal_mask(_to_mask([padded, vis], form), (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_causal_with_interior_block(self, form):
+        m = _to_mask([_add_block(_visible_pattern(_S), 20, _BLOCK)] * 2, form)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_sliding_with_interior_block(self, form):
+        m = _to_mask([_add_block(_visible_pattern(_S, _WINDOW), 20, _BLOCK)] * 2, form)
+        assert _detect_causal_mask(m, (_WINDOW, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_two_blocks(self, form):
+        vis = _add_block(_add_block(_visible_pattern(_S), 8, 10), 36, 12)
+        assert _detect_causal_mask(_to_mask([vis], form), (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_block_only_in_batch_item_1(self, form):
+        plain = _visible_pattern(_S)
+        m = _to_mask([plain, _add_block(plain, 20, _BLOCK)], form)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    @pytest.mark.parametrize("form", _FORMS)
+    def test_block_touching_last_token(self, form):
+        m = _to_mask([_add_block(_visible_pattern(_S), _S - 10, 10)], form)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_two_token_block_is_none(self):
+        """Smallest deviation: a single future edge anywhere in the interior."""
+        vis = _visible_pattern(_S)
+        vis[30, 31] = True
+        assert _detect_causal_mask(_to_mask([vis], "bool"), (-1, 0)) is None
+
+    def test_soft_bias_is_none(self):
+        """A float mask with a finite bias on visible entries is not a plain causal mask."""
+        m = _to_mask([_visible_pattern(_S)], "fp32")
+        m[0, 0, 10, 3] = -2.0
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+
+class TestTeSdpaImageBlockDispatch:
+    def _make(self):
+        B, H, Hkv, D = 1, 4, 2, 16
+        te_module = mock.MagicMock(return_value=torch.zeros(B, _S, H, D))
+        original_sdpa = mock.MagicMock(return_value=torch.zeros(B, H, _S, D))
+        te_sdpa = _make_te_sdpa(te_module, num_heads=H, num_kv_heads=Hkv, original_sdpa=original_sdpa)
+        q = torch.randn(B, H, _S, D)
+        k = torch.randn(B, Hkv, _S, D)
+        return te_sdpa, te_module, original_sdpa, q, k
+
+    def test_interior_block_goes_to_original_sdpa_with_the_mask(self):
+        te_sdpa, te_module, original_sdpa, q, k = self._make()
+        mask = _to_mask([_add_block(_visible_pattern(_S), 20, _BLOCK)], "fp32")
+        te_sdpa(q, k, k, attn_mask=mask, enable_gqa=True)
+        te_module.assert_not_called()
+        original_sdpa.assert_called_once()
+        assert original_sdpa.call_args.kwargs["attn_mask"] is mask
+
+    def test_plain_causal_goes_to_te(self):
+        te_sdpa, te_module, original_sdpa, q, k = self._make()
+        te_sdpa(q, k, k, attn_mask=_to_mask([_visible_pattern(_S)], "fp32"), enable_gqa=True)
+        original_sdpa.assert_not_called()
+        te_module.assert_called_once()
+        assert te_module.call_args.kwargs["attn_mask_type"] == "causal"
+
+
+class TestDetectCausalMaskCache:
+    """The verdict cache must never return a stale "causal"."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self):
+        te_attention._VERDICT_CACHE.clear()
+        yield
+        te_attention._VERDICT_CACHE.clear()
+
+    @staticmethod
+    def _scans():
+        """Patch the exact comparison with a counting wrapper."""
+        return mock.patch.object(te_attention, "_matches_causal_exactly", wraps=te_attention._matches_causal_exactly)
+
+    def test_repeated_calls_scan_once(self):
+        m = _to_mask([_visible_pattern(_S)] * 2, "bool")
+        with self._scans() as scan:
+            for _ in range(5):
+                assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        assert scan.call_count == 1
+
+    def test_in_place_edit_after_cached_verdict(self):
+        m = _to_mask([_visible_pattern(_S)], "bool")
+        assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        m[0, 0, 30, 31] = True  # add one future edge in place
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_in_place_edit_through_a_view(self):
+        m = _to_mask([_visible_pattern(_S)], "fp32")
+        assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        m.view(-1)[30 * _S + 31] = 0.0  # edit through a different alias of the same storage
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_new_mask_after_old_one_is_freed(self):
+        """A different mask that lands on the freed mask's address must not inherit its verdict."""
+        import gc
+
+        good_pattern = _visible_pattern(_S)[None, None]
+        bad_pattern = _add_block(_visible_pattern(_S), 20, _BLOCK)[None, None]
+        reused = 0
+        for _ in range(200):
+            good = torch.empty(1, 1, _S, _S, dtype=torch.bool)
+            good.copy_(good_pattern)
+            assert _detect_causal_mask(good, (-1, 0)) == ("causal", (-1, 0))
+            ptr = good.data_ptr()
+            del good
+            gc.collect()
+            bad = torch.empty(1, 1, _S, _S, dtype=torch.bool)
+            bad.copy_(bad_pattern)
+            reused += bad.data_ptr() == ptr
+            assert _detect_causal_mask(bad, (-1, 0)) is None
+            del bad
+            gc.collect()
+        if reused == 0:
+            pytest.skip("allocator never reused the freed address; the stale-address case was not exercised")
+
+    def test_cache_does_not_keep_masks_alive(self):
+        import gc
+        import weakref
+
+        m = _to_mask([_visible_pattern(_S)], "bool")
+        assert _detect_causal_mask(m, (-1, 0)) is not None
+        ref = weakref.ref(m)
+        del m
+        gc.collect()
+        assert ref() is None
+        assert len(te_attention._VERDICT_CACHE) == 0
+
+    def test_two_views_of_one_base_with_different_slices(self):
+        S2 = _S + 8
+        base = _to_mask([_visible_pattern(S2)], "bool")
+        full = base[:, :, :_S, :_S]  # top-left slice of a causal mask is causal
+        assert _detect_causal_mask(full, (-1, 0)) == ("causal", (-1, 0))
+        base[0, 0, 5, 6] = True  # edit the base: only the stale-view entry could hide it
+        assert _detect_causal_mask(full, (-1, 0)) is None
+        shifted = base[:, :, 8:, 8:]  # a different slice (offset) of the same base
+        assert _detect_causal_mask(shifted, (-1, 0)) == ("causal", (-1, 0))
+        assert _detect_causal_mask(base[:, :, :_S, :_S], (-1, 0)) is None
+
+    def test_same_mask_two_window_sizes(self):
+        m = _to_mask([_visible_pattern(_S, _WINDOW)], "bool")
+        assert _detect_causal_mask(m, (_WINDOW, 0)) == ("causal", (_WINDOW, 0))
+        assert _detect_causal_mask(m, (-1, 0)) is None
+        assert _detect_causal_mask(m, (_WINDOW + 1, 0)) is None
+        assert _detect_causal_mask(m, (_WINDOW, 0)) == ("causal", (_WINDOW, 0))
+
+    def test_exact_scans_in_a_forward_equal_distinct_masks(self):
+        """12 layers sharing two masks (full-causal and sliding) -> exactly 2 exact scans."""
+        causal = _to_mask([_visible_pattern(_S)] * 2, "bool")
+        sliding = _to_mask([_visible_pattern(_S, _WINDOW)] * 2, "bool")
+        layers = [(sliding, (_WINDOW, 0)) if i % 6 != 5 else (causal, (-1, 0)) for i in range(12)]
+        with self._scans() as scan:
+            for _ in range(3):  # three forwards re-using the same mask objects
+                for m, w in layers:
+                    assert _detect_causal_mask(m, w) is not None
+        assert scan.call_count == 2
+
+    def test_padded_mask_is_rejected_without_the_exact_scan(self):
+        vis = _visible_pattern(_S)
+        padded = vis.clone()
+        padded[:, _S - 4 :] = False
+        m = _to_mask([padded, vis], "bool")
+        with self._scans() as scan:
+            assert _detect_causal_mask(m, (-1, 0)) is None
+        scan.assert_not_called()
+
+    def test_inference_tensor_is_never_cached(self):
+        with torch.inference_mode():
+            m = _to_mask([_visible_pattern(_S)], "bool")
+            assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+        assert len(te_attention._VERDICT_CACHE) == 0
+
+
+class TestFallbackWarningOnce:
+    def test_first_fallback_logs_once(self, caplog):
+        te_attention._MASK_FALLBACK_WARNED = False
+        te_module = mock.MagicMock()
+        original_sdpa = mock.MagicMock(return_value=torch.zeros(1, 4, _S, 16))
+        te_sdpa = _make_te_sdpa(te_module, num_heads=4, num_kv_heads=2, original_sdpa=original_sdpa)
+        q = torch.randn(1, 4, _S, 16)
+        k = torch.randn(1, 2, _S, 16)
+        mask = _to_mask([_add_block(_visible_pattern(_S), 20, _BLOCK)], "bool")
+        with caplog.at_level("WARNING", logger=te_attention.logger.name):
+            te_sdpa(q, k, k, attn_mask=mask, enable_gqa=True)
+            te_sdpa(q, k, k, attn_mask=mask, enable_gqa=True)
+        msgs = [r.getMessage() for r in caplog.records if "not plain causal" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "native SDPA" in msgs[0]
+
+
 # ---------------------------------------------------------------------------
 # _proj_out_features
 # ---------------------------------------------------------------------------
@@ -575,6 +820,7 @@ class TestScaleMismatchFallback:
         """Reset both the counter and the one-shot warning flag so tests are
         independent of ordering."""
         import nemo_automodel._transformers.te_attention as te_mod
+
         reset_te_attention_stats()
         te_mod._SCALE_MISMATCH_WARNED = False
 
@@ -618,6 +864,7 @@ class TestScaleMismatchFallback:
         """The warning is gated by a module-level flag; after the first
         mismatch, subsequent mismatches still fall back but do not re-warn."""
         import nemo_automodel._transformers.te_attention as te_mod
+
         self._reset()
         te_sdpa, _, original_sdpa = self._build(module_scale=0.125)
         q, k, v = self._qkv()
