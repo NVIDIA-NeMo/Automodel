@@ -56,6 +56,11 @@ class TestDtypeFromStr:
             result = dtype_from_str(input_val)
             assert result == expected_dtype
 
+    @pytest.mark.parametrize("name", ["torch.complex64", "complex64", "torch.cfloat", "cfloat"])
+    def test_dtype_from_str_complex64_returns_a_dtype(self, name):
+        """The complex64 spellings resolve to torch.complex64, not the torch.complex function."""
+        assert dtype_from_str(name) is torch.complex64
+
     def test_dtype_from_str_invalid_inputs(self):
         """Test dtype_from_str raises KeyError on invalid input."""
         invalid_inputs = ["abc", "torch.invalid", "invalid_dtype", "torch.xyz"]
