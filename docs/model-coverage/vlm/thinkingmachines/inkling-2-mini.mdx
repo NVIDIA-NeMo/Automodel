@@ -92,6 +92,29 @@ Each row holds many documents. Positions restart at every document, and local at
 attention, and the short convolutions all stay inside a document. With context parallelism, each GPU
 holds one contiguous shard of the row, 32,768 tokens here.
 
+## Export for Serving
+
+Training saves the experts in floating point. Serving runtimes that read `hf_quant_config.json` expect
+the released expert layout instead: NVFP4 in layers 0-19 and MXFP8 in layers 20-23. To write a
+fine-tuned model in that layout, pass the released checkpoint and a consolidated save (written with
+`checkpoint.save_consolidated`, or by the `model/consolidate.sh` helper; see
+[Checkpointing](/development/checkpointing)):
+
+```bash
+uv run python -m nemo_automodel.components.models.inkling2.quantized_export \
+  --released /path/to/Inkling-2-Mini \
+  --trained checkpoints/inkling2_mini_medpix_sft_ep4/epoch_0_step_99/model/consolidated \
+  --out /path/to/Inkling-2-Mini-finetuned
+```
+
+The output has the released tensor names, dtypes, shapes, and shards, with the release's
+`config.json`, `hf_quant_config.json`, `mtp.safetensors`, and tokenizer files. Experts that training
+left unchanged keep their released bytes, and changed experts are quantized again with
+round-to-nearest, the rule the release declares. Refer to
+[Inkling-2-Small](/model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small#export-for-serving)
+for details. The export takes the consolidated save of a full fine-tune, not a LoRA adapter. Use the
+export for serving only, and resume training from the floating-point checkpoint.
+
 ## Model Reference
 
 ### Model Architecture
