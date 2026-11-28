@@ -28,6 +28,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+from nemo_automodel.components.datasets.vlm import collate_fns
 from nemo_automodel.components.datasets.vlm import loader as vlm_loader
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
@@ -70,10 +71,11 @@ def _collate_prefixed_examples(examples, *, processor, prefix):
 @dataclass
 class StaticDatasetConfig:
     events: list[str]
+    examples: list[dict[str, torch.Tensor]] | None = None
 
     def build(self):
         self.events.append("dataset")
-        return ["one", "two"]
+        return self.examples if self.examples is not None else ["one", "two"]
 
 
 class BuildContext:
@@ -190,6 +192,60 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert result.processor is processor
     assert batch == ["item:one", "item:two"]
     assert padding_idx == processor.tokenizer.pad_token_id
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [None, *vlm_loader.COLLATE_FNS.values(), collate_fns.gemma4_prefix_collate_fn, collate_fns.phi4_mm_collate_fn],
+)
+def test_vlm_dataloader_rejects_processor_dependent_collator_without_processor(factory):
+    """Fail while building instead of deferring the processor error to first batch."""
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: None),
+        collator=VlmCollatorConfig(factory=factory) if factory is not None else None,
+    )
+
+    with pytest.raises(ValueError, match="VLM dataloader for 'unused' requires a processor"):
+        config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2)
+
+
+def test_vlm_dataloader_allows_processorless_pad_collator():
+    """A pad collator can consume pre-tokenized samples without a processor."""
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig(
+            [],
+            examples=[
+                {
+                    "input_ids": torch.tensor([3, 5, 8]),
+                    "attention_mask": torch.ones(3, dtype=torch.long),
+                    "labels": torch.tensor([3, 5, 8]),
+                }
+            ],
+        ),
+        processor_config=VlmProcessorConfig(factory=lambda: None),
+        collator=VlmCollatorConfig(factory=collate_fns.pad_collate_fn),
+        shuffle=False,
+        num_workers=1,
+    )
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+
+    assert next(iter(result.dataloader))["labels"].tolist() == [[5, 8]]
+
+
+def test_vlm_dataloader_allows_processorless_custom_collator():
+    """A custom collator remains responsible for its own processor contract."""
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: None),
+        collator=VlmCollatorConfig(factory=_collate_worker_samples),
+        shuffle=False,
+        num_workers=1,
+    )
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2)
+    assert list(result.dataloader) == [(["one", "two"], 0)]
 
 
 @dataclass

@@ -43,6 +43,7 @@ from nemo_automodel.components.datasets.packing import (
 )
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     COLLATE_FNS,
+    PROCESSOR_REQUIRED_COLLATE_FNS,
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
     pad_collate_fn,
@@ -445,11 +446,20 @@ class VlmDataloaderConfig:
         elif self.pretokenization is not None:
             collate_fn = partial(pad_collate_fn, processor=processor)
         else:
-            processor_type = type(processor).__name__
+            processor_type = "default" if processor is None else type(processor).__name__
             if processor_type not in COLLATE_FNS:
                 logger.warning("Using %s with the default VLM collator", processor_type)
                 processor_type = "default"
             collate_fn = partial(COLLATE_FNS[processor_type], processor=processor)
+
+        collator_factory = self.collator.factory if self.collator is not None else COLLATE_FNS["default"]
+        while isinstance(collator_factory, partial):
+            collator_factory = collator_factory.func
+        if processor is None and collator_factory in PROCESSOR_REQUIRED_COLLATE_FNS:
+            raise ValueError(
+                f"VLM dataloader for {pretrained_model_name_or_path!r} requires a processor; "
+                "the selected built-in collator cannot run without one"
+            )
 
         if hasattr(dataset, "robust_collate"):
             collate_fn = dataset.robust_collate(collate_fn)

@@ -1363,6 +1363,9 @@ def default_collate_fn(
         whose tensor elements preserve their processor-defined shapes; image lists
         commonly contain tensors of shape [channels, height, width].
     """
+    if processor is None:
+        raise ValueError("default_collate_fn requires a processor to apply the chat template")
+
     conversations = _ensure_rgb([example["conversation"] for example in examples], preserve_alpha=preserve_alpha)
 
     # Optionally drop overlong samples before processing
@@ -2473,3 +2476,10 @@ COLLATE_FNS = {
     "LlavaOneVisionProcessor": llava_onevision_collate_fn,
     "default": default_collate_fn,
 }
+
+# Built-in VLM collators that consume the runtime processor.
+PROCESSOR_REQUIRED_COLLATE_FNS = (
+    *COLLATE_FNS.values(),
+    gemma4_prefix_collate_fn,
+    phi4_mm_collate_fn,
+)
