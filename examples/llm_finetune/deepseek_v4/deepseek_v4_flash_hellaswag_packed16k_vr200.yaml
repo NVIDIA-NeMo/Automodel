@@ -1,0 +1,104 @@
+# DeepSeek-V4-Flash (291B) full SFT on VR200 (4 GPUs per node, 280 GiB per GPU).
+# EP16 on 4 nodes, the fewest that fit, holds ~169 GiB of bf16 weights, gradients and TE FusedAdam
+# state (param remainders plus bf16 moments, 10 bytes per parameter) per GPU. 8K packs peaked at
+# 176 GiB in training; 16K packs fill more of the 280 GiB.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 10
+  num_epochs: 10
+  max_steps: 20
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    ignore_router_for_ac: true
+    reshard_after_forward: true
+    wrap_outer_model: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  load_base_model: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang  # DeepSeek-V4 trains on packed THD batches only through the TileLang kernels
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    dispatcher: hybridep
+    experts: torch_mm
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  pad_to_max_length: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+
+packed_sequence:
+  packed_sequence_size: 16384
+  packing_strategy: thd
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: vrnvl72
+  recipe_owner: akoumpa
+  nodes: 4
+  nproc_per_node: 4
+  time: "00:30:00"
+  max_steps: 20
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  perf_testing:
+    schedule: weekly

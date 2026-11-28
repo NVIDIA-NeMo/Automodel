@@ -1,0 +1,124 @@
+# Muse-Spark-open (822B) full SFT on VR200 (4 GPUs per node, 280 GiB per GPU).
+# EP64 on 16 nodes, the fewest that fit (256 experts rule out 12 nodes), holds ~120 GiB of bf16
+# weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU; 16K-token packs bring
+# the measured peak to 168 GiB (60%).
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 20
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-models/Muse-Spark-open-816B-A42B
+  dtype: bfloat16
+  config:
+    residual_dtype: fp32
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te  # packed THD batches need te or magi; te avoids the MagiAttention build
+    linear: torch
+    rms_norm: torch_fp32
+    compile_norm: true
+    experts: torch_mm
+    dispatcher: hybridep
+    compile_router_weight: true
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  multimodal:
+    frozen_sharding: per_layer
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  impl: cce
+  logit_softcapping: 20.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:30000]  # 20000 samples fill only 16 of the 20 steps of 64 x 16K packs
+  shuffle_seed: 1234
+  seq_length: 4096
+  truncation: true
+  padding: false
+
+packed_sequence:
+  packed_sequence_size: 16384
+  packing_strategy: thd
+  pad_to_multiple_of: 64
+  num_proc: 8
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+  shuffle: true
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 5.0e-06
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: vrnvl72
+  recipe_owner: akoumpa
+  nodes: 16
+  nproc_per_node: 4
+  time: "00:30:00"
+  max_steps: 20
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  perf_testing:
+    schedule: weekly

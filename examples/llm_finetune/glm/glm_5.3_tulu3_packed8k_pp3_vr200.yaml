@@ -1,0 +1,118 @@
+# GLM-5.3 (753B) full SFT on VR200 (4 GPUs per node, 280 GiB per GPU).
+# PP3 x EP16 on 12 nodes shards the experts 48 ways (256 experts rule out EP48), holding ~146 GiB of
+# bf16 weights, gradients and TE FusedAdam state (10 bytes per parameter) per GPU, plus ~57 GiB of
+# NCCL/HybridEP buffers outside the PyTorch allocator. The pipeline settings follow the GB200 recipe
+# (interleaved 1F1B, two layers per virtual stage). Six 16K microbatches put ~104 GiB of activations
+# on the first stage and ran out of memory once optimizer state existed, so three 8K microbatches.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 48
+  local_batch_size: 3
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 20
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 3
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+    ignore_router_for_ac: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: zai-org/GLM-5.3
+  dtype: bfloat16  # bf16 resident params; fp32 master weights live in TE FusedAdam
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:30000]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 4096
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.3
+
+packed_sequence:
+  packed_sequence_size: 8192
+  packing_strategy: thd
+  num_proc: 8
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1e-5
+  weight_decay: 0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: vrnvl72
+  recipe_owner: akoumpa
+  nodes: 12
+  nproc_per_node: 4
+  time: "00:40:00"
+  max_steps: 20
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  perf_testing:
+    schedule: weekly

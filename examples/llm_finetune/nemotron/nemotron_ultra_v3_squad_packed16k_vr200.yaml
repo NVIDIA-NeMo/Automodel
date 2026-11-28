@@ -1,0 +1,95 @@
+# NVIDIA-Nemotron-3-Ultra (560B) full SFT on VR200 (4 GPUs per node, 280 GiB per GPU).
+# EP32 on 8 nodes, the fewest that fit, holds ~163 GiB of bf16 weights, gradients and TE FusedAdam
+# state (10 bytes per parameter) per GPU. 8K packs peaked at 183 GiB; 16K packs add ~19 GiB.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1111
+
+step_scheduler:
+  num_epochs: 2
+  max_steps: 20
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  mtp_loss_scaling_factor: 0.1
+  output_hidden_states: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_fsdp_optimizations: false
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  padding: false
+
+packed_sequence:
+  packed_sequence_size: 16384
+  packing_strategy: thd
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+  drop_last: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+ci:
+  nemo_ci_schedule: release
+  cluster_tag: vrnvl72
+  recipe_owner: akoumpa
+  nodes: 8
+  nproc_per_node: 4
+  time: "00:30:00"
+  max_steps: 20
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  perf_testing:
+    schedule: weekly
