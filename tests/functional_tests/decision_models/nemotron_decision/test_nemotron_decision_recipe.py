@@ -22,6 +22,12 @@ ship; only the weights are random and tiny.
 Native -> stage -> export agreement: the recipe's test probabilities after reloading the selected stage must match
 probabilities computed from the exported checkpoint with a stock ``transformers`` ``Ministral3Model`` with causal
 attention disabled plus the head at the mask, and their decisions must agree.
+
+``packed``: LoRA with ``data.packed_read`` on multi-question records (``json-sep`` prompts). The reloaded stage's packed
+test probabilities must match the stock encoder reading the exported checkpoint with the packed layout (state ->
+state; question -> state + itself; positions restart after the state; one mask per question), the same stage read
+one question per sequence (``data.packed_read: false``) must match the stock single read, and the exported
+``config.json`` must record ``prompt_format``, ``packed_read`` and ``read_layout``.
 """
 
 import argparse
@@ -117,10 +123,46 @@ def _records(root: Path) -> None:
     write_jsonl(root / "test.jsonl", records[120:])
 
 
+def _packed_records(root: Path) -> None:
+    """Multi-question records: the three questions of a ticket share its state (one packed read each)."""
+    from nemo_automodel.components.models.nemotron_decision.records import write_jsonl
+
+    teams = {"billing": "Payments and refunds", "technical": "Bugs and outages", "sales": "Contracts and quotes"}
+    records = []
+    for i in range(48):
+        team = list(teams)[i % 3]
+        record = {
+            "id": f"r{i}",
+            "state": {"ticket": f"ticket {i} about {team}", "users": i, "level": i % 4},
+            "questions": {
+                "team": {"type": "choice", "instructions": "Which team?", "criteria": teams},
+                "page": {"type": "noul", "instructions": "Page on-call?"},
+                "severity": {
+                    "type": "score",
+                    "instructions": "Severity?",
+                    "criteria": ["low", "medium", "high", "critical"],
+                },
+            },
+            "answers": {"team": team, "page": "true" if i % 2 == 0 else "false", "severity": str(i % 4)},
+            "meta": {"group": f"g{i}"},
+        }
+        if i % 4 == 0:
+            record["soft_labels"] = {"team": {team: 0.8, "sales": 0.2}}
+        records.append(record)
+    write_jsonl(root / "train.jsonl", records[:32])
+    write_jsonl(root / "validation.jsonl", records[32:40])
+    write_jsonl(root / "test.jsonl", records[40:])
+
+
 def _reference_probabilities(
-    export_dir: Path, test_records: Path, device: torch.device
+    export_dir: Path, test_records: Path, device: torch.device, *, prompt_format: str = "json", packed: bool = False
 ) -> dict[tuple[str, str], list[float]]:
-    """Probabilities from the exported checkpoint with a stock bidirectional Ministral 3 encoder and the head."""
+    """Probabilities from the exported checkpoint with a stock bidirectional Ministral 3 encoder and the head.
+
+    ``packed``: each record is one read with the packed layout, built here from the layout rules (not the recipe's
+    packer): the state ends at the state-end token, each question follows with its own mask, question positions
+    restart after the state, and a boolean mask lets the state see the state and a question the state and itself.
+    """
     from safetensors.torch import load_file
     from transformers import AutoConfig, PreTrainedTokenizerFast
     from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
@@ -142,10 +184,45 @@ def _reference_probabilities(
     out = {}
     with torch.no_grad():
         for record in read_jsonl(test_records):
-            for question_id in record["questions"]:
-                prompt = encode_question(
-                    tokenizer, contract, record, question_id, mask_token_id=config.mask_token_id, max_tokens=8192
+            prompts = {
+                question_id: encode_question(
+                    tokenizer,
+                    contract,
+                    record,
+                    question_id,
+                    mask_token_id=config.mask_token_id,
+                    max_tokens=8192,
+                    prompt_format=prompt_format,
                 )
+                for question_id in record["questions"]
+            }
+            if packed:
+                end = tokenizer.convert_tokens_to_ids("<SPECIAL_101>")
+                state_length = list(next(iter(prompts.values())).input_ids).index(end) + 1
+                ids, positions, groups, slots = [], [], [], {}
+                for k, (question_id, prompt) in enumerate(prompts.items()):
+                    if not ids:
+                        ids += prompt.input_ids[:state_length]
+                        positions += range(state_length)
+                        groups += [-1] * state_length
+                    question = [*prompt.input_ids[state_length:], config.mask_token_id]
+                    ids += question
+                    positions += range(state_length, state_length + len(question))
+                    groups += [k] * len(question)
+                    slots[question_id] = len(ids) - 1
+                g = torch.tensor(groups, device=device)
+                allowed = (g[None, :] == -1) | ((g[:, None] == g[None, :]) & (g[:, None] != -1))
+                hidden = encoder(
+                    input_ids=torch.tensor([ids], device=device),
+                    position_ids=torch.tensor([positions], device=device),
+                    attention_mask=allowed[None, None],
+                    use_cache=False,
+                ).last_hidden_state
+                for question_id, prompt in prompts.items():
+                    logits = (head[list(prompt.code_token_ids)] @ hidden[0, slots[question_id]]).float()
+                    out[(record["id"], question_id)] = logits.softmax(-1).tolist()
+                continue
+            for question_id, prompt in prompts.items():
                 ids = torch.tensor([[*prompt.input_ids, config.mask_token_id]], device=device)
                 positions = torch.arange(ids.shape[1], device=device)[None]
                 hidden = encoder(input_ids=ids, position_ids=positions, use_cache=False).last_hidden_state
@@ -154,16 +231,16 @@ def _reference_probabilities(
     return out
 
 
-def _check_selected_stage_and_export(root, run, method, selected, native, repository) -> None:
+def _check_selected_stage_and_export(root, run, method, selected, native, repository, single=None) -> None:
     """Rank-0 checks: selected stage, finite losses, export, reference reload agreement and wrong-base rejection."""
     from nemo_automodel.components.checkpoint.utils import read_checkpoint_pointer
 
     best = read_checkpoint_pointer(run, "LOWEST_VAL")
     assert best is not None and Path(best).name == f"step_{selected['step']:08d}"
-    assert method == "lora" or selected["step"] > 0, "full fine-tuning selects among trained stages"
+    assert method != "full" or selected["step"] > 0, "full fine-tuning selects among trained stages"
     stage = read_checkpoint_pointer(run, "LATEST")
     assert stage is not None and Path(stage).name == "step_00000003"
-    if method == "lora":
+    if method in ("lora", "packed"):
         from safetensors.torch import load_file
 
         adapter = load_file(str(Path(stage) / "model" / "adapter_model.safetensors"))
@@ -185,14 +262,48 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
         check=True,
     )
     assert (out / "decision.json").read_text() == (root / "base" / "decision.json").read_text()
-    assert json.loads((out / "config.json").read_text())["architectures"] == ["NemotronForDecision"]
-    reference = _reference_probabilities(out, root / "data/test.jsonl", torch.device("cuda", 0))
-    assert reference.keys() == native.keys()
-    for key, probabilities in native.items():
-        torch.testing.assert_close(torch.tensor(probabilities), torch.tensor(reference[key]), atol=2e-5, rtol=1e-4)
-        assert max(range(len(probabilities)), key=probabilities.__getitem__) == max(
-            range(len(probabilities)), key=reference[key].__getitem__
+    exported = json.loads((out / "config.json").read_text())
+    assert exported["architectures"] == ["NemotronForDecision"]
+    data = root / ("data_packed" if method == "packed" else "data")
+    checks = [(native, False)] + ([(single, False)] if single is not None else [])
+    if method == "packed":
+        base = json.loads((root / "base" / "config.json").read_text())
+        assert exported == {
+            **base,
+            "prompt_format": "json-sep",
+            "packed_read": True,
+            "read_layout": exported["read_layout"],
+        }
+        layout = exported["read_layout"]
+        assert (
+            layout["packed_read"],
+            layout["prompt_format"],
+            layout["state_end_token_id"],
+            layout["mask_token_id"],
+        ) == (
+            True,
+            "json-sep",
+            101,
+            100,
         )
+        assert layout["attention"] == "state->state; question->state+self; no question<->question"
+        checks = [(native, True), (single, False)]
+    else:
+        assert exported == json.loads((root / "base" / "config.json").read_text())
+    for probabilities_by_key, packed in checks:
+        reference = _reference_probabilities(
+            out,
+            data / "test.jsonl",
+            torch.device("cuda", 0),
+            prompt_format="json-sep" if method == "packed" else "json",
+            packed=packed,
+        )
+        assert reference.keys() == probabilities_by_key.keys()
+        for key, probabilities in probabilities_by_key.items():
+            torch.testing.assert_close(torch.tensor(probabilities), torch.tensor(reference[key]), atol=2e-5, rtol=1e-4)
+            assert max(range(len(probabilities)), key=probabilities.__getitem__) == max(
+                range(len(probabilities)), key=reference[key].__getitem__
+            )
     wrong = subprocess.run(
         [
             sys.executable,
@@ -211,6 +322,7 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
 
 
 def _worker(root: Path, method: str) -> None:
+    from nemo_automodel.components.checkpoint.utils import read_checkpoint_pointer
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.recipes.decision.train_nemotron_decision import TrainNemotronDecisionRecipe
 
@@ -224,7 +336,10 @@ def _worker(root: Path, method: str) -> None:
     cfg["model"]["pretrained_model_name_or_path"] = str(root / "base")
     cfg["model"]["torch_dtype"] = "float32"
     cfg["output_dir"] = str(root / f"run_{method}")
-    cfg["data"].update({s: str(root / f"data/{s}.jsonl") for s in ("train", "validation", "test")})
+    data = "data_packed" if method == "packed" else "data"
+    cfg["data"].update({s: str(root / f"{data}/{s}.jsonl") for s in ("train", "validation", "test")})
+    if method == "packed":
+        cfg["data"].update(packed_read=True, prompt_format="json-sep")
     cfg["train"].update(global_batch_size=4, max_steps=3, val_every_steps=1)
     cfg["optimizer"]["lr"] = 1.0e-2
     # fp32 compute so native-vs-export agreement tests state, not bf16 rounding (the default policy computes in bf16).
@@ -241,7 +356,7 @@ def _worker(root: Path, method: str) -> None:
     recipe.setup()
     assert recipe._get_dp_group_size() == 2
     trainable = {name for name, p in recipe.model.named_parameters() if p.requires_grad}
-    if method == "lora":
+    if method in ("lora", "packed"):
         assert trainable and all("lora_" in name for name in trainable)
     else:
         assert trainable and all(".layers." in name or "encoder.norm" in name for name in trainable)
@@ -263,10 +378,26 @@ def _worker(root: Path, method: str) -> None:
     assert metrics["overall"]["n"] == 24 and metrics["run"]["skipped_questions"] == 0
     predictions = (root / f"eval_{method}" / "predictions_test.jsonl").read_text().splitlines()
     native = {(p["record_id"], p["question_id"]): p["probs"] for p in map(json.loads, predictions)}
+    single = None
+    if method == "packed":
+        # 8 states x 3 questions, one packed read per state; the same stage then reads one question per sequence.
+        assert metrics["run"]["packed_read"] is True and metrics["run"]["packed_reads"] == 8
+        assert metrics["overall"]["records"] == 8 and "exact_match" in metrics["overall"]
+        stage = json.loads((Path(read_checkpoint_pointer(run, "LATEST")) / "stage.json").read_text())
+        assert stage["prompt_format"] == "json-sep" and stage["read_layout"]["packed_read"] is True
+        del reloaded
+        torch.cuda.empty_cache()
+        single_cfg = {**cfg_eval, "output_dir": str(root / "eval_packed_single")}
+        single_cfg["data"] = {**cfg["data"], "packed_read": False}
+        single_recipe = TrainNemotronDecisionRecipe(ConfigNode(single_cfg))
+        single_recipe.setup()
+        single_recipe.run_train_validation_loop()
+        lines = (root / "eval_packed_single" / "predictions_test.jsonl").read_text().splitlines()
+        single = {(p["record_id"], p["question_id"]): p["probs"] for p in map(json.loads, lines)}
     failure = None
     if dist.get_rank() == 0:
         try:
-            _check_selected_stage_and_export(root, run, method, selected, native, repository)
+            _check_selected_stage_and_export(root, run, method, selected, native, repository, single)
         except BaseException as error:  # report on every rank instead of leaving rank 1 in a barrier
             failure = error
     failed = torch.tensor([failure is not None], device="cuda")
@@ -280,17 +411,18 @@ def _worker(root: Path, method: str) -> None:
 def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
-    parser.add_argument("--method", choices=["lora", "full"], required=True)
+    parser.add_argument("--method", choices=["lora", "full", "packed"], required=True)
     args = parser.parse_args()
     _worker(Path(args.root), args.method)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two assigned CUDA GPUs for native FSDP2 setup")
-@pytest.mark.parametrize("method", ["lora", "full"])
+@pytest.mark.parametrize("method", ["lora", "full", "packed"])
 def test_nemotron_decision_recipe_two_gpu(tmp_path, method):
     _tiny_checkpoint(tmp_path / "base", seed=0)
     _tiny_checkpoint(tmp_path / "other", seed=1)
     _records(tmp_path / "data")
+    _packed_records(tmp_path / "data_packed")
     env = {
         **os.environ,
         "PYTHONPATH": str(Path(__file__).resolve().parents[4]),

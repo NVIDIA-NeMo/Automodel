@@ -30,6 +30,7 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
         "clef_soc_triage_lora.yaml",
         "clef_soc_triage_heads.yaml",
         "nemotron_decision_soc_triage_lora.yaml",
+        "nemotron_decision_soc_triage_packed_lora.yaml",
         "nemotron_decision_support_routing_lora.yaml",
     ],
 )
@@ -382,7 +383,11 @@ def test_nemotron_decision_rejects_batches_that_do_not_split_over_dp(batch, worl
 
 def test_nemotron_decision_examples_keep_the_reference_training_contract():
     root = Path(__file__).resolve().parents[3] / "examples" / "decision"
-    for name in ("nemotron_decision_soc_triage_lora.yaml", "nemotron_decision_support_routing_lora.yaml"):
+    for name in (
+        "nemotron_decision_soc_triage_lora.yaml",
+        "nemotron_decision_soc_triage_packed_lora.yaml",
+        "nemotron_decision_support_routing_lora.yaml",
+    ):
         config = yaml.safe_load((root / name).read_text())
         assert "dlm_paradigm" not in config["model"] and not config["model"].get("trust_remote_code")
         assert (config["peft"]["dim"], config["peft"]["alpha"], config["peft"]["dropout"]) == (32, 64, 0.0)
@@ -440,3 +445,15 @@ def test_nemotron_decision_reads_each_supervised_question_and_counts_unreadable_
         )
     decisions, skipped = recipe._encode_split([record], train=False)
     assert [d.prompt.question_id for d in decisions] == ["gold", "reward"] and skipped == 1
+
+
+def test_nemotron_decision_packed_example_reads_state_blind():
+    root = Path(__file__).resolve().parents[3] / "examples" / "decision"
+    packed = yaml.safe_load((root / "nemotron_decision_soc_triage_packed_lora.yaml").read_text())
+    single = yaml.safe_load((root / "nemotron_decision_soc_triage_lora.yaml").read_text())
+    assert packed["data"]["packed_read"] is True and packed["data"]["prompt_format"] == "json-sep"
+    assert packed["model"]["attn_implementation"] == "sdpa"
+    assert "packed_read" not in single["data"] and "prompt_format" not in single["data"]
+    # Everything else matches the one-question-per-read example.
+    for key in ("peft", "optimizer", "loss", "train", "distributed", "lr_scheduler", "seed"):
+        assert packed[key] == single[key]

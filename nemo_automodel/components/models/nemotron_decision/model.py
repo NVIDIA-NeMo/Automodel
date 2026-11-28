@@ -109,7 +109,9 @@ class NemotronForDecision(PreTrainedModel):
 
         Args:
             input_ids: Token ids ``[batch, sequence]``.
-            attention_mask: Optional padding mask ``[batch, sequence]``.
+            attention_mask: Optional padding mask ``[batch, sequence]``, or a dense boolean mask
+                ``[batch, 1, sequence, sequence]`` (``True`` = the query attends to the key) such as a packed read's
+                (see ``packed.py``). Eager attention gets the boolean mask as its additive equivalent.
             position_ids: Optional positions ``[batch, sequence]``; defaults to ``0..sequence-1``.
             inputs_embeds: Optional embeddings instead of ``input_ids``.
             output_last_hidden_states_only: Return the encoder's last hidden state without projecting the
@@ -120,6 +122,16 @@ class NemotronForDecision(PreTrainedModel):
             ``BaseModelOutput(last_hidden_state)`` or ``MaskedLMOutput(logits)``.
         """
         kwargs.pop("use_cache", None)
+        if (
+            attention_mask is not None
+            and attention_mask.dim() == 4
+            and attention_mask.dtype == torch.bool
+            and self.config._attn_implementation == "eager"
+        ):
+            dtype = self.encoder.embed_tokens.weight.dtype if inputs_embeds is None else inputs_embeds.dtype
+            attention_mask = torch.zeros(attention_mask.shape, dtype=dtype, device=attention_mask.device).masked_fill(
+                ~attention_mask, torch.finfo(dtype).min
+            )
         hidden = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,

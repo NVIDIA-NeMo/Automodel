@@ -35,6 +35,12 @@ The checkpoint owns its prompt contract, and training reads each question exactl
 An optional, explicit option shuffle (training only) permutes the options and re-codes them by position, so the model
 learns option meanings rather than codes. The permutation seed is ``crc32(f"{seed}|perm")``, independent of the coin
 that decides whether a row is shuffled.
+
+Prompt formats (``prompt_format``): ``json`` (default) writes the JSON above unchanged. ``json-sep`` writes the same
+JSON with the state-end token (``<SPECIAL_101>`` by default) right after the state value, closing the state:
+``{"state": ...<SPECIAL_101>, "question": ..., "options": [...]}``. Only that one token is a control token; the same
+text inside the user content is still encoded as plain text. Everything up to and including the state-end token is
+the state prefix that packed reads share (see ``packed.py``).
 """
 
 from __future__ import annotations
@@ -52,6 +58,8 @@ from typing import Any
 DECISION_CONFIG_FILE = "decision.json"
 DECISION_TEMPLATE_FILE = "decision_template.jinja"
 QUESTION_TYPES = ("choice", "noul", "score")
+PROMPT_FORMATS = ("json", "json-sep")
+DEFAULT_STATE_END_TOKEN = "<SPECIAL_101>"
 NOUL_OPTIONS = ("false", "true")
 NOUL_DEFAULT_MEANINGS = {"false": "No, the condition does not hold.", "true": "Yes, the condition holds."}
 _QUESTION_FIELDS = frozenset({"type", "instructions", "criteria"})
@@ -126,6 +134,7 @@ class PreparedQuestion:
     labels: tuple[str, ...]  # API option labels in prompt order
     code_token_ids: tuple[int, ...]  # single-token code of each option, same order as ``labels``
     input_ids: tuple[int, ...]  # prompt tokens; the mask token is appended by the caller
+    state_length: int | None = None  # json-sep: tokens up to and including the state-end token; json: None
 
 
 def perm_seed(shuffle_seed: int) -> int:
@@ -189,6 +198,8 @@ def prepare_question(
     *,
     mask_token_id: int,
     shuffle_seed: int | None = None,
+    prompt_format: str = "json",
+    state_end_token: str = DEFAULT_STATE_END_TOKEN,
 ) -> PreparedQuestion:
     """Render one question with the checkpoint's decision template, optionally with shuffled, re-coded options.
 
@@ -201,14 +212,20 @@ def prepare_question(
         mask_token_id: The checkpoint's mask token, which the template must write exactly once, at the end.
         shuffle_seed: When set, permute the options with ``perm_seed(shuffle_seed)`` and re-code them by position;
             ``None`` keeps the checkpoint's option order.
+        prompt_format: ``json`` (the user content is the JSON object) or ``json-sep`` (the same JSON with
+            ``state_end_token`` right after the state value).
+        state_end_token: The control token that closes the state in ``json-sep`` prompts.
 
     Returns:
-        The prepared prompt; token ids exclude the trailing mask.
+        The prepared prompt; token ids exclude the trailing mask. For ``json-sep``, ``state_length`` counts the tokens
+        up to and including the state-end token.
 
     Raises:
-        ValueError: If the question is malformed, has more options than codes, or the template does not end in exactly
-            one mask token.
+        ValueError: If the question is malformed, has more options than codes, the template does not end in exactly
+            one mask token, or a ``json-sep`` prompt does not hold exactly one state-end token before its questions.
     """
+    if prompt_format not in PROMPT_FORMATS:
+        raise ValueError(f"prompt_format must be one of {PROMPT_FORMATS}, got {prompt_format!r}")
     try:
         labels, meanings = question_options(question)
     except ValueError as error:
@@ -221,12 +238,28 @@ def prepare_question(
     if shuffle_seed is not None:
         random.Random(perm_seed(shuffle_seed)).shuffle(order)
     options = [{"code": codes[i], "label": labels[j], "meaning": meanings[j]} for i, j in enumerate(order)]
-    content = json.dumps(
-        {"state": state, "question": question["instructions"], "options": options},
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-    ids = render_decision_ids(tokenizer, contract.template, content)
+    state_length = None
+    if prompt_format == "json":
+        content = json.dumps(
+            {"state": state, "question": question["instructions"], "options": options},
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        ids = render_decision_ids(tokenizer, contract.template, content)
+    else:
+        # The same JSON split after the state value: '{"state": <state>' + state-end token + ', "question": ...}'.
+        head = json.dumps({"state": state}, ensure_ascii=False, allow_nan=False)[:-1]
+        tail = (
+            ", "
+            + json.dumps(
+                {"question": question["instructions"], "options": options}, ensure_ascii=False, allow_nan=False
+            )[1:]
+        )
+        ids = render_decision_ids(tokenizer, contract.template, head, tail=tail, state_end_token=state_end_token)
+        state_end_id = tokenizer.convert_tokens_to_ids(state_end_token)
+        if ids.count(state_end_id) != 1:
+            raise ValueError(f"a json-sep prompt must hold exactly one {state_end_token!r} token")
+        state_length = ids.index(state_end_id) + 1
     if not ids or ids[-1] != mask_token_id or ids.count(mask_token_id) != 1:
         raise ValueError("the decision template must produce exactly one trailing mask token")
     return PreparedQuestion(
@@ -235,16 +268,35 @@ def prepare_question(
         labels=tuple(labels[j] for j in order),
         code_token_ids=label_token_ids(tokenizer, codes),
         input_ids=tuple(int(t) for t in ids[:-1]),
+        state_length=state_length,
     )
 
 
-def render_decision_ids(tokenizer: Any, template: str, content: str) -> list[int]:
-    """Token ids of ``template`` rendered around ``content``, with control tokens in ``content`` encoded as text."""
-    control = _control_tokens(tokenizer, template)
+def render_decision_ids(
+    tokenizer: Any,
+    template: str,
+    content: str,
+    *,
+    tail: str | None = None,
+    state_end_token: str | None = None,
+) -> list[int]:
+    """Token ids of ``template`` rendered around ``content``, with control tokens in ``content`` encoded as text.
+
+    With ``state_end_token``, the user content is ``content + state_end_token + tail``: only the inserted token is a
+    control token; control-token text inside ``content`` and ``tail`` is still encoded as text.
+    """
+    control = _pattern(_control_tokens(tokenizer, template))
+    decision_content = _mark(content, control)
+    if state_end_token is not None:
+        if state_end_token not in tokenizer.added_tokens_encoder:
+            raise ValueError(f"the tokenizer has no {state_end_token!r} token for json-sep prompts")
+        decision_content += state_end_token + _mark(tail or "", control)
+    elif tail is not None:
+        raise ValueError("tail needs a state_end_token")
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": ""}],
         chat_template=template,
-        decision_content=_mark(content, _pattern(control)),
+        decision_content=decision_content,
         tokenize=False,
         add_generation_prompt=False,
     )
