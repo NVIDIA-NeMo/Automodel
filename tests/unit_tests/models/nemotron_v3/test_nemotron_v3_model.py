@@ -1449,6 +1449,25 @@ class TestNemotronV3ModelWithMoE:
         assert hasattr(model.layers["0"].mixer, "experts")
         assert hasattr(model.layers["0"].mixer, "shared_experts")
 
+    def test_moe_overrides_turn_on_gate_load_balancing(self, config, backend):
+        """The pretraining recipe trains the gate with an auxiliary loss and the expert-bias update."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        backend = BackendConfig(
+            linear=backend.linear,
+            attn=backend.attn,
+            rms_norm=backend.rms_norm,
+            dispatcher="torch",
+            fake_balanced_gate=False,
+            enable_hf_state_dict_adapter=False,
+        )
+        gate = NemotronHForCausalLM(config, backend).model.layers["0"].mixer.gate
+        assert (gate.aux_loss_coeff, gate.bias_update_factor) == (0.0, 0.0)
+
+        overrides = {"aux_loss_coeff": 1e-4, "gate_bias_update_factor": 1e-3}
+        gate = NemotronHForCausalLM(config, backend, moe_overrides=overrides).model.layers["0"].mixer.gate
+        assert (gate.aux_loss_coeff, gate.bias_update_factor) == (1e-4, 1e-3)
+
     def test_e_score_correction_bias_stays_fp32_after_dtype_cast(self, config, backend):
         """Nemotron v3 router correction bias must stay fp32 under bf16 storage casts."""
         from nemo_automodel.components.models.common.utils import cast_model_to_dtype

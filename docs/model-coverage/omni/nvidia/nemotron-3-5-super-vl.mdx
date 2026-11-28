@@ -84,6 +84,7 @@ and fp32 moments. Rank 0 logs the module counts at startup.
 | Parallelism | FSDP2, `ep_size 16`, `tp_size 1`, `cp_size 1`, `pp_size 1` |
 | Batch | 128 sequences of 8,192 tokens per optimizer step, in 2 microbatches of 4 sequences per rank |
 | Model | 88-layer language model with 512 routed experts and the learned gate; MTP head trained with two depths |
+| Gate load balancing | Auxiliary loss with coefficient 1e-4 and expert-bias update with factor 1e-3 (`model.moe_overrides`) |
 | Kernels | TE attention and linear layers, TE experts with one GEMM per expert, HybridEP, full-block activation checkpointing |
 | Optimizer | lr 3e-4 with 100 warmup steps from 3e-5 and cosine decay to 3e-5, weight decay 0.1, gradient clipping at 1.0 |
 
@@ -104,6 +105,7 @@ torchrun --nnodes=4 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=$HEAD
   examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_te_nvfp4_gb300.yaml
 ```
 
+The runs below were made before gate load balancing was added to the recipe, with both of its settings at 0.
 The figure and tables compare the recipe with the same file without its `te_nvfp4` block (BF16), which was run
 twice. All runs use the same seed, initial weights, and data order on 16 GB300 GPUs (TE 2.19.0) and train
 1,500 optimizer steps, 1.57 billion tokens. Two settings differ from the recipe as written: a 1,500-step cosine
