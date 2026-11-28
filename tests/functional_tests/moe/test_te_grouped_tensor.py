@@ -654,8 +654,8 @@ def test_nvfp4_experts_at_real_sizes_match_fp32_row_by_row(
     factors of 3 and 9, so a row quantized with another expert's scale is off by more than 0.5 of its norm
     (NVFP4 rounding leaves 0.2 to 0.35), and TE's output buffers are pre-filled with NaN so an unwritten element
     shows. Output, input gradient and both weight gradients are compared with FP32 values computed here, expert by
-    expert. The side stream is exercised with one GEMM per expert only: on cuBLASLt
-    before 13.8.1 a grouped GEMM can leave output unwritten while a GEMM runs on a second stream."""
+    expert. The side stream is exercised with one GEMM per expert only: with Transformer Engine 2.19.0 and
+    cuBLASLt 13.7.0 a grouped GEMM can leave output unwritten while a GEMM runs on a second stream."""
     recipe = _nvfp4_recipe_or_skip(stochastic_rounding=True)
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear

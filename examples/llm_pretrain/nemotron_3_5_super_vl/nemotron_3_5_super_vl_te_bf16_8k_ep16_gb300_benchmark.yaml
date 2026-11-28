@@ -36,9 +36,9 @@
 #     dispatcher_recompute_cache: combine and mamba_norm_backward_grid_scale: 8.
 #   - FusedLinearCrossEntropy computes lm_head and the loss in one operation and does not keep the logits of the
 #     three heads (8 GiB each in BF16 for 4 x 8192 tokens).
-# shared_expert_overlap (the shared expert on a second CUDA stream) is off: with cuBLASLt before 13.8.1 a
-# grouped GEMM can leave part of a weight gradient unwritten while GEMMs run on a second stream, whatever the
-# routing, so this file does not use te_grouped_tensor together with it. Of the two, the
+# shared_expert_overlap (the shared expert on a second CUDA stream) is off: with Transformer Engine 2.19.0
+# and cuBLASLt 13.7.0 a grouped GEMM can leave part of a weight gradient unwritten while GEMMs run on a second
+# stream, whatever the routing, so this file does not use te_grouped_tensor together with it. Of the two, the
 # grouped GEMMs are worth more here. On one node with 128 of the 512 experts (ep4), two runs each: this file
 # 12,573 and 12,567 tokens/s/GPU; the side stream with one GEMM per expert 12,348 and 12,351; both together
 # 12,565 and 12,566.
@@ -110,7 +110,7 @@ model:
     dispatcher_recompute_cache: combine
     # Benchmark only: valid for fixed-length rows, see the header.
     dispatcher_equal_token_counts: true
-    # Not together with te_grouped_tensor before cuBLASLt 13.8.1, see the header.
+    # Not together with te_grouped_tensor, see the header.
     shared_expert_overlap: false
     mamba_norm_backward_grid_scale: 8
     # `--benchmark` sets this to true through ci.perf_testing.fake_balanced_gate.

@@ -214,12 +214,12 @@ model:
     # The combine output of every MoE layer is kept for the activation-checkpoint recompute.
     dispatcher_recompute_cache: combine
     # The shared expert runs on the main stream. shared_expert_overlap: true moves it to a second CUDA stream
-    # during dispatch and combine. With cuBLASLt before 13.8.1 a grouped GEMM can leave part of a weight
-    # gradient unwritten while GEMMs run on a second stream, so te_grouped_tensor is not to be used together
-    # with it there. With one GEMM per expert, 7,106 checked passes on cuBLASLt
-    # 13.7.0 lost no output; that excludes a rate above 0.04% per pass and no lower one, against 75,600
-    # passes per rank in the 900 steps of this file, so the side stream is off. It can be turned on from
-    # cuBLAS 13.8.1 on.
+    # during dispatch and combine. With Transformer Engine 2.19.0 and cuBLASLt 13.7.0 a grouped GEMM can leave
+    # part of a weight gradient unwritten while GEMMs run on a second stream, so te_grouped_tensor is not to be
+    # used together with it. With one GEMM per expert, 7,106 checked passes with those versions lost no output;
+    # that excludes a rate above 0.04% per pass and no lower one, against 75,600 passes per rank in the 900
+    # steps of this file, so the side stream is off. The defect was not seen with Transformer Engine 2.21.0 and
+    # cuBLASLt 13.8.1.
     shared_expert_overlap: false
     # Eight times the programs for the gated-RMSNorm backward kernel of the Mamba scan.
     mamba_norm_backward_grid_scale: 8
