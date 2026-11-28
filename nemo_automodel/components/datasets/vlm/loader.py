@@ -49,7 +49,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
     pad_collate_fn,
 )
 from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
-from nemo_automodel.components.datasets.vlm.datasets import MetaDatasetConfig, PreTokenizedDatasetWrapperConfig
+from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.fake_image import FakeImageDatasetWrapper, dataset_has_media
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.datasets.vlm.pp_media import wrap_vlm_collate_for_pp
@@ -362,16 +362,13 @@ class VlmDataloaderConfig:
     ) -> bool:
         """Decide once per loader whether samples without media get a fake image, and log why.
 
-        Ranks of one data-parallel group must enter the vision tower in the same steps, so
-        every rank has to reach the same answer. Ranks that hold the same dataset do; a
-        dataset sharded by rank shows each rank only its slice, so it counts as having media.
+        Each rank decides from the dataset it holds. A dataset sharded by rank is looked
+        through per rank and not coordinated, so ranks whose slices differ can decide differently.
         """
         if self.inject_fake_images is not None:
             inject, reason = self.inject_fake_images, "set by dataset.inject_fake_images"
         elif dp_world_size <= 1:
             inject, reason = False, "one data-parallel rank"
-        elif isinstance(self.dataset_config, MetaDatasetConfig) and self.dataset_config.shard_data:
-            inject, reason = True, "the dataset is sharded by rank, so it is treated as having media"
         elif dataset_has_media(dataset):
             inject, reason = True, f"{dp_world_size} data-parallel ranks and the dataset has samples with media"
         else:

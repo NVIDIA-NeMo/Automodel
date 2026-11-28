@@ -102,17 +102,14 @@ def dataset_has_media(dataset: Dataset | torch.utils.data.Dataset | Sequence[Con
     """Return whether *dataset* holds a sample with an image or video.
 
     Reads the raw samples in order and stops at the first one with media. A sample that
-    cannot be read counts as one with media: a missing fake image hangs sharded training,
-    an extra one does not.
+    cannot be read is skipped with a warning; the answer comes from the samples that can be read.
     """
     for index in range(len(dataset)):
         try:
             sample = dataset[index]
         except Exception as error:
-            logger.warning(
-                "fake_image: sample %d could not be read (%s); treating the dataset as having media", index, error
-            )
-            return True
+            logger.warning("fake_image: sample %d could not be read (%s); skipping it", index, error)
+            continue
         conversation = sample.get("conversation") if isinstance(sample, dict) else None
         if conversation is not None and _conversation_has_media(conversation):
             return True

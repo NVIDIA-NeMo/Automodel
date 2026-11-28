@@ -994,8 +994,8 @@ def test_fake_image_decision_table(caplog, dp_world_size, data, switch, expected
     assert caplog.text.count("VLM fake image injection:") == 1
 
 
-def test_dataset_sharded_by_rank_gets_the_same_decision_on_every_rank(monkeypatch):
-    """Rank 0's slice is text only and rank 1's has an image: both ranks must inject."""
+def test_dataset_sharded_by_rank_is_decided_per_rank(monkeypatch):
+    """A dataset sharded by rank is looked through per rank and not coordinated: a text-only slice gets none."""
     slices = {0: (False, False), 1: (True, False)}
     monkeypatch.setattr(
         MetaDatasetConfig,
@@ -1013,7 +1013,7 @@ def test_dataset_sharded_by_rank_gets_the_same_decision_on_every_rank(monkeypatc
 
     marks = {rank: _fake_image_marks(config, dp_world_size=2, dp_rank=rank) for rank in slices}
 
-    assert marks == {0: [True, True], 1: [False, True]}
+    assert marks == {0: [False, False], 1: [False, True]}
 
 
 def test_unsharded_text_only_meta_dataset_gets_no_fake_image(monkeypatch):

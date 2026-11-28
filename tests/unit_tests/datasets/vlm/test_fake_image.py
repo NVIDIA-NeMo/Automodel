@@ -357,12 +357,17 @@ class TestDatasetHasMedia:
         video = {"conversation": [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]}
         assert fake_image.dataset_has_media([_text_sample(), video]) is True
 
-    def test_sample_that_cannot_be_read_counts_as_media(self, caplog):
+    def test_sample_that_cannot_be_read_is_skipped(self, caplog):
         dataset = _CountingDataset([_text_sample(), OSError("broken file"), _text_sample()])
         with caplog.at_level(logging.WARNING, logger=fake_image.__name__):
-            assert fake_image.dataset_has_media(dataset) is True
+            assert fake_image.dataset_has_media(dataset) is False
+        assert dataset.read == [0, 1, 2]
+        assert "sample 1 could not be read (broken file); skipping it" in caplog.text
+
+    def test_media_after_a_sample_that_cannot_be_read_is_found(self):
+        dataset = _CountingDataset([OSError("broken file"), _image_sample(), _text_sample()])
+        assert fake_image.dataset_has_media(dataset) is True
         assert dataset.read == [0, 1]
-        assert "treating the dataset as having media" in caplog.text
 
     def test_samples_without_a_conversation_have_no_media(self):
         assert fake_image.dataset_has_media([{"audio": b"wave", "text": "hello"}, 7]) is False
