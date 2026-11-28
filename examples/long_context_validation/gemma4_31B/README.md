@@ -62,20 +62,41 @@ higher-length pass is a cheap re-filter (no re-tokenization) that emits a new
   **no `chat_template.jinja`** — copy it from `google/gemma-4-31B-it` into the base
   checkpoint dir before running data prep or training (the tokenizer is identical).
 - **Assistant masking uses `gemma4_coderforge_chat_template.jinja`** (in this
-  directory), a copy of the stock Gemma4 template with every assistant turn's body
-  wrapped in `{% generation %}...{% endgeneration %}`. The recipe, `validate_data.py`,
-  and `check_masking.py` point `chat_template` at it, so
+  directory), a copy of the upstream `google/gemma-4-31B-it` template (revision in
+  its header) with the model-generated spans wrapped in
+  `{% generation %}...{% endgeneration %}`: thinking, tool calls, the
+  `<|tool_response>` stop token the model emits after its calls, content, and the
+  closing `<turn|>`. Tool response payloads stay masked. The recipe,
+  `validate_data.py`, and `check_masking.py` point `chat_template` at it, so
   `apply_chat_template(return_assistant_tokens_mask=True)` returns the assistant
-  mask directly (one `apply_chat_template` call per sample). The rendered token
-  stream is byte-identical to the stock template.
+  mask directly (one `apply_chat_template` call per sample). With the generation
+  tags removed it renders byte-identically to the upstream template, except for
+  the message order change described below.
   The stock Gemma4 template has **no `{% generation %}` block**, so `ChatDataset`
   would fall back to `_build_multiturn_assistant_mask` — an O(turns) per-sample
   re-tokenization that #3024's prefix-consistency guard rejects for multi-turn
   conversations whose rendered prefixes are not exact token prefixes of the full
   render. The generation-block template is the supported path.
-- The stop token the model must learn is **`<turn|>` (id 106)**, listed in
+- **Tool calls use the native Gemma4 format** (`call:name{key:<|"|>value<|"|>}`,
+  tool results inside the model turn). The template requires `arguments` as a
+  mapping while the cache stores JSON strings. The three data scripts load the
+  tokenizer with `NeMoAutoTokenizer`, which decodes them for Gemma4. The recipe
+  (`FinetuneRecipeForVLM`) ignores `dataset.tokenizer` and hands `ChatDataset` the
+  processor's tokenizer, which the VLM dataloader wraps the same way for the model
+  types registered for `DictToolArgumentsTokenizer` (`gemma4`, `gemma4_unified`).
+  A plain `transformers.AutoTokenizer` would hand the template strings, and it
+  raises. `prefilter.sh` measures `n_tokens` with this template by default.
+- **An assistant message's text renders before its tool calls**
+  (`<|turn>model\n{text}<|tool_call>...<tool_call|><|tool_response>`). OpenHands
+  writes that text for the call it precedes (75% of CoderForge assistant messages
+  have both), and `oh3_run.py` sends messages back in the same shape. Upstream
+  renders the text after the tool results, which would train it as the lead-in to
+  the *next* call. Messages without tool calls render as upstream.
+- The stop tokens the model must learn are **`<turn|>` (id 106)** and, after its
+  tool calls, **`<|tool_response>` (id 50)**, both listed in
   `generation_config.eos_token_id=[1,106,50]` — **not** the tokenizer
-  `eos_token_id` (1 = `<eos>`). `validate_data.py` checks 106.
+  `eos_token_id` (1 = `<eos>`). CoderForge trajectories end on a `finish` tool
+  call, so their final supervised token is 50. `validate_data.py` accepts either.
 - CoderForge messages use a union schema (`tool_calls: null` on plain turns);
   the preprocessor strips those, and the cache is **JSONL** (Parquet's Arrow
   struct unification would re-add the null keys and break `ChatDataset`).
@@ -107,7 +128,8 @@ symptom is only a valid finding if the mask is correct. If masking is broken
 (≈0% supervised → nothing learned; ≈100% → the model also imitates user/tool
 text; or the wrong spans), then loss-down/capability-down is a **bug, not a
 finding**. For a few samples it prints the supervised fraction (`labels != -100`),
-whether the Gemma4 stop token `<turn|>` (106) lands inside supervised spans, and a
+which Gemma4 stop tokens (`<turn|>` 106, `<|tool_response>` 50) are supervised
+labels (CoderForge rows end on a tool call, so expect 50), and a
 decoded supervised span vs a masked span so you can confirm assistant content
 (incl. `tool_calls`) is supervised while system/user/tool-result content is masked.
 
@@ -130,6 +152,12 @@ dataset:
 ```
 
 ## Phase 2 — Training recipe (Gemma4 31B + CP)
+
+> **The loss curve below and the Phase 3 results were produced before the native
+> tool-call template.** Those checkpoints trained on `call:name{{"k": "v"}}` with
+> tool results as separate turns, and the Phase 3 serving settings (`NOPARSER=1`,
+> `OH3_ENABLE_THINKING=1`) belong to them. See "Serving a checkpoint trained with
+> the current template" in Phase 3.
 
 `gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml` — SFT on the **base**
 `google/gemma-4-31B`, on 16 nodes / 128 GPUs, `cp8 × dp16`, `gbs=16`, 64K
@@ -236,6 +264,16 @@ with the 3-tool schema and checks whether the checkpoint emits a real structured
 config (`response_schema` + `stop_token_ids` + parser choice) is correct, and that the
 checkpoint has crossed over from text-only planning to structured tool calls, **before**
 you commit to a full 500-instance run.
+
+### Serving a checkpoint trained with the current template
+
+The current template trains the native `call:name{key:<|"|>value<|"|>}` format,
+which is what vLLM's `gemma4` tool-call parser reads, so `NOPARSER=1` should not be
+needed (not re-measured yet). Set `OH3_ENABLE_THINKING=0`: with thinking on, the
+template appends `<|channel>thought\n` after every tool result, which the training
+text never contains. With it off, the prompt after a tool result ends exactly where
+the training text continues; only the first model turn opens with an empty
+`<|channel>thought\n<channel|>`, as upstream does.
 
 ### Result — SFT installs agentic behavior; the raw base has none
 

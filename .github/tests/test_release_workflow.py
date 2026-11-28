@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from NVIDIA-NeMo/Gym under Apache-2.0.
+# https://github.com/NVIDIA-NeMo/Gym/blob/e58425147cf1729131f8cf3f16dad5fe266944dd/.github/tests/test_release_workflow.py
 # SPDX-License-Identifier: Apache-2.0
 # /// script
 # dependencies = ["pyyaml>=6.0,<7"]
@@ -137,6 +139,82 @@ class ReleaseGuards(unittest.TestCase):
             self.assertNotIn("run", step)
             self.assertNotIn("password", step.get("with", {}))
             self.assertNotIn("checkout", step["uses"])
+
+    def test_dispatch_guard_preserves_push_rehearsals(self) -> None:
+        """Only manual dispatches from refs other than main fail this step."""
+        step = next(step for step in JOBS["validate-inputs"]["steps"] if step["name"] == "Require dispatch from main")
+        for event in ("workflow_dispatch", "push"):
+            for ref in ("refs/heads/main", "refs/tags/main", "refs/heads/r0.7.0", "refs/heads/pull-request/123"):
+                with self.subTest(event=event, ref=ref):
+                    rejected = evaluate(step["if"], {"github.event_name": event, "github.ref": ref})
+                    self.assertEqual(rejected, event == "workflow_dispatch" and ref != "refs/heads/main")
+        self.assertNotEqual(subprocess.run(["bash"], input=step["run"], text=True, capture_output=True).returncode, 0)
+
+    def test_release_commit_belongs_to_protected_target(self) -> None:
+        """Only a matching protected branch containing the requested SHA can be released."""
+        step = next(step for step in JOBS["validate-inputs"]["steps"] if step["name"].startswith("Verify release"))
+        self.assertEqual(step["if"], "github.event_name == 'workflow_dispatch'")
+        candidate_sha = "a" * 40
+        target_sha = "b" * 40
+        fixture = """
+gh() {
+    [[ $1 == api && $3 == --jq && $# == 4 ]] || return 1
+    case "$2" in
+      "repos/example/repo/branches/$TARGET_BRANCH") reply=$BRANCH_REPLY ;;
+      "repos/example/repo/compare/$RELEASE_REF...$TIP") reply=$COMPARE_REPLY ;;
+      *) return 1 ;;
+    esac
+    jq -r "$4" <<< "$reply"
+}
+"""
+        for branch, protected, comparison, accepts in (
+            ("main", True, "identical", True),
+            ("r0.7.0", True, "ahead", True),
+            ("v0.2.0", True, "identical", True),
+            ("r0.7.0", False, "identical", False),
+            ("r0.7.0", True, "behind", False),
+            ("main", True, "diverged", False),
+            ("r0.7.0-preview", True, "ahead", False),
+            ("pull-request/123", True, "ahead", False),
+        ):
+            with self.subTest(branch=branch, protected=protected, comparison=comparison):
+                env = dict(
+                    os.environ,
+                    GITHUB_REPOSITORY="example/repo",
+                    RELEASE_REF=candidate_sha,
+                    TIP=target_sha,
+                    TARGET_BRANCH=branch,
+                    BRANCH_REPLY=json.dumps({"protected": protected, "commit": {"sha": target_sha}}),
+                    COMPARE_REPLY=json.dumps({"status": comparison}),
+                )
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail"], input=fixture + step["run"], text=True, env=env, capture_output=True
+                )
+                self.assertEqual(result.returncode == 0, accepts, result.stderr)
+
+    def test_release_jobs_use_only_the_environment_app_for_github_writes(self) -> None:
+        """Release and freeze use the protected App while PR rehearsals retain read access."""
+        freeze = yaml.safe_load((ROOT / ".github/workflows/release-freeze.yml").read_text())["jobs"]["code-freeze"]
+        self.assertEqual(freeze["with"]["freeze-source-branch"], "main")
+        self.assertEqual(freeze["with"]["freeze-commit"], "${{ inputs.freeze-commit }}")
+        for job in (freeze, JOBS["bump"], JOBS["finalize"]):
+            self.assertEqual(job["with"]["release-environment"], "automodel-release")
+            self.assertNotIn("app-id", job["with"])
+            self.assertEqual(job["secrets"]["RELEASE_APP_PRIVATE_KEY"], "${{ secrets.RELEASE_APP_PRIVATE_KEY }}")
+            self.assertTrue(set(job["secrets"]) <= {"RELEASE_APP_PRIVATE_KEY", "SLACK_WEBHOOK", "SLACK_WEBHOOK_ADMIN"})
+        self.assertEqual(JOBS["bump"]["permissions"], {"contents": "read"})
+        self.assertEqual(JOBS["finalize"]["permissions"], {"contents": "read", "pull-requests": "read"})
+
+    def test_fern_is_the_documentation_publisher(self) -> None:
+        """Reject retired Sphinx dispatches before version and package publication."""
+        docs = next(
+            step for step in JOBS["validate-inputs"]["steps"] if step["name"] == "Check documentation publisher"
+        )
+        self.assertEqual(docs["if"], "inputs.publish-docs")
+        result = subprocess.run(["bash"], input=docs["run"], text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Publish Fern Docs", result.stdout)
+        self.assertIs(JOBS["finalize"]["with"]["publish-docs"], False)
 
 
 if __name__ == "__main__":

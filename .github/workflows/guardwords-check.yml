@@ -1,0 +1,50 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from NVIDIA-NeMo/Gym under Apache-2.0.
+# https://github.com/NVIDIA-NeMo/Gym/blob/e58425147cf1729131f8cf3f16dad5fe266944dd/.github/workflows/guardwords-check.yml
+# SPDX-License-Identifier: Apache-2.0
+name: Guardwords check
+
+on:
+  push:
+    branches: ["pull-request/[0-9]+"]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-info:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      pr-number: ${{ steps.verify.outputs.number }}
+      base-sha: ${{ steps.verify.outputs.base }}
+    steps:
+      - name: Verify the approved PR mirror
+        id: verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^pull-request/([1-9][0-9]*)$ ]]
+          number=${BASH_REMATCH[1]}
+          refs=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '[.base.sha, .head.sha] | @tsv')
+          IFS=$'\t' read -r base head <<< "$refs"
+          if [[ ! "$base" =~ ^[0-9a-f]{40}$ || "$head" != "$GITHUB_SHA" ]]; then
+            echo "::error::The mirror does not match the current PR head and base."
+            exit 1
+          fi
+          printf 'number=%s\nbase=%s\n' "$number" "$base" | tee -a "$GITHUB_OUTPUT"
+
+  guardwords-check:
+    needs: pr-info
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_guardwords_check.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
+    with:
+      base-sha: ${{ needs.pr-info.outputs.base-sha }}
+      head-sha: ${{ github.sha }}
+      pr-number: ${{ fromJSON(needs.pr-info.outputs.pr-number) }}
+    secrets:
+      GUARDWORDS_DEPLOY_KEY: ${{ secrets.GUARDWORDS_DEPLOY_KEY }}

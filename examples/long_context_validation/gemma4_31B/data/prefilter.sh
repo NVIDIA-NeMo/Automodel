@@ -32,6 +32,8 @@ MODEL="${MODEL:?Set MODEL to the Gemma4 checkpoint dir, e.g. /path/to/hf_gemma4_
 DATASET="${DATASET:-togethercomputer/CoderForge-Preview}"
 NAME="${NAME:-trajectories}"
 SPLIT="${SPLIT:-filtered_reward1}"
+# The training chat template, so n_tokens is measured on the exact training render.
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-${SCRIPT_DIR}/../gemma4_coderforge_chat_template.jinja}"
 CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/cached}"
 
 CMD=(python "${SCRIPT_DIR}/prefilter_dataset.py"
@@ -39,6 +41,7 @@ CMD=(python "${SCRIPT_DIR}/prefilter_dataset.py"
     --name "${NAME}"
     --split "${SPLIT}"
     --model "${MODEL}"
+    --chat_template "${CHAT_TEMPLATE}"
     --cache_dir "${CACHE_DIR}")
 
 # SEQ_LENGTH is optional: omit it to only run the coverage analysis.

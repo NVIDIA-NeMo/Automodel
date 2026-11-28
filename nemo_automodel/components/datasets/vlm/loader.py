@@ -30,8 +30,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.stateful import Stateful
-from transformers import AutoProcessor, ProcessorMixin
+from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 
+from nemo_automodel._transformers.tokenization.tool_call_arguments import wrap_tokenizer_for_model
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
 from nemo_automodel.components.datasets.packing import (
@@ -220,6 +221,20 @@ class VlmProcessorConfig:
         Returns:
             Processor instance, or ``None`` when the model has no compatible AutoProcessor.
         """
+        processor = self._load(pretrained_model_name_or_path)
+        tokenizer = getattr(processor, "tokenizer", None) if isinstance(processor, ProcessorMixin) else processor
+        if isinstance(tokenizer, PreTrainedTokenizerBase):
+            # The processor's tokenizer skips NeMoAutoTokenizer's registry, so apply its tool-call argument
+            # decoding here (templates such as Gemma4's raise on JSON-string arguments).
+            wrap_tokenizer_for_model(
+                tokenizer,
+                self.kwargs.get("pretrained_model_name_or_path", pretrained_model_name_or_path),
+                trust_remote_code=bool(self.kwargs.get("trust_remote_code", False)),
+            )
+        return processor
+
+    def _load(self, pretrained_model_name_or_path: str) -> ProcessorMixin | None:
+        """Load the processor from the configured factory or ``AutoProcessor``."""
         kwargs = dict(self.kwargs)
         if self.video_processor is not None:
             kwargs["video_processor"] = self.video_processor.build(

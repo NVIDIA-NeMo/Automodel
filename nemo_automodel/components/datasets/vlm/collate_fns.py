@@ -2327,9 +2327,15 @@ def gemma4_inject_thinking_prefix(
     Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
     channel prefix before the actual response.  When this prefix is absent from
     training sequences the model predicts ``<|channel>`` but the label says
-    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
-    as -100 in labels) lets the model see its expected pattern and brings
-    initial loss down to ~3.
+    answer text, inflating initial loss to ~9.  Injecting the prefix lets the
+    model see its expected pattern and brings initial loss down to ~3.
+
+    The injected tokens are supervised when labels are built from the turn
+    markers: ``build_labels_from_template`` labels everything after
+    ``<|turn>model\\n``, so the four prefix tokens of every model turn count
+    toward the loss.  With a generation-keyword template they are not
+    supervised, because their ``assistant_masks`` entries are 0.  The generation
+    prompt at evaluation already ends with the prefix.
 
     Safe no-op for non-Gemma4 tokenizers.
     """
@@ -2394,10 +2400,9 @@ def gemma4_prefix_collate_fn(
     """Collate function for Gemma4 models with thinking-channel prefix.
 
     Wraps ``default_collate_fn`` and injects ``<|channel>thought\\n<channel|>``
-    after every ``<|turn>model\\n`` marker before labels are built.  The injected
-    tokens are automatically masked to -100 by ``build_labels_from_template``
-    (which only unmasks tokens inside assistant turns), so the model sees its
-    expected thinking prefix without being penalised for it.
+    after every ``<|turn>model\\n`` marker before labels are built.  The model
+    then sees its expected thinking prefix.  The injected tokens are supervised
+    like the answer that follows them; see :func:`gemma4_inject_thinking_prefix`.
     """
 
     def _inject(batch, proc):

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 name: Build container
+description: Build and publish a container from public dependencies at the verified revision
 
 inputs:
   container-registry:
@@ -22,47 +23,62 @@ inputs:
     description: "Path to dockerfile to build"
     required: true
   PAT:
-    description: "GitHub Personal Access Token"
-    required: true
+    description: "Deprecated legacy input"
+    deprecationMessage: "Remove the PAT input. This action builds with public dependencies."
+    required: false
   repo-name:
     description: "The name of the repo to build container"
     required: true
-    type: string
 
 runs:
   using: "composite"
   steps:
-    - name: Get PR info
-      id: get-pr-info
-      if: startsWith(github.ref, 'refs/heads/pull-request/')
-      uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
-
-    - name: Get merge commit sha
-      shell: bash -x -e -u -o pipefail {0}
-      id: sha
-      env:
-        IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+    - name: Install GH CLI
+      shell: bash
       run: |
-        if [[ "$IS_PR" == "true" ]]; then
-          SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
-        else
-          SHA=${GITHUB_SHA}
+        if command -v gh >/dev/null; then exit 0; fi
+        for i in 1 2 3; do
+          if apt-get update && apt-get install -y gh; then exit 0; fi
+          if [[ "$i" != 3 ]]; then sleep 10; fi
+        done
+        exit 1
+
+    - name: Resolve verified container revision
+      id: revision
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        sha=$GITHUB_SHA
+        pr_number=""
+        base=""
+        if [[ "$GITHUB_REF" == refs/heads/pull-request/* ]]; then
+          if ! [[ "$GITHUB_REF" =~ ^refs/heads/pull-request/([1-9][0-9]*)$ ]]; then
+            echo "::error::Invalid PR mirror branch."
+            exit 1
+          fi
+          pr_number=${BASH_REMATCH[1]}
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" \
+            --jq '[.state, .head.sha, .base.sha, .merge_commit_sha] | @tsv')
+          read -r state head base sha <<< "$pr"
+          if [[ "$state" != open || "$head" != "$GITHUB_SHA" || ! "$sha" =~ ^[0-9a-f]{40}$ || ! "$base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The PR mirror is stale or the current test merge is unavailable."
+            exit 1
+          fi
+          parents=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$sha" --jq '[.parents[].sha] | join(" ")')
+          if [[ "$parents" != "$base $GITHUB_SHA" ]]; then
+            echo "::error::Test merge parents do not match the current base and vetted PR head."
+            exit 1
+          fi
         fi
-        echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+        printf 'sha=%s\npr_number=%s\nbase=%s\n' "$sha" "$pr_number" "$base" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
-        ref: ${{ steps.sha.outputs.main }}
-
-    - name: Install GH CLI
-      shell: bash
-      run: |
-        for i in 1 2 3; do
-          apt-get update && apt-get install -y gh && break
-          echo "Attempt $i failed, retrying in 10s..."
-          sleep 10
-        done
+        ref: ${{ steps.revision.outputs.sha }}
+        persist-credentials: false
 
     - name: Normalize repo name to lowercase
       shell: bash
@@ -70,6 +86,10 @@ runs:
         REPO: ${{ inputs.repo-name }}
         REGISTRY: ${{ inputs.container-registry }}
       run: |
+        if [[ "$REPO$REGISTRY" == *$'\n'* || "$REPO$REGISTRY" == *$'\r'* ]]; then
+          echo "::error::Repository and registry names must fit on one line."
+          exit 1
+        fi
         echo "REPO_LOWER=${REPO,,}" >> "$GITHUB_ENV"
         echo "container-registry=${REGISTRY}" >> "$GITHUB_ENV"
 
@@ -78,10 +98,13 @@ runs:
       id: cache_from
       env:
         GH_TOKEN: ${{ github.token }}
+        REPO_NAME: ${{ inputs.repo-name }}
+        REGISTRY: ${{ inputs.container-registry }}
       run: |
+        # shellcheck disable=SC2016
         LAST_PRS=$(gh api graphql \
           -F owner="NVIDIA-NeMo" \
-          -F name=${{ inputs.repo-name }} \
+          -f name="$REPO_NAME" \
           -f query='
             query($owner: String!, $name: String!) {
               repository(owner: $owner, name: $name) {
@@ -92,12 +115,12 @@ runs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-            echo "type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:$number-buildcache,mode=max"
+            echo "type=registry,ref=$REGISTRY/$REPO_LOWER:$number-buildcache,mode=max"
           done)
 
-        echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
-        echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
-        echo "EOF" | tee -a $GITHUB_OUTPUT
+        echo "LAST_PRS<<EOF" | tee -a "$GITHUB_OUTPUT"
+        echo "$LAST_PRS" | tee -a "$GITHUB_OUTPUT"
+        echo "EOF" | tee -a "$GITHUB_OUTPUT"
 
     - name: Set up Docker Buildx
       id: setup-buildx
@@ -144,14 +167,12 @@ runs:
         build-args: |
           BASE_IMAGE=pytorch
         cache-from: |
-          type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ steps.revision.outputs.pr_number || '0' }}-buildcache,mode=max
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max
           ${{ steps.cache_from.outputs.LAST_PRS }}
         cache-to: |
-          type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ steps.revision.outputs.pr_number || '0' }}-buildcache,mode=max
         no-cache: false
         tags: |
-          ${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          ${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ steps.revision.outputs.pr_number || '0' }}
           ${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ github.sha }}
-        secrets: |
-          GH_TOKEN=${{ inputs.PAT }}
