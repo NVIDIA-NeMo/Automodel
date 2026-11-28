@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Refer to README.md for the text-stage starting checkpoint and data preparation.
+# Fine-tune the released checkpoint on your data. Refer to README.md for preparation.
 recipe: TrainCrossEncoderRecipe
 seed: 42
 temperature: 0.02
@@ -23,7 +23,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
-  pretrained_model_name_or_path: &model_id <path/to/text-trained-rerank-8b>
+  pretrained_model_name_or_path: &model_id nvidia/Nemotron-3.5-Rerank-8B-BF16
   num_labels: 1
   pooling: avg
   is_causal: false
@@ -38,7 +38,7 @@ model:
   use_liger_kernel: true
   use_sdpa_patching: true
 
-# Full-model multimodal training, following the representative cross-encoder config.
+# Fine-tune both towers and the scoring head.
 freeze_config:
   freeze_vision_tower: false
   freeze_language_model: false

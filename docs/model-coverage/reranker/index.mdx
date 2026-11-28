@@ -1,46 +1,45 @@
 ---
 title: "Reranking Models"
-description: "Reranking model coverage in NeMo AutoModel, including optimized Llama and Qwen3 backbones, Hugging Face Auto fallback, and supported workflows."
+description: "Browse released reranking models by publisher and find fine-tuning resources in NeMo AutoModel."
 position: 1
 ---
 
-## Introduction
-
-Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and a causal Qwen3 reranker that scores with a yes or no decision at the final token, and falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
-
-For first-stage dense retrieval, see [Embedding Models](/model-coverage/embedding-models/overview).
-
-## Optimized Backbones
-
-| Owner | Model | Architecture | Wrapper Class | Tasks |
-|---|---|---|---|---|
-| NVIDIA | [llama-nemotron-rerank-1b-v2](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
-| Qwen | [Qwen3-Reranker-4B](/model-coverage/reranking-models/qwen/Qwen3-Reranker-4B) | `Qwen3RerankerForCausalReranking` | `NeMoAutoModelCrossEncoder` | Reranking |
-
-The Llama backbones convert to bidirectional attention. `Qwen3RerankerForCausalReranking` stays causal: it reuses the pretrained `lm_head` and scores a pair as `logit("yes") - logit("no")` at the final non-padding token, adding no parameters. Its checkpoints serialize as a plain `Qwen3ForCausalLM`, so they load in stock Transformers and vLLM without custom code.
-
-## Hugging Face Auto Backbones
-
-Unregistered scoring architectures load through Hugging Face `AutoModelForSequenceClassification`. An explicit `model.is_causal` value overrides a saved text-config value. Without either setting, the fallback preserves the backbone's native attention mode. Verify that an unregistered architecture honors the selected policy before using it for retrieval training.
-
-Composite backbones must identify their text tower through matching `get_text_config(decoder=True)` and `get_decoder()` results. Only that tower's attention policy is changed.
+Reranking models score a query and document together to reorder candidates from a retriever.
+Fine-tune a released reranker to adapt its relevance scores to your data. For first-stage
+candidate retrieval, refer to [Embedding Models](/model-coverage/embedding-models/overview).
 
 ## Supported Models
 
-This table combines recipe-backed checkpoints with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for recipe-backed checkpoints of every model type.
+Choose a released checkpoint by publisher. Each page describes the model and available fine-tuning resources.
+
+| Publisher | Reranking Model | Inputs |
+| --- | --- | --- |
+| NVIDIA | [llama-nemotron-rerank-1b-v2](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2) | Text query-document pairs |
+| NVIDIA | [Nemotron-3.5-Rerank](/model-coverage/reranking-models/nvidia/Nemotron-3.5-Rerank) | Text queries; text, image, or combined documents |
+| Qwen | [Qwen3-Reranker-4B](/model-coverage/reranking-models/qwen/Qwen3-Reranker-4B) | Text query-document pairs |
+
+## Fine-Tune a Reranker
+
+Follow the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune)
+for data preparation, configuration, training, and checkpoint export. Use the selected model's
+tokenizer and input formatting, including its scoring head or yes/no scoring behavior.
+
+The [Qwen3-Reranker-4B example](/model-coverage/reranking-models/qwen/Qwen3-Reranker-4B)
+loads the released checkpoint directly. For multimodal documents, refer to the
+[Nemotron 3.5 Rerank example](/model-coverage/reranking-models/nvidia/Nemotron-3.5-Rerank).
+
+## Train from a Base Model
+
+To create a custom reranker from Llama or Ministral weights, follow
+[Train Retrieval Models from Base Checkpoints](/recipes-e2e-examples/retrieval-base-models).
+These examples initialize a scoring model from a language or vision-language checkpoint.
+They do not reproduce a named, released reranker.
+
+## Recipe Checkpoints and References
+
+This table lists recipe starting checkpoints and documented retrieval models. Dates show when a
+checkpoint first appeared in a recipe or its reference page was added. Refer to the
+[combined model support log](/model-coverage/release-log) for all model types.
 
 {/* BEGIN GENERATED MODEL SUPPORT LOG */}
 {/* END GENERATED MODEL SUPPORT LOG */}
-
-## Supported Workflows
-
-- **Fine-tuning (Cross-Encoder):** Cross-entropy training on query-document pairs to produce rerankers
-- **LoRA and PEFT:** Parameter-efficient fine-tuning for reranking backbones
-
-## Dataset
-
-Retrieval fine-tuning requires query-document pairs: each example is a query paired with one positive document and one or more negative documents. Both inline JSONL and corpus ID-based JSON formats are supported. See the [Retrieval Dataset](/datasets/retrieval-dataset) guide.
-
-## Train Reranking Models
-
-For a complete walkthrough of training configuration, model-specific settings, and launch commands, see the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune).

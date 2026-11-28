@@ -1,61 +1,58 @@
 ---
 title: "Embedding Models"
-description: "Overview of NeMo AutoModel embedding models, including bidirectional Llama and Ministral3 backbones, Hugging Face AutoModel fallback, and bi-encoder recipes."
+description: "Browse released embedding models by publisher and find fine-tuning resources in NeMo AutoModel."
 position: 1
 ---
 
-## Introduction
-
-Text embedding models transform text into dense vector representations that power semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification tasks. NeMo AutoModel includes custom bidirectional backbones and configures supported Hugging Face `AutoModel` backbones with non-causal attention for retrieval training.
-
-For cross-encoder pairwise scoring, see [Reranking Models](/model-coverage/reranking-models/overview).
-
-Embedding models use bi-encoders to produce dense representations for queries and documents independently. They are the standard path for embedding generation and first-stage dense retrieval.
-
-### Optimized Backbones
-
-| Owner | Model | Architecture | Auto Class | Tasks |
-|---|---|---|---|---|
-| NVIDIA | [Llama (Bidirectional)](/model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
-| NVIDIA | [Llama Nemotron VL](/model-coverage/embedding-models/nvidia/llama-nemotron-embed-vl-1b-v2) | `LlamaNemotronVLModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
-| Mistral AI | [Ministral3](/model-coverage/embedding-models/mistralai/Ministral-3-3B-Base-2512) | `Ministral3Model` with configurable attention | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
-
-The stock `ministral3` path is preferred. The `ministral3_bidirec` model type remains available for compatibility with legacy checkpoints and resolves to the custom `Ministral3BidirectionalModel`.
-
-### Hugging Face Auto Backbones
-
-Unregistered text architectures load through Hugging Face `AutoModel`. The fallback path applies `model.is_causal`, restores a saved text-config value when the option is omitted, and otherwise defaults to bidirectional attention. Verify that an unregistered architecture honors the selected policy before using it for retrieval training.
-
-Composite backbones must expose matching text configuration and decoder objects through `get_text_config(decoder=True)` and `get_decoder()`. Loading fails if these methods do not identify the same text tower. The attention policy changes only that tower, leaving vision attention unchanged.
-
-## Example Recipes
-
-| Recipe | Description |
-|---|---|
-| [Nemotron end-to-end text bi-encoder recipe](https://github.com/NVIDIA-NeMo/Nemotron/tree/main/docs/nemotron/embed) | Adapt an embedding model to your domain-specific data with a complete multi-stage pipeline, from synthetic data generation and data preparation to model fine-tuning, evaluation, export, and deployment. |
-| [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) | Llama-3.2-1B based text embedding model training recipe. |
-| [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) | [Llama-Embed-Nemotron-8B](https://huggingface.co/nvidia/llama-embed-nemotron-8b) text embedding model reproduction recipe. |
-| [ministral3_3b_instruct.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml) | Ministral3-3B based text embedding model training recipe. |
+Embedding models encode queries and documents independently into vectors for semantic search
+and first-stage retrieval. Fine-tune a released model to adapt these representations to your data.
+For joint query-document scoring, refer to [Reranking Models](/model-coverage/reranking-models/overview).
 
 ## Supported Models
 
-This table combines recipe-backed checkpoints with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for recipe-backed checkpoints of every model type.
+Choose a released checkpoint by publisher. Each page describes the model and available fine-tuning resources.
+
+| Publisher | Embedding Model | Inputs |
+| --- | --- | --- |
+| NVIDIA | [llama-embed-nemotron-8b](/model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b) | Text |
+| NVIDIA | [llama-nemotron-embed-vl-1b-v2](/model-coverage/embedding-models/nvidia/llama-nemotron-embed-vl-1b-v2) | Text and images |
+| NVIDIA | [Nemotron-3-Embed](/model-coverage/embedding-models/nvidia/Nemotron-3-Embed) | Text |
+| NVIDIA | [Nemotron-3.5-Embed](/model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed) | Text queries; text, image, or combined documents |
+
+## Fine-Tune an Embedding Model
+
+Follow the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune)
+for data preparation, configuration, training, and checkpoint export. Preserve the checkpoint's
+tokenizer, pooling, normalization, and query and document formatting when adapting a recipe.
+
+These resources cover additional workflows:
+
+- [Nemotron embedding recipe](https://github.com/NVIDIA-NeMo/Nemotron/tree/main/docs/nemotron/embed):
+  data preparation, fine-tuning, evaluation, and deployment from your document corpus.
+- [Nemotron 3 text distillation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/README.md):
+  continue training the released 1B student with an 8B teacher.
+- [Nemotron 3.5 multimodal examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/README.md):
+  fine-tune the released 8B embedding model's vision components.
+
+Choose a checked-in configuration for these released checkpoints:
+
+| Configuration | Fine-Tuning Workflow |
+| --- | --- |
+| [nemotron3_embed_1b_distill.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml) | Continue text distillation from Nemotron 3 Embed 8B into the released 1B student. |
+| [embed_8b_multimodal.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/embed_8b_multimodal.yaml) | Adapt Nemotron 3.5 Embed 8B vision components with a frozen language model. |
+
+## Train from a Base Model
+
+To create a custom embedding model from Llama or Ministral weights, follow
+[Train Retrieval Models from Base Checkpoints](/recipes-e2e-examples/retrieval-base-models).
+Base checkpoints are training inputs, rather than released embedding models.
+The guide also describes the retrieval backbones and attention settings.
+
+## Recipe Checkpoints and References
+
+This table lists recipe starting checkpoints and documented retrieval models. Dates show when a
+checkpoint first appeared in a recipe or its reference page was added. Refer to the
+[combined model support log](/model-coverage/release-log) for all model types.
 
 {/* BEGIN GENERATED MODEL SUPPORT LOG */}
 {/* END GENERATED MODEL SUPPORT LOG */}
-
-## Supported Workflows
-
-- **Fine-tuning (Bi-Encoder):** Contrastive learning on query-document pairs to produce embedding models
-- **LoRA/PEFT:** Parameter-efficient fine-tuning for embedding backbones
-- **ONNX Export:** Export trained embedding models for deployment (case-by-case, model-dependent)
-
-## Dataset
-
-Retrieval fine-tuning requires query-document pairs: each example is a query paired with one positive document and one or more negative documents. Both inline JSONL and corpus ID-based JSON formats are supported. See the [Retrieval Dataset](/datasets/retrieval-dataset) guide.
-
-## Train Embedding Models
-
-For a complete walkthrough of training configuration, model-specific settings, and launch commands, see the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune).
-
-For a hands-on notebook walkthrough of dataset preparation, Ministral-3-3B recipe configuration, training dynamics, and similarity evaluation, see [Text Embedding Model Fine-Tuning with NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/embedding-biencoder/finetune.ipynb).
