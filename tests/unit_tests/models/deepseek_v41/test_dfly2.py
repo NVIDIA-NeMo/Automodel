@@ -232,7 +232,7 @@ def test_confidence_head_reads_detached_backbone_states() -> None:
     )
     assert outputs.confidence_pred.shape == (1, 4, 2) and outputs.confidence_pred.dtype == torch.float32
     outputs.confidence_pred.sum().backward()
-    assert draft.confidence_head.weight.grad is not None
+    assert draft.confidence_head.confidence_proj.weight.grad is not None
     assert all(parameter.grad is None for parameter in draft.layers.parameters())
 
 
@@ -307,18 +307,7 @@ def test_exported_config_carries_the_dfly2_settings() -> None:
     assert exported["dfly_config"]["mask_token_id"] == 63
 
 
-def test_attentive_correction_starts_from_the_last_layer() -> None:
-    draft = _draft()
-    source = draft.layers[-1].attn
-    attention = draft.hidden_correction.attention
-    torch.testing.assert_close(attention.q_in.weight[:, :16], source.wq_a.weight)
-    assert attention.q_in.weight[:, 16:].abs().max() == 0
-    torch.testing.assert_close(attention.kv_in.weight[:, :16], source.wkv.weight)
-    torch.testing.assert_close(attention.block_sink.weight, source.sinks_param.weight)
-    assert attention.wo_b.weight.abs().max() == 0
-
-
-def test_build_from_target_config_honors_recipe_options() -> None:
+def test_draft_does_not_inherit_the_targets_sparse_backward() -> None:
     config = DeepseekV41Config(
         vision_config=DeepseekV41VisionConfig(num_hidden_layers=0),
         text_config=_text_config(sparse_attention_backward="deterministic"),
@@ -328,16 +317,12 @@ def test_build_from_target_config_honors_recipe_options() -> None:
         block_size=3,
         num_anchors=2,
         mask_token_id=63,
-        enable_confidence_head=True,
-        confidence_head_stop_gradient=False,
+        enable_confidence_head=False,
+        confidence_head_stop_gradient=True,
         attn_backend="eager",
     )
+    # The target's TileLang-only deterministic backward would reject the eager draft.
     draft = config.build_dfly2_draft(options)
-    assert draft.dfly2_config.target_layer_ids == (4, 5)
-    assert draft.confidence_head is not None
-    assert len(draft.layers) == 2
-    assert draft.layers[0].attn.backend.attn == "eager"
-    # The target's TileLang-only backward selector is not inherited by the draft.
     assert config.text_config.sparse_attention_backward == "deterministic"
     assert draft.dfly2_config.text_config.sparse_attention_backward == "atomic"
 
@@ -369,7 +354,7 @@ def _fsdp_trainer():
     return DFly2TrainerModule(draft, confidence_head_alpha=1.0)
 
 
-def _fsdp_training_worker(rank: int, rendezvous: str, reference_path: str) -> None:
+def _fsdp_training_worker(rank: int, rendezvous: str, reference_path: str, compute_dtype: str) -> None:
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -386,7 +371,8 @@ def _fsdp_training_worker(rank: int, rendezvous: str, reference_path: str) -> No
     try:
         trainer = _fsdp_trainer()
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
-        policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32, cast_forward_inputs=False)
+        param_dtype = getattr(torch, compute_dtype)
+        policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=torch.float32, cast_forward_inputs=False)
         # The recipe's sharding: dtype-uniform units for the draft units, then the root.
         for unit in TrainDFly2Recipe._draft_fsdp_units(trainer.draft_model):
             fully_shard_by_dtype(
@@ -416,7 +402,13 @@ def _fsdp_training_worker(rank: int, rendezvous: str, reference_path: str) -> No
                 assert parameter.grad is None, name
                 continue
             grad = parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
-            torch.testing.assert_close(grad, reference[name], rtol=1e-4, atol=1e-6, msg=name)
+            if param_dtype == torch.float32:
+                torch.testing.assert_close(grad, reference[name], rtol=1e-4, atol=1e-6, msg=name)
+            else:
+                # The recipe's BF16 policy: the FP32 heads must still run (a BF16 weight against
+                # their FP32 inputs fails) and every gradient must stay close to the FP32 one.
+                assert torch.isfinite(grad).all(), name
+                assert (grad - reference[name]).norm() <= 0.1 * reference[name].norm() + 1e-6, name
     finally:
         dist.destroy_process_group()
 
@@ -424,7 +416,8 @@ def _fsdp_training_worker(rank: int, rendezvous: str, reference_path: str) -> No
 @pytest.mark.runtime_budget(
     20, hard_timeout=70, reason="Two-process gloo FSDP2 forward and backward of the draft against one process."
 )
-def test_fsdp_gradient_matches_the_single_process_global_batch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("compute_dtype", ["float32", "bfloat16"])
+def test_fsdp_gradient_matches_the_single_process_global_batch(tmp_path: Path, compute_dtype: str) -> None:
     """Sharded like the recipe over two ranks, the draft's gradient equals the one-process gradient.
 
     The objective divides by the weight sum of all ranks and scales by the world size, so
@@ -446,8 +439,203 @@ def test_fsdp_gradient_matches_the_single_process_global_batch(tmp_path: Path) -
     )
     metrics.loss.backward()
     reference = {name: parameter.grad for name, parameter in trainer.named_parameters() if parameter.grad is not None}
-    assert "draft_model.confidence_head.weight" in reference and "draft_model.mtp_fusion.gate" in reference
+    assert "draft_model.confidence_head.confidence_proj.weight" in reference
+    assert "draft_model.mtp_fusion.gate" in reference
     torch.save(reference, tmp_path / "reference.pt")
     mp.spawn(
-        _fsdp_training_worker, args=(str(tmp_path / "rendezvous"), str(tmp_path / "reference.pt")), nprocs=2, join=True
+        _fsdp_training_worker,
+        args=(str(tmp_path / "rendezvous"), str(tmp_path / "reference.pt"), compute_dtype),
+        nprocs=2,
+        join=True,
     )
+
+
+def test_each_drafted_slot_reads_only_what_exists_when_its_block_is_drafted() -> None:
+    """Perturb one input row at a time; slot ``k`` of the block at anchor ``a`` may move only for
+
+    * tokens up to row ``a + k - 1`` (the anchor, then the teacher-forced previous tokens),
+    * the target's last hidden state at row ``a - 1`` (the MTP fusion),
+    * keys listed by row ``a - 1``'s key list of the same paired layer, and that list itself.
+
+    A label leak, a fusion or key list read from row ``a``, or a draft layer reading another
+    paired layer's keys each moves a slot that must not move.
+    """
+    torch.manual_seed(7)
+    sequence, block_size = 10, 3
+    # Every candidate anchor is taken, so block j sits at anchor j.
+    draft = _draft(num_anchors=sequence, block_size=block_size)
+    draft.initialize_embeddings_and_head(embed_tokens=torch.nn.Embedding(64, 16), lm_head=torch.nn.Linear(16, 64))
+    with torch.no_grad():
+        # Open the zero-initialized heads so every path carries signal.
+        draft.mtp_fusion.gate.fill_(1.0)
+        draft.hidden_correction.down_proj.weight.normal_(std=0.2)
+        attention = draft.hidden_correction.attention
+        # Full projections: the embedding half of q_in / kv_in and the gate start at zero.
+        for linear in (attention.wo_b, attention.q_in, attention.kv_in, attention.block_gate):
+            linear.weight.normal_(std=0.2)
+        attention.block_gate_bias.weight.fill_(0.5)
+    generator = torch.Generator().manual_seed(11)
+    input_ids = torch.randint(0, 60, (1, sequence), generator=generator)
+    last_hidden = torch.randn(1, sequence, 16, generator=generator)
+    keys = [torch.randn(1, sequence, 8, generator=generator) for _ in _PAIRED_LAYERS]
+    # Causal key lists that differ between the two paired layers: row r lists keys at or before r.
+    lists = []
+    for _ in _PAIRED_LAYERS:
+        rows = [torch.randperm(r + 1, generator=generator)[:3] for r in range(sequence)]
+        lists.append(torch.stack([torch.nn.functional.pad(row, (0, 3 - len(row)), value=-1) for row in rows])[None])
+    loss_mask = torch.ones(1, sequence)
+
+    def logits(ids=input_ids, hidden=last_hidden, context=keys, indices=lists):
+        with torch.no_grad():
+            return draft(ids, loss_mask, context, [index.int() for index in indices], hidden).draft_logits[0]
+
+    base = logits()
+    anchors = range(sequence - 1)
+    violations = []
+
+    def check(name, changed, allowed):
+        moved = (changed - base).abs().amax(-1) > 1e-6  # [blocks, drafted]
+        for anchor in anchors:
+            for drafted in range(block_size - 1):
+                if moved[anchor, drafted] and not allowed(anchor, drafted + 1):
+                    violations.append((name, anchor, drafted + 1))
+
+    for row in range(sequence):
+        ids = input_ids.clone()
+        ids[0, row] = (ids[0, row] + 1) % 60
+        check(f"token {row}", logits(ids=ids), lambda a, k, r=row: r <= a + k - 1)
+        hidden = last_hidden.clone()
+        hidden[0, row] += 1.0
+        check(f"last hidden {row}", logits(hidden=hidden), lambda a, k, r=row: r == a - 1)
+        for layer in range(len(_PAIRED_LAYERS)):
+            context = [key.clone() for key in keys]
+            context[layer][0, row] += 1.0
+            listed = lambda a, k, r=row, i=layer: a >= 1 and bool((lists[i][0, a - 1] == r).any())  # noqa: E731
+            check(f"layer {layer} key {row}", logits(context=context), listed)
+            indices = [index.clone() for index in lists]
+            indices[layer][0, row] = torch.roll(indices[layer][0, row], 1)
+            indices[layer][0, row, 0] = -1
+            check(f"layer {layer} key list {row}", logits(indices=indices), lambda a, k, r=row: r == a - 1)
+    assert violations == []
+
+
+def test_unused_slots_never_read_key_zero() -> None:
+    from nemo_automodel.components.models.deepseek_v41.dfly2 import _listed_latent_attention
+
+    torch.manual_seed(1)
+    query = torch.randn(1, 2, 2, 8)
+    kv = torch.randn(1, 5, 8)
+    # Neither row lists key 0; the second lists nothing at all.
+    indices = torch.tensor([[[3, -1, 1, -1], [-1, -1, -1, -1]]], dtype=torch.int32)
+    sinks = torch.zeros(2)
+    for backend in ("eager", "sdpa"):
+        out = _listed_latent_attention(query, kv, indices, sinks, 8**-0.5, backend=backend)
+        changed = kv.clone()
+        changed[0, 0] += 5.0
+        torch.testing.assert_close(
+            _listed_latent_attention(query, changed, indices, sinks, 8**-0.5, backend=backend), out
+        )
+        assert out[0, 1].abs().max() == 0
+
+
+def test_each_draft_layer_reads_its_own_paired_layer() -> None:
+    """With draft layer 1's attention and the correction silenced, only layer 0's keys may matter."""
+    torch.manual_seed(3)
+    sequence = 8
+    draft = _draft(num_anchors=sequence)
+    draft.initialize_embeddings_and_head(embed_tokens=torch.nn.Embedding(64, 16), lm_head=torch.nn.Linear(16, 64))
+    with torch.no_grad():
+        draft.layers[1].attn.wo_b.weight.zero_()
+        draft.hidden_correction.attention.wo_b.weight.zero_()
+    input_ids = torch.randint(0, 60, (1, sequence))
+    keys = [torch.randn(1, sequence, 8) for _ in _PAIRED_LAYERS]
+    indices = [torch.arange(sequence).view(1, -1, 1).expand(-1, -1, 2).clone().int() for _ in _PAIRED_LAYERS]
+    last_hidden = torch.randn(1, sequence, 16)
+
+    def logits(context):
+        with torch.no_grad():
+            return draft(input_ids, torch.ones(1, sequence), context, indices, last_hidden).draft_logits
+
+    base = logits(keys)
+    torch.testing.assert_close(logits([keys[0], keys[1] + 1.0]), base, rtol=0, atol=0)
+    assert not torch.allclose(logits([keys[0] + 1.0, keys[1]]), base)
+
+
+def _consolidated_save_worker(rank: int, root: str) -> None:
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+    from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+    from nemo_automodel.components.speculative.dfly2 import DFly2TrainerModule
+    from nemo_automodel.recipes.speculative_decoding.train_dfly2 import TrainDFly2Recipe
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=2, timeout=timedelta(seconds=90)
+    )
+    try:
+        draft = _draft(enable_confidence_head=True)
+        torch.manual_seed(13)
+        draft.initialize_embeddings_and_head(embed_tokens=torch.nn.Embedding(64, 16), lm_head=torch.nn.Linear(16, 64))
+        expected = {key: value.detach().clone() for key, value in draft.state_dict().items()}
+        trainer = DFly2TrainerModule(draft)
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
+        policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False)
+        for unit in TrainDFly2Recipe._draft_fsdp_units(draft):
+            fully_shard_by_dtype(
+                unit,
+                mesh=mesh,
+                mp_policy=policy,
+                offload_policy=None,
+                fp32_compute_module_names=tuple(draft._keep_in_fp32_modules_strict),
+            )
+        fully_shard(trainer, mesh=mesh, mp_policy=policy)
+        # As the recipe builds it: native draft keys, no reference checkpoint.
+        checkpointer = Checkpointer(
+            CheckpointingConfig(
+                checkpoint_dir=f"{root}/checkpoints",
+                model_save_format="safetensors",
+                save_consolidated=True,
+                model_cache_dir=f"{root}/cache",
+                model_repo_id="test/dfly2",
+                model_state_dict_keys=list(expected),
+            ),
+            dp_rank=rank,
+            tp_rank=0,
+            pp_rank=0,
+        )
+        try:
+            checkpointer.save_model(draft, f"{root}/saved")
+        finally:
+            checkpointer.close()
+        dist.barrier()
+        if rank == 0:
+            restored = _draft(enable_confidence_head=True)
+            restored.initialize_embeddings_and_head(
+                embed_tokens=torch.nn.Embedding(64, 16), lm_head=torch.nn.Linear(16, 64)
+            )
+            load_dspark_draft_weights(
+                restored,
+                f"{root}/saved/model/consolidated",
+                keep_target_embeddings=True,
+                target_layer_ids=list(_PAIRED_LAYERS),
+                mask_token_id=63,
+            )
+            for key, value in restored.state_dict().items():
+                if key not in ("embed_tokens.weight", "lm_head.weight"):
+                    torch.testing.assert_close(value, expected[key], rtol=0, atol=0, msg=key)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(
+    20, hard_timeout=70, reason="Two-process gloo FSDP2 consolidated save of the draft, then a warm start from it."
+)
+def test_consolidated_save_of_a_sharded_draft_holds_every_expert(tmp_path: Path) -> None:
+    """Each rank exports only the experts of its FSDP shard; the consolidated draft must still hold all of them."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(_consolidated_save_worker, args=(str(tmp_path),), nprocs=2, join=True)

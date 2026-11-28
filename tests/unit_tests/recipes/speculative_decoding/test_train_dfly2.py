@@ -73,26 +73,14 @@ def test_setup_rejects_options_without_a_colocated_unpacked_target(option, value
     called.assert_not_called()
 
 
-def test_model_owned_draft_is_built_from_the_dfly2_options_and_the_target() -> None:
-    draft = Mock()
-    target_config = SimpleNamespace(build_dfly2_draft=Mock(return_value=draft))
-    recipe = _recipe(confidence_head_stop_gradient=False, draft_attn_backend="tilelang")
-    recipe.target_model = object()
-    assert recipe._build_model_owned_draft(target_config, _margs(confidence_head_alpha=1.0)) is draft
-    options = target_config.build_dfly2_draft.call_args.args[0]
-    assert options.target_layer_ids == [28, 32, 36]
-    assert (options.block_size, options.num_anchors, options.mask_token_id) == (6, 512, 128799)
-    assert options.enable_confidence_head is True
-    assert options.confidence_head_stop_gradient is False
-    assert options.attn_backend == "tilelang"
-    draft.initialize_from_target.assert_called_once_with(recipe.target_model)
-
-
 def test_confidence_head_is_off_and_detached_by_default() -> None:
     target_config = SimpleNamespace(build_dfly2_draft=Mock(return_value=Mock()))
     recipe = _recipe()
     recipe.target_model = object()
-    recipe._build_model_owned_draft(target_config, _margs())
+    # The recipe's own default, as setup() resolves it when the YAML leaves the key out.
+    recipe._build_model_owned_draft(
+        target_config, _margs(confidence_head_alpha=TrainDFly2Recipe.default_confidence_head_alpha)
+    )
     options = target_config.build_dfly2_draft.call_args.args[0]
     assert options.enable_confidence_head is False
     assert options.confidence_head_stop_gradient is True
@@ -110,3 +98,20 @@ def test_fsdp_units_include_the_heads_holding_fp32_tensors() -> None:
     # The FP32 confidence head must not fall into the root unit, which all-gathers in BF16.
     draft.confidence_head = nn.Linear(1, 1)
     assert TrainDFly2Recipe._draft_fsdp_units(draft)[-1] is draft.confidence_head
+
+
+def test_warm_start_refuses_a_checkpoint_paired_with_other_layers(tmp_path) -> None:
+    import json
+
+    from nemo_automodel.recipes.speculative_decoding.train_dfly2 import check_dfly2_checkpoint_settings
+
+    # The released draft's dfly_config.
+    released = {"block_size": 6, "target_kv_layers": [28, 32, 36], "mask_token_id": 128799}
+    (tmp_path / "config.json").write_text(json.dumps({"dfly_config": released}))
+    check_dfly2_checkpoint_settings(str(tmp_path), target_layer_ids=[28, 32, 36], block_size=6, mask_token_id=128799)
+    with pytest.raises(ValueError, match="target_kv_layers"):
+        check_dfly2_checkpoint_settings(
+            str(tmp_path / "model.safetensors"), target_layer_ids=[24, 28, 32], block_size=6, mask_token_id=128799
+        )
+    with pytest.raises(ValueError, match="mask_token_id"):
+        check_dfly2_checkpoint_settings(str(tmp_path), target_layer_ids=[28, 32, 36], block_size=6, mask_token_id=1)

@@ -23,7 +23,6 @@ import torch.nn as nn
 from nemo_automodel.components.speculative.dfly2.common import (
     KEY_LIST_ALIGNMENT,
     build_block_key_indices,
-    context_key_indices,
 )
 from nemo_automodel.components.speculative.dfly2.core import DFly2TrainerModule
 from nemo_automodel.components.speculative.dfly2.loss import compute_dfly2_loss
@@ -74,11 +73,6 @@ def test_dropped_blocks_and_sequence_start_anchors_read_nothing_from_the_context
     assert (indices[0, 2:] == -1).all()
 
 
-def test_context_key_indices_masks_only_the_draft_keys() -> None:
-    indices = torch.tensor([[[3, -1, 20, 21]]], dtype=torch.int32)
-    assert context_key_indices(indices, 20).tolist() == [[[3, -1, -1, -1]]]
-
-
 def _outputs(draft_logits: torch.Tensor, target_logits: torch.Tensor, eval_mask: torch.Tensor, confidence=None):
     batch, blocks, drafted, _ = draft_logits.shape
     return DSparkForwardOutput(
@@ -92,14 +86,14 @@ def _outputs(draft_logits: torch.Tensor, target_logits: torch.Tensor, eval_mask:
 
 
 def _reference_loss(draft_logits, target_logits, target_ids, mask, alpha, eta):
-    """The objective written out slot by slot."""
+    """The objective written out slot by slot; the D-PACE weights and the LK mix carry no gradient."""
     q = draft_logits.float().softmax(-1)
     p = target_logits.float().softmax(-1)
     tv = 0.5 * (p - q).abs().sum(-1)
     kl = (p * (p.log() - q.log())).sum(-1)
-    lam = torch.exp(-eta * (1 - tv))
+    lam = torch.exp(-eta * (1 - tv)).detach()
     lk = lam * kl + (1 - lam) * tv
-    confidence = q.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    confidence = q.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1).detach()
     smooth = torch.where(mask, (1 - alpha) * confidence + alpha, torch.ones_like(confidence))
     prefix = smooth.cumprod(-1)
     weights = (prefix * mask).flip(-1).cumsum(-1).flip(-1) * mask
@@ -118,14 +112,13 @@ def test_objective_matches_the_written_out_formula() -> None:
     expected, expected_tv = _reference_loss(draft_logits, target_logits, outputs.target_ids, mask, 0.5, 3.0)
     torch.testing.assert_close(loss, expected, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(terms["l1_loss"], expected_tv, rtol=1e-5, atol=1e-6)
-    # The D-PACE weights and the LK mixing weight are detached: the gradient is that of the
-    # weighted LK sum with both held fixed.
+    # The gradient is that of the weighted LK sum with the D-PACE weights and the mix held fixed.
     loss.backward()
     draft_grad = draft_logits.grad.clone()
     draft_logits.grad = None
     expected.backward()
-    assert not torch.allclose(draft_grad, draft_logits.grad)
-    assert torch.isfinite(draft_grad).all() and draft_grad[1, 2].abs().max() == 0
+    torch.testing.assert_close(draft_grad, draft_logits.grad, rtol=1e-4, atol=1e-7)
+    assert draft_grad[1, 2].abs().max() == 0
 
 
 def test_identical_distributions_give_zero_distillation_and_full_acceptance() -> None:
